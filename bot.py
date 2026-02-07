@@ -121,9 +121,9 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 _AVAILABLE_MODELS = {
-    "opus": "Claude Opus 4.6",
-    "sonnet": "Claude Sonnet 4.5",
-    "haiku": "Claude Haiku 4.5",
+    "opus": "\U0001f9e0 Claude Opus 4.6",
+    "sonnet": "\u26a1 Claude Sonnet 4.5",
+    "haiku": "\U0001fab6 Claude Haiku 4.5",
 }
 
 
