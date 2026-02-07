@@ -17,7 +17,6 @@ from telegram.ext import (
     filters,
 )
 
-import cron
 import sessions
 from claude import PersistentClaude
 from config import Config
@@ -307,11 +306,6 @@ async def _handle_response(
         await sessions.save_session(
             chat_id, final_response.session_id, model, final_response.cost_usd
         )
-
-    # Check for new cron job files created by Claude
-    new_jobs = await cron.process_cron_files(context.application, chat_id)
-    for j in new_jobs:
-        log.info("Registered cron job #%d: %s", j["id"], j["name"])
 
     final_text = final_response.text
     if live_msg:

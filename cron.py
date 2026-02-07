@@ -13,7 +13,8 @@ from locks import get_lock
 
 log = logging.getLogger(__name__)
 
-CRON_DIR = Path(__file__).parent / "workspace" / ".cron"
+_SIGNAL_DIR = Path(__file__).parent / "workspace" / ".cron"
+_SIGNAL_FILE = _SIGNAL_DIR / ".pending"
 
 # Protocol markers for conditional auto-remove jobs.
 # Claude is instructed to begin its response with one of these markers.
@@ -30,11 +31,27 @@ def _ensure_utc(dt: datetime) -> datetime:
 
 
 async def init_jobs(app: Application) -> None:
-    """Load all active jobs from DB and register them with the JobQueue."""
-    CRON_DIR.mkdir(parents=True, exist_ok=True)
+    """Load all active jobs from DB, register them, and start the signal watcher."""
+    _SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
+    await _register_new_jobs(app)
+    # Check for new jobs written directly to the DB by schedule_job.py
+    app.job_queue.run_repeating(_check_pending_signal, interval=10, name="cron_signal_watcher")
+    log.info("Started cron signal watcher")
+
+
+async def _register_new_jobs(app: Application) -> int:
+    """Find active DB jobs not yet in the scheduler and register them.
+
+    Returns the number of newly registered jobs.
+    """
     jobs = await sessions.get_all_active_jobs()
+    registered = {j.name for j in app.job_queue.jobs()}
     now = datetime.now(timezone.utc)
+    count = 0
     for job in jobs:
+        job_name = f"cron_{job['id']}"
+        if job_name in registered:
+            continue
         schedule = json.loads(job["schedule_data"])
         # Skip expired one-shot jobs
         if job["schedule_type"] == "once":
@@ -44,7 +61,18 @@ async def init_jobs(app: Application) -> None:
                 log.info("Skipped expired one-shot job %d: %s", job["id"], job["name"])
                 continue
         _register_job(app, job)
-    log.info("Loaded %d active jobs", len(jobs))
+        count += 1
+    return count
+
+
+async def _check_pending_signal(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Called periodically to check if schedule_job.py signaled new jobs."""
+    if not _SIGNAL_FILE.exists():
+        return
+    _SIGNAL_FILE.unlink(missing_ok=True)
+    count = await _register_new_jobs(context.application)
+    if count:
+        log.info("Registered %d new job(s) from signal", count)
 
 
 def _register_job(app: Application, job: dict) -> None:
@@ -163,42 +191,3 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(chat_id=chat_id, text=msg)
             except Exception:
                 log.exception("Failed to send job %d result", job_id)
-
-
-async def process_cron_files(app: Application, chat_id: int) -> list[dict]:
-    """Check for new .cron/*.json files, register them, and return created jobs."""
-    created = []
-    if not CRON_DIR.exists():
-        return created
-
-    for f in CRON_DIR.glob("*.json"):
-        try:
-            data = json.loads(f.read_text())
-            job_id = await sessions.create_job(
-                chat_id=chat_id,
-                name=data["name"],
-                job_type=data.get("job_type", "reminder"),
-                prompt=data["prompt"],
-                schedule_type=data["schedule_type"],
-                schedule_data=json.dumps(data["schedule_data"]),
-                auto_remove=data.get("auto_remove", False),
-            )
-            job = {
-                "id": job_id,
-                "chat_id": chat_id,
-                "name": data["name"],
-                "job_type": data.get("job_type", "reminder"),
-                "prompt": data["prompt"],
-                "schedule_type": data["schedule_type"],
-                "schedule_data": json.dumps(data["schedule_data"]),
-                "auto_remove": data.get("auto_remove", False),
-            }
-            _register_job(app, job)
-            created.append(job)
-            log.info("Registered new job %d '%s' from file %s", job_id, data["name"], f.name)
-        except Exception:
-            log.exception("Failed to process cron file %s", f.name)
-        finally:
-            f.unlink(missing_ok=True)
-
-    return created
