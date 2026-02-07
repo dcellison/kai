@@ -15,6 +15,8 @@ from telegram.ext import (
     filters,
 )
 
+import json
+
 from claude import PersistentClaude
 import cron
 import sessions
@@ -162,10 +164,10 @@ async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     for j in jobs:
         sched = j["schedule_type"]
         if sched == "once":
-            data = __import__("json").loads(j["schedule_data"])
+            data = json.loads(j["schedule_data"])
             detail = f"once at {data.get('run_at', '?')}"
         elif sched == "interval":
-            data = __import__("json").loads(j["schedule_data"])
+            data = json.loads(j["schedule_data"])
             secs = data.get("seconds", 0)
             if secs >= 3600:
                 detail = f"every {secs // 3600}h"
@@ -174,7 +176,7 @@ async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             else:
                 detail = f"every {secs}s"
         elif sched == "daily":
-            data = __import__("json").loads(j["schedule_data"])
+            data = json.loads(j["schedule_data"])
             detail = f"daily at {data.get('time', '?')} UTC"
         else:
             detail = sched

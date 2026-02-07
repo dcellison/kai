@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from telegram.constants import ChatAction, ParseMode
+from telegram.constants import ChatAction
 from telegram.ext import Application
 
 import sessions
@@ -48,6 +47,7 @@ def _register_job(app: Application, job: dict) -> None:
         "prompt": job["prompt"],
         "auto_remove": job["auto_remove"],
         "name": job["name"],
+        "schedule_type": job["schedule_type"],
     }
 
     if job["schedule_type"] == "once":
@@ -87,7 +87,7 @@ async def _job_callback(context) -> None:
         except Exception:
             log.exception("Failed to send reminder for job %d", job_id)
         # One-shot reminders auto-deactivate
-        if context.job.name and not context.job.job.trigger.__class__.__name__ == "IntervalTrigger":
+        if data["schedule_type"] == "once":
             await sessions.deactivate_job(job_id)
         return
 
