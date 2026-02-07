@@ -22,7 +22,7 @@ import sessions
 from claude import PersistentClaude
 from config import Config
 from chat_log import log_message
-from locks import get_lock
+from locks import get_lock, get_stop_event
 
 log = logging.getLogger(__name__)
 
@@ -207,8 +207,19 @@ async def handle_canceljob(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 @_require_auth
+async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    claude = _get_claude(context)
+    stop_event = get_stop_event(chat_id)
+    stop_event.set()
+    claude.force_kill()
+    await update.message.reply_text("Stopping...")
+
+
+@_require_auth
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
+        "/stop - Interrupt current response\n"
         "/new - Start a fresh session\n"
         "/model <name> - Switch model (opus, sonnet, haiku)\n"
         "/stats - Show session info and cost\n"
@@ -378,7 +389,17 @@ async def _handle_response(
     last_edit_text = ""
     final_response = None
 
+    stop_event = get_stop_event(chat_id)
+    stop_event.clear()
+
     async for event in claude.send(prompt):
+        if stop_event.is_set():
+            stop_event.clear()
+            if live_msg:
+                await _edit_message_safe(live_msg, last_edit_text + "\n\n_(stopped)_")
+            final_response = None
+            break
+
         if event.done:
             final_response = event.response
             break
@@ -453,6 +474,7 @@ def create_bot(config: Config) -> Application:
     app.add_handler(CommandHandler("help", handle_help))
     app.add_handler(CommandHandler("jobs", handle_jobs))
     app.add_handler(CommandHandler("canceljob", handle_canceljob))
+    app.add_handler(CommandHandler("stop", handle_stop))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))

@@ -13,7 +13,8 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
-    # Silence noisy APScheduler "Running job ..." messages
+    # Silence noisy per-request and scheduler logs
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
 
     config = load_config()

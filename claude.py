@@ -214,6 +214,18 @@ class PersistentClaude:
                 response=ClaudeResponse(success=False, text=accumulated_text, error=str(e)),
             )
 
+    def force_kill(self) -> None:
+        """Kill the subprocess immediately. Safe to call without holding the lock.
+
+        The streaming loop in _send_locked() will see EOF on stdout and
+        clean up via the existing error-handling path.
+        """
+        if self._proc and self._proc.returncode is None:
+            try:
+                self._proc.kill()
+            except ProcessLookupError:
+                pass
+
     async def restart(self) -> None:
         """Kill and restart the process (for /new command)."""
         await self._kill()
