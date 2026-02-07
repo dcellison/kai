@@ -171,7 +171,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     model = claude.model
 
     async with _get_lock(chat_id):
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        # Keep "typing..." visible until the first message appears
+        typing_active = True
+
+        async def _keep_typing():
+            while typing_active:
+                try:
+                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                except Exception:
+                    pass
+                await asyncio.sleep(4)
+
+        typing_task = asyncio.create_task(_keep_typing())
 
         live_msg = None
         last_edit_time = 0.0
@@ -188,6 +199,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 continue
 
             if live_msg is None:
+                typing_active = False
+                typing_task.cancel()
                 truncated = _truncate_for_telegram(event.text_so_far)
                 try:
                     live_msg = await update.message.reply_text(
@@ -201,6 +214,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await _edit_message_safe(live_msg, event.text_so_far)
                 last_edit_time = now
                 last_edit_text = event.text_so_far
+
+        typing_active = False
+        typing_task.cancel()
 
         if final_response is None:
             await update.message.reply_text("Error: No response from Claude")
