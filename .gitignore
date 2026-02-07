@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 sessions.db
 kai.log
+.responding_to

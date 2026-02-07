@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
@@ -15,6 +16,7 @@ from telegram.ext import (
 )
 
 from claude import PersistentClaude
+import cron
 import sessions
 from config import Config
 
@@ -25,6 +27,17 @@ _chat_locks: dict[int, asyncio.Lock] = {}
 
 # Minimum interval between Telegram message edits (seconds)
 EDIT_INTERVAL = 2.0
+
+# Flag file to track in-flight responses
+_RESPONDING_FLAG = Path(__file__).parent / ".responding_to"
+
+
+def _set_responding(chat_id: int) -> None:
+    _RESPONDING_FLAG.write_text(str(chat_id))
+
+
+def _clear_responding() -> None:
+    _RESPONDING_FLAG.unlink(missing_ok=True)
 
 
 def _get_lock(chat_id: int) -> asyncio.Lock:
@@ -137,6 +150,63 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.bot_data["config"]
+    if not _is_authorized(config, update.effective_user.id):
+        return
+    jobs = await sessions.get_jobs(update.effective_chat.id)
+    if not jobs:
+        await update.message.reply_text("No active scheduled jobs.")
+        return
+    lines = []
+    for j in jobs:
+        sched = j["schedule_type"]
+        if sched == "once":
+            data = __import__("json").loads(j["schedule_data"])
+            detail = f"once at {data.get('run_at', '?')}"
+        elif sched == "interval":
+            data = __import__("json").loads(j["schedule_data"])
+            secs = data.get("seconds", 0)
+            if secs >= 3600:
+                detail = f"every {secs // 3600}h"
+            elif secs >= 60:
+                detail = f"every {secs // 60}m"
+            else:
+                detail = f"every {secs}s"
+        elif sched == "daily":
+            data = __import__("json").loads(j["schedule_data"])
+            detail = f"daily at {data.get('time', '?')} UTC"
+        else:
+            detail = sched
+        type_tag = "🔔" if j["job_type"] == "reminder" else "🤖"
+        lines.append(f"{type_tag} #{j['id']} {j['name']} ({detail})")
+    await update.message.reply_text("Active jobs:\n" + "\n".join(lines))
+
+
+async def handle_canceljob(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.bot_data["config"]
+    if not _is_authorized(config, update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /canceljob <id>")
+        return
+    try:
+        job_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Job ID must be a number.")
+        return
+    deleted = await sessions.delete_job(job_id)
+    if not deleted:
+        await update.message.reply_text(f"Job #{job_id} not found.")
+        return
+    # Remove from scheduler
+    jq = context.application.job_queue
+    current = jq.get_jobs_by_name(f"cron_{job_id}")
+    for j in current:
+        j.schedule_removal()
+    await update.message.reply_text(f"Job #{job_id} cancelled.")
+
+
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = context.bot_data["config"]
     if not _is_authorized(config, update.effective_user.id):
@@ -145,6 +215,8 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/new - Start a fresh session\n"
         "/model <name> - Switch model (opus, sonnet, haiku)\n"
         "/stats - Show session info and cost\n"
+        "/jobs - List scheduled jobs\n"
+        "/canceljob <id> - Cancel a job\n"
         "/help - This message"
     )
 
@@ -173,83 +245,96 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     model = claude.model
 
     async with _get_lock(chat_id):
-        # Keep "typing..." visible until the first message appears
-        typing_active = True
+        _set_responding(chat_id)
+        try:
+            await _handle_response(update, context, chat_id, prompt, claude, model)
+        finally:
+            _clear_responding()
 
-        async def _keep_typing():
-            while typing_active:
-                try:
-                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-                except Exception:
-                    pass
-                await asyncio.sleep(4)
 
-        typing_task = asyncio.create_task(_keep_typing())
+async def _handle_response(update, context, chat_id, prompt, claude, model):
+    # Keep "typing..." visible until the first message appears
+    typing_active = True
 
-        live_msg = None
-        last_edit_time = 0.0
-        last_edit_text = ""
-        final_response = None
+    async def _keep_typing():
+        while typing_active:
+            try:
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            except Exception:
+                pass
+            await asyncio.sleep(4)
 
-        async for event in claude.send(prompt):
-            if event.done:
-                final_response = event.response
-                break
+    typing_task = asyncio.create_task(_keep_typing())
 
-            now = time.monotonic()
-            if not event.text_so_far:
-                continue
+    live_msg = None
+    last_edit_time = 0.0
+    last_edit_text = ""
+    final_response = None
 
-            if live_msg is None:
-                truncated = _truncate_for_telegram(event.text_so_far)
-                try:
-                    live_msg = await update.message.reply_text(
-                        truncated, parse_mode=ParseMode.MARKDOWN
-                    )
-                except Exception:
-                    live_msg = await update.message.reply_text(truncated)
-                last_edit_time = now
-                last_edit_text = event.text_so_far
-            elif now - last_edit_time >= EDIT_INTERVAL and event.text_so_far != last_edit_text:
-                await _edit_message_safe(live_msg, event.text_so_far)
-                last_edit_time = now
-                last_edit_text = event.text_so_far
+    async for event in claude.send(prompt):
+        if event.done:
+            final_response = event.response
+            break
 
-        typing_active = False
-        typing_task.cancel()
+        now = time.monotonic()
+        if not event.text_so_far:
+            continue
 
-        if final_response is None:
-            await update.message.reply_text("Error: No response from Claude")
-            return
+        if live_msg is None:
+            truncated = _truncate_for_telegram(event.text_so_far)
+            try:
+                live_msg = await update.message.reply_text(
+                    truncated, parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception:
+                live_msg = await update.message.reply_text(truncated)
+            last_edit_time = now
+            last_edit_text = event.text_so_far
+        elif now - last_edit_time >= EDIT_INTERVAL and event.text_so_far != last_edit_text:
+            await _edit_message_safe(live_msg, event.text_so_far)
+            last_edit_time = now
+            last_edit_text = event.text_so_far
 
-        if not final_response.success:
-            error_text = f"Error: {final_response.error}"
-            if live_msg:
-                await _edit_message_safe(live_msg, error_text)
-            else:
-                await update.message.reply_text(error_text)
-            return
+    typing_active = False
+    typing_task.cancel()
 
-        if final_response.session_id:
-            await sessions.save_session(
-                chat_id, final_response.session_id, model, final_response.cost_usd
-            )
+    if final_response is None:
+        await update.message.reply_text("Error: No response from Claude")
+        return
 
-        final_text = final_response.text
+    if not final_response.success:
+        error_text = f"Error: {final_response.error}"
         if live_msg:
-            if len(final_text) <= 4096:
-                if final_text != last_edit_text:
-                    await _edit_message_safe(live_msg, final_text)
-            else:
-                chunks = _chunk_text(final_text)
-                await _edit_message_safe(live_msg, chunks[0])
-                for chunk in chunks[1:]:
-                    try:
-                        await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
-                    except Exception:
-                        await update.message.reply_text(chunk)
+            await _edit_message_safe(live_msg, error_text)
         else:
-            await _send_response(update, final_text)
+            await update.message.reply_text(error_text)
+        return
+
+    if final_response.session_id:
+        await sessions.save_session(
+            chat_id, final_response.session_id, model, final_response.cost_usd
+        )
+
+    # Check for new cron job files created by Claude
+    new_jobs = await cron.process_cron_files(context.application, chat_id)
+    for j in new_jobs:
+        log.info("Registered cron job #%d: %s", j["id"], j["name"])
+
+    final_text = final_response.text
+    if live_msg:
+        if len(final_text) <= 4096:
+            if final_text != last_edit_text:
+                await _edit_message_safe(live_msg, final_text)
+        else:
+            chunks = _chunk_text(final_text)
+            await _edit_message_safe(live_msg, chunks[0])
+            for chunk in chunks[1:]:
+                try:
+                    await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+                except Exception:
+                    await update.message.reply_text(chunk)
+    else:
+        await _send_response(update, final_text)
 
 
 def create_bot(config: Config) -> Application:
@@ -267,6 +352,8 @@ def create_bot(config: Config) -> Application:
     app.add_handler(CommandHandler("model", handle_model))
     app.add_handler(CommandHandler("stats", handle_stats))
     app.add_handler(CommandHandler("help", handle_help))
+    app.add_handler(CommandHandler("jobs", handle_jobs))
+    app.add_handler(CommandHandler("canceljob", handle_canceljob))
     app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

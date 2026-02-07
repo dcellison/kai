@@ -19,6 +19,20 @@ async def init_db(db_path: Path) -> None:
             total_cost_usd REAL DEFAULT 0.0
         )
     """)
+    await _db.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            job_type TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            schedule_type TEXT NOT NULL,
+            schedule_data TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            active INTEGER DEFAULT 1,
+            auto_remove INTEGER DEFAULT 0
+        )
+    """)
     await _db.commit()
 
 
@@ -63,6 +77,55 @@ async def get_stats(chat_id: int) -> dict | None:
             "last_used_at": row[3],
             "total_cost_usd": row[4],
         }
+
+
+async def create_job(
+    chat_id: int, name: str, job_type: str, prompt: str,
+    schedule_type: str, schedule_data: str, auto_remove: bool = False,
+) -> int:
+    cursor = await _db.execute(
+        """INSERT INTO jobs (chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (chat_id, name, job_type, prompt, schedule_type, schedule_data, int(auto_remove)),
+    )
+    await _db.commit()
+    return cursor.lastrowid
+
+
+async def get_jobs(chat_id: int) -> list[dict]:
+    async with _db.execute(
+        "SELECT id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, created_at FROM jobs WHERE chat_id = ? AND active = 1",
+        (chat_id,),
+    ) as cursor:
+        rows = await cursor.fetchall()
+        return [
+            {"id": r[0], "name": r[1], "job_type": r[2], "prompt": r[3],
+             "schedule_type": r[4], "schedule_data": r[5], "auto_remove": bool(r[6]), "created_at": r[7]}
+            for r in rows
+        ]
+
+
+async def get_all_active_jobs() -> list[dict]:
+    async with _db.execute(
+        "SELECT id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove FROM jobs WHERE active = 1"
+    ) as cursor:
+        rows = await cursor.fetchall()
+        return [
+            {"id": r[0], "chat_id": r[1], "name": r[2], "job_type": r[3], "prompt": r[4],
+             "schedule_type": r[5], "schedule_data": r[6], "auto_remove": bool(r[7])}
+            for r in rows
+        ]
+
+
+async def delete_job(job_id: int) -> bool:
+    cursor = await _db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+    await _db.commit()
+    return cursor.rowcount > 0
+
+
+async def deactivate_job(job_id: int) -> None:
+    await _db.execute("UPDATE jobs SET active = 0 WHERE id = ?", (job_id,))
+    await _db.commit()
 
 
 async def close_db() -> None:

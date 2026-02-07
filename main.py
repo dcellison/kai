@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from pathlib import Path
 
 from config import load_config
 from bot import create_bot
@@ -22,6 +23,21 @@ def main() -> None:
             await app.initialize()
             await app.start()
             await app.updater.start_polling()
+
+            # Notify if previous response was interrupted by a crash/restart
+            flag = Path(__file__).parent / ".responding_to"
+            if flag.exists():
+                try:
+                    chat_id = int(flag.read_text().strip())
+                    await app.bot.send_message(
+                        chat_id, "Sorry, my previous response was interrupted. Please resend your last message."
+                    )
+                    logging.info("Notified chat %d of interrupted response", chat_id)
+                except Exception as e:
+                    logging.warning("Failed to send interrupted-response notice: %s", e)
+                finally:
+                    flag.unlink(missing_ok=True)
+
             logging.info("Kai is running. Press Ctrl+C to stop.")
             await asyncio.Event().wait()  # run forever
         finally:
