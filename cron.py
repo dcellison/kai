@@ -9,6 +9,7 @@ from telegram.constants import ChatAction
 from telegram.ext import Application, ContextTypes
 
 import sessions
+from chat_log import log_message
 from locks import get_lock
 
 log = logging.getLogger(__name__)
@@ -131,6 +132,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if job_type == "reminder":
         try:
+            log_message(direction="assistant", chat_id=chat_id, text=f"[Reminder: {data['name']}] {prompt}")
             await context.bot.send_message(chat_id=chat_id, text=prompt)
         except Exception:
             log.exception("Failed to send reminder for job %d", job_id)
@@ -151,11 +153,15 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
 
-        final_response = None
-        async for event in claude.send(prompt):
-            if event.done:
-                final_response = event.response
-                break
+        try:
+            final_response = None
+            async for event in claude.send(prompt):
+                if event.done:
+                    final_response = event.response
+                    break
+        except Exception:
+            log.exception("Job %d crashed during Claude interaction", job_id)
+            return
 
         if final_response is None or not final_response.success:
             error = final_response.error if final_response else "No response"
@@ -175,6 +181,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             clean_text = f"{after_marker}\n{rest}".strip() if after_marker else rest
             msg = f"[Job: {data['name']}]\n{clean_text}" if clean_text else f"[Job: {data['name']}] Condition met."
             try:
+                log_message(direction="assistant", chat_id=chat_id, text=msg)
                 await context.bot.send_message(chat_id=chat_id, text=msg)
             except Exception:
                 log.exception("Failed to send job %d result", job_id)
@@ -190,6 +197,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             # Always send response for non-auto-remove jobs
             msg = f"[Job: {data['name']}]\n{response_text}"
             try:
+                log_message(direction="assistant", chat_id=chat_id, text=msg)
                 await context.bot.send_message(chat_id=chat_id, text=msg)
             except Exception:
                 log.exception("Failed to send job %d result", job_id)

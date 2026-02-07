@@ -21,6 +21,7 @@ from telegram.ext import (
 import sessions
 from claude import PersistentClaude
 from config import Config
+from chat_log import log_message
 from locks import get_lock
 
 log = logging.getLogger(__name__)
@@ -241,6 +242,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     b64 = base64.b64encode(bytes(data)).decode()
 
     caption = update.message.caption or "What's in this image?"
+    log_message(direction="user", chat_id=chat_id, text=caption, media={"type": "photo"})
     content = [
         {"type": "text", "text": caption},
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
@@ -297,6 +299,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         data = await file.download_as_bytearray()
         b64 = base64.b64encode(bytes(data)).decode()
         media_type = _IMAGE_MEDIA_TYPES[suffix]
+        log_message(direction="user", chat_id=chat_id, text=caption or file_name, media={"type": "document", "filename": file_name})
         content = [
             {"type": "text", "text": caption or f"What's in this image ({file_name})?"},
             {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
@@ -310,6 +313,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text(f"Couldn't decode {file_name} as text.")
             return
         header = f"File: {file_name}\n```\n{text_content}\n```"
+        log_message(direction="user", chat_id=chat_id, text=caption or f"[file: {file_name}]", media={"type": "document", "filename": file_name})
         if caption:
             content = f"{caption}\n\n{header}"
         else:
@@ -336,6 +340,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     chat_id = update.effective_chat.id
     prompt = update.message.text
+    log_message(direction="user", chat_id=chat_id, text=prompt)
     claude = _get_claude(context)
     model = claude.model
 
@@ -417,6 +422,7 @@ async def _handle_response(
         )
 
     final_text = final_response.text
+    log_message(direction="assistant", chat_id=chat_id, text=final_text)
     if live_msg:
         if len(final_text) <= 4096:
             if final_text != last_edit_text:
