@@ -162,8 +162,10 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
     claude.model = model
     await claude.restart()
     await sessions.clear_session(update.effective_chat.id)
-    await query.answer(f"Switched to {name}.")
-    await query.edit_message_text(f"Switched to {name}. Session restarted.")
+    await query.edit_message_text(
+        f"Switched to {name}. Session restarted.", reply_markup=None,
+    )
+    await query.answer()
 
 
 @_require_auth
