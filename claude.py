@@ -137,8 +137,10 @@ class PersistentClaude:
         try:
             while True:
                 try:
+                    # Allow extra time for cold starts before any output arrives
+                    timeout = self.timeout_seconds * 3 if not accumulated_text else self.timeout_seconds
                     line = await asyncio.wait_for(
-                        self._proc.stdout.readline(), timeout=self.timeout_seconds
+                        self._proc.stdout.readline(), timeout=timeout
                     )
                 except asyncio.TimeoutError:
                     log.error("Claude response timed out")
