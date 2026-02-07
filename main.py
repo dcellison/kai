@@ -5,6 +5,7 @@ from pathlib import Path
 from config import load_config
 from bot import create_bot
 import sessions
+import cron
 
 
 def main() -> None:
@@ -23,6 +24,9 @@ def main() -> None:
             await app.initialize()
             await app.start()
             await app.updater.start_polling()
+
+            # Reload scheduled jobs from the database
+            await cron.init_jobs(app)
 
             # Notify if previous response was interrupted by a crash/restart
             flag = Path(__file__).parent / ".responding_to"
