@@ -179,9 +179,14 @@ class PersistentClaude:
                         self._session_id = sid
 
                 elif etype == "result":
+                    # The result event's text may only contain the final
+                    # assistant message; accumulated_text has everything
+                    # (including text before tool use).
+                    result_text = event.get("result", "")
+                    text = accumulated_text if len(accumulated_text) > len(result_text) else result_text
                     response = ClaudeResponse(
                         success=not event.get("is_error", False),
-                        text=event.get("result", accumulated_text),
+                        text=text or accumulated_text,
                         session_id=event.get("session_id", self._session_id),
                         cost_usd=event.get("total_cost_usd", 0.0),
                         duration_ms=event.get("duration_ms", 0),
