@@ -120,6 +120,18 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 @_require_auth
+async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    claude = _get_claude(context)
+    current = claude.model
+    available = ["opus", "sonnet", "haiku"]
+    lines = []
+    for m in available:
+        marker = " \u2190 current" if m == current else ""
+        lines.append(f"  {m}{marker}")
+    await update.message.reply_text("Available models:\n" + "\n".join(lines))
+
+
+@_require_auth
 async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text("Usage: /model <opus|sonnet|haiku>")
@@ -221,6 +233,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         "/stop - Interrupt current response\n"
         "/new - Start a fresh session\n"
+        "/models - List available models\n"
         "/model <name> - Switch model (opus, sonnet, haiku)\n"
         "/stats - Show session info and cost\n"
         "/jobs - List scheduled jobs\n"
@@ -469,6 +482,7 @@ def create_bot(config: Config) -> Application:
 
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("new", handle_new))
+    app.add_handler(CommandHandler("models", handle_models))
     app.add_handler(CommandHandler("model", handle_model))
     app.add_handler(CommandHandler("stats", handle_stats))
     app.add_handler(CommandHandler("help", handle_help))
