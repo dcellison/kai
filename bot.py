@@ -162,6 +162,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not _is_authorized(config, update.effective_user.id):
         return
 
+    if not update.message or not update.message.text:
+        return
+
     chat_id = update.effective_chat.id
     prompt = update.message.text
     claude = _get_claude(context)
