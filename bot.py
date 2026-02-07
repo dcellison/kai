@@ -8,10 +8,11 @@ import logging
 import time
 from pathlib import Path
 
-from telegram import Message, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -119,16 +120,46 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("Session cleared. Starting fresh.")
 
 
+_AVAILABLE_MODELS = ["opus", "sonnet", "haiku"]
+
+
+def _models_keyboard(current: str) -> InlineKeyboardMarkup:
+    buttons = []
+    for m in _AVAILABLE_MODELS:
+        label = f"\u2713 {m}" if m == current else m
+        buttons.append([InlineKeyboardButton(label, callback_data=f"model:{m}")])
+    return InlineKeyboardMarkup(buttons)
+
+
 @_require_auth
 async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     claude = _get_claude(context)
-    current = claude.model
-    available = ["opus", "sonnet", "haiku"]
-    lines = []
-    for m in available:
-        marker = " \u2190 current" if m == current else ""
-        lines.append(f"  {m}{marker}")
-    await update.message.reply_text("Available models:\n" + "\n".join(lines))
+    await update.message.reply_text(
+        "Choose a model:", reply_markup=_models_keyboard(claude.model),
+    )
+
+
+async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    config: Config = context.bot_data["config"]
+    if not _is_authorized(config, update.effective_user.id):
+        await query.answer("Not authorized.")
+        return
+
+    model = query.data.removeprefix("model:")
+    claude = _get_claude(context)
+
+    if model == claude.model:
+        await query.answer(f"Already using {model}.")
+        return
+
+    claude.model = model
+    await claude.restart()
+    await sessions.clear_session(update.effective_chat.id)
+    await query.answer(f"Switched to {model}.")
+    await query.edit_message_text(
+        "Choose a model:", reply_markup=_models_keyboard(model),
+    )
 
 
 @_require_auth
@@ -137,7 +168,7 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Usage: /model <opus|sonnet|haiku>")
         return
     model = context.args[0].lower()
-    if model not in ("opus", "sonnet", "haiku"):
+    if model not in _AVAILABLE_MODELS:
         await update.message.reply_text("Choose: opus, sonnet, or haiku")
         return
     claude = _get_claude(context)
@@ -233,8 +264,8 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         "/stop - Interrupt current response\n"
         "/new - Start a fresh session\n"
-        "/models - List available models\n"
-        "/model <name> - Switch model (opus, sonnet, haiku)\n"
+        "/models - Choose a model\n"
+        "/model <name> - Switch model directly\n"
         "/stats - Show session info and cost\n"
         "/jobs - List scheduled jobs\n"
         "/canceljob <id> - Cancel a job\n"
@@ -489,6 +520,7 @@ def create_bot(config: Config) -> Application:
     app.add_handler(CommandHandler("jobs", handle_jobs))
     app.add_handler(CommandHandler("canceljob", handle_canceljob))
     app.add_handler(CommandHandler("stop", handle_stop))
+    app.add_handler(CallbackQueryHandler(handle_model_callback, pattern=r"^model:"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
