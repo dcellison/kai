@@ -54,8 +54,7 @@ async def _edit_message_safe(msg, text: str) -> None:
             pass
 
 
-async def _send_response(update: Update, text: str) -> None:
-    max_len = 4096
+def _chunk_text(text: str, max_len: int = 4096) -> list[str]:
     chunks = []
     while text:
         if len(text) <= max_len:
@@ -68,8 +67,11 @@ async def _send_response(update: Update, text: str) -> None:
             split_at = max_len
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip("\n")
+    return chunks
 
-    for chunk in chunks:
+
+async def _send_response(update: Update, text: str) -> None:
+    for chunk in _chunk_text(text):
         try:
             await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
         except Exception:
@@ -239,11 +241,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 if final_text != last_edit_text:
                     await _edit_message_safe(live_msg, final_text)
             else:
-                try:
-                    await live_msg.delete()
-                except Exception:
-                    pass
-                await _send_response(update, final_text)
+                chunks = _chunk_text(final_text)
+                await _edit_message_safe(live_msg, chunks[0])
+                for chunk in chunks[1:]:
+                    try:
+                        await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+                    except Exception:
+                        await update.message.reply_text(chunk)
         else:
             await _send_response(update, final_text)
 
