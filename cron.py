@@ -101,8 +101,12 @@ def _register_job(app: Application, job: dict) -> None:
         log.info("Scheduled repeating job %d '%s' every %ds", job["id"], job["name"], seconds)
 
     elif job["schedule_type"] == "daily":
-        parts = schedule["time"].split(":")
-        hour, minute = int(parts[0]), int(parts[1])
+        try:
+            parts = schedule["time"].split(":")
+            hour, minute = int(parts[0]), int(parts[1])
+        except (ValueError, IndexError):
+            log.error("Invalid time %s for job %d, skipping", schedule["time"], job["id"])
+            return
         if not (0 <= hour <= 23 and 0 <= minute <= 59):
             log.error("Invalid time %s for job %d, skipping", schedule["time"], job["id"])
             return
