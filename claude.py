@@ -194,7 +194,10 @@ class PersistentClaude:
                     if isinstance(msg_data, dict) and "content" in msg_data:
                         for block in msg_data["content"]:
                             if block.get("type") == "text":
-                                accumulated_text += block.get("text", "")
+                                new_text = block.get("text", "")
+                                if accumulated_text and new_text and not accumulated_text.endswith("\n"):
+                                    accumulated_text += "\n\n"
+                                accumulated_text += new_text
                                 yield StreamEvent(text_so_far=accumulated_text)
 
         except Exception as e:
