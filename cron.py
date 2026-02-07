@@ -131,6 +131,8 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("Job %d '%s' fired (type=%s)", job_id, data["name"], job_type)
 
     if job_type == "reminder":
+        # Strip stray backslash escapes (e.g. \! from bash double-quoting)
+        prompt = prompt.replace("\\!", "!").replace("\\.", ".").replace("\\?", "?")
         try:
             log_message(direction="assistant", chat_id=chat_id, text=f"[Reminder: {data['name']}] {prompt}")
             await context.bot.send_message(chat_id=chat_id, text=prompt)
