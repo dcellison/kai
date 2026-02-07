@@ -319,6 +319,10 @@ async def _handle_response(
 
     typing_active = False
     typing_task.cancel()
+    try:
+        await typing_task
+    except asyncio.CancelledError:
+        pass
 
     if final_response is None:
         await update.message.reply_text("Error: No response from Claude")

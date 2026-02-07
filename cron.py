@@ -151,13 +151,11 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
 
-        accumulated = ""
         final_response = None
         async for event in claude.send(prompt):
             if event.done:
                 final_response = event.response
                 break
-            accumulated = event.text_so_far
 
         if final_response is None or not final_response.success:
             error = final_response.error if final_response else "No response"

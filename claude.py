@@ -186,7 +186,7 @@ class PersistentClaude:
                     text = accumulated_text if len(accumulated_text) > len(result_text) else result_text
                     response = ClaudeResponse(
                         success=not event.get("is_error", False),
-                        text=text or accumulated_text,
+                        text=text,
                         session_id=event.get("session_id", self._session_id),
                         cost_usd=event.get("total_cost_usd", 0.0),
                         duration_ms=event.get("duration_ms", 0),
