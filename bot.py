@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import functools
 import json
 import logging
@@ -225,6 +226,35 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
 
 
 @_require_auth
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.photo:
+        return
+
+    chat_id = update.effective_chat.id
+    claude = _get_claude(context)
+    model = claude.model
+
+    # Download the largest available resolution
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    data = await file.download_as_bytearray()
+    b64 = base64.b64encode(bytes(data)).decode()
+
+    caption = update.message.caption or "What's in this image?"
+    content = [
+        {"type": "text", "text": caption},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+    ]
+
+    async with get_lock(chat_id):
+        _set_responding(chat_id)
+        try:
+            await _handle_response(update, context, chat_id, content, claude, model)
+        finally:
+            _clear_responding()
+
+
+@_require_auth
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
@@ -246,7 +276,7 @@ async def _handle_response(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
-    prompt: str,
+    prompt: str | list,
     claude: PersistentClaude,
     model: str,
 ) -> None:
@@ -338,6 +368,7 @@ def create_bot(config: Config) -> Application:
     app.add_handler(CommandHandler("help", handle_help))
     app.add_handler(CommandHandler("jobs", handle_jobs))
     app.add_handler(CommandHandler("canceljob", handle_canceljob))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

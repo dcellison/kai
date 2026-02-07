@@ -97,13 +97,13 @@ class PersistentClaude:
             except Exception:
                 break
 
-    async def send(self, prompt: str) -> AsyncIterator[StreamEvent]:
+    async def send(self, prompt: str | list) -> AsyncIterator[StreamEvent]:
         """Send a message and yield streaming events. Serialized via lock."""
         async with self._lock:
             async for event in self._send_locked(prompt):
                 yield event
 
-    async def _send_locked(self, prompt: str) -> AsyncIterator[StreamEvent]:
+    async def _send_locked(self, prompt: str | list) -> AsyncIterator[StreamEvent]:
         try:
             await self._ensure_started()
         except FileNotFoundError:
@@ -113,11 +113,12 @@ class PersistentClaude:
             )
             return
 
+        content = prompt if isinstance(prompt, list) else [{"type": "text", "text": prompt}]
         msg = json.dumps({
             "type": "user",
             "message": {
                 "role": "user",
-                "content": [{"type": "text", "text": prompt}],
+                "content": content,
             },
         }) + "\n"
 
