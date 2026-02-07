@@ -40,8 +40,6 @@ def _clear_responding() -> None:
     _RESPONDING_FLAG.unlink(missing_ok=True)
 
 
-
-
 def _is_authorized(config: Config, user_id: int) -> bool:
     return user_id in config.allowed_user_ids
 

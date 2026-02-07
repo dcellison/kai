@@ -5,3 +5,4 @@ __pycache__/
 sessions.db
 kai.log
 .responding_to
+.DS_Store

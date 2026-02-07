@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import aiosqlite
 from pathlib import Path
+
+import aiosqlite
 
 _db: aiosqlite.Connection | None = None
 
@@ -9,6 +10,7 @@ _db: aiosqlite.Connection | None = None
 async def init_db(db_path: Path) -> None:
     global _db
     _db = await aiosqlite.connect(str(db_path))
+    _db.row_factory = aiosqlite.Row
     await _db.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             chat_id INTEGER PRIMARY KEY,
@@ -41,7 +43,7 @@ async def get_session(chat_id: int) -> str | None:
         "SELECT session_id FROM sessions WHERE chat_id = ?", (chat_id,)
     ) as cursor:
         row = await cursor.fetchone()
-        return row[0] if row else None
+        return row["session_id"] if row else None
 
 
 async def save_session(chat_id: int, session_id: str, model: str, cost_usd: float) -> None:
@@ -70,13 +72,7 @@ async def get_stats(chat_id: int) -> dict | None:
         row = await cursor.fetchone()
         if not row:
             return None
-        return {
-            "session_id": row[0],
-            "model": row[1],
-            "created_at": row[2],
-            "last_used_at": row[3],
-            "total_cost_usd": row[4],
-        }
+        return dict(row)
 
 
 async def create_job(
@@ -98,11 +94,7 @@ async def get_jobs(chat_id: int) -> list[dict]:
         (chat_id,),
     ) as cursor:
         rows = await cursor.fetchall()
-        return [
-            {"id": r[0], "name": r[1], "job_type": r[2], "prompt": r[3],
-             "schedule_type": r[4], "schedule_data": r[5], "auto_remove": bool(r[6]), "created_at": r[7]}
-            for r in rows
-        ]
+        return [{**dict(r), "auto_remove": bool(r["auto_remove"])} for r in rows]
 
 
 async def get_all_active_jobs() -> list[dict]:
@@ -110,11 +102,7 @@ async def get_all_active_jobs() -> list[dict]:
         "SELECT id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove FROM jobs WHERE active = 1"
     ) as cursor:
         rows = await cursor.fetchall()
-        return [
-            {"id": r[0], "chat_id": r[1], "name": r[2], "job_type": r[3], "prompt": r[4],
-             "schedule_type": r[5], "schedule_data": r[6], "auto_remove": bool(r[7])}
-            for r in rows
-        ]
+        return [{**dict(r), "auto_remove": bool(r["auto_remove"])} for r in rows]
 
 
 async def delete_job(job_id: int) -> bool:

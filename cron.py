@@ -6,7 +6,7 @@ from datetime import datetime, time as dt_time, timezone
 from pathlib import Path
 
 from telegram.constants import ChatAction
-from telegram.ext import Application
+from telegram.ext import Application, ContextTypes
 
 import sessions
 from locks import get_lock
@@ -15,9 +15,11 @@ log = logging.getLogger(__name__)
 
 CRON_DIR = Path(__file__).parent / "workspace" / ".cron"
 
-# Markers for conditional auto-remove jobs (case-insensitive matching)
-_CONDITION_MET_MARKER = "CONDITION_MET:"
-_CONDITION_NOT_MET_MARKER = "CONDITION_NOT_MET"
+# Protocol markers for conditional auto-remove jobs.
+# Claude is instructed to begin its response with one of these markers.
+# Matching is case-insensitive and checks the start of any line.
+_CONDITION_MET_PREFIX = "CONDITION_MET:"
+_CONDITION_NOT_MET_PREFIX = "CONDITION_NOT_MET"
 
 
 def _ensure_utc(dt: datetime) -> datetime:
@@ -80,8 +82,11 @@ def _register_job(app: Application, job: dict) -> None:
         jq.run_daily(_job_callback, time=t, name=job_name, data=callback_data)
         log.info("Scheduled daily job %d '%s' at %s UTC", job["id"], job["name"], schedule["time"])
 
+    else:
+        log.warning("Unknown schedule type '%s' for job %d, skipping", job["schedule_type"], job["id"])
 
-async def _job_callback(context) -> None:
+
+async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Called by APScheduler when a job fires."""
     data = context.job.data
     chat_id = data["chat_id"]
@@ -128,17 +133,17 @@ async def _job_callback(context) -> None:
             return
 
         response_text = final_response.text
-        response_upper = response_text.upper()
+        # Check first non-empty line for condition markers
+        first_line = response_text.strip().split("\n", 1)[0].strip().upper()
 
-        if auto_remove and _CONDITION_MET_MARKER.upper() in response_upper:
-            # Condition met — send notification and deactivate
-            # Strip the marker (case-insensitive) from the response
-            marker_idx = response_upper.index(_CONDITION_MET_MARKER.upper())
-            clean_text = (
-                response_text[:marker_idx]
-                + response_text[marker_idx + len(_CONDITION_MET_MARKER):]
-            ).strip()
-            msg = f"[Job: {data['name']}]\n{clean_text}"
+        if auto_remove and first_line.startswith(_CONDITION_MET_PREFIX.upper()):
+            # Condition met — send the rest (after the marker line) and deactivate
+            lines = response_text.strip().split("\n", 1)
+            # Text after the marker on the same line, plus any remaining lines
+            after_marker = lines[0].strip()[len(_CONDITION_MET_PREFIX):].strip()
+            rest = lines[1].strip() if len(lines) > 1 else ""
+            clean_text = f"{after_marker}\n{rest}".strip() if after_marker else rest
+            msg = f"[Job: {data['name']}]\n{clean_text}" if clean_text else f"[Job: {data['name']}] Condition met."
             try:
                 await context.bot.send_message(chat_id=chat_id, text=msg)
             except Exception:
@@ -147,7 +152,7 @@ async def _job_callback(context) -> None:
             context.job.schedule_removal()
             log.info("Job %d condition met, deactivated", job_id)
 
-        elif auto_remove and _CONDITION_NOT_MET_MARKER.upper() in response_upper:
+        elif auto_remove and first_line.startswith(_CONDITION_NOT_MET_PREFIX.upper()):
             # Silently continue
             log.info("Job %d condition not met, continuing", job_id)
 
