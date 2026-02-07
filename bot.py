@@ -130,7 +130,7 @@ _AVAILABLE_MODELS = {
 def _models_keyboard(current: str) -> InlineKeyboardMarkup:
     buttons = []
     for key, name in _AVAILABLE_MODELS.items():
-        label = f"{name} \u2705" if key == current else name
+        label = f"\U0001f7e2 {name}" if key == current else name
         buttons.append([InlineKeyboardButton(label, callback_data=f"model:{key}")])
     return InlineKeyboardMarkup(buttons)
 
