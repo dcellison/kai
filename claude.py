@@ -124,7 +124,7 @@ class PersistentClaude:
         try:
             self._proc.stdin.write(msg.encode())
             await self._proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+        except OSError as e:
             log.error("Failed to write to Claude process: %s", e)
             await self._kill()
             yield StreamEvent(
@@ -194,7 +194,7 @@ class PersistentClaude:
                     if isinstance(msg_data, dict) and "content" in msg_data:
                         for block in msg_data["content"]:
                             if block.get("type") == "text":
-                                accumulated_text = block.get("text", "")
+                                accumulated_text += block.get("text", "")
                                 yield StreamEvent(text_so_far=accumulated_text)
 
         except Exception as e:

@@ -2,17 +2,29 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timezone
 from pathlib import Path
 
 from telegram.constants import ChatAction
 from telegram.ext import Application
 
 import sessions
+from locks import get_lock
 
 log = logging.getLogger(__name__)
 
 CRON_DIR = Path(__file__).parent / "workspace" / ".cron"
+
+# Markers for conditional auto-remove jobs (case-insensitive matching)
+_CONDITION_MET_MARKER = "CONDITION_MET:"
+_CONDITION_NOT_MET_MARKER = "CONDITION_NOT_MET"
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    """Attach UTC timezone if the datetime is naive."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 async def init_jobs(app: Application) -> None:
@@ -24,9 +36,7 @@ async def init_jobs(app: Application) -> None:
         schedule = json.loads(job["schedule_data"])
         # Skip expired one-shot jobs
         if job["schedule_type"] == "once":
-            run_at = datetime.fromisoformat(schedule["run_at"])
-            if run_at.tzinfo is None:
-                run_at = run_at.replace(tzinfo=timezone.utc)
+            run_at = _ensure_utc(datetime.fromisoformat(schedule["run_at"]))
             if run_at <= now:
                 await sessions.deactivate_job(job["id"])
                 log.info("Skipped expired one-shot job %d: %s", job["id"], job["name"])
@@ -51,9 +61,7 @@ def _register_job(app: Application, job: dict) -> None:
     }
 
     if job["schedule_type"] == "once":
-        run_at = datetime.fromisoformat(schedule["run_at"])
-        if run_at.tzinfo is None:
-            run_at = run_at.replace(tzinfo=timezone.utc)
+        run_at = _ensure_utc(datetime.fromisoformat(schedule["run_at"]))
         jq.run_once(_job_callback, when=run_at, name=job_name, data=callback_data)
         log.info("Scheduled one-shot job %d '%s' at %s", job["id"], job["name"], run_at)
 
@@ -63,9 +71,12 @@ def _register_job(app: Application, job: dict) -> None:
         log.info("Scheduled repeating job %d '%s' every %ds", job["id"], job["name"], seconds)
 
     elif job["schedule_type"] == "daily":
-        from datetime import time as dt_time
         parts = schedule["time"].split(":")
-        t = dt_time(int(parts[0]), int(parts[1]), tzinfo=timezone.utc)
+        hour, minute = int(parts[0]), int(parts[1])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            log.error("Invalid time %s for job %d, skipping", schedule["time"], job["id"])
+            return
+        t = dt_time(hour, minute, tzinfo=timezone.utc)
         jq.run_daily(_job_callback, time=t, name=job_name, data=callback_data)
         log.info("Scheduled daily job %d '%s' at %s UTC", job["id"], job["name"], schedule["time"])
 
@@ -97,10 +108,7 @@ async def _job_callback(context) -> None:
         log.error("No Claude process available for job %d", job_id)
         return
 
-    # Import here to avoid circular imports
-    from bot import _get_lock
-
-    async with _get_lock(chat_id):
+    async with get_lock(chat_id):
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         except Exception:
@@ -120,21 +128,26 @@ async def _job_callback(context) -> None:
             return
 
         response_text = final_response.text
+        response_upper = response_text.upper()
 
-        if auto_remove and "CONDITION_MET:" in response_text:
+        if auto_remove and _CONDITION_MET_MARKER.upper() in response_upper:
             # Condition met — send notification and deactivate
-            clean_text = response_text.replace("CONDITION_MET:", "").strip()
+            # Strip the marker (case-insensitive) from the response
+            marker_idx = response_upper.index(_CONDITION_MET_MARKER.upper())
+            clean_text = (
+                response_text[:marker_idx]
+                + response_text[marker_idx + len(_CONDITION_MET_MARKER):]
+            ).strip()
             msg = f"[Job: {data['name']}]\n{clean_text}"
             try:
                 await context.bot.send_message(chat_id=chat_id, text=msg)
             except Exception:
                 log.exception("Failed to send job %d result", job_id)
             await sessions.deactivate_job(job_id)
-            # Remove from scheduler
             context.job.schedule_removal()
             log.info("Job %d condition met, deactivated", job_id)
 
-        elif auto_remove and "CONDITION_NOT_MET" in response_text:
+        elif auto_remove and _CONDITION_NOT_MET_MARKER.upper() in response_upper:
             # Silently continue
             log.info("Job %d condition not met, continuing", job_id)
 
