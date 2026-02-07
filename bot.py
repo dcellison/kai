@@ -159,13 +159,15 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer(f"Already using {name}.")
         return
 
+    await query.answer()
+    try:
+        await query.edit_message_text(f"Switched to {name}. Session restarted.")
+    except Exception:
+        log.exception("Failed to edit model selection message")
+
     claude.model = model
     await claude.restart()
     await sessions.clear_session(update.effective_chat.id)
-    await query.edit_message_text(
-        f"Switched to {name}. Session restarted.", reply_markup=None,
-    )
-    await query.answer()
 
 
 @_require_auth
