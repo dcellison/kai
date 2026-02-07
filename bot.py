@@ -120,14 +120,18 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("Session cleared. Starting fresh.")
 
 
-_AVAILABLE_MODELS = ["opus", "sonnet", "haiku"]
+_AVAILABLE_MODELS = {
+    "opus": "Claude Opus 4.6",
+    "sonnet": "Claude Sonnet 4.5",
+    "haiku": "Claude Haiku 4.5",
+}
 
 
 def _models_keyboard(current: str) -> InlineKeyboardMarkup:
     buttons = []
-    for m in _AVAILABLE_MODELS:
-        label = f"\u2713 {m}" if m == current else m
-        buttons.append([InlineKeyboardButton(label, callback_data=f"model:{m}")])
+    for key, name in _AVAILABLE_MODELS.items():
+        label = f"\u2713 {name}" if key == current else name
+        buttons.append([InlineKeyboardButton(label, callback_data=f"model:{key}")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -149,14 +153,16 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
     model = query.data.removeprefix("model:")
     claude = _get_claude(context)
 
+    name = _AVAILABLE_MODELS.get(model, model)
+
     if model == claude.model:
-        await query.answer(f"Already using {model}.")
+        await query.answer(f"Already using {name}.")
         return
 
     claude.model = model
     await claude.restart()
     await sessions.clear_session(update.effective_chat.id)
-    await query.answer(f"Switched to {model}.")
+    await query.answer(f"Switched to {name}.")
     await query.edit_message_text(
         "Choose a model:", reply_markup=_models_keyboard(model),
     )
@@ -175,7 +181,7 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     claude.model = model
     await claude.restart()
     await sessions.clear_session(update.effective_chat.id)
-    await update.message.reply_text(f"Model set to {model}. Session restarted.")
+    await update.message.reply_text(f"Model set to {_AVAILABLE_MODELS[model]}. Session restarted.")
 
 
 @_require_auth
