@@ -199,8 +199,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 continue
 
             if live_msg is None:
-                typing_active = False
-                typing_task.cancel()
                 truncated = _truncate_for_telegram(event.text_so_far)
                 try:
                     live_msg = await update.message.reply_text(
