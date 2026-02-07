@@ -160,10 +160,10 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     await query.answer()
-    try:
-        await query.edit_message_text(f"Switched to {name}. Session restarted.")
-    except Exception:
-        log.exception("Failed to edit model selection message")
+    await query.edit_message_text(
+        f"Switched to {name}. Session restarted.",
+        reply_markup=InlineKeyboardMarkup([]),
+    )
 
     claude.model = model
     await claude.restart()
