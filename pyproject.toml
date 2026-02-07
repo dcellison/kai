@@ -1,0 +1,10 @@
+[project]
+name = "kai"
+version = "0.1.0"
+description = "Telegram gateway to Claude Code CLI"
+requires-python = ">=3.10"
+dependencies = [
+    "python-telegram-bot[ext]>=20.0",
+    "aiosqlite>=0.19.0",
+    "python-dotenv>=1.0.0",
+]
