@@ -254,6 +254,81 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             _clear_responding()
 
 
+# File extensions treated as readable text
+_TEXT_EXTENSIONS = {
+    ".txt", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".csv", ".tsv",
+    ".md", ".rst", ".xml", ".html", ".htm", ".css", ".yaml", ".yml",
+    ".toml", ".ini", ".cfg", ".conf", ".sh", ".bash", ".zsh", ".fish",
+    ".sql", ".log", ".env", ".gitignore", ".dockerfile", ".makefile",
+    ".rb", ".go", ".rs", ".java", ".kt", ".c", ".cpp", ".h", ".hpp",
+    ".swift", ".r", ".lua", ".pl", ".php", ".ex", ".exs", ".erl",
+}
+
+# Image extensions that can be sent as documents
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+# Media type mapping for images
+_IMAGE_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
+@_require_auth
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.document:
+        return
+
+    doc = update.message.document
+    file_name = doc.file_name or "unknown"
+    suffix = Path(file_name).suffix.lower()
+    caption = update.message.caption or ""
+
+    chat_id = update.effective_chat.id
+    claude = _get_claude(context)
+    model = claude.model
+
+    if suffix in _IMAGE_EXTENSIONS:
+        # Handle images sent as documents (uncompressed)
+        file = await context.bot.get_file(doc.file_id)
+        data = await file.download_as_bytearray()
+        b64 = base64.b64encode(bytes(data)).decode()
+        media_type = _IMAGE_MEDIA_TYPES[suffix]
+        content = [
+            {"type": "text", "text": caption or f"What's in this image ({file_name})?"},
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+        ]
+    elif suffix in _TEXT_EXTENSIONS or doc.mime_type and doc.mime_type.startswith("text/"):
+        file = await context.bot.get_file(doc.file_id)
+        data = await file.download_as_bytearray()
+        try:
+            text_content = bytes(data).decode("utf-8")
+        except UnicodeDecodeError:
+            await update.message.reply_text(f"Couldn't decode {file_name} as text.")
+            return
+        header = f"File: {file_name}\n```\n{text_content}\n```"
+        if caption:
+            content = f"{caption}\n\n{header}"
+        else:
+            content = header
+    else:
+        await update.message.reply_text(
+            f"I can't process {suffix or 'this'} files yet. "
+            "I support text files and images."
+        )
+        return
+
+    async with get_lock(chat_id):
+        _set_responding(chat_id)
+        try:
+            await _handle_response(update, context, chat_id, content, claude, model)
+        finally:
+            _clear_responding()
+
+
 @_require_auth
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
@@ -373,6 +448,7 @@ def create_bot(config: Config) -> Application:
     app.add_handler(CommandHandler("jobs", handle_jobs))
     app.add_handler(CommandHandler("canceljob", handle_canceljob))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
