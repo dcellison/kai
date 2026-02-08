@@ -149,10 +149,12 @@ sudo systemctl status kai
 | `/model <name>` | Switch model directly (`opus`, `sonnet`, `haiku`) |
 | `/new` | Clear session and start fresh |
 | `/workspace` | Show current working directory |
-| `/workspace <path>` | Switch to a different repo/directory |
-| `/workspace <number>` | Switch by history number |
+| `/workspace <name>` | Switch by name (resolved via base) or absolute path |
 | `/workspace home` | Return to default workspace |
-| `/workspaces` | List recently used workspaces |
+| `/workspace base <path>` | Set the projects directory for short-name resolution |
+| `/workspace base` | Show current base directory |
+| `/workspace new <name>` | Create a new workspace, git init, and switch to it |
+| `/workspaces` | Interactive workspace picker (inline buttons) |
 | `/stop` | Interrupt a response mid-stream |
 | `/memory` | View persistent memory |
 | `/memory clear` | Clear all memory |
@@ -171,7 +173,7 @@ Responses stream into Telegram in real time, updating the message every 2 second
 Use `/models` for an interactive picker or `/model <name>` to switch directly. Changing models restarts the session.
 
 ### Workspace switching
-Point Kai at any directory on your machine with `/workspace <path>`. Kai's identity and memory carry over from the home workspace. Use `/workspaces` to see a numbered list of recent workspaces and switch quickly with `/workspace <number>`.
+Point Kai at any directory on your machine with `/workspace <path>`. Kai's identity and memory carry over from the home workspace. Set a base directory with `/workspace base /path/to/projects` and then switch by short name (e.g., `/workspace kai`). Create new workspaces with `/workspace new <name>` (creates the directory and runs `git init`). Use `/workspaces` for an interactive picker with inline buttons — tap to switch, or tap the current workspace to dismiss.
 
 ### Image and file support
 Send photos or documents directly in the chat. Kai supports:
@@ -268,8 +270,8 @@ kai/
 │   ├── chat_log.py       # JSONL chat logging
 │   └── locks.py          # Per-chat async locks and stop events
 ├── tests/                # Test suite
-├── workspace/            # Claude Code working directory
-│   └── .claude/          # Identity and memory
+├── workspace/            # Claude Code working directory (contents gitignored)
+│   └── .gitkeep          # Placeholder to preserve directory in git
 ├── pyproject.toml        # Package metadata, dependencies, and tool config
 ├── Makefile              # Common dev commands
 ├── .env.example          # Environment variable template
