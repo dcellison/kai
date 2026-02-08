@@ -50,7 +50,7 @@ Kai will start polling for Telegram messages. Press Ctrl+C to stop.
 
 ### Running as a service (macOS)
 
-Create a launchd plist to keep Kai running in the background and restart it automatically:
+Create a launchd plist to keep Kai running in the background and restart it automatically. Replace `/Users/kai/Projects/kai` with your actual install path:
 
 ```bash
 cat > ~/Library/LaunchAgents/com.kai.bot.plist << 'EOF'
@@ -114,6 +114,8 @@ launchctl list | grep com.kai.bot
 ```
 
 ### Running as a service (Linux with systemd)
+
+Adjust paths to match your install location:
 
 ```ini
 # /etc/systemd/system/kai.service
