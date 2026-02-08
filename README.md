@@ -53,29 +53,44 @@ Kai will start polling for Telegram messages. Press Ctrl+C to stop.
 Create a launchd plist to keep Kai running in the background and restart it automatically:
 
 ```bash
-cat > ~/Library/LaunchAgents/com.kai.bot.plist << 'EOF'
+cat > ~/Library/LaunchAgents/com.syrinx.kai.plist << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.kai.bot</string>
+    <string>com.syrinx.kai</string>
+
     <key>ProgramArguments</key>
     <array>
         <string>/Users/kai/Projects/kai/.venv/bin/python</string>
         <string>-m</string>
         <string>kai</string>
     </array>
+
     <key>WorkingDirectory</key>
     <string>/Users/kai/Projects/kai</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
     <key>RunAtLoad</key>
     <true/>
+
     <key>KeepAlive</key>
     <true/>
+
     <key>StandardOutPath</key>
     <string>/Users/kai/Projects/kai/kai.log</string>
+
     <key>StandardErrorPath</key>
     <string>/Users/kai/Projects/kai/kai.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
 </dict>
 </plist>
 EOF
@@ -85,17 +100,17 @@ Load and manage the service:
 
 ```bash
 # Start
-launchctl load ~/Library/LaunchAgents/com.kai.bot.plist
+launchctl load ~/Library/LaunchAgents/com.syrinx.kai.plist
 
 # Stop
-launchctl unload ~/Library/LaunchAgents/com.kai.bot.plist
+launchctl unload ~/Library/LaunchAgents/com.syrinx.kai.plist
 
 # Restart (stop then start)
-launchctl unload ~/Library/LaunchAgents/com.kai.bot.plist
-launchctl load ~/Library/LaunchAgents/com.kai.bot.plist
+launchctl unload ~/Library/LaunchAgents/com.syrinx.kai.plist
+launchctl load ~/Library/LaunchAgents/com.syrinx.kai.plist
 
 # Check status
-launchctl list | grep com.kai.bot
+launchctl list | grep com.syrinx.kai
 ```
 
 ### Running as a service (Linux with systemd)
