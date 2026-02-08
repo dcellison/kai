@@ -8,6 +8,7 @@ from config import load_config
 from bot import create_bot
 import cron
 import sessions
+import webhook
 
 
 def main() -> None:
@@ -40,11 +41,15 @@ def main() -> None:
                 BotCommand("stats", "Show session info and cost"),
                 BotCommand("jobs", "List scheduled jobs"),
                 BotCommand("canceljob", "Cancel a scheduled job"),
+                BotCommand("webhooks", "Show webhook server status"),
                 BotCommand("help", "Show available commands"),
             ])
 
             # Reload scheduled jobs from the database
             await cron.init_jobs(app)
+
+            # Start webhook server if enabled
+            await webhook.start(app, config)
 
             # Notify if previous response was interrupted by a crash/restart
             flag = Path(__file__).parent / ".responding_to"
@@ -64,6 +69,7 @@ def main() -> None:
             logging.info("Kai is running. Press Ctrl+C to stop.")
             await asyncio.Event().wait()  # run forever
         finally:
+            await webhook.stop()
             await app.updater.stop()
             await app.stop()
             await app.bot_data["claude"].shutdown()

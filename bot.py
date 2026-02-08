@@ -20,6 +20,7 @@ from telegram.ext import (
 )
 
 import sessions
+import webhook
 from claude import PersistentClaude
 from config import Config
 from chat_log import log_message
@@ -291,6 +292,39 @@ async def handle_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 @_require_auth
+async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.bot_data["config"]
+    if not config.webhook_enabled:
+        await update.message.reply_text(
+            "Webhook server is disabled.\n"
+            "Set WEBHOOK_ENABLED=true in .env to enable."
+        )
+        return
+
+    running = webhook.is_running()
+    status = "running" if running else "not running"
+    lines = [
+        f"Webhook server: {status}",
+        f"Port: {config.webhook_port}",
+        "",
+        "Endpoints:",
+        f"  POST /webhook/github  (GitHub events)",
+        f"  POST /webhook         (generic, X-Webhook-Secret header)",
+        f"  GET  /health          (health check)",
+    ]
+    if running:
+        lines += [
+            "",
+            "GitHub setup:",
+            f"1. Set Payload URL to https://your-host:{config.webhook_port}/webhook/github",
+            "2. Content type: application/json",
+            "3. Set the secret to match WEBHOOK_SECRET",
+            "4. Choose events: Pushes, Pull requests, Issues, Comments",
+        ]
+    await update.message.reply_text("\n".join(lines))
+
+
+@_require_auth
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "/stop - Interrupt current response\n"
@@ -302,6 +336,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/stats - Show session info and cost\n"
         "/jobs - List scheduled jobs\n"
         "/canceljob <id> - Cancel a job\n"
+        "/webhooks - Show webhook server status\n"
         "/help - This message"
     )
 
@@ -553,6 +588,7 @@ def create_bot(config: Config) -> Application:
     app.add_handler(CommandHandler("jobs", handle_jobs))
     app.add_handler(CommandHandler("canceljob", handle_canceljob))
     app.add_handler(CommandHandler("memory", handle_memory))
+    app.add_handler(CommandHandler("webhooks", handle_webhooks))
     app.add_handler(CommandHandler("stop", handle_stop))
     app.add_handler(CallbackQueryHandler(handle_model_callback, pattern=r"^model:"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
