@@ -21,6 +21,13 @@ _CONDITION_MET_PREFIX = "CONDITION_MET:"
 _CONDITION_NOT_MET_PREFIX = "CONDITION_NOT_MET"
 
 
+def _parse_iso(s: str) -> datetime:
+    """Parse an ISO datetime string, handling the Z suffix for Python 3.9."""
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
+
+
 def _ensure_utc(dt: datetime) -> datetime:
     """Attach UTC timezone if the datetime is naive."""
     if dt.tzinfo is None:
@@ -49,7 +56,7 @@ async def _register_new_jobs(app: Application) -> int:
         schedule = json.loads(job["schedule_data"])
         # Skip expired one-shot jobs
         if job["schedule_type"] == "once":
-            run_at = _ensure_utc(datetime.fromisoformat(schedule["run_at"]))
+            run_at = _ensure_utc(_parse_iso(schedule["run_at"]))
             if run_at <= now:
                 await sessions.deactivate_job(job["id"])
                 log.info("Skipped expired one-shot job %d: %s", job["id"], job["name"])
@@ -85,7 +92,7 @@ def _register_job(app: Application, job: dict) -> None:
     }
 
     if job["schedule_type"] == "once":
-        run_at = _ensure_utc(datetime.fromisoformat(schedule["run_at"]))
+        run_at = _ensure_utc(_parse_iso(schedule["run_at"]))
         jq.run_once(_job_callback, when=run_at, name=job_name, data=callback_data)
         log.info("Scheduled one-shot job %d '%s' at %s", job["id"], job["name"], run_at)
 
