@@ -36,6 +36,7 @@ def main() -> None:
                 BotCommand("model", "Switch model (opus, sonnet, haiku)"),
                 BotCommand("new", "Start a fresh session"),
                 BotCommand("stop", "Interrupt current response"),
+                BotCommand("memory", "View or clear persistent memory"),
                 BotCommand("stats", "Show session info and cost"),
                 BotCommand("jobs", "List scheduled jobs"),
                 BotCommand("canceljob", "Cancel a scheduled job"),

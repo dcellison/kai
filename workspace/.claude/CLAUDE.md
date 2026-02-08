@@ -50,3 +50,24 @@ For auto-remove jobs, start your response with `CONDITION_MET: <message>` when t
 - `--time` — HH:MM UTC for `daily` jobs
 - `--seconds` — interval in seconds for `interval` jobs
 - `--chat-id` — auto-detected, rarely needed
+
+## Memory
+
+You have persistent memory in `.claude/MEMORY.md` that survives session resets (`/new`, `/model`). This file is automatically loaded into your context at the start of every session.
+
+### When to save memory
+- User explicitly asks you to remember something
+- You learn important facts: name, timezone, preferences, ongoing projects
+- User corrects a misconception — update the relevant entry
+
+### When NOT to save memory
+- Transient questions or one-off tasks
+- Information already in memory (avoid duplicates)
+
+### How to update
+1. Read `.claude/MEMORY.md`
+2. Add or edit entries under the appropriate heading
+3. Write the updated file
+4. Briefly confirm (e.g. "Got it, I'll remember that.")
+
+Keep the file under ~50 lines. Consolidate or remove outdated entries when it grows. Never remove entries unless the user asks.

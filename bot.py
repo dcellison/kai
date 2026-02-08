@@ -33,6 +33,9 @@ EDIT_INTERVAL = 2.0
 # Flag file to track in-flight responses
 _RESPONDING_FLAG = Path(__file__).parent / ".responding_to"
 
+# Persistent memory file (survives session resets)
+_MEMORY_PATH = Path(__file__).parent / "workspace" / ".claude" / "MEMORY.md"
+
 
 def _set_responding(chat_id: int) -> None:
     _RESPONDING_FLAG.write_text(str(chat_id))
@@ -268,12 +271,34 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 @_require_auth
+async def handle_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args and context.args[0].lower() == "clear":
+        if _MEMORY_PATH.exists():
+            _MEMORY_PATH.unlink()
+            await update.message.reply_text("Memory cleared.")
+        else:
+            await update.message.reply_text("Memory is already empty.")
+        return
+
+    if _MEMORY_PATH.exists():
+        content = _MEMORY_PATH.read_text().strip()
+        if content:
+            await _send_response(update, content)
+        else:
+            await update.message.reply_text("Memory is empty.")
+    else:
+        await update.message.reply_text("No memories yet. I'll start remembering as we chat.")
+
+
+@_require_auth
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "/stop - Interrupt current response\n"
         "/new - Start a fresh session\n"
         "/models - Choose a model\n"
         "/model <name> - Switch model directly\n"
+        "/memory - View persistent memory\n"
+        "/memory clear - Clear all memory\n"
         "/stats - Show session info and cost\n"
         "/jobs - List scheduled jobs\n"
         "/canceljob <id> - Cancel a job\n"
@@ -527,6 +552,7 @@ def create_bot(config: Config) -> Application:
     app.add_handler(CommandHandler("help", handle_help))
     app.add_handler(CommandHandler("jobs", handle_jobs))
     app.add_handler(CommandHandler("canceljob", handle_canceljob))
+    app.add_handler(CommandHandler("memory", handle_memory))
     app.add_handler(CommandHandler("stop", handle_stop))
     app.add_handler(CallbackQueryHandler(handle_model_callback, pattern=r"^model:"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
