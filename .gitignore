@@ -12,10 +12,9 @@ sessions.db
 kai.log
 .responding_to
 
-# Workspace runtime data
-workspace/chat_history/
-workspace/.cron/
-workspace/memory.png
+# Workspace runtime data (Kai's state, not source code)
+workspace/*
+!workspace/.gitkeep
 
 # OS / IDE
 .DS_Store
