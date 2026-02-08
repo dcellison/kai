@@ -97,6 +97,17 @@ async def get_jobs(chat_id: int) -> list[dict]:
         return [{**dict(r), "auto_remove": bool(r["auto_remove"])} for r in rows]
 
 
+async def get_job_by_id(job_id: int) -> dict | None:
+    async with _db.execute(
+        "SELECT id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove FROM jobs WHERE id = ?",
+        (job_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        return {**dict(row), "auto_remove": bool(row["auto_remove"])}
+
+
 async def get_all_active_jobs() -> list[dict]:
     async with _db.execute(
         "SELECT id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove FROM jobs WHERE active = 1"

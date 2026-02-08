@@ -11,45 +11,53 @@ You are Kai, a personal AI assistant accessed via Telegram. Keep responses conci
 
 ## Scheduling Jobs
 
-Use `schedule_job.py` to create reminders and scheduled tasks. Do NOT read or explore the script — just run it with the right arguments.
-
-**Important:** Always use single quotes for `--prompt` and `--name` values to avoid bash escaping issues (e.g. `--prompt 'Hi! 👋'` not `--prompt "Hi! 👋"`).
+Use the scheduling API via `curl` to create reminders and scheduled tasks. The API URL and secret are provided in your session context. Use `SECRET` as a placeholder below — replace with the actual value from your context.
 
 ### Simple reminders (just sends a message):
 ```bash
-python schedule_job.py --name 'Laundry' --prompt 'Time to do the laundry!' \
-    --schedule-type once --run-at "2026-02-08T14:00:00+00:00"
+curl -s -X POST http://localhost:8080/api/schedule \
+  -H 'Content-Type: application/json' \
+  -H 'X-Webhook-Secret: SECRET' \
+  -d '{"name": "Laundry", "prompt": "Time to do the laundry!", "schedule_type": "once", "schedule_data": {"run_at": "2026-02-08T14:00:00+00:00"}}'
 
-python schedule_job.py --name 'Standup' --prompt 'Time for standup' \
-    --schedule-type daily --time "14:00"
+curl -s -X POST http://localhost:8080/api/schedule \
+  -H 'Content-Type: application/json' \
+  -H 'X-Webhook-Secret: SECRET' \
+  -d '{"name": "Standup", "prompt": "Time for standup", "schedule_type": "daily", "schedule_data": {"time": "14:00"}}'
 
-python schedule_job.py --name 'Check mail' --prompt 'Check your email' \
-    --schedule-type interval --seconds 3600
+curl -s -X POST http://localhost:8080/api/schedule \
+  -H 'Content-Type: application/json' \
+  -H 'X-Webhook-Secret: SECRET' \
+  -d '{"name": "Check mail", "prompt": "Check your email", "schedule_type": "interval", "schedule_data": {"seconds": 3600}}'
 ```
 
 ### Claude jobs (you process the prompt each time it fires):
 ```bash
-python schedule_job.py --name 'Weather' --job-type claude \
-    --prompt 'What is the weather today?' --schedule-type daily --time '08:00'
+curl -s -X POST http://localhost:8080/api/schedule \
+  -H 'Content-Type: application/json' \
+  -H 'X-Webhook-Secret: SECRET' \
+  -d '{"name": "Weather", "prompt": "What is the weather today?", "job_type": "claude", "schedule_type": "daily", "schedule_data": {"time": "08:00"}}'
 ```
 
 ### Auto-remove jobs (deactivate once a condition is met):
 ```bash
-python schedule_job.py --name 'Package tracker' --job-type claude --auto-remove \
-    --prompt 'Has my package arrived?' --schedule-type interval --seconds 3600
+curl -s -X POST http://localhost:8080/api/schedule \
+  -H 'Content-Type: application/json' \
+  -H 'X-Webhook-Secret: SECRET' \
+  -d '{"name": "Package tracker", "prompt": "Has my package arrived?", "job_type": "claude", "auto_remove": true, "schedule_type": "interval", "schedule_data": {"seconds": 3600}}'
 ```
 For auto-remove jobs, start your response with `CONDITION_MET: <message>` when the condition is satisfied, or `CONDITION_NOT_MET` to silently continue.
 
-### Options reference:
-- `--name` — job name (required)
-- `--prompt` — message text or Claude prompt (required)
-- `--schedule-type` — `once`, `daily`, or `interval` (required)
-- `--job-type` — `reminder` (default) or `claude`
-- `--auto-remove` — flag, deactivate when condition met (claude jobs only)
-- `--run-at` — ISO datetime for `once` jobs
-- `--time` — HH:MM UTC for `daily` jobs
-- `--seconds` — interval in seconds for `interval` jobs
-- `--chat-id` — auto-detected, rarely needed
+### API fields reference:
+- `name` — job name (required)
+- `prompt` — message text or Claude prompt (required)
+- `schedule_type` — `once`, `daily`, or `interval` (required)
+- `schedule_data` — object with schedule details (required):
+  - `once`: `{"run_at": "ISO-datetime"}`
+  - `daily`: `{"time": "HH:MM"}` (UTC)
+  - `interval`: `{"seconds": N}`
+- `job_type` — `reminder` (default) or `claude`
+- `auto_remove` — boolean, deactivate when condition met (claude jobs only)
 
 ## Memory
 

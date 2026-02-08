@@ -37,12 +37,16 @@ class PersistentClaude:
         model: str = "sonnet",
         workspace: Path = Path("workspace"),
         home_workspace: Path | None = None,
+        webhook_port: int = 8080,
+        webhook_secret: str = "",
         max_budget_usd: float = 1.0,
         timeout_seconds: int = 120,
     ):
         self.model = model
         self.workspace = workspace
         self.home_workspace = home_workspace or workspace
+        self.webhook_port = webhook_port
+        self.webhook_secret = webhook_secret
         self.max_budget_usd = max_budget_usd
         self.timeout_seconds = timeout_seconds
         self._proc: asyncio.subprocess.Process | None = None
@@ -137,13 +141,21 @@ class PersistentClaude:
                 if memory:
                     parts.append(f"[Your persistent memory from previous sessions:]\n{memory}")
 
-            # When in a foreign workspace, add context about schedule_job.py path
-            if self.workspace != self.home_workspace:
-                parts.append(
-                    f"[Workspace context: You are working in {self.workspace}. "
-                    f"Your home workspace is {self.home_workspace}. "
-                    f"To schedule jobs, use: python {self.home_workspace / 'schedule_job.py'}]"
+            # Inject scheduling API info (always, so cron works from any workspace)
+            if self.webhook_secret:
+                api_note = (
+                    f"[Scheduling API: To schedule jobs, POST JSON to "
+                    f"http://localhost:{self.webhook_port}/api/schedule "
+                    f"with header 'X-Webhook-Secret: {self.webhook_secret}'. "
+                    f"Required fields: name, prompt, schedule_type, schedule_data. "
+                    f"Optional: job_type (reminder|claude), auto_remove (bool).]"
                 )
+                if self.workspace != self.home_workspace:
+                    api_note = (
+                        f"[Workspace context: You are working in {self.workspace}. "
+                        f"Your home workspace is {self.home_workspace}.]\n{api_note}"
+                    )
+                parts.append(api_note)
 
             if parts:
                 prefix = "\n\n".join(parts) + "\n\n"

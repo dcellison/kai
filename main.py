@@ -49,7 +49,7 @@ def main() -> None:
             # Reload scheduled jobs from the database
             await cron.init_jobs(app)
 
-            # Start webhook server if enabled
+            # Start webhook and scheduling API server
             await webhook.start(app, config)
 
             # Notify if previous response was interrupted by a crash/restart

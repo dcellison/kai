@@ -348,13 +348,6 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 @_require_auth
 async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = context.bot_data["config"]
-    if not config.webhook_enabled:
-        await update.message.reply_text(
-            "Webhook server is disabled.\n"
-            "Set WEBHOOK_ENABLED=true in .env to enable."
-        )
-        return
-
     running = webhook.is_running()
     status = "running" if running else "not running"
     lines = [
@@ -362,15 +355,16 @@ async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"Port: {config.webhook_port}",
         "",
         "Endpoints:",
-        f"  POST /webhook/github  (GitHub events)",
-        f"  POST /webhook         (generic, X-Webhook-Secret header)",
-        f"  GET  /health          (health check)",
+        "  POST /webhook/github  (GitHub events)",
+        "  POST /webhook         (generic)",
+        "  POST /api/schedule    (scheduling API)",
+        "  GET  /health          (health check)",
     ]
     if running:
         lines += [
             "",
             "GitHub setup:",
-            f"1. Set Payload URL to https://your-host:{config.webhook_port}/webhook/github",
+            f"1. Set Payload URL to https://your-host/webhook/github",
             "2. Content type: application/json",
             "3. Set the secret to match WEBHOOK_SECRET",
             "4. Choose events: Pushes, Pull requests, Issues, Comments",
@@ -633,6 +627,8 @@ def create_bot(config: Config) -> Application:
         model=config.claude_model,
         workspace=config.claude_workspace,
         home_workspace=config.claude_workspace,
+        webhook_port=config.webhook_port,
+        webhook_secret=config.webhook_secret,
         max_budget_usd=config.claude_max_budget_usd,
         timeout_seconds=config.claude_timeout_seconds,
     )

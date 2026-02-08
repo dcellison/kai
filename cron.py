@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, time as dt_time, timezone
-from pathlib import Path
 
 from telegram.constants import ChatAction
 from telegram.error import Forbidden
@@ -14,9 +13,6 @@ from chat_log import log_message
 from locks import get_lock
 
 log = logging.getLogger(__name__)
-
-_SIGNAL_DIR = Path(__file__).parent / "workspace" / ".cron"
-_SIGNAL_FILE = _SIGNAL_DIR / ".pending"
 
 # Protocol markers for conditional auto-remove jobs.
 # Claude is instructed to begin its response with one of these markers.
@@ -33,12 +29,8 @@ def _ensure_utc(dt: datetime) -> datetime:
 
 
 async def init_jobs(app: Application) -> None:
-    """Load all active jobs from DB, register them, and start the signal watcher."""
-    _SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
+    """Load all active jobs from DB and register them with the scheduler."""
     await _register_new_jobs(app)
-    # Check for new jobs written directly to the DB by schedule_job.py
-    app.job_queue.run_repeating(_check_pending_signal, interval=10, name="cron_signal_watcher")
-    log.info("Started cron signal watcher")
 
 
 async def _register_new_jobs(app: Application) -> int:
@@ -67,14 +59,14 @@ async def _register_new_jobs(app: Application) -> int:
     return count
 
 
-async def _check_pending_signal(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Called periodically to check if schedule_job.py signaled new jobs."""
-    if not _SIGNAL_FILE.exists():
-        return
-    _SIGNAL_FILE.unlink(missing_ok=True)
-    count = await _register_new_jobs(context.application)
-    if count:
-        log.info("Registered %d new job(s) from signal", count)
+async def register_job_by_id(app: Application, job_id: int) -> bool:
+    """Register a single job by its DB ID. Called by the scheduling API."""
+    job = await sessions.get_job_by_id(job_id)
+    if not job:
+        log.error("Job %d not found in DB", job_id)
+        return False
+    _register_job(app, job)
+    return True
 
 
 def _register_job(app: Application, job: dict) -> None:

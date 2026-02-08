@@ -9,6 +9,9 @@ import logging
 
 from aiohttp import web
 
+import cron
+import sessions
+
 log = logging.getLogger(__name__)
 
 _app: web.Application | None = None
@@ -190,21 +193,81 @@ async def _handle_generic(request: web.Request) -> web.Response:
     return web.json_response({"msg": "ok"})
 
 
+# ── Scheduling API ───────────────────────────────────────────────────
+
+_VALID_SCHEDULE_TYPES = ("once", "daily", "interval")
+
+async def _handle_schedule(request: web.Request) -> web.Response:
+    secret = request.app["webhook_secret"]
+
+    # Validate shared secret
+    provided = request.headers.get("X-Webhook-Secret", "")
+    if not hmac.compare_digest(provided, secret):
+        return web.Response(status=401, text="Invalid secret")
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.Response(status=400, text="Invalid JSON")
+
+    # Required fields
+    name = payload.get("name")
+    prompt = payload.get("prompt")
+    schedule_type = payload.get("schedule_type")
+    schedule_data = payload.get("schedule_data")
+
+    if not all([name, prompt, schedule_type, schedule_data]):
+        return web.json_response(
+            {"error": "Missing required fields: name, prompt, schedule_type, schedule_data"},
+            status=400,
+        )
+
+    if schedule_type not in _VALID_SCHEDULE_TYPES:
+        return web.json_response(
+            {"error": f"schedule_type must be one of: {', '.join(_VALID_SCHEDULE_TYPES)}"},
+            status=400,
+        )
+
+    job_type = payload.get("job_type", "reminder")
+    auto_remove = payload.get("auto_remove", False)
+    chat_id = request.app["chat_id"]
+
+    # schedule_data can be passed as a dict (JSON) or a string
+    if isinstance(schedule_data, dict):
+        schedule_data_str = json.dumps(schedule_data)
+    else:
+        schedule_data_str = schedule_data
+
+    try:
+        job_id = await sessions.create_job(
+            chat_id=chat_id,
+            name=name,
+            job_type=job_type,
+            prompt=prompt,
+            schedule_type=schedule_type,
+            schedule_data=schedule_data_str,
+            auto_remove=auto_remove,
+        )
+    except Exception:
+        log.exception("Failed to create job")
+        return web.json_response({"error": "Failed to create job"}, status=500)
+
+    # Register with APScheduler immediately
+    telegram_app = request.app["telegram_app"]
+    await cron.register_job_by_id(telegram_app, job_id)
+
+    log.info("Scheduled job %d '%s' via API (%s)", job_id, name, schedule_type)
+    return web.json_response({"job_id": job_id, "name": name})
+
+
 # ── Lifecycle ────────────────────────────────────────────────────────
 
 async def start(telegram_app, config) -> None:
     """Start the webhook HTTP server."""
     global _app, _runner
 
-    if not config.webhook_enabled:
-        log.info("Webhook server disabled (set WEBHOOK_ENABLED=true to enable)")
-        return
-
-    if not config.webhook_secret:
-        log.warning("WEBHOOK_SECRET not set — webhook server will not start")
-        return
-
     _app = web.Application()
+    _app["telegram_app"] = telegram_app
     _app["telegram_bot"] = telegram_app.bot
     _app["webhook_secret"] = config.webhook_secret
 
@@ -214,6 +277,7 @@ async def start(telegram_app, config) -> None:
     _app.router.add_get("/health", _handle_health)
     _app.router.add_post("/webhook/github", _handle_github)
     _app.router.add_post("/webhook", _handle_generic)
+    _app.router.add_post("/api/schedule", _handle_schedule)
 
     _runner = web.AppRunner(_app)
     await _runner.setup()
