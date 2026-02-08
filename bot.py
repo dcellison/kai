@@ -316,6 +316,7 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         await claude.change_workspace(home)
         await sessions.clear_session(update.effective_chat.id)
+        await sessions.delete_setting("workspace")
         await update.message.reply_text(f"Switched to home workspace. Session cleared.")
         return
 
@@ -334,6 +335,7 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     await claude.change_workspace(path)
     await sessions.clear_session(update.effective_chat.id)
+    await sessions.set_setting("workspace", str(path))
 
     # Build confirmation with useful context
     notes = []

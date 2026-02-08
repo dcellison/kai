@@ -35,6 +35,12 @@ async def init_db(db_path: Path) -> None:
             auto_remove INTEGER DEFAULT 0
         )
     """)
+    await _db.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
     await _db.commit()
 
 
@@ -124,6 +130,27 @@ async def delete_job(job_id: int) -> bool:
 
 async def deactivate_job(job_id: int) -> None:
     await _db.execute("UPDATE jobs SET active = 0 WHERE id = ?", (job_id,))
+    await _db.commit()
+
+
+async def get_setting(key: str) -> str | None:
+    async with _db.execute(
+        "SELECT value FROM settings WHERE key = ?", (key,)
+    ) as cursor:
+        row = await cursor.fetchone()
+        return row["value"] if row else None
+
+
+async def set_setting(key: str, value: str) -> None:
+    await _db.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    await _db.commit()
+
+
+async def delete_setting(key: str) -> None:
+    await _db.execute("DELETE FROM settings WHERE key = ?", (key,))
     await _db.commit()
 
 

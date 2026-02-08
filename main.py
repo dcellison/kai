@@ -26,6 +26,18 @@ def main() -> None:
     async def _init_and_run() -> None:
         await sessions.init_db(config.session_db_path)
         app = create_bot(config)
+
+        # Restore workspace from previous session
+        saved_workspace = await sessions.get_setting("workspace")
+        if saved_workspace:
+            ws_path = Path(saved_workspace)
+            if ws_path.is_dir():
+                await app.bot_data["claude"].change_workspace(ws_path)
+                logging.info("Restored workspace: %s", ws_path)
+            else:
+                logging.warning("Saved workspace no longer exists: %s", saved_workspace)
+                await sessions.delete_setting("workspace")
+
         try:
             await app.initialize()
             await app.start()
