@@ -178,21 +178,71 @@ Send photos or documents directly in the chat. Kai supports:
 - **Images** (JPEG, PNG, GIF, WebP) - sent as photos or uncompressed documents
 - **Text files** (Python, JS, JSON, Markdown, and many more) - content is extracted and sent to Claude
 
+### GitHub notifications
+
+Kai runs an HTTP server that receives GitHub webhook events and forwards them to Telegram as formatted notifications. Supported events:
+
+- **Pushes** — commit summaries with SHAs, messages, and a compare link
+- **Pull requests** — opened, closed, merged, reopened
+- **Issues** — opened, closed, reopened
+- **Issue comments** — new comments with author and body preview
+- **PR reviews** — approved or changes requested
+
+Signatures are validated using the `WEBHOOK_SECRET` via HMAC-SHA256, matching GitHub's `X-Hub-Signature-256` header.
+
+To configure, add a webhook on your GitHub repo pointing to `https://<your-host>/webhook/github` with the secret set to your `WEBHOOK_SECRET` value. Select the events you want.
+
+### Generic webhooks
+
+POST JSON to `/webhook` with an `X-Webhook-Secret` header. If the payload contains a `message` field, that text is sent to Telegram; otherwise the full JSON is forwarded (truncated to 4096 characters).
+
+Useful for connecting any service that can fire HTTP requests — CI pipelines, monitoring alerts, home automation, etc.
+
 ### Scheduled jobs
+
 Kai can schedule reminders and recurring tasks. Ask it naturally (e.g., "remind me to check the laundry at 3pm") and it will use the built-in scheduling API. Two job types:
 
-- **Reminders** - sends a message at the scheduled time
-- **Claude jobs** - runs a prompt through Claude at the scheduled time (useful for monitoring, daily summaries, etc.)
+- **Reminders** — sends a message at the scheduled time
+- **Claude jobs** — runs a prompt through Claude at the scheduled time (useful for monitoring, daily summaries, etc.)
 
 Jobs support one-shot, daily, and interval schedules. Use `/jobs` to list active jobs and `/canceljob <id>` to remove one.
 
+#### Conditional jobs
+
+Claude jobs can be set with `auto_remove: true` for monitoring use cases. Claude is expected to respond with a protocol marker:
+
+- `CONDITION_MET: <message>` — delivers the message and deactivates the job
+- `CONDITION_NOT_MET` — silently continues checking on the next scheduled run
+
+This is useful for things like "let me know when this PR is merged" or "tell me when the deploy finishes."
+
+#### Scheduling HTTP API
+
+Jobs can also be created programmatically via `POST /api/schedule`:
+
+```json
+{
+  "name": "daily standup",
+  "prompt": "Summarize my recent git activity",
+  "schedule_type": "daily",
+  "schedule_data": {"time": "09:00"},
+  "job_type": "claude",
+  "auto_remove": false
+}
+```
+
+Auth: set the `X-Webhook-Secret` header to your `WEBHOOK_SECRET`. Schedule types: `once` (with `{"run_at": "ISO8601"}`), `daily` (with `{"time": "HH:MM"}`), `interval` (with `{"seconds": N}`).
+
 ### Persistent memory
+
 Kai remembers facts across sessions. Ask it to remember something and it will persist to `.claude/MEMORY.md` in the workspace. Memory survives `/new` and model switches.
 
 ### Chat logging
+
 All messages are logged as JSONL files in `workspace/chat_history/`, organized by date.
 
 ### Crash recovery
+
 If Kai is interrupted mid-response, it notifies you on restart and asks you to resend your last message.
 
 ## Project Structure
@@ -208,7 +258,7 @@ kai/
 │   ├── config.py         # Environment config loading
 │   ├── sessions.py       # SQLite session, job, and settings storage
 │   ├── cron.py           # Scheduled job execution (APScheduler)
-│   ├── webhook.py        # HTTP server for webhooks and scheduling API
+│   ├── webhook.py        # HTTP server: GitHub/generic webhooks, scheduling API
 │   ├── chat_log.py       # JSONL chat logging
 │   └── locks.py          # Per-chat async locks and stop events
 ├── tests/                # Test suite
