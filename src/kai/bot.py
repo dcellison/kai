@@ -291,6 +291,25 @@ async def handle_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("No memories yet. I'll start remembering as we chat.")
 
 
+async def _resolve_workspace_path(target: str, base: str | None) -> Path | None:
+    """Resolve a workspace target to an absolute path.
+
+    Returns None if the target is a bare name and no base is set.
+    """
+    if target.startswith("/") or target.startswith("~"):
+        return Path(target).expanduser().resolve()
+    if base:
+        return (Path(base) / target).resolve()
+    return None
+
+
+def _short_workspace_name(path: str, base: str | None) -> str:
+    """Shorten a workspace path for display."""
+    if base and path.startswith(base.rstrip("/") + "/"):
+        return path[len(base.rstrip("/")) + 1 :]
+    return "/".join(Path(path).parts[-2:])
+
+
 async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, path: Path) -> None:
     """Switch to a workspace path, update DB state, and confirm."""
     claude = _get_claude(context)
@@ -319,25 +338,103 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text(f"Workspace: {path}{suffix}\nSession cleared.")
 
 
+async def _workspaces_keyboard(
+    history: list[dict],
+    current_path: str,
+    home_path: str,
+    base: str | None,
+) -> InlineKeyboardMarkup:
+    """Build inline keyboard for workspace switching."""
+    buttons = []
+    # Home button
+    home_label = "\U0001f3e0 Home"
+    if current_path == home_path:
+        home_label += " \U0001f7e2"
+    buttons.append([InlineKeyboardButton(home_label, callback_data="ws:home")])
+    # History entries
+    for i, entry in enumerate(history):
+        p = entry["path"]
+        if p == home_path:
+            continue  # already shown as Home
+        short = _short_workspace_name(p, base)
+        label = short
+        if p == current_path:
+            label += " \U0001f7e2"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"ws:{i}")])
+    return InlineKeyboardMarkup(buttons)
+
+
 @_require_auth
 async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     history = await sessions.get_workspace_history()
-    if not history:
-        await update.message.reply_text("No workspace history yet.\nUse /workspace <path> to switch.")
+    claude = _get_claude(context)
+    config: Config = context.bot_data["config"]
+    current = str(claude.workspace)
+    home = str(config.claude_workspace)
+    base = await sessions.get_setting("workspace_base")
+
+    if not history and current == home:
+        await update.message.reply_text("No workspace history yet.\nUse /workspace new <name> to create one.")
         return
 
+    keyboard = await _workspaces_keyboard(history, current, home, base)
+    await update.message.reply_text("Workspaces:", reply_markup=keyboard)
+
+
+async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    config: Config = context.bot_data["config"]
+    if not _is_authorized(config, update.effective_user.id):
+        await query.answer("Not authorized.")
+        return
+
+    data = query.data.removeprefix("ws:")
     claude = _get_claude(context)
-    current = str(claude.workspace)
-    lines = ["Recent workspaces:"]
-    for i, entry in enumerate(history, 1):
-        p = entry["path"]
-        marker = " (current)" if p == current else ""
-        # Show just the last two path components for brevity
-        short = "/".join(Path(p).parts[-2:])
-        lines.append(f"  {i}. {short}{marker}")
-    lines.append("")
-    lines.append("Switch: /workspace <number>")
-    await update.message.reply_text("\n".join(lines))
+    home = config.claude_workspace
+
+    if data == "home":
+        if claude.workspace == home:
+            await query.answer("Already home.")
+            return
+        await query.answer()
+        await claude.change_workspace(home)
+        await sessions.clear_session(update.effective_chat.id)
+        await sessions.delete_setting("workspace")
+    else:
+        try:
+            idx = int(data)
+        except ValueError:
+            await query.answer("Invalid selection.")
+            return
+        history = await sessions.get_workspace_history()
+        if idx < 0 or idx >= len(history):
+            await query.answer("Workspace no longer in history.")
+            return
+        path = Path(history[idx]["path"])
+        if not path.is_dir():
+            await sessions.delete_workspace_history(str(path))
+            await query.answer("That workspace no longer exists.")
+            # Refresh the keyboard
+            history = await sessions.get_workspace_history()
+            base = await sessions.get_setting("workspace_base")
+            keyboard = await _workspaces_keyboard(history, str(claude.workspace), str(home), base)
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+            return
+        if path == claude.workspace:
+            await query.answer("Already there.")
+            return
+        await query.answer()
+        await claude.change_workspace(path)
+        await sessions.clear_session(update.effective_chat.id)
+        await sessions.set_setting("workspace", str(path))
+        await sessions.upsert_workspace_history(str(path))
+
+    # Refresh keyboard to show updated current marker
+    history = await sessions.get_workspace_history()
+    base = await sessions.get_setting("workspace_base")
+    keyboard = await _workspaces_keyboard(history, str(claude.workspace), str(home), base)
+    short = _short_workspace_name(str(claude.workspace), base)
+    await query.edit_message_text(f"Switched to {short}", reply_markup=keyboard)
 
 
 @_require_auth
@@ -357,10 +454,56 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     target = " ".join(context.args)
+    base = await sessions.get_setting("workspace_base")
 
     # "home" keyword: return to default
     if target.lower() == "home":
         await _switch_workspace(update, context, home)
+        return
+
+    # "base" keyword: show or set workspace base directory
+    if target.lower().startswith("base"):
+        parts = target.split(None, 1)
+        if len(parts) == 1:
+            if base:
+                await update.message.reply_text(f"Workspace base: {base}")
+            else:
+                await update.message.reply_text("No workspace base set.\nUsage: /workspace base /path/to/projects")
+            return
+        new_base = Path(parts[1]).expanduser().resolve()
+        if not new_base.is_dir():
+            await update.message.reply_text(f"Not a directory:\n{new_base}")
+            return
+        await sessions.set_setting("workspace_base", str(new_base))
+        await update.message.reply_text(f"Workspace base set to:\n{new_base}")
+        return
+
+    # "new" keyword: create a new workspace
+    if target.lower().startswith("new"):
+        parts = target.split(None, 1)
+        if len(parts) < 2:
+            await update.message.reply_text("Usage: /workspace new <name>")
+            return
+        name = parts[1]
+        resolved = await _resolve_workspace_path(name, base)
+        if resolved is None:
+            await update.message.reply_text(
+                "Set a workspace base first:\n/workspace base /path/to/projects\n\nOr use a full path: /workspace new /full/path"
+            )
+            return
+        if resolved.exists():
+            await update.message.reply_text(f"Already exists:\n{resolved}")
+            return
+        resolved.mkdir(parents=True)
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "init",
+            cwd=str(resolved),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        await _switch_workspace(update, context, resolved)
         return
 
     # Numeric shortcut: pick from history
@@ -378,8 +521,9 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _switch_workspace(update, context, path)
         return
 
-    # Resolve the path
-    path = Path(target).expanduser().resolve()
+    # Resolve via base directory, then fall back to absolute path
+    resolved = await _resolve_workspace_path(target, base)
+    path = resolved if resolved else Path(target).expanduser().resolve()
 
     if not path.exists():
         await update.message.reply_text(f"Path does not exist:\n{path}")
@@ -424,10 +568,11 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/stop - Interrupt current response\n"
         "/new - Start a fresh session\n"
         "/workspace - Show current workspace\n"
-        "/workspace <path> - Switch working directory\n"
-        "/workspace <number> - Switch by history number\n"
+        "/workspace <name> - Switch by name or path\n"
+        "/workspace new <name> - Create + git init + switch\n"
+        "/workspace base <path> - Set projects directory\n"
         "/workspace home - Return to default\n"
-        "/workspaces - List recent workspaces\n"
+        "/workspaces - Switch workspace (inline buttons)\n"
         "/models - Choose a model\n"
         "/model <name> - Switch model directly\n"
         "/memory - View persistent memory\n"
@@ -743,6 +888,7 @@ def create_bot(config: Config) -> Application:
     app.add_handler(CommandHandler("webhooks", handle_webhooks))
     app.add_handler(CommandHandler("stop", handle_stop))
     app.add_handler(CallbackQueryHandler(handle_model_callback, pattern=r"^model:"))
+    app.add_handler(CallbackQueryHandler(handle_workspace_callback, pattern=r"^ws:"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
