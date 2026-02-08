@@ -5,5 +5,7 @@
 ## Ongoing Projects
 
 ## Preferences
+- Favourite color: green
+- Temperature units: Celsius
 
 ## Notes

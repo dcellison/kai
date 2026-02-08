@@ -430,10 +430,13 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
         await sessions.upsert_workspace_history(str(path))
 
     # Dismiss the keyboard and confirm
-    base = await sessions.get_setting("workspace_base")
-    short = _short_workspace_name(str(claude.workspace), base)
+    if data == "home":
+        label = "Home"
+    else:
+        base = await sessions.get_setting("workspace_base")
+        label = _short_workspace_name(str(claude.workspace), base)
     await query.edit_message_text(
-        f"Switched to {short}. Session cleared.",
+        f"Switched to {label}. Session cleared.",
         reply_markup=InlineKeyboardMarkup([]),
     )
 
