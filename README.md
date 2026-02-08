@@ -6,7 +6,7 @@ Kai acts as a Telegram gateway to a persistent Claude Code CLI process. Messages
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.13+
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - Your Telegram user ID (get it from [@userinfobot](https://t.me/userinfobot))

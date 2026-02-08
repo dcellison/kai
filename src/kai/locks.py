@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 
 # Per-chat locks to serialize messages within a conversation.

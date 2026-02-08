@@ -1,8 +1,6 @@
-from __future__ import annotations
-
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from kai.config import PROJECT_ROOT
 
@@ -20,7 +18,7 @@ def log_message(
 ) -> None:
     """Append a message record to today's JSONL chat log."""
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     record = {
         "ts": now.isoformat(),
         "dir": direction,

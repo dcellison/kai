@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 import json
 import logging
@@ -207,7 +205,7 @@ class PersistentClaude:
                     # Opus with tool use can go minutes between output lines
                     timeout = self.timeout_seconds * 3
                     line = await asyncio.wait_for(self._proc.stdout.readline(), timeout=timeout)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     log.error("Claude response timed out")
                     await self._kill()
                     yield StreamEvent(
@@ -325,7 +323,7 @@ class PersistentClaude:
             self._proc.terminate()
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 self._proc.kill()
                 await self._proc.wait()
         self._proc = None
