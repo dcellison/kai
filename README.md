@@ -190,7 +190,13 @@ Kai runs an HTTP server that receives GitHub webhook events and forwards them to
 
 Signatures are validated using the `WEBHOOK_SECRET` via HMAC-SHA256, matching GitHub's `X-Hub-Signature-256` header.
 
-To configure, add a webhook on your GitHub repo pointing to `https://<your-host>/webhook/github` with the secret set to your `WEBHOOK_SECRET` value. Select the events you want.
+The webhook server listens on `localhost:8080` by default. To receive events from GitHub (or any external service), you need to expose it to the internet. Options include:
+
+- [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) — free, runs as a background service, maps a domain to your local port. Recommended if you have a domain on Cloudflare.
+- [ngrok](https://ngrok.com/) — quick setup, gives you a public URL with one command. Good for testing.
+- A reverse proxy (nginx, Caddy) on a server with a public IP.
+
+Once exposed, add a webhook on your GitHub repo pointing to `https://<your-host>/webhook/github` with the secret set to your `WEBHOOK_SECRET` value. Select the events you want.
 
 ### Generic webhooks
 
