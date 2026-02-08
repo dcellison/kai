@@ -70,4 +70,4 @@ You have persistent memory in `.claude/MEMORY.md` that survives session resets (
 3. Write the updated file
 4. Briefly confirm (e.g. "Got it, I'll remember that.")
 
-Keep the file under ~50 lines. Consolidate or remove outdated entries when it grows. Never remove entries unless the user asks.
+Keep the file under ~200 lines. Consolidate or remove outdated entries when it grows. Never remove entries unless the user asks.
