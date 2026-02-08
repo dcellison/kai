@@ -307,7 +307,7 @@ def _short_workspace_name(path: str, base: str | None) -> str:
     """Shorten a workspace path for display."""
     if base and path.startswith(base.rstrip("/") + "/"):
         return path[len(base.rstrip("/")) + 1 :]
-    return "/".join(Path(path).parts[-2:])
+    return Path(path).name
 
 
 async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, path: Path) -> None:
