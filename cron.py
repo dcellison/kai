@@ -6,6 +6,7 @@ from datetime import datetime, time as dt_time, timezone
 from pathlib import Path
 
 from telegram.constants import ChatAction
+from telegram.error import Forbidden
 from telegram.ext import Application, ContextTypes
 
 import sessions
@@ -136,6 +137,11 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             log_message(direction="assistant", chat_id=chat_id, text=f"[Reminder: {data['name']}] {prompt}")
             await context.bot.send_message(chat_id=chat_id, text=prompt)
+        except Forbidden:
+            log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
+            await sessions.deactivate_job(job_id)
+            context.job.schedule_removal()
+            return
         except Exception:
             log.exception("Failed to send reminder for job %d", job_id)
         # One-shot reminders auto-deactivate
@@ -185,6 +191,8 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 log_message(direction="assistant", chat_id=chat_id, text=msg)
                 await context.bot.send_message(chat_id=chat_id, text=msg)
+            except Forbidden:
+                log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
             except Exception:
                 log.exception("Failed to send job %d result", job_id)
             await sessions.deactivate_job(job_id)
@@ -201,5 +209,9 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 log_message(direction="assistant", chat_id=chat_id, text=msg)
                 await context.bot.send_message(chat_id=chat_id, text=msg)
+            except Forbidden:
+                log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
+                await sessions.deactivate_job(job_id)
+                context.job.schedule_removal()
             except Exception:
                 log.exception("Failed to send job %d result", job_id)
