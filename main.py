@@ -2,6 +2,8 @@ import asyncio
 import logging
 from pathlib import Path
 
+from telegram import BotCommand
+
 from config import load_config
 from bot import create_bot
 import cron
@@ -27,6 +29,18 @@ def main() -> None:
             await app.initialize()
             await app.start()
             await app.updater.start_polling()
+
+            # Register slash command menu in Telegram
+            await app.bot.set_my_commands([
+                BotCommand("models", "Choose a model"),
+                BotCommand("model", "Switch model (opus, sonnet, haiku)"),
+                BotCommand("new", "Start a fresh session"),
+                BotCommand("stop", "Interrupt current response"),
+                BotCommand("stats", "Show session info and cost"),
+                BotCommand("jobs", "List scheduled jobs"),
+                BotCommand("canceljob", "Cancel a scheduled job"),
+                BotCommand("help", "Show available commands"),
+            ])
 
             # Reload scheduled jobs from the database
             await cron.init_jobs(app)
