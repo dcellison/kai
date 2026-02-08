@@ -19,12 +19,11 @@ from telegram.ext import (
     filters,
 )
 
-import sessions
-import webhook
-from claude import PersistentClaude
-from config import Config
-from chat_log import log_message
-from locks import get_lock, get_stop_event
+from kai import sessions, webhook
+from kai.chat_log import log_message
+from kai.claude import PersistentClaude
+from kai.config import PROJECT_ROOT, Config
+from kai.locks import get_lock, get_stop_event
 
 log = logging.getLogger(__name__)
 
@@ -32,10 +31,10 @@ log = logging.getLogger(__name__)
 EDIT_INTERVAL = 2.0
 
 # Flag file to track in-flight responses
-_RESPONDING_FLAG = Path(__file__).parent / ".responding_to"
+_RESPONDING_FLAG = PROJECT_ROOT / ".responding_to"
 
 # Persistent memory file (survives session resets)
-_MEMORY_PATH = Path(__file__).parent / "workspace" / ".claude" / "MEMORY.md"
+_MEMORY_PATH = PROJECT_ROOT / "workspace" / ".claude" / "MEMORY.md"
 
 
 def _set_responding(chat_id: int) -> None:
@@ -52,12 +51,14 @@ def _is_authorized(config: Config, user_id: int) -> bool:
 
 def _require_auth(func):
     """Decorator to check authorization before running a handler."""
+
     @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         config: Config = context.bot_data["config"]
         if not _is_authorized(config, update.effective_user.id):
             return
         return await func(update, context)
+
     return wrapper
 
 
@@ -143,7 +144,8 @@ def _models_keyboard(current: str) -> InlineKeyboardMarkup:
 async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     claude = _get_claude(context)
     await update.message.reply_text(
-        "Choose a model:", reply_markup=_models_keyboard(claude.model),
+        "Choose a model:",
+        reply_markup=_models_keyboard(claude.model),
     )
 
 
@@ -291,9 +293,7 @@ async def handle_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("No memories yet. I'll start remembering as we chat.")
 
 
-async def _switch_workspace(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, path: Path
-) -> None:
+async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, path: Path) -> None:
     """Switch to a workspace path, update DB state, and confirm."""
     claude = _get_claude(context)
     config: Config = context.bot_data["config"]
@@ -370,9 +370,7 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         idx = int(target)
         history = await sessions.get_workspace_history()
         if not history or idx < 1 or idx > len(history):
-            await update.message.reply_text(
-                f"Invalid workspace number. Use /workspaces to see the list."
-            )
+            await update.message.reply_text("Invalid workspace number. Use /workspaces to see the list.")
             return
         path = Path(history[idx - 1]["path"])
         if not path.is_dir():
@@ -414,7 +412,7 @@ async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         lines += [
             "",
             "GitHub setup:",
-            f"1. Set Payload URL to https://your-host/webhook/github",
+            "1. Set Payload URL to https://your-host/webhook/github",
             "2. Content type: application/json",
             "3. Set the secret to match WEBHOOK_SECRET",
             "4. Choose events: Pushes, Pull requests, Issues, Comments",
@@ -447,8 +445,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 @_require_auth
 async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        f"Unknown command: {update.message.text.split()[0]}\n"
-        "Try /help for available commands."
+        f"Unknown command: {update.message.text.split()[0]}\nTry /help for available commands."
     )
 
 
@@ -484,12 +481,54 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # File extensions treated as readable text
 _TEXT_EXTENSIONS = {
-    ".txt", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".csv", ".tsv",
-    ".md", ".rst", ".xml", ".html", ".htm", ".css", ".yaml", ".yml",
-    ".toml", ".ini", ".cfg", ".conf", ".sh", ".bash", ".zsh", ".fish",
-    ".sql", ".log", ".env", ".gitignore", ".dockerfile", ".makefile",
-    ".rb", ".go", ".rs", ".java", ".kt", ".c", ".cpp", ".h", ".hpp",
-    ".swift", ".r", ".lua", ".pl", ".php", ".ex", ".exs", ".erl",
+    ".txt",
+    ".py",
+    ".js",
+    ".ts",
+    ".jsx",
+    ".tsx",
+    ".json",
+    ".csv",
+    ".tsv",
+    ".md",
+    ".rst",
+    ".xml",
+    ".html",
+    ".htm",
+    ".css",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".fish",
+    ".sql",
+    ".log",
+    ".env",
+    ".gitignore",
+    ".dockerfile",
+    ".makefile",
+    ".rb",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".c",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".swift",
+    ".r",
+    ".lua",
+    ".pl",
+    ".php",
+    ".ex",
+    ".exs",
+    ".erl",
 }
 
 # Image extensions that can be sent as documents
@@ -525,12 +564,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         data = await file.download_as_bytearray()
         b64 = base64.b64encode(bytes(data)).decode()
         media_type = _IMAGE_MEDIA_TYPES[suffix]
-        log_message(direction="user", chat_id=chat_id, text=caption or file_name, media={"type": "document", "filename": file_name})
+        log_message(
+            direction="user",
+            chat_id=chat_id,
+            text=caption or file_name,
+            media={"type": "document", "filename": file_name},
+        )
         content = [
             {"type": "text", "text": caption or f"What's in this image ({file_name})?"},
             {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
         ]
-    elif suffix in _TEXT_EXTENSIONS or doc.mime_type and doc.mime_type.startswith("text/"):
+    elif suffix in _TEXT_EXTENSIONS or (doc.mime_type and doc.mime_type.startswith("text/")):
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
         try:
@@ -539,15 +583,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text(f"Couldn't decode {file_name} as text.")
             return
         header = f"File: {file_name}\n```\n{text_content}\n```"
-        log_message(direction="user", chat_id=chat_id, text=caption or f"[file: {file_name}]", media={"type": "document", "filename": file_name})
+        log_message(
+            direction="user",
+            chat_id=chat_id,
+            text=caption or f"[file: {file_name}]",
+            media={"type": "document", "filename": file_name},
+        )
         if caption:
             content = f"{caption}\n\n{header}"
         else:
             content = header
     else:
         await update.message.reply_text(
-            f"I can't process {suffix or 'this'} files yet. "
-            "I support text files and images."
+            f"I can't process {suffix or 'this'} files yet. I support text files and images."
         )
         return
 
@@ -653,9 +701,7 @@ async def _handle_response(
         return
 
     if final_response.session_id:
-        await sessions.save_session(
-            chat_id, final_response.session_id, model, final_response.cost_usd
-        )
+        await sessions.save_session(chat_id, final_response.session_id, model, final_response.cost_usd)
 
     final_text = final_response.text
     log_message(direction="assistant", chat_id=chat_id, text=final_text)

@@ -9,8 +9,7 @@ import logging
 
 from aiohttp import web
 
-import cron
-import sessions
+from kai import cron, sessions
 
 log = logging.getLogger(__name__)
 
@@ -19,6 +18,7 @@ _runner: web.AppRunner | None = None
 
 
 # ── GitHub event formatters ───────────────────────────────────────────
+
 
 def _fmt_push(payload: dict) -> str | None:
     pusher = payload.get("pusher", {}).get("name", "Someone")
@@ -110,6 +110,7 @@ _GITHUB_FORMATTERS = {
 
 # ── Signature validation ─────────────────────────────────────────────
 
+
 def _verify_github_signature(secret: str, body: bytes, signature: str) -> bool:
     if not signature.startswith("sha256="):
         return False
@@ -118,6 +119,7 @@ def _verify_github_signature(secret: str, body: bytes, signature: str) -> bool:
 
 
 # ── Route handlers ───────────────────────────────────────────────────
+
 
 async def _handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
@@ -197,6 +199,7 @@ async def _handle_generic(request: web.Request) -> web.Response:
 
 _VALID_SCHEDULE_TYPES = ("once", "daily", "interval")
 
+
 async def _handle_schedule(request: web.Request) -> web.Response:
     secret = request.app["webhook_secret"]
 
@@ -261,6 +264,7 @@ async def _handle_schedule(request: web.Request) -> web.Response:
 
 
 # ── Lifecycle ────────────────────────────────────────────────────────
+
 
 async def start(telegram_app, config) -> None:
     """Start the webhook HTTP server."""

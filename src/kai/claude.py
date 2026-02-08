@@ -23,6 +23,7 @@ class ClaudeResponse:
 @dataclass
 class StreamEvent:
     """A partial update during streaming."""
+
     text_so_far: str
     done: bool = False
     response: ClaudeResponse | None = None  # set when done=True
@@ -71,12 +72,17 @@ class PersistentClaude:
 
         cmd = [
             "claude",
-            "--input-format", "stream-json",
-            "--output-format", "stream-json",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
             "--verbose",
-            "--model", self.model,
-            "--permission-mode", "bypassPermissions",
-            "--max-budget-usd", str(self.max_budget_usd),
+            "--model",
+            self.model,
+            "--permission-mode",
+            "bypassPermissions",
+            "--max-budget-usd",
+            str(self.max_budget_usd),
         ]
         log.info("Starting persistent Claude process (model=%s)", self.model)
 
@@ -116,7 +122,8 @@ class PersistentClaude:
             await self._ensure_started()
         except FileNotFoundError:
             yield StreamEvent(
-                text_so_far="", done=True,
+                text_so_far="",
+                done=True,
                 response=ClaudeResponse(success=False, text="", error="claude CLI not found"),
             )
             return
@@ -165,13 +172,18 @@ class PersistentClaude:
                     prompt = [{"type": "text", "text": prefix}] + prompt
 
         content = prompt if isinstance(prompt, list) else [{"type": "text", "text": prompt}]
-        msg = json.dumps({
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": content,
-            },
-        }) + "\n"
+        msg = (
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": content,
+                    },
+                }
+            )
+            + "\n"
+        )
 
         try:
             self._proc.stdin.write(msg.encode())
@@ -180,8 +192,11 @@ class PersistentClaude:
             log.error("Failed to write to Claude process: %s", e)
             await self._kill()
             yield StreamEvent(
-                text_so_far="", done=True,
-                response=ClaudeResponse(success=False, text="", error="Claude process died, restarting on next message"),
+                text_so_far="",
+                done=True,
+                response=ClaudeResponse(
+                    success=False, text="", error="Claude process died, restarting on next message"
+                ),
             )
             return
 
@@ -191,14 +206,13 @@ class PersistentClaude:
                 try:
                     # Opus with tool use can go minutes between output lines
                     timeout = self.timeout_seconds * 3
-                    line = await asyncio.wait_for(
-                        self._proc.stdout.readline(), timeout=timeout
-                    )
+                    line = await asyncio.wait_for(self._proc.stdout.readline(), timeout=timeout)
                 except asyncio.TimeoutError:
                     log.error("Claude response timed out")
                     await self._kill()
                     yield StreamEvent(
-                        text_so_far=accumulated_text, done=True,
+                        text_so_far=accumulated_text,
+                        done=True,
                         response=ClaudeResponse(success=False, text=accumulated_text, error="Claude timed out"),
                     )
                     return
@@ -208,7 +222,8 @@ class PersistentClaude:
                     log.error("Claude process EOF")
                     await self._kill()
                     yield StreamEvent(
-                        text_so_far=accumulated_text, done=True,
+                        text_so_far=accumulated_text,
+                        done=True,
                         response=ClaudeResponse(
                             success=bool(accumulated_text),
                             text=accumulated_text,
@@ -261,7 +276,8 @@ class PersistentClaude:
             log.exception("Unexpected error reading Claude stream")
             await self._kill()
             yield StreamEvent(
-                text_so_far=accumulated_text, done=True,
+                text_so_far=accumulated_text,
+                done=True,
                 response=ClaudeResponse(success=False, text=accumulated_text, error=str(e)),
             )
 

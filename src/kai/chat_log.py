@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
+
+from kai.config import PROJECT_ROOT
 
 log = logging.getLogger(__name__)
 
-_LOG_DIR = Path(__file__).parent / "workspace" / "chat_history"
+_LOG_DIR = PROJECT_ROOT / "workspace" / "chat_history"
 
 
 def log_message(

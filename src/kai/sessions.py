@@ -51,15 +51,14 @@ async def init_db(db_path: Path) -> None:
 
 
 async def get_session(chat_id: int) -> str | None:
-    async with _db.execute(
-        "SELECT session_id FROM sessions WHERE chat_id = ?", (chat_id,)
-    ) as cursor:
+    async with _db.execute("SELECT session_id FROM sessions WHERE chat_id = ?", (chat_id,)) as cursor:
         row = await cursor.fetchone()
         return row["session_id"] if row else None
 
 
 async def save_session(chat_id: int, session_id: str, model: str, cost_usd: float) -> None:
-    await _db.execute("""
+    await _db.execute(
+        """
         INSERT INTO sessions (chat_id, session_id, model, total_cost_usd)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(chat_id) DO UPDATE SET
@@ -67,7 +66,9 @@ async def save_session(chat_id: int, session_id: str, model: str, cost_usd: floa
             model = excluded.model,
             last_used_at = CURRENT_TIMESTAMP,
             total_cost_usd = total_cost_usd + excluded.total_cost_usd
-    """, (chat_id, session_id, model, cost_usd))
+    """,
+        (chat_id, session_id, model, cost_usd),
+    )
     await _db.commit()
 
 
@@ -88,8 +89,13 @@ async def get_stats(chat_id: int) -> dict | None:
 
 
 async def create_job(
-    chat_id: int, name: str, job_type: str, prompt: str,
-    schedule_type: str, schedule_data: str, auto_remove: bool = False,
+    chat_id: int,
+    name: str,
+    job_type: str,
+    prompt: str,
+    schedule_type: str,
+    schedule_data: str,
+    auto_remove: bool = False,
 ) -> int:
     cursor = await _db.execute(
         """INSERT INTO jobs (chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove)
@@ -140,9 +146,7 @@ async def deactivate_job(job_id: int) -> None:
 
 
 async def get_setting(key: str) -> str | None:
-    async with _db.execute(
-        "SELECT value FROM settings WHERE key = ?", (key,)
-    ) as cursor:
+    async with _db.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cursor:
         row = await cursor.fetchone()
         return row["value"] if row else None
 

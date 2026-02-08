@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "kai"
 version = "0.1.0"
@@ -10,3 +14,46 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "aiohttp>=3.9.0",
 ]
+
+[project.scripts]
+kai = "kai.main:main"
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.9.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "RUF005", # list concatenation vs unpacking (preference)
+    "RUF012", # mutable class default (false positives with dataclasses)
+    "SIM105", # contextlib.suppress vs try/except/pass (less readable for async)
+    "SIM108", # ternary vs if/else (readability preference)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["kai"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

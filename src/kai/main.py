@@ -4,11 +4,9 @@ from pathlib import Path
 
 from telegram import BotCommand
 
-from config import load_config
-from bot import create_bot
-import cron
-import sessions
-import webhook
+from kai import cron, sessions, webhook
+from kai.bot import create_bot
+from kai.config import PROJECT_ROOT, load_config
 
 
 def main() -> None:
@@ -44,20 +42,22 @@ def main() -> None:
             await app.updater.start_polling()
 
             # Register slash command menu in Telegram
-            await app.bot.set_my_commands([
-                BotCommand("models", "Choose a model"),
-                BotCommand("model", "Switch model (opus, sonnet, haiku)"),
-                BotCommand("new", "Start a fresh session"),
-                BotCommand("workspace", "Switch working directory"),
-                BotCommand("workspaces", "List recent workspaces"),
-                BotCommand("stop", "Interrupt current response"),
-                BotCommand("memory", "View or clear persistent memory"),
-                BotCommand("stats", "Show session info and cost"),
-                BotCommand("jobs", "List scheduled jobs"),
-                BotCommand("canceljob", "Cancel a scheduled job"),
-                BotCommand("webhooks", "Show webhook server status"),
-                BotCommand("help", "Show available commands"),
-            ])
+            await app.bot.set_my_commands(
+                [
+                    BotCommand("models", "Choose a model"),
+                    BotCommand("model", "Switch model (opus, sonnet, haiku)"),
+                    BotCommand("new", "Start a fresh session"),
+                    BotCommand("workspace", "Switch working directory"),
+                    BotCommand("workspaces", "List recent workspaces"),
+                    BotCommand("stop", "Interrupt current response"),
+                    BotCommand("memory", "View or clear persistent memory"),
+                    BotCommand("stats", "Show session info and cost"),
+                    BotCommand("jobs", "List scheduled jobs"),
+                    BotCommand("canceljob", "Cancel a scheduled job"),
+                    BotCommand("webhooks", "Show webhook server status"),
+                    BotCommand("help", "Show available commands"),
+                ]
+            )
 
             # Reload scheduled jobs from the database
             await cron.init_jobs(app)
@@ -66,7 +66,7 @@ def main() -> None:
             await webhook.start(app, config)
 
             # Notify if previous response was interrupted by a crash/restart
-            flag = Path(__file__).parent / ".responding_to"
+            flag = PROJECT_ROOT / ".responding_to"
             try:
                 chat_id = int(flag.read_text().strip())
                 await app.bot.send_message(

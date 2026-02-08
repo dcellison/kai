@@ -1,9 +1,24 @@
+# Environment
 .env
 .venv/
+
+# Python
 __pycache__/
 *.pyc
+*.egg-info/
+
+# Runtime artifacts
 sessions.db
 kai.log
 .responding_to
-.DS_Store
+
+# Workspace runtime data
+workspace/chat_history/
 workspace/.cron/
+workspace/memory.png
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, time as dt_time, timezone
+from datetime import datetime, timezone
+from datetime import time as dt_time
 
 from telegram.constants import ChatAction
 from telegram.error import Forbidden
 from telegram.ext import Application, ContextTypes
 
-import sessions
-from chat_log import log_message
-from locks import get_lock
+from kai import sessions
+from kai.chat_log import log_message
+from kai.locks import get_lock
 
 log = logging.getLogger(__name__)
 
@@ -183,7 +184,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             # Condition met — send the rest (after the marker line) and deactivate
             lines = response_text.strip().split("\n", 1)
             # Text after the marker on the same line, plus any remaining lines
-            after_marker = lines[0].strip()[len(_CONDITION_MET_PREFIX):].strip()
+            after_marker = lines[0].strip()[len(_CONDITION_MET_PREFIX) :].strip()
             rest = lines[1].strip() if len(lines) > 1 else ""
             clean_text = f"{after_marker}\n{rest}".strip() if after_marker else rest
             msg = f"[Job: {data['name']}]\n{clean_text}" if clean_text else f"[Job: {data['name']}] Condition met."

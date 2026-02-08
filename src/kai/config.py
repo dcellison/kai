@@ -4,6 +4,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# src/kai/config.py -> src/kai -> src -> project root
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
 
 @dataclass(frozen=True)
 class Config:
@@ -12,14 +15,14 @@ class Config:
     claude_model: str = "sonnet"
     claude_timeout_seconds: int = 120
     claude_max_budget_usd: float = 1.0
-    claude_workspace: Path = field(default_factory=lambda: Path(__file__).parent / "workspace")
-    session_db_path: Path = field(default_factory=lambda: Path(__file__).parent / "sessions.db")
+    claude_workspace: Path = field(default_factory=lambda: PROJECT_ROOT / "workspace")
+    session_db_path: Path = field(default_factory=lambda: PROJECT_ROOT / "sessions.db")
     webhook_port: int = 8080
     webhook_secret: str = ""
 
 
 def load_config() -> Config:
-    load_dotenv()
+    load_dotenv(PROJECT_ROOT / ".env")
 
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -30,11 +33,11 @@ def load_config() -> Config:
         raise SystemExit("ALLOWED_USER_IDS is required in .env")
     try:
         allowed_ids = {int(uid.strip()) for uid in raw_ids.split(",") if uid.strip()}
-    except ValueError:
+    except ValueError as e:
         raise SystemExit(
             "ALLOWED_USER_IDS must be numeric Telegram user IDs (not usernames). "
             "Message @userinfobot on Telegram to find yours."
-        )
+        ) from e
 
     return Config(
         telegram_bot_token=token,
