@@ -429,12 +429,13 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
         await sessions.set_setting("workspace", str(path))
         await sessions.upsert_workspace_history(str(path))
 
-    # Refresh keyboard to show updated current marker
-    history = await sessions.get_workspace_history()
+    # Dismiss the keyboard and confirm
     base = await sessions.get_setting("workspace_base")
-    keyboard = await _workspaces_keyboard(history, str(claude.workspace), str(home), base)
     short = _short_workspace_name(str(claude.workspace), base)
-    await query.edit_message_text(f"Switched to {short}", reply_markup=keyboard)
+    await query.edit_message_text(
+        f"Switched to {short}. Session cleared.",
+        reply_markup=InlineKeyboardMarkup([]),
+    )
 
 
 @_require_auth
