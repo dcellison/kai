@@ -46,6 +46,7 @@ class PersistentClaude:
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
         self._session_id: str | None = None
+        self._fresh_session = True
         # Background task to drain stderr
         self._stderr_task: asyncio.Task | None = None
 
@@ -81,6 +82,7 @@ class PersistentClaude:
             cwd=str(self.workspace),
         )
         self._session_id = None
+        self._fresh_session = True
 
         # Drain stderr in background to prevent buffer deadlock
         self._stderr_task = asyncio.create_task(self._drain_stderr())
@@ -112,6 +114,19 @@ class PersistentClaude:
                 response=ClaudeResponse(success=False, text="", error="claude CLI not found"),
             )
             return
+
+        # Inject persistent memory on the first message of a new session
+        if self._fresh_session:
+            self._fresh_session = False
+            memory_path = self.workspace / ".claude" / "MEMORY.md"
+            if memory_path.exists():
+                memory = memory_path.read_text().strip()
+                if memory:
+                    prefix = f"[Your persistent memory from previous sessions:]\n{memory}\n\n"
+                    if isinstance(prompt, str):
+                        prompt = prefix + prompt
+                    elif isinstance(prompt, list):
+                        prompt = [{"type": "text", "text": prefix}] + prompt
 
         content = prompt if isinstance(prompt, list) else [{"type": "text", "text": prompt}]
         msg = json.dumps({
