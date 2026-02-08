@@ -53,13 +53,13 @@ Kai will start polling for Telegram messages. Press Ctrl+C to stop.
 Create a launchd plist to keep Kai running in the background and restart it automatically:
 
 ```bash
-cat > ~/Library/LaunchAgents/com.syrinx.kai.plist << 'EOF'
+cat > ~/Library/LaunchAgents/com.kai.bot.plist << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.syrinx.kai</string>
+    <string>com.kai.bot</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -100,17 +100,17 @@ Load and manage the service:
 
 ```bash
 # Start
-launchctl load ~/Library/LaunchAgents/com.syrinx.kai.plist
+launchctl load ~/Library/LaunchAgents/com.kai.bot.plist
 
 # Stop
-launchctl unload ~/Library/LaunchAgents/com.syrinx.kai.plist
+launchctl unload ~/Library/LaunchAgents/com.kai.bot.plist
 
 # Restart (stop then start)
-launchctl unload ~/Library/LaunchAgents/com.syrinx.kai.plist
-launchctl load ~/Library/LaunchAgents/com.syrinx.kai.plist
+launchctl unload ~/Library/LaunchAgents/com.kai.bot.plist
+launchctl load ~/Library/LaunchAgents/com.kai.bot.plist
 
 # Check status
-launchctl list | grep com.syrinx.kai
+launchctl list | grep com.kai.bot
 ```
 
 ### Running as a service (Linux with systemd)
