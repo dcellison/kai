@@ -361,6 +361,7 @@ async def _workspaces_keyboard(
         if p == current_path:
             label += " \U0001f7e2"
         buttons.append([InlineKeyboardButton(label, callback_data=f"ws:{i}")])
+    buttons.append([InlineKeyboardButton("Cancel", callback_data="ws:cancel")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -391,6 +392,11 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     data = query.data.removeprefix("ws:")
     claude = _get_claude(context)
     home = config.claude_workspace
+
+    if data == "cancel":
+        await query.answer()
+        await query.edit_message_text("Workspaces", reply_markup=InlineKeyboardMarkup([]))
+        return
 
     if data == "home":
         if claude.workspace == home:
