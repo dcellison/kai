@@ -361,7 +361,6 @@ async def _workspaces_keyboard(
         if p == current_path:
             label += " \U0001f7e2"
         buttons.append([InlineKeyboardButton(label, callback_data=f"ws:{i}")])
-    buttons.append([InlineKeyboardButton("Cancel", callback_data="ws:cancel")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -393,14 +392,10 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     claude = _get_claude(context)
     home = config.claude_workspace
 
-    if data == "cancel":
-        await query.answer()
-        await query.edit_message_text("Workspaces", reply_markup=InlineKeyboardMarkup([]))
-        return
-
     if data == "home":
         if claude.workspace == home:
-            await query.answer("Already home.")
+            await query.answer()
+            await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
             return
         await query.answer()
         await claude.change_workspace(home)
@@ -427,7 +422,8 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return
         if path == claude.workspace:
-            await query.answer("Already there.")
+            await query.answer()
+            await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
             return
         await query.answer()
         await claude.change_workspace(path)
