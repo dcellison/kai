@@ -292,6 +292,60 @@ async def handle_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 @_require_auth
+async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    claude = _get_claude(context)
+    config: Config = context.bot_data["config"]
+    home = config.claude_workspace
+
+    # No args: show current workspace
+    if not context.args:
+        current = claude.workspace
+        if current == home:
+            label = f"{current} (home)"
+        else:
+            label = f"{current}\nHome: {home}"
+        await update.message.reply_text(f"Current workspace:\n{label}")
+        return
+
+    target = " ".join(context.args)
+
+    # "home" keyword: return to default
+    if target.lower() == "home":
+        if claude.workspace == home:
+            await update.message.reply_text("Already in home workspace.")
+            return
+        await claude.change_workspace(home)
+        await sessions.clear_session(update.effective_chat.id)
+        await update.message.reply_text(f"Switched to home workspace. Session cleared.")
+        return
+
+    # Resolve the path
+    path = Path(target).expanduser().resolve()
+
+    if not path.exists():
+        await update.message.reply_text(f"Path does not exist:\n{path}")
+        return
+    if not path.is_dir():
+        await update.message.reply_text(f"Not a directory:\n{path}")
+        return
+    if path == claude.workspace:
+        await update.message.reply_text("Already in that workspace.")
+        return
+
+    await claude.change_workspace(path)
+    await sessions.clear_session(update.effective_chat.id)
+
+    # Build confirmation with useful context
+    notes = []
+    if (path / ".git").is_dir():
+        notes.append("Git repo")
+    if (path / ".claude" / "CLAUDE.md").exists():
+        notes.append("Has CLAUDE.md")
+    suffix = f" ({', '.join(notes)})" if notes else ""
+    await update.message.reply_text(f"Workspace: {path}{suffix}\nSession cleared.")
+
+
+@_require_auth
 async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = context.bot_data["config"]
     if not config.webhook_enabled:
@@ -329,6 +383,9 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         "/stop - Interrupt current response\n"
         "/new - Start a fresh session\n"
+        "/workspace - Show current workspace\n"
+        "/workspace <path> - Switch working directory\n"
+        "/workspace home - Return to default\n"
         "/models - Choose a model\n"
         "/model <name> - Switch model directly\n"
         "/memory - View persistent memory\n"
@@ -575,6 +632,7 @@ def create_bot(config: Config) -> Application:
     app.bot_data["claude"] = PersistentClaude(
         model=config.claude_model,
         workspace=config.claude_workspace,
+        home_workspace=config.claude_workspace,
         max_budget_usd=config.claude_max_budget_usd,
         timeout_seconds=config.claude_timeout_seconds,
     )
@@ -588,6 +646,7 @@ def create_bot(config: Config) -> Application:
     app.add_handler(CommandHandler("jobs", handle_jobs))
     app.add_handler(CommandHandler("canceljob", handle_canceljob))
     app.add_handler(CommandHandler("memory", handle_memory))
+    app.add_handler(CommandHandler("workspace", handle_workspace))
     app.add_handler(CommandHandler("webhooks", handle_webhooks))
     app.add_handler(CommandHandler("stop", handle_stop))
     app.add_handler(CallbackQueryHandler(handle_model_callback, pattern=r"^model:"))

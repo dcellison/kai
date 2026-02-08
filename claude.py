@@ -36,11 +36,13 @@ class PersistentClaude:
         *,
         model: str = "sonnet",
         workspace: Path = Path("workspace"),
+        home_workspace: Path | None = None,
         max_budget_usd: float = 1.0,
         timeout_seconds: int = 120,
     ):
         self.model = model
         self.workspace = workspace
+        self.home_workspace = home_workspace or workspace
         self.max_budget_usd = max_budget_usd
         self.timeout_seconds = timeout_seconds
         self._proc: asyncio.subprocess.Process | None = None
@@ -115,18 +117,40 @@ class PersistentClaude:
             )
             return
 
-        # Inject persistent memory on the first message of a new session
+        # Inject identity and memory on the first message of a new session
         if self._fresh_session:
             self._fresh_session = False
-            memory_path = self.workspace / ".claude" / "MEMORY.md"
+            parts = []
+
+            # When in a foreign workspace, inject Kai's identity from home
+            if self.workspace != self.home_workspace:
+                identity_path = self.home_workspace / ".claude" / "CLAUDE.md"
+                if identity_path.exists():
+                    identity = identity_path.read_text().strip()
+                    if identity:
+                        parts.append(f"[Your core identity and instructions:]\n{identity}")
+
+            # Always inject Kai's personal memory from home workspace
+            memory_path = self.home_workspace / ".claude" / "MEMORY.md"
             if memory_path.exists():
                 memory = memory_path.read_text().strip()
                 if memory:
-                    prefix = f"[Your persistent memory from previous sessions:]\n{memory}\n\n"
-                    if isinstance(prompt, str):
-                        prompt = prefix + prompt
-                    elif isinstance(prompt, list):
-                        prompt = [{"type": "text", "text": prefix}] + prompt
+                    parts.append(f"[Your persistent memory from previous sessions:]\n{memory}")
+
+            # When in a foreign workspace, add context about schedule_job.py path
+            if self.workspace != self.home_workspace:
+                parts.append(
+                    f"[Workspace context: You are working in {self.workspace}. "
+                    f"Your home workspace is {self.home_workspace}. "
+                    f"To schedule jobs, use: python {self.home_workspace / 'schedule_job.py'}]"
+                )
+
+            if parts:
+                prefix = "\n\n".join(parts) + "\n\n"
+                if isinstance(prompt, str):
+                    prompt = prefix + prompt
+                elif isinstance(prompt, list):
+                    prompt = [{"type": "text", "text": prefix}] + prompt
 
         content = prompt if isinstance(prompt, list) else [{"type": "text", "text": prompt}]
         msg = json.dumps({
@@ -240,6 +264,12 @@ class PersistentClaude:
                 self._proc.kill()
             except ProcessLookupError:
                 pass
+
+    async def change_workspace(self, new_workspace: Path) -> None:
+        """Switch the working directory. Kills the current process;
+        next send() will restart in the new directory."""
+        self.workspace = new_workspace
+        await self._kill()
 
     async def restart(self) -> None:
         """Kill and restart the process (for /new command)."""
