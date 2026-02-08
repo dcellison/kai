@@ -49,6 +49,7 @@ def main() -> None:
                 BotCommand("model", "Switch model (opus, sonnet, haiku)"),
                 BotCommand("new", "Start a fresh session"),
                 BotCommand("workspace", "Switch working directory"),
+                BotCommand("workspaces", "List recent workspaces"),
                 BotCommand("stop", "Interrupt current response"),
                 BotCommand("memory", "View or clear persistent memory"),
                 BotCommand("stats", "Show session info and cost"),

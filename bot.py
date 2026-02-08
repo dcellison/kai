@@ -291,6 +291,57 @@ async def handle_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("No memories yet. I'll start remembering as we chat.")
 
 
+async def _switch_workspace(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, path: Path
+) -> None:
+    """Switch to a workspace path, update DB state, and confirm."""
+    claude = _get_claude(context)
+    config: Config = context.bot_data["config"]
+    home = config.claude_workspace
+
+    if path == claude.workspace:
+        await update.message.reply_text("Already in that workspace.")
+        return
+
+    await claude.change_workspace(path)
+    await sessions.clear_session(update.effective_chat.id)
+
+    if path == home:
+        await sessions.delete_setting("workspace")
+        await update.message.reply_text("Switched to home workspace. Session cleared.")
+    else:
+        await sessions.set_setting("workspace", str(path))
+        await sessions.upsert_workspace_history(str(path))
+        notes = []
+        if (path / ".git").is_dir():
+            notes.append("Git repo")
+        if (path / ".claude" / "CLAUDE.md").exists():
+            notes.append("Has CLAUDE.md")
+        suffix = f" ({', '.join(notes)})" if notes else ""
+        await update.message.reply_text(f"Workspace: {path}{suffix}\nSession cleared.")
+
+
+@_require_auth
+async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    history = await sessions.get_workspace_history()
+    if not history:
+        await update.message.reply_text("No workspace history yet.\nUse /workspace <path> to switch.")
+        return
+
+    claude = _get_claude(context)
+    current = str(claude.workspace)
+    lines = ["Recent workspaces:"]
+    for i, entry in enumerate(history, 1):
+        p = entry["path"]
+        marker = " (current)" if p == current else ""
+        # Show just the last two path components for brevity
+        short = "/".join(Path(p).parts[-2:])
+        lines.append(f"  {i}. {short}{marker}")
+    lines.append("")
+    lines.append("Switch: /workspace <number>")
+    await update.message.reply_text("\n".join(lines))
+
+
 @_require_auth
 async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     claude = _get_claude(context)
@@ -311,13 +362,24 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # "home" keyword: return to default
     if target.lower() == "home":
-        if claude.workspace == home:
-            await update.message.reply_text("Already in home workspace.")
+        await _switch_workspace(update, context, home)
+        return
+
+    # Numeric shortcut: pick from history
+    if target.isdigit():
+        idx = int(target)
+        history = await sessions.get_workspace_history()
+        if not history or idx < 1 or idx > len(history):
+            await update.message.reply_text(
+                f"Invalid workspace number. Use /workspaces to see the list."
+            )
             return
-        await claude.change_workspace(home)
-        await sessions.clear_session(update.effective_chat.id)
-        await sessions.delete_setting("workspace")
-        await update.message.reply_text(f"Switched to home workspace. Session cleared.")
+        path = Path(history[idx - 1]["path"])
+        if not path.is_dir():
+            await sessions.delete_workspace_history(str(path))
+            await update.message.reply_text(f"That workspace no longer exists:\n{path}")
+            return
+        await _switch_workspace(update, context, path)
         return
 
     # Resolve the path
@@ -329,22 +391,8 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not path.is_dir():
         await update.message.reply_text(f"Not a directory:\n{path}")
         return
-    if path == claude.workspace:
-        await update.message.reply_text("Already in that workspace.")
-        return
 
-    await claude.change_workspace(path)
-    await sessions.clear_session(update.effective_chat.id)
-    await sessions.set_setting("workspace", str(path))
-
-    # Build confirmation with useful context
-    notes = []
-    if (path / ".git").is_dir():
-        notes.append("Git repo")
-    if (path / ".claude" / "CLAUDE.md").exists():
-        notes.append("Has CLAUDE.md")
-    suffix = f" ({', '.join(notes)})" if notes else ""
-    await update.message.reply_text(f"Workspace: {path}{suffix}\nSession cleared.")
+    await _switch_workspace(update, context, path)
 
 
 @_require_auth
@@ -381,7 +429,9 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/new - Start a fresh session\n"
         "/workspace - Show current workspace\n"
         "/workspace <path> - Switch working directory\n"
+        "/workspace <number> - Switch by history number\n"
         "/workspace home - Return to default\n"
+        "/workspaces - List recent workspaces\n"
         "/models - Choose a model\n"
         "/model <name> - Switch model directly\n"
         "/memory - View persistent memory\n"
@@ -645,6 +695,7 @@ def create_bot(config: Config) -> Application:
     app.add_handler(CommandHandler("canceljob", handle_canceljob))
     app.add_handler(CommandHandler("memory", handle_memory))
     app.add_handler(CommandHandler("workspace", handle_workspace))
+    app.add_handler(CommandHandler("workspaces", handle_workspaces))
     app.add_handler(CommandHandler("webhooks", handle_webhooks))
     app.add_handler(CommandHandler("stop", handle_stop))
     app.add_handler(CallbackQueryHandler(handle_model_callback, pattern=r"^model:"))

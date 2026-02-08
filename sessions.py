@@ -41,6 +41,12 @@ async def init_db(db_path: Path) -> None:
             value TEXT NOT NULL
         )
     """)
+    await _db.execute("""
+        CREATE TABLE IF NOT EXISTS workspace_history (
+            path TEXT PRIMARY KEY,
+            last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     await _db.commit()
 
 
@@ -151,6 +157,29 @@ async def set_setting(key: str, value: str) -> None:
 
 async def delete_setting(key: str) -> None:
     await _db.execute("DELETE FROM settings WHERE key = ?", (key,))
+    await _db.commit()
+
+
+async def upsert_workspace_history(path: str) -> None:
+    await _db.execute(
+        "INSERT INTO workspace_history (path, last_used_at) VALUES (?, CURRENT_TIMESTAMP) "
+        "ON CONFLICT(path) DO UPDATE SET last_used_at = CURRENT_TIMESTAMP",
+        (path,),
+    )
+    await _db.commit()
+
+
+async def get_workspace_history(limit: int = 10) -> list[dict]:
+    async with _db.execute(
+        "SELECT path, last_used_at FROM workspace_history ORDER BY last_used_at DESC LIMIT ?",
+        (limit,),
+    ) as cursor:
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def delete_workspace_history(path: str) -> None:
+    await _db.execute("DELETE FROM workspace_history WHERE path = ?", (path,))
     await _db.commit()
 
 
