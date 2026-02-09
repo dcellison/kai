@@ -9,8 +9,12 @@ __pycache__/
 
 # Runtime artifacts
 sessions.db
+kai.db
 kai.log
 .responding_to
+
+# Claude Code local config
+CLAUDE.md
 
 # Workspace runtime data (Kai's state, not source code)
 workspace/*
