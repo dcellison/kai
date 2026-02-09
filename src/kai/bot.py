@@ -160,7 +160,8 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
     name = _AVAILABLE_MODELS.get(model, model)
 
     if model == claude.model:
-        await query.answer(f"Already using {name}.")
+        await query.answer()
+        await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
         return
 
     await query.answer()
