@@ -31,6 +31,7 @@ EDIT_INTERVAL = 2.0
 # Flag file to track in-flight responses
 _RESPONDING_FLAG = PROJECT_ROOT / ".responding_to"
 
+
 def _line_count(path: Path) -> int:
     """Count lines in a file, returning 0 if it doesn't exist."""
     if not path.exists():
@@ -150,6 +151,14 @@ async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def _switch_model(context: ContextTypes.DEFAULT_TYPE, chat_id: int, model: str) -> None:
+    """Switch model: update Claude, restart process, clear session."""
+    claude = _get_claude(context)
+    claude.model = model
+    await claude.restart()
+    await sessions.clear_session(chat_id)
+
+
 async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     config: Config = context.bot_data["config"]
@@ -158,24 +167,22 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     model = query.data.removeprefix("model:")
+    if model not in _AVAILABLE_MODELS:
+        await query.answer("Invalid model.")
+        return
+
     claude = _get_claude(context)
-
-    name = _AVAILABLE_MODELS.get(model, model)
-
     if model == claude.model:
         await query.answer()
         await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
         return
 
     await query.answer()
+    await _switch_model(context, update.effective_chat.id, model)
     await query.edit_message_text(
-        f"Switched to {name}. Session restarted.",
+        f"Switched to {_AVAILABLE_MODELS[model]}. Session restarted.",
         reply_markup=InlineKeyboardMarkup([]),
     )
-
-    claude.model = model
-    await claude.restart()
-    await sessions.clear_session(update.effective_chat.id)
 
 
 @_require_auth
@@ -187,10 +194,7 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if model not in _AVAILABLE_MODELS:
         await update.message.reply_text("Choose: opus, sonnet, or haiku")
         return
-    claude = _get_claude(context)
-    claude.model = model
-    await claude.restart()
-    await sessions.clear_session(update.effective_chat.id)
+    await _switch_model(context, update.effective_chat.id, model)
     await update.message.reply_text(f"Model set to {_AVAILABLE_MODELS[model]}. Session restarted.")
 
 
@@ -432,10 +436,12 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             idx = int(data)
         except ValueError:
             await query.answer("Invalid selection.")
+            await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
             return
         history = await sessions.get_workspace_history()
         if idx < 0 or idx >= len(history):
             await query.answer("Workspace no longer in history.")
+            await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
             return
         path = Path(history[idx]["path"])
         if not path.is_dir():
@@ -537,8 +543,7 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     resolved = await _resolve_workspace_path(target, base)
     if resolved is None:
         await update.message.reply_text(
-            f"Unknown workspace: {target}\n"
-            "Set a workspace base first:\n/workspace base /path/to/projects"
+            f"Unknown workspace: {target}\nSet a workspace base first:\n/workspace base /path/to/projects"
         )
         return
     path = resolved
