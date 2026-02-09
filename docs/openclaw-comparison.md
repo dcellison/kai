@@ -19,7 +19,7 @@ This document compares the two projects across architecture, features, security,
 | **Language** | Node.js (TypeScript) | Python |
 | **LLM integration** | Direct API calls to any provider (OpenAI, Anthropic, Google, DeepSeek, local models) | Delegates to Claude Code CLI subprocess |
 | **Architecture** | Hub-and-spoke: gateway server + channel spokes + agent runtimes | Single process: Telegram bot + Claude Code subprocess + webhook server |
-| **Deployment** | Self-hosted (local, VPS, or managed hosting) | Self-hosted (local machine only) |
+| **Deployment** | Self-hosted (local, VPS, or managed hosting) | Local machine (by design — see below) |
 | **Messaging** | 13+ platforms (WhatsApp, Telegram, Discord, Slack, Signal, iMessage, Teams, Matrix, Google Chat, and more) | Telegram (by design — see below) |
 | **Multi-user** | Yes, with role-based access | Single-user by design |
 | **Tool use** | Built-in skill system with 100+ preconfigured AgentSkills | Full Claude Code tool access (shell, files, web search, code editing) + Claude Code skills |
@@ -31,6 +31,8 @@ Kai takes the opposite approach. There is no gateway, no spoke architecture, no 
 **Why just Telegram?** This is a deliberate choice, not a missing feature. Telegram's Bot API is the most capable messaging platform for this use case: it supports message editing (enabling real-time streaming output), inline keyboards (interactive UI), file and image handling, slash commands, and unlimited free messaging. No other major platform offers all of these without restrictions or per-message costs. Supporting 13 platforms means building 13 platform-specific spokes and maintaining them — complexity that serves multi-user products but adds pure overhead for a single-user tool. Kai picks the best platform and goes deep rather than going wide.
 
 **Why just Claude Code?** Similarly, delegating to Claude Code is a deliberate architectural decision. Claude Code provides a persistent CLI with full tool access — shell commands, file operations, web search, code editing — in a single subprocess. Kai doesn't need to implement its own tool-use layer, manage API conversations directly, or maintain integrations with multiple LLM providers. It delegates to Claude Code and focuses on what it adds: the Telegram interface, workspace management, and scheduling. The result is a ~1,000-line Python codebase that punches far above its weight, precisely because it doesn't rebuild what already exists.
+
+**Why local-only?** Kai is technically portable — it's ~1,000 lines of Python with no OS-specific dependencies — but running locally is a deliberate choice that enables three things a VPS cannot provide. First, Claude Code authenticated via `claude login` on a Max plan means all usage is covered by the subscription. On a VPS, you'd likely need API key auth, which means per-token billing and the runaway cost risks that OpenClaw users regularly encounter. Second, running on your own machine means Kai can access local applications — macOS Calendar, Music, Reminders via AppleScript, local git repos, local development tools — things that disappear on a remote server. Third, the security guarantee is unambiguous: your conversations, credentials, and data never leave your hardware. On managed hosting, that guarantee depends on trusting a third party.
 
 This architectural difference reflects a core design philosophy: OpenClaw builds its own tool-use layer for maximum flexibility; Kai delegates to Claude Code's existing one for maximum simplicity.
 
@@ -146,7 +148,7 @@ OpenClaw itself is free (MIT license). The real cost is API usage:
 | **Plugin ecosystem** | ClawHub marketplace (4,000+ skills) | Claude Code skills (local, user-installed) |
 | **Documentation** | Extensive (docs site, community guides, tutorials) | README + GitHub wiki |
 | **LLM support** | Any provider (OpenAI, Anthropic, Google, DeepSeek, local) | Claude only (deliberate — delegates to Claude Code's full tool suite) |
-| **Managed hosting** | Multiple third-party providers | N/A |
+| **Managed hosting** | Multiple third-party providers | Local-only (deliberate — Max plan auth, local app access, data sovereignty) |
 
 OpenClaw's community is massive and growing fast. The ecosystem of tutorials, hosting providers, and third-party integrations is extensive. For users who want a ready-made solution with community support and provider flexibility, this matters.
 

@@ -14,6 +14,8 @@ Kai acts as a Telegram gateway to a persistent Claude Code CLI process. Messages
 
 **Why Claude Code?** Claude Code provides a persistent CLI with full tool access — shell commands, file operations, web search — in a single subprocess. Kai doesn't need to implement its own tool-use layer or manage API conversations directly. It delegates to Claude Code and focuses on the Telegram interface, workspace management, and scheduling. When authenticated via `claude login` on a Max plan, all usage is covered by the subscription — no per-token API costs.
 
+**Why local?** Kai is portable enough to run on a VPS, but local deployment is a deliberate choice. Running on your own machine enables flat-rate Max plan authentication (no per-token API costs), access to local applications and repos (macOS Calendar, Music, development tools), and a clear security boundary — your conversations and credentials never leave your hardware. A VPS would trade all three for always-on hosting, which launchd already provides on macOS.
+
 ## Requirements
 
 - Python 3.13+
