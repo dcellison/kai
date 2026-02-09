@@ -179,7 +179,17 @@ Responses stream into Telegram in real time, updating the message every 2 second
 Use `/models` for an interactive picker or `/model <name>` to switch directly. Changing models restarts the session.
 
 ### Workspace switching
-Point Kai at any directory on your machine with `/workspace <path>`. Kai's identity and memory carry over from the home workspace. Set a base directory with `/workspace base /path/to/projects` and then switch by short name (e.g., `/workspace kai`). Create new workspaces with `/workspace new <name>` (creates the directory and runs `git init`). Use `/workspaces` for an interactive picker with inline buttons — tap to switch, or tap the current workspace to dismiss.
+Point Kai at any directory on your machine with `/workspace <path>`. Kai's identity and memory carry over from the home workspace.
+
+To switch by short name (e.g., `/workspace kai` instead of `/workspace /Users/you/Projects/kai`), first set a base directory:
+
+```
+/workspace base /Users/you/Projects
+```
+
+After that, `/workspace kai` resolves to `/Users/you/Projects/kai`. Without a base, only absolute paths and `~` paths work.
+
+Create new workspaces with `/workspace new <name>` (creates the directory and runs `git init`). Use `/workspaces` for an interactive picker with inline buttons — tap to switch, or tap the current workspace to dismiss.
 
 ### Image and file support
 Send photos or documents directly in the chat. Kai supports:

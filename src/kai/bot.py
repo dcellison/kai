@@ -528,9 +528,15 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _switch_workspace(update, context, path)
         return
 
-    # Resolve via base directory, then fall back to absolute path
+    # Resolve via base directory or absolute path
     resolved = await _resolve_workspace_path(target, base)
-    path = resolved if resolved else Path(target).expanduser().resolve()
+    if resolved is None:
+        await update.message.reply_text(
+            f"Unknown workspace: {target}\n"
+            "Set a workspace base first:\n/workspace base /path/to/projects"
+        )
+        return
+    path = resolved
 
     if not path.exists():
         await update.message.reply_text(f"Path does not exist:\n{path}")
