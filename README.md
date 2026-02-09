@@ -214,6 +214,19 @@ The webhook server listens on `localhost:8080` by default. To receive events fro
 - [ngrok](https://ngrok.com/) — quick setup, gives you a public URL with one command. Good for testing.
 - A reverse proxy (nginx, Caddy) on a server with a public IP.
 
+If using Cloudflare Tunnel, the tunnel config should only route public-facing paths to your server. Internal APIs (like `/api/*`) should not be exposed. A config like this ensures only webhooks and health checks are reachable from the internet — everything else returns 404 at the tunnel level, before it ever reaches your server:
+
+```yaml
+ingress:
+  - hostname: your.domain
+    path: /webhook/*
+    service: http://localhost:8080
+  - hostname: your.domain
+    path: /health
+    service: http://localhost:8080
+  - service: http_status:404
+```
+
 Once exposed, add a webhook on your GitHub repo pointing to `https://<your-host>/webhook/github` with the secret set to your `WEBHOOK_SECRET` value. Select the events you want.
 
 ### Generic webhooks
