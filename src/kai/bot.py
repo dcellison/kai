@@ -455,11 +455,11 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # No args: show current workspace
     if not context.args:
         current = claude.workspace
+        base = await sessions.get_setting("workspace_base")
+        short = _short_workspace_name(str(current), base)
         if current == home:
-            label = f"{current} (home)"
-        else:
-            label = f"{current}\nHome: {home}"
-        await update.message.reply_text(f"Current workspace:\n{label}")
+            short = "Home"
+        await update.message.reply_text(f"Workspace: {short}\n{current}")
         return
 
     target = " ".join(context.args)
