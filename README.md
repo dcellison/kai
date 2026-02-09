@@ -4,6 +4,16 @@ A personal AI assistant accessed via Telegram, powered by [Claude Code](https://
 
 Kai acts as a Telegram gateway to a persistent Claude Code CLI process. Messages you send in Telegram are forwarded to Claude, and responses stream back in real time. Claude has full tool access (shell, files, web search) and maintains conversation context across messages.
 
+### Why Kai?
+
+**Security-first.** Projects like OpenClaw route your messages through third-party servers with unclear data handling. Kai runs entirely on your own machine — your code, your credentials, and your conversations never leave your hardware. The only external connections are to the Telegram Bot API and Anthropic's API, both authenticated and encrypted.
+
+**Developer-focused.** Kai is built around Claude Code's full capabilities: shell access, file editing, web search, and tool use. Switch between repos from your phone, create workspaces, trigger builds, review diffs — all through Telegram. It's a remote development companion, not just a chatbot.
+
+**Why Telegram?** Telegram's Bot API is the most capable messaging platform for this use case. It supports message editing (enabling real-time streaming output), inline keyboards (interactive UI for model/workspace switching), file and image handling, slash commands, and unlimited free messaging. No other major platform offers all of these without restrictions or per-message costs. See the [project wiki](https://github.com/dcellison/kai/wiki) for a detailed comparison of messaging platforms evaluated during development.
+
+**Why Claude Code?** Claude Code provides a persistent CLI with full tool access — shell commands, file operations, web search — in a single subprocess. Kai doesn't need to implement its own tool-use layer or manage API conversations directly. It delegates to Claude Code and focuses on the Telegram interface, workspace management, and scheduling. When authenticated via `claude login` on a Max plan, all usage is covered by the subscription — no per-token API costs.
+
 ## Requirements
 
 - Python 3.13+
