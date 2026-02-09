@@ -172,8 +172,7 @@ sudo systemctl status kai
 | `/workspace new <name>` | Create a new workspace, git init, and switch to it |
 | `/workspaces` | Interactive workspace picker (inline buttons) |
 | `/stop` | Interrupt a response mid-stream |
-| `/memory` | View persistent memory |
-| `/memory clear` | Clear all memory |
+| `/memory` | Show memory file locations |
 | `/stats` | Show session info, model, and cost |
 | `/jobs` | List active scheduled jobs |
 | `/canceljob <id>` | Cancel a scheduled job |
@@ -282,7 +281,13 @@ Auth: set the `X-Webhook-Secret` header to your `WEBHOOK_SECRET`. Schedule types
 
 ### Persistent memory
 
-Kai remembers facts across sessions. Ask it to remember something and it will persist to `.claude/MEMORY.md` in the workspace. Memory survives `/new` and model switches.
+Kai has three layers of memory, all injected at the start of each session:
+
+1. **Auto-memory** (`~/.claude/projects/.../memory/MEMORY.md`) — managed by Claude Code itself. Project architecture, completed features, infrastructure knowledge. Created per-workspace.
+2. **Home memory** (`workspace/.claude/MEMORY.md`) — Kai's personal memory from the home workspace. User preferences, facts, ongoing context. Always injected regardless of current workspace.
+3. **Workspace memory** (`<workspace>/.claude/MEMORY.md`) — per-project memory. Only injected when working in that workspace.
+
+Kai proactively saves facts, preferences, decisions, and project context without being asked. Use `/memory` to see file locations.
 
 ### Chat logging
 

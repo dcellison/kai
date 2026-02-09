@@ -31,8 +31,11 @@ EDIT_INTERVAL = 2.0
 # Flag file to track in-flight responses
 _RESPONDING_FLAG = PROJECT_ROOT / ".responding_to"
 
-# Persistent memory file (survives session resets)
-_MEMORY_PATH = PROJECT_ROOT / "workspace" / ".claude" / "MEMORY.md"
+def _line_count(path: Path) -> int:
+    """Count lines in a file, returning 0 if it doesn't exist."""
+    if not path.exists():
+        return 0
+    return len(path.read_text().splitlines())
 
 
 def _set_responding(chat_id: int) -> None:
@@ -274,22 +277,37 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 @_require_auth
 async def handle_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if context.args and context.args[0].lower() == "clear":
-        if _MEMORY_PATH.exists():
-            _MEMORY_PATH.unlink()
-            await update.message.reply_text("Memory cleared.")
-        else:
-            await update.message.reply_text("Memory is already empty.")
-        return
+    claude = _get_claude(context)
+    config: Config = context.bot_data["config"]
+    home = config.claude_workspace
 
-    if _MEMORY_PATH.exists():
-        content = _MEMORY_PATH.read_text().strip()
-        if content:
-            await _send_response(update, content)
-        else:
-            await update.message.reply_text("Memory is empty.")
-    else:
-        await update.message.reply_text("No memories yet. I'll start remembering as we chat.")
+    # Build a list of memory file locations and their status
+    lines = ["Memory files (all injected at session start):\n"]
+
+    # 1. Claude Code auto-memory (managed by Claude Code itself)
+    # Path is based on workspace path with slashes replaced by hyphens
+    ws_path = str(claude.workspace)
+    auto_key = ws_path.replace("/", "-")
+    auto_path = Path.home() / ".claude" / "projects" / auto_key / "memory" / "MEMORY.md"
+    exists = auto_path.exists()
+    status = f"{_line_count(auto_path)} lines" if exists else "not created yet"
+    lines.append(f"Auto-memory ({status}):\n{auto_path}")
+
+    # 2. Home workspace memory
+    home_memory = home / ".claude" / "MEMORY.md"
+    exists = home_memory.exists()
+    status = f"{_line_count(home_memory)} lines" if exists else "not created yet"
+    lines.append(f"\nHome memory ({status}):\n{home_memory}")
+
+    # 3. Current workspace memory (if different from home)
+    if claude.workspace != home:
+        ws_memory = claude.workspace / ".claude" / "MEMORY.md"
+        exists = ws_memory.exists()
+        status = f"{_line_count(ws_memory)} lines" if exists else "not created yet"
+        lines.append(f"\nWorkspace memory ({status}):\n{ws_memory}")
+
+    lines.append("\nAsk me about my memory in natural language to see details.")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def _resolve_workspace_path(target: str, base: str | None) -> Path | None:
@@ -575,8 +593,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/workspaces - Switch workspace (inline buttons)\n"
         "/models - Choose a model\n"
         "/model <name> - Switch model directly\n"
-        "/memory - View persistent memory\n"
-        "/memory clear - Clear all memory\n"
+        "/memory - Show memory file locations\n"
         "/stats - Show session info and cost\n"
         "/jobs - List scheduled jobs\n"
         "/canceljob <id> - Cancel a job\n"

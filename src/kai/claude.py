@@ -144,7 +144,15 @@ class PersistentClaude:
             if memory_path.exists():
                 memory = memory_path.read_text().strip()
                 if memory:
-                    parts.append(f"[Your persistent memory from previous sessions:]\n{memory}")
+                    parts.append(f"[Your persistent memory from home workspace:]\n{memory}")
+
+            # Inject current workspace memory if different from home
+            if self.workspace != self.home_workspace:
+                ws_memory_path = self.workspace / ".claude" / "MEMORY.md"
+                if ws_memory_path.exists():
+                    ws_memory = ws_memory_path.read_text().strip()
+                    if ws_memory:
+                        parts.append(f"[Your memory for this workspace ({self.workspace.name}):]\n{ws_memory}")
 
             # Inject scheduling API info (always, so cron works from any workspace)
             if self.webhook_secret:
