@@ -261,6 +261,39 @@ async def _handle_schedule(request: web.Request) -> web.Response:
     return web.json_response({"job_id": job_id, "name": name})
 
 
+# ── Jobs API ─────────────────────────────────────────────────────────
+
+
+async def _handle_get_jobs(request: web.Request) -> web.Response:
+    secret = request.app["webhook_secret"]
+
+    provided = request.headers.get("X-Webhook-Secret", "")
+    if not hmac.compare_digest(provided, secret):
+        return web.Response(status=401, text="Invalid secret")
+
+    chat_id = request.app["chat_id"]
+    jobs = await sessions.get_jobs(chat_id)
+    return web.json_response(jobs)
+
+
+async def _handle_get_job(request: web.Request) -> web.Response:
+    secret = request.app["webhook_secret"]
+
+    provided = request.headers.get("X-Webhook-Secret", "")
+    if not hmac.compare_digest(provided, secret):
+        return web.Response(status=401, text="Invalid secret")
+
+    try:
+        job_id = int(request.match_info["id"])
+    except ValueError:
+        return web.json_response({"error": "Invalid job ID"}, status=400)
+
+    job = await sessions.get_job_by_id(job_id)
+    if not job:
+        return web.json_response({"error": "Job not found"}, status=404)
+    return web.json_response(job)
+
+
 # ── Lifecycle ────────────────────────────────────────────────────────
 
 
@@ -280,6 +313,8 @@ async def start(telegram_app, config) -> None:
     _app.router.add_post("/webhook/github", _handle_github)
     _app.router.add_post("/webhook", _handle_generic)
     _app.router.add_post("/api/schedule", _handle_schedule)
+    _app.router.add_get("/api/jobs", _handle_get_jobs)
+    _app.router.add_get("/api/jobs/{id}", _handle_get_job)
 
     _runner = web.AppRunner(_app)
     await _runner.setup()
