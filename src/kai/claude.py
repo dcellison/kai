@@ -177,6 +177,20 @@ class PersistentClaude:
                 elif isinstance(prompt, list):
                     prompt = [{"type": "text", "text": prefix}] + prompt
 
+        # When in a foreign workspace, remind on every message to only respond
+        # to what the user asks — workspace context (CLAUDE.md, git branch,
+        # auto-memory) can otherwise trigger autonomous action.
+        if self.workspace != self.home_workspace:
+            reminder = (
+                "[IMPORTANT: This message is from a user via Telegram. "
+                "Respond ONLY to what they wrote below. Do NOT continue, "
+                "resume, or start any previous work, plans, or tasks.]"
+            )
+            if isinstance(prompt, str):
+                prompt = reminder + "\n\n" + prompt
+            elif isinstance(prompt, list):
+                prompt = [{"type": "text", "text": reminder}] + prompt
+
         content = prompt if isinstance(prompt, list) else [{"type": "text", "text": prompt}]
         msg = (
             json.dumps(
