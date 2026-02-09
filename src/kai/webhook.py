@@ -316,7 +316,7 @@ async def start(telegram_app, config) -> None:
     _app.router.add_get("/api/jobs", _handle_get_jobs)
     _app.router.add_get("/api/jobs/{id}", _handle_get_job)
 
-    _runner = web.AppRunner(_app)
+    _runner = web.AppRunner(_app, access_log=None)
     await _runner.setup()
     site = web.TCPSite(_runner, "0.0.0.0", config.webhook_port)
     await site.start()
