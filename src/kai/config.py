@@ -16,7 +16,7 @@ class Config:
     claude_timeout_seconds: int = 120
     claude_max_budget_usd: float = 10.0
     claude_workspace: Path = field(default_factory=lambda: PROJECT_ROOT / "workspace")
-    session_db_path: Path = field(default_factory=lambda: PROJECT_ROOT / "sessions.db")
+    session_db_path: Path = field(default_factory=lambda: PROJECT_ROOT / "kai.db")
     webhook_port: int = 8080
     webhook_secret: str = ""
 
