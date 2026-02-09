@@ -154,7 +154,7 @@ sudo systemctl status kai
 | `/models` | Interactive model picker with inline buttons |
 | `/model <name>` | Switch model directly (`opus`, `sonnet`, `haiku`) |
 | `/new` | Clear session and start fresh |
-| `/workspace` | Show current working directory |
+| `/workspace` | Show current workspace |
 | `/workspace <name>` | Switch by name (resolved via base) or absolute path |
 | `/workspace home` | Return to default workspace |
 | `/workspace base <path>` | Set the projects directory for short-name resolution |
