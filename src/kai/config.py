@@ -14,7 +14,7 @@ class Config:
     allowed_user_ids: set[int]
     claude_model: str = "sonnet"
     claude_timeout_seconds: int = 120
-    claude_max_budget_usd: float = 1.0
+    claude_max_budget_usd: float = 10.0
     claude_workspace: Path = field(default_factory=lambda: PROJECT_ROOT / "workspace")
     session_db_path: Path = field(default_factory=lambda: PROJECT_ROOT / "sessions.db")
     webhook_port: int = 8080
@@ -44,7 +44,7 @@ def load_config() -> Config:
         allowed_user_ids=allowed_ids,
         claude_model=os.environ.get("CLAUDE_MODEL", "sonnet"),
         claude_timeout_seconds=int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "120")),
-        claude_max_budget_usd=float(os.environ.get("CLAUDE_MAX_BUDGET_USD", "1.0")),
+        claude_max_budget_usd=float(os.environ.get("CLAUDE_MAX_BUDGET_USD", "10.0")),
         webhook_port=int(os.environ.get("WEBHOOK_PORT", "8080")),
         webhook_secret=os.environ.get("WEBHOOK_SECRET", ""),
     )

@@ -35,9 +35,15 @@ cp .env.example .env
 | `ALLOWED_USER_IDS` | Yes | | Comma-separated Telegram user IDs |
 | `CLAUDE_MODEL` | No | `sonnet` | Default model (`opus`, `sonnet`, or `haiku`) |
 | `CLAUDE_TIMEOUT_SECONDS` | No | `120` | Per-message timeout |
-| `CLAUDE_MAX_BUDGET_USD` | No | `1.0` | Max spend per session |
+| `CLAUDE_MAX_BUDGET_USD` | No | `10.0` | Session budget cap (see below) |
 | `WEBHOOK_PORT` | No | `8080` | HTTP server port for webhooks and scheduling API |
 | `WEBHOOK_SECRET` | No | | Secret for webhook validation and scheduling API auth |
+
+### Session budget cap
+
+`CLAUDE_MAX_BUDGET_USD` is passed to Claude Code's `--max-budget-usd` flag. It limits how much work the inner Claude can do in a single session, measured in estimated API token costs. When the cap is reached, Claude stops processing and you'll need to start a new session with `/new`.
+
+On the Max plan (subscription-based), no per-token charges are incurred — the budget acts purely as a runaway prevention mechanism. On API-billed plans, it caps actual spend. The session resets whenever you use `/new`, switch models, or switch workspaces.
 
 ## Running
 
