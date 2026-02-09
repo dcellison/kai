@@ -879,7 +879,7 @@ async def _handle_response(
 
 
 def create_bot(config: Config) -> Application:
-    app = Application.builder().token(config.telegram_bot_token).build()
+    app = Application.builder().token(config.telegram_bot_token).concurrent_updates(True).build()
     app.bot_data["config"] = config
     app.bot_data["claude"] = PersistentClaude(
         model=config.claude_model,
