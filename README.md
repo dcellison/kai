@@ -236,7 +236,7 @@ ingress:
   - service: http_status:404
 ```
 
-Once exposed, add a webhook on your GitHub repo pointing to `https://<your-host>/webhook/github` with the secret set to your `WEBHOOK_SECRET` value. Select the events you want.
+Once exposed, add a webhook on your GitHub repo pointing to `https://<your-host>/webhook/github` with the secret set to your `WEBHOOK_SECRET` value. Select the events you want. See the [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet) wiki page for a full walkthrough.
 
 ### Generic webhooks
 
@@ -251,7 +251,7 @@ Kai can schedule reminders and recurring tasks. Ask it naturally (e.g., "remind 
 - **Reminders** — sends a message at the scheduled time
 - **Claude jobs** — runs a prompt through Claude at the scheduled time (useful for monitoring, daily summaries, etc.)
 
-Jobs support one-shot, daily, and interval schedules. Use `/jobs` to list active jobs and `/canceljob <id>` to remove one.
+Jobs support one-shot, daily, and interval schedules. Use `/jobs` to list active jobs and `/canceljob <id>` to remove one. See the [Scheduling and Conditional Jobs](https://github.com/dcellison/kai/wiki/Scheduling-and-Conditional-Jobs) wiki page for details on job types, the HTTP API, and conditional monitoring patterns.
 
 #### Conditional jobs
 
@@ -289,7 +289,7 @@ Kai has three layers of memory, all injected at the start of each session:
 
 The three layers mirror how context works in practice: auto-memory is institutional knowledge (how the project works), home memory is personal (who you are, what you prefer), and workspace memory is situational (what's going on in this specific project). By injecting all three, Kai always has its full context regardless of which workspace it's in.
 
-Kai proactively saves facts, preferences, decisions, and project context without being asked. Use `/memory` to see file locations.
+Kai proactively saves facts, preferences, decisions, and project context without being asked. Use `/memory` to see file locations. The [Architecture](https://github.com/dcellison/kai/wiki/Architecture) wiki page covers how memory injection works across workspace switches.
 
 ### Chat logging
 
@@ -323,6 +323,8 @@ kai/
 ├── .env.example          # Environment variable template
 └── LICENSE               # Apache 2.0
 ```
+
+For a deeper look at the message lifecycle, database schema, concurrency model, and how workspaces interact with memory, see the [Architecture](https://github.com/dcellison/kai/wiki/Architecture) wiki page.
 
 ## Development
 
