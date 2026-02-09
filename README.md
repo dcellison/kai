@@ -287,6 +287,8 @@ Kai has three layers of memory, all injected at the start of each session:
 2. **Home memory** (`workspace/.claude/MEMORY.md`) — Kai's personal memory from the home workspace. User preferences, facts, ongoing context. Always injected regardless of current workspace.
 3. **Workspace memory** (`<workspace>/.claude/MEMORY.md`) — per-project memory. Only injected when working in that workspace.
 
+The three layers mirror how context works in practice: auto-memory is institutional knowledge (how the project works), home memory is personal (who you are, what you prefer), and workspace memory is situational (what's going on in this specific project). By injecting all three, Kai always has its full context regardless of which workspace it's in.
+
 Kai proactively saves facts, preferences, decisions, and project context without being asked. Use `/memory` to see file locations.
 
 ### Chat logging
