@@ -311,8 +311,24 @@ def _short_workspace_name(path: str, base: str | None) -> str:
     return Path(path).name
 
 
+async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path: Path) -> None:
+    """Switch workspace: update Claude, clear session, persist setting."""
+    claude = _get_claude(context)
+    config: Config = context.bot_data["config"]
+    home = config.claude_workspace
+
+    await claude.change_workspace(path)
+    await sessions.clear_session(chat_id)
+
+    if path == home:
+        await sessions.delete_setting("workspace")
+    else:
+        await sessions.set_setting("workspace", str(path))
+        await sessions.upsert_workspace_history(str(path))
+
+
 async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, path: Path) -> None:
-    """Switch to a workspace path, update DB state, and confirm."""
+    """Switch to a workspace path and confirm via reply."""
     claude = _get_claude(context)
     config: Config = context.bot_data["config"]
     home = config.claude_workspace
@@ -321,15 +337,11 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text("Already in that workspace.")
         return
 
-    await claude.change_workspace(path)
-    await sessions.clear_session(update.effective_chat.id)
+    await _do_switch_workspace(context, update.effective_chat.id, path)
 
     if path == home:
-        await sessions.delete_setting("workspace")
         await update.message.reply_text("Switched to home workspace. Session cleared.")
     else:
-        await sessions.set_setting("workspace", str(path))
-        await sessions.upsert_workspace_history(str(path))
         notes = []
         if (path / ".git").is_dir():
             notes.append("Git repo")
@@ -393,15 +405,10 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     claude = _get_claude(context)
     home = config.claude_workspace
 
+    # Resolve target path
     if data == "home":
-        if claude.workspace == home:
-            await query.answer()
-            await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
-            return
-        await query.answer()
-        await claude.change_workspace(home)
-        await sessions.clear_session(update.effective_chat.id)
-        await sessions.delete_setting("workspace")
+        path = home
+        label = "Home"
     else:
         try:
             idx = int(data)
@@ -416,28 +423,23 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
         if not path.is_dir():
             await sessions.delete_workspace_history(str(path))
             await query.answer("That workspace no longer exists.")
-            # Refresh the keyboard
             history = await sessions.get_workspace_history()
             base = await sessions.get_setting("workspace_base")
             keyboard = await _workspaces_keyboard(history, str(claude.workspace), str(home), base)
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return
-        if path == claude.workspace:
-            await query.answer()
-            await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
-            return
-        await query.answer()
-        await claude.change_workspace(path)
-        await sessions.clear_session(update.effective_chat.id)
-        await sessions.set_setting("workspace", str(path))
-        await sessions.upsert_workspace_history(str(path))
-
-    # Dismiss the keyboard and confirm
-    if data == "home":
-        label = "Home"
-    else:
         base = await sessions.get_setting("workspace_base")
-        label = _short_workspace_name(str(claude.workspace), base)
+        label = _short_workspace_name(str(path), base)
+
+    # Already there — dismiss
+    if path == claude.workspace:
+        await query.answer()
+        await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
+        return
+
+    # Switch and confirm
+    await query.answer()
+    await _do_switch_workspace(context, update.effective_chat.id, path)
     await query.edit_message_text(
         f"Switched to {label}. Session cleared.",
         reply_markup=InlineKeyboardMarkup([]),
@@ -511,21 +513,6 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         await proc.wait()
         await _switch_workspace(update, context, resolved)
-        return
-
-    # Numeric shortcut: pick from history
-    if target.isdigit():
-        idx = int(target)
-        history = await sessions.get_workspace_history()
-        if not history or idx < 1 or idx > len(history):
-            await update.message.reply_text("Invalid workspace number. Use /workspaces to see the list.")
-            return
-        path = Path(history[idx - 1]["path"])
-        if not path.is_dir():
-            await sessions.delete_workspace_history(str(path))
-            await update.message.reply_text(f"That workspace no longer exists:\n{path}")
-            return
-        await _switch_workspace(update, context, path)
         return
 
     # Resolve via base directory or absolute path
