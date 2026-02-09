@@ -22,7 +22,7 @@ This document compares the two projects across architecture, features, security,
 | **Deployment** | Self-hosted (local, VPS, or managed hosting) | Self-hosted (local machine only) |
 | **Messaging** | 13+ platforms (WhatsApp, Telegram, Discord, Slack, Signal, iMessage, Teams, Matrix, Google Chat, and more) | Telegram (by design — see below) |
 | **Multi-user** | Yes, with role-based access | Single-user by design |
-| **Tool use** | Built-in skill system with 100+ preconfigured AgentSkills | Full Claude Code tool access (shell, files, web search, code editing) |
+| **Tool use** | Built-in skill system with 100+ preconfigured AgentSkills | Full Claude Code tool access (shell, files, web search, code editing) + Claude Code skills |
 
 OpenClaw's hub-and-spoke design is built for scale: a central gateway manages routing, and channel-specific spokes handle platform integration. This enables multi-platform support but introduces complexity — the gateway alone exposes a WebSocket API that, if misconfigured, becomes an attack surface (more on this below).
 
@@ -105,7 +105,7 @@ OpenClaw has faced a cascade of security issues since its viral rise:
 
 Kai was built specifically to avoid these classes of vulnerability:
 
-- **No marketplace, no plugins**: There is no skill marketplace. Claude Code's tool use is built into the CLI — no third-party code runs in the agent runtime.
+- **Skills without a marketplace**: Kai supports extensibility through Claude Code's skill system — local prompt-based skills installed on the host machine. The critical difference from OpenClaw's ClawHub is the trust model: Claude Code skills are files you place on your own filesystem, not packages downloaded from a public marketplace where 7% of submissions were found to leak credentials. There is no remote skill registry, no auto-installation, and no third-party code execution.
 
 - **Single-user, local-only**: Kai runs on your own machine and only accepts messages from whitelisted Telegram user IDs. There is no multi-user gateway, no WebSocket API, no public-facing control plane.
 
@@ -143,7 +143,7 @@ OpenClaw itself is free (MIT license). The real cost is API usage:
 | **GitHub stars** | 176,000+ | Private repository |
 | **License** | MIT | Apache 2.0 |
 | **Contributors** | Large open-source community | Single developer |
-| **Plugin ecosystem** | ClawHub marketplace (4,000+ skills) | None (by design) |
+| **Plugin ecosystem** | ClawHub marketplace (4,000+ skills) | Claude Code skills (local, user-installed) |
 | **Documentation** | Extensive (docs site, community guides, tutorials) | README + GitHub wiki |
 | **LLM support** | Any provider (OpenAI, Anthropic, Google, DeepSeek, local) | Claude only (deliberate — delegates to Claude Code's full tool suite) |
 | **Managed hosting** | Multiple third-party providers | N/A |
