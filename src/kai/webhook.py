@@ -157,9 +157,13 @@ async def _handle_github(request: web.Request) -> web.Response:
 
     try:
         await bot.send_message(chat_id, message, parse_mode="Markdown")
-        log.info("Sent GitHub %s notification to chat %d", event_type, chat_id)
     except Exception:
-        log.exception("Failed to send GitHub notification")
+        try:
+            await bot.send_message(chat_id, message)
+        except Exception:
+            log.exception("Failed to send GitHub notification")
+            return web.json_response({"msg": "error"})
+    log.info("Sent GitHub %s notification to chat %d", event_type, chat_id)
 
     return web.json_response({"msg": "ok"})
 
