@@ -17,7 +17,10 @@ CLAUDE.md
 
 # Workspace runtime data (Kai's state, not source code)
 workspace/*
-!workspace/.gitkeep
+!workspace/.claude
+workspace/.claude/*
+!workspace/.claude/CLAUDE.md
+!workspace/.claude/MEMORY.md.example
 
 # OS / IDE
 .DS_Store
