@@ -6,7 +6,7 @@ Kai acts as a Telegram gateway to a persistent Claude Code CLI process. Messages
 
 ### Why Kai?
 
-**Security-first.** Projects like OpenClaw route your messages through third-party servers with unclear data handling. Kai runs entirely on your own machine — your code, your credentials, and your conversations never leave your hardware. The only external connections are to the Telegram Bot API and Anthropic's API, both authenticated and encrypted.
+**Security-first.** Projects like OpenClaw route your messages through third-party servers with unclear data handling. Kai runs entirely on your own machine — your code, your credentials, and your conversations never leave your hardware. The only external connections are to the Telegram Bot API and Claude Code's CLI (which connects to Anthropic internally), both authenticated and encrypted.
 
 **Developer-focused.** Kai is built around Claude Code's full capabilities: shell access, file editing, web search, and tool use. Switch between repos from your phone, create workspaces, trigger builds, review diffs — all through Telegram. It's a remote development companion, not just a chatbot.
 
