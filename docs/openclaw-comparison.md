@@ -32,7 +32,7 @@ Kai takes the opposite approach. There is no gateway, no spoke architecture, no 
 
 **Why just Claude Code?** Similarly, delegating to Claude Code is a deliberate architectural decision. Claude Code provides a persistent CLI with full tool access — shell commands, file operations, web search, code editing — in a single subprocess. Kai doesn't need to implement its own tool-use layer, manage API conversations directly, or maintain integrations with multiple LLM providers. It delegates to Claude Code and focuses on what it adds: the Telegram interface, workspace management, and scheduling. The result is a ~1,000-line Python codebase that punches far above its weight, precisely because it doesn't rebuild what already exists.
 
-**Why local-only?** Kai is technically portable — it's ~1,000 lines of Python with no OS-specific dependencies — but running locally is a deliberate choice that enables three things a VPS cannot provide. First, Claude Code authenticated via `claude login` on a Max plan means all usage is covered by the subscription. On a VPS, you'd likely need API key auth, which means per-token billing and the runaway cost risks that OpenClaw users regularly encounter. Second, running on your own machine means Kai can access local applications — macOS Calendar, Music, Reminders via AppleScript, local git repos, local development tools — things that disappear on a remote server. Third, the security guarantee is unambiguous: your conversations, credentials, and data never leave your hardware. On managed hosting, that guarantee depends on trusting a third party. The typical argument for a VPS — always-on availability — is already solved by launchd (macOS) or systemd (Linux) on any local machine.
+**Why local-only?** Kai is technically portable — it's ~1,000 lines of Python with no OS-specific dependencies — but running locally is a deliberate choice that enables three things a VPS cannot provide. First, Claude Code authenticated via `claude login` on a Pro or Max plan means all usage is covered by the subscription. On a VPS, you'd likely need API key auth, which means per-token billing and the runaway cost risks that OpenClaw users regularly encounter. Second, running on your own machine means Kai can access local applications — macOS Calendar, Music, Reminders via AppleScript, local git repos, local development tools — things that disappear on a remote server. Third, the security guarantee is unambiguous: your conversations, credentials, and data never leave your hardware. On managed hosting, that guarantee depends on trusting a third party. The typical argument for a VPS — always-on availability — is already solved by launchd (macOS) or systemd (Linux) on any local machine.
 
 This architectural difference reflects a core design philosophy: OpenClaw builds its own tool-use layer for maximum flexibility; Kai delegates to Claude Code's existing one for maximum simplicity.
 
@@ -44,7 +44,7 @@ This architectural difference reflects a core design philosophy: OpenClaw builds
 |---|---|---|
 | Platform support | 13+ messaging platforms | Telegram (deliberate — best bot API for this use case) |
 | Streaming responses | Yes | Yes (real-time message editing) |
-| Voice messages | Yes (speech-to-text, text-to-speech) | Not yet |
+| Voice messages | Yes (speech-to-text, text-to-speech) | Yes (local transcription via whisper.cpp) |
 | Image handling | Yes | Yes (photos and documents) |
 | File handling | Yes | Yes (text files, images) |
 | Browser automation | Yes (built-in) | Yes (via Claude Code) |
@@ -55,7 +55,7 @@ This architectural difference reflects a core design philosophy: OpenClaw builds
 | Feature | OpenClaw | Kai |
 |---|---|---|
 | Identity file | SOUL.md (personality, tone, boundaries) | CLAUDE.md (identity, instructions, rules) |
-| Persistent memory | MEMORY.md + daily logs (YYYY-MM-DD.md) | MEMORY.md (three-layer: auto-memory, home, workspace) |
+| Persistent memory | MEMORY.md + daily logs (YYYY-MM-DD.md) | MEMORY.md (two-layer: auto-memory + home memory) |
 | Memory search | Hybrid vector (70%) + BM25 (30%) semantic search | File-based (injected into context at session start) |
 | Context compaction | Pre-compaction memory save (agentic turn) | Handled by Claude Code's built-in compaction |
 | User profile | USER.md (explicit user context file) | Stored in MEMORY.md (user facts, preferences) |
@@ -63,7 +63,7 @@ This architectural difference reflects a core design philosophy: OpenClaw builds
 
 OpenClaw's memory system is more sophisticated on paper. The hybrid vector/BM25 search means it can retrieve relevant memories from a large history without loading everything into context. The pre-compaction save is a clever touch — before context gets compressed, the agent writes important information to durable storage.
 
-Kai's approach is simpler: all memory is injected as plaintext at session start. This works well for a single user (memory files stay small), but wouldn't scale to thousands of interactions without context window pressure. The three-layer system (auto-memory from Claude Code, home workspace memory, current workspace memory) provides good coverage without the complexity of a search index.
+Kai's approach is simpler: all memory is injected as plaintext at session start. This works well for a single user (memory files stay small), but wouldn't scale to thousands of interactions without context window pressure. The two-layer system (auto-memory from Claude Code, plus home workspace memory always injected) provides good coverage without the complexity of a search index. When working in a foreign workspace, that workspace's memory is also injected if it exists.
 
 ### Task Automation
 
@@ -133,7 +133,7 @@ OpenClaw itself is free (MIT license). The real cost is API usage:
 
 ### Kai
 
-- **On a Max plan**: $0 additional cost. Claude Code usage is covered by the Anthropic subscription ($100–200/month depending on plan). Kai includes a configurable session budget cap (`--max-budget-usd`) as runaway prevention — the cap limits work per session, not actual spend.
+- **On a Pro or Max plan**: $0 additional cost. Claude Code usage is covered by the Anthropic subscription. Kai includes a configurable session budget cap (`--max-budget-usd`) as runaway prevention — the cap limits work per session, not actual spend.
 - **On API billing**: Per-token costs apply, similar to OpenClaw's cost structure. The budget cap limits actual spend.
 - **Hosting**: $0 (runs on your existing machine)
 - **No surprise bills**: The budget cap prevents runaway costs regardless of billing model
@@ -161,7 +161,7 @@ Kai has none of that, and doesn't aim to. It's a single-developer project built 
 - Model-agnostic LLM access (switch between providers freely)
 - A large community and ecosystem of plugins
 - Multi-user or team deployments
-- Voice interaction built-in
+- Voice interaction with text-to-speech
 - The flexibility to customize everything
 
 ### Choose Kai if you want:
@@ -169,7 +169,7 @@ Kai has none of that, and doesn't aim to. It's a single-developer project built 
 - A developer-focused assistant with native code editing, git, and shell access
 - Workspace management across multiple repositories
 - Claude Code's full capabilities without building your own tool layer
-- Zero additional cost on a Max plan
+- Zero additional cost on a Pro or Max plan
 - Minimal attack surface and no third-party dependencies in the agent runtime
 - Complete control over your data with nothing leaving your machine
 
