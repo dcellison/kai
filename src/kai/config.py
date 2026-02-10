@@ -19,6 +19,7 @@ class Config:
     session_db_path: Path = field(default_factory=lambda: PROJECT_ROOT / "kai.db")
     webhook_port: int = 8080
     webhook_secret: str = ""
+    voice_enabled: bool = False
     whisper_model_path: Path = field(default_factory=lambda: PROJECT_ROOT / "models" / "ggml-base.en.bin")
 
 
@@ -48,4 +49,5 @@ def load_config() -> Config:
         claude_max_budget_usd=float(os.environ.get("CLAUDE_MAX_BUDGET_USD", "10.0")),
         webhook_port=int(os.environ.get("WEBHOOK_PORT", "8080")),
         webhook_secret=os.environ.get("WEBHOOK_SECRET", ""),
+        voice_enabled=os.environ.get("VOICE_ENABLED", "").lower() in ("1", "true", "yes"),
     )

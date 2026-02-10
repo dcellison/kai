@@ -3,6 +3,7 @@ import base64
 import functools
 import json
 import logging
+import shutil
 import time
 from pathlib import Path
 
@@ -781,6 +782,24 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = update.effective_chat.id
     claude = _get_claude(context)
     config: Config = context.bot_data["config"]
+
+    if not config.voice_enabled:
+        await update.message.reply_text("Voice messages are not enabled.")
+        return
+
+    missing = []
+    if not shutil.which("ffmpeg"):
+        missing.append("ffmpeg")
+    if not shutil.which("whisper-cli"):
+        missing.append("whisper-cpp")
+    if not config.whisper_model_path.exists():
+        missing.append("whisper model")
+    if missing:
+        await update.message.reply_text(
+            f"Voice is enabled but dependencies are missing: {', '.join(missing)}. "
+            "See the wiki for setup instructions: Voice-Message-Setup"
+        )
+        return
 
     voice = update.message.voice
     file = await context.bot.get_file(voice.file_id)
