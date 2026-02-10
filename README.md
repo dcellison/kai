@@ -12,9 +12,9 @@ Kai acts as a Telegram gateway to a persistent Claude Code CLI process. Messages
 
 **Why Telegram?** Telegram's Bot API is the most capable messaging platform for this use case. It supports message editing (enabling real-time streaming output), inline keyboards (interactive UI for model/workspace switching), file and image handling, slash commands, and unlimited free messaging. No other major platform offers all of these without restrictions or per-message costs. See the [project wiki](https://github.com/dcellison/kai/wiki) for a detailed comparison of messaging platforms evaluated during development.
 
-**Why Claude Code?** Claude Code provides a persistent CLI with full tool access — shell commands, file operations, web search — in a single subprocess. Kai doesn't need to implement its own tool-use layer or manage API conversations directly. It delegates to Claude Code and focuses on the Telegram interface, workspace management, and scheduling. When authenticated via `claude login` on a Max plan, all usage is covered by the subscription — no per-token API costs.
+**Why Claude Code?** Claude Code provides a persistent CLI with full tool access — shell commands, file operations, web search — in a single subprocess. Kai doesn't need to implement its own tool-use layer or manage API conversations directly. It delegates to Claude Code and focuses on the Telegram interface, workspace management, and scheduling. When authenticated via `claude login` on a Pro or Max plan, all usage is covered by the subscription — no per-token API costs.
 
-**Why local?** Kai is portable enough to run on a VPS, but local deployment is a deliberate choice. Running on your own machine enables flat-rate Max plan authentication (no per-token API costs), access to local applications and repos (macOS Calendar, Music, development tools), and a clear security boundary — your conversations and credentials never leave your hardware. A VPS would trade all three for always-on hosting, which launchd (macOS) or systemd (Linux) already provide on a local machine.
+**Why local?** Kai is portable enough to run on a VPS, but local deployment is a deliberate choice. Running on your own machine enables flat-rate Pro/Max plan authentication (no per-token API costs), access to local applications and repos (macOS Calendar, Music, development tools), and a clear security boundary — your conversations and credentials never leave your hardware. A VPS would trade all three for always-on hosting, which launchd (macOS) or systemd (Linux) already provide on a local machine.
 
 ## Requirements
 
@@ -56,7 +56,7 @@ cp .env.example .env
 
 `CLAUDE_MAX_BUDGET_USD` is passed to Claude Code's `--max-budget-usd` flag. It limits how much work the inner Claude can do in a single session, measured in estimated API token costs. When the cap is reached, Claude stops processing and you'll need to start a new session with `/new`.
 
-On the Max plan (subscription-based), no per-token charges are incurred — the budget acts purely as a runaway prevention mechanism. On API-billed plans, it caps actual spend. The session resets whenever you use `/new`, switch models, or switch workspaces.
+On Pro/Max plans (subscription-based), no per-token charges are incurred — the budget acts purely as a runaway prevention mechanism. On API-billed plans, it caps actual spend. The session resets whenever you use `/new`, switch models, or switch workspaces.
 
 ## Running
 
