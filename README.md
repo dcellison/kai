@@ -50,6 +50,7 @@ cp .env.example .env
 | `CLAUDE_MAX_BUDGET_USD` | No | `10.0` | Session budget cap (see below) |
 | `WEBHOOK_PORT` | No | `8080` | HTTP server port for webhooks and scheduling API |
 | `WEBHOOK_SECRET` | No | | Secret for webhook validation and scheduling API auth |
+| `VOICE_ENABLED` | No | `false` | Enable voice message transcription (see below) |
 
 ### Session budget cap
 
@@ -207,6 +208,14 @@ Send photos or documents directly in the chat. Kai supports:
 - **Images** (JPEG, PNG, GIF, WebP) - sent as photos or uncompressed documents
 - **Text files** (Python, JS, JSON, Markdown, and many more) - content is extracted and sent to Claude
 
+### Voice messages
+
+Send a voice note in Telegram and Kai transcribes it locally using [whisper.cpp](https://github.com/ggerganov/whisper.cpp), then forwards the transcription to Claude. The transcription is echoed back to the chat so you can see what Kai heard before it responds.
+
+Everything runs on your machine — no external speech-to-text APIs or per-minute costs. Requires `ffmpeg` and `whisper-cpp` (both available via Homebrew) plus a one-time model download (~148MB).
+
+Voice messages are disabled by default. Set `VOICE_ENABLED=true` in `.env` after installing the dependencies. See the [Voice Message Setup](https://github.com/dcellison/kai/wiki/Voice-Message-Setup) wiki page for full instructions.
+
 ### GitHub notifications
 
 Kai runs an HTTP server that receives GitHub webhook events and forwards them to Telegram as formatted notifications. Supported events:
@@ -283,15 +292,16 @@ Auth: set the `X-Webhook-Secret` header to your `WEBHOOK_SECRET`. Schedule types
 
 ### Persistent memory
 
-Kai has three layers of memory, all injected at the start of each session:
+Kai has two layers of memory, injected at the start of each session:
 
-1. **Auto-memory** (`~/.claude/projects/.../memory/MEMORY.md`) — managed by Claude Code itself. Project architecture, completed features, infrastructure knowledge. Created per-workspace.
+1. **Auto-memory** (`~/.claude/projects/.../memory/MEMORY.md`) — managed automatically by Claude Code. Project architecture, completed features, infrastructure knowledge. Created per-workspace.
 2. **Home memory** (`workspace/.claude/MEMORY.md`) — Kai's personal memory from the home workspace. User preferences, facts, ongoing context. Always injected regardless of current workspace.
-3. **Workspace memory** (`<workspace>/.claude/MEMORY.md`) — per-project memory. Only injected when working in that workspace.
 
-The three layers mirror how context works in practice: auto-memory is institutional knowledge (how the project works), home memory is personal (who you are, what you prefer), and workspace memory is situational (what's going on in this specific project). By injecting all three, Kai always has its full context regardless of which workspace it's in.
+When working in a foreign workspace, Kai also injects that workspace's `.claude/MEMORY.md` if it exists, so project-specific context is available alongside personal memory.
 
-Kai proactively saves facts, preferences, decisions, and project context without being asked. Use `/memory` to see file locations. The [Architecture](https://github.com/dcellison/kai/wiki/Architecture) wiki page covers how memory injection works across workspace switches.
+Auto-memory is institutional knowledge (how the project works) while home memory is personal (who you are, what you prefer). By injecting both, Kai always has its full context regardless of which workspace it's in.
+
+Use `/memory` to see file locations. The [Architecture](https://github.com/dcellison/kai/wiki/Architecture) wiki page covers how memory injection works across workspace switches.
 
 ### Chat logging
 
@@ -316,10 +326,12 @@ kai/
 │   ├── cron.py           # Scheduled job execution (APScheduler)
 │   ├── webhook.py        # HTTP server: GitHub/generic webhooks, scheduling API
 │   ├── chat_log.py       # JSONL chat logging
-│   └── locks.py          # Per-chat async locks and stop events
+│   ├── locks.py          # Per-chat async locks and stop events
+│   └── transcribe.py     # Voice message transcription (ffmpeg + whisper-cpp)
 ├── tests/                # Test suite
-├── workspace/            # Claude Code working directory (contents gitignored)
-│   └── .gitkeep          # Placeholder to preserve directory in git
+├── models/               # Whisper model files (gitignored)
+├── workspace/            # Claude Code working directory
+│   └── .claude/          # Identity (CLAUDE.md) and memory template (MEMORY.md.example)
 ├── pyproject.toml        # Package metadata, dependencies, and tool config
 ├── Makefile              # Common dev commands
 ├── .env.example          # Environment variable template
