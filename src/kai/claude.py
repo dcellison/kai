@@ -90,6 +90,7 @@ class PersistentClaude:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.workspace),
+            limit=1024 * 1024,  # 1 MiB; default 64 KiB too small for large tool results
         )
         self._session_id = None
         self._fresh_session = True
