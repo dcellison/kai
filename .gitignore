@@ -11,6 +11,7 @@ __pycache__/
 kai.db
 kai.log
 .responding_to
+models/
 
 # Claude Code local config
 CLAUDE.md

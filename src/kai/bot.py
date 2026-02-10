@@ -22,6 +22,7 @@ from kai.chat_log import log_message
 from kai.claude import PersistentClaude
 from kai.config import PROJECT_ROOT, Config
 from kai.locks import get_lock, get_stop_event
+from kai.transcribe import TranscriptionError, transcribe_voice
 
 log = logging.getLogger(__name__)
 
@@ -773,6 +774,49 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 @_require_auth
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.voice:
+        return
+
+    chat_id = update.effective_chat.id
+    claude = _get_claude(context)
+    config: Config = context.bot_data["config"]
+
+    voice = update.message.voice
+    file = await context.bot.get_file(voice.file_id)
+    audio_data = bytes(await file.download_as_bytearray())
+
+    log_message(
+        direction="user", chat_id=chat_id,
+        text=f"[voice message, {voice.duration}s]",
+        media={"type": "voice", "duration": voice.duration},
+    )
+
+    try:
+        transcript = await transcribe_voice(audio_data, config.whisper_model_path)
+    except TranscriptionError as e:
+        await update.message.reply_text(f"Transcription failed: {e}")
+        return
+
+    if not transcript:
+        await update.message.reply_text("Couldn't make out any speech in that voice message.")
+        return
+
+    # Echo so the user sees what Kai heard
+    await _reply_safe(update.message, f"_Heard:_ {transcript}")
+
+    prompt = f"[Voice message transcription]: {transcript}"
+    model = claude.model
+
+    async with get_lock(chat_id):
+        _set_responding(chat_id)
+        try:
+            await _handle_response(update, context, chat_id, prompt, claude, model)
+        finally:
+            _clear_responding()
+
+
+@_require_auth
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
@@ -913,6 +957,7 @@ def create_bot(config: Config) -> Application:
     app.add_handler(CallbackQueryHandler(handle_workspace_callback, pattern=r"^ws:"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

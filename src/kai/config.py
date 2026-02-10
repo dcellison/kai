@@ -19,6 +19,7 @@ class Config:
     session_db_path: Path = field(default_factory=lambda: PROJECT_ROOT / "kai.db")
     webhook_port: int = 8080
     webhook_secret: str = ""
+    whisper_model_path: Path = field(default_factory=lambda: PROJECT_ROOT / "models" / "ggml-base.en.bin")
 
 
 def load_config() -> Config:
