@@ -389,22 +389,25 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 
-async def _resolve_workspace_path(target: str, base: str | None) -> Path | None:
-    """Resolve a workspace target to an absolute path.
+def _resolve_workspace_path(target: str, base: Path | None) -> Path | None:
+    """Resolve a workspace name to an absolute path under base.
 
-    Returns None if the target is a bare name and no base is set.
+    Only relative names are allowed. Returns None if no base is set.
     """
-    if target.startswith("/") or target.startswith("~"):
-        return Path(target).expanduser().resolve()
-    if base:
-        return (Path(base) / target).resolve()
-    return None
+    if not base:
+        return None
+    resolved = (base / target).resolve()
+    # Prevent traversal outside the base directory
+    if not str(resolved).startswith(str(base) + "/") and resolved != base:
+        return None
+    return resolved
 
 
-def _short_workspace_name(path: str, base: str | None) -> str:
+def _short_workspace_name(path: str, base: Path | None) -> str:
     """Shorten a workspace path for display."""
-    if base and path.startswith(base.rstrip("/") + "/"):
-        return path[len(base.rstrip("/")) + 1 :]
+    base_str = str(base) if base else None
+    if base_str and path.startswith(base_str.rstrip("/") + "/"):
+        return path[len(base_str.rstrip("/")) + 1 :]
     return Path(path).name
 
 
@@ -452,7 +455,7 @@ async def _workspaces_keyboard(
     history: list[dict],
     current_path: str,
     home_path: str,
-    base: str | None,
+    base: Path | None,
 ) -> InlineKeyboardMarkup:
     """Build inline keyboard for workspace switching."""
     buttons = []
@@ -481,13 +484,12 @@ async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     config: Config = context.bot_data["config"]
     current = str(claude.workspace)
     home = str(config.claude_workspace)
-    base = await sessions.get_setting("workspace_base")
 
     if not history and current == home:
         await update.message.reply_text("No workspace history yet.\nUse /workspace new <name> to create one.")
         return
 
-    keyboard = await _workspaces_keyboard(history, current, home, base)
+    keyboard = await _workspaces_keyboard(history, current, home, config.workspace_base)
     await update.message.reply_text("Workspaces:", reply_markup=keyboard)
 
 
@@ -501,6 +503,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     data = query.data.removeprefix("ws:")
     claude = _get_claude(context)
     home = config.claude_workspace
+    base = config.workspace_base
 
     # Resolve target path
     if data == "home":
@@ -523,11 +526,9 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             await sessions.delete_workspace_history(str(path))
             await query.answer("That workspace no longer exists.")
             history = await sessions.get_workspace_history()
-            base = await sessions.get_setting("workspace_base")
             keyboard = await _workspaces_keyboard(history, str(claude.workspace), str(home), base)
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return
-        base = await sessions.get_setting("workspace_base")
         label = _short_workspace_name(str(path), base)
 
     # Already there — dismiss
@@ -545,16 +546,19 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     )
 
 
+_NO_BASE_MSG = "WORKSPACE_BASE is not set. Add it to .env and restart."
+
+
 @_require_auth
 async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     claude = _get_claude(context)
     config: Config = context.bot_data["config"]
     home = config.claude_workspace
+    base = config.workspace_base
 
     # No args: show current workspace
     if not context.args:
         current = claude.workspace
-        base = await sessions.get_setting("workspace_base")
         short = _short_workspace_name(str(current), base)
         if current == home:
             short = "Home"
@@ -562,28 +566,15 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     target = " ".join(context.args)
-    base = await sessions.get_setting("workspace_base")
 
-    # "home" keyword: return to default
+    # "home" keyword: always allowed
     if target.lower() == "home":
         await _switch_workspace(update, context, home)
         return
 
-    # "base" keyword: show or set workspace base directory
-    if target.lower().startswith("base"):
-        parts = target.split(None, 1)
-        if len(parts) == 1:
-            if base:
-                await update.message.reply_text(f"Workspace base: {base}")
-            else:
-                await update.message.reply_text("No workspace base set.\nUsage: /workspace base /path/to/projects")
-            return
-        new_base = Path(parts[1]).expanduser().resolve()
-        if not new_base.is_dir():
-            await update.message.reply_text(f"Not a directory:\n{new_base}")
-            return
-        await sessions.set_setting("workspace_base", str(new_base))
-        await update.message.reply_text(f"Workspace base set to:\n{new_base}")
+    # Reject absolute paths and ~ expansion
+    if target.startswith("/") or target.startswith("~"):
+        await update.message.reply_text("Absolute paths are not allowed. Use a workspace name.")
         return
 
     # "new" keyword: create a new workspace
@@ -592,12 +583,13 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if len(parts) < 2:
             await update.message.reply_text("Usage: /workspace new <name>")
             return
+        if not base:
+            await update.message.reply_text(_NO_BASE_MSG)
+            return
         name = parts[1]
-        resolved = await _resolve_workspace_path(name, base)
+        resolved = _resolve_workspace_path(name, base)
         if resolved is None:
-            await update.message.reply_text(
-                "Set a workspace base first:\n/workspace base /path/to/projects\n\nOr use a full path: /workspace new /full/path"
-            )
+            await update.message.reply_text("Invalid workspace name.")
             return
         if resolved.exists():
             await update.message.reply_text(f"Already exists:\n{resolved}")
@@ -614,23 +606,24 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _switch_workspace(update, context, resolved)
         return
 
-    # Resolve via base directory or absolute path
-    resolved = await _resolve_workspace_path(target, base)
+    # Resolve via base directory
+    if not base:
+        await update.message.reply_text(_NO_BASE_MSG)
+        return
+
+    resolved = _resolve_workspace_path(target, base)
     if resolved is None:
-        await update.message.reply_text(
-            f"Unknown workspace: {target}\nSet a workspace base first:\n/workspace base /path/to/projects"
-        )
-        return
-    path = resolved
-
-    if not path.exists():
-        await update.message.reply_text(f"Path does not exist:\n{path}")
-        return
-    if not path.is_dir():
-        await update.message.reply_text(f"Not a directory:\n{path}")
+        await update.message.reply_text("Invalid workspace name.")
         return
 
-    await _switch_workspace(update, context, path)
+    if not resolved.exists():
+        await update.message.reply_text(f"Path does not exist:\n{resolved}")
+        return
+    if not resolved.is_dir():
+        await update.message.reply_text(f"Not a directory:\n{resolved}")
+        return
+
+    await _switch_workspace(update, context, resolved)
 
 
 @_require_auth
@@ -666,9 +659,8 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/stop - Interrupt current response\n"
         "/new - Start a fresh session\n"
         "/workspace - Show current workspace\n"
-        "/workspace <name> - Switch by name or path\n"
+        "/workspace <name> - Switch by name\n"
         "/workspace new <name> - Create + git init + switch\n"
-        "/workspace base <path> - Set projects directory\n"
         "/workspace home - Return to default\n"
         "/workspaces - Switch workspace (inline buttons)\n"
         "/models - Choose a model\n"

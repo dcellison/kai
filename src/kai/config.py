@@ -23,6 +23,7 @@ class Config:
     whisper_model_path: Path = field(default_factory=lambda: PROJECT_ROOT / "models" / "ggml-base.en.bin")
     tts_enabled: bool = False
     piper_model_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "models" / "piper")
+    workspace_base: Path | None = None
 
 
 def load_config() -> Config:
@@ -43,6 +44,13 @@ def load_config() -> Config:
             "Message @userinfobot on Telegram to find yours."
         ) from e
 
+    workspace_base = None
+    raw_base = os.environ.get("WORKSPACE_BASE", "").strip()
+    if raw_base:
+        workspace_base = Path(raw_base).expanduser().resolve()
+        if not workspace_base.is_dir():
+            raise SystemExit(f"WORKSPACE_BASE is not an existing directory: {workspace_base}")
+
     return Config(
         telegram_bot_token=token,
         allowed_user_ids=allowed_ids,
@@ -53,4 +61,5 @@ def load_config() -> Config:
         webhook_secret=os.environ.get("WEBHOOK_SECRET", ""),
         voice_enabled=os.environ.get("VOICE_ENABLED", "").lower() in ("1", "true", "yes"),
         tts_enabled=os.environ.get("TTS_ENABLED", "").lower() in ("1", "true", "yes"),
+        workspace_base=workspace_base,
     )

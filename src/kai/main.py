@@ -29,7 +29,18 @@ def main() -> None:
         saved_workspace = await sessions.get_setting("workspace")
         if saved_workspace:
             ws_path = Path(saved_workspace)
-            if ws_path.is_dir():
+            base = config.workspace_base
+            if base and not (
+                str(ws_path.resolve()).startswith(str(base) + "/")
+                or ws_path.resolve() == base
+            ):
+                logging.warning(
+                    "Saved workspace %s is outside WORKSPACE_BASE %s, ignoring",
+                    saved_workspace,
+                    base,
+                )
+                await sessions.delete_setting("workspace")
+            elif ws_path.is_dir():
                 await app.bot_data["claude"].change_workspace(ws_path)
                 logging.info("Restored workspace: %s", ws_path)
             else:

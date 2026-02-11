@@ -16,7 +16,7 @@ Switch between Opus, Sonnet, and Haiku via `/models` (interactive picker) or `/m
 
 ### Workspaces
 
-Point Claude at any directory with `/workspace <path>`. Identity and memory from the home workspace carry over. Set a base directory with `/workspace base` to enable short names (e.g., `/workspace kai` instead of the full path). Create new workspaces with `/workspace new <name>`.
+Point Claude at any project with `/workspace <name>`. Names resolve relative to `WORKSPACE_BASE` (set in `.env`). Identity and memory from the home workspace carry over. Create new workspaces with `/workspace new <name>`. Absolute paths are not accepted — all workspaces must live under the configured base directory.
 
 ### Image and file support
 
@@ -61,9 +61,8 @@ If interrupted mid-response, Kai notifies you on restart and asks you to resend 
 | `/models` | Interactive model picker |
 | `/model <name>` | Switch model (`opus`, `sonnet`, `haiku`) |
 | `/workspace` | Show current workspace |
-| `/workspace <name>` | Switch by name or absolute path |
+| `/workspace <name>` | Switch by name (resolved under `WORKSPACE_BASE`) |
 | `/workspace home` | Return to default workspace |
-| `/workspace base <path>` | Set the projects directory for short-name resolution |
 | `/workspace new <name>` | Create a new workspace with git init |
 | `/workspaces` | Interactive workspace picker |
 | `/voice` | Toggle voice responses on/off |
@@ -104,6 +103,7 @@ cp .env.example .env
 | `CLAUDE_MODEL` | No | `sonnet` | Default model (`opus`, `sonnet`, or `haiku`) |
 | `CLAUDE_TIMEOUT_SECONDS` | No | `120` | Per-message timeout |
 | `CLAUDE_MAX_BUDGET_USD` | No | `10.0` | Session budget cap |
+| `WORKSPACE_BASE` | No | | Base directory for workspace name resolution |
 | `WEBHOOK_PORT` | No | `8080` | HTTP server port for webhooks and scheduling API |
 | `WEBHOOK_SECRET` | No | | Secret for webhook validation and scheduling API auth |
 | `VOICE_ENABLED` | No | `false` | Enable voice message transcription |
