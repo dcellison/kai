@@ -4,75 +4,6 @@ A personal AI assistant accessed via Telegram, powered by [Claude Code](https://
 
 Kai is a Telegram gateway to a persistent Claude Code process. Messages are forwarded to Claude with full tool access (shell, files, web search), and responses stream back in real time. Everything runs locally — conversations and credentials never leave your machine.
 
-## Requirements
-
-- Python 3.13+
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
-- A Telegram bot token from [@BotFather](https://t.me/BotFather)
-- Your Telegram user ID (get it from [@userinfobot](https://t.me/userinfobot))
-
-## Setup
-
-```bash
-git clone git@github.com:dcellison/kai.git
-cd kai
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev]'
-cp .env.example .env
-```
-
-### Environment variables
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | Yes | | Bot token from BotFather |
-| `ALLOWED_USER_IDS` | Yes | | Comma-separated Telegram user IDs |
-| `CLAUDE_MODEL` | No | `sonnet` | Default model (`opus`, `sonnet`, or `haiku`) |
-| `CLAUDE_TIMEOUT_SECONDS` | No | `120` | Per-message timeout |
-| `CLAUDE_MAX_BUDGET_USD` | No | `10.0` | Session budget cap |
-| `WEBHOOK_PORT` | No | `8080` | HTTP server port for webhooks and scheduling API |
-| `WEBHOOK_SECRET` | No | | Secret for webhook validation and scheduling API auth |
-| `VOICE_ENABLED` | No | `false` | Enable voice message transcription |
-| `TTS_ENABLED` | No | `false` | Enable text-to-speech voice responses |
-
-`CLAUDE_MAX_BUDGET_USD` limits how much work Claude can do in a single session via Claude Code's `--max-budget-usd` flag. On Pro/Max plans this is purely a runaway prevention mechanism (no per-token charges). The session resets on `/new`, model switch, or workspace switch.
-
-## Running
-
-```bash
-make run
-```
-
-Or manually: `source .venv/bin/activate && python -m kai`
-
-For running as a background service, see the wiki: [macOS (launchd)](https://github.com/dcellison/kai/wiki/Architecture) or Linux (systemd).
-
-## Commands
-
-| Command | Description |
-|---|---|
-| `/new` | Clear session and start fresh |
-| `/stop` | Interrupt a response mid-stream |
-| `/models` | Interactive model picker |
-| `/model <name>` | Switch model (`opus`, `sonnet`, `haiku`) |
-| `/workspace` | Show current workspace |
-| `/workspace <name>` | Switch by name or absolute path |
-| `/workspace home` | Return to default workspace |
-| `/workspace base <path>` | Set the projects directory for short-name resolution |
-| `/workspace new <name>` | Create a new workspace with git init |
-| `/workspaces` | Interactive workspace picker |
-| `/voice` | Toggle voice responses on/off |
-| `/voice only` | Voice-only mode (no text) |
-| `/voice on` | Text + voice mode |
-| `/voice <name>` | Set voice |
-| `/voices` | Interactive voice picker |
-| `/stats` | Show session info, model, and cost |
-| `/jobs` | List active scheduled jobs |
-| `/canceljob <id>` | Cancel a scheduled job |
-| `/webhooks` | Show webhook server status |
-| `/help` | Show available commands |
-
 ## Features
 
 ### Streaming responses
@@ -120,6 +51,75 @@ Foreign workspaces also get their own `.claude/MEMORY.md` injected alongside hom
 ### Crash recovery
 
 If interrupted mid-response, Kai notifies you on restart and asks you to resend your last message.
+
+## Commands
+
+| Command | Description |
+|---|---|
+| `/new` | Clear session and start fresh |
+| `/stop` | Interrupt a response mid-stream |
+| `/models` | Interactive model picker |
+| `/model <name>` | Switch model (`opus`, `sonnet`, `haiku`) |
+| `/workspace` | Show current workspace |
+| `/workspace <name>` | Switch by name or absolute path |
+| `/workspace home` | Return to default workspace |
+| `/workspace base <path>` | Set the projects directory for short-name resolution |
+| `/workspace new <name>` | Create a new workspace with git init |
+| `/workspaces` | Interactive workspace picker |
+| `/voice` | Toggle voice responses on/off |
+| `/voice only` | Voice-only mode (no text) |
+| `/voice on` | Text + voice mode |
+| `/voice <name>` | Set voice |
+| `/voices` | Interactive voice picker |
+| `/stats` | Show session info, model, and cost |
+| `/jobs` | List active scheduled jobs |
+| `/canceljob <id>` | Cancel a scheduled job |
+| `/webhooks` | Show webhook server status |
+| `/help` | Show available commands |
+
+## Requirements
+
+- Python 3.13+
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
+- A Telegram bot token from [@BotFather](https://t.me/BotFather)
+- Your Telegram user ID (get it from [@userinfobot](https://t.me/userinfobot))
+
+## Setup
+
+```bash
+git clone git@github.com:dcellison/kai.git
+cd kai
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+cp .env.example .env
+```
+
+### Environment variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | Yes | | Bot token from BotFather |
+| `ALLOWED_USER_IDS` | Yes | | Comma-separated Telegram user IDs |
+| `CLAUDE_MODEL` | No | `sonnet` | Default model (`opus`, `sonnet`, or `haiku`) |
+| `CLAUDE_TIMEOUT_SECONDS` | No | `120` | Per-message timeout |
+| `CLAUDE_MAX_BUDGET_USD` | No | `10.0` | Session budget cap |
+| `WEBHOOK_PORT` | No | `8080` | HTTP server port for webhooks and scheduling API |
+| `WEBHOOK_SECRET` | No | | Secret for webhook validation and scheduling API auth |
+| `VOICE_ENABLED` | No | `false` | Enable voice message transcription |
+| `TTS_ENABLED` | No | `false` | Enable text-to-speech voice responses |
+
+`CLAUDE_MAX_BUDGET_USD` limits how much work Claude can do in a single session via Claude Code's `--max-budget-usd` flag. On Pro/Max plans this is purely a runaway prevention mechanism (no per-token charges). The session resets on `/new`, model switch, or workspace switch.
+
+## Running
+
+```bash
+make run
+```
+
+Or manually: `source .venv/bin/activate && python -m kai`
+
+For running as a background service, see the wiki: [macOS (launchd)](https://github.com/dcellison/kai/wiki/Architecture) or Linux (systemd).
 
 ## Project Structure
 
