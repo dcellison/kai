@@ -2,19 +2,7 @@
 
 A personal AI assistant accessed via Telegram, powered by [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
 
-Kai acts as a Telegram gateway to a persistent Claude Code CLI process. Messages you send in Telegram are forwarded to Claude, and responses stream back in real time. Claude has full tool access (shell, files, web search) and maintains conversation context across messages.
-
-### Why Kai?
-
-**Security-first.** Projects like OpenClaw route your messages through third-party servers with unclear data handling. Kai runs entirely on your own machine — your code, your credentials, and your conversations never leave your hardware. The only external connections are to the Telegram Bot API and Claude Code's CLI (which connects to Anthropic internally), both authenticated and encrypted.
-
-**Developer-focused.** Kai is built around Claude Code's full capabilities: shell access, file editing, web search, and tool use. Switch between repos from your phone, create workspaces, trigger builds, review diffs — all through Telegram. It's a remote development companion, not just a chatbot.
-
-**Why Telegram?** Telegram's Bot API is the most capable messaging platform for this use case. It supports message editing (enabling real-time streaming output), inline keyboards (interactive UI for model/workspace switching), file and image handling, slash commands, and unlimited free messaging. No other major platform offers all of these without restrictions or per-message costs. See the [project wiki](https://github.com/dcellison/kai/wiki) for a detailed comparison of messaging platforms evaluated during development.
-
-**Why Claude Code?** Claude Code provides a persistent CLI with full tool access — shell commands, file operations, web search — in a single subprocess. Kai doesn't need to implement its own tool-use layer or manage API conversations directly. It delegates to Claude Code and focuses on the Telegram interface, workspace management, and scheduling. When authenticated via `claude login` on a Pro or Max plan, all usage is covered by the subscription — no per-token API costs.
-
-**Why local?** Kai is portable enough to run on a VPS, but local deployment is a deliberate choice. Running on your own machine enables flat-rate Pro/Max plan authentication (no per-token API costs), access to local applications and repos (macOS Calendar, Music, development tools), and a clear security boundary — your conversations and credentials never leave your hardware. A VPS would trade all three for always-on hosting, which launchd (macOS) or systemd (Linux) already provide on a local machine.
+Kai is a Telegram gateway to a persistent Claude Code process. Messages are forwarded to Claude with full tool access (shell, files, web search), and responses stream back in real time. Everything runs locally — conversations and credentials never leave your machine.
 
 ## Requirements
 
@@ -31,11 +19,6 @@ cd kai
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
-```
-
-Copy the example environment file and fill in your values:
-
-```bash
 cp .env.example .env
 ```
 
@@ -47,140 +30,43 @@ cp .env.example .env
 | `ALLOWED_USER_IDS` | Yes | | Comma-separated Telegram user IDs |
 | `CLAUDE_MODEL` | No | `sonnet` | Default model (`opus`, `sonnet`, or `haiku`) |
 | `CLAUDE_TIMEOUT_SECONDS` | No | `120` | Per-message timeout |
-| `CLAUDE_MAX_BUDGET_USD` | No | `10.0` | Session budget cap (see below) |
+| `CLAUDE_MAX_BUDGET_USD` | No | `10.0` | Session budget cap |
 | `WEBHOOK_PORT` | No | `8080` | HTTP server port for webhooks and scheduling API |
 | `WEBHOOK_SECRET` | No | | Secret for webhook validation and scheduling API auth |
-| `VOICE_ENABLED` | No | `false` | Enable voice message transcription (see below) |
-| `TTS_ENABLED` | No | `false` | Enable text-to-speech voice responses (see below) |
+| `VOICE_ENABLED` | No | `false` | Enable voice message transcription |
+| `TTS_ENABLED` | No | `false` | Enable text-to-speech voice responses |
 
-### Session budget cap
-
-`CLAUDE_MAX_BUDGET_USD` is passed to Claude Code's `--max-budget-usd` flag. It limits how much work the inner Claude can do in a single session, measured in estimated API token costs. When the cap is reached, Claude stops processing and you'll need to start a new session with `/new`.
-
-On Pro/Max plans (subscription-based), no per-token charges are incurred — the budget acts purely as a runaway prevention mechanism. On API-billed plans, it caps actual spend. The session resets whenever you use `/new`, switch models, or switch workspaces.
+`CLAUDE_MAX_BUDGET_USD` limits how much work Claude can do in a single session via Claude Code's `--max-budget-usd` flag. On Pro/Max plans this is purely a runaway prevention mechanism (no per-token charges). The session resets on `/new`, model switch, or workspace switch.
 
 ## Running
 
 ```bash
-source .venv/bin/activate
-python -m kai
+make run
 ```
 
-Kai will start polling for Telegram messages. Press Ctrl+C to stop.
+Or manually: `source .venv/bin/activate && python -m kai`
 
-### Running as a service (macOS)
+For running as a background service, see the wiki: [macOS (launchd)](https://github.com/dcellison/kai/wiki/Architecture) or Linux (systemd).
 
-Create a launchd plist to keep Kai running in the background and restart it automatically. Replace `/Users/kai/Projects/kai` with your actual install path:
-
-```bash
-cat > ~/Library/LaunchAgents/com.kai.bot.plist << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.kai.bot</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Users/kai/Projects/kai/.venv/bin/python</string>
-        <string>-m</string>
-        <string>kai</string>
-    </array>
-
-    <key>WorkingDirectory</key>
-    <string>/Users/kai/Projects/kai</string>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-    </dict>
-
-    <key>RunAtLoad</key>
-    <true/>
-
-    <key>KeepAlive</key>
-    <true/>
-
-    <key>StandardOutPath</key>
-    <string>/Users/kai/Projects/kai/kai.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>/Users/kai/Projects/kai/kai.log</string>
-
-    <key>ProcessType</key>
-    <string>Background</string>
-</dict>
-</plist>
-EOF
-```
-
-Load and manage the service:
-
-```bash
-# Start
-launchctl load ~/Library/LaunchAgents/com.kai.bot.plist
-
-# Stop
-launchctl unload ~/Library/LaunchAgents/com.kai.bot.plist
-
-# Restart (stop then start)
-launchctl unload ~/Library/LaunchAgents/com.kai.bot.plist
-launchctl load ~/Library/LaunchAgents/com.kai.bot.plist
-
-# Check status
-launchctl list | grep com.kai.bot
-```
-
-### Running as a service (Linux with systemd)
-
-Adjust paths to match your install location:
-
-```ini
-# /etc/systemd/system/kai.service
-[Unit]
-Description=Kai Telegram Bot
-After=network.target
-
-[Service]
-Type=simple
-User=kai
-WorkingDirectory=/home/kai/kai
-ExecStart=/home/kai/kai/.venv/bin/python -m kai
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl enable kai
-sudo systemctl start kai
-sudo systemctl status kai
-```
-
-## Telegram Commands
+## Commands
 
 | Command | Description |
 |---|---|
-| `/models` | Interactive model picker with inline buttons |
-| `/model <name>` | Switch model directly (`opus`, `sonnet`, `haiku`) |
 | `/new` | Clear session and start fresh |
+| `/stop` | Interrupt a response mid-stream |
+| `/models` | Interactive model picker |
+| `/model <name>` | Switch model (`opus`, `sonnet`, `haiku`) |
 | `/workspace` | Show current workspace |
-| `/workspace <name>` | Switch by name (resolved via base) or absolute path |
+| `/workspace <name>` | Switch by name or absolute path |
 | `/workspace home` | Return to default workspace |
 | `/workspace base <path>` | Set the projects directory for short-name resolution |
-| `/workspace base` | Show current base directory |
-| `/workspace new <name>` | Create a new workspace, git init, and switch to it |
-| `/workspaces` | Interactive workspace picker (inline buttons) |
+| `/workspace new <name>` | Create a new workspace with git init |
+| `/workspaces` | Interactive workspace picker |
 | `/voice` | Toggle voice responses on/off |
 | `/voice only` | Voice-only mode (no text) |
 | `/voice on` | Text + voice mode |
 | `/voice <name>` | Set voice |
-| `/voices` | Interactive voice picker with inline buttons |
-| `/stop` | Interrupt a response mid-stream |
+| `/voices` | Interactive voice picker |
 | `/stats` | Show session info, model, and cost |
 | `/jobs` | List active scheduled jobs |
 | `/canceljob <id>` | Cancel a scheduled job |
@@ -190,140 +76,50 @@ sudo systemctl status kai
 ## Features
 
 ### Streaming responses
-Responses stream into Telegram in real time, updating the message every 2 seconds as Claude generates text.
+
+Responses stream into Telegram in real time, updating the message every 2 seconds.
 
 ### Model switching
-Use `/models` for an interactive picker or `/model <name>` to switch directly. Changing models restarts the session.
 
-### Workspace switching
-Point Kai at any directory on your machine with `/workspace <path>`. Kai's identity and memory carry over from the home workspace.
+Switch between Opus, Sonnet, and Haiku via `/models` (interactive picker) or `/model <name>` (direct). Changing models restarts the session.
 
-To switch by short name (e.g., `/workspace kai` instead of `/workspace /Users/you/Projects/kai`), first set a base directory:
+### Workspaces
 
-```
-/workspace base /Users/you/Projects
-```
-
-After that, `/workspace kai` resolves to `/Users/you/Projects/kai`. Without a base, only absolute paths and `~` paths work.
-
-Create new workspaces with `/workspace new <name>` (creates the directory and runs `git init`). Use `/workspaces` for an interactive picker with inline buttons — tap to switch, or tap the current workspace to dismiss.
+Point Claude at any directory with `/workspace <path>`. Identity and memory from the home workspace carry over. Set a base directory with `/workspace base` to enable short names (e.g., `/workspace kai` instead of the full path). Create new workspaces with `/workspace new <name>`.
 
 ### Image and file support
-Send photos or documents directly in the chat. Kai supports:
-- **Images** (JPEG, PNG, GIF, WebP) - sent as photos or uncompressed documents
-- **Text files** (Python, JS, JSON, Markdown, and many more) - content is extracted and sent to Claude
 
-### Voice messages
+Send photos or documents directly in chat. Supports images (JPEG, PNG, GIF, WebP) and text files (Python, JS, JSON, Markdown, and many more).
 
-Send a voice note in Telegram and Kai transcribes it locally using [whisper.cpp](https://github.com/ggerganov/whisper.cpp), then forwards the transcription to Claude. The transcription is echoed back to the chat so you can see what Kai heard before it responds.
+### Voice input
 
-Everything runs on your machine — no external speech-to-text APIs or per-minute costs. Requires `ffmpeg` and `whisper-cpp` (both available via Homebrew) plus a one-time model download (~148MB).
-
-Voice messages are disabled by default. Set `VOICE_ENABLED=true` in `.env` after installing the dependencies. See the [Voice Setup](https://github.com/dcellison/kai/wiki/Voice-Setup) wiki page for full instructions.
+Voice notes are transcribed locally using [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and forwarded to Claude. Requires `ffmpeg` and `whisper-cpp`. Disabled by default — set `VOICE_ENABLED=true` after installing dependencies. See the [Voice Setup](https://github.com/dcellison/kai/wiki/Voice-Setup) wiki page.
 
 ### Voice responses (TTS)
 
-Kai can speak its responses back to you using [Piper TTS](https://github.com/rhasspy/piper), a fast local text-to-speech engine. Three modes are available:
+Text-to-speech via [Piper TTS](https://github.com/rhasspy/piper). Three modes: `/voice only` (voice note, no text), `/voice on` (text + voice), `/voice off` (text only, default). Eight curated English voices. Requires `pip install -e '.[tts]'` and `TTS_ENABLED=true`. See [Voice Setup](https://github.com/dcellison/kai/wiki/Voice-Setup).
 
-- **`/voice only`** — Voice-only responses. Kai shows "recording voice message..." while synthesizing, then sends a voice note. No text streaming. Falls back to text if synthesis fails.
-- **`/voice on`** — Text + voice. Responses stream as text first, then a voice note follows.
-- **`/voice off`** — Text only (default).
+### Webhooks
 
-Use `/voice <name>` to switch between voices or `/voices` for an interactive picker. Eight curated English voices are included (4 British, 4 American).
-
-Everything runs locally via [Piper TTS](https://github.com/rhasspy/piper) — no cloud services. Requires `pip install -e '.[tts]'` and a one-time model download (~61MB per voice). Set `TTS_ENABLED=true` in `.env` after setup. See the [Voice Setup](https://github.com/dcellison/kai/wiki/Voice-Setup) wiki page for full instructions.
-
-### GitHub notifications
-
-Kai runs an HTTP server that receives GitHub webhook events and forwards them to Telegram as formatted notifications. Supported events:
-
-- **Pushes** — commit summaries with SHAs, messages, and a compare link
-- **Pull requests** — opened, closed, merged, reopened
-- **Issues** — opened, closed, reopened
-- **Issue comments** — new comments with author and body preview
-- **PR reviews** — approved or changes requested
-
-Signatures are validated using the `WEBHOOK_SECRET` via HMAC-SHA256, matching GitHub's `X-Hub-Signature-256` header.
-
-The webhook server listens on `localhost:8080` by default. To receive events from GitHub (or any external service), you need to expose it to the internet. Options include:
-
-- [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) — free, runs as a background service, maps a domain to your local port. Recommended if you have a domain on Cloudflare.
-- [ngrok](https://ngrok.com/) — quick setup, gives you a public URL with one command. Good for testing.
-- A reverse proxy (nginx, Caddy) on a server with a public IP.
-
-If using Cloudflare Tunnel, the tunnel config should only route public-facing paths to your server. Internal APIs (like `/api/*`) should not be exposed. A config like this ensures only webhooks and health checks are reachable from the internet — everything else returns 404 at the tunnel level, before it ever reaches your server:
-
-```yaml
-ingress:
-  - hostname: your.domain
-    path: /webhook/*
-    service: http://localhost:8080
-  - hostname: your.domain
-    path: /health
-    service: http://localhost:8080
-  - service: http_status:404
-```
-
-Once exposed, add a webhook on your GitHub repo pointing to `https://<your-host>/webhook/github` with the secret set to your `WEBHOOK_SECRET` value. Select the events you want. See the [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet) wiki page for a full walkthrough.
-
-### Generic webhooks
-
-POST JSON to `/webhook` with an `X-Webhook-Secret` header. If the payload contains a `message` field, that text is sent to Telegram; otherwise the full JSON is forwarded (truncated to 4096 characters).
-
-Useful for connecting any service that can fire HTTP requests — CI pipelines, monitoring alerts, home automation, etc.
+An HTTP server receives GitHub webhook events (pushes, PRs, issues, comments, reviews) and forwards them to Telegram. Signatures are validated via HMAC-SHA256. A generic webhook endpoint (`POST /webhook`) accepts JSON from any service. See [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet).
 
 ### Scheduled jobs
 
-Kai can schedule reminders and recurring tasks. Ask it naturally (e.g., "remind me to check the laundry at 3pm") and it will use the built-in scheduling API. Two job types:
+Reminders and recurring Claude jobs with one-shot, daily, and interval schedules. Ask naturally ("remind me at 3pm") or use the HTTP API (`POST /api/schedule`). Claude jobs support conditional auto-remove for monitoring use cases (`CONDITION_MET` / `CONDITION_NOT_MET` protocol). See [Scheduling and Conditional Jobs](https://github.com/dcellison/kai/wiki/Scheduling-and-Conditional-Jobs).
 
-- **Reminders** — sends a message at the scheduled time
-- **Claude jobs** — runs a prompt through Claude at the scheduled time (useful for monitoring, daily summaries, etc.)
+### Memory
 
-Jobs support one-shot, daily, and interval schedules. Use `/jobs` to list active jobs and `/canceljob <id>` to remove one. See the [Scheduling and Conditional Jobs](https://github.com/dcellison/kai/wiki/Scheduling-and-Conditional-Jobs) wiki page for details on job types, the HTTP API, and conditional monitoring patterns.
+Three layers of persistent context:
 
-#### Conditional jobs
+1. **Auto-memory** — managed by Claude Code per-workspace. Project architecture and patterns.
+2. **Home memory** (`workspace/.claude/MEMORY.md`) — personal memory, always injected regardless of current workspace. Proactively updated by Kai.
+3. **Conversation history** (`workspace/.claude/history/`) — JSONL logs, one file per day. Searchable for past conversations.
 
-Claude jobs can be set with `auto_remove: true` for monitoring use cases. Claude is expected to respond with a protocol marker:
-
-- `CONDITION_MET: <message>` — delivers the message and deactivates the job
-- `CONDITION_NOT_MET` — silently continues checking on the next scheduled run
-
-This is useful for things like "let me know when this PR is merged" or "tell me when the deploy finishes."
-
-#### Scheduling HTTP API
-
-Jobs can also be created programmatically via `POST /api/schedule`:
-
-```json
-{
-  "name": "daily standup",
-  "prompt": "Summarize my recent git activity",
-  "schedule_type": "daily",
-  "schedule_data": {"times": ["09:00"]},
-  "job_type": "claude",
-  "auto_remove": false
-}
-```
-
-Auth: set the `X-Webhook-Secret` header to your `WEBHOOK_SECRET`. Schedule types: `once` (with `{"run_at": "ISO8601"}`), `daily` (with `{"times": ["HH:MM", ...]}`), `interval` (with `{"seconds": N}`).
-
-### Persistent memory
-
-Kai has three layers of memory:
-
-1. **Auto-memory** (`~/.claude/projects/.../memory/MEMORY.md`) — managed automatically by Claude Code. Project architecture, completed features, infrastructure knowledge. Created per-workspace.
-2. **Home memory** (`workspace/.claude/MEMORY.md`) — Kai's personal memory from the home workspace. User preferences, facts, ongoing context. Always injected regardless of current workspace. Kai proactively updates this file when it notices information worth persisting — no need to explicitly ask it to remember things.
-3. **Conversation history** (`workspace/.claude/history/`) — all messages logged as JSONL files, one per day. Kai can search these when asked about past conversations, giving it long-term recall beyond what fits in context.
-
-Auto-memory is institutional knowledge (how the project works), home memory is personal (who you are, what you prefer), and conversation history is episodic (what you talked about and when). Together they give Kai full context regardless of which workspace it's in.
-
-When working in a foreign workspace, Kai also injects that workspace's `.claude/MEMORY.md` if it exists, so project-specific context is available alongside personal memory.
-
-The [Architecture](https://github.com/dcellison/kai/wiki/Architecture) wiki page covers how memory injection works across workspace switches.
+Foreign workspaces also get their own `.claude/MEMORY.md` injected alongside home memory. See [Architecture](https://github.com/dcellison/kai/wiki/Architecture).
 
 ### Crash recovery
 
-If Kai is interrupted mid-response, it notifies you on restart and asks you to resend your last message.
+If interrupted mid-response, Kai notifies you on restart and asks you to resend your last message.
 
 ## Project Structure
 
@@ -346,14 +142,12 @@ kai/
 ├── tests/                # Test suite
 ├── models/               # Whisper and Piper model files (gitignored)
 ├── workspace/            # Claude Code working directory
-│   └── .claude/          # Identity (CLAUDE.md), memory (MEMORY.md), and history/ (chat logs)
-├── pyproject.toml        # Package metadata, dependencies, and tool config
+│   └── .claude/          # Identity, memory, and chat history
+├── pyproject.toml        # Package metadata and dependencies
 ├── Makefile              # Common dev commands
 ├── .env.example          # Environment variable template
 └── LICENSE               # Apache 2.0
 ```
-
-For a deeper look at the message lifecycle, database schema, concurrency model, and how workspaces interact with memory, see the [Architecture](https://github.com/dcellison/kai/wiki/Architecture) wiki page.
 
 ## Development
 
