@@ -54,6 +54,8 @@ def main() -> None:
                     BotCommand("stats", "Show session info and cost"),
                     BotCommand("jobs", "List scheduled jobs"),
                     BotCommand("canceljob", "Cancel a scheduled job"),
+                    BotCommand("voice", "Toggle voice responses / set voice"),
+                    BotCommand("voices", "Choose a voice (inline buttons)"),
                     BotCommand("webhooks", "Show webhook server status"),
                     BotCommand("help", "Show available commands"),
                 ]

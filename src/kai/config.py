@@ -21,6 +21,8 @@ class Config:
     webhook_secret: str = ""
     voice_enabled: bool = False
     whisper_model_path: Path = field(default_factory=lambda: PROJECT_ROOT / "models" / "ggml-base.en.bin")
+    tts_enabled: bool = False
+    piper_model_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "models" / "piper")
 
 
 def load_config() -> Config:
@@ -50,4 +52,5 @@ def load_config() -> Config:
         webhook_port=int(os.environ.get("WEBHOOK_PORT", "8080")),
         webhook_secret=os.environ.get("WEBHOOK_SECRET", ""),
         voice_enabled=os.environ.get("VOICE_ENABLED", "").lower() in ("1", "true", "yes"),
+        tts_enabled=os.environ.get("TTS_ENABLED", "").lower() in ("1", "true", "yes"),
     )

@@ -24,6 +24,7 @@ from kai.claude import PersistentClaude
 from kai.config import PROJECT_ROOT, Config
 from kai.locks import get_lock, get_stop_event
 from kai.transcribe import TranscriptionError, transcribe_voice
+from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 
 log = logging.getLogger(__name__)
 
@@ -198,6 +199,118 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await _switch_model(context, update.effective_chat.id, model)
     await update.message.reply_text(f"Model set to {_AVAILABLE_MODELS[model]}. Session restarted.")
+
+
+# ── Voice TTS ────────────────────────────────────────────────────────
+
+
+def _voices_keyboard(current: str) -> InlineKeyboardMarkup:
+    buttons = []
+    for key, name in VOICES.items():
+        label = f"{name} \U0001f7e2" if key == current else name
+        buttons.append([InlineKeyboardButton(label, callback_data=f"voice:{key}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+_VOICE_MODES = {"off", "on", "only"}
+_VOICE_MODE_LABELS = {"off": "OFF", "on": "ON (text + voice)", "only": "ONLY (voice only)"}
+
+
+@_require_auth
+async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle voice mode or set voice: /voice [on|only|off|<name>]."""
+    config: Config = context.bot_data["config"]
+    if not config.tts_enabled:
+        await update.message.reply_text("TTS is not enabled. Set TTS_ENABLED=true in .env")
+        return
+
+    chat_id = update.effective_chat.id
+    current_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
+    current_voice = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+
+    if context.args:
+        arg = context.args[0].lower()
+        if arg in _VOICE_MODES:
+            # /voice on|only|off — set mode directly
+            await sessions.set_setting(f"voice_mode:{chat_id}", arg)
+            await update.message.reply_text(
+                f"Voice mode: {_VOICE_MODE_LABELS[arg]} (voice: {VOICES[current_voice]})"
+            )
+        elif arg in VOICES:
+            # /voice <name> — set voice (enable in current mode, or default to "only")
+            await sessions.set_setting(f"voice_name:{chat_id}", arg)
+            if current_mode == "off":
+                await sessions.set_setting(f"voice_mode:{chat_id}", "only")
+                current_mode = "only"
+            await update.message.reply_text(
+                f"Voice set to {VOICES[arg]}. Voice mode: {_VOICE_MODE_LABELS[current_mode]}"
+            )
+        else:
+            names = ", ".join(VOICES.keys())
+            await update.message.reply_text(
+                f"Unknown voice or mode. Usage:\n"
+                f"/voice on — text + voice\n"
+                f"/voice only — voice only\n"
+                f"/voice off — text only\n"
+                f"/voice <name> — set voice\n\n"
+                f"Voices: {names}"
+            )
+    else:
+        # /voice — toggle: off → only → off
+        new_mode = "off" if current_mode != "off" else "only"
+        await sessions.set_setting(f"voice_mode:{chat_id}", new_mode)
+        await update.message.reply_text(
+            f"Voice mode: {_VOICE_MODE_LABELS[new_mode]} (voice: {VOICES[current_voice]})"
+        )
+
+
+@_require_auth
+async def handle_voices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show inline keyboard of available voices."""
+    config: Config = context.bot_data["config"]
+    if not config.tts_enabled:
+        await update.message.reply_text("TTS is not enabled. Set TTS_ENABLED=true in .env")
+        return
+
+    chat_id = update.effective_chat.id
+    current_voice = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+    await update.message.reply_text(
+        "Choose a voice:",
+        reply_markup=_voices_keyboard(current_voice),
+    )
+
+
+async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard voice selection."""
+    query = update.callback_query
+    config: Config = context.bot_data["config"]
+    if not _is_authorized(config, update.effective_user.id):
+        await query.answer("Not authorized.")
+        return
+
+    voice = query.data.removeprefix("voice:")
+    if voice not in VOICES:
+        await query.answer("Invalid voice.")
+        return
+
+    chat_id = update.effective_chat.id
+    current_voice = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+
+    if voice == current_voice:
+        await query.answer()
+        await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
+        return
+
+    current_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
+    await sessions.set_setting(f"voice_name:{chat_id}", voice)
+    if current_mode == "off":
+        await sessions.set_setting(f"voice_mode:{chat_id}", "only")
+        current_mode = "only"
+    await query.answer()
+    await query.edit_message_text(
+        f"Voice set to {VOICES[voice]}. Voice mode: {_VOICE_MODE_LABELS[current_mode]}",
+        reply_markup=InlineKeyboardMarkup([]),
+    )
 
 
 @_require_auth
@@ -600,6 +713,11 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/workspaces - Switch workspace (inline buttons)\n"
         "/models - Choose a model\n"
         "/model <name> - Switch model directly\n"
+        "/voice - Toggle voice on/off\n"
+        "/voice only - Voice only (no text)\n"
+        "/voice on - Text + voice\n"
+        "/voice <name> - Set voice\n"
+        "/voices - Choose a voice (inline buttons)\n"
         "/memory - Show memory file locations\n"
         "/stats - Show session info and cost\n"
         "/jobs - List scheduled jobs\n"
@@ -862,13 +980,21 @@ async def _handle_response(
     claude: PersistentClaude,
     model: str,
 ) -> None:
-    # Keep "typing..." visible until the response completes
+    # Check voice mode before starting
+    config: Config = context.bot_data["config"]
+    voice_mode = "off"
+    if config.tts_enabled:
+        voice_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
+    voice_only = voice_mode == "only"
+
+    # Keep activity indicator visible until the response completes
+    chat_action = ChatAction.RECORD_VOICE if voice_only else ChatAction.TYPING
     typing_active = True
 
     async def _keep_typing():
         while typing_active:
             try:
-                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                await context.bot.send_chat_action(chat_id=chat_id, action=chat_action)
             except Exception:
                 pass
             await asyncio.sleep(4)
@@ -894,6 +1020,9 @@ async def _handle_response(
         if event.done:
             final_response = event.response
             break
+
+        if voice_only:
+            continue
 
         now = time.monotonic()
         if not event.text_so_far:
@@ -933,6 +1062,18 @@ async def _handle_response(
 
     final_text = final_response.text
     log_message(direction="assistant", chat_id=chat_id, text=final_text)
+
+    # Voice-only mode: synthesize and send voice, fall back to text on failure
+    if voice_only and final_text:
+        voice_name = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+        try:
+            audio = await synthesize_speech(final_text, config.piper_model_dir, voice_name)
+            await context.bot.send_voice(chat_id=chat_id, voice=audio)
+            return
+        except TTSError as e:
+            log.warning("TTS failed, falling back to text: %s", e)
+
+    # Send text response (normal mode, or voice-only fallback)
     if live_msg:
         if len(final_text) <= 4096:
             if final_text != last_edit_text:
@@ -944,6 +1085,15 @@ async def _handle_response(
                 await _reply_safe(update.message, chunk)
     else:
         await _send_response(update, final_text)
+
+    # Text+voice mode: send voice note after text
+    if voice_mode == "on" and final_text:
+        voice_name = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+        try:
+            audio = await synthesize_speech(final_text, config.piper_model_dir, voice_name)
+            await context.bot.send_voice(chat_id=chat_id, voice=audio)
+        except TTSError as e:
+            log.warning("TTS failed: %s", e)
 
 
 def create_bot(config: Config) -> Application:
@@ -970,9 +1120,12 @@ def create_bot(config: Config) -> Application:
     app.add_handler(CommandHandler("memory", handle_memory))
     app.add_handler(CommandHandler("workspace", handle_workspace))
     app.add_handler(CommandHandler("workspaces", handle_workspaces))
+    app.add_handler(CommandHandler("voice", handle_voice_command))
+    app.add_handler(CommandHandler("voices", handle_voices))
     app.add_handler(CommandHandler("webhooks", handle_webhooks))
     app.add_handler(CommandHandler("stop", handle_stop))
     app.add_handler(CallbackQueryHandler(handle_model_callback, pattern=r"^model:"))
+    app.add_handler(CallbackQueryHandler(handle_voice_callback, pattern=r"^voice:"))
     app.add_handler(CallbackQueryHandler(handle_workspace_callback, pattern=r"^ws:"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))

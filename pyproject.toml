@@ -24,6 +24,10 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24.0",
 ]
+tts = [
+    "piper-tts>=1.4.0",
+    "pathvalidate>=3.0.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
