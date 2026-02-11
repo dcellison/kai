@@ -4,6 +4,8 @@ A personal AI assistant accessed via Telegram, powered by [Claude Code](https://
 
 Kai is a Telegram gateway to a persistent Claude Code process. Messages are forwarded to Claude with full tool access (shell, files, web search), and responses stream back in real time. Everything runs locally — conversations and credentials never leave your machine.
 
+For detailed guides on setup, architecture, and optional features, see the **[Wiki](https://github.com/dcellison/kai/wiki)**.
+
 ## Features
 
 ### Streaming responses
@@ -46,7 +48,7 @@ Three layers of persistent context:
 2. **Home memory** (`workspace/.claude/MEMORY.md`) — personal memory, always injected regardless of current workspace. Proactively updated by Kai.
 3. **Conversation history** (`workspace/.claude/history/`) — JSONL logs, one file per day. Searchable for past conversations.
 
-Foreign workspaces also get their own `.claude/MEMORY.md` injected alongside home memory. See [Architecture](https://github.com/dcellison/kai/wiki/Architecture).
+Foreign workspaces also get their own `.claude/MEMORY.md` injected alongside home memory. See [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture).
 
 ### Crash recovery
 
