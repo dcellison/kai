@@ -51,6 +51,7 @@ cp .env.example .env
 | `WEBHOOK_PORT` | No | `8080` | HTTP server port for webhooks and scheduling API |
 | `WEBHOOK_SECRET` | No | | Secret for webhook validation and scheduling API auth |
 | `VOICE_ENABLED` | No | `false` | Enable voice message transcription (see below) |
+| `TTS_ENABLED` | No | `false` | Enable text-to-speech voice responses (see below) |
 
 ### Session budget cap
 
@@ -174,6 +175,11 @@ sudo systemctl status kai
 | `/workspace base` | Show current base directory |
 | `/workspace new <name>` | Create a new workspace, git init, and switch to it |
 | `/workspaces` | Interactive workspace picker (inline buttons) |
+| `/voice` | Toggle voice responses on/off |
+| `/voice only` | Voice-only mode (no text) |
+| `/voice on` | Text + voice mode |
+| `/voice <name>` | Set voice |
+| `/voices` | Interactive voice picker with inline buttons |
 | `/stop` | Interrupt a response mid-stream |
 | `/memory` | Show memory file locations |
 | `/stats` | Show session info, model, and cost |
@@ -214,7 +220,19 @@ Send a voice note in Telegram and Kai transcribes it locally using [whisper.cpp]
 
 Everything runs on your machine — no external speech-to-text APIs or per-minute costs. Requires `ffmpeg` and `whisper-cpp` (both available via Homebrew) plus a one-time model download (~148MB).
 
-Voice messages are disabled by default. Set `VOICE_ENABLED=true` in `.env` after installing the dependencies. See the [Voice Message Setup](https://github.com/dcellison/kai/wiki/Voice-Message-Setup) wiki page for full instructions.
+Voice messages are disabled by default. Set `VOICE_ENABLED=true` in `.env` after installing the dependencies. See the [Voice Setup](https://github.com/dcellison/kai/wiki/Voice-Setup) wiki page for full instructions.
+
+### Voice responses (TTS)
+
+Kai can speak its responses back to you using [Piper TTS](https://github.com/rhasspy/piper), a fast local text-to-speech engine. Three modes are available:
+
+- **`/voice only`** — Voice-only responses. Kai shows "recording voice message..." while synthesizing, then sends a voice note. No text streaming. Falls back to text if synthesis fails.
+- **`/voice on`** — Text + voice. Responses stream as text first, then a voice note follows.
+- **`/voice off`** — Text only (default).
+
+Use `/voice <name>` to switch between voices or `/voices` for an interactive picker. Eight curated English voices are included (4 British, 4 American).
+
+Everything runs locally via [Piper TTS](https://github.com/rhasspy/piper) — no cloud services. Requires `pip install -e '.[tts]'` and a one-time model download (~61MB per voice). Set `TTS_ENABLED=true` in `.env` after setup. See the [Voice Setup](https://github.com/dcellison/kai/wiki/Voice-Setup) wiki page for full instructions.
 
 ### GitHub notifications
 
@@ -327,9 +345,10 @@ kai/
 │   ├── webhook.py        # HTTP server: GitHub/generic webhooks, scheduling API
 │   ├── chat_log.py       # JSONL chat logging
 │   ├── locks.py          # Per-chat async locks and stop events
-│   └── transcribe.py     # Voice message transcription (ffmpeg + whisper-cpp)
+│   ├── transcribe.py     # Voice message transcription (ffmpeg + whisper-cpp)
+│   └── tts.py            # Text-to-speech synthesis (Piper TTS + ffmpeg)
 ├── tests/                # Test suite
-├── models/               # Whisper model files (gitignored)
+├── models/               # Whisper and Piper model files (gitignored)
 ├── workspace/            # Claude Code working directory
 │   └── .claude/          # Identity (CLAUDE.md) and memory template (MEMORY.md.example)
 ├── pyproject.toml        # Package metadata, dependencies, and tool config
