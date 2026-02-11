@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 
 from aiohttp import web
 
@@ -13,6 +14,15 @@ log = logging.getLogger(__name__)
 
 _app: web.Application | None = None
 _runner: web.AppRunner | None = None
+
+
+def _strip_markdown(text: str) -> str:
+    """Remove markdown syntax so text reads cleanly as plain text."""
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)  # [text](url) → text (url)
+    text = text.replace("**", "").replace("__", "")  # bold
+    text = text.replace("`", "")  # inline code
+    text = re.sub(r"(?<!\w)_(\S.*?\S)_(?!\w)", r"\1", text)  # _italic_ but not snake_case
+    return text
 
 
 # ── GitHub event formatters ───────────────────────────────────────────
@@ -159,7 +169,7 @@ async def _handle_github(request: web.Request) -> web.Response:
         await bot.send_message(chat_id, message, parse_mode="Markdown")
     except Exception:
         try:
-            await bot.send_message(chat_id, message)
+            await bot.send_message(chat_id, _strip_markdown(message))
         except Exception:
             log.exception("Failed to send GitHub notification")
             return web.json_response({"msg": "error"})
