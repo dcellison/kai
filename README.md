@@ -119,7 +119,65 @@ make run
 
 Or manually: `source .venv/bin/activate && python -m kai`
 
-For running as a background service, see the wiki: [macOS (launchd)](https://github.com/dcellison/kai/wiki/Architecture) or Linux (systemd).
+### Running as a service (macOS)
+
+Create `~/Library/LaunchAgents/com.syrinx.kai.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.syrinx.kai</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/kai/.venv/bin/python</string>
+        <string>-m</string>
+        <string>kai</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/path/to/kai</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/path/to/kai/kai.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/path/to/kai/kai.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
+```
+
+Replace `/path/to/kai` with your actual project path. The `PATH` must include directories for `claude`, `ffmpeg`, and any other tools Kai shells out to.
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.syrinx.kai.plist
+```
+
+Kai will start immediately and restart automatically on login or crash. Logs go to `kai.log` in the project directory. To stop:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.syrinx.kai.plist
+```
+
+On Linux, create an equivalent systemd unit with `Restart=always`.
 
 ## Project Structure
 
