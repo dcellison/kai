@@ -121,7 +121,7 @@ Or manually: `source .venv/bin/activate && python -m kai`
 
 ### Running as a service (macOS)
 
-Create `~/Library/LaunchAgents/com.syrinx.kai.plist`:
+Create `~/Library/LaunchAgents/com.kai.bot.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -129,7 +129,7 @@ Create `~/Library/LaunchAgents/com.syrinx.kai.plist`:
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.syrinx.kai</string>
+    <string>com.kai.bot</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -168,13 +168,13 @@ Create `~/Library/LaunchAgents/com.syrinx.kai.plist`:
 Replace `/path/to/kai` with your actual project path. The `PATH` must include directories for `claude`, `ffmpeg`, and any other tools Kai shells out to.
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.syrinx.kai.plist
+launchctl load ~/Library/LaunchAgents/com.kai.bot.plist
 ```
 
 Kai will start immediately and restart automatically on login or crash. Logs go to `kai.log` in the project directory. To stop:
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.syrinx.kai.plist
+launchctl unload ~/Library/LaunchAgents/com.kai.bot.plist
 ```
 
 On Linux, create an equivalent systemd unit with `Restart=always`.
