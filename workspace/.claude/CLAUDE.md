@@ -20,7 +20,7 @@ Your persistent memory file is at `.claude/MEMORY.md`. When asked to remember so
 
 ## Chat History
 
-All past conversations are logged as JSONL in `chat_history/`, one file per day (e.g., `2026-02-10.jsonl`). Each line is a JSON object with fields: `ts` (ISO timestamp), `dir` (`user` or `assistant`), `chat_id`, `text`, and optional `media`. When asked about past conversations, search these files with grep or jq.
+All past conversations are logged as JSONL in `.claude/history/`, one file per day (e.g., `2026-02-10.jsonl`). Each line is a JSON object with fields: `ts` (ISO timestamp), `dir` (`user` or `assistant`), `chat_id`, `text`, and optional `media`. When asked about past conversations, search these files with grep or jq.
 
 ## Scheduling Jobs
 

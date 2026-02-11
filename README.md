@@ -323,7 +323,7 @@ Use `/memory` to see file locations. The [Architecture](https://github.com/dcell
 
 ### Chat logging
 
-All messages are logged as JSONL files in `workspace/chat_history/`, organized by date.
+All messages are logged as JSONL files in `workspace/.claude/history/`, organized by date.
 
 ### Crash recovery
 

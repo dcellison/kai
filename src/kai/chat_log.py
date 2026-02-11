@@ -6,7 +6,7 @@ from kai.config import PROJECT_ROOT
 
 log = logging.getLogger(__name__)
 
-_LOG_DIR = PROJECT_ROOT / "workspace" / "chat_history"
+_LOG_DIR = PROJECT_ROOT / "workspace" / ".claude" / "history"
 
 
 def log_message(
