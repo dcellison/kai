@@ -350,7 +350,7 @@ kai/
 ├── tests/                # Test suite
 ├── models/               # Whisper and Piper model files (gitignored)
 ├── workspace/            # Claude Code working directory
-│   └── .claude/          # Identity (CLAUDE.md) and memory template (MEMORY.md.example)
+│   └── .claude/          # Identity (CLAUDE.md), memory (MEMORY.md), and history/ (chat logs)
 ├── pyproject.toml        # Package metadata, dependencies, and tool config
 ├── Makefile              # Common dev commands
 ├── .env.example          # Environment variable template
