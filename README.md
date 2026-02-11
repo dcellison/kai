@@ -181,7 +181,6 @@ sudo systemctl status kai
 | `/voice <name>` | Set voice |
 | `/voices` | Interactive voice picker with inline buttons |
 | `/stop` | Interrupt a response mid-stream |
-| `/memory` | Show memory file locations |
 | `/stats` | Show session info, model, and cost |
 | `/jobs` | List active scheduled jobs |
 | `/canceljob <id>` | Cancel a scheduled job |
@@ -320,7 +319,7 @@ Auto-memory is institutional knowledge (how the project works), home memory is p
 
 When working in a foreign workspace, Kai also injects that workspace's `.claude/MEMORY.md` if it exists, so project-specific context is available alongside personal memory.
 
-Use `/memory` to see file locations. The [Architecture](https://github.com/dcellison/kai/wiki/Architecture) wiki page covers how memory injection works across workspace switches.
+The [Architecture](https://github.com/dcellison/kai/wiki/Architecture) wiki page covers how memory injection works across workspace switches.
 
 ### Crash recovery
 

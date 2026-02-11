@@ -50,7 +50,6 @@ def main() -> None:
                     BotCommand("workspace", "Switch working directory"),
                     BotCommand("workspaces", "List recent workspaces"),
                     BotCommand("stop", "Interrupt current response"),
-                    BotCommand("memory", "View or clear persistent memory"),
                     BotCommand("stats", "Show session info and cost"),
                     BotCommand("jobs", "List scheduled jobs"),
                     BotCommand("canceljob", "Cancel a scheduled job"),

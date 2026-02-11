@@ -35,12 +35,6 @@ EDIT_INTERVAL = 2.0
 _RESPONDING_FLAG = PROJECT_ROOT / ".responding_to"
 
 
-def _line_count(path: Path) -> int:
-    """Count lines in a file, returning 0 if it doesn't exist."""
-    if not path.exists():
-        return 0
-    return len(path.read_text().splitlines())
-
 
 def _set_responding(chat_id: int) -> None:
     _RESPONDING_FLAG.write_text(str(chat_id))
@@ -394,40 +388,6 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text("Stopping...")
 
 
-@_require_auth
-async def handle_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    claude = _get_claude(context)
-    config: Config = context.bot_data["config"]
-    home = config.claude_workspace
-
-    # Build a list of memory file locations and their status
-    lines = ["Memory files (all injected at session start):\n"]
-
-    # 1. Claude Code auto-memory (managed by Claude Code itself)
-    # Path is based on workspace path with slashes replaced by hyphens
-    ws_path = str(claude.workspace)
-    auto_key = ws_path.replace("/", "-")
-    auto_path = Path.home() / ".claude" / "projects" / auto_key / "memory" / "MEMORY.md"
-    exists = auto_path.exists()
-    status = f"{_line_count(auto_path)} lines" if exists else "not created yet"
-    lines.append(f"Auto-memory ({status}):\n{auto_path}")
-
-    # 2. Home workspace memory
-    home_memory = home / ".claude" / "MEMORY.md"
-    exists = home_memory.exists()
-    status = f"{_line_count(home_memory)} lines" if exists else "not created yet"
-    lines.append(f"\nHome memory ({status}):\n{home_memory}")
-
-    # 3. Current workspace memory (if different from home)
-    if claude.workspace != home:
-        ws_memory = claude.workspace / ".claude" / "MEMORY.md"
-        exists = ws_memory.exists()
-        status = f"{_line_count(ws_memory)} lines" if exists else "not created yet"
-        lines.append(f"\nWorkspace memory ({status}):\n{ws_memory}")
-
-    lines.append("\nAsk me about my memory in natural language to see details.")
-    await update.message.reply_text("\n".join(lines))
-
 
 async def _resolve_workspace_path(target: str, base: str | None) -> Path | None:
     """Resolve a workspace target to an absolute path.
@@ -718,7 +678,6 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/voice on - Text + voice\n"
         "/voice <name> - Set voice\n"
         "/voices - Choose a voice (inline buttons)\n"
-        "/memory - Show memory file locations\n"
         "/stats - Show session info and cost\n"
         "/jobs - List scheduled jobs\n"
         "/canceljob <id> - Cancel a job\n"
@@ -1117,7 +1076,6 @@ def create_bot(config: Config) -> Application:
     app.add_handler(CommandHandler("help", handle_help))
     app.add_handler(CommandHandler("jobs", handle_jobs))
     app.add_handler(CommandHandler("canceljob", handle_canceljob))
-    app.add_handler(CommandHandler("memory", handle_memory))
     app.add_handler(CommandHandler("workspace", handle_workspace))
     app.add_handler(CommandHandler("workspaces", handle_workspaces))
     app.add_handler(CommandHandler("voice", handle_voice_command))
