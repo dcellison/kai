@@ -5,6 +5,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from kai.history import get_recent_history
+
 log = logging.getLogger(__name__)
 
 
@@ -154,6 +156,13 @@ class PersistentClaude:
                     ws_memory = ws_memory_path.read_text().strip()
                     if ws_memory:
                         parts.append(f"[Your memory for this workspace ({self.workspace.name}):]\n{ws_memory}")
+
+            # Inject recent conversation history for continuity
+            recent = get_recent_history()
+            if recent:
+                parts.append(
+                    f"[Recent conversations (search .claude/history/ for full logs):]\n{recent}"
+                )
 
             # Inject scheduling API info (always, so cron works from any workspace)
             if self.webhook_secret:

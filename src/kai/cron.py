@@ -8,7 +8,7 @@ from telegram.error import Forbidden
 from telegram.ext import Application, ContextTypes
 
 from kai import sessions
-from kai.chat_log import log_message
+from kai.history import log_message
 from kai.locks import get_lock
 
 log = logging.getLogger(__name__)

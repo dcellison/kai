@@ -310,20 +310,17 @@ Auth: set the `X-Webhook-Secret` header to your `WEBHOOK_SECRET`. Schedule types
 
 ### Persistent memory
 
-Kai has two layers of memory, injected at the start of each session:
+Kai has three layers of memory:
 
 1. **Auto-memory** (`~/.claude/projects/.../memory/MEMORY.md`) — managed automatically by Claude Code. Project architecture, completed features, infrastructure knowledge. Created per-workspace.
-2. **Home memory** (`workspace/.claude/MEMORY.md`) — Kai's personal memory from the home workspace. User preferences, facts, ongoing context. Always injected regardless of current workspace.
+2. **Home memory** (`workspace/.claude/MEMORY.md`) — Kai's personal memory from the home workspace. User preferences, facts, ongoing context. Always injected regardless of current workspace. Kai proactively updates this file when it notices information worth persisting — no need to explicitly ask it to remember things.
+3. **Conversation history** (`workspace/.claude/history/`) — all messages logged as JSONL files, one per day. Kai can search these when asked about past conversations, giving it long-term recall beyond what fits in context.
+
+Auto-memory is institutional knowledge (how the project works), home memory is personal (who you are, what you prefer), and conversation history is episodic (what you talked about and when). Together they give Kai full context regardless of which workspace it's in.
 
 When working in a foreign workspace, Kai also injects that workspace's `.claude/MEMORY.md` if it exists, so project-specific context is available alongside personal memory.
 
-Auto-memory is institutional knowledge (how the project works) while home memory is personal (who you are, what you prefer). By injecting both, Kai always has its full context regardless of which workspace it's in.
-
 Use `/memory` to see file locations. The [Architecture](https://github.com/dcellison/kai/wiki/Architecture) wiki page covers how memory injection works across workspace switches.
-
-### Chat logging
-
-All messages are logged as JSONL files in `workspace/.claude/history/`, organized by date.
 
 ### Crash recovery
 
@@ -343,7 +340,7 @@ kai/
 │   ├── sessions.py       # SQLite session, job, and settings storage
 │   ├── cron.py           # Scheduled job execution (APScheduler)
 │   ├── webhook.py        # HTTP server: GitHub/generic webhooks, scheduling API
-│   ├── chat_log.py       # JSONL chat logging
+│   ├── history.py        # Conversation history (read/write JSONL logs)
 │   ├── locks.py          # Per-chat async locks and stop events
 │   ├── transcribe.py     # Voice message transcription (ffmpeg + whisper-cpp)
 │   └── tts.py            # Text-to-speech synthesis (Piper TTS + ffmpeg)

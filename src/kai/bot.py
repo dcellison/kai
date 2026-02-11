@@ -19,9 +19,9 @@ from telegram.ext import (
 )
 
 from kai import sessions, webhook
-from kai.chat_log import log_message
 from kai.claude import PersistentClaude
 from kai.config import PROJECT_ROOT, Config
+from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
