@@ -177,7 +177,40 @@ Kai will start immediately and restart automatically on login or crash. Logs go 
 launchctl unload ~/Library/LaunchAgents/com.kai.bot.plist
 ```
 
-On Linux, create an equivalent systemd unit with `Restart=always`.
+### Running as a service (Linux)
+
+Create `/etc/systemd/system/kai.service`:
+
+```ini
+[Unit]
+Description=Kai Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/path/to/kai
+ExecStart=/path/to/kai/.venv/bin/python -m kai
+Restart=always
+RestartSec=5
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Replace `YOUR_USERNAME` and `/path/to/kai` with your values. Add any extra directories to `PATH` where `claude`, `ffmpeg`, etc. are installed.
+
+```bash
+sudo systemctl enable kai
+sudo systemctl start kai
+```
+
+Check logs with `journalctl -u kai -f`. To stop:
+
+```bash
+sudo systemctl stop kai
+```
 
 ## Project Structure
 
