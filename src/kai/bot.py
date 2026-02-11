@@ -631,17 +631,27 @@ async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     config: Config = context.bot_data["config"]
     running = webhook.is_running()
     status = "running" if running else "not running"
+    has_secret = bool(config.webhook_secret)
     lines = [
         f"Webhook server: {status}",
         f"Port: {config.webhook_port}",
         "",
         "Endpoints:",
-        "  POST /webhook/github  (GitHub events)",
-        "  POST /webhook         (generic)",
-        "  POST /api/schedule    (scheduling API)",
         "  GET  /health          (health check)",
     ]
-    if running:
+    if has_secret:
+        lines += [
+            "  POST /webhook/github  (GitHub events)",
+            "  POST /webhook         (generic)",
+            "  POST /api/schedule    (scheduling API)",
+        ]
+    else:
+        lines += [
+            "",
+            "WEBHOOK_SECRET not set — only /health is active.",
+            "Set WEBHOOK_SECRET in .env to enable webhooks and scheduling.",
+        ]
+    if running and has_secret:
         lines += [
             "",
             "GitHub setup:",

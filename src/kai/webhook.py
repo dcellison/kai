@@ -324,11 +324,15 @@ async def start(telegram_app, config) -> None:
     _app["chat_id"] = next(iter(config.allowed_user_ids))
 
     _app.router.add_get("/health", _handle_health)
-    _app.router.add_post("/webhook/github", _handle_github)
-    _app.router.add_post("/webhook", _handle_generic)
-    _app.router.add_post("/api/schedule", _handle_schedule)
-    _app.router.add_get("/api/jobs", _handle_get_jobs)
-    _app.router.add_get("/api/jobs/{id}", _handle_get_job)
+
+    if config.webhook_secret:
+        _app.router.add_post("/webhook/github", _handle_github)
+        _app.router.add_post("/webhook", _handle_generic)
+        _app.router.add_post("/api/schedule", _handle_schedule)
+        _app.router.add_get("/api/jobs", _handle_get_jobs)
+        _app.router.add_get("/api/jobs/{id}", _handle_get_job)
+    else:
+        log.warning("WEBHOOK_SECRET not set — webhook and scheduling endpoints disabled")
 
     _runner = web.AppRunner(_app, access_log=None)
     await _runner.setup()
