@@ -299,13 +299,13 @@ Jobs can also be created programmatically via `POST /api/schedule`:
   "name": "daily standup",
   "prompt": "Summarize my recent git activity",
   "schedule_type": "daily",
-  "schedule_data": {"time": "09:00"},
+  "schedule_data": {"times": ["09:00"]},
   "job_type": "claude",
   "auto_remove": false
 }
 ```
 
-Auth: set the `X-Webhook-Secret` header to your `WEBHOOK_SECRET`. Schedule types: `once` (with `{"run_at": "ISO8601"}`), `daily` (with `{"time": "HH:MM"}` or `{"times": ["HH:MM", ...]}`), `interval` (with `{"seconds": N}`).
+Auth: set the `X-Webhook-Secret` header to your `WEBHOOK_SECRET`. Schedule types: `once` (with `{"run_at": "ISO8601"}`), `daily` (with `{"times": ["HH:MM", ...]}`), `interval` (with `{"seconds": N}`).
 
 ### Persistent memory
 

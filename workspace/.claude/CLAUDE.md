@@ -38,7 +38,7 @@ curl -s -X POST http://localhost:8080/api/schedule \
 curl -s -X POST http://localhost:8080/api/schedule \
   -H 'Content-Type: application/json' \
   -H 'X-Webhook-Secret: SECRET' \
-  -d '{"name": "Standup", "prompt": "Time for standup", "schedule_type": "daily", "schedule_data": {"time": "14:00"}}'
+  -d '{"name": "Standup", "prompt": "Time for standup", "schedule_type": "daily", "schedule_data": {"times": ["14:00"]}}'
 
 curl -s -X POST http://localhost:8080/api/schedule \
   -H 'Content-Type: application/json' \
@@ -51,7 +51,7 @@ curl -s -X POST http://localhost:8080/api/schedule \
 curl -s -X POST http://localhost:8080/api/schedule \
   -H 'Content-Type: application/json' \
   -H 'X-Webhook-Secret: SECRET' \
-  -d '{"name": "Weather", "prompt": "What is the weather today?", "job_type": "claude", "schedule_type": "daily", "schedule_data": {"time": "08:00"}}'
+  -d '{"name": "Weather", "prompt": "What is the weather today?", "job_type": "claude", "schedule_type": "daily", "schedule_data": {"times": ["08:00"]}}'
 ```
 
 ### Auto-remove jobs (deactivate once a condition is met):
@@ -69,7 +69,7 @@ For auto-remove jobs, start your response with `CONDITION_MET: <message>` when t
 - `schedule_type` — `once`, `daily`, or `interval` (required)
 - `schedule_data` — object with schedule details (required):
   - `once`: `{"run_at": "ISO-datetime"}`
-  - `daily`: `{"time": "HH:MM"}` or `{"times": ["HH:MM", "HH:MM"]}` (UTC)
+  - `daily`: `{"times": ["HH:MM", ...]}` (UTC)
   - `interval`: `{"seconds": N}`
 - `job_type` — `reminder` (default) or `claude`
 - `auto_remove` — boolean, deactivate when condition met (claude jobs only)

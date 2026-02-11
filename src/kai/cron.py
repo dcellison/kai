@@ -94,8 +94,7 @@ def _register_job(app: Application, job: dict) -> None:
         log.info("Scheduled repeating job %d '%s' every %ds", job["id"], job["name"], seconds)
 
     elif job["schedule_type"] == "daily":
-        # Support both "time": "HH:MM" (single) and "times": ["HH:MM", ...] (multiple)
-        times = schedule.get("times") or [schedule["time"]]
+        times = schedule["times"]
         for i, time_str in enumerate(times):
             try:
                 parts = time_str.split(":")
