@@ -305,7 +305,7 @@ Jobs can also be created programmatically via `POST /api/schedule`:
 }
 ```
 
-Auth: set the `X-Webhook-Secret` header to your `WEBHOOK_SECRET`. Schedule types: `once` (with `{"run_at": "ISO8601"}`), `daily` (with `{"time": "HH:MM"}`), `interval` (with `{"seconds": N}`).
+Auth: set the `X-Webhook-Secret` header to your `WEBHOOK_SECRET`. Schedule types: `once` (with `{"run_at": "ISO8601"}`), `daily` (with `{"time": "HH:MM"}` or `{"times": ["HH:MM", ...]}`), `interval` (with `{"seconds": N}`).
 
 ### Persistent memory
 

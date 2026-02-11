@@ -43,7 +43,7 @@ async def _register_new_jobs(app: Application) -> int:
     count = 0
     for job in jobs:
         job_name = f"cron_{job['id']}"
-        if job_name in registered:
+        if any(name == job_name or name.startswith(f"{job_name}_") for name in registered):
             continue
         schedule = json.loads(job["schedule_data"])
         # Skip expired one-shot jobs
@@ -94,18 +94,22 @@ def _register_job(app: Application, job: dict) -> None:
         log.info("Scheduled repeating job %d '%s' every %ds", job["id"], job["name"], seconds)
 
     elif job["schedule_type"] == "daily":
-        try:
-            parts = schedule["time"].split(":")
-            hour, minute = int(parts[0]), int(parts[1])
-        except (ValueError, IndexError):
-            log.error("Invalid time %s for job %d, skipping", schedule["time"], job["id"])
-            return
-        if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            log.error("Invalid time %s for job %d, skipping", schedule["time"], job["id"])
-            return
-        t = dt_time(hour, minute, tzinfo=UTC)
-        jq.run_daily(_job_callback, time=t, name=job_name, data=callback_data)
-        log.info("Scheduled daily job %d '%s' at %s UTC", job["id"], job["name"], schedule["time"])
+        # Support both "time": "HH:MM" (single) and "times": ["HH:MM", ...] (multiple)
+        times = schedule.get("times") or [schedule["time"]]
+        for i, time_str in enumerate(times):
+            try:
+                parts = time_str.split(":")
+                hour, minute = int(parts[0]), int(parts[1])
+            except (ValueError, IndexError):
+                log.error("Invalid time %s for job %d, skipping", time_str, job["id"])
+                continue
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                log.error("Invalid time %s for job %d, skipping", time_str, job["id"])
+                continue
+            t = dt_time(hour, minute, tzinfo=UTC)
+            name_suffix = f"{job_name}_{i}" if len(times) > 1 else job_name
+            jq.run_daily(_job_callback, time=t, name=name_suffix, data=callback_data)
+            log.info("Scheduled daily job %d '%s' at %s UTC", job["id"], job["name"], time_str)
 
     else:
         log.warning("Unknown schedule type '%s' for job %d, skipping", job["schedule_type"], job["id"])

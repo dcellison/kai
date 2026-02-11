@@ -69,7 +69,7 @@ For auto-remove jobs, start your response with `CONDITION_MET: <message>` when t
 - `schedule_type` — `once`, `daily`, or `interval` (required)
 - `schedule_data` — object with schedule details (required):
   - `once`: `{"run_at": "ISO-datetime"}`
-  - `daily`: `{"time": "HH:MM"}` (UTC)
+  - `daily`: `{"time": "HH:MM"}` or `{"times": ["HH:MM", "HH:MM"]}` (UTC)
   - `interval`: `{"seconds": N}`
 - `job_type` — `reminder` (default) or `claude`
 - `auto_remove` — boolean, deactivate when condition met (claude jobs only)
