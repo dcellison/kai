@@ -1,4 +1,21 @@
-"""Text-to-speech synthesis using local Piper TTS."""
+"""
+Text-to-speech synthesis using local Piper TTS.
+
+Provides functionality to:
+1. Convert text to speech using Piper TTS (local, no cloud dependency)
+2. Encode output as OGG Opus audio suitable for Telegram voice messages
+3. Support multiple curated English voices (British and American)
+
+This module is opt-in — controlled by TTS_ENABLED in .env. It requires
+piper-tts (pip install -e '.[tts]'), ffmpeg, and downloaded voice model
+files in models/piper/ (make tts-model).
+
+The synthesis pipeline:
+    text → Piper (stdin) → WAV file → ffmpeg → OGG Opus bytes
+
+The main interface is synthesize_speech(), which returns OGG bytes ready
+for Telegram's send_voice() API.
+"""
 
 import asyncio
 import logging
@@ -8,7 +25,8 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# Curated English voices — each maps to a Piper model file
+# Curated English voices — displayed in /voices inline keyboard.
+# Keys are short names used in settings and commands.
 VOICES = {
     "cori": "Cori (F, British)",
     "alba": "Alba (F, British)",
@@ -20,7 +38,8 @@ VOICES = {
     "joe": "Joe (M, American)",
 }
 
-# Short name → Piper model filename (without .onnx extension)
+# Short name → Piper ONNX model filename (without .onnx extension).
+# Each voice requires a matching .onnx file in the model directory.
 _VOICE_MODELS = {
     "cori": "en_GB-cori-medium",
     "alba": "en_GB-alba-medium",
@@ -36,17 +55,39 @@ DEFAULT_VOICE = "cori"
 
 
 class TTSError(Exception):
-    """Raised when text-to-speech synthesis fails."""
+    """
+    Raised when any step of the TTS pipeline fails.
+
+    Includes missing dependencies (piper-tts, ffmpeg), missing model files,
+    timeouts, and non-zero exit codes. Error messages include install hints.
+    """
 
 
 async def synthesize_speech(text: str, model_dir: Path, voice: str = DEFAULT_VOICE) -> bytes:
-    """Convert text to OGG Opus audio bytes via Piper TTS + ffmpeg.
+    """
+    Convert text to OGG Opus audio bytes via Piper TTS + ffmpeg.
 
-    Returns bytes suitable for Telegram's send_voice().
+    Runs the full synthesis pipeline in a temporary directory: Piper reads
+    text from stdin and writes a WAV file, then ffmpeg converts to OGG Opus.
+    The temp directory is cleaned up afterward.
+
+    Args:
+        text: The text to synthesize. Must not be empty/whitespace-only.
+        model_dir: Directory containing Piper .onnx voice model files.
+        voice: Short name of the voice to use (must be a key in VOICES).
+
+    Returns:
+        OGG Opus audio bytes suitable for Telegram's send_voice() API.
+
+    Raises:
+        TTSError: If the text is empty, the voice is unknown, the model file
+            is missing, piper/ffmpeg are not installed, or either process
+            fails or times out.
     """
     if not text.strip():
         raise TTSError("No text to synthesize")
 
+    # Resolve voice short name to Piper model filename
     model_name = _VOICE_MODELS.get(voice)
     if not model_name:
         raise TTSError(f"Unknown voice: {voice}. Choose from: {', '.join(VOICES)}")
@@ -62,7 +103,7 @@ async def synthesize_speech(text: str, model_dir: Path, voice: str = DEFAULT_VOI
         wav_path = Path(tmpdir) / "speech.wav"
         ogg_path = Path(tmpdir) / "speech.ogg"
 
-        # Synthesize text → WAV via Piper (reads from stdin)
+        # Step 1: Synthesize text → WAV via Piper (reads from stdin)
         try:
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, "-m", "piper",
@@ -80,7 +121,7 @@ async def synthesize_speech(text: str, model_dir: Path, voice: str = DEFAULT_VOI
         try:
             _, stderr = await asyncio.wait_for(
                 proc.communicate(input=text.encode()),
-                timeout=120,
+                timeout=120,  # Long responses may take a while to synthesize
             )
         except TimeoutError:
             proc.kill()
@@ -90,7 +131,7 @@ async def synthesize_speech(text: str, model_dir: Path, voice: str = DEFAULT_VOI
             err = stderr.decode().strip()[:200]
             raise TTSError(f"Piper failed (exit {proc.returncode}): {err}")
 
-        # Convert WAV → OGG Opus via ffmpeg
+        # Step 2: Convert WAV → OGG Opus via ffmpeg (Telegram's voice format)
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-i", str(wav_path),

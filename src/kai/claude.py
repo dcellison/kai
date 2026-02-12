@@ -1,3 +1,31 @@
+"""
+Persistent Claude Code subprocess manager.
+
+Provides functionality to:
+1. Manage a long-running Claude Code subprocess with stream-json I/O
+2. Inject identity, memory, history, and API context on each new session
+3. Stream partial responses for real-time Telegram message updates
+4. Handle workspace switching, model changes, and graceful shutdown
+
+This is the core bridge between Telegram (bot.py) and Claude Code. Instead of
+launching a new Claude process per message, a single persistent process is kept
+alive and communicated with via newline-delimited JSON on stdin/stdout. This
+preserves Claude's conversation context across messages within a session.
+
+The stream-json protocol:
+    Input:  {"type": "user", "message": {"role": "user", "content": [...]}}
+    Output: {"type": "system", ...}      — session metadata
+            {"type": "assistant", ...}   — partial text (streaming)
+            {"type": "result", ...}      — final response with cost/session info
+
+Context injection on first message of each session:
+    1. Identity (CLAUDE.md from home workspace, when in a foreign workspace)
+    2. Personal memory (MEMORY.md from home workspace)
+    3. Workspace memory (MEMORY.md from current workspace, if different from home)
+    4. Recent conversation history (last 20 messages from JSONL logs)
+    5. Scheduling API endpoint info (URL, secret, field reference)
+"""
+
 import asyncio
 import json
 import logging
@@ -12,6 +40,18 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class ClaudeResponse:
+    """
+    Final response from a Claude Code interaction.
+
+    Attributes:
+        success: True if Claude returned a valid response, False on error.
+        text: The full response text (accumulated from streaming chunks).
+        session_id: Claude's session identifier (used for session continuity).
+        cost_usd: Cost of this interaction in USD (from Claude's billing).
+        duration_ms: Wall-clock duration of the interaction in milliseconds.
+        error: Error message if success is False, None otherwise.
+    """
+
     success: bool
     text: str
     session_id: str | None = None
@@ -22,15 +62,34 @@ class ClaudeResponse:
 
 @dataclass
 class StreamEvent:
-    """A partial update during streaming."""
+    """
+    A partial update emitted during Claude's streaming response.
+
+    Yielded by PersistentClaude.send() as Claude generates text. The final
+    event has done=True and includes the complete ClaudeResponse.
+
+    Attributes:
+        text_so_far: Accumulated response text up to this point.
+        done: True if this is the final event (response complete or error).
+        response: The complete ClaudeResponse, set only when done=True.
+    """
 
     text_so_far: str
     done: bool = False
-    response: ClaudeResponse | None = None  # set when done=True
+    response: ClaudeResponse | None = None
 
 
 class PersistentClaude:
-    """A long-running Claude process using stream-json I/O for multi-turn chat."""
+    """
+    A long-running Claude Code subprocess using stream-json I/O for multi-turn chat.
+
+    Manages the lifecycle of the Claude process: starting, sending messages,
+    streaming responses, killing/restarting, and workspace switching. All message
+    sends are serialized via an internal asyncio lock to prevent interleaving.
+
+    The process runs with --permission-mode bypassPermissions (required for headless
+    operation via Telegram) and --max-budget-usd to cap per-session spending.
+    """
 
     def __init__(
         self,
@@ -51,22 +110,32 @@ class PersistentClaude:
         self.max_budget_usd = max_budget_usd
         self.timeout_seconds = timeout_seconds
         self._proc: asyncio.subprocess.Process | None = None
-        self._lock = asyncio.Lock()
+        self._lock = asyncio.Lock()  # Serializes all message sends
         self._session_id: str | None = None
-        self._fresh_session = True
-        # Background task to drain stderr
-        self._stderr_task: asyncio.Task | None = None
+        self._fresh_session = True  # True until the first message is sent
+        self._stderr_task: asyncio.Task | None = None  # Background stderr drain
 
     @property
     def is_alive(self) -> bool:
+        """True if the Claude subprocess is running and hasn't exited."""
         return self._proc is not None and self._proc.returncode is None
 
     @property
     def session_id(self) -> str | None:
+        """The current Claude session ID, or None if no session is active."""
         return self._session_id
 
     async def _ensure_started(self) -> None:
-        """Start the claude process if not already running."""
+        """
+        Start the Claude Code subprocess if not already running.
+
+        Launches claude with stream-json I/O, bypassPermissions mode (required
+        for headless operation), and the configured model and budget. The process
+        runs in the current workspace directory and persists across messages.
+
+        The stdout buffer limit is raised to 1 MiB (from the default 64 KiB)
+        because large tool results from Claude can exceed the default.
+        """
         if self.is_alive:
             return
 
@@ -97,10 +166,16 @@ class PersistentClaude:
         self._session_id = None
         self._fresh_session = True
 
-        # Drain stderr in background to prevent buffer deadlock
+        # Drain stderr in background to prevent pipe buffer deadlock
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def _drain_stderr(self) -> None:
+        """
+        Continuously read and discard stderr from the Claude process.
+
+        Without this, the stderr pipe buffer fills up and the process deadlocks.
+        Lines are logged at DEBUG level (truncated to 200 chars) for diagnostics.
+        """
         while self._proc and self._proc.stderr:
             try:
                 line = await self._proc.stderr.readline()
@@ -113,12 +188,46 @@ class PersistentClaude:
                 break
 
     async def send(self, prompt: str | list) -> AsyncIterator[StreamEvent]:
-        """Send a message and yield streaming events. Serialized via lock."""
+        """
+        Send a message to Claude and yield streaming events.
+
+        This is the main public interface. All sends are serialized via an
+        internal lock so concurrent callers (e.g., a user message arriving
+        while a cron job is running) queue rather than interleave.
+
+        Args:
+            prompt: Either a text string or a list of content blocks (for
+                multi-modal messages like images).
+
+        Yields:
+            StreamEvent objects with accumulated text. The final event has
+            done=True and includes the complete ClaudeResponse.
+        """
         async with self._lock:
             async for event in self._send_locked(prompt):
                 yield event
 
     async def _send_locked(self, prompt: str | list) -> AsyncIterator[StreamEvent]:
+        """
+        Core message-sending logic (must be called while holding self._lock).
+
+        Handles the full lifecycle of a single Claude interaction:
+        1. Ensure the subprocess is alive (start if needed)
+        2. On the first message of a new session, prepend identity, memory,
+           conversation history, and scheduling API context to the prompt
+        3. When in a foreign workspace, prepend a per-message reminder to
+           prevent Claude from acting on workspace context autonomously
+        4. Write the JSON message to stdin and stream stdout line-by-line
+        5. Parse stream-json events and yield StreamEvents to the caller
+
+        Args:
+            prompt: Either a text string or a list of content blocks (for
+                multi-modal messages like images).
+
+        Yields:
+            StreamEvent objects with accumulated text. The final event has
+            done=True and includes the complete ClaudeResponse.
+        """
         try:
             await self._ensure_started()
         except FileNotFoundError:
@@ -312,10 +421,13 @@ class PersistentClaude:
             )
 
     def force_kill(self) -> None:
-        """Kill the subprocess immediately. Safe to call without holding the lock.
+        """
+        Kill the subprocess immediately. Safe to call without holding the lock.
 
-        The streaming loop in _send_locked() will see EOF on stdout and
-        clean up via the existing error-handling path.
+        Called by /stop to abort an in-flight response. The streaming loop
+        in _send_locked() will see EOF on stdout and clean up via its
+        existing error-handling path. Does not await process termination
+        (that happens in the streaming loop).
         """
         if self._proc and self._proc.returncode is None:
             try:
@@ -324,16 +436,33 @@ class PersistentClaude:
                 pass
 
     async def change_workspace(self, new_workspace: Path) -> None:
-        """Switch the working directory. Kills the current process;
-        next send() will restart in the new directory."""
+        """
+        Switch the working directory for future Claude sessions.
+
+        Kills the current process so the next send() call will restart
+        Claude in the new directory. Called by /workspace command.
+
+        Args:
+            new_workspace: Path to the new working directory.
+        """
         self.workspace = new_workspace
         await self._kill()
 
     async def restart(self) -> None:
-        """Kill and restart the process (for /new command)."""
+        """
+        Kill the current process so the next send() starts fresh.
+        Called by /new command and model switches.
+        """
         await self._kill()
 
     async def _kill(self) -> None:
+        """
+        Kill the subprocess and clean up resources.
+
+        Sends SIGKILL, waits for the process to exit, clears the session ID,
+        and cancels the stderr drain task. Idempotent — safe to call even if
+        the process has already exited.
+        """
         if self._proc:
             try:
                 self._proc.kill()
@@ -350,7 +479,13 @@ class PersistentClaude:
             self._stderr_task = None
 
     async def shutdown(self) -> None:
-        """Cleanly shut down."""
+        """
+        Gracefully shut down the Claude process.
+
+        Sends SIGTERM first and waits up to 5 seconds for clean exit.
+        Falls back to SIGKILL if the process doesn't terminate in time.
+        Called during bot shutdown from main.py.
+        """
         if self._proc and self._proc.returncode is None:
             self._proc.terminate()
             try:
