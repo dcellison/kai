@@ -348,7 +348,8 @@ async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 detail = f"every {secs}s"
         elif sched == "daily":
             data = json.loads(j["schedule_data"])
-            detail = f"daily at {data.get('time', '?')} UTC"
+            times = data.get("times", [])
+            detail = f"daily at {', '.join(times)} UTC" if times else "daily"
         else:
             detail = sched
         type_tag = "\U0001f514" if j["job_type"] == "reminder" else "\U0001f916"
