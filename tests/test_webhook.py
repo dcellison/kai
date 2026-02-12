@@ -13,7 +13,6 @@ from kai.webhook import (
     _verify_github_signature,
 )
 
-
 # ── _verify_github_signature ─────────────────────────────────────────
 
 

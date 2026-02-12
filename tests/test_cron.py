@@ -1,6 +1,6 @@
 """Tests for cron.py pure functions."""
 
-from datetime import UTC, datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 from kai.cron import _ensure_utc
 

@@ -4,7 +4,6 @@ from pathlib import Path
 
 from kai.bot import _chunk_text, _resolve_workspace_path, _short_workspace_name, _truncate_for_telegram
 
-
 # ── _resolve_workspace_path ──────────────────────────────────────────
 
 
