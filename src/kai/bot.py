@@ -545,6 +545,7 @@ async def handle_canceljob(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     # Remove from APScheduler's in-memory queue
     jq = context.application.job_queue
+    assert jq is not None
     current = jq.get_jobs_by_name(f"cron_{job_id}")
     for j in current:
         j.schedule_removal()
@@ -942,7 +943,7 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
     """Handle unrecognized slash commands with a helpful redirect to /help."""
     assert update.message is not None
     await update.message.reply_text(
-        f"Unknown command: {update.message.text.split()[0]}\nTry /help for available commands."
+        f"Unknown command: {(update.message.text or '').split()[0]}\nTry /help for available commands."
     )
 
 

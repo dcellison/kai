@@ -185,6 +185,7 @@ async def create_job(
         (chat_id, name, job_type, prompt, schedule_type, schedule_data, int(auto_remove)),
     )
     await _get_db().commit()
+    assert cursor.lastrowid is not None
     return cursor.lastrowid
 
 

@@ -91,6 +91,7 @@ async def _register_new_jobs(app: Application) -> int:
     Returns:
         The number of newly registered jobs.
     """
+    assert app.job_queue is not None
     jobs = await sessions.get_all_active_jobs()
     registered = {j.name for j in app.job_queue.jobs()}
     now = datetime.now(UTC)
@@ -148,6 +149,7 @@ def _register_job(app: Application, job: dict) -> None:
         job: Job dict from the database (as returned by sessions.get_job_by_id).
     """
     jq = app.job_queue
+    assert jq is not None
     schedule = json.loads(job["schedule_data"])
     job_name = f"cron_{job['id']}"
 
@@ -216,7 +218,10 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
     Args:
         context: Telegram callback context containing job data and bot reference.
     """
-    data = context.job.data
+    job = context.job
+    assert job is not None
+    assert isinstance(job.data, dict)
+    data: dict = job.data
     chat_id = data["chat_id"]
     job_type = data["job_type"]
     prompt = data["prompt"]
@@ -235,7 +240,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Forbidden:
             log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
             await sessions.deactivate_job(job_id)
-            context.job.schedule_removal()
+            job.schedule_removal()
             return
         except Exception:
             log.exception("Failed to send reminder for job %d", job_id)
@@ -293,7 +298,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 log.exception("Failed to send job %d result", job_id)
             await sessions.deactivate_job(job_id)
-            context.job.schedule_removal()
+            job.schedule_removal()
             log.info("Job %d condition met, deactivated", job_id)
 
         elif auto_remove and first_line.startswith(_CONDITION_NOT_MET_PREFIX.upper()):
@@ -309,6 +314,6 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             except Forbidden:
                 log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
                 await sessions.deactivate_job(job_id)
-                context.job.schedule_removal()
+                job.schedule_removal()
             except Exception:
                 log.exception("Failed to send job %d result", job_id)
