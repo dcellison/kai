@@ -94,6 +94,7 @@ def main() -> None:
         try:
             await app.initialize()
             await app.start()
+            assert app.updater is not None
             await app.updater.start_polling()
 
             # Register slash command menu in Telegram's bot command list
@@ -144,7 +145,8 @@ def main() -> None:
         finally:
             # Shutdown in reverse order of startup
             await webhook.stop()
-            await app.updater.stop()
+            if app.updater is not None:
+                await app.updater.stop()
             await app.stop()
             await app.bot_data["claude"].shutdown()
             await app.shutdown()

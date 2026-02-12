@@ -32,6 +32,12 @@ import aiosqlite
 _db: aiosqlite.Connection | None = None
 
 
+def _get_db() -> aiosqlite.Connection:
+    """Return the database connection, raising if init_db() hasn't been called."""
+    assert _db is not None, "Database not initialized — call init_db() first"
+    return _db
+
+
 # ── Initialization ───────────────────────────────────────────────────
 
 
@@ -47,8 +53,8 @@ async def init_db(db_path: Path) -> None:
     """
     global _db
     _db = await aiosqlite.connect(str(db_path))
-    _db.row_factory = aiosqlite.Row
-    await _db.execute("""
+    _get_db().row_factory = aiosqlite.Row
+    await _get_db().execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             chat_id INTEGER PRIMARY KEY,
             session_id TEXT NOT NULL,
@@ -58,7 +64,7 @@ async def init_db(db_path: Path) -> None:
             total_cost_usd REAL DEFAULT 0.0
         )
     """)
-    await _db.execute("""
+    await _get_db().execute("""
         CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER NOT NULL,
@@ -72,19 +78,19 @@ async def init_db(db_path: Path) -> None:
             auto_remove INTEGER DEFAULT 0
         )
     """)
-    await _db.execute("""
+    await _get_db().execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         )
     """)
-    await _db.execute("""
+    await _get_db().execute("""
         CREATE TABLE IF NOT EXISTS workspace_history (
             path TEXT PRIMARY KEY,
             last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    await _db.commit()
+    await _get_db().commit()
 
 
 # ── Session management ───────────────────────────────────────────────
@@ -92,7 +98,7 @@ async def init_db(db_path: Path) -> None:
 
 async def get_session(chat_id: int) -> str | None:
     """Get the current Claude session ID for a chat, or None if no session exists."""
-    async with _db.execute("SELECT session_id FROM sessions WHERE chat_id = ?", (chat_id,)) as cursor:
+    async with _get_db().execute("SELECT session_id FROM sessions WHERE chat_id = ?", (chat_id,)) as cursor:
         row = await cursor.fetchone()
         return row["session_id"] if row else None
 
@@ -110,7 +116,7 @@ async def save_session(chat_id: int, session_id: str, model: str, cost_usd: floa
         model: Model name used for this session (e.g., "sonnet").
         cost_usd: Cost of this particular interaction (added to running total).
     """
-    await _db.execute(
+    await _get_db().execute(
         """
         INSERT INTO sessions (chat_id, session_id, model, total_cost_usd)
         VALUES (?, ?, ?, ?)
@@ -122,18 +128,18 @@ async def save_session(chat_id: int, session_id: str, model: str, cost_usd: floa
     """,
         (chat_id, session_id, model, cost_usd),
     )
-    await _db.commit()
+    await _get_db().commit()
 
 
 async def clear_session(chat_id: int) -> None:
     """Delete the session record for a chat. Used by /new and workspace switching."""
-    await _db.execute("DELETE FROM sessions WHERE chat_id = ?", (chat_id,))
-    await _db.commit()
+    await _get_db().execute("DELETE FROM sessions WHERE chat_id = ?", (chat_id,))
+    await _get_db().commit()
 
 
 async def get_stats(chat_id: int) -> dict | None:
     """Get session statistics for the /stats command. Returns None if no session exists."""
-    async with _db.execute(
+    async with _get_db().execute(
         "SELECT session_id, model, created_at, last_used_at, total_cost_usd FROM sessions WHERE chat_id = ?",
         (chat_id,),
     ) as cursor:
@@ -173,18 +179,18 @@ async def create_job(
     Returns:
         The auto-generated integer job ID.
     """
-    cursor = await _db.execute(
+    cursor = await _get_db().execute(
         """INSERT INTO jobs (chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (chat_id, name, job_type, prompt, schedule_type, schedule_data, int(auto_remove)),
     )
-    await _db.commit()
+    await _get_db().commit()
     return cursor.lastrowid
 
 
 async def get_jobs(chat_id: int) -> list[dict]:
     """Get all active jobs for a specific chat. Used by /jobs command."""
-    async with _db.execute(
+    async with _get_db().execute(
         "SELECT id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, created_at FROM jobs WHERE chat_id = ? AND active = 1",
         (chat_id,),
     ) as cursor:
@@ -195,7 +201,7 @@ async def get_jobs(chat_id: int) -> list[dict]:
 
 async def get_job_by_id(job_id: int) -> dict | None:
     """Get a single job by ID, or None if not found. Used by cron.register_job_by_id()."""
-    async with _db.execute(
+    async with _get_db().execute(
         "SELECT id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove FROM jobs WHERE id = ?",
         (job_id,),
     ) as cursor:
@@ -207,7 +213,7 @@ async def get_job_by_id(job_id: int) -> dict | None:
 
 async def get_all_active_jobs() -> list[dict]:
     """Get all active jobs across all chats. Used at startup to register with APScheduler."""
-    async with _db.execute(
+    async with _get_db().execute(
         "SELECT id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove FROM jobs WHERE active = 1"
     ) as cursor:
         rows = await cursor.fetchall()
@@ -216,15 +222,15 @@ async def get_all_active_jobs() -> list[dict]:
 
 async def delete_job(job_id: int) -> bool:
     """Permanently delete a job. Returns True if a row was deleted, False if not found."""
-    cursor = await _db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
-    await _db.commit()
+    cursor = await _get_db().execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+    await _get_db().commit()
     return cursor.rowcount > 0
 
 
 async def deactivate_job(job_id: int) -> None:
     """Soft-delete a job by setting active=0. Preserves the row for history."""
-    await _db.execute("UPDATE jobs SET active = 0 WHERE id = ?", (job_id,))
-    await _db.commit()
+    await _get_db().execute("UPDATE jobs SET active = 0 WHERE id = ?", (job_id,))
+    await _get_db().commit()
 
 
 # ── Settings (generic key-value store) ───────────────────────────────
@@ -236,24 +242,24 @@ async def get_setting(key: str) -> str | None:
 
     Common keys: "workspace", "voice_mode:{chat_id}", "voice_name:{chat_id}".
     """
-    async with _db.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cursor:
+    async with _get_db().execute("SELECT value FROM settings WHERE key = ?", (key,)) as cursor:
         row = await cursor.fetchone()
         return row["value"] if row else None
 
 
 async def set_setting(key: str, value: str) -> None:
     """Set a setting value, creating or updating as needed (upsert)."""
-    await _db.execute(
+    await _get_db().execute(
         "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
-    await _db.commit()
+    await _get_db().commit()
 
 
 async def delete_setting(key: str) -> None:
     """Remove a setting by key. No-op if the key doesn't exist."""
-    await _db.execute("DELETE FROM settings WHERE key = ?", (key,))
-    await _db.commit()
+    await _get_db().execute("DELETE FROM settings WHERE key = ?", (key,))
+    await _get_db().commit()
 
 
 # ── Workspace history ────────────────────────────────────────────────
@@ -261,12 +267,12 @@ async def delete_setting(key: str) -> None:
 
 async def upsert_workspace_history(path: str) -> None:
     """Record or refresh a workspace path in the history. Used for /workspaces keyboard."""
-    await _db.execute(
+    await _get_db().execute(
         "INSERT INTO workspace_history (path, last_used_at) VALUES (?, CURRENT_TIMESTAMP) "
         "ON CONFLICT(path) DO UPDATE SET last_used_at = CURRENT_TIMESTAMP",
         (path,),
     )
-    await _db.commit()
+    await _get_db().commit()
 
 
 async def get_workspace_history(limit: int = 10) -> list[dict]:
@@ -279,7 +285,7 @@ async def get_workspace_history(limit: int = 10) -> list[dict]:
     Returns:
         List of dicts with "path" and "last_used_at" keys.
     """
-    async with _db.execute(
+    async with _get_db().execute(
         "SELECT path, last_used_at FROM workspace_history ORDER BY last_used_at DESC LIMIT ?",
         (limit,),
     ) as cursor:
@@ -289,8 +295,8 @@ async def get_workspace_history(limit: int = 10) -> list[dict]:
 
 async def delete_workspace_history(path: str) -> None:
     """Remove a workspace path from history. Used when a workspace directory no longer exists."""
-    await _db.execute("DELETE FROM workspace_history WHERE path = ?", (path,))
-    await _db.commit()
+    await _get_db().execute("DELETE FROM workspace_history WHERE path = ?", (path,))
+    await _get_db().commit()
 
 
 # ── Lifecycle ────────────────────────────────────────────────────────
@@ -300,5 +306,5 @@ async def close_db() -> None:
     """Close the database connection. Called during shutdown from main.py."""
     global _db
     if _db:
-        await _db.close()
+        await _get_db().close()
         _db = None

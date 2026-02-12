@@ -101,6 +101,7 @@ def _require_auth(func):
 
     @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        assert update.effective_user is not None
         config: Config = context.bot_data["config"]
         if not _is_authorized(config, update.effective_user.id):
             return
@@ -199,6 +200,7 @@ def _get_claude(context: ContextTypes.DEFAULT_TYPE) -> PersistentClaude:
 @_require_auth
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start — the initial greeting when a user first messages the bot."""
+    assert update.message is not None
     await update.message.reply_text("Kai is ready. Send me a message.")
 
 
@@ -210,6 +212,7 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     Clears the session from the database so cost tracking resets, and
     kills the subprocess so the next message launches a new one.
     """
+    assert update.message is not None
     claude = _get_claude(context)
     await claude.restart()
     await sessions.clear_session(update.effective_chat.id)
@@ -238,6 +241,7 @@ def _models_keyboard(current: str) -> InlineKeyboardMarkup:
 @_require_auth
 async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /models — show an inline keyboard for model selection."""
+    assert update.message is not None
     claude = _get_claude(context)
     await update.message.reply_text(
         "Choose a model:",
@@ -264,6 +268,7 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
     Validates authorization and the selected model, switches if different
     from current, and updates the keyboard message with confirmation text.
     """
+    assert update.callback_query is not None
     query = update.callback_query
     config: Config = context.bot_data["config"]
     if not _is_authorized(config, update.effective_user.id):
@@ -292,6 +297,7 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
 @_require_auth
 async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /model <name> — switch model directly via text command."""
+    assert update.message is not None
     if not context.args:
         await update.message.reply_text("Usage: /model <opus|sonnet|haiku>")
         return
@@ -332,6 +338,7 @@ async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYP
         /voice off      — disable voice
         /voice <name>   — set a specific voice (enables voice if off)
     """
+    assert update.message is not None
     config: Config = context.bot_data["config"]
     if not config.tts_enabled:
         await update.message.reply_text("TTS is not enabled. Set TTS_ENABLED=true in .env")
@@ -380,6 +387,7 @@ async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYP
 @_require_auth
 async def handle_voices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /voices — show an inline keyboard of available TTS voices."""
+    assert update.message is not None
     config: Config = context.bot_data["config"]
     if not config.tts_enabled:
         await update.message.reply_text("TTS is not enabled. Set TTS_ENABLED=true in .env")
@@ -400,6 +408,7 @@ async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TY
     Sets the chosen voice in settings and auto-enables voice mode if it
     was off (defaults to "only" mode).
     """
+    assert update.callback_query is not None
     query = update.callback_query
     config: Config = context.bot_data["config"]
     if not _is_authorized(config, update.effective_user.id):
@@ -438,6 +447,7 @@ async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TY
 @_require_auth
 async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /stats — show session info, model, cost, and process status."""
+    assert update.message is not None
     claude = _get_claude(context)
     stats = await sessions.get_stats(update.effective_chat.id)
     alive = claude.is_alive
@@ -462,6 +472,7 @@ async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     Formats each job with an emoji tag (bell for reminders, robot for Claude
     jobs), the job ID, name, and a human-readable schedule description.
     """
+    assert update.message is not None
     jobs = await sessions.get_jobs(update.effective_chat.id)
     if not jobs:
         await update.message.reply_text("No active scheduled jobs.")
@@ -500,6 +511,7 @@ async def handle_canceljob(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     Removes the job from both the database and APScheduler's in-memory queue.
     """
+    assert update.message is not None
     if not context.args:
         await update.message.reply_text("Usage: /canceljob <id>")
         return
@@ -529,6 +541,7 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     the Claude process immediately. The streaming loop in _handle_response()
     sees the stop event and appends "(stopped)" to the live message.
     """
+    assert update.message is not None
     chat_id = update.effective_chat.id
     claude = _get_claude(context)
     stop_event = get_stop_event(chat_id)
@@ -606,6 +619,7 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     Wraps _do_switch_workspace with user-facing feedback including workspace
     metadata (git repo detection, CLAUDE.md presence).
     """
+    assert update.message is not None
     claude = _get_claude(context)
     config: Config = context.bot_data["config"]
     home = config.claude_workspace
@@ -664,6 +678,7 @@ async def _workspaces_keyboard(
 @_require_auth
 async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /workspaces — show an inline keyboard of recent workspaces."""
+    assert update.message is not None
     history = await sessions.get_workspace_history()
     claude = _get_claude(context)
     config: Config = context.bot_data["config"]
@@ -686,6 +701,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     still exists, switches to it, and updates the keyboard message.
     Removes stale entries from history if the directory no longer exists.
     """
+    assert update.callback_query is not None
     query = update.callback_query
     config: Config = context.bot_data["config"]
     if not _is_authorized(config, update.effective_user.id):
@@ -756,6 +772,7 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     Absolute paths and ~ expansion are rejected for security. All workspace
     names are resolved relative to WORKSPACE_BASE with traversal prevention.
     """
+    assert update.message is not None
     claude = _get_claude(context)
     config: Config = context.bot_data["config"]
     home = config.claude_workspace
@@ -837,6 +854,7 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 @_require_auth
 async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /webhooks — show webhook server status and endpoint info."""
+    assert update.message is not None
     config: Config = context.bot_data["config"]
     running = webhook.is_running()
     status = "running" if running else "not running"
@@ -875,6 +893,7 @@ async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 @_require_auth
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help — show all available commands."""
+    assert update.message is not None
     await update.message.reply_text(
         "/stop - Interrupt current response\n"
         "/new - Start a fresh session\n"
@@ -901,6 +920,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 @_require_auth
 async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle unrecognized slash commands with a helpful redirect to /help."""
+    assert update.message is not None
     await update.message.reply_text(
         f"Unknown command: {update.message.text.split()[0]}\nTry /help for available commands."
     )
@@ -1221,6 +1241,7 @@ async def _handle_response(
         claude: The PersistentClaude instance.
         model: Current model name (for session tracking).
     """
+    assert update.message is not None
     # Check voice mode before starting
     config: Config = context.bot_data["config"]
     voice_mode = "off"

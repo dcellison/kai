@@ -324,6 +324,9 @@ class PersistentClaude:
             + "\n"
         )
 
+        assert self._proc is not None
+        assert self._proc.stdin is not None
+        assert self._proc.stdout is not None
         try:
             self._proc.stdin.write(msg.encode())
             await self._proc.stdin.drain()
