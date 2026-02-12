@@ -93,7 +93,7 @@ async def _register_new_jobs(app: Application) -> int:
     """
     assert app.job_queue is not None
     jobs = await sessions.get_all_active_jobs()
-    registered = {j.name for j in app.job_queue.jobs()}
+    registered = {j.name for j in app.job_queue.jobs() if j.name is not None}
     now = datetime.now(UTC)
     count = 0
     for job in jobs:
