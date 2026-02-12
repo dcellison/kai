@@ -82,6 +82,23 @@ def _clear_responding() -> None:
     _RESPONDING_FLAG.unlink(missing_ok=True)
 
 
+# ── Update property helpers (Pyright can't narrow @property returns) ─
+
+
+def _chat_id(update: Update) -> int:
+    """Extract the chat ID from an update, with type narrowing for static analysis."""
+    chat = update.effective_chat
+    assert chat is not None
+    return chat.id
+
+
+def _user_id(update: Update) -> int:
+    """Extract the user ID from an update, with type narrowing for static analysis."""
+    user = update.effective_user
+    assert user is not None
+    return user.id
+
+
 # ── Authorization ────────────────────────────────────────────────────
 
 
@@ -101,9 +118,8 @@ def _require_auth(func):
 
     @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        assert update.effective_user is not None
         config: Config = context.bot_data["config"]
-        if not _is_authorized(config, update.effective_user.id):
+        if not _is_authorized(config, _user_id(update)):
             return
         return await func(update, context)
 
@@ -185,6 +201,7 @@ def _chunk_text(text: str, max_len: int = 4096) -> list[str]:
 
 async def _send_response(update: Update, text: str) -> None:
     """Send a potentially long response as multiple chunked messages."""
+    assert update.message is not None
     for chunk in _chunk_text(text):
         await _reply_safe(update.message, chunk)
 
@@ -215,7 +232,7 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     assert update.message is not None
     claude = _get_claude(context)
     await claude.restart()
-    await sessions.clear_session(update.effective_chat.id)
+    await sessions.clear_session(_chat_id(update))
     await update.message.reply_text("Session cleared. Starting fresh.")
 
 
@@ -271,10 +288,11 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
     assert update.callback_query is not None
     query = update.callback_query
     config: Config = context.bot_data["config"]
-    if not _is_authorized(config, update.effective_user.id):
+    if not _is_authorized(config, _user_id(update)):
         await query.answer("Not authorized.")
         return
 
+    assert query.data is not None
     model = query.data.removeprefix("model:")
     if model not in _AVAILABLE_MODELS:
         await query.answer("Invalid model.")
@@ -287,7 +305,7 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     await query.answer()
-    await _switch_model(context, update.effective_chat.id, model)
+    await _switch_model(context, _chat_id(update), model)
     await query.edit_message_text(
         f"Switched to {_AVAILABLE_MODELS[model]}. Session restarted.",
         reply_markup=InlineKeyboardMarkup([]),
@@ -305,7 +323,7 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if model not in _AVAILABLE_MODELS:
         await update.message.reply_text("Choose: opus, sonnet, or haiku")
         return
-    await _switch_model(context, update.effective_chat.id, model)
+    await _switch_model(context, _chat_id(update), model)
     await update.message.reply_text(f"Model set to {_AVAILABLE_MODELS[model]}. Session restarted.")
 
 
@@ -344,7 +362,7 @@ async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("TTS is not enabled. Set TTS_ENABLED=true in .env")
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = _chat_id(update)
     current_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
     current_voice = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
 
@@ -393,7 +411,7 @@ async def handle_voices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("TTS is not enabled. Set TTS_ENABLED=true in .env")
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = _chat_id(update)
     current_voice = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
     await update.message.reply_text(
         "Choose a voice:",
@@ -411,16 +429,17 @@ async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TY
     assert update.callback_query is not None
     query = update.callback_query
     config: Config = context.bot_data["config"]
-    if not _is_authorized(config, update.effective_user.id):
+    if not _is_authorized(config, _user_id(update)):
         await query.answer("Not authorized.")
         return
 
+    assert query.data is not None
     voice = query.data.removeprefix("voice:")
     if voice not in VOICES:
         await query.answer("Invalid voice.")
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = _chat_id(update)
     current_voice = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
 
     if voice == current_voice:
@@ -449,7 +468,7 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Handle /stats — show session info, model, cost, and process status."""
     assert update.message is not None
     claude = _get_claude(context)
-    stats = await sessions.get_stats(update.effective_chat.id)
+    stats = await sessions.get_stats(_chat_id(update))
     alive = claude.is_alive
     if not stats:
         await update.message.reply_text(f"No active session.\nProcess alive: {alive}")
@@ -473,7 +492,7 @@ async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     jobs), the job ID, name, and a human-readable schedule description.
     """
     assert update.message is not None
-    jobs = await sessions.get_jobs(update.effective_chat.id)
+    jobs = await sessions.get_jobs(_chat_id(update))
     if not jobs:
         await update.message.reply_text("No active scheduled jobs.")
         return
@@ -542,7 +561,7 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     sees the stop event and appends "(stopped)" to the live message.
     """
     assert update.message is not None
-    chat_id = update.effective_chat.id
+    chat_id = _chat_id(update)
     claude = _get_claude(context)
     stop_event = get_stop_event(chat_id)
     stop_event.set()
@@ -628,7 +647,7 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text("Already in that workspace.")
         return
 
-    await _do_switch_workspace(context, update.effective_chat.id, path)
+    await _do_switch_workspace(context, _chat_id(update), path)
 
     if path == home:
         await update.message.reply_text("Switched to home workspace. Session cleared.")
@@ -704,10 +723,11 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     assert update.callback_query is not None
     query = update.callback_query
     config: Config = context.bot_data["config"]
-    if not _is_authorized(config, update.effective_user.id):
+    if not _is_authorized(config, _user_id(update)):
         await query.answer("Not authorized.")
         return
 
+    assert query.data is not None
     data = query.data.removeprefix("ws:")
     claude = _get_claude(context)
     home = config.claude_workspace
@@ -748,7 +768,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
 
     # Switch and confirm
     await query.answer()
-    await _do_switch_workspace(context, update.effective_chat.id, path)
+    await _do_switch_workspace(context, _chat_id(update), path)
     await query.edit_message_text(
         f"Switched to {label}. Session cleared.",
         reply_markup=InlineKeyboardMarkup([]),
@@ -941,7 +961,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message or not update.message.photo:
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = _chat_id(update)
     claude = _get_claude(context)
     model = claude.model
 
@@ -1049,7 +1069,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     suffix = Path(file_name).suffix.lower()
     caption = update.message.caption or ""
 
-    chat_id = update.effective_chat.id
+    chat_id = _chat_id(update)
     claude = _get_claude(context)
     model = claude.model
 
@@ -1117,7 +1137,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message or not update.message.voice:
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = _chat_id(update)
     claude = _get_claude(context)
     config: Config = context.bot_data["config"]
 
@@ -1189,7 +1209,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not update.message or not update.message.text:
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = _chat_id(update)
     prompt = update.message.text
     log_message(direction="user", chat_id=chat_id, text=prompt)
     claude = _get_claude(context)
