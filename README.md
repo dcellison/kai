@@ -153,7 +153,10 @@ Create `~/Library/LaunchAgents/com.kai.bot.plist`:
     <true/>
 
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
 
     <key>StandardOutPath</key>
     <string>/path/to/kai/kai.log</string>
@@ -168,6 +171,8 @@ Create `~/Library/LaunchAgents/com.kai.bot.plist`:
 ```
 
 Replace `/path/to/kai` with your actual project path. The `PATH` must include directories for `claude`, `ffmpeg`, and any other tools Kai shells out to.
+
+The `NetworkState` condition ensures launchd waits for network availability before starting Kai, preventing DNS failures during boot when the network isn't ready yet.
 
 ```bash
 launchctl load ~/Library/LaunchAgents/com.kai.bot.plist
