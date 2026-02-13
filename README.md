@@ -158,12 +158,6 @@ Create `~/Library/LaunchAgents/com.kai.bot.plist`:
         <true/>
     </dict>
 
-    <key>StandardOutPath</key>
-    <string>/path/to/kai/kai.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>/path/to/kai/kai.log</string>
-
     <key>ProcessType</key>
     <string>Background</string>
 </dict>
@@ -178,7 +172,7 @@ The `NetworkState` condition ensures launchd waits for network availability befo
 launchctl load ~/Library/LaunchAgents/com.kai.bot.plist
 ```
 
-Kai will start immediately and restart automatically on login or crash. Logs go to `kai.log` in the project directory. To stop:
+Kai will start immediately and restart automatically on login or crash. Logs go to `logs/kai.log` with daily rotation (14 days of history). To stop:
 
 ```bash
 launchctl unload ~/Library/LaunchAgents/com.kai.bot.plist
@@ -216,7 +210,7 @@ sudo systemctl enable kai
 sudo systemctl start kai
 ```
 
-Check logs with `journalctl -u kai -f`. To stop:
+Check logs with `tail -f logs/kai.log` or `journalctl -u kai -f`. To stop:
 
 ```bash
 sudo systemctl stop kai
@@ -241,6 +235,7 @@ kai/
 │   ├── transcribe.py     # Voice message transcription (ffmpeg + whisper-cpp)
 │   └── tts.py            # Text-to-speech synthesis (Piper TTS + ffmpeg)
 ├── tests/                # Test suite
+├── logs/                 # Daily-rotated log files (gitignored)
 ├── models/               # Whisper and Piper model files (gitignored)
 ├── workspace/            # Claude Code working directory
 │   └── .claude/          # Identity, memory, and chat history

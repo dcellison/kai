@@ -9,7 +9,7 @@ __pycache__/
 
 # Runtime artifacts
 kai.db
-kai.log
+logs/
 .responding_to
 models/
 

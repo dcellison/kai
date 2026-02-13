@@ -2,7 +2,7 @@
 Application entry point — initializes all subsystems and runs the Telegram bot.
 
 Provides functionality to:
-1. Configure logging with appropriate levels for each subsystem
+1. Configure logging with daily rotation and terminal output
 2. Load configuration and validate environment
 3. Initialize the database, Telegram bot, scheduled jobs, and webhook server
 4. Restore workspace from previous session
@@ -28,6 +28,7 @@ The shutdown sequence (in the finally block) reverses this order:
 
 import asyncio
 import logging
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from telegram import BotCommand
@@ -36,6 +37,47 @@ from telegram.error import NetworkError
 from kai import cron, sessions, webhook
 from kai.bot import create_bot
 from kai.config import PROJECT_ROOT, load_config
+
+
+def setup_logging() -> None:
+    """
+    Configure root logger with file rotation and terminal output.
+
+    Sets up two handlers on the root logger:
+    - TimedRotatingFileHandler: writes to logs/kai.log, rotates at midnight,
+      keeps 14 days of dated backups (kai.log.2026-02-12, etc.)
+    - StreamHandler: writes to stderr for terminal visibility during `make run`
+      (harmless under launchd since there's no terminal attached)
+
+    Creates the logs/ directory if it doesn't already exist.
+    """
+    log_dir = PROJECT_ROOT / "logs"
+    log_dir.mkdir(exist_ok=True)
+
+    formatter = logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+
+    # Daily rotation at midnight, keep 2 weeks of history, use UTF-8 for
+    # emoji and non-ASCII content in Claude responses
+    file_handler = TimedRotatingFileHandler(
+        filename=log_dir / "kai.log",
+        when="midnight",
+        backupCount=14,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+
+    # Terminal output for interactive runs (make run, manual debugging)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(file_handler)
+    root.addHandler(stream_handler)
+
+    # Silence noisy per-request HTTP logs and APScheduler tick logs
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
 
 
 def main() -> None:
@@ -47,13 +89,7 @@ def main() -> None:
     Catches KeyboardInterrupt for clean Ctrl+C shutdown and logs any
     unexpected crashes.
     """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
-    # Silence noisy per-request HTTP logs and APScheduler tick logs
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+    setup_logging()
 
     config = load_config()
     logging.info("Kai starting (model=%s, users=%s)", config.claude_model, config.allowed_user_ids)
