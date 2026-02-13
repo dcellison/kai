@@ -31,6 +31,7 @@ import logging
 from pathlib import Path
 
 from telegram import BotCommand
+from telegram.error import NetworkError
 
 from kai import cron, sessions, webhook
 from kai.bot import create_bot
@@ -92,7 +93,22 @@ def main() -> None:
                 await sessions.delete_setting("workspace")
 
         try:
-            await app.initialize()
+            # Retry initialization if the network isn't ready yet (e.g. after a
+            # power outage where DNS may take a while to come back).
+            for attempt in range(1, 13):
+                try:
+                    await app.initialize()
+                    break
+                except NetworkError:
+                    if attempt == 12:
+                        raise
+                    wait = min(30, 2 ** attempt)
+                    logging.warning(
+                        "Network not ready (attempt %d/12), retrying in %ds…",
+                        attempt, wait,
+                    )
+                    await asyncio.sleep(wait)
+
             await app.start()
             assert app.updater is not None
             await app.updater.start_polling()
