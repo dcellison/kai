@@ -1295,36 +1295,17 @@ async def _handle_response(
     stop_event = get_stop_event(chat_id)
     stop_event.clear()
 
-    # Send "Let me think…" if Claude hasn't started responding within 3 seconds.
-    # Sets live_msg directly so the streaming loop edits it with real content.
-    # We never cancel this task — instead we signal first_text and await it,
-    # so we always know whether it sent a message (avoids orphaned ack messages).
-    async def _delayed_ack() -> None:
-        nonlocal live_msg
-        try:
-            await asyncio.wait_for(first_text.wait(), timeout=3.0)
-        except TimeoutError:
-            assert update.message is not None
-            live_msg = await _reply_safe(update.message, "Let me think\u2026")
-
-    first_text = asyncio.Event()
-    ack_task = asyncio.create_task(_delayed_ack())
-
     # Stream events from Claude
     async for event in claude.send(prompt):
         # Check for /stop between stream chunks
         if stop_event.is_set():
             stop_event.clear()
-            first_text.set()
-            await ack_task
             if live_msg:
                 await _edit_message_safe(live_msg, last_edit_text + "\n\n_(stopped)_")
             final_response = None
             break
 
         if event.done:
-            first_text.set()
-            await ack_task
             final_response = event.response
             break
 
@@ -1336,30 +1317,16 @@ async def _handle_response(
         if not event.text_so_far:
             continue
 
-        # Create the live message on first text, then edit periodically.
-        # Await ack_task to resolve the race: either it already sent
-        # "Let me think…" (and set live_msg) or it exited cleanly.
+        # Create the live message on first text, then edit periodically
         if live_msg is None:
-            first_text.set()
-            await ack_task
-            if live_msg is not None:
-                # Ack sent its message — edit it with real content
-                await _edit_message_safe(live_msg, _truncate_for_telegram(event.text_so_far))
-            else:
-                # Ack never fired — create a fresh message
-                truncated = _truncate_for_telegram(event.text_so_far)
-                live_msg = await _reply_safe(update.message, truncated)
+            truncated = _truncate_for_telegram(event.text_so_far)
+            live_msg = await _reply_safe(update.message, truncated)
             last_edit_time = now
             last_edit_text = event.text_so_far
         elif now - last_edit_time >= EDIT_INTERVAL and event.text_so_far != last_edit_text:
             await _edit_message_safe(live_msg, event.text_so_far)
             last_edit_time = now
             last_edit_text = event.text_so_far
-
-    # Ensure ack task is fully resolved before final delivery — if it sent
-    # "Let me think…", live_msg is set and final delivery will edit it.
-    first_text.set()
-    await ack_task
 
     # Stop the typing indicator
     typing_active = False
