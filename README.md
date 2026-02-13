@@ -191,7 +191,8 @@ Create `/etc/systemd/system/kai.service`:
 ```ini
 [Unit]
 Description=Kai Telegram Bot
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -207,6 +208,8 @@ WantedBy=multi-user.target
 ```
 
 Replace `YOUR_USERNAME` and `/path/to/kai` with your values. Add any extra directories to `PATH` where `claude`, `ffmpeg`, etc. are installed.
+
+The `network-online.target` dependency ensures systemd waits for network connectivity before starting Kai, preventing DNS failures during boot.
 
 ```bash
 sudo systemctl enable kai
