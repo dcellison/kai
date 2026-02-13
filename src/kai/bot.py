@@ -1295,17 +1295,32 @@ async def _handle_response(
     stop_event = get_stop_event(chat_id)
     stop_event.clear()
 
+    # Send "Let me think…" if Claude hasn't started responding within 3 seconds.
+    # Sets live_msg directly so the streaming loop edits it with real content.
+    async def _delayed_ack() -> None:
+        nonlocal live_msg
+        try:
+            await asyncio.wait_for(first_text.wait(), timeout=3.0)
+        except TimeoutError:
+            assert update.message is not None
+            live_msg = await _reply_safe(update.message, "Let me think\u2026")
+
+    first_text = asyncio.Event()
+    ack_task = asyncio.create_task(_delayed_ack())
+
     # Stream events from Claude
     async for event in claude.send(prompt):
         # Check for /stop between stream chunks
         if stop_event.is_set():
             stop_event.clear()
+            ack_task.cancel()
             if live_msg:
                 await _edit_message_safe(live_msg, last_edit_text + "\n\n_(stopped)_")
             final_response = None
             break
 
         if event.done:
+            ack_task.cancel()
             final_response = event.response
             break
 
@@ -1317,8 +1332,11 @@ async def _handle_response(
         if not event.text_so_far:
             continue
 
-        # Create the live message on first text, then edit periodically
+        # Create the live message on first text, then edit periodically.
+        # Signal first_text to cancel the delayed ack — we have real content.
         if live_msg is None:
+            first_text.set()
+            ack_task.cancel()
             truncated = _truncate_for_telegram(event.text_so_far)
             live_msg = await _reply_safe(update.message, truncated)
             last_edit_time = now
@@ -1327,6 +1345,9 @@ async def _handle_response(
             await _edit_message_safe(live_msg, event.text_so_far)
             last_edit_time = now
             last_edit_text = event.text_so_far
+
+    # Ensure ack task is cancelled in all exit paths (normal, stop, error)
+    ack_task.cancel()
 
     # Stop the typing indicator
     typing_active = False
