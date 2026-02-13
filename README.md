@@ -1,5 +1,9 @@
 # Kai
 
+[![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue)](https://python.org)
+[![License](https://img.shields.io/github/license/dcellison/kai)](LICENSE)
+[![Version](https://img.shields.io/github/v/tag/dcellison/kai?label=version)](https://github.com/dcellison/kai/releases)
+
 A personal AI assistant accessed via Telegram, powered by [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
 
 Kai is a Telegram gateway to a persistent Claude Code process. Messages are forwarded to Claude with full tool access (shell, files, web search), and responses stream back in real time. Everything runs locally — conversations and credentials never leave your machine.

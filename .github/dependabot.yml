@@ -1,0 +1,8 @@
+# Check for outdated or vulnerable pip dependencies weekly.
+# Opens PRs against main when updates are available.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
