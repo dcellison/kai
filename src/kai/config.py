@@ -67,9 +67,7 @@ class Config:
 
     # Voice input (speech-to-text via whisper-cpp)
     voice_enabled: bool = False
-    whisper_model_path: Path = field(
-        default_factory=lambda: PROJECT_ROOT / "models" / "ggml-base.en.bin"
-    )
+    whisper_model_path: Path = field(default_factory=lambda: PROJECT_ROOT / "models" / "ggml-base.en.bin")
 
     # Voice output (text-to-speech via Piper)
     tts_enabled: bool = False

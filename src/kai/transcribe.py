@@ -54,8 +54,7 @@ async def transcribe_voice(audio_data: bytes, model_path: Path) -> str:
     """
     if not model_path.exists():
         raise TranscriptionError(
-            f"Whisper model not found at {model_path}. "
-            "Download with: make models/ggml-base.en.bin"
+            f"Whisper model not found at {model_path}. Download with: make models/ggml-base.en.bin"
         )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -66,8 +65,15 @@ async def transcribe_voice(audio_data: bytes, model_path: Path) -> str:
 
         # Step 1: Convert Ogg Opus → 16kHz mono WAV (what whisper expects)
         await _run(
-            "ffmpeg", "-i", str(ogg_path),
-            "-ar", "16000", "-ac", "1", "-f", "wav",
+            "ffmpeg",
+            "-i",
+            str(ogg_path),
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-f",
+            "wav",
             str(wav_path),
             label="ffmpeg",
         )
@@ -75,11 +81,14 @@ async def transcribe_voice(audio_data: bytes, model_path: Path) -> str:
         # Step 2: Transcribe WAV → text via whisper-cli
         stdout = await _run(
             "whisper-cli",
-            "--model", str(model_path),
-            "--file", str(wav_path),
+            "--model",
+            str(model_path),
+            "--file",
+            str(wav_path),
             "--no-prints",
             "--no-timestamps",
-            "--language", "en",
+            "--language",
+            "en",
             label="whisper-cli",
         )
 
@@ -116,8 +125,7 @@ async def _run(*cmd: str, label: str) -> str:
         )
     except FileNotFoundError:
         raise TranscriptionError(
-            f"{label} not found. Install with: brew install "
-            f"{'whisper-cpp' if 'whisper' in label else label}"
+            f"{label} not found. Install with: brew install {'whisper-cpp' if 'whisper' in label else label}"
         ) from None
 
     try:

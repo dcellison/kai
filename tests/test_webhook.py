@@ -65,10 +65,7 @@ def _push_payload(num_commits=2, compare="https://github.com/o/r/compare/a...b")
     return {
         "pusher": {"name": "alice"},
         "ref": "refs/heads/main",
-        "commits": [
-            {"id": f"sha{i:010d}", "message": f"Commit {i}"}
-            for i in range(num_commits)
-        ],
+        "commits": [{"id": f"sha{i:010d}", "message": f"Commit {i}"} for i in range(num_commits)],
         "repository": {"full_name": "owner/repo"},
         "compare": compare,
     }

@@ -95,9 +95,7 @@ class TestGetRecentHistory:
             "text": "yesterday msg",
             "media": None,
         }
-        (_log_dir / f"{yesterday}.jsonl").write_text(
-            json.dumps(record) + "\n"
-        )
+        (_log_dir / f"{yesterday}.jsonl").write_text(json.dumps(record) + "\n")
         # Also add a today message
         log_message(direction="assistant", chat_id=1, text="today msg")
         result = get_recent_history()

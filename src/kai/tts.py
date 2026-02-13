@@ -94,10 +94,7 @@ async def synthesize_speech(text: str, model_dir: Path, voice: str = DEFAULT_VOI
 
     model_path = model_dir / f"{model_name}.onnx"
     if not model_path.exists():
-        raise TTSError(
-            f"Piper model not found at {model_path}. "
-            "Download with: make tts-model"
-        )
+        raise TTSError(f"Piper model not found at {model_path}. Download with: make tts-model")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         wav_path = Path(tmpdir) / "speech.wav"
@@ -106,17 +103,19 @@ async def synthesize_speech(text: str, model_dir: Path, voice: str = DEFAULT_VOI
         # Step 1: Synthesize text → WAV via Piper (reads from stdin)
         try:
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-m", "piper",
-                "--model", str(model_path),
-                "--output_file", str(wav_path),
+                sys.executable,
+                "-m",
+                "piper",
+                "--model",
+                str(model_path),
+                "--output_file",
+                str(wav_path),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError:
-            raise TTSError(
-                "piper-tts not found. Install with: pip install -e '.[tts]'"
-            ) from None
+            raise TTSError("piper-tts not found. Install with: pip install -e '.[tts]'") from None
 
         try:
             _, stderr = await asyncio.wait_for(
@@ -134,9 +133,15 @@ async def synthesize_speech(text: str, model_dir: Path, voice: str = DEFAULT_VOI
         # Step 2: Convert WAV → OGG Opus via ffmpeg (Telegram's voice format)
         try:
             proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-i", str(wav_path),
-                "-c:a", "libopus", "-f", "ogg",
-                "-y", str(ogg_path),
+                "ffmpeg",
+                "-i",
+                str(wav_path),
+                "-c:a",
+                "libopus",
+                "-f",
+                "ogg",
+                "-y",
+                str(ogg_path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

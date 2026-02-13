@@ -371,9 +371,7 @@ async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYP
         if arg in _VOICE_MODES:
             # /voice on|only|off — set mode directly
             await sessions.set_setting(f"voice_mode:{chat_id}", arg)
-            await update.message.reply_text(
-                f"Voice mode: {_VOICE_MODE_LABELS[arg]} (voice: {VOICES[current_voice]})"
-            )
+            await update.message.reply_text(f"Voice mode: {_VOICE_MODE_LABELS[arg]} (voice: {VOICES[current_voice]})")
         elif arg in VOICES:
             # /voice <name> — set voice (enable in current mode, or default to "only")
             await sessions.set_setting(f"voice_name:{chat_id}", arg)
@@ -397,9 +395,7 @@ async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYP
         # /voice — toggle: off → only → off
         new_mode = "off" if current_mode != "off" else "only"
         await sessions.set_setting(f"voice_mode:{chat_id}", new_mode)
-        await update.message.reply_text(
-            f"Voice mode: {_VOICE_MODE_LABELS[new_mode]} (voice: {VOICES[current_voice]})"
-        )
+        await update.message.reply_text(f"Voice mode: {_VOICE_MODE_LABELS[new_mode]} (voice: {VOICES[current_voice]})")
 
 
 @_require_auth
@@ -1166,7 +1162,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     audio_data = bytes(await file.download_as_bytearray())
 
     log_message(
-        direction="user", chat_id=chat_id,
+        direction="user",
+        chat_id=chat_id,
         text=f"[voice message, {voice.duration}s]",
         media={"type": "voice", "duration": voice.duration},
     )

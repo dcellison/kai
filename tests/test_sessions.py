@@ -55,16 +55,23 @@ class TestSessions:
 class TestJobs:
     async def test_create_returns_int_id(self, db):
         job_id = await sessions.create_job(
-            chat_id=1, name="test", job_type="reminder",
-            prompt="hello", schedule_type="once",
+            chat_id=1,
+            name="test",
+            job_type="reminder",
+            prompt="hello",
+            schedule_type="once",
             schedule_data='{"run_at": "2026-12-01T00:00:00"}',
         )
         assert isinstance(job_id, int)
 
     async def test_get_jobs_returns_active(self, db):
         await sessions.create_job(
-            chat_id=1, name="j1", job_type="reminder",
-            prompt="p1", schedule_type="once", schedule_data="{}",
+            chat_id=1,
+            name="j1",
+            job_type="reminder",
+            prompt="p1",
+            schedule_type="once",
+            schedule_data="{}",
         )
         jobs = await sessions.get_jobs(1)
         assert len(jobs) == 1
@@ -72,20 +79,31 @@ class TestJobs:
 
     async def test_get_jobs_filters_by_chat(self, db):
         await sessions.create_job(
-            chat_id=1, name="j1", job_type="reminder",
-            prompt="p", schedule_type="once", schedule_data="{}",
+            chat_id=1,
+            name="j1",
+            job_type="reminder",
+            prompt="p",
+            schedule_type="once",
+            schedule_data="{}",
         )
         await sessions.create_job(
-            chat_id=2, name="j2", job_type="reminder",
-            prompt="p", schedule_type="once", schedule_data="{}",
+            chat_id=2,
+            name="j2",
+            job_type="reminder",
+            prompt="p",
+            schedule_type="once",
+            schedule_data="{}",
         )
         assert len(await sessions.get_jobs(1)) == 1
         assert len(await sessions.get_jobs(2)) == 1
 
     async def test_get_job_by_id(self, db):
         job_id = await sessions.create_job(
-            chat_id=1, name="j1", job_type="claude",
-            prompt="analyze", schedule_type="daily",
+            chat_id=1,
+            name="j1",
+            job_type="claude",
+            prompt="analyze",
+            schedule_type="daily",
             schedule_data='{"times": ["09:00"]}',
         )
         job = await sessions.get_job_by_id(job_id)
@@ -98,20 +116,32 @@ class TestJobs:
 
     async def test_get_all_active_jobs(self, db):
         await sessions.create_job(
-            chat_id=1, name="j1", job_type="reminder",
-            prompt="p", schedule_type="once", schedule_data="{}",
+            chat_id=1,
+            name="j1",
+            job_type="reminder",
+            prompt="p",
+            schedule_type="once",
+            schedule_data="{}",
         )
         await sessions.create_job(
-            chat_id=2, name="j2", job_type="reminder",
-            prompt="p", schedule_type="once", schedule_data="{}",
+            chat_id=2,
+            name="j2",
+            job_type="reminder",
+            prompt="p",
+            schedule_type="once",
+            schedule_data="{}",
         )
         all_jobs = await sessions.get_all_active_jobs()
         assert len(all_jobs) == 2
 
     async def test_deactivate_job(self, db):
         job_id = await sessions.create_job(
-            chat_id=1, name="j1", job_type="reminder",
-            prompt="p", schedule_type="once", schedule_data="{}",
+            chat_id=1,
+            name="j1",
+            job_type="reminder",
+            prompt="p",
+            schedule_type="once",
+            schedule_data="{}",
         )
         await sessions.deactivate_job(job_id)
         assert len(await sessions.get_jobs(1)) == 0
@@ -119,8 +149,12 @@ class TestJobs:
 
     async def test_delete_job(self, db):
         job_id = await sessions.create_job(
-            chat_id=1, name="j1", job_type="reminder",
-            prompt="p", schedule_type="once", schedule_data="{}",
+            chat_id=1,
+            name="j1",
+            job_type="reminder",
+            prompt="p",
+            schedule_type="once",
+            schedule_data="{}",
         )
         assert await sessions.delete_job(job_id) is True
         assert await sessions.get_job_by_id(job_id) is None
@@ -130,8 +164,11 @@ class TestJobs:
 
     async def test_auto_remove_stored_as_bool(self, db):
         job_id = await sessions.create_job(
-            chat_id=1, name="j1", job_type="claude",
-            prompt="check", schedule_type="interval",
+            chat_id=1,
+            name="j1",
+            job_type="claude",
+            prompt="check",
+            schedule_type="interval",
             schedule_data='{"seconds": 3600}',
             auto_remove=True,
         )
@@ -139,8 +176,12 @@ class TestJobs:
         assert job["auto_remove"] is True
 
         job_id2 = await sessions.create_job(
-            chat_id=1, name="j2", job_type="reminder",
-            prompt="hi", schedule_type="once", schedule_data="{}",
+            chat_id=1,
+            name="j2",
+            job_type="reminder",
+            prompt="hi",
+            schedule_type="once",
+            schedule_data="{}",
             auto_remove=False,
         )
         job2 = await sessions.get_job_by_id(job_id2)

@@ -111,10 +111,7 @@ def main() -> None:
             ws_path = Path(saved_workspace)
             base = config.workspace_base
             # Security check: reject saved workspaces outside WORKSPACE_BASE
-            if base and not (
-                str(ws_path.resolve()).startswith(str(base) + "/")
-                or ws_path.resolve() == base
-            ):
+            if base and not (str(ws_path.resolve()).startswith(str(base) + "/") or ws_path.resolve() == base):
                 logging.warning(
                     "Saved workspace %s is outside WORKSPACE_BASE %s, ignoring",
                     saved_workspace,
@@ -138,10 +135,11 @@ def main() -> None:
                 except NetworkError:
                     if attempt == 12:
                         raise
-                    wait = min(30, 2 ** attempt)
+                    wait = min(30, 2**attempt)
                     logging.warning(
                         "Network not ready (attempt %d/12), retrying in %ds…",
-                        attempt, wait,
+                        attempt,
+                        wait,
                     )
                     await asyncio.sleep(wait)
 

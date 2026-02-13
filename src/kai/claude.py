@@ -269,9 +269,7 @@ class PersistentClaude:
             # Inject recent conversation history for continuity
             recent = get_recent_history()
             if recent:
-                parts.append(
-                    f"[Recent conversations (search .claude/history/ for full logs):]\n{recent}"
-                )
+                parts.append(f"[Recent conversations (search .claude/history/ for full logs):]\n{recent}")
 
             # Inject scheduling API info (always, so cron works from any workspace)
             if self.webhook_secret:
