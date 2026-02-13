@@ -1,8 +1,8 @@
 # Kai
 
 [![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue)](https://python.org)
-[![License](https://img.shields.io/github/license/dcellison/kai)](LICENSE)
-[![Version](https://img.shields.io/github/v/tag/dcellison/kai?label=version)](https://github.com/dcellison/kai/releases)
+[![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue)](https://github.com/dcellison/kai/releases)
 
 A personal AI assistant accessed via Telegram, powered by [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
 
