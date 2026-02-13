@@ -1,22 +1,26 @@
+# Prefix for venv binaries. Override with `make BIN= test` in CI
+# where tools are installed globally (no .venv).
+BIN = .venv/bin/
+
 .PHONY: run lint format check test install tts-model
 
 run:
-	.venv/bin/python -m kai
+	$(BIN)python -m kai
 
 lint:
-	.venv/bin/ruff check .
+	$(BIN)ruff check .
 
 format:
-	.venv/bin/ruff format .
+	$(BIN)ruff format .
 
 check: lint
-	.venv/bin/ruff format --check .
+	$(BIN)ruff format --check .
 
 test:
-	.venv/bin/python -m pytest tests/ -v
+	$(BIN)python -m pytest tests/ -v
 
 install:
-	.venv/bin/pip install -e '.[dev]'
+	$(BIN)pip install -e '.[dev]'
 
 models/ggml-base.en.bin:
 	mkdir -p models
