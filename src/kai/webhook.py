@@ -301,7 +301,8 @@ async def _handle_schedule(request: web.Request) -> web.Response:
     scheduled tasks. Claude uses curl to POST here from within the workspace.
 
     Required JSON fields: name, prompt, schedule_type, schedule_data.
-    Optional fields: job_type (default "reminder"), auto_remove (default false).
+    Optional fields: job_type (default "reminder"), auto_remove (default false),
+        notify_on_check (default false).
 
     The job is persisted to the database and immediately registered with
     APScheduler so it starts firing without a restart.
@@ -342,6 +343,7 @@ async def _handle_schedule(request: web.Request) -> web.Response:
     # Optional fields with defaults
     job_type = payload.get("job_type", "reminder")
     auto_remove = payload.get("auto_remove", False)
+    notify_on_check = payload.get("notify_on_check", False)
     chat_id = request.app["chat_id"]
 
     # schedule_data can arrive as a JSON object or a pre-serialized string
@@ -360,6 +362,7 @@ async def _handle_schedule(request: web.Request) -> web.Response:
             schedule_type=schedule_type,
             schedule_data=schedule_data_str,
             auto_remove=auto_remove,
+            notify_on_check=notify_on_check,
         )
     except Exception:
         log.exception("Failed to create job")

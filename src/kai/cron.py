@@ -212,7 +212,8 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
     For Claude jobs with auto_remove=True, the response is inspected for
     protocol markers:
     - CONDITION_MET: <message> — delivers the message and deactivates the job.
-    - CONDITION_NOT_MET — silently continues without notifying the user.
+    - CONDITION_NOT_MET: <message> — silently continues (default), or delivers
+      the message if notify_on_check=True (useful for progress updates).
     - No marker — delivers the full response (non-auto-remove jobs always do this).
 
     Args:
@@ -302,8 +303,27 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             log.info("Job %d condition met, deactivated", job_id)
 
         elif auto_remove and first_line.startswith(_CONDITION_NOT_MET_PREFIX.upper()):
-            # Condition not met — silently continue, no notification to user
-            log.info("Job %d condition not met, continuing", job_id)
+            # Condition not met — notify user if notify_on_check is enabled, otherwise silent
+            notify_on_check = data.get("notify_on_check", False)
+            if notify_on_check:
+                # Extract and send the message after the marker (same logic as CONDITION_MET)
+                lines = response_text.strip().split("\n", 1)
+                after_marker = lines[0].strip()[len(_CONDITION_NOT_MET_PREFIX) :].strip()
+                rest = lines[1].strip() if len(lines) > 1 else ""
+                clean_text = f"{after_marker}\n{rest}".strip() if after_marker else rest
+                msg = (
+                    f"[Job: {data['name']}]\n{clean_text}" if clean_text else f"[Job: {data['name']}] Still checking..."
+                )
+                try:
+                    log_message(direction="assistant", chat_id=chat_id, text=msg)
+                    await context.bot.send_message(chat_id=chat_id, text=msg)
+                except Forbidden:
+                    log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
+                    await sessions.deactivate_job(job_id)
+                    job.schedule_removal()
+                except Exception:
+                    log.exception("Failed to send job %d progress update", job_id)
+            log.info("Job %d condition not met, continuing (notified=%s)", job_id, notify_on_check)
 
         else:
             # Non-conditional or non-auto-remove: always deliver the response

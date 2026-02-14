@@ -75,9 +75,16 @@ async def init_db(db_path: Path) -> None:
             schedule_data TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             active INTEGER DEFAULT 1,
-            auto_remove INTEGER DEFAULT 0
+            auto_remove INTEGER DEFAULT 0,
+            notify_on_check INTEGER DEFAULT 0
         )
     """)
+
+    # Schema evolution: add notify_on_check column to existing databases that don't have it
+    cursor = await _get_db().execute("PRAGMA table_info(jobs)")
+    columns = [row[1] for row in await cursor.fetchall()]
+    if "notify_on_check" not in columns:
+        await _get_db().execute("ALTER TABLE jobs ADD COLUMN notify_on_check INTEGER DEFAULT 0")
     await _get_db().execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -160,6 +167,7 @@ async def create_job(
     schedule_type: str,
     schedule_data: str,
     auto_remove: bool = False,
+    notify_on_check: bool = False,
 ) -> int:
     """
     Create a new scheduled job and return its integer ID.
@@ -175,14 +183,16 @@ async def create_job(
             daily: {"times": ["HH:MM", ...]} (UTC)
             interval: {"seconds": N}
         auto_remove: If True, deactivate the job when a CONDITION_MET marker is received.
+        notify_on_check: If True (and auto_remove=True), forward CONDITION_NOT_MET responses
+            instead of silently continuing. Useful for "heartbeat" status updates.
 
     Returns:
         The auto-generated integer job ID.
     """
     cursor = await _get_db().execute(
-        """INSERT INTO jobs (chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (chat_id, name, job_type, prompt, schedule_type, schedule_data, int(auto_remove)),
+        """INSERT INTO jobs (chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (chat_id, name, job_type, prompt, schedule_type, schedule_data, int(auto_remove), int(notify_on_check)),
     )
     await _get_db().commit()
     assert cursor.lastrowid is not None
