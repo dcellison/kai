@@ -2,6 +2,9 @@
 .env
 .venv/
 
+# Service config (user-specific, contains service selections)
+services.yaml
+
 # Python
 __pycache__/
 *.pyc
