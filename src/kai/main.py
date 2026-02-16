@@ -34,7 +34,7 @@ from pathlib import Path
 from telegram import BotCommand
 from telegram.error import NetworkError
 
-from kai import cron, sessions, webhook
+from kai import cron, services, sessions, webhook
 from kai.bot import create_bot
 from kai.config import PROJECT_ROOT, load_config
 
@@ -93,6 +93,12 @@ def main() -> None:
 
     config = load_config()
     logging.info("Kai starting (model=%s, users=%s)", config.claude_model, config.allowed_user_ids)
+
+    # Load external service definitions from services.yaml (missing file is fine — graceful degradation)
+    loaded = services.load_services(PROJECT_ROOT / "services.yaml")
+    if loaded:
+        names = ", ".join(loaded.keys())
+        logging.info("Loaded %d service(s): %s", len(loaded), names)
 
     async def _init_and_run() -> None:
         """

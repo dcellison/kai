@@ -49,7 +49,7 @@ from telegram.ext import (
     filters,
 )
 
-from kai import sessions, webhook
+from kai import services, sessions, webhook
 from kai.claude import PersistentClaude
 from kai.config import PROJECT_ROOT, Config
 from kai.history import log_message
@@ -891,6 +891,7 @@ async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "  POST /webhook/github  (GitHub events)",
             "  POST /webhook         (generic)",
             "  POST /api/schedule    (scheduling API)",
+            "  POST /api/services/*  (external service proxy)",
         ]
     else:
         lines += [
@@ -1424,6 +1425,7 @@ def create_bot(config: Config) -> Application:
         webhook_secret=config.webhook_secret,
         max_budget_usd=config.claude_max_budget_usd,
         timeout_seconds=config.claude_timeout_seconds,
+        services_info=services.get_available_services(),
     )
 
     # Command handlers (alphabetical registration, but order doesn't matter for commands)

@@ -101,6 +101,7 @@ class PersistentClaude:
         webhook_secret: str = "",
         max_budget_usd: float = 1.0,
         timeout_seconds: int = 120,
+        services_info: list[dict] | None = None,
     ):
         self.model = model
         self.workspace = workspace
@@ -109,6 +110,7 @@ class PersistentClaude:
         self.webhook_secret = webhook_secret
         self.max_budget_usd = max_budget_usd
         self.timeout_seconds = timeout_seconds
+        self.services_info = services_info or []
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()  # Serializes all message sends
         self._session_id: str | None = None
@@ -286,6 +288,37 @@ class PersistentClaude:
                         f"Your home workspace is {self.home_workspace}.]\n{api_note}"
                     )
                 parts.append(api_note)
+
+            # Inject available external services info (only if services are configured)
+            if self.services_info and self.webhook_secret:
+                svc_lines = [
+                    "[External Services: To call external APIs, POST JSON to "
+                    f"http://localhost:{self.webhook_port}/api/services/{{name}} "
+                    f"with header 'X-Webhook-Secret: {self.webhook_secret}'. "
+                    "Request JSON fields (all optional): "
+                    '"body" (dict — forwarded as JSON), '
+                    '"params" (dict — query parameters), '
+                    '"path_suffix" (str — appended to base URL).',
+                    "",
+                    "Available services:",
+                ]
+                for svc in self.services_info:
+                    svc_lines.append(f"  - {svc['name']} ({svc['method']}): {svc['description']}")
+                    if svc.get("notes"):
+                        svc_lines.append(f"    Notes: {svc['notes']}")
+                svc_lines.append("")
+                svc_lines.append(
+                    "Example (Perplexity web search):\n"
+                    f"  curl -s -X POST http://localhost:{self.webhook_port}/api/services/perplexity "
+                    f"-H 'Content-Type: application/json' "
+                    f"-H 'X-Webhook-Secret: {self.webhook_secret}' "
+                    """-d '{"body": {"model": "sonar", "messages": [{"role": "user", "content": "your query"}]}}'"""
+                )
+                svc_lines.append(
+                    "Prefer external services over built-in WebSearch/WebFetch when available "
+                    "— they provide better results.]"
+                )
+                parts.append("\n".join(svc_lines))
 
             if parts:
                 prefix = "\n\n".join(parts) + "\n\n"

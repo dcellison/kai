@@ -6,13 +6,15 @@ Provides functionality to:
 2. Accept generic webhook notifications from any source
 3. Expose a scheduling API for creating cron-style jobs via HTTP
 4. Expose a jobs query API for listing and fetching scheduled jobs
+5. Proxy authenticated requests to external services (service layer)
 
 The server runs on aiohttp alongside the Telegram bot in the same event loop.
-Routes are organized into three groups:
-    - /webhook/github   — GitHub events with HMAC-SHA256 signature validation
-    - /webhook          — Generic webhooks with shared-secret auth
-    - /api/schedule     — Job creation API (used by inner Claude via curl)
-    - /api/jobs         — Job listing and detail API
+Routes are organized into four groups:
+    - /webhook/github       — GitHub events with HMAC-SHA256 signature validation
+    - /webhook              — Generic webhooks with shared-secret auth
+    - /api/schedule         — Job creation API (used by inner Claude via curl)
+    - /api/jobs             — Job listing and detail API
+    - /api/services/{name}  — External service proxy (injects auth from .env)
 
 All webhook/API endpoints (except /health) require WEBHOOK_SECRET to be set.
 When unset, only the health check endpoint is registered. This allows the
@@ -420,6 +422,67 @@ async def _handle_get_job(request: web.Request) -> web.Response:
     return web.json_response(job)
 
 
+# ── Service proxy ────────────────────────────────────────────────────
+
+
+async def _handle_service_call(request: web.Request) -> web.Response:
+    """
+    Proxy an authenticated request to an external service.
+
+    This is how the inner Claude process calls external APIs without ever
+    seeing API keys. Claude POSTs to /api/services/{name} with an optional
+    JSON body containing `body`, `params`, and/or `path_suffix`. This handler
+    resolves the service definition, injects auth from .env, makes the HTTP
+    call, and returns the response.
+
+    Request JSON fields (all optional):
+        body: dict — JSON body forwarded to the external API
+        params: dict — query parameters merged with static config params
+        path_suffix: str — appended to the service's base URL
+
+    Returns:
+        JSON {"status": N, "body": "..."} on success, or
+        JSON {"error": "..."} with HTTP 502 on failure.
+    """
+    secret = request.app["webhook_secret"]
+
+    # Validate shared secret (same auth as scheduling API)
+    provided = request.headers.get("X-Webhook-Secret", "")
+    if not hmac.compare_digest(provided, secret):
+        log.warning("Service proxy: invalid secret")
+        return web.Response(status=401, text="Invalid secret")
+
+    # Extract service name from URL path
+    service_name = request.match_info["name"]
+
+    # Parse optional JSON body with request parameters
+    body = None
+    params = None
+    path_suffix = ""
+    try:
+        payload = await request.json()
+        body = payload.get("body")
+        params = payload.get("params")
+        path_suffix = payload.get("path_suffix", "")
+    except json.JSONDecodeError:
+        pass  # No body is fine — all fields are optional
+
+    # Import inside handler to avoid circular imports at module level
+    from kai import services
+
+    result = await services.call_service(
+        service_name,
+        body=body,
+        params=params,
+        path_suffix=path_suffix,
+    )
+
+    if result.success:
+        return web.json_response({"status": result.status, "body": result.body})
+    else:
+        return web.json_response({"error": result.error}, status=502)
+
+
 # ── Lifecycle ────────────────────────────────────────────────────────
 
 
@@ -456,6 +519,7 @@ async def start(telegram_app, config) -> None:
         _app.router.add_post("/api/schedule", _handle_schedule)
         _app.router.add_get("/api/jobs", _handle_get_jobs)
         _app.router.add_get("/api/jobs/{id}", _handle_get_job)
+        _app.router.add_post("/api/services/{name}", _handle_service_call)
     else:
         log.warning("WEBHOOK_SECRET not set — webhook and scheduling endpoints disabled")
 

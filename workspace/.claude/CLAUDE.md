@@ -105,3 +105,29 @@ For auto-remove jobs, start your response with `CONDITION_MET: <message>` when t
   - `interval`: `{"seconds": N}`
 - `job_type` — `reminder` (default) or `claude`
 - `auto_remove` — boolean, deactivate when condition met (claude jobs only)
+
+## External Services
+
+Use the service proxy to call external APIs without handling API keys directly. The proxy endpoint, secret, and available services are provided in your session context. Use `SECRET` as a placeholder below — replace with the actual value from your context.
+
+### Calling a service:
+```bash
+curl -s -X POST http://localhost:8080/api/services/perplexity \
+  -H 'Content-Type: application/json' \
+  -H 'X-Webhook-Secret: SECRET' \
+  -d '{"body": {"model": "sonar", "messages": [{"role": "user", "content": "What happened today in tech news?"}]}}'
+```
+
+### Request JSON fields (all optional):
+- `body` — dict, forwarded as JSON body to the external API
+- `params` — dict, query parameters (merged with any static params in the service config)
+- `path_suffix` — string, appended to the service's base URL (useful for Jina Reader: set to the target URL)
+
+### Response format:
+- Success: `{"status": 200, "body": "..."}`
+- Failure: `{"error": "..."}`
+
+### When to use services vs built-in tools:
+- **Prefer external services** (like Perplexity) when available — they provide better, more current results than built-in WebSearch/WebFetch
+- **Fall back to WebSearch/WebFetch** if no services are configured or if a service call fails
+- Check your session context for the list of available services and their usage notes

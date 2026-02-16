@@ -1,0 +1,89 @@
+# ── External Services ────────────────────────────────────────────────
+#
+# Declarative HTTP service definitions for Kai. Each entry describes an
+# external API that inner Claude can call via the local proxy endpoint.
+#
+# Setup:
+#   1. Copy this file: cp services.example.yaml services.yaml
+#   2. Uncomment the services you want to use
+#   3. Set the corresponding API key(s) in .env
+#   4. Restart Kai
+#
+# Kai injects authentication from .env at call time — API keys never
+# enter Claude's context. See workspace/.claude/CLAUDE.md for usage docs.
+#
+# Auth types:
+#   bearer  — Authorization: Bearer $KEY
+#   header  — Custom header {name}: $KEY
+#   query   — Query param {name}=$KEY
+#   none    — No authentication
+# ─────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Perplexity (recommended for web search) ─────────────────────
+  # Sign up at https://www.perplexity.ai/ and generate an API key.
+  # Set PERPLEXITY_API_KEY in .env to activate.
+  perplexity:
+    url: https://api.perplexity.ai/chat/completions
+    method: POST
+    auth:
+      type: bearer
+      env: PERPLEXITY_API_KEY
+    headers:
+      Content-Type: application/json
+    description: "Web search and AI synthesis via Perplexity Sonar API"
+    notes: >
+      Send JSON body with "model" (use "sonar" for web search) and "messages"
+      array. Example: {"model": "sonar", "messages": [{"role": "user",
+      "content": "What happened today?"}]}. Response includes citations in
+      the "citations" array.
+
+  # ── Brave Search ────────────────────────────────────────────────
+  # Uncomment to enable. Get an API key at https://brave.com/search/api/
+  # Set BRAVE_API_KEY in .env to activate.
+  #
+  # brave_search:
+  #   url: https://api.search.brave.com/res/v1/web/search
+  #   method: GET
+  #   auth:
+  #     type: header
+  #     name: X-Subscription-Token
+  #     env: BRAVE_API_KEY
+  #   description: "Web search via Brave Search API"
+  #   notes: >
+  #     Pass search query as "q" param. Example params: {"q": "your query"}.
+  #     Returns JSON with "web.results" array containing title, url, description.
+
+  # ── Jina Reader ─────────────────────────────────────────────────
+  # Uncomment to enable. Works without a key (rate-limited), or get
+  # a key at https://jina.ai/reader/ for higher limits.
+  # Set JINA_API_KEY in .env (optional) to activate with auth.
+  #
+  # jina_reader:
+  #   url: https://r.jina.ai/
+  #   method: GET
+  #   auth:
+  #     type: bearer
+  #     env: JINA_API_KEY
+  #     optional: true
+  #   description: "Convert URLs to clean markdown text"
+  #   notes: >
+  #     Append the target URL as path_suffix. Example: set path_suffix
+  #     to "https://example.com" to fetch and convert that page.
+
+  # ── SearXNG (self-hosted) ──────────────────────────────────────
+  # Uncomment if you run a local SearXNG instance.
+  # No API key needed — just set the correct URL.
+  #
+  # searxng:
+  #   url: http://localhost:8888/search
+  #   method: GET
+  #   auth:
+  #     type: none
+  #   params:
+  #     format: json
+  #   description: "Self-hosted metasearch via local SearXNG instance"
+  #   notes: >
+  #     Pass search query as "q" param. Example params: {"q": "your query"}.
+  #     Returns JSON with "results" array.
