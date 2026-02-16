@@ -93,7 +93,15 @@ curl -s -X POST http://localhost:8080/api/schedule \
   -H 'X-Webhook-Secret: SECRET' \
   -d '{"name": "Package tracker", "prompt": "Has my package arrived?", "job_type": "claude", "auto_remove": true, "schedule_type": "interval", "schedule_data": {"seconds": 3600}}'
 ```
-For auto-remove jobs, start your response with `CONDITION_MET: <message>` when the condition is satisfied, or `CONDITION_NOT_MET` to silently continue.
+For auto-remove jobs, start your response with `CONDITION_MET: <message>` when the condition is satisfied, or `CONDITION_NOT_MET` to silently continue. If `notify_on_check` is enabled, use `CONDITION_NOT_MET: <status message>` to send progress updates to the user while continuing to monitor.
+
+### Auto-remove jobs with progress updates:
+```bash
+curl -s -X POST http://localhost:8080/api/schedule \
+  -H 'Content-Type: application/json' \
+  -H 'X-Webhook-Secret: SECRET' \
+  -d '{"name": "Package tracker", "prompt": "Has my package arrived? Give a brief status update.", "job_type": "claude", "auto_remove": true, "notify_on_check": true, "schedule_type": "interval", "schedule_data": {"seconds": 3600}}'
+```
 
 ### API fields reference:
 - `name` — job name (required)
@@ -105,6 +113,7 @@ For auto-remove jobs, start your response with `CONDITION_MET: <message>` when t
   - `interval`: `{"seconds": N}`
 - `job_type` — `reminder` (default) or `claude`
 - `auto_remove` — boolean, deactivate when condition met (claude jobs only)
+- `notify_on_check` — boolean, send CONDITION_NOT_MET messages to user instead of silently continuing (auto_remove claude jobs only, default false)
 
 ## External Services
 
