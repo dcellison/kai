@@ -39,23 +39,39 @@ services:
       "content": "What happened today?"}]}. Response includes citations in
       the "citations" array.
 
-  # ── Brave Search ────────────────────────────────────────────────
-  # Uncomment to enable. Get an API key at https://brave.com/search/api/
-  # Set BRAVE_API_KEY in .env to activate.
+  # ── OpenWeatherMap (weather data) ───────────────────────────────
+  # Uncomment to enable. Get a free API key at https://openweathermap.org/api
+  # Set OPENWEATHER_API_KEY in .env to activate.
   #
-  # brave_search:
-  #   url: https://api.search.brave.com/res/v1/web/search
+  # openweathermap:
+  #   url: https://api.openweathermap.org/data/2.5/weather
   #   method: GET
   #   auth:
-  #     type: header
-  #     name: X-Subscription-Token
-  #     env: BRAVE_API_KEY
-  #   description: "Web search via Brave Search API"
+  #     type: query
+  #     name: appid
+  #     env: OPENWEATHER_API_KEY
+  #   description: "Current weather data from OpenWeatherMap"
   #   notes: >
-  #     Pass search query as "q" param. Example params: {"q": "your query"}.
-  #     Returns JSON with "web.results" array containing title, url, description.
+  #     Pass location as params: {"q": "London,UK"} or {"lat": "51.5", "lon": "-0.1"}.
+  #     Add {"units": "metric"} or {"units": "imperial"} for temperature units.
+  #     Returns JSON with main.temp, weather[0].description, wind.speed, etc.
 
-  # ── Jina Reader ─────────────────────────────────────────────────
+  # ── ntfy (push notifications) ─────────────────────────────────
+  # Uncomment to enable. Free, no account needed for public topics.
+  # See https://ntfy.sh for self-hosted or hosted options.
+  #
+  # ntfy:
+  #   url: https://ntfy.sh
+  #   method: POST
+  #   auth:
+  #     type: none
+  #   description: "Send push notifications via ntfy"
+  #   notes: >
+  #     Set path_suffix to the topic name (e.g., "my-kai-alerts").
+  #     Send the notification text as body: {"body": "message text"}.
+  #     Supports params for priority, tags, title — see https://docs.ntfy.sh
+
+  # ── Jina Reader (content extraction) ──────────────────────────
   # Uncomment to enable. Works without a key (rate-limited), or get
   # a key at https://jina.ai/reader/ for higher limits.
   # Set JINA_API_KEY in .env (optional) to activate with auth.
@@ -72,7 +88,7 @@ services:
   #     Append the target URL as path_suffix. Example: set path_suffix
   #     to "https://example.com" to fetch and convert that page.
 
-  # ── SearXNG (self-hosted) ──────────────────────────────────────
+  # ── SearXNG (self-hosted search) ──────────────────────────────
   # Uncomment if you run a local SearXNG instance.
   # No API key needed — just set the correct URL.
   #
