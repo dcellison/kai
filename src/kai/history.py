@@ -21,7 +21,7 @@ summary of the last few messages for ambient recall at session start.
 
 import json
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from kai.config import PROJECT_ROOT
 
@@ -74,7 +74,11 @@ def log_message(
 
 def get_recent_history() -> str:
     """
-    Return a formatted summary of recent messages from today and yesterday.
+    Return a formatted summary of recent messages, scanning back as needed.
+
+    Scans date-stamped JSONL files from newest to oldest, collecting up to
+    _MAX_RECENT_MESSAGES messages. This ensures Kai has ambient recall even
+    after gaps of several days without conversation.
 
     Injected into the first prompt of each new Claude session (in claude.py)
     to give Kai ambient awareness of recent conversations without loading the
@@ -84,26 +88,40 @@ def get_recent_history() -> str:
         A newline-separated string of formatted messages like
         "[2026-02-11 07:00] You: hello", or an empty string if no history exists.
     """
-    now = datetime.now(UTC)
-    dates = [now.strftime("%Y-%m-%d"), (now - timedelta(days=1)).strftime("%Y-%m-%d")]
+    if not _LOG_DIR.exists():
+        return ""
 
-    # Read yesterday first, then today, so messages are in chronological order
+    # List all JSONL files and sort newest-first (ISO date filenames sort
+    # lexicographically, so reversed gives us most recent first)
+    files = sorted(_LOG_DIR.glob("*.jsonl"), reverse=True)
+    if not files:
+        return ""
+
+    # Read files newest-first, collecting messages until we have enough.
+    # We read entire files since individual files are small (one day of chat),
+    # then take the last N from the combined pool.
     messages: list[dict] = []
-    for date_str in reversed(dates):
-        path = _LOG_DIR / f"{date_str}.jsonl"
-        if not path.exists():
-            continue
+    for path in files:
+        file_messages: list[dict] = []
         try:
             for line in path.read_text(encoding="utf-8").splitlines():
                 if line.strip():
-                    messages.append(json.loads(line))
+                    file_messages.append(json.loads(line))
         except (OSError, json.JSONDecodeError):
             log.exception("Failed to read history file %s", path)
+            continue
+
+        # Prepend this file's messages (older days go before newer days)
+        messages = file_messages + messages
+
+        # Stop scanning once we have more than enough
+        if len(messages) >= _MAX_RECENT_MESSAGES:
+            break
 
     if not messages:
         return ""
 
-    # Take only the most recent N messages
+    # Take only the most recent N messages (chronological order preserved)
     messages = messages[-_MAX_RECENT_MESSAGES:]
 
     lines = []
