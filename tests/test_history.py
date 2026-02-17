@@ -86,7 +86,8 @@ class TestGetRecentHistory:
         assert "msg0" not in result
         assert "msg1" not in result
 
-    def test_reads_yesterday_file(self, _log_dir):
+    def test_reads_older_files(self, _log_dir):
+        """History should scan back beyond yesterday to find messages."""
         yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
         record = {
             "ts": f"{yesterday}T23:00:00+00:00",
@@ -101,3 +102,64 @@ class TestGetRecentHistory:
         result = get_recent_history()
         assert "yesterday msg" in result
         assert "today msg" in result
+
+    def test_scans_back_multiple_days(self, _log_dir):
+        """Messages from several days ago should still be found."""
+        # Write a message from 5 days ago — old code would miss this entirely
+        old_date = (datetime.now(UTC) - timedelta(days=5)).strftime("%Y-%m-%d")
+        record = {
+            "ts": f"{old_date}T10:00:00+00:00",
+            "dir": "user",
+            "chat_id": 1,
+            "text": "five days ago",
+            "media": None,
+        }
+        (_log_dir / f"{old_date}.jsonl").write_text(json.dumps(record) + "\n")
+        result = get_recent_history()
+        assert "five days ago" in result
+
+    def test_chronological_order_across_days(self, _log_dir):
+        """Messages from multiple days should appear oldest-first."""
+        # Create files for 3 days ago, 1 day ago, and today
+        for days_back, msg in [(3, "three days"), (1, "one day"), (0, "today")]:
+            date = (datetime.now(UTC) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+            record = {
+                "ts": f"{date}T12:00:00+00:00",
+                "dir": "user",
+                "chat_id": 1,
+                "text": msg,
+                "media": None,
+            }
+            (_log_dir / f"{date}.jsonl").write_text(json.dumps(record) + "\n")
+        result = get_recent_history()
+        # All three should be present, in chronological order
+        assert "three days" in result
+        assert "one day" in result
+        assert "today" in result
+        assert result.index("three days") < result.index("one day") < result.index("today")
+
+    def test_stops_scanning_when_enough_messages(self, _log_dir, monkeypatch):
+        """Should stop reading older files once enough messages are collected."""
+        monkeypatch.setattr(history, "_MAX_RECENT_MESSAGES", 3)
+        # Write 2 messages today and 2 messages from 5 days ago
+        for msg in ["today1", "today2"]:
+            log_message(direction="user", chat_id=1, text=msg)
+        old_date = (datetime.now(UTC) - timedelta(days=5)).strftime("%Y-%m-%d")
+        for msg in ["old1", "old2"]:
+            record = {
+                "ts": f"{old_date}T12:00:00+00:00",
+                "dir": "user",
+                "chat_id": 1,
+                "text": msg,
+                "media": None,
+            }
+            with open(_log_dir / f"{old_date}.jsonl", "a") as f:
+                f.write(json.dumps(record) + "\n")
+        result = get_recent_history()
+        # With max=3, should get the last 3: old2, today1, today2
+        assert "today1" in result
+        assert "today2" in result
+        # old2 should be included (it's in the last 3 of the 4 total)
+        assert "old2" in result
+        # old1 should be excluded (it's the 4th oldest, beyond the cap)
+        assert "old1" not in result
