@@ -115,6 +115,36 @@ curl -s -X POST http://localhost:8080/api/schedule \
 - `auto_remove` — boolean, deactivate when condition met (claude jobs only)
 - `notify_on_check` — boolean, send CONDITION_NOT_MET messages to user instead of silently continuing (auto_remove claude jobs only, default false)
 
+### Managing existing jobs:
+
+**List all jobs:**
+```bash
+curl -s http://localhost:8080/api/jobs \
+  -H 'X-Webhook-Secret: SECRET'
+```
+
+**Get a single job:**
+```bash
+curl -s http://localhost:8080/api/jobs/21 \
+  -H 'X-Webhook-Secret: SECRET'
+```
+
+**Delete a job:**
+```bash
+curl -s -X DELETE http://localhost:8080/api/jobs/21 \
+  -H 'X-Webhook-Secret: SECRET'
+```
+
+**Update a job (any combination of fields):**
+```bash
+curl -s -X PATCH http://localhost:8080/api/jobs/21 \
+  -H 'Content-Type: application/json' \
+  -H 'X-Webhook-Secret: SECRET' \
+  -d '{"schedule_data": {"seconds": 7200}}'
+```
+
+**Updatable fields:** `name`, `prompt`, `schedule_type`, `schedule_data`, `auto_remove`, `notify_on_check`
+
 ## External Services
 
 Use the service proxy to call external APIs without handling API keys directly. The proxy endpoint, secret, and available services are provided in your session context. Use `SECRET` as a placeholder below — replace with the actual value from your context.

@@ -244,6 +244,72 @@ async def deactivate_job(job_id: int) -> None:
     await _get_db().commit()
 
 
+async def update_job(
+    job_id: int,
+    *,
+    name: str | None = None,
+    prompt: str | None = None,
+    schedule_type: str | None = None,
+    schedule_data: str | None = None,
+    auto_remove: bool | None = None,
+    notify_on_check: bool | None = None,
+) -> bool:
+    """
+    Update mutable fields on an existing active job.
+
+    Only provided (non-None) fields are updated. The job must be active.
+    Returns True if a row was updated, False if the job wasn't found or
+    is inactive.
+
+    Note: job_type and chat_id are intentionally not updatable. Changing
+    a job from reminder to claude (or vice versa) is a fundamentally
+    different job — delete and recreate for that.
+
+    Args:
+        job_id: Database ID of the job to update.
+        name: New job name.
+        prompt: New prompt text.
+        schedule_type: New schedule type ("once", "daily", "interval").
+        schedule_data: New schedule data (JSON string).
+        auto_remove: New auto_remove flag.
+        notify_on_check: New notify_on_check flag.
+
+    Returns:
+        True if the job was updated, False if not found or inactive.
+    """
+    # Build SET clause dynamically from provided fields. This is safe because
+    # all field names are from a controlled list, not user input.
+    updates = []
+    values = []
+    if name is not None:
+        updates.append("name = ?")
+        values.append(name)
+    if prompt is not None:
+        updates.append("prompt = ?")
+        values.append(prompt)
+    if schedule_type is not None:
+        updates.append("schedule_type = ?")
+        values.append(schedule_type)
+    if schedule_data is not None:
+        updates.append("schedule_data = ?")
+        values.append(schedule_data)
+    if auto_remove is not None:
+        updates.append("auto_remove = ?")
+        values.append(int(auto_remove))
+    if notify_on_check is not None:
+        updates.append("notify_on_check = ?")
+        values.append(int(notify_on_check))
+
+    if not updates:
+        return False
+
+    values.append(job_id)
+    sql = f"UPDATE jobs SET {', '.join(updates)} WHERE id = ? AND active = 1"
+    cursor = await _get_db().execute(sql, values)
+    await _get_db().commit()
+    return cursor.rowcount > 0
+
+
 # ── Settings (generic key-value store) ───────────────────────────────
 
 

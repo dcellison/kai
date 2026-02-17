@@ -14,6 +14,7 @@ Routes are organized into four groups:
     - /webhook              — Generic webhooks with shared-secret auth
     - /api/schedule         — Job creation API (used by inner Claude via curl)
     - /api/jobs             — Job listing and detail API
+    - /api/jobs/{id}        — Job detail (GET), deletion (DELETE), and update (PATCH)
     - /api/services/{name}  — External service proxy (injects auth from .env)
 
 All webhook/API endpoints (except /health) require WEBHOOK_SECRET to be set.
@@ -422,6 +423,116 @@ async def _handle_get_job(request: web.Request) -> web.Response:
     return web.json_response(job)
 
 
+async def _handle_delete_job(request: web.Request) -> web.Response:
+    """
+    Delete a scheduled job by ID via the HTTP API.
+
+    Removes the job from both the database and APScheduler's in-memory
+    queue. Uses the same logic as the /canceljob Telegram command.
+    Returns 404 if the job doesn't exist.
+    """
+    secret = request.app["webhook_secret"]
+
+    provided = request.headers.get("X-Webhook-Secret", "")
+    if not hmac.compare_digest(provided, secret):
+        return web.Response(status=401, text="Invalid secret")
+
+    try:
+        job_id = int(request.match_info["id"])
+    except ValueError:
+        return web.json_response({"error": "Invalid job ID"}, status=400)
+
+    deleted = await sessions.delete_job(job_id)
+    if not deleted:
+        return web.json_response({"error": "Job not found"}, status=404)
+
+    # Remove from APScheduler's in-memory queue. Daily jobs with multiple
+    # times get suffixed names (e.g., cron_19_0, cron_19_1), so we match
+    # both the exact name and the prefix pattern.
+    telegram_app = request.app["telegram_app"]
+    jq = telegram_app.job_queue
+    assert jq is not None
+    prefix = f"cron_{job_id}"
+    for j in jq.jobs():
+        if j.name == prefix or (j.name and j.name.startswith(f"{prefix}_")):
+            j.schedule_removal()
+
+    log.info("Deleted job %d via API", job_id)
+    return web.json_response({"deleted": job_id})
+
+
+async def _handle_update_job(request: web.Request) -> web.Response:
+    """
+    Update a scheduled job's mutable fields via the HTTP API.
+
+    Accepts a JSON body with any of: name, prompt, schedule_type,
+    schedule_data, auto_remove, notify_on_check. Only provided fields
+    are updated. If the schedule changes (type or data), the job is
+    re-registered with APScheduler to pick up the new timing.
+
+    Returns 404 if the job doesn't exist or is inactive.
+    """
+    secret = request.app["webhook_secret"]
+
+    provided = request.headers.get("X-Webhook-Secret", "")
+    if not hmac.compare_digest(provided, secret):
+        return web.Response(status=401, text="Invalid secret")
+
+    try:
+        job_id = int(request.match_info["id"])
+    except ValueError:
+        return web.json_response({"error": "Invalid job ID"}, status=400)
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    # Validate schedule_type if provided
+    new_schedule_type = payload.get("schedule_type")
+    if new_schedule_type and new_schedule_type not in _VALID_SCHEDULE_TYPES:
+        return web.json_response(
+            {"error": f"schedule_type must be one of: {', '.join(_VALID_SCHEDULE_TYPES)}"},
+            status=400,
+        )
+
+    # Serialize schedule_data if provided as a dict (allow either string or dict)
+    schedule_data = payload.get("schedule_data")
+    if isinstance(schedule_data, dict):
+        schedule_data = json.dumps(schedule_data)
+
+    updated = await sessions.update_job(
+        job_id,
+        name=payload.get("name"),
+        prompt=payload.get("prompt"),
+        schedule_type=new_schedule_type,
+        schedule_data=schedule_data,
+        auto_remove=payload.get("auto_remove"),
+        notify_on_check=payload.get("notify_on_check"),
+    )
+
+    if not updated:
+        return web.json_response({"error": "Job not found or inactive"}, status=404)
+
+    # If schedule changed, re-register with APScheduler. Remove old entries
+    # and re-register with the new schedule from the database.
+    schedule_changed = new_schedule_type is not None or schedule_data is not None
+    if schedule_changed:
+        # Remove old APScheduler entries
+        telegram_app = request.app["telegram_app"]
+        jq = telegram_app.job_queue
+        assert jq is not None
+        prefix = f"cron_{job_id}"
+        for j in jq.jobs():
+            if j.name == prefix or (j.name and j.name.startswith(f"{prefix}_")):
+                j.schedule_removal()
+        # Re-register with new schedule
+        await cron.register_job_by_id(telegram_app, job_id)
+
+    log.info("Updated job %d via API", job_id)
+    return web.json_response({"updated": job_id})
+
+
 # ── Service proxy ────────────────────────────────────────────────────
 
 
@@ -519,6 +630,8 @@ async def start(telegram_app, config) -> None:
         _app.router.add_post("/api/schedule", _handle_schedule)
         _app.router.add_get("/api/jobs", _handle_get_jobs)
         _app.router.add_get("/api/jobs/{id}", _handle_get_job)
+        _app.router.add_delete("/api/jobs/{id}", _handle_delete_job)
+        _app.router.add_patch("/api/jobs/{id}", _handle_update_job)
         _app.router.add_post("/api/services/{name}", _handle_service_call)
     else:
         log.warning("WEBHOOK_SECRET not set — webhook and scheduling endpoints disabled")

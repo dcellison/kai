@@ -162,6 +162,74 @@ class TestJobs:
     async def test_delete_job_nonexistent(self, db):
         assert await sessions.delete_job(999) is False
 
+    async def test_update_job_single_field(self, db):
+        job_id = await sessions.create_job(
+            chat_id=1,
+            name="original",
+            job_type="reminder",
+            prompt="original prompt",
+            schedule_type="once",
+            schedule_data='{"run_at": "2026-02-20T10:00:00+00:00"}',
+        )
+        updated = await sessions.update_job(job_id, name="updated")
+        assert updated is True
+        job = await sessions.get_job_by_id(job_id)
+        assert job is not None
+        assert job["name"] == "updated"
+        assert job["prompt"] == "original prompt"
+
+    async def test_update_job_multiple_fields(self, db):
+        job_id = await sessions.create_job(
+            chat_id=1,
+            name="j1",
+            job_type="claude",
+            prompt="old prompt",
+            schedule_type="interval",
+            schedule_data='{"seconds": 3600}',
+            auto_remove=False,
+        )
+        updated = await sessions.update_job(
+            job_id,
+            prompt="new prompt",
+            schedule_data='{"seconds": 7200}',
+            auto_remove=True,
+        )
+        assert updated is True
+        job = await sessions.get_job_by_id(job_id)
+        assert job is not None
+        assert job["prompt"] == "new prompt"
+        assert job["schedule_data"] == '{"seconds": 7200}'
+        assert job["auto_remove"] is True
+
+    async def test_update_job_inactive_returns_false(self, db):
+        job_id = await sessions.create_job(
+            chat_id=1,
+            name="j1",
+            job_type="reminder",
+            prompt="p",
+            schedule_type="once",
+            schedule_data="{}",
+        )
+        await sessions.deactivate_job(job_id)
+        updated = await sessions.update_job(job_id, name="new name")
+        assert updated is False
+
+    async def test_update_job_nonexistent_returns_false(self, db):
+        updated = await sessions.update_job(999, name="new name")
+        assert updated is False
+
+    async def test_update_job_no_fields_returns_false(self, db):
+        job_id = await sessions.create_job(
+            chat_id=1,
+            name="j1",
+            job_type="reminder",
+            prompt="p",
+            schedule_type="once",
+            schedule_data="{}",
+        )
+        updated = await sessions.update_job(job_id)
+        assert updated is False
+
     async def test_auto_remove_stored_as_bool(self, db):
         job_id = await sessions.create_job(
             chat_id=1,

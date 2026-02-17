@@ -276,11 +276,13 @@ class PersistentClaude:
             # Inject scheduling API info (always, so cron works from any workspace)
             if self.webhook_secret:
                 api_note = (
-                    f"[Scheduling API: To schedule jobs, POST JSON to "
+                    f"[Scheduling API: To create jobs, POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/schedule "
                     f"with header 'X-Webhook-Secret: {self.webhook_secret}'. "
                     f"Required fields: name, prompt, schedule_type, schedule_data. "
-                    f"Optional: job_type (reminder|claude), auto_remove (bool).]"
+                    f"Optional: job_type (reminder|claude), auto_remove (bool). "
+                    f"To list jobs: GET /api/jobs. To update: PATCH /api/jobs/{{id}}. "
+                    f"To delete: DELETE /api/jobs/{{id}}.]"
                 )
                 if self.workspace != self.home_workspace:
                     api_note = (
