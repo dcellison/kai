@@ -145,11 +145,13 @@ class TestUpdateJob:
 
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.match_info = {"id": str(job_id)}
-        mock_request.json = AsyncMock(return_value={
-            "name": "new name",
-            "prompt": "new prompt",
-            "auto_remove": True,
-        })
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "new name",
+                "prompt": "new prompt",
+                "auto_remove": True,
+            }
+        )
 
         resp = await _handle_update_job(mock_request)
 
