@@ -343,9 +343,7 @@ class TestSendFile:
         f = tmp_path / "pic.png"
         f.write_bytes(b"fake-png")
 
-        send_file_request.json = AsyncMock(
-            return_value={"path": str(f), "caption": "Here you go"}
-        )
+        send_file_request.json = AsyncMock(return_value={"path": str(f), "caption": "Here you go"})
         resp = await _handle_send_file(send_file_request)
 
         assert resp.status == 200
@@ -360,25 +358,19 @@ class TestSendFile:
 
     async def test_file_not_found_returns_404(self, tmp_path, send_file_request):
         """Returns 404 when the file doesn't exist on disk."""
-        send_file_request.json = AsyncMock(
-            return_value={"path": str(tmp_path / "nonexistent.txt")}
-        )
+        send_file_request.json = AsyncMock(return_value={"path": str(tmp_path / "nonexistent.txt")})
         resp = await _handle_send_file(send_file_request)
         assert resp.status == 404
 
     async def test_path_outside_workspace_returns_403(self, send_file_request):
         """Returns 403 for paths that escape the workspace via traversal."""
-        send_file_request.json = AsyncMock(
-            return_value={"path": "/etc/passwd"}
-        )
+        send_file_request.json = AsyncMock(return_value={"path": "/etc/passwd"})
         resp = await _handle_send_file(send_file_request)
         assert resp.status == 403
 
     async def test_invalid_json_returns_400(self, send_file_request):
         """Returns 400 for malformed JSON body."""
-        send_file_request.json = AsyncMock(
-            side_effect=json.JSONDecodeError("test", "doc", 0)
-        )
+        send_file_request.json = AsyncMock(side_effect=json.JSONDecodeError("test", "doc", 0))
         resp = await _handle_send_file(send_file_request)
         assert resp.status == 400
 
