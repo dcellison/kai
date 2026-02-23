@@ -321,6 +321,10 @@ async def call_service(
     if api_key and svc.auth.type == "query" and svc.auth.name:
         merged_params[svc.auth.name] = api_key
 
+    # Validate path_suffix to prevent SSRF via host manipulation
+    if path_suffix and ("@" in path_suffix or ".." in path_suffix):
+        return ServiceResponse(success=False, error="Invalid path_suffix")
+
     # Construct the full URL (base + optional path suffix)
     url = svc.url + path_suffix
 

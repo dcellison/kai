@@ -32,6 +32,13 @@ workspace/.claude/*
 !workspace/.claude/CLAUDE.md
 !workspace/.claude/MEMORY.md.example
 
+# Claude Code
+.claude/
+
+# TLDR code analysis
+.tldr/
+.tldrignore
+
 # OS / IDE
 .DS_Store
 .idea/
