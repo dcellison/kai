@@ -119,12 +119,17 @@ def load_config() -> Config:
         if not workspace_base.is_dir():
             raise SystemExit(f"WORKSPACE_BASE is not an existing directory: {workspace_base}")
 
+    # Optional: initial workspace for the inner Claude Code process
+    raw_workspace = os.environ.get("CLAUDE_WORKSPACE", "").strip()
+    claude_workspace = Path(raw_workspace).expanduser().resolve() if raw_workspace else PROJECT_ROOT / "workspace"
+
     return Config(
         telegram_bot_token=token,
         allowed_user_ids=allowed_ids,
         claude_model=os.environ.get("CLAUDE_MODEL", "sonnet"),
         claude_timeout_seconds=int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "120")),
         claude_max_budget_usd=float(os.environ.get("CLAUDE_MAX_BUDGET_USD", "10.0")),
+        claude_workspace=claude_workspace,
         webhook_port=int(os.environ.get("WEBHOOK_PORT", "8080")),
         webhook_secret=os.environ.get("WEBHOOK_SECRET", ""),
         voice_enabled=os.environ.get("VOICE_ENABLED", "").lower() in ("1", "true", "yes"),
