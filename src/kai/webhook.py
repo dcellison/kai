@@ -693,7 +693,7 @@ async def start(telegram_app, config) -> None:
 
     _runner = web.AppRunner(_app, access_log=None)
     await _runner.setup()
-    site = web.TCPSite(_runner, "0.0.0.0", config.webhook_port)
+    site = web.TCPSite(_runner, "127.0.0.1", config.webhook_port)
     await site.start()
     log.info("Webhook server listening on port %d", config.webhook_port)
 
