@@ -9,13 +9,14 @@ Provides functionality to:
 5. Proxy authenticated requests to external services (service layer)
 
 The server runs on aiohttp alongside the Telegram bot in the same event loop.
-Routes are organized into four groups:
+Routes are organized into five groups:
     - /webhook/github       — GitHub events with HMAC-SHA256 signature validation
     - /webhook              — Generic webhooks with shared-secret auth
     - /api/schedule         — Job creation API (used by inner Claude via curl)
     - /api/jobs             — Job listing and detail API
     - /api/jobs/{id}        — Job detail (GET), deletion (DELETE), and update (PATCH)
     - /api/services/{name}  — External service proxy (injects auth from .env)
+    - /api/send-file        — Send a file from the filesystem to the Telegram chat
 
 All webhook/API endpoints (except /health) require WEBHOOK_SECRET to be set.
 When unset, only the health check endpoint is registered. This allows the
@@ -31,6 +32,7 @@ import hmac
 import json
 import logging
 import re
+from pathlib import Path
 
 from aiohttp import web
 
@@ -602,6 +604,82 @@ async def _handle_service_call(request: web.Request) -> web.Response:
         return web.json_response({"error": result.error}, status=502)
 
 
+# ── File exchange ────────────────────────────────────────────────────
+
+# Image extensions sent as Telegram photos (rendered inline); everything
+# else is sent as a document attachment.
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+async def _handle_send_file(request: web.Request) -> web.Response:
+    """
+    Send a file from the filesystem to the Telegram chat.
+
+    Called by the inner Claude process to deliver files back to the user.
+    Accepts a JSON body with a required "path" field (absolute path) and
+    an optional "caption". Images are sent as photos (rendered inline),
+    everything else as document attachments.
+
+    Path confinement: the resolved path must be inside the current workspace
+    directory. This prevents path traversal attacks via symlinks or "../".
+
+    Returns:
+        JSON {"status": "sent", "file": "<filename>"} on success, or an
+        appropriate HTTP error (400/401/403/404).
+    """
+    secret = request.app["webhook_secret"]
+
+    # Validate shared secret (same auth as all other API endpoints)
+    if not hmac.compare_digest(request.headers.get("X-Webhook-Secret", ""), secret):
+        return web.Response(status=401, text="Invalid secret")
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.Response(status=400, text="Invalid JSON")
+
+    file_path = payload.get("path")
+    if not file_path:
+        return web.json_response({"error": "Missing required field: path"}, status=400)
+
+    path = Path(file_path).resolve()
+
+    # Confine to the current workspace to prevent path traversal. Uses
+    # Path.relative_to() which raises ValueError on escape, unlike string
+    # prefix matching which is bypassable via symlinks.
+    workspace = request.app.get("workspace")
+    if workspace:
+        workspace_resolved = Path(workspace).resolve()
+        try:
+            path.relative_to(workspace_resolved)
+        except ValueError:
+            return web.json_response({"error": "Path outside workspace"}, status=403)
+
+    if not path.is_file():
+        return web.json_response({"error": f"File not found: {file_path}"}, status=404)
+
+    bot = request.app["telegram_bot"]
+    chat_id = request.app["chat_id"]
+    caption = payload.get("caption", "")
+
+    # Send images as photos (Telegram renders them inline) and everything
+    # else as document attachments (preserves filename, allows any type).
+    try:
+        suffix = path.suffix.lower()
+        if suffix in _IMAGE_EXTENSIONS:
+            with open(path, "rb") as f:
+                await bot.send_photo(chat_id, f, caption=caption or None)
+        else:
+            with open(path, "rb") as f:
+                await bot.send_document(chat_id, f, caption=caption or None, filename=path.name)
+    except Exception:
+        log.exception("Failed to send file %s to chat %d", path, chat_id)
+        return web.json_response({"error": "Failed to send file"}, status=500)
+
+    log.info("Sent file %s to chat %d via API", path.name, chat_id)
+    return web.json_response({"status": "sent", "file": path.name})
+
+
 # ── Lifecycle ────────────────────────────────────────────────────────
 
 
@@ -630,6 +708,9 @@ async def start(telegram_app, config) -> None:
     # Use first allowed user ID as the notification target
     _app["chat_id"] = next(iter(config.allowed_user_ids))
 
+    # Store workspace path for send-file path confinement
+    _app["workspace"] = str(config.claude_workspace)
+
     _app.router.add_get("/health", _handle_health)
 
     if config.webhook_secret:
@@ -641,6 +722,7 @@ async def start(telegram_app, config) -> None:
         _app.router.add_delete("/api/jobs/{id}", _handle_delete_job)
         _app.router.add_patch("/api/jobs/{id}", _handle_update_job)
         _app.router.add_post("/api/services/{name}", _handle_service_call)
+        _app.router.add_post("/api/send-file", _handle_send_file)
     else:
         log.warning("WEBHOOK_SECRET not set — webhook and scheduling endpoints disabled")
 

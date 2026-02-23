@@ -36,6 +36,7 @@ import json
 import logging
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
@@ -950,6 +951,34 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
 # ── Media message handlers ──────────────────────────────────────────
 
 
+def _save_to_workspace(data: bytes, filename: str, workspace: Path) -> Path:
+    """
+    Save file bytes to the workspace/files/ directory with a timestamped name.
+
+    Creates the files/ directory if it doesn't exist. Filenames are prefixed
+    with a timestamp to avoid collisions and sanitized to remove slashes and
+    spaces. Returns the absolute path to the saved file so Claude can
+    reference it in subsequent commands.
+
+    Args:
+        data: Raw file bytes to write.
+        filename: Original filename from Telegram (sanitized before use).
+        workspace: The current workspace root directory.
+
+    Returns:
+        Absolute path to the saved file.
+    """
+    files_dir = workspace / "files"
+    files_dir.mkdir(exist_ok=True)
+
+    # Timestamp prefix ensures unique names even if the same file is sent twice
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    safe_name = filename.replace("/", "_").replace(" ", "_")
+    dest = files_dir / f"{ts}_{safe_name}"
+    dest.write_bytes(data)
+    return dest
+
+
 @_require_auth
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -970,9 +999,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     data = await file.download_as_bytearray()
-    b64 = base64.b64encode(bytes(data)).decode()
+    raw = bytes(data)
+    b64 = base64.b64encode(raw).decode()
+
+    # Save to workspace so Claude can access the file via shell tools
+    saved = _save_to_workspace(raw, f"photo_{photo.file_unique_id}.jpg", claude.workspace)
 
     caption = update.message.caption or "What's in this image?"
+    caption += f"\n[File saved to: {saved}]"
     log_message(direction="user", chat_id=chat_id, text=caption, media={"type": "photo"})
     content = [
         {"type": "text", "text": caption},
@@ -1055,12 +1089,13 @@ _IMAGE_MEDIA_TYPES = {
 @_require_auth
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handle document (file) uploads — images, text files, and code.
+    Handle document (file) uploads -- images, text files, and everything else.
 
-    Routes based on file extension:
-    - Image files → base64-encoded and sent as multi-modal content
-    - Text/code files → decoded as UTF-8 and sent as a code block
-    - Other files → rejected with a helpful message
+    All files are saved to workspace/files/ so Claude can access them via
+    shell tools. Routes based on file extension for content presentation:
+    - Image files -- base64-encoded and sent as multi-modal content
+    - Text/code files -- decoded as UTF-8 and sent as a code block
+    - Other files -- saved to disk, Claude gets the path to work with
     """
     if not update.message or not update.message.document:
         return
@@ -1078,8 +1113,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Handle images sent as documents (uncompressed upload)
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
-        b64 = base64.b64encode(bytes(data)).decode()
+        raw = bytes(data)
+        b64 = base64.b64encode(raw).decode()
         media_type = _IMAGE_MEDIA_TYPES[suffix]
+
+        # Save to workspace so Claude can access the file via shell tools
+        saved = _save_to_workspace(raw, file_name, claude.workspace)
+        img_caption = caption or f"What's in this image ({file_name})?"
+        img_caption += f"\n[File saved to: {saved}]"
+
         log_message(
             direction="user",
             chat_id=chat_id,
@@ -1087,19 +1129,24 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             media={"type": "document", "filename": file_name},
         )
         content = [
-            {"type": "text", "text": caption or f"What's in this image ({file_name})?"},
+            {"type": "text", "text": img_caption},
             {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
         ]
     elif suffix in _TEXT_EXTENSIONS or (doc.mime_type and doc.mime_type.startswith("text/")):
-        # Handle text/code files — decode and wrap in a code block
+        # Handle text/code files -- decode and wrap in a code block
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
+        raw = bytes(data)
         try:
-            text_content = bytes(data).decode("utf-8")
+            text_content = raw.decode("utf-8")
         except UnicodeDecodeError:
             await update.message.reply_text(f"Couldn't decode {file_name} as text.")
             return
-        header = f"File: {file_name}\n```\n{text_content}\n```"
+
+        # Save to workspace so Claude can access the file via shell tools
+        saved = _save_to_workspace(raw, file_name, claude.workspace)
+        header = f"File: {file_name}\n```\n{text_content}\n```\n[File saved to: {saved}]"
+
         log_message(
             direction="user",
             chat_id=chat_id,
@@ -1111,10 +1158,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             content = header
     else:
-        await update.message.reply_text(
-            f"I can't process {suffix or 'this'} files yet. I support text files and images."
+        # Any other file type -- save to disk and tell Claude the path so it
+        # can work with the file via shell tools (e.g., unzip, pdftotext, etc.)
+        file = await context.bot.get_file(doc.file_id)
+        data = await file.download_as_bytearray()
+        saved = _save_to_workspace(bytes(data), file_name, claude.workspace)
+
+        log_message(
+            direction="user",
+            chat_id=chat_id,
+            text=caption or f"[file: {file_name}]",
+            media={"type": "document", "filename": file_name},
         )
-        return
+        content = (caption or f"File received: {file_name}") + f"\n[File saved to: {saved}]"
 
     async with get_lock(chat_id):
         _set_responding(chat_id)

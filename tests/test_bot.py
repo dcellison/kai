@@ -2,7 +2,13 @@
 
 from pathlib import Path
 
-from kai.bot import _chunk_text, _resolve_workspace_path, _short_workspace_name, _truncate_for_telegram
+from kai.bot import (
+    _chunk_text,
+    _resolve_workspace_path,
+    _save_to_workspace,
+    _short_workspace_name,
+    _truncate_for_telegram,
+)
 
 # ── _resolve_workspace_path ──────────────────────────────────────────
 
@@ -87,3 +93,45 @@ class TestTruncateForTelegram:
     def test_exact_length_not_truncated(self):
         text = "a" * 50
         assert _truncate_for_telegram(text, 50) == text
+
+
+# ── _save_to_workspace ──────────────────────────────────────────────
+
+
+class TestSaveToWorkspace:
+    def test_creates_files_directory(self, tmp_path):
+        """Automatically creates the files/ subdirectory if missing."""
+        _save_to_workspace(b"hello", "test.txt", tmp_path)
+        assert (tmp_path / "files").is_dir()
+
+    def test_saves_content_correctly(self, tmp_path):
+        """Written bytes match the input exactly."""
+        data = b"binary content here"
+        result = _save_to_workspace(data, "doc.pdf", tmp_path)
+        assert result.read_bytes() == data
+
+    def test_filename_contains_original_name(self, tmp_path):
+        """Saved filename preserves the original name after the timestamp."""
+        result = _save_to_workspace(b"x", "report.pdf", tmp_path)
+        assert "report.pdf" in result.name
+
+    def test_timestamp_prefix_format(self, tmp_path):
+        """Filename starts with YYYYMMDD_HHMMSS_ffffff timestamp."""
+        result = _save_to_workspace(b"x", "file.txt", tmp_path)
+        # Format: YYYYMMDD_HHMMSS_ffffff_file.txt
+        parts = result.name.split("_", 3)
+        assert len(parts[0]) == 8  # date
+        assert len(parts[1]) == 6  # time
+        assert len(parts[2]) == 6  # microseconds
+
+    def test_sanitizes_slashes_and_spaces(self, tmp_path):
+        """Slashes and spaces in filenames are replaced with underscores."""
+        result = _save_to_workspace(b"x", "my file/name.txt", tmp_path)
+        assert "/" not in result.name
+        assert " " not in result.name
+
+    def test_returns_absolute_path(self, tmp_path):
+        """Returned path is absolute and points to an existing file."""
+        result = _save_to_workspace(b"x", "test.txt", tmp_path)
+        assert result.is_absolute()
+        assert result.is_file()

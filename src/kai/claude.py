@@ -291,6 +291,20 @@ class PersistentClaude:
                     )
                 parts.append(api_note)
 
+            # Inject file exchange API info so Claude can send files to the user
+            if self.webhook_secret:
+                parts.append(
+                    f"[File API: To send a file to the user, POST JSON to "
+                    f"http://localhost:{self.webhook_port}/api/send-file "
+                    f"with header 'X-Webhook-Secret: {self.webhook_secret}'. "
+                    f'Required: "path" (absolute file path within the workspace). '
+                    f'Optional: "caption". Images are sent as photos, '
+                    f"everything else as documents.\n"
+                    f"Incoming files from the user are auto-saved to "
+                    f"{self.workspace}/files/ and their paths are included "
+                    f"in the message.]"
+                )
+
             # Inject available external services info (only if services are configured)
             if self.services_info and self.webhook_secret:
                 svc_lines = [
