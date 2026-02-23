@@ -36,6 +36,7 @@ import json
 import logging
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
@@ -950,6 +951,17 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
 # ── Media message handlers ──────────────────────────────────────────
 
 
+def _save_to_workspace(data: bytes, filename: str, workspace: Path) -> Path:
+    """Save file to workspace/files/ and return the absolute path."""
+    files_dir = workspace / "files"
+    files_dir.mkdir(exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    safe_name = filename.replace("/", "_").replace(" ", "_")
+    dest = files_dir / f"{ts}_{safe_name}"
+    dest.write_bytes(data)
+    return dest
+
+
 @_require_auth
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -973,6 +985,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     b64 = base64.b64encode(bytes(data)).decode()
 
     caption = update.message.caption or "What's in this image?"
+    saved = _save_to_workspace(bytes(data), f"photo_{photo.file_unique_id}.jpg", claude.workspace)
+    caption += f"\n[File saved to: {saved}]"
     log_message(direction="user", chat_id=chat_id, text=caption, media={"type": "photo"})
     content = [
         {"type": "text", "text": caption},
@@ -1078,8 +1092,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Handle images sent as documents (uncompressed upload)
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
-        b64 = base64.b64encode(bytes(data)).decode()
+        raw = bytes(data)
+        b64 = base64.b64encode(raw).decode()
         media_type = _IMAGE_MEDIA_TYPES[suffix]
+        saved = _save_to_workspace(raw, file_name, claude.workspace)
+        img_caption = caption or f"What's in this image ({file_name})?"
+        img_caption += f"\n[File saved to: {saved}]"
         log_message(
             direction="user",
             chat_id=chat_id,
@@ -1087,19 +1105,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             media={"type": "document", "filename": file_name},
         )
         content = [
-            {"type": "text", "text": caption or f"What's in this image ({file_name})?"},
+            {"type": "text", "text": img_caption},
             {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
         ]
     elif suffix in _TEXT_EXTENSIONS or (doc.mime_type and doc.mime_type.startswith("text/")):
         # Handle text/code files — decode and wrap in a code block
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
+        raw = bytes(data)
         try:
-            text_content = bytes(data).decode("utf-8")
+            text_content = raw.decode("utf-8")
         except UnicodeDecodeError:
             await update.message.reply_text(f"Couldn't decode {file_name} as text.")
             return
-        header = f"File: {file_name}\n```\n{text_content}\n```"
+        saved = _save_to_workspace(raw, file_name, claude.workspace)
+        header = f"File: {file_name}\n```\n{text_content}\n```\n[File saved to: {saved}]"
         log_message(
             direction="user",
             chat_id=chat_id,

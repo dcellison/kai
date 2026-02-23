@@ -16,6 +16,7 @@ Routes are organized into four groups:
     - /api/jobs             — Job listing and detail API
     - /api/jobs/{id}        — Job detail (GET), deletion (DELETE), and update (PATCH)
     - /api/services/{name}  — External service proxy (injects auth from .env)
+    - /api/send-file        — Send a file from the filesystem to the Telegram chat
 
 All webhook/API endpoints (except /health) require WEBHOOK_SECRET to be set.
 When unset, only the health check endpoint is registered. This allows the
@@ -31,6 +32,8 @@ import hmac
 import json
 import logging
 import re
+
+from pathlib import Path
 
 from aiohttp import web
 
@@ -345,6 +348,11 @@ async def _handle_schedule(request: web.Request) -> web.Response:
 
     # Optional fields with defaults
     job_type = payload.get("job_type", "reminder")
+    if job_type not in ("reminder", "claude"):
+        return web.json_response(
+            {"error": "job_type must be 'reminder' or 'claude'"},
+            status=400,
+        )
     auto_remove = payload.get("auto_remove", False)
     notify_on_check = payload.get("notify_on_check", False)
     chat_id = request.app["chat_id"]
@@ -594,6 +602,51 @@ async def _handle_service_call(request: web.Request) -> web.Response:
         return web.json_response({"error": result.error}, status=502)
 
 
+# ── File exchange ────────────────────────────────────────────────────
+
+
+async def _handle_send_file(request: web.Request) -> web.Response:
+    """Send a file from the filesystem to the Telegram chat."""
+    secret = request.app["webhook_secret"]
+    if not hmac.compare_digest(request.headers.get("X-Webhook-Secret", ""), secret):
+        return web.Response(status=401, text="Unauthorized")
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.Response(status=400, text="Invalid JSON")
+
+    file_path = payload.get("path")
+    if not file_path:
+        return web.Response(status=400, text='Missing "path" field')
+
+    path = Path(file_path).resolve()
+
+    # Confine to workspace to prevent path traversal
+    workspace = request.app.get("workspace")
+    if workspace:
+        workspace_resolved = Path(workspace).resolve()
+        if not str(path).startswith(str(workspace_resolved) + "/"):
+            return web.Response(status=403, text="Path outside workspace")
+
+    if not path.is_file():
+        return web.Response(status=404, text=f"File not found: {file_path}")
+
+    bot = request.app["telegram_bot"]
+    chat_id = request.app["chat_id"]
+    caption = payload.get("caption", "")
+
+    suffix = path.suffix.lower()
+    if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        with open(path, "rb") as f:
+            await bot.send_photo(chat_id, f, caption=caption or None)
+    else:
+        with open(path, "rb") as f:
+            await bot.send_document(chat_id, f, caption=caption or None, filename=path.name)
+
+    return web.json_response({"status": "sent", "file": path.name})
+
+
 # ── Lifecycle ────────────────────────────────────────────────────────
 
 
@@ -621,6 +674,7 @@ async def start(telegram_app, config) -> None:
 
     # Use first allowed user ID as the notification target
     _app["chat_id"] = next(iter(config.allowed_user_ids))
+    _app["workspace"] = str(config.claude_workspace)
 
     _app.router.add_get("/health", _handle_health)
 
@@ -633,6 +687,7 @@ async def start(telegram_app, config) -> None:
         _app.router.add_delete("/api/jobs/{id}", _handle_delete_job)
         _app.router.add_patch("/api/jobs/{id}", _handle_update_job)
         _app.router.add_post("/api/services/{name}", _handle_service_call)
+        _app.router.add_post("/api/send-file", _handle_send_file)
     else:
         log.warning("WEBHOOK_SECRET not set — webhook and scheduling endpoints disabled")
 

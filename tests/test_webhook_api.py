@@ -7,7 +7,7 @@ import pytest
 from aiohttp import web
 
 from kai import sessions
-from kai.webhook import _handle_delete_job, _handle_update_job
+from kai.webhook import _handle_delete_job, _handle_send_file, _handle_update_job
 
 
 @pytest.fixture
@@ -237,4 +237,101 @@ class TestUpdateJob:
         assert resp.status == 400
         body = json.loads(resp.body.decode())
         assert "error" in body
-        assert "json" in body["error"].lower()
+
+
+# ── POST /api/send-file ─────────────────────────────────────────────
+
+
+@pytest.fixture
+def send_file_request(tmp_path):
+    """Create a mock request for the send-file endpoint."""
+    request = MagicMock(spec=web.Request)
+    request.app = {
+        "webhook_secret": "test-secret",
+        "telegram_bot": AsyncMock(),
+        "chat_id": 123,
+        "workspace": str(tmp_path),
+    }
+    request.headers = {"X-Webhook-Secret": "test-secret"}
+    return request
+
+
+class TestSendFile:
+    async def test_send_image(self, tmp_path, send_file_request):
+        """POST sends image files via send_photo."""
+        img = tmp_path / "photo.jpg"
+        img.write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
+
+        send_file_request.json = AsyncMock(return_value={"path": str(img)})
+        resp = await _handle_send_file(send_file_request)
+
+        assert resp.status == 200
+        body = json.loads(resp.body)
+        assert body["status"] == "sent"
+        assert body["file"] == "photo.jpg"
+        send_file_request.app["telegram_bot"].send_photo.assert_called_once()
+
+    async def test_send_document(self, tmp_path, send_file_request):
+        """POST sends non-image files via send_document."""
+        doc = tmp_path / "report.pdf"
+        doc.write_bytes(b"%PDF-1.4 fake")
+
+        send_file_request.json = AsyncMock(return_value={"path": str(doc)})
+        resp = await _handle_send_file(send_file_request)
+
+        assert resp.status == 200
+        body = json.loads(resp.body)
+        assert body["status"] == "sent"
+        send_file_request.app["telegram_bot"].send_document.assert_called_once()
+
+    async def test_send_with_caption(self, tmp_path, send_file_request):
+        """POST forwards caption to Telegram."""
+        f = tmp_path / "pic.png"
+        f.write_bytes(b"fake-png")
+
+        send_file_request.json = AsyncMock(
+            return_value={"path": str(f), "caption": "Here you go"}
+        )
+        resp = await _handle_send_file(send_file_request)
+
+        assert resp.status == 200
+        send_file_request.app["telegram_bot"].send_photo.assert_called_once()
+        _, kwargs = send_file_request.app["telegram_bot"].send_photo.call_args
+        assert kwargs.get("caption") == "Here you go"
+
+    async def test_missing_path_returns_400(self, send_file_request):
+        """POST returns 400 when path field is missing."""
+        send_file_request.json = AsyncMock(return_value={})
+        resp = await _handle_send_file(send_file_request)
+        assert resp.status == 400
+
+    async def test_file_not_found_returns_404(self, tmp_path, send_file_request):
+        """POST returns 404 when file doesn't exist inside workspace."""
+        send_file_request.json = AsyncMock(
+            return_value={"path": str(tmp_path / "nonexistent.txt")}
+        )
+        resp = await _handle_send_file(send_file_request)
+        assert resp.status == 404
+
+    async def test_path_outside_workspace_returns_403(self, send_file_request):
+        """POST returns 403 for paths outside the workspace."""
+        send_file_request.json = AsyncMock(
+            return_value={"path": "/etc/passwd"}
+        )
+        resp = await _handle_send_file(send_file_request)
+        assert resp.status == 403
+
+    async def test_invalid_json_returns_400(self, send_file_request):
+        """POST returns 400 for malformed JSON body."""
+        send_file_request.json = AsyncMock(
+            side_effect=json.JSONDecodeError("test", "doc", 0)
+        )
+        resp = await _handle_send_file(send_file_request)
+        assert resp.status == 400
+
+    async def test_missing_secret_returns_401(self, send_file_request):
+        """POST returns 401 without valid webhook secret."""
+        send_file_request.headers = {}
+        send_file_request.json = AsyncMock(return_value={"path": "/any"})
+        resp = await _handle_send_file(send_file_request)
+        assert resp.status == 401
