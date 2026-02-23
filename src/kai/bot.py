@@ -1131,10 +1131,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             content = header
     else:
-        await update.message.reply_text(
-            f"I can't process {suffix or 'this'} files yet. I support text files and images."
+        # Any other file type — save to disk and tell Claude the path
+        file = await context.bot.get_file(doc.file_id)
+        data = await file.download_as_bytearray()
+        raw = bytes(data)
+        saved = _save_to_workspace(raw, file_name, claude.workspace)
+        log_message(
+            direction="user",
+            chat_id=chat_id,
+            text=caption or f"[file: {file_name}]",
+            media={"type": "document", "filename": file_name},
         )
-        return
+        content = (caption or f"File received: {file_name}") + f"\n[File saved to: {saved}]"
 
     async with get_lock(chat_id):
         _set_responding(chat_id)
