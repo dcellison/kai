@@ -295,6 +295,9 @@ async def _handle_generic(request: web.Request) -> web.Response:
 # Valid schedule types accepted by the scheduling API
 _VALID_SCHEDULE_TYPES = ("once", "daily", "interval")
 
+# Valid job types accepted by the scheduling API
+_VALID_JOB_TYPES = ("reminder", "claude")
+
 
 async def _handle_schedule(request: web.Request) -> web.Response:
     """
@@ -343,8 +346,13 @@ async def _handle_schedule(request: web.Request) -> web.Response:
             status=400,
         )
 
-    # Optional fields with defaults
+    # Optional fields with defaults — validate job_type the same way as schedule_type
     job_type = payload.get("job_type", "reminder")
+    if job_type not in _VALID_JOB_TYPES:
+        return web.json_response(
+            {"error": f"job_type must be one of: {', '.join(_VALID_JOB_TYPES)}"},
+            status=400,
+        )
     auto_remove = payload.get("auto_remove", False)
     notify_on_check = payload.get("notify_on_check", False)
     chat_id = request.app["chat_id"]
@@ -638,7 +646,9 @@ async def start(telegram_app, config) -> None:
 
     _runner = web.AppRunner(_app, access_log=None)
     await _runner.setup()
-    site = web.TCPSite(_runner, "0.0.0.0", config.webhook_port)
+    # Bind to localhost only — all external access routes through Cloudflare Tunnel,
+    # so there's no reason to expose the server on the LAN.
+    site = web.TCPSite(_runner, "127.0.0.1", config.webhook_port)
     await site.start()
     log.info("Webhook server listening on port %d", config.webhook_port)
 

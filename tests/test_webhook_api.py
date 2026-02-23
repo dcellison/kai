@@ -7,7 +7,7 @@ import pytest
 from aiohttp import web
 
 from kai import sessions
-from kai.webhook import _handle_delete_job, _handle_update_job
+from kai.webhook import _handle_delete_job, _handle_schedule, _handle_update_job
 
 
 @pytest.fixture
@@ -33,6 +33,59 @@ def mock_request():
     request.headers = {}
     request.match_info = {}
     return request
+
+
+# ── POST /api/schedule ────────────────────────────────────────────────
+
+
+class TestScheduleJobType:
+    async def test_invalid_job_type_returns_400(self, db, mock_request):
+        """Schedule endpoint rejects unrecognized job_type values."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "test",
+                "prompt": "test",
+                "schedule_type": "once",
+                "schedule_data": {"run_at": "2026-02-20T10:00:00+00:00"},
+                "job_type": "invalid",
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "error" in body
+        assert "job_type" in body["error"]
+
+    async def test_valid_job_type_accepted(self, db, mock_request):
+        """Schedule endpoint accepts valid job_type values without error."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.app["telegram_app"].job_queue = MagicMock()
+
+        # Mock register_job_by_id so we don't need a full APScheduler setup
+        import kai.cron as cron_mod
+
+        cron_mod.register_job_by_id = AsyncMock()
+
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "test claude job",
+                "prompt": "test",
+                "schedule_type": "once",
+                "schedule_data": {"run_at": "2026-02-20T10:00:00+00:00"},
+                "job_type": "claude",
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        assert "job_id" in body
 
 
 # ── DELETE /api/jobs/{id} ────────────────────────────────────────────
