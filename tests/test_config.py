@@ -146,3 +146,23 @@ class TestLoadConfigOptional:
         _set_required(monkeypatch)
         monkeypatch.setenv("ALLOWED_WORKSPACES", str(tmp_path / "nope"))
         assert load_config().allowed_workspaces == []
+
+    def test_allowed_workspaces_deduplicates(self, monkeypatch, tmp_path):
+        # Same path listed twice should appear only once
+        dir_a = tmp_path / "a"
+        dir_a.mkdir()
+        _set_required(monkeypatch)
+        monkeypatch.setenv("ALLOWED_WORKSPACES", f"{dir_a},{dir_a}")
+        config = load_config()
+        assert len(config.allowed_workspaces) == 1
+        assert config.allowed_workspaces[0] == dir_a
+
+    def test_allowed_workspaces_deduplicates_canonical_paths(self, monkeypatch, tmp_path):
+        # /a/b and /a/../a/b resolve to the same path — only one entry
+        dir_a = tmp_path / "a"
+        dir_a.mkdir()
+        non_canonical = tmp_path / "." / "a"
+        _set_required(monkeypatch)
+        monkeypatch.setenv("ALLOWED_WORKSPACES", f"{dir_a},{non_canonical}")
+        config = load_config()
+        assert len(config.allowed_workspaces) == 1

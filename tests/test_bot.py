@@ -6,6 +6,7 @@ import pytest
 
 from kai.bot import (
     _chunk_text,
+    _is_workspace_allowed,
     _resolve_workspace_path,
     _save_to_workspace,
     _short_workspace_name,
@@ -211,3 +212,95 @@ class TestWorkspacesKeyboard:
         """With no allowed workspaces and no history, only the Home button appears."""
         markup = await _workspaces_keyboard([], "/home", "/home", None, [])
         assert len(_button_labels(markup)) == 1
+
+    @pytest.mark.asyncio
+    async def test_disambiguates_duplicate_names(self, tmp_path):
+        """Two allowed workspaces with the same directory name get parent/name labels."""
+        foo_a = tmp_path / "projects" / "foo"
+        foo_b = tmp_path / "clients" / "foo"
+        foo_a.mkdir(parents=True)
+        foo_b.mkdir(parents=True)
+        markup = await _workspaces_keyboard([], "/home", "/home", None, [foo_a, foo_b])
+        labels = _button_labels(markup)
+        assert "projects/foo" in labels
+        assert "clients/foo" in labels
+        # Neither bare "foo" label should appear
+        assert "foo" not in labels
+
+    @pytest.mark.asyncio
+    async def test_unique_names_not_disambiguated(self, tmp_path):
+        """Allowed workspaces with unique names keep their short labels."""
+        bar = tmp_path / "bar"
+        baz = tmp_path / "baz"
+        bar.mkdir()
+        baz.mkdir()
+        markup = await _workspaces_keyboard([], "/home", "/home", None, [bar, baz])
+        labels = _button_labels(markup)
+        assert "bar" in labels
+        assert "baz" in labels
+
+
+# ── _is_workspace_allowed ────────────────────────────────────────────
+
+
+from kai.config import Config  # noqa: E402 — after fixtures, before tests
+
+
+def _make_config(workspace_base=None, allowed_workspaces=None) -> Config:
+    """Minimal Config for testing _is_workspace_allowed."""
+    return Config(
+        telegram_bot_token="test",
+        allowed_user_ids={1},
+        workspace_base=workspace_base,
+        allowed_workspaces=allowed_workspaces or [],
+    )
+
+
+class TestIsWorkspaceAllowed:
+    def test_no_sources_allows_anything(self, tmp_path):
+        """With no WORKSPACE_BASE and no ALLOWED_WORKSPACES, all paths are allowed."""
+        config = _make_config()
+        assert _is_workspace_allowed(tmp_path / "anything", config) is True
+
+    def test_path_under_base_is_allowed(self, tmp_path):
+        """Paths under WORKSPACE_BASE are allowed."""
+        config = _make_config(workspace_base=tmp_path)
+        assert _is_workspace_allowed(tmp_path / "myproject", config) is True
+
+    def test_path_in_allowed_workspaces_is_allowed(self, tmp_path):
+        """Paths listed in ALLOWED_WORKSPACES are allowed."""
+        project = tmp_path / "project"
+        project.mkdir()
+        config = _make_config(allowed_workspaces=[project])
+        assert _is_workspace_allowed(project, config) is True
+
+    def test_path_outside_both_is_rejected(self, tmp_path):
+        """Paths not in WORKSPACE_BASE or ALLOWED_WORKSPACES are rejected."""
+        base = tmp_path / "base"
+        base.mkdir()
+        outside = tmp_path / "outside"
+        config = _make_config(workspace_base=base)
+        assert _is_workspace_allowed(outside, config) is False
+
+    def test_base_set_allowed_workspaces_empty_rejects_outside(self, tmp_path):
+        """With WORKSPACE_BASE set but no allowed workspaces, outside paths are rejected."""
+        base = tmp_path / "base"
+        base.mkdir()
+        config = _make_config(workspace_base=base, allowed_workspaces=[])
+        assert _is_workspace_allowed(tmp_path / "other", config) is False
+
+    def test_only_allowed_workspaces_set_rejects_unlisted(self, tmp_path):
+        """With only ALLOWED_WORKSPACES set, unlisted paths are rejected."""
+        allowed = tmp_path / "allowed"
+        allowed.mkdir()
+        unlisted = tmp_path / "unlisted"
+        config = _make_config(allowed_workspaces=[allowed])
+        assert _is_workspace_allowed(unlisted, config) is False
+
+    def test_resolves_symlinks_for_comparison(self, tmp_path):
+        """Path resolution handles non-canonical paths correctly."""
+        project = tmp_path / "project"
+        project.mkdir()
+        config = _make_config(allowed_workspaces=[project])
+        # Pass the resolved canonical path — should still match
+        assert _is_workspace_allowed(project.resolve(), config) is True

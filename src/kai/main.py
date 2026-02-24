@@ -35,7 +35,7 @@ from telegram import BotCommand
 from telegram.error import NetworkError
 
 from kai import cron, services, sessions, webhook
-from kai.bot import create_bot
+from kai.bot import _is_workspace_allowed, create_bot
 from kai.config import PROJECT_ROOT, load_config
 
 
@@ -115,14 +115,7 @@ def main() -> None:
         saved_workspace = await sessions.get_setting("workspace")
         if saved_workspace:
             ws_path = Path(saved_workspace)
-            base = config.workspace_base
-            resolved = ws_path.resolve()
-            # Security check: if workspace sources are configured, reject any saved workspace
-            # that isn't covered by WORKSPACE_BASE or ALLOWED_WORKSPACES. Without any source
-            # configured, the saved path is trusted as-is (single-user local install).
-            in_base = base and (str(resolved).startswith(str(base) + "/") or resolved == base)
-            in_allowed = resolved in config.allowed_workspaces
-            if (base or config.allowed_workspaces) and not in_base and not in_allowed:
+            if not _is_workspace_allowed(ws_path, config):
                 logging.warning(
                     "Saved workspace %s is not under WORKSPACE_BASE or ALLOWED_WORKSPACES, ignoring",
                     saved_workspace,

@@ -125,13 +125,18 @@ def load_config() -> Config:
             raise SystemExit(f"WORKSPACE_BASE is not an existing directory: {workspace_base}")
 
     # Parse optional: allowed workspaces (comma-separated absolute paths).
-    # Non-existent paths are skipped with a warning rather than crashing, so
-    # a stale entry (e.g. an unmounted external drive) doesn't block startup.
+    # Paths are resolved to canonical form so /a/b and /a/../a/b deduplicate
+    # to one entry. Non-existent paths are skipped with a warning rather than
+    # crashing, so a stale entry (e.g. an unmounted drive) doesn't block startup.
     allowed_workspaces: list[Path] = []
+    seen_allowed: set[Path] = set()
     raw_allowed = os.environ.get("ALLOWED_WORKSPACES", "").strip()
     if raw_allowed:
         for raw_path in raw_allowed.split(","):
             p = Path(raw_path.strip()).expanduser().resolve()
+            if p in seen_allowed:
+                continue
+            seen_allowed.add(p)
             if p.is_dir():
                 allowed_workspaces.append(p)
             else:

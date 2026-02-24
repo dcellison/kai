@@ -597,6 +597,31 @@ def _resolve_workspace_path(target: str, base: Path | None) -> Path | None:
     return resolved
 
 
+def _is_workspace_allowed(path: Path, config: "Config") -> bool:
+    """
+    Return True if path is covered by a configured workspace source.
+
+    Accepts paths that are under WORKSPACE_BASE or present in ALLOWED_WORKSPACES.
+    If neither source is configured, all paths are accepted (permissive mode for
+    installs that don't restrict workspace access).
+
+    Args:
+        path: The workspace path to validate (need not exist).
+        config: The application config.
+
+    Returns:
+        True if the path is allowed, False if it should be rejected.
+    """
+    base = config.workspace_base
+    if not base and not config.allowed_workspaces:
+        # No restrictions configured — open access
+        return True
+    resolved = path.resolve()
+    in_base = base and (str(resolved).startswith(str(base) + "/") or resolved == base)
+    in_allowed = resolved in config.allowed_workspaces
+    return bool(in_base or in_allowed)
+
+
 def _short_workspace_name(path: str, base: Path | None) -> str:
     """
     Shorten a workspace path for display in Telegram messages and keyboards.
@@ -694,9 +719,20 @@ async def _workspaces_keyboard(
         home_label += " \U0001f7e2"
     buttons.append([InlineKeyboardButton(home_label, callback_data="ws:home")])
 
+    # Detect name collisions within the allowed list so labels can be disambiguated.
+    # If two entries share the same directory name, show "parent/name" instead of "name".
+    name_counts: dict[str, int] = {}
+    for p in allowed_workspaces:
+        name_counts[p.name] = name_counts.get(p.name, 0) + 1
+    duplicate_names = {name for name, count in name_counts.items() if count > 1}
+
     # Pinned workspaces from ALLOWED_WORKSPACES (shown above history)
     for i, p in enumerate(allowed_workspaces):
-        short = _short_workspace_name(str(p), base)
+        if p.name in duplicate_names:
+            # Include parent directory name to make the button unambiguous
+            short = f"{p.parent.name}/{p.name}"
+        else:
+            short = _short_workspace_name(str(p), base)
         label = short
         if str(p) == current_path:
             label += " \U0001f7e2"
@@ -791,6 +827,18 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
             return
         path = Path(history[idx]["path"])
+        # Reject history entries that are no longer in an allowed workspace source.
+        # This handles the case where a path was removed from ALLOWED_WORKSPACES
+        # after the user visited it — the history entry persists but access is revoked.
+        if not _is_workspace_allowed(path, config):
+            await sessions.delete_workspace_history(str(path))
+            await query.answer("That workspace is no longer allowed.")
+            history = await sessions.get_workspace_history()
+            keyboard = await _workspaces_keyboard(
+                history, str(claude.workspace), str(home), base, config.allowed_workspaces
+            )
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+            return
         # Remove stale entries where the directory no longer exists
         if not path.is_dir():
             await sessions.delete_workspace_history(str(path))
@@ -897,12 +945,17 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if base_candidate is not None and base_candidate.is_dir():
         resolved = base_candidate
 
-    # Fall back to allowed workspaces — match by directory name
+    # Fall back to allowed workspaces — match by directory name.
+    # Multiple matches means the user needs to pick via /workspaces.
     if resolved is None:
-        resolved = next(
-            (p for p in config.allowed_workspaces if p.name == target),
-            None,
-        )
+        matches = [p for p in config.allowed_workspaces if p.name == target]
+        if len(matches) > 1:
+            paths = "\n".join(f"  {p}" for p in matches)
+            await update.message.reply_text(
+                f"Multiple workspaces named '{target}':\n{paths}\nUse /workspaces to pick one."
+            )
+            return
+        resolved = matches[0] if matches else None
 
     if resolved is None:
         # Give a helpful message if neither source is configured
