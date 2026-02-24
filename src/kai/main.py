@@ -116,12 +116,16 @@ def main() -> None:
         if saved_workspace:
             ws_path = Path(saved_workspace)
             base = config.workspace_base
-            # Security check: reject saved workspaces outside WORKSPACE_BASE
-            if base and not (str(ws_path.resolve()).startswith(str(base) + "/") or ws_path.resolve() == base):
+            resolved = ws_path.resolve()
+            # Security check: if workspace sources are configured, reject any saved workspace
+            # that isn't covered by WORKSPACE_BASE or ALLOWED_WORKSPACES. Without any source
+            # configured, the saved path is trusted as-is (single-user local install).
+            in_base = base and (str(resolved).startswith(str(base) + "/") or resolved == base)
+            in_allowed = resolved in config.allowed_workspaces
+            if (base or config.allowed_workspaces) and not in_base and not in_allowed:
                 logging.warning(
-                    "Saved workspace %s is outside WORKSPACE_BASE %s, ignoring",
+                    "Saved workspace %s is not under WORKSPACE_BASE or ALLOWED_WORKSPACES, ignoring",
                     saved_workspace,
-                    base,
                 )
                 await sessions.delete_setting("workspace")
             elif ws_path.is_dir():
