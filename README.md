@@ -25,9 +25,9 @@ Switch between Opus, Sonnet, and Haiku via `/models` (interactive picker) or `/m
 
 Point Claude at any project with `/workspace <name>`. Names resolve relative to `WORKSPACE_BASE` (set in `.env`). Identity and memory from the home workspace carry over. Create new workspaces with `/workspace new <name>`. Absolute paths are not accepted — all workspaces must live under the configured base directory.
 
-### Image and file support
+### File exchange
 
-Send photos or documents directly in chat. Supports images (JPEG, PNG, GIF, WebP) and text files (Python, JS, JSON, Markdown, and many more).
+Send any file type directly in chat -- photos, documents, PDFs, archives, anything. Files are saved to `workspace/files/` with timestamped names, and Claude gets the path so it can work with them via shell tools. Claude can also send files back to you through the internal API. Images render inline; everything else arrives as a document attachment.
 
 ### Voice input
 

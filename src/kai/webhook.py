@@ -7,6 +7,7 @@ Provides functionality to:
 3. Expose a scheduling API for creating cron-style jobs via HTTP
 4. Expose a jobs query API for listing and fetching scheduled jobs
 5. Proxy authenticated requests to external services (service layer)
+6. Send files from the workspace to the Telegram chat (file exchange API)
 
 The server runs on aiohttp alongside the Telegram bot in the same event loop.
 Routes are organized into five groups:
