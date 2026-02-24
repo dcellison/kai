@@ -668,30 +668,51 @@ async def _workspaces_keyboard(
     current_path: str,
     home_path: str,
     base: Path | None,
+    allowed_workspaces: list[Path],
 ) -> InlineKeyboardMarkup:
     """
     Build an inline keyboard for workspace switching.
 
-    Shows a Home button at the top, followed by recent workspace history.
-    The current workspace is marked with a green dot. Each button's callback
-    data is "ws:home" or "ws:<index>" where index maps to the history list.
+    Layout (top to bottom):
+    1. Home button (always first)
+    2. Allowed (pinned) workspaces from ALLOWED_WORKSPACES config, in order
+    3. Recent workspace history, deduplicated against allowed workspaces and home
+
+    The current workspace is marked with a green dot. Callback data:
+    - "ws:home" for the home button
+    - "ws:allowed:<index>" for pinned workspaces (index into allowed_workspaces)
+    - "ws:<index>" for history entries (index into the history list)
     """
     buttons = []
+
+    # Collect allowed paths as strings for deduplication checks below
+    allowed_path_strs = {str(p) for p in allowed_workspaces}
+
     # Home button (always first)
     home_label = "\U0001f3e0 Home"
     if current_path == home_path:
         home_label += " \U0001f7e2"
     buttons.append([InlineKeyboardButton(home_label, callback_data="ws:home")])
-    # History entries (skip home, already shown above)
+
+    # Pinned workspaces from ALLOWED_WORKSPACES (shown above history)
+    for i, p in enumerate(allowed_workspaces):
+        short = _short_workspace_name(str(p), base)
+        label = short
+        if str(p) == current_path:
+            label += " \U0001f7e2"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"ws:allowed:{i}")])
+
+    # History entries — skip home and any path already shown in the allowed section
     for i, entry in enumerate(history):
         p = entry["path"]
-        if p == home_path:
+        if p == home_path or p in allowed_path_strs:
             continue
         short = _short_workspace_name(p, base)
         label = short
         if p == current_path:
             label += " \U0001f7e2"
         buttons.append([InlineKeyboardButton(label, callback_data=f"ws:{i}")])
+
     return InlineKeyboardMarkup(buttons)
 
 
@@ -705,11 +726,11 @@ async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     current = str(claude.workspace)
     home = str(config.claude_workspace)
 
-    if not history and current == home:
+    if not history and not config.allowed_workspaces and current == home:
         await update.message.reply_text("No workspace history yet.\nUse /workspace new <name> to create one.")
         return
 
-    keyboard = await _workspaces_keyboard(history, current, home, config.workspace_base)
+    keyboard = await _workspaces_keyboard(history, current, home, config.workspace_base, config.allowed_workspaces)
     await update.message.reply_text("Workspaces:", reply_markup=keyboard)
 
 
@@ -738,6 +759,25 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     if data == "home":
         path = home
         label = "Home"
+    elif data.startswith("allowed:"):
+        # Pinned workspace from ALLOWED_WORKSPACES config
+        try:
+            idx = int(data.removeprefix("allowed:"))
+        except ValueError:
+            await query.answer("Invalid selection.")
+            await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
+            return
+        allowed = config.allowed_workspaces
+        if idx < 0 or idx >= len(allowed):
+            await query.answer("Workspace no longer available.")
+            await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
+            return
+        path = allowed[idx]
+        if not path.is_dir():
+            await query.answer("That workspace no longer exists.")
+            await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
+            return
+        label = _short_workspace_name(str(path), base)
     else:
         try:
             idx = int(data)
@@ -756,7 +796,9 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             await sessions.delete_workspace_history(str(path))
             await query.answer("That workspace no longer exists.")
             history = await sessions.get_workspace_history()
-            keyboard = await _workspaces_keyboard(history, str(claude.workspace), str(home), base)
+            keyboard = await _workspaces_keyboard(
+                history, str(claude.workspace), str(home), base, config.allowed_workspaces
+            )
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return
         label = _short_workspace_name(str(path), base)
@@ -787,11 +829,11 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     Subcommands:
         /workspace              — show current workspace
         /workspace home         — switch to home workspace
-        /workspace <name>       — switch to a workspace by name (resolved under WORKSPACE_BASE)
+        /workspace <name>       — switch to a workspace by name (WORKSPACE_BASE, then ALLOWED_WORKSPACES)
         /workspace new <name>   — create a new workspace with git init and switch to it
 
-    Absolute paths and ~ expansion are rejected for security. All workspace
-    names are resolved relative to WORKSPACE_BASE with traversal prevention.
+    Absolute paths and ~ expansion are rejected for security. Name resolution
+    checks WORKSPACE_BASE first, then ALLOWED_WORKSPACES (by directory name).
     """
     assert update.message is not None
     claude = _get_claude(context)
@@ -849,21 +891,25 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _switch_workspace(update, context, resolved)
         return
 
-    # Resolve workspace name via base directory
-    if not base:
-        await update.message.reply_text(_NO_BASE_MSG)
-        return
+    # Try WORKSPACE_BASE first (WORKSPACE_BASE wins on name collision per spec)
+    resolved: Path | None = None
+    base_candidate = _resolve_workspace_path(target, base)
+    if base_candidate is not None and base_candidate.is_dir():
+        resolved = base_candidate
 
-    resolved = _resolve_workspace_path(target, base)
+    # Fall back to allowed workspaces — match by directory name
     if resolved is None:
-        await update.message.reply_text("Invalid workspace name.")
-        return
+        resolved = next(
+            (p for p in config.allowed_workspaces if p.name == target),
+            None,
+        )
 
-    if not resolved.exists():
-        await update.message.reply_text(f"Path does not exist:\n{resolved}")
-        return
-    if not resolved.is_dir():
-        await update.message.reply_text(f"Not a directory:\n{resolved}")
+    if resolved is None:
+        # Give a helpful message if neither source is configured
+        if not base and not config.allowed_workspaces:
+            await update.message.reply_text(_NO_BASE_MSG)
+        else:
+            await update.message.reply_text(f"Workspace '{target}' not found.")
         return
 
     await _switch_workspace(update, context, resolved)

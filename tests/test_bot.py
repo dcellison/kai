@@ -2,12 +2,15 @@
 
 from pathlib import Path
 
+import pytest
+
 from kai.bot import (
     _chunk_text,
     _resolve_workspace_path,
     _save_to_workspace,
     _short_workspace_name,
     _truncate_for_telegram,
+    _workspaces_keyboard,
 )
 
 # ── _resolve_workspace_path ──────────────────────────────────────────
@@ -135,3 +138,76 @@ class TestSaveToWorkspace:
         result = _save_to_workspace(b"x", "test.txt", tmp_path)
         assert result.is_absolute()
         assert result.is_file()
+
+
+# ── _workspaces_keyboard ────────────────────────────────────────────
+
+
+def _button_labels(markup) -> list[str]:
+    """Flatten InlineKeyboardMarkup into a list of button labels."""
+    return [btn.text for row in markup.inline_keyboard for btn in row]
+
+
+def _button_callbacks(markup) -> list[str]:
+    """Flatten InlineKeyboardMarkup into a list of callback data strings."""
+    return [btn.callback_data for row in markup.inline_keyboard for btn in row]
+
+
+class TestWorkspacesKeyboard:
+    @pytest.mark.asyncio
+    async def test_home_always_first(self, tmp_path):
+        """Home button appears first regardless of history or allowed workspaces."""
+        markup = await _workspaces_keyboard([], "/home", "/home", None, [])
+        assert _button_labels(markup)[0] == "\U0001f3e0 Home \U0001f7e2"
+
+    @pytest.mark.asyncio
+    async def test_allowed_workspaces_appear_before_history(self, tmp_path):
+        """Pinned workspaces appear between Home and history entries."""
+        pinned = tmp_path / "pinned"
+        pinned.mkdir()
+        history = [{"path": "/other/project"}]
+        markup = await _workspaces_keyboard(history, "/other/project", "/home", None, [pinned])
+        labels = _button_labels(markup)
+        # Home, then pinned, then history
+        assert labels[0].startswith("\U0001f3e0 Home")
+        assert labels[1] == "pinned"
+        assert labels[2].endswith("\U0001f7e2")  # history entry marked as current
+
+    @pytest.mark.asyncio
+    async def test_allowed_workspace_callback_data(self, tmp_path):
+        """Pinned workspaces use ws:allowed:<index> callback data."""
+        pinned = tmp_path / "project-a"
+        pinned.mkdir()
+        markup = await _workspaces_keyboard([], "/home", "/home", None, [pinned])
+        callbacks = _button_callbacks(markup)
+        assert "ws:allowed:0" in callbacks
+
+    @pytest.mark.asyncio
+    async def test_history_deduplicated_against_allowed(self, tmp_path):
+        """A path in both allowed and history appears only once (in allowed section)."""
+        pinned = tmp_path / "shared"
+        pinned.mkdir()
+        history = [{"path": str(pinned)}]
+        markup = await _workspaces_keyboard(history, "/home", "/home", None, [pinned])
+        labels = _button_labels(markup)
+        # Should be: Home + one "shared" entry — not two "shared" entries
+        assert labels.count("shared") == 1
+        callbacks = _button_callbacks(markup)
+        # The single entry should be the allowed version, not a bare history index
+        assert "ws:allowed:0" in callbacks
+        assert not any(c == "ws:0" for c in callbacks)
+
+    @pytest.mark.asyncio
+    async def test_current_workspace_marked_in_allowed(self, tmp_path):
+        """Green dot appears on the pinned workspace button when it is current."""
+        pinned = tmp_path / "active"
+        pinned.mkdir()
+        markup = await _workspaces_keyboard([], str(pinned), "/home", None, [pinned])
+        labels = _button_labels(markup)
+        assert any("active" in lbl and "\U0001f7e2" in lbl for lbl in labels)
+
+    @pytest.mark.asyncio
+    async def test_no_allowed_no_history_shows_only_home(self):
+        """With no allowed workspaces and no history, only the Home button appears."""
+        markup = await _workspaces_keyboard([], "/home", "/home", None, [])
+        assert len(_button_labels(markup)) == 1

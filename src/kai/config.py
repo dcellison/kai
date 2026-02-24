@@ -12,6 +12,7 @@ All paths are resolved relative to PROJECT_ROOT (the repository root), which is
 derived from this file's location in the source tree: src/kai/config.py -> project root.
 """
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,6 +47,9 @@ class Config:
         tts_enabled: Whether to enable Piper text-to-speech for voice responses
         piper_model_dir: Directory containing Piper voice model files
         workspace_base: Base directory for workspace name resolution (/workspace <name>)
+        allowed_workspaces: Additional workspace directories accessible by name, from config only.
+            These appear as pinned workspaces in /workspaces and are reachable via /workspace <name>
+            without being under WORKSPACE_BASE. Non-existent paths are skipped at startup.
     """
 
     # Required fields — no defaults, must be provided
@@ -75,6 +79,7 @@ class Config:
 
     # Workspace switching
     workspace_base: Path | None = None
+    allowed_workspaces: list[Path] = field(default_factory=list)
 
 
 def load_config() -> Config:
@@ -119,6 +124,19 @@ def load_config() -> Config:
         if not workspace_base.is_dir():
             raise SystemExit(f"WORKSPACE_BASE is not an existing directory: {workspace_base}")
 
+    # Parse optional: allowed workspaces (comma-separated absolute paths).
+    # Non-existent paths are skipped with a warning rather than crashing, so
+    # a stale entry (e.g. an unmounted external drive) doesn't block startup.
+    allowed_workspaces: list[Path] = []
+    raw_allowed = os.environ.get("ALLOWED_WORKSPACES", "").strip()
+    if raw_allowed:
+        for raw_path in raw_allowed.split(","):
+            p = Path(raw_path.strip()).expanduser().resolve()
+            if p.is_dir():
+                allowed_workspaces.append(p)
+            else:
+                logging.warning("ALLOWED_WORKSPACES: skipping non-existent path: %s", p)
+
     return Config(
         telegram_bot_token=token,
         allowed_user_ids=allowed_ids,
@@ -130,4 +148,5 @@ def load_config() -> Config:
         voice_enabled=os.environ.get("VOICE_ENABLED", "").lower() in ("1", "true", "yes"),
         tts_enabled=os.environ.get("TTS_ENABLED", "").lower() in ("1", "true", "yes"),
         workspace_base=workspace_base,
+        allowed_workspaces=allowed_workspaces,
     )

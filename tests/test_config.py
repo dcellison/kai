@@ -16,6 +16,7 @@ _CONFIG_ENV_VARS = [
     "VOICE_ENABLED",
     "TTS_ENABLED",
     "WORKSPACE_BASE",
+    "ALLOWED_WORKSPACES",
 ]
 
 
@@ -110,3 +111,38 @@ class TestLoadConfigOptional:
         _set_required(monkeypatch)
         monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
         assert load_config().webhook_secret == "s3cret"
+
+    def test_allowed_workspaces_default_empty(self, monkeypatch):
+        _set_required(monkeypatch)
+        assert load_config().allowed_workspaces == []
+
+    def test_allowed_workspaces_single(self, monkeypatch, tmp_path):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("ALLOWED_WORKSPACES", str(tmp_path))
+        config = load_config()
+        assert config.allowed_workspaces == [tmp_path]
+
+    def test_allowed_workspaces_multiple(self, monkeypatch, tmp_path):
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        _set_required(monkeypatch)
+        monkeypatch.setenv("ALLOWED_WORKSPACES", f"{dir_a},{dir_b}")
+        config = load_config()
+        assert config.allowed_workspaces == [dir_a, dir_b]
+
+    def test_allowed_workspaces_skips_nonexistent(self, monkeypatch, tmp_path):
+        # Non-existent paths are skipped with a warning, not a crash
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        fake_dir = tmp_path / "nope"
+        _set_required(monkeypatch)
+        monkeypatch.setenv("ALLOWED_WORKSPACES", f"{real_dir},{fake_dir}")
+        config = load_config()
+        assert config.allowed_workspaces == [real_dir]
+
+    def test_allowed_workspaces_all_nonexistent_returns_empty(self, monkeypatch, tmp_path):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("ALLOWED_WORKSPACES", str(tmp_path / "nope"))
+        assert load_config().allowed_workspaces == []
