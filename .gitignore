@@ -32,6 +32,7 @@ workspace/*
 !workspace/.claude
 workspace/.claude/*
 !workspace/.claude/CLAUDE.md
+!workspace/.claude/settings.json
 !workspace/.claude/MEMORY.md.example
 
 # Lock file

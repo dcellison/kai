@@ -648,7 +648,11 @@ async def _handle_send_file(request: web.Request) -> web.Response:
     # Confine to the current workspace to prevent path traversal. Uses
     # Path.relative_to() which raises ValueError on escape, unlike string
     # prefix matching which is bypassable via symlinks.
-    workspace = request.app.get("workspace")
+    # Prefer the live claude.workspace (tracks workspace switches) over the
+    # static fallback set at server startup.
+    telegram_app = request.app.get("telegram_app")
+    claude = telegram_app.bot_data.get("claude") if telegram_app else None
+    workspace = str(claude.workspace) if claude else request.app.get("workspace")
     if workspace:
         workspace_resolved = Path(workspace).resolve()
         try:

@@ -29,6 +29,7 @@ Context injection on first message of each session:
 import asyncio
 import json
 import logging
+import shutil
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -87,8 +88,9 @@ class PersistentClaude:
     streaming responses, killing/restarting, and workspace switching. All message
     sends are serialized via an internal asyncio lock to prevent interleaving.
 
-    The process runs with --permission-mode bypassPermissions (required for headless
-    operation via Telegram) and --max-budget-usd to cap per-session spending.
+    The process runs with --permission-mode dontAsk and a workspace settings.json
+    allow-list (see workspace/.claude/settings.json) to cap tool access.
+    Budget is capped per-session via --max-budget-usd.
     """
 
     def __init__(
@@ -127,19 +129,50 @@ class PersistentClaude:
         """The current Claude session ID, or None if no session is active."""
         return self._session_id
 
+    def _provision_settings(self) -> None:
+        """Ensure the workspace has a .claude/settings.json for dontAsk mode.
+
+        The canonical allow/deny list lives in the home workspace.  For foreign
+        workspaces that don't already have their own settings.json, we copy
+        the home version so that dontAsk mode has rules to work with.
+
+        If the target workspace already has a settings.json it is left
+        untouched — it may contain workspace-specific permissions.
+        """
+        src = self.home_workspace / ".claude" / "settings.json"
+        if not src.exists():
+            return
+
+        dst_dir = self.workspace / ".claude"
+        dst = dst_dir / "settings.json"
+
+        if dst.exists():
+            return
+
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        log.info("Provisioned %s → %s", src, dst)
+
     async def _ensure_started(self) -> None:
         """
         Start the Claude Code subprocess if not already running.
 
-        Launches claude with stream-json I/O, bypassPermissions mode (required
-        for headless operation), and the configured model and budget. The process
-        runs in the current workspace directory and persists across messages.
+        Launches claude with stream-json I/O, dontAsk permission mode with an
+        explicit allow-list (workspace/.claude/settings.json), and the configured
+        model and budget. The process runs in the current workspace directory and
+        persists across messages.
 
         The stdout buffer limit is raised to 1 MiB (from the default 64 KiB)
         because large tool results from Claude can exceed the default.
         """
         if self.is_alive:
             return
+
+        # Ensure the workspace has a .claude/settings.json with the permission
+        # allow-list.  The canonical copy lives in the home workspace; for
+        # foreign workspaces we copy it so that dontAsk mode has rules to work
+        # with.
+        self._provision_settings()
 
         cmd = [
             "claude",
@@ -151,7 +184,7 @@ class PersistentClaude:
             "--model",
             self.model,
             "--permission-mode",
-            "bypassPermissions",
+            "dontAsk",
             "--max-budget-usd",
             str(self.max_budget_usd),
         ]
@@ -297,9 +330,12 @@ class PersistentClaude:
                     f"[File API: To send a file to the user, POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/send-file "
                     f"with header 'X-Webhook-Secret: {self.webhook_secret}'. "
-                    f'Required: "path" (absolute file path within the workspace). '
+                    f'Required: "path" (absolute file path inside the current '
+                    f"workspace {self.workspace}). "
                     f'Optional: "caption". Images are sent as photos, '
-                    f"everything else as documents.\n"
+                    f"everything else as documents. "
+                    f"Do NOT copy files to another directory — use the "
+                    f"original path if it is already inside {self.workspace}.\n"
                     f"Incoming files from the user are auto-saved to "
                     f"{self.workspace}/files/ and their paths are included "
                     f"in the message.]"
