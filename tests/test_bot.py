@@ -250,6 +250,8 @@ def _make_config(workspace_base=None, allowed_workspaces=None) -> Config:
     """Minimal Config for testing _is_workspace_allowed."""
     return Config(
         telegram_bot_token="test",
+        telegram_webhook_url="https://example.com/webhook/telegram",
+        telegram_webhook_secret="test-secret",
         allowed_user_ids={1},
         workspace_base=workspace_base,
         allowed_workspaces=allowed_workspaces or [],

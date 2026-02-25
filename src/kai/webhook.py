@@ -1,31 +1,34 @@
 """
-Webhook HTTP server for receiving external notifications and scheduling jobs.
+Webhook HTTP server for receiving external notifications, scheduling jobs, and
+serving as the Telegram update transport.
 
 Provides functionality to:
-1. Receive and validate GitHub webhook events (push, PR, issues, comments, reviews)
-2. Accept generic webhook notifications from any source
-3. Expose a scheduling API for creating cron-style jobs via HTTP
-4. Expose a jobs query API for listing and fetching scheduled jobs
-5. Proxy authenticated requests to external services (service layer)
-6. Send files from the workspace to the Telegram chat (file exchange API)
+1. Receive Telegram updates via webhook (replaces long-polling for reliability)
+2. Receive and validate GitHub webhook events (push, PR, issues, comments, reviews)
+3. Accept generic webhook notifications from any source
+4. Expose a scheduling API for creating cron-style jobs via HTTP
+5. Expose a jobs query API for listing and fetching scheduled jobs
+6. Proxy authenticated requests to external services (service layer)
+7. Send files from the workspace to the Telegram chat (file exchange API)
 
 The server runs on aiohttp alongside the Telegram bot in the same event loop.
-Routes are organized into five groups:
-    - /webhook/github       — GitHub events with HMAC-SHA256 signature validation
-    - /webhook              — Generic webhooks with shared-secret auth
-    - /api/schedule         — Job creation API (used by inner Claude via curl)
-    - /api/jobs             — Job listing and detail API
-    - /api/jobs/{id}        — Job detail (GET), deletion (DELETE), and update (PATCH)
-    - /api/services/{name}  — External service proxy (injects auth from .env)
-    - /api/send-file        — Send a file from the filesystem to the Telegram chat
+Routes are organized into these groups:
+    - /webhook/telegram     - Telegram updates (secret_token auth, always registered)
+    - /webhook/github       - GitHub events with HMAC-SHA256 signature validation
+    - /webhook              - Generic webhooks with shared-secret auth
+    - /api/schedule         - Job creation API (used by inner Claude via curl)
+    - /api/jobs             - Job listing and detail API
+    - /api/jobs/{id}        - Job detail (GET), deletion (DELETE), and update (PATCH)
+    - /api/services/{name}  - External service proxy (injects auth from .env)
+    - /api/send-file        - Send a file from the filesystem to the Telegram chat
 
-All webhook/API endpoints (except /health) require WEBHOOK_SECRET to be set.
-When unset, only the health check endpoint is registered. This allows the
-server to start cleanly in development without exposing unauthenticated routes.
+The Telegram webhook route uses its own secret (TELEGRAM_WEBHOOK_SECRET) and is
+registered unconditionally. All other webhook/API endpoints require WEBHOOK_SECRET.
+When WEBHOOK_SECRET is unset, only /health and /webhook/telegram are active.
 
 GitHub events are formatted into human-readable Markdown messages and sent
 to the configured Telegram chat. The formatter pattern (dispatch dict mapping
-event type → formatter function) makes it easy to add new event types.
+event type to formatter function) makes it easy to add new event types.
 """
 
 import hashlib
@@ -36,6 +39,7 @@ import re
 from pathlib import Path
 
 from aiohttp import web
+from telegram import Update
 
 from kai import cron, sessions
 
@@ -198,6 +202,43 @@ def _verify_github_signature(secret: str, body: bytes, signature: str) -> bool:
 async def _handle_health(request: web.Request) -> web.Response:
     """Health check endpoint. Returns {"status": "ok"} for uptime monitoring."""
     return web.json_response({"status": "ok"})
+
+
+async def _handle_telegram_update(request: web.Request) -> web.Response:
+    """
+    Receive a Telegram update pushed via webhook.
+
+    Validates the X-Telegram-Bot-Api-Secret-Token header against the configured
+    secret, deserializes the JSON body into a python-telegram-bot Update object,
+    and dispatches it to the existing handler system via process_update().
+
+    Always returns 200 on valid-secret requests, even on errors. Telegram retries
+    on non-200 responses, so surfacing internal errors as HTTP errors would cause
+    an infinite retry loop. Errors are logged instead.
+    """
+    secret = request.app["telegram_webhook_secret"]
+    provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(provided, secret):
+        log.warning("Telegram update: invalid secret")
+        return web.Response(status=401, text="Invalid secret")
+
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        log.warning("Telegram update: malformed JSON")
+        return web.Response(status=200)
+
+    telegram_app = request.app["telegram_app"]
+    bot = request.app["telegram_bot"]
+
+    try:
+        update = Update.de_json(data, bot)
+        if update:
+            await telegram_app.process_update(update)
+    except Exception:
+        log.exception("Error processing Telegram update")
+
+    return web.Response(status=200)
 
 
 async def _handle_github(request: web.Request) -> web.Response:
@@ -686,14 +727,17 @@ async def _handle_send_file(request: web.Request) -> web.Response:
 
 async def start(telegram_app, config) -> None:
     """
-    Start the webhook HTTP server on the configured port.
+    Start the webhook HTTP server and register the Telegram webhook.
 
     Sets up all routes and stores references to the Telegram app/bot and
-    webhook secret in the aiohttp app dict so route handlers can access them.
+    secrets in the aiohttp app dict so route handlers can access them.
     The first allowed user ID is used as the notification target chat.
 
-    Webhook and scheduling routes are only registered if WEBHOOK_SECRET is
-    set — otherwise only the /health endpoint is available.
+    The Telegram webhook route (/webhook/telegram) is always registered since
+    it uses its own secret. All other webhook/API routes require WEBHOOK_SECRET.
+
+    After the server is listening, registers the webhook URL with Telegram's API
+    so Telegram starts pushing updates to this endpoint.
 
     Args:
         telegram_app: The python-telegram-bot Application instance.
@@ -705,6 +749,7 @@ async def start(telegram_app, config) -> None:
     _app["telegram_app"] = telegram_app
     _app["telegram_bot"] = telegram_app.bot
     _app["webhook_secret"] = config.webhook_secret
+    _app["telegram_webhook_secret"] = config.telegram_webhook_secret
 
     # Use first allowed user ID as the notification target
     _app["chat_id"] = next(iter(config.allowed_user_ids))
@@ -713,6 +758,9 @@ async def start(telegram_app, config) -> None:
     _app["workspace"] = str(config.claude_workspace)
 
     _app.router.add_get("/health", _handle_health)
+
+    # Telegram update route uses its own secret, registered unconditionally
+    _app.router.add_post("/webhook/telegram", _handle_telegram_update)
 
     if config.webhook_secret:
         _app.router.add_post("/webhook/github", _handle_github)
@@ -725,24 +773,49 @@ async def start(telegram_app, config) -> None:
         _app.router.add_post("/api/services/{name}", _handle_service_call)
         _app.router.add_post("/api/send-file", _handle_send_file)
     else:
-        log.warning("WEBHOOK_SECRET not set — webhook and scheduling endpoints disabled")
+        log.warning("WEBHOOK_SECRET not set - webhook and scheduling endpoints disabled")
 
     _runner = web.AppRunner(_app, access_log=None)
     await _runner.setup()
-    # Bind to localhost only — all external access routes through Cloudflare Tunnel,
+    # Bind to localhost only - all external access routes through Cloudflare Tunnel,
     # so there's no reason to expose the server on the LAN.
     site = web.TCPSite(_runner, "127.0.0.1", config.webhook_port)
     await site.start()
     log.info("Webhook server listening on port %d", config.webhook_port)
 
+    # Register the webhook URL with Telegram's API. This must come after the
+    # server is listening so the endpoint is ready before Telegram starts pushing.
+    # allowed_updates limits which update types Telegram sends - Kai only handles
+    # messages and callback queries (inline keyboard taps), not edited_message etc.
+    await telegram_app.bot.set_webhook(
+        url=config.telegram_webhook_url,
+        secret_token=config.telegram_webhook_secret,
+        allowed_updates=["message", "callback_query"],
+    )
+    log.info("Registered Telegram webhook: %s", config.telegram_webhook_url)
+
 
 async def stop() -> None:
     """
-    Stop the webhook server and clean up resources.
+    Deregister the Telegram webhook and stop the HTTP server.
 
-    Called during shutdown from main.py's finally block.
+    Called during shutdown from main.py's finally block. Deregisters the webhook
+    with Telegram first (so Telegram stops sending updates to an endpoint that's
+    about to disappear), then tears down the aiohttp server. The delete_webhook
+    call is wrapped in try/except because it's not critical - if the network is
+    down at shutdown time, Telegram will just overwrite the stale webhook on the
+    next set_webhook call at startup.
     """
     global _app, _runner
+    # Deregister the Telegram webhook before shutting down the server
+    if _app is not None:
+        telegram_bot = _app.get("telegram_bot")
+        if telegram_bot is not None:
+            try:
+                await telegram_bot.delete_webhook()
+                log.info("Deregistered Telegram webhook")
+            except Exception:
+                log.warning("Failed to deregister Telegram webhook (will re-register on next start)")
     if _runner:
         await _runner.cleanup()
         log.info("Webhook server stopped")

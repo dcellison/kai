@@ -1573,7 +1573,9 @@ def create_bot(config: Config) -> Application:
     Returns:
         A fully configured Telegram Application ready to be started.
     """
-    app = Application.builder().token(config.telegram_bot_token).concurrent_updates(True).build()
+    # updater(None) disables the polling Updater - updates arrive via webhook instead.
+    # All existing handlers are transport-agnostic and work identically either way.
+    app = Application.builder().token(config.telegram_bot_token).updater(None).concurrent_updates(True).build()
     app.bot_data["config"] = config
     app.bot_data["claude"] = PersistentClaude(
         model=config.claude_model,

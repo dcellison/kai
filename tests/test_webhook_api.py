@@ -8,7 +8,14 @@ from aiohttp import web
 
 import kai.webhook as webhook_mod
 from kai import sessions
-from kai.webhook import _handle_delete_job, _handle_schedule, _handle_send_file, _handle_update_job, update_workspace
+from kai.webhook import (
+    _handle_delete_job,
+    _handle_schedule,
+    _handle_send_file,
+    _handle_telegram_update,
+    _handle_update_job,
+    update_workspace,
+)
 
 
 @pytest.fixture
@@ -403,3 +410,69 @@ class TestUpdateWorkspace:
         monkeypatch.setattr(webhook_mod, "_app", None)
         # Should not raise
         update_workspace("/any/path")
+
+
+# ── POST /webhook/telegram ─────────────────────────────────────────
+
+
+@pytest.fixture
+def telegram_request():
+    """Create a mock request for the Telegram webhook endpoint."""
+    request = MagicMock(spec=web.Request)
+    request.app = {
+        "telegram_webhook_secret": "tg-secret",
+        "telegram_app": MagicMock(),
+        "telegram_bot": MagicMock(),
+    }
+    request.app["telegram_app"].process_update = AsyncMock()
+    request.headers = {"X-Telegram-Bot-Api-Secret-Token": "tg-secret"}
+    return request
+
+
+class TestTelegramUpdate:
+    async def test_valid_secret_dispatches_update(self, telegram_request, monkeypatch):
+        """Valid secret and JSON body dispatches to process_update."""
+        fake_update = MagicMock()
+        monkeypatch.setattr("kai.webhook.Update.de_json", MagicMock(return_value=fake_update))
+        telegram_request.json = AsyncMock(return_value={"update_id": 123})
+
+        resp = await _handle_telegram_update(telegram_request)
+
+        assert resp.status == 200
+        telegram_request.app["telegram_app"].process_update.assert_called_once_with(fake_update)
+
+    async def test_wrong_secret_returns_401(self, telegram_request):
+        """Wrong secret token returns 401 without dispatching."""
+        telegram_request.headers = {"X-Telegram-Bot-Api-Secret-Token": "wrong"}
+
+        resp = await _handle_telegram_update(telegram_request)
+
+        assert resp.status == 401
+        telegram_request.app["telegram_app"].process_update.assert_not_called()
+
+    async def test_missing_secret_returns_401(self, telegram_request):
+        """Missing secret header returns 401."""
+        telegram_request.headers = {}
+
+        resp = await _handle_telegram_update(telegram_request)
+
+        assert resp.status == 401
+
+    async def test_malformed_json_returns_200(self, telegram_request):
+        """Malformed JSON returns 200 (swallowed to prevent Telegram retries)."""
+        telegram_request.json = AsyncMock(side_effect=json.JSONDecodeError("test", "doc", 0))
+
+        resp = await _handle_telegram_update(telegram_request)
+
+        assert resp.status == 200
+        telegram_request.app["telegram_app"].process_update.assert_not_called()
+
+    async def test_null_update_skips_dispatch(self, telegram_request, monkeypatch):
+        """If Update.de_json returns None, process_update is not called."""
+        monkeypatch.setattr("kai.webhook.Update.de_json", MagicMock(return_value=None))
+        telegram_request.json = AsyncMock(return_value={"update_id": 999})
+
+        resp = await _handle_telegram_update(telegram_request)
+
+        assert resp.status == 200
+        telegram_request.app["telegram_app"].process_update.assert_not_called()

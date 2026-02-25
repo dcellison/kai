@@ -1,29 +1,29 @@
 """
-Application entry point — initializes all subsystems and runs the Telegram bot.
+Application entry point - initializes all subsystems and runs the Telegram bot.
 
 Provides functionality to:
 1. Configure logging with daily rotation and terminal output
 2. Load configuration and validate environment
 3. Initialize the database, Telegram bot, scheduled jobs, and webhook server
 4. Restore workspace from previous session
-5. Notify the user if a previous response was interrupted by a crash
-6. Run the event loop until shutdown (Ctrl+C or SIGTERM)
-7. Clean up all resources in the correct order on exit
+5. Register the Telegram webhook (updates arrive via HTTP POST, not polling)
+6. Notify the user if a previous response was interrupted by a crash
+7. Run the event loop until shutdown (Ctrl+C or SIGTERM)
+8. Clean up all resources in the correct order on exit
 
 The startup sequence is:
     1. Load config from .env
     2. Initialize SQLite database
-    3. Create the Telegram bot application
+    3. Create the Telegram bot application (with updater=None, no polling)
     4. Restore previous workspace (if saved in settings table)
-    5. Start the Telegram updater (polling)
-    6. Register slash commands in Telegram's menu
-    7. Load scheduled jobs from database into APScheduler
-    8. Start the webhook HTTP server
-    9. Check for interrupted-response flag file
-    10. Block forever on asyncio.Event().wait()
+    5. Initialize the Telegram bot and register slash commands
+    6. Load scheduled jobs from database into APScheduler
+    7. Start the webhook HTTP server (registers Telegram webhook with the API)
+    8. Check for interrupted-response flag file
+    9. Block forever on asyncio.Event().wait()
 
 The shutdown sequence (in the finally block) reverses this order:
-    webhook → updater → bot → Claude process → Telegram app → database
+    webhook (deregisters Telegram webhook) -> bot -> Claude process -> Telegram app -> database
 """
 
 import asyncio
@@ -147,8 +147,6 @@ def main() -> None:
                     await asyncio.sleep(wait)
 
             await app.start()
-            assert app.updater is not None
-            await app.updater.start_polling()
 
             # Register slash command menu in Telegram's bot command list
             await app.bot.set_my_commands(
@@ -204,8 +202,6 @@ def main() -> None:
         finally:
             # Shutdown in reverse order of startup
             await webhook.stop()
-            if app.updater is not None:
-                await app.updater.stop()
             await app.stop()
             await app.bot_data["claude"].shutdown()
             await app.shutdown()
