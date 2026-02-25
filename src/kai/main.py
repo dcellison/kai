@@ -174,6 +174,12 @@ def main() -> None:
 
             # Start webhook and scheduling API server
             await webhook.start(app, config)
+            # webhook.start() initializes the confinement path from config (home workspace).
+            # If a non-default workspace was restored above, sync it now so send-file
+            # accepts files from the restored workspace. Must come after start() because
+            # start() would overwrite any earlier update_workspace() call.
+            if app.bot_data["claude"].workspace != config.claude_workspace:
+                webhook.update_workspace(str(app.bot_data["claude"].workspace))
 
             # Check if a previous response was interrupted by a crash/restart.
             # bot.py writes this flag file when it starts processing a message

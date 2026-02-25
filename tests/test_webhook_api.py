@@ -6,8 +6,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 
+import kai.webhook as webhook_mod
 from kai import sessions
-from kai.webhook import _handle_delete_job, _handle_schedule, _handle_send_file, _handle_update_job
+from kai.webhook import _handle_delete_job, _handle_schedule, _handle_send_file, _handle_update_job, update_workspace
 
 
 @pytest.fixture
@@ -380,3 +381,25 @@ class TestSendFile:
         send_file_request.json = AsyncMock(return_value={"path": "/any"})
         resp = await _handle_send_file(send_file_request)
         assert resp.status == 401
+
+
+# ── update_workspace() ──────────────────────────────────────────────
+
+
+class TestUpdateWorkspace:
+    def test_updates_app_workspace(self, monkeypatch):
+        """update_workspace() changes the path stored in the live aiohttp app dict."""
+        # Simulate a running server by setting _app to a real Application instance
+        app = web.Application()
+        app["workspace"] = "/original/workspace"
+        monkeypatch.setattr(webhook_mod, "_app", app)
+
+        update_workspace("/switched/workspace")
+
+        assert app["workspace"] == "/switched/workspace"
+
+    def test_no_op_when_server_not_running(self, monkeypatch):
+        """update_workspace() is a no-op (no exception) when the server hasn't started."""
+        monkeypatch.setattr(webhook_mod, "_app", None)
+        # Should not raise
+        update_workspace("/any/path")

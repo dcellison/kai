@@ -753,3 +753,24 @@ async def stop() -> None:
 def is_running() -> bool:
     """True if the webhook server is currently running."""
     return _runner is not None
+
+
+def update_workspace(workspace: str) -> None:
+    """
+    Update the workspace path used by the send-file endpoint's confinement check.
+
+    Called by _do_switch_workspace in bot.py whenever the user switches workspaces,
+    and by main.py after startup if a non-default workspace was restored from the
+    settings table. Without this, the confinement check keeps using the initial
+    home workspace path set at startup, causing send-file to return 403 for any
+    file in the current (switched) workspace.
+
+    The server must already be running when this is called - callers in main.py
+    should invoke this after webhook.start(), not before, since start() sets the
+    path from config and would overwrite an earlier call.
+
+    Args:
+        workspace: Absolute path string of the new current workspace.
+    """
+    if _app is not None:
+        _app["workspace"] = workspace

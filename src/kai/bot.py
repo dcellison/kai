@@ -648,6 +648,9 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     home = config.claude_workspace
 
     await claude.change_workspace(path)
+    # Keep the webhook server's confinement path in sync so send-file accepts
+    # files from the new workspace rather than rejecting them with 403.
+    webhook.update_workspace(str(path))
     await sessions.clear_session(chat_id)
 
     if path == home:
