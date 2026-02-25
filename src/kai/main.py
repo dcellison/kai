@@ -6,24 +6,30 @@ Provides functionality to:
 2. Load configuration and validate environment
 3. Initialize the database, Telegram bot, scheduled jobs, and webhook server
 4. Restore workspace from previous session
-5. Register the Telegram webhook (updates arrive via HTTP POST, not polling)
+5. Start the Telegram transport (webhook or polling, depending on config)
 6. Notify the user if a previous response was interrupted by a crash
 7. Run the event loop until shutdown (Ctrl+C or SIGTERM)
 8. Clean up all resources in the correct order on exit
 
+Telegram transport mode is determined by TELEGRAM_WEBHOOK_URL in .env:
+    - Set: webhook mode (Telegram POSTs updates to Kai's HTTP server)
+    - Unset: polling mode (Kai pulls updates from Telegram's servers)
+
 The startup sequence is:
     1. Load config from .env
     2. Initialize SQLite database
-    3. Create the Telegram bot application
+    3. Create the Telegram bot application (with or without Updater)
     4. Restore previous workspace (if saved in settings table)
     5. Initialize the Telegram bot and register slash commands
     6. Load scheduled jobs from database into APScheduler
-    7. Start the webhook HTTP server (registers Telegram webhook with the API)
-    8. Check for interrupted-response flag file
-    9. Block forever on asyncio.Event().wait()
+    7. Start the webhook HTTP server (always runs for scheduling API, GitHub webhooks, etc.)
+    8. In webhook mode: register Telegram webhook with the API
+       In polling mode: start the Updater's polling loop
+    9. Check for interrupted-response flag file
+    10. Block forever on asyncio.Event().wait()
 
 The shutdown sequence (in the finally block) reverses this order:
-    webhook (deregisters Telegram webhook) -> bot -> Claude process -> Telegram app -> database
+    webhook server -> polling updater (if active) -> bot -> Claude process -> Telegram app -> database
 """
 
 import asyncio
@@ -108,8 +114,11 @@ def main() -> None:
         restores previous state, and blocks until shutdown. The finally
         block ensures all resources are cleaned up in reverse order.
         """
+        # Derive transport mode from config: webhook if URL is set, polling otherwise
+        use_webhook = config.telegram_webhook_url is not None
+
         await sessions.init_db(config.session_db_path)
-        app = create_bot(config)
+        app = create_bot(config, use_webhook=use_webhook)
 
         # Restore workspace from previous session (persisted in settings table)
         saved_workspace = await sessions.get_setting("workspace")
@@ -170,7 +179,9 @@ def main() -> None:
             # Reload scheduled jobs from the database into APScheduler
             await cron.init_jobs(app)
 
-            # Start webhook and scheduling API server
+            # Start the HTTP server (always runs - serves scheduling API, GitHub
+            # webhooks, file exchange, and health check regardless of transport mode).
+            # In webhook mode, this also registers the Telegram webhook with the API.
             await webhook.start(app, config)
             # webhook.start() initializes the confinement path from config (home workspace).
             # If a non-default workspace was restored above, sync it now so send-file
@@ -178,6 +189,16 @@ def main() -> None:
             # start() would overwrite any earlier update_workspace() call.
             if app.bot_data["claude"].workspace != config.claude_workspace:
                 webhook.update_workspace(str(app.bot_data["claude"].workspace))
+
+            # In polling mode, start the Updater's long-polling loop. PTB's
+            # start_polling() automatically calls delete_webhook() first, which
+            # cleans up any stale webhook from a previous webhook-mode run.
+            if not use_webhook:
+                assert app.updater is not None
+                await app.updater.start_polling(
+                    allowed_updates=["message", "callback_query"],
+                )
+                logging.info("Polling started")
 
             # Check if a previous response was interrupted by a crash/restart.
             # bot.py writes this flag file when it starts processing a message
@@ -202,6 +223,10 @@ def main() -> None:
         finally:
             # Shutdown in reverse order of startup
             await webhook.stop()
+            # Stop the polling Updater if it was running (no-op in webhook mode
+            # since the Updater was suppressed at build time)
+            if not use_webhook and app.updater:
+                await app.updater.stop()
             await app.stop()
             await app.bot_data["claude"].shutdown()
             await app.shutdown()

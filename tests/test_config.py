@@ -31,10 +31,12 @@ def _clean_env(monkeypatch):
 
 
 def _set_required(monkeypatch, token="fake-token", user_ids="123"):
+    """Set only the truly required env vars (token + user IDs).
+
+    TELEGRAM_WEBHOOK_URL is no longer required - omitting it selects polling mode.
+    Tests that need webhook mode should set it explicitly.
+    """
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
-    monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook/telegram")
-    # WEBHOOK_SECRET doubles as the fallback for TELEGRAM_WEBHOOK_SECRET
-    monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
     monkeypatch.setenv("ALLOWED_USER_IDS", user_ids)
 
 
@@ -55,10 +57,9 @@ class TestLoadConfigDefaults:
         assert config.claude_timeout_seconds == 120
         assert config.claude_max_budget_usd == 10.0
         assert config.webhook_port == 8080
-        assert config.webhook_secret == "test-secret"
-        assert config.telegram_webhook_url == "https://example.com/webhook/telegram"
-        # Falls back to WEBHOOK_SECRET when TELEGRAM_WEBHOOK_SECRET is not set
-        assert config.telegram_webhook_secret == "test-secret"
+        # Without TELEGRAM_WEBHOOK_URL, defaults to polling mode
+        assert config.telegram_webhook_url is None
+        assert config.telegram_webhook_secret is None
         assert config.voice_enabled is False
         assert config.tts_enabled is False
         assert config.workspace_base is None
@@ -74,15 +75,11 @@ class TestLoadConfigErrors:
 
     def test_missing_user_ids(self, monkeypatch):
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
-        monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook/telegram")
-        monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
         with pytest.raises(SystemExit, match="ALLOWED_USER_IDS"):
             load_config()
 
     def test_non_numeric_user_ids(self, monkeypatch):
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
-        monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook/telegram")
-        monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
         monkeypatch.setenv("ALLOWED_USER_IDS", "notanumber")
         with pytest.raises(SystemExit, match="numeric"):
             load_config()
@@ -184,18 +181,25 @@ class TestLoadConfigOptional:
 
 
 class TestTelegramWebhookConfig:
-    def test_missing_webhook_url_raises(self, monkeypatch):
-        """TELEGRAM_WEBHOOK_URL is required; missing it causes SystemExit."""
-        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
-        monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
-        monkeypatch.setenv("ALLOWED_USER_IDS", "123")
-        # TELEGRAM_WEBHOOK_URL deliberately not set
-        with pytest.raises(SystemExit, match="TELEGRAM_WEBHOOK_URL"):
-            load_config()
+    def test_missing_webhook_url_selects_polling(self, monkeypatch):
+        """Without TELEGRAM_WEBHOOK_URL, config defaults to polling mode."""
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.telegram_webhook_url is None
+        assert config.telegram_webhook_secret is None
+
+    def test_webhook_url_set_selects_webhook_mode(self, monkeypatch):
+        """With TELEGRAM_WEBHOOK_URL set, config selects webhook mode."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook/telegram")
+        monkeypatch.setenv("WEBHOOK_SECRET", "shared-secret")
+        config = load_config()
+        assert config.telegram_webhook_url == "https://example.com/webhook/telegram"
 
     def test_secret_defaults_to_webhook_secret(self, monkeypatch):
         """TELEGRAM_WEBHOOK_SECRET falls back to WEBHOOK_SECRET when unset."""
         _set_required(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook/telegram")
         monkeypatch.setenv("WEBHOOK_SECRET", "shared-secret")
         # TELEGRAM_WEBHOOK_SECRET deliberately not set
         config = load_config()
@@ -204,16 +208,24 @@ class TestTelegramWebhookConfig:
     def test_explicit_secret_overrides_fallback(self, monkeypatch):
         """TELEGRAM_WEBHOOK_SECRET uses its own value when explicitly set."""
         _set_required(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook/telegram")
         monkeypatch.setenv("WEBHOOK_SECRET", "shared-secret")
         monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "tg-only-secret")
         config = load_config()
         assert config.telegram_webhook_secret == "tg-only-secret"
 
-    def test_both_secrets_unset_raises(self, monkeypatch):
-        """Empty effective secret is rejected to prevent open endpoint."""
-        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    def test_webhook_url_without_secret_raises(self, monkeypatch):
+        """Webhook mode with no secret is rejected to prevent open endpoint."""
+        _set_required(monkeypatch)
         monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook/telegram")
-        monkeypatch.setenv("ALLOWED_USER_IDS", "123")
         # Neither TELEGRAM_WEBHOOK_SECRET nor WEBHOOK_SECRET set
         with pytest.raises(SystemExit, match="TELEGRAM_WEBHOOK_SECRET"):
             load_config()
+
+    def test_polling_mode_ignores_missing_secret(self, monkeypatch):
+        """In polling mode, missing secrets are fine (no webhook to protect)."""
+        _set_required(monkeypatch)
+        # No TELEGRAM_WEBHOOK_URL, no secrets
+        config = load_config()
+        assert config.telegram_webhook_url is None
+        assert config.telegram_webhook_secret is None

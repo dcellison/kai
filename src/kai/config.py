@@ -34,10 +34,12 @@ class Config:
 
     Attributes:
         telegram_bot_token: Bot token from @BotFather (required)
-        telegram_webhook_url: Public URL where Telegram pushes updates (required)
+        telegram_webhook_url: Public URL where Telegram pushes updates via webhook.
+            When set, Kai runs in webhook mode (Telegram POSTs updates here).
+            When None, Kai falls back to long-polling (Kai pulls updates from Telegram).
         telegram_webhook_secret: Secret token for validating incoming Telegram updates.
             Sent by Telegram as X-Telegram-Bot-Api-Secret-Token header on each update.
-            Defaults to WEBHOOK_SECRET if not explicitly set; must be non-empty.
+            Only required in webhook mode. Defaults to WEBHOOK_SECRET if not explicitly set.
         allowed_user_ids: Set of Telegram user IDs permitted to interact with the bot (required)
         claude_model: Model name passed to the inner Claude Code process (haiku/sonnet/opus)
         claude_timeout_seconds: Seconds before a Claude response is considered timed out
@@ -58,9 +60,13 @@ class Config:
 
     # Required fields - no defaults, must be provided
     telegram_bot_token: str
-    telegram_webhook_url: str
-    telegram_webhook_secret: str
     allowed_user_ids: set[int]
+
+    # Telegram transport mode: set telegram_webhook_url to use webhook mode,
+    # leave as None to fall back to long-polling. The secret is only needed
+    # in webhook mode to authenticate incoming updates from Telegram.
+    telegram_webhook_url: str | None = None
+    telegram_webhook_secret: str | None = None
 
     # Claude Code process configuration
     claude_model: str = "sonnet"
@@ -110,23 +116,32 @@ def load_config() -> Config:
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN is required in .env")
 
-    # Validate required: Telegram webhook URL (where Telegram pushes updates)
-    telegram_webhook_url = os.environ.get("TELEGRAM_WEBHOOK_URL", "").strip()
-    if not telegram_webhook_url:
-        raise SystemExit("TELEGRAM_WEBHOOK_URL is required in .env")
+    # Telegram transport mode: if TELEGRAM_WEBHOOK_URL is set, use webhook mode
+    # (Telegram POSTs updates to this URL). If unset, fall back to long-polling
+    # (Kai pulls updates from Telegram). This lets users without a tunnel/proxy
+    # run Kai out of the box.
+    telegram_webhook_url: str | None = None
+    telegram_webhook_secret: str | None = None
+    raw_webhook_url = os.environ.get("TELEGRAM_WEBHOOK_URL", "").strip()
+    if raw_webhook_url:
+        telegram_webhook_url = raw_webhook_url
 
-    # Telegram webhook secret: used to validate incoming updates from Telegram.
-    # Falls back to WEBHOOK_SECRET so existing installs work without a config change.
-    # Must be non-empty after fallback resolution; an empty secret would let anyone
-    # POST fake updates to /webhook/telegram.
-    telegram_webhook_secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
-    if not telegram_webhook_secret:
-        telegram_webhook_secret = os.environ.get("WEBHOOK_SECRET", "").strip()
-    if not telegram_webhook_secret:
-        raise SystemExit(
-            "TELEGRAM_WEBHOOK_SECRET (or WEBHOOK_SECRET as fallback) is required in .env. "
-            "Without it, anyone could POST fake updates to the Telegram webhook endpoint."
-        )
+        # Webhook secret: validates incoming updates from Telegram. Falls back to
+        # WEBHOOK_SECRET so existing installs work without a config change. Must be
+        # non-empty in webhook mode; an empty secret would let anyone POST fake
+        # updates to /webhook/telegram.
+        telegram_webhook_secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
+        if not telegram_webhook_secret:
+            telegram_webhook_secret = os.environ.get("WEBHOOK_SECRET", "").strip()
+        if not telegram_webhook_secret:
+            raise SystemExit(
+                "TELEGRAM_WEBHOOK_SECRET (or WEBHOOK_SECRET as fallback) is required in .env "
+                "when TELEGRAM_WEBHOOK_URL is set. Without it, anyone could POST fake updates "
+                "to the Telegram webhook endpoint."
+            )
+        logging.info("Telegram transport: webhook (%s)", telegram_webhook_url)
+    else:
+        logging.info("Telegram transport: polling (TELEGRAM_WEBHOOK_URL not set)")
 
     # Validate required: allowed user IDs (comma-separated numeric Telegram user IDs)
     raw_ids = os.environ.get("ALLOWED_USER_IDS", "")

@@ -1553,7 +1553,7 @@ async def _handle_response(
 # ── Application factory ─────────────────────────────────────────────
 
 
-def create_bot(config: Config) -> Application:
+def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
     """
     Build and configure the Telegram Application with all handlers.
 
@@ -1569,12 +1569,21 @@ def create_bot(config: Config) -> Application:
 
     Args:
         config: The application Config instance.
+        use_webhook: If True, suppress the default Updater (updates arrive via
+            webhook POST). If False, keep the Updater for long-polling mode.
 
     Returns:
         A fully configured Telegram Application ready to be started.
     """
-    # Suppress default Updater creation - updates arrive via webhook, not polling
-    app = Application.builder().token(config.telegram_bot_token).updater(None).concurrent_updates(True).build()
+    builder = Application.builder().token(config.telegram_bot_token).concurrent_updates(True)
+
+    # PTB's ApplicationBuilder creates an Updater by default. In webhook mode,
+    # updates arrive via HTTP POST so the Updater is dead weight - suppress it.
+    # In polling mode, the Updater drives the update loop and must be kept.
+    if use_webhook:
+        builder = builder.updater(None)
+
+    app = builder.build()
     app.bot_data["config"] = config
     app.bot_data["claude"] = PersistentClaude(
         model=config.claude_model,

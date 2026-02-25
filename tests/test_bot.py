@@ -12,6 +12,7 @@ from kai.bot import (
     _short_workspace_name,
     _truncate_for_telegram,
     _workspaces_keyboard,
+    create_bot,
 )
 
 # ── _resolve_workspace_path ──────────────────────────────────────────
@@ -250,8 +251,6 @@ def _make_config(workspace_base=None, allowed_workspaces=None) -> Config:
     """Minimal Config for testing _is_workspace_allowed."""
     return Config(
         telegram_bot_token="test",
-        telegram_webhook_url="https://example.com/webhook/telegram",
-        telegram_webhook_secret="test-secret",
         allowed_user_ids={1},
         workspace_base=workspace_base,
         allowed_workspaces=allowed_workspaces or [],
@@ -306,3 +305,32 @@ class TestIsWorkspaceAllowed:
         config = _make_config(allowed_workspaces=[project])
         # Pass the resolved canonical path — should still match
         assert _is_workspace_allowed(project.resolve(), config) is True
+
+
+# ── create_bot transport mode ──────────────────────────────────────
+
+
+class TestCreateBotTransportMode:
+    @pytest.fixture(autouse=True)
+    def _init_services(self, tmp_path):
+        """Initialize services before create_bot() (normally done in main.py).
+
+        create_bot() calls services.get_available_services(), which requires
+        load_services() to have been called first. Use a nonexistent file so
+        it loads an empty service registry (graceful degradation).
+        """
+        from kai import services
+
+        services.load_services(tmp_path / "nonexistent.yaml")
+
+    def test_webhook_mode_suppresses_updater(self):
+        """In webhook mode, the Updater is suppressed (None)."""
+        config = _make_config()
+        app = create_bot(config, use_webhook=True)
+        assert app.updater is None
+
+    def test_polling_mode_keeps_updater(self):
+        """In polling mode, the Updater is present for start_polling()."""
+        config = _make_config()
+        app = create_bot(config, use_webhook=False)
+        assert app.updater is not None
