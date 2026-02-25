@@ -1,5 +1,6 @@
 """Integration tests for webhook HTTP API endpoints (jobs CRUD, file exchange)."""
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -439,6 +440,10 @@ class TestTelegramUpdate:
         resp = await _handle_telegram_update(telegram_request)
 
         assert resp.status == 200
+        # process_update runs as a background task (fire-and-forget to avoid
+        # Telegram's webhook timeout). Yield to the event loop so the task
+        # actually executes before we assert.
+        await asyncio.sleep(0)
         telegram_request.app["telegram_app"].process_update.assert_called_once_with(fake_update)
 
     async def test_wrong_secret_returns_401(self, telegram_request):

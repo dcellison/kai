@@ -35,6 +35,7 @@ to the configured Telegram chat. The formatter pattern (dispatch dict mapping
 event type to formatter function) makes it easy to add new event types.
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -55,6 +56,12 @@ _runner: web.AppRunner | None = None
 # Tracks whether we registered a Telegram webhook with the API, so stop()
 # knows whether to call delete_webhook(). Only True in webhook mode.
 _webhook_registered: bool = False
+
+# Background tasks for processing Telegram updates. Tasks are kept in this set
+# to prevent garbage collection (Python only weakly references fire-and-forget
+# tasks, so an unreferenced task can be silently collected mid-execution).
+# Each task removes itself from the set via a done callback.
+_background_tasks: set[asyncio.Task] = set()
 
 
 def _strip_markdown(text: str) -> str:
@@ -219,6 +226,14 @@ async def _handle_telegram_update(request: web.Request) -> web.Response:
     secret, deserializes the JSON body into a python-telegram-bot Update object,
     and dispatches it to the existing handler system via process_update().
 
+    IMPORTANT: process_update() is launched as a background task, not awaited.
+    Claude responses can take 30+ seconds, and Telegram's webhook client times
+    out after ~30-35s. If we awaited process_update(), Telegram would assume
+    delivery failed and retry the same message, causing duplicate responses.
+    By returning 200 immediately and processing in the background, we acknowledge
+    receipt before Telegram's timeout. The per-chat lock in bot.py serializes
+    concurrent messages, so ordering is preserved.
+
     Always returns 200 on valid-secret requests, even on errors. Telegram retries
     on non-200 responses, so surfacing internal errors as HTTP errors would cause
     an infinite retry loop. Errors are logged instead.
@@ -241,7 +256,12 @@ async def _handle_telegram_update(request: web.Request) -> web.Response:
     try:
         update = Update.de_json(data, bot)
         if update:
-            await telegram_app.process_update(update)
+            # Fire-and-forget: return 200 to Telegram immediately while
+            # processing continues in the background. Without this, Claude's
+            # response time would exceed Telegram's webhook timeout.
+            task = asyncio.create_task(telegram_app.process_update(update))
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
     except Exception:
         log.exception("Error processing Telegram update")
 

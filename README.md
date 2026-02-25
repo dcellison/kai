@@ -37,6 +37,10 @@ Voice notes are transcribed locally using [whisper.cpp](https://github.com/ggerg
 
 Text-to-speech via [Piper TTS](https://github.com/rhasspy/piper). Three modes: `/voice only` (voice note, no text), `/voice on` (text + voice), `/voice off` (text only, default). Eight curated English voices. Requires `pip install -e '.[tts]'` and `TTS_ENABLED=true`. See [Voice Setup](https://github.com/dcellison/kai/wiki/Voice-Setup).
 
+### Dual-mode Telegram transport
+
+Kai supports two ways of receiving Telegram updates: **long polling** (default) and **webhooks**. Polling works out of the box behind NAT with zero infrastructure. Set `TELEGRAM_WEBHOOK_URL` in `.env` to switch to webhook mode for lower latency - this requires a tunnel or reverse proxy (see [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet)).
+
 ### Webhooks
 
 An HTTP server receives GitHub webhook events (pushes, PRs, issues, comments, reviews) and forwards them to Telegram. Signatures are validated via HMAC-SHA256. A generic webhook endpoint (`POST /webhook`) accepts JSON from any service. See [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet).
@@ -113,6 +117,8 @@ cp .env.example .env
 | `WORKSPACE_BASE` | No | | Base directory for workspace name resolution |
 | `WEBHOOK_PORT` | No | `8080` | HTTP server port for webhooks and scheduling API |
 | `WEBHOOK_SECRET` | No | | Secret for webhook validation and scheduling API auth |
+| `TELEGRAM_WEBHOOK_URL` | No | | Telegram webhook URL (enables webhook mode; omit for polling) |
+| `TELEGRAM_WEBHOOK_SECRET` | No | | Separate secret for Telegram webhook auth (defaults to `WEBHOOK_SECRET`) |
 | `VOICE_ENABLED` | No | `false` | Enable voice message transcription |
 | `TTS_ENABLED` | No | `false` | Enable text-to-speech voice responses |
 
