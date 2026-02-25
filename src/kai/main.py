@@ -14,7 +14,7 @@ Provides functionality to:
 The startup sequence is:
     1. Load config from .env
     2. Initialize SQLite database
-    3. Create the Telegram bot application (with updater=None, no polling)
+    3. Create the Telegram bot application
     4. Restore previous workspace (if saved in settings table)
     5. Initialize the Telegram bot and register slash commands
     6. Load scheduled jobs from database into APScheduler
