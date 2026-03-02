@@ -121,6 +121,10 @@ def verify_code(code: str, lockout_attempts: int = 3, lockout_minutes: int = 15)
     Returns True only if the code is valid and the account is not locked out.
     Returns False if: locked out, secret unavailable, or code invalid.
     """
+    # Reject obviously malformed codes immediately, before any subprocess calls.
+    if not code.isdigit() or len(code) != 6:
+        return False
+
     # Check lockout before doing anything else - don't even read the secret
     # if we're in a lockout period, to avoid unnecessary sudo calls.
     state = _read_attempts()

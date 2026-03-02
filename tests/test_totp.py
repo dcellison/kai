@@ -59,6 +59,16 @@ def _tee_proc() -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
+def test_verify_code_rejects_malformed_input():
+    """verify_code returns False immediately for non-6-digit input, with no subprocess calls."""
+    with patch("kai.totp.subprocess.run") as mock_run:
+        assert verify_code("12345") is False    # too short
+        assert verify_code("1234567") is False  # too long
+        assert verify_code("12345a") is False   # non-digit
+        assert verify_code("") is False         # empty
+        mock_run.assert_not_called()
+
+
 def test_verify_code_valid():
     """verify_code returns True when a correct TOTP code is supplied."""
     valid_code = pyotp.TOTP(_TEST_SECRET).now()
