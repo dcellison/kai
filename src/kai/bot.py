@@ -61,12 +61,23 @@ from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 
 # TOTP is optional (requires pip install -e '.[totp]'). When the extra is not
 # installed, is_totp_configured() returns False and the gate is fully disabled.
+# All four stubs are defined in the except block so Pyright doesn't flag them
+# as possibly-unbound at their call sites inside the gate.
 try:
-    from kai.totp import _read_attempts, get_lockout_remaining, is_totp_configured, verify_code
+    from kai.totp import get_failure_count, get_lockout_remaining, is_totp_configured, verify_code
 except ImportError:
 
     def is_totp_configured() -> bool:  # type: ignore[misc]
         return False
+
+    def get_lockout_remaining() -> int:  # type: ignore[misc]
+        return 0
+
+    def verify_code(code: str, lockout_attempts: int = 3, lockout_minutes: int = 15) -> bool:  # type: ignore[misc]
+        return False
+
+    def get_failure_count() -> int:  # type: ignore[misc]
+        return 0
 
 
 log = logging.getLogger(__name__)
@@ -1385,6 +1396,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # allowing any Claude invocation. Auth state lives in context.user_data
     # (in-memory, bot-process-owned) so Claude cannot read or manipulate it.
     if is_totp_configured():
+        # Assert non-None to narrow types for Pyright. user_data is always
+        # populated by PTB when a user_id is present (which it is here - the
+        # @_require_auth decorator already confirmed that). effective_chat is
+        # always set for user messages.
+        assert context.user_data is not None
+        assert update.effective_chat is not None
+
         auth_time = context.user_data.get("totp_authenticated_at", 0)
         session_minutes = int(os.environ.get("TOTP_SESSION_MINUTES", "30"))
         totp_expired = time.time() - auth_time > session_minutes * 60
@@ -1395,9 +1413,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if not pending:
                 # First message after auth expired - send the challenge and
                 # store a pending state so the next message is treated as a code.
+                challenge_seconds = int(os.environ.get("TOTP_CHALLENGE_SECONDS", "120"))
                 context.user_data["totp_pending"] = {
-                    "attempts": 0,
-                    "expires_at": time.time() + 120,
+                    "expires_at": time.time() + challenge_seconds,
                 }
                 await update.message.reply_text("Session expired. Enter code from authenticator.")
                 return
@@ -1445,8 +1463,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     f"Too many failed attempts. Locked out for {lockout_minutes} minutes."
                 )
             else:
-                failures = _read_attempts().get("failures", 0)
-                remaining = lockout_attempts - failures
+                remaining = lockout_attempts - get_failure_count()
                 await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
             return
     # ── End TOTP gate ─────────────────────────────────────────────────────

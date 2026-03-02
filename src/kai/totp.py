@@ -116,6 +116,16 @@ def get_lockout_remaining() -> int:
     return max(0, int(remaining))
 
 
+def get_failure_count() -> int:
+    """
+    Return the number of consecutive failed verification attempts since the last success.
+
+    Public wrapper around the private _read_attempts() so bot.py doesn't need to
+    import or call a private function across module boundaries.
+    """
+    return _read_attempts().get("failures", 0)
+
+
 def verify_code(code: str, lockout_attempts: int = 3, lockout_minutes: int = 15) -> bool:
     """
     Verify a 6-digit TOTP code against the stored secret.

@@ -117,7 +117,7 @@ async def test_gate_skipped_when_totp_not_configured():
 
 async def test_code_message_deleted_after_verification():
     """The code message is deleted from chat regardless of whether verification succeeds or fails."""
-    pending = {"attempts": 0, "expires_at": time.time() + 120}
+    pending = {"expires_at": time.time() + 120}
     update = _make_update("123456")
     ctx = _make_context({"totp_pending": pending})
 
@@ -126,7 +126,7 @@ async def test_code_message_deleted_after_verification():
         patch("kai.bot.is_totp_configured", return_value=True),
         patch("kai.bot.get_lockout_remaining", return_value=0),
         patch("kai.bot.verify_code", return_value=False),
-        patch("kai.bot._read_attempts", return_value={"failures": 1}),
+        patch("kai.bot.get_failure_count", return_value=1),
     ):
         await handle_message(update, ctx)
 
@@ -136,7 +136,7 @@ async def test_code_message_deleted_after_verification():
 async def test_challenge_expires_after_two_minutes():
     """A pending challenge that is past its expires_at is rejected with an expiry message."""
     # expires_at in the past
-    pending = {"attempts": 0, "expires_at": time.time() - 1}
+    pending = {"expires_at": time.time() - 1}
     update = _make_update("123456")
     ctx = _make_context({"totp_pending": pending})
 
@@ -155,7 +155,7 @@ async def test_challenge_expires_after_two_minutes():
 
 async def test_successful_auth_sets_timestamp():
     """Successful code verification records totp_authenticated_at in context.user_data."""
-    pending = {"attempts": 0, "expires_at": time.time() + 120}
+    pending = {"expires_at": time.time() + 120}
     update = _make_update("123456")
     ctx = _make_context({"totp_pending": pending})
 
@@ -177,7 +177,7 @@ async def test_successful_auth_sets_timestamp():
 
 async def test_lockout_message_shown_when_rate_limited():
     """When the global lockout is active, the user sees a lockout message (not a 'remaining' message)."""
-    pending = {"attempts": 0, "expires_at": time.time() + 120}
+    pending = {"expires_at": time.time() + 120}
     update = _make_update("123456")
     ctx = _make_context({"totp_pending": pending})
 
@@ -196,7 +196,7 @@ async def test_lockout_message_shown_when_rate_limited():
 
 async def test_invalid_code_shows_remaining_attempts():
     """An invalid code that doesn't trigger lockout shows the remaining attempt count."""
-    pending = {"attempts": 0, "expires_at": time.time() + 120}
+    pending = {"expires_at": time.time() + 120}
     update = _make_update("000000")
     ctx = _make_context({"totp_pending": pending})
 
@@ -207,7 +207,7 @@ async def test_invalid_code_shows_remaining_attempts():
         patch("kai.bot.get_lockout_remaining", return_value=0),
         patch("kai.bot.verify_code", return_value=False),
         # After a failed attempt with default lockout_attempts=3, failures=1 -> 2 remaining.
-        patch("kai.bot._read_attempts", return_value={"failures": 1}),
+        patch("kai.bot.get_failure_count", return_value=1),
     ):
         await handle_message(update, ctx)
 
