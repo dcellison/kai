@@ -33,6 +33,7 @@ def _reset_totp_cache():
     yield
     kai.totp._totp_is_configured = False
 
+
 # A stable base32 secret used across tests.
 _TEST_SECRET = "JBSWY3DPEHPK3PXP"
 
@@ -77,10 +78,10 @@ def _tee_proc() -> MagicMock:
 def test_verify_code_rejects_malformed_input():
     """verify_code returns False immediately for non-6-digit input, with no subprocess calls."""
     with patch("kai.totp.subprocess.run") as mock_run:
-        assert verify_code("12345") is False    # too short
+        assert verify_code("12345") is False  # too short
         assert verify_code("1234567") is False  # too long
-        assert verify_code("12345a") is False   # non-digit
-        assert verify_code("") is False         # empty
+        assert verify_code("12345a") is False  # non-digit
+        assert verify_code("") is False  # empty
         mock_run.assert_not_called()
 
 
@@ -92,8 +93,8 @@ def test_verify_code_valid():
     with patch("kai.totp.subprocess.run") as mock_run:
         mock_run.side_effect = [
             _attempts_proc(),  # _read_attempts
-            _secret_proc(),    # _read_secret
-            _tee_proc(),       # _write_attempts (reset counter on success)
+            _secret_proc(),  # _read_secret
+            _tee_proc(),  # _write_attempts (reset counter on success)
         ]
         result = verify_code(valid_code)
 
@@ -105,8 +106,8 @@ def test_verify_code_invalid():
     with patch("kai.totp.subprocess.run") as mock_run:
         mock_run.side_effect = [
             _attempts_proc(),  # _read_attempts
-            _secret_proc(),    # _read_secret
-            _tee_proc(),       # _write_attempts (increment failures)
+            _secret_proc(),  # _read_secret
+            _tee_proc(),  # _write_attempts (increment failures)
         ]
         result = verify_code("000000")
 
@@ -123,8 +124,8 @@ def test_failure_counter_increments():
     with patch("kai.totp.subprocess.run") as mock_run:
         mock_run.side_effect = [
             _attempts_proc(failures=0),  # _read_attempts
-            _secret_proc(),              # _read_secret
-            _tee_proc(),                 # _write_attempts
+            _secret_proc(),  # _read_secret
+            _tee_proc(),  # _write_attempts
         ]
         verify_code("000000")
 
@@ -142,8 +143,8 @@ def test_lockout_triggers_after_n_failures():
     with patch("kai.totp.subprocess.run") as mock_run:
         mock_run.side_effect = [
             _attempts_proc(failures=2),  # _read_attempts - already at 2
-            _secret_proc(),              # _read_secret
-            _tee_proc(),                 # _write_attempts - should trigger lockout
+            _secret_proc(),  # _read_secret
+            _tee_proc(),  # _write_attempts - should trigger lockout
         ]
         verify_code("000000")
 
@@ -180,8 +181,8 @@ def test_successful_code_resets_failure_counter():
     with patch("kai.totp.subprocess.run") as mock_run:
         mock_run.side_effect = [
             _attempts_proc(failures=2),  # _read_attempts - had 2 prior failures
-            _secret_proc(),              # _read_secret
-            _tee_proc(),                 # _write_attempts
+            _secret_proc(),  # _read_secret
+            _tee_proc(),  # _write_attempts
         ]
         result = verify_code(valid_code)
 

@@ -146,9 +146,7 @@ async def test_challenge_expires_after_two_minutes():
     ):
         await handle_message(update, ctx)
 
-    update.message.reply_text.assert_called_once_with(
-        "TOTP challenge expired. Send another message to try again."
-    )
+    update.message.reply_text.assert_called_once_with("TOTP challenge expired. Send another message to try again.")
     # Pending state must be cleared so the next message re-issues the challenge.
     assert "totp_pending" not in ctx.user_data
 
