@@ -19,7 +19,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -e '.[dev]'
+        run: pip install -e '.[dev,totp]'
 
       - name: Lint and format check
         run: make BIN= check
