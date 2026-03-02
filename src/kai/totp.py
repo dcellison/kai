@@ -166,7 +166,6 @@ def verify_code(code: str, lockout_attempts: int = 3, lockout_minutes: int = 15)
     if state.get("lockout_until", 0) > time.time():
         return False
 
-    # Read the secret and verify the code.
     secret = _read_secret()
     if not secret:
         return False
@@ -191,9 +190,7 @@ def verify_code(code: str, lockout_attempts: int = 3, lockout_minutes: int = 15)
     return False
 
 
-# ---------------------------------------------------------------------------
-# CLI entry point (python -m kai totp <subcommand>)
-# ---------------------------------------------------------------------------
+# ── CLI entry point (python -m kai totp <subcommand>) ────────────────
 
 # Platform-specific binary paths for the sudoers rule.
 # macOS ships cat at /bin/cat; most Linux distros put it at /usr/bin/cat.

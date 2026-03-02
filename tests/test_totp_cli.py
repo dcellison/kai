@@ -37,9 +37,7 @@ def _reset_totp_cache():
     kai.totp._totp_is_configured = False
 
 
-# ---------------------------------------------------------------------------
-# _cmd_status
-# ---------------------------------------------------------------------------
+# ── _cmd_status ──────────────────────────────────────────────────────
 
 
 def test_cmd_status_prints_configured(capsys):
@@ -61,9 +59,7 @@ def test_cmd_status_prints_not_configured(capsys):
     assert "not configured" in out.lower()
 
 
-# ---------------------------------------------------------------------------
-# _cmd_reset
-# ---------------------------------------------------------------------------
+# ── _cmd_reset ───────────────────────────────────────────────────────
 
 
 def test_cmd_reset_exits_if_not_root():
@@ -124,9 +120,7 @@ def test_cmd_reset_handles_partially_missing_files(capsys):
     assert TOTP_SECRET_PATH in out
 
 
-# ---------------------------------------------------------------------------
-# _cmd_setup root guard
-# ---------------------------------------------------------------------------
+# ── _cmd_setup root guard ────────────────────────────────────────────
 
 
 def test_cmd_setup_exits_if_not_root():
@@ -140,9 +134,7 @@ def test_cmd_setup_exits_if_not_root():
     assert exc.value.code == 1
 
 
-# ---------------------------------------------------------------------------
-# cli() dispatch
-# ---------------------------------------------------------------------------
+# ── cli() dispatch ───────────────────────────────────────────────────
 
 
 def test_cli_exits_on_unknown_subcommand():

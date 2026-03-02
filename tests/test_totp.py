@@ -24,7 +24,8 @@ from kai.totp import (
 
 @pytest.fixture(autouse=True)
 def _reset_totp_cache():
-    """Reset the is_totp_configured module-level cache before and after each test.
+    """
+    Reset the is_totp_configured module-level cache before and after each test.
 
     Without this, a test that calls is_totp_configured() and gets True would
     pollute the cache for subsequent tests in the same process run.
@@ -70,9 +71,7 @@ def _tee_proc() -> MagicMock:
     return m
 
 
-# ---------------------------------------------------------------------------
-# verify_code: valid and invalid codes
-# ---------------------------------------------------------------------------
+# ── verify_code: valid and invalid codes ─────────────────────────────
 
 
 def test_verify_code_rejects_malformed_input():
@@ -114,9 +113,7 @@ def test_verify_code_invalid():
     assert result is False
 
 
-# ---------------------------------------------------------------------------
-# Rate limiting: failure counter
-# ---------------------------------------------------------------------------
+# ── Rate limiting: failure counter ───────────────────────────────────
 
 
 def test_failure_counter_increments():
@@ -194,9 +191,7 @@ def test_successful_code_resets_failure_counter():
     assert written["lockout_until"] == 0
 
 
-# ---------------------------------------------------------------------------
-# is_totp_configured
-# ---------------------------------------------------------------------------
+# ── is_totp_configured ───────────────────────────────────────────────
 
 
 def test_is_totp_configured_true_when_readable():
@@ -211,9 +206,7 @@ def test_is_totp_configured_false_when_file_missing():
         assert is_totp_configured() is False
 
 
-# ---------------------------------------------------------------------------
-# get_lockout_remaining
-# ---------------------------------------------------------------------------
+# ── get_lockout_remaining ────────────────────────────────────────────
 
 
 def test_get_lockout_remaining_zero_when_not_locked():
@@ -232,9 +225,7 @@ def test_get_lockout_remaining_positive_when_locked():
     assert 295 <= remaining <= 300
 
 
-# ---------------------------------------------------------------------------
-# get_failure_count
-# ---------------------------------------------------------------------------
+# ── get_failure_count ────────────────────────────────────────────────
 
 
 def test_get_failure_count_returns_failures_from_disk():

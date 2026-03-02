@@ -59,6 +59,21 @@ Three layers of persistent context:
 
 Foreign workspaces also get their own `.claude/MEMORY.md` injected alongside home memory. See [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture).
 
+### TOTP authentication
+
+Optional two-factor authentication using time-based one-time passwords. When enabled, the bot requires a 6-digit authenticator code before processing messages after a configurable session timeout. The TOTP secret is stored in a root-owned file (`/etc/kai/totp.secret`, mode 0600) that is inaccessible to the bot user and any subprocesses it spawns. The bot reads the secret via narrowly-scoped sudoers rules at verification time only.
+
+Setup requires the optional dependency group and root access:
+
+```bash
+pip install -e '.[totp]'             # adds pyotp and qrcode
+sudo python -m kai totp setup        # generate secret, display QR code, confirm
+python -m kai totp status            # check configuration state
+sudo python -m kai totp reset        # remove secret and attempts files
+```
+
+Rate limiting locks the account after consecutive failed attempts (configurable, default 3). Lockout state is persisted to disk so it survives restarts. Code messages are deleted from Telegram immediately after verification. All settings are configurable via environment variables (see below).
+
 ### Crash recovery
 
 If interrupted mid-response, Kai notifies you on restart and asks you to resend your last message.
@@ -121,6 +136,10 @@ cp .env.example .env
 | `TELEGRAM_WEBHOOK_SECRET` | No | | Separate secret for Telegram webhook auth (defaults to `WEBHOOK_SECRET`) |
 | `VOICE_ENABLED` | No | `false` | Enable voice message transcription |
 | `TTS_ENABLED` | No | `false` | Enable text-to-speech voice responses |
+| `TOTP_SESSION_MINUTES` | No | `30` | Minutes before TOTP re-authentication is required |
+| `TOTP_CHALLENGE_SECONDS` | No | `120` | Seconds the code entry window stays open |
+| `TOTP_LOCKOUT_ATTEMPTS` | No | `3` | Failed TOTP attempts before temporary lockout |
+| `TOTP_LOCKOUT_MINUTES` | No | `15` | TOTP lockout duration in minutes |
 
 `CLAUDE_MAX_BUDGET_USD` limits how much work Claude can do in a single session via Claude Code's `--max-budget-usd` flag. On Pro/Max plans this is purely a runaway prevention mechanism (no per-token charges). The session resets on `/new`, model switch, or workspace switch.
 
@@ -243,6 +262,7 @@ kai/
 │   ├── webhook.py        # HTTP server: GitHub/generic webhooks, scheduling API
 │   ├── history.py        # Conversation history (read/write JSONL logs)
 │   ├── locks.py          # Per-chat async locks and stop events
+│   ├── totp.py           # TOTP verification, rate limiting, and CLI
 │   ├── transcribe.py     # Voice message transcription (ffmpeg + whisper-cpp)
 │   └── tts.py            # Text-to-speech synthesis (Piper TTS + ffmpeg)
 ├── tests/                # Test suite
