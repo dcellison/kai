@@ -28,6 +28,14 @@ import pyotp
 TOTP_SECRET_PATH = "/etc/kai/totp.secret"
 TOTP_ATTEMPTS_PATH = "/etc/kai/totp.attempts"
 
+# Module-level cache for is_totp_configured().
+# Once TOTP is confirmed configured, it stays configured for the lifetime of the
+# process - the secret file can only be removed by `totp reset`, which requires
+# root and would be followed by a bot restart anyway. We only cache True so that
+# the False -> True transition (setting TOTP up while the bot is running) is
+# picked up on the next message without a restart. False results are never cached.
+_totp_is_configured: bool = False
+
 
 def _read_secret() -> str | None:
     """
@@ -100,8 +108,18 @@ def is_totp_configured() -> bool:
 
     Used by the bot to decide whether to prompt for a code at session start.
     If this returns False, TOTP is disabled and the bot runs without it.
+
+    The True result is cached for the lifetime of the process to avoid spawning
+    a subprocess on every incoming message. False is never cached so that
+    enabling TOTP while the bot is running takes effect on the next message.
     """
-    return _read_secret() is not None
+    global _totp_is_configured
+    if _totp_is_configured:
+        return True
+    result = _read_secret() is not None
+    if result:
+        _totp_is_configured = True
+    return result
 
 
 def get_lockout_remaining() -> int:
@@ -226,22 +244,29 @@ def _cmd_setup() -> None:
 
     # Also print the raw secret for manual entry.
     print(f"\nManual entry secret: {secret}")
-    print("Account: Kai / Issuer: Kai\n")
+    print("Account: Kai / Issuer: Kai")
+
+    # Print the sudoers rule BEFORE asking for the confirmation code.
+    # The bot process (running as the 'kai' user) needs these rules to verify
+    # codes at runtime. Showing them first ensures the user adds them before
+    # treating setup as complete - without sudoers, the bot can't read the
+    # secret file and will silently behave as if TOTP is not configured.
+    print("\nAdd the following lines to /etc/sudoers.d/kai (via visudo -f /etc/sudoers.d/kai):")
+    print("(Complete this step before restarting the bot.)\n")
+    print(f"  kai ALL=(root) NOPASSWD: {_CAT} {TOTP_SECRET_PATH}")
+    print(f"  kai ALL=(root) NOPASSWD: {_CAT} {TOTP_ATTEMPTS_PATH}")
+    print(f"  kai ALL=(root) NOPASSWD: {_TEE} {TOTP_ATTEMPTS_PATH}")
 
     # Confirm setup with a live code from the authenticator.
-    code = input("Enter a 6-digit code to confirm setup: ").strip()
+    # This runs as root (sudo python -m kai totp setup) so it doesn't depend
+    # on the sudoers rules above - root can always sudo.
+    code = input("\nEnter a 6-digit code to confirm setup: ").strip()
     if verify_code(code):
         print("TOTP setup complete.")
     else:
         print("Code incorrect. Setup files written but verification failed.")
         print("Run 'sudo python -m kai totp reset' and try again.")
         sys.exit(1)
-
-    # Print the sudoers rule so the user can configure it immediately.
-    print("\nAdd the following lines to /etc/sudoers.d/kai (via visudo -f /etc/sudoers.d/kai):\n")
-    print(f"kai ALL=(root) NOPASSWD: {_CAT} {TOTP_SECRET_PATH}")
-    print(f"kai ALL=(root) NOPASSWD: {_CAT} {TOTP_ATTEMPTS_PATH}")
-    print(f"kai ALL=(root) NOPASSWD: {_TEE} {TOTP_ATTEMPTS_PATH}")
 
 
 def _cmd_status() -> None:

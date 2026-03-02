@@ -11,12 +11,27 @@ import time
 from unittest.mock import MagicMock, patch
 
 import pyotp
+import pytest
 
+import kai.totp
 from kai.totp import (
+    get_failure_count,
     get_lockout_remaining,
     is_totp_configured,
     verify_code,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_totp_cache():
+    """Reset the is_totp_configured module-level cache before and after each test.
+
+    Without this, a test that calls is_totp_configured() and gets True would
+    pollute the cache for subsequent tests in the same process run.
+    """
+    kai.totp._totp_is_configured = False
+    yield
+    kai.totp._totp_is_configured = False
 
 # A stable base32 secret used across tests.
 _TEST_SECRET = "JBSWY3DPEHPK3PXP"
@@ -214,3 +229,24 @@ def test_get_lockout_remaining_positive_when_locked():
 
     # Should be close to 300, allow a few seconds of test execution slack.
     assert 295 <= remaining <= 300
+
+
+# ---------------------------------------------------------------------------
+# get_failure_count
+# ---------------------------------------------------------------------------
+
+
+def test_get_failure_count_returns_failures_from_disk():
+    """get_failure_count returns the current consecutive failure count from the attempts file."""
+    with patch("kai.totp.subprocess.run", return_value=_attempts_proc(failures=2)):
+        count = get_failure_count()
+
+    assert count == 2
+
+
+def test_get_failure_count_returns_zero_on_clean_state():
+    """get_failure_count returns 0 when there are no recorded failures."""
+    with patch("kai.totp.subprocess.run", return_value=_attempts_proc(failures=0)):
+        count = get_failure_count()
+
+    assert count == 0
