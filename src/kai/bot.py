@@ -34,6 +34,7 @@ import base64
 import functools
 import json
 import logging
+import os
 import shutil
 import time
 from datetime import datetime
@@ -57,6 +58,16 @@ from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
+
+# TOTP is optional (requires pip install -e '.[totp]'). When the extra is not
+# installed, is_totp_configured() returns False and the gate is fully disabled.
+try:
+    from kai.totp import _read_attempts, get_lockout_remaining, is_totp_configured, verify_code
+except ImportError:
+
+    def is_totp_configured() -> bool:  # type: ignore[misc]
+        return False
+
 
 log = logging.getLogger(__name__)
 
@@ -1368,6 +1379,77 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """
     if not update.message or not update.message.text:
         return
+
+    # ── TOTP gate ────────────────────────────────────────────────────────
+    # When TOTP is configured, require a valid authenticator code before
+    # allowing any Claude invocation. Auth state lives in context.user_data
+    # (in-memory, bot-process-owned) so Claude cannot read or manipulate it.
+    if is_totp_configured():
+        auth_time = context.user_data.get("totp_authenticated_at", 0)
+        session_minutes = int(os.environ.get("TOTP_SESSION_MINUTES", "30"))
+        totp_expired = time.time() - auth_time > session_minutes * 60
+
+        if totp_expired:
+            pending = context.user_data.get("totp_pending")
+
+            if not pending:
+                # First message after auth expired - send the challenge and
+                # store a pending state so the next message is treated as a code.
+                context.user_data["totp_pending"] = {
+                    "attempts": 0,
+                    "expires_at": time.time() + 120,
+                }
+                await update.message.reply_text("Session expired. Enter code from authenticator.")
+                return
+
+            # A challenge is already in flight - this message should be the code.
+            if time.time() > pending["expires_at"]:
+                del context.user_data["totp_pending"]
+                await update.message.reply_text("TOTP challenge expired. Send another message to try again.")
+                return
+
+            code = update.message.text.strip() if update.message.text else ""
+
+            # Delete the code message immediately so it doesn't linger in chat.
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+
+            # Check global lockout before calling verify_code().
+            lockout_remaining = get_lockout_remaining()
+            if lockout_remaining > 0:
+                minutes = lockout_remaining // 60
+                await update.effective_chat.send_message(
+                    f"Too many failed attempts. Locked out for {minutes} more minutes."
+                )
+                return
+
+            lockout_attempts = int(os.environ.get("TOTP_LOCKOUT_ATTEMPTS", "3"))
+            lockout_minutes = int(os.environ.get("TOTP_LOCKOUT_MINUTES", "15"))
+
+            if verify_code(code, lockout_attempts, lockout_minutes):
+                del context.user_data["totp_pending"]
+                context.user_data["totp_authenticated_at"] = time.time()
+                await update.effective_chat.send_message("Authenticated.")
+                # Return here - the code message has been deleted and its text
+                # is meaningless as a Claude prompt. The user sends their actual
+                # query in the next message, which will pass the gate cleanly.
+                return
+
+            # Verification failed. Show lockout message if triggered, or remaining attempts.
+            lockout_remaining = get_lockout_remaining()
+            if lockout_remaining > 0:
+                del context.user_data["totp_pending"]
+                await update.effective_chat.send_message(
+                    f"Too many failed attempts. Locked out for {lockout_minutes} minutes."
+                )
+            else:
+                failures = _read_attempts().get("failures", 0)
+                remaining = lockout_attempts - failures
+                await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
+            return
+    # ── End TOTP gate ─────────────────────────────────────────────────────
 
     chat_id = _chat_id(update)
     prompt = update.message.text
