@@ -7,10 +7,17 @@ This means the kai user (and any subprocess it spawns, including inner Claude)
 cannot directly read or tamper with either file.
 
 Rate limiting state is persisted to disk so lockouts survive bot restarts.
+
+CLI usage (run as root or with sudo):
+    python -m kai totp setup    # generate secret, show QR, confirm
+    python -m kai totp status   # check whether TOTP is configured
+    python -m kai totp reset    # remove secret and attempts files
 """
 
 import json
+import os
 import subprocess
+import sys
 import time
 
 import pyotp
@@ -154,3 +161,128 @@ def verify_code(code: str, lockout_attempts: int = 3, lockout_minutes: int = 15)
     else:
         _write_attempts({"failures": failures, "lockout_until": 0})
     return False
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point (python -m kai totp <subcommand>)
+# ---------------------------------------------------------------------------
+
+# Platform-specific binary paths for the sudoers rule.
+# macOS ships cat at /bin/cat; most Linux distros put it at /usr/bin/cat.
+_CAT = "/bin/cat" if sys.platform == "darwin" else "/usr/bin/cat"
+_TEE = "/usr/bin/tee"
+
+
+def _cmd_setup() -> None:
+    """
+    Generate a TOTP secret, write it to /etc/kai/totp.secret (root-owned, 0600),
+    display a QR code and the raw secret, then confirm with a test code.
+
+    Must be run as root (or via sudo python -m kai totp setup) since it creates
+    files owned by root. Exits with a non-zero status on any failure.
+    """
+    if os.geteuid() != 0:
+        print("Error: 'totp setup' must be run as root (try: sudo python -m kai totp setup)")
+        sys.exit(1)
+
+    # Create /etc/kai/ if it doesn't exist, owned by root.
+    etc_kai = "/etc/kai"
+    os.makedirs(etc_kai, mode=0o755, exist_ok=True)
+
+    # Generate a cryptographically random base32 secret.
+    secret = pyotp.random_base32()
+
+    # Write secret file: root:root 0600.
+    with open(TOTP_SECRET_PATH, "w") as f:
+        f.write(secret)
+    os.chmod(TOTP_SECRET_PATH, 0o600)
+    os.chown(TOTP_SECRET_PATH, 0, 0)
+
+    # Create a clean attempts file: root:root 0600.
+    with open(TOTP_ATTEMPTS_PATH, "w") as f:
+        f.write(json.dumps({"failures": 0, "lockout_until": 0}))
+    os.chmod(TOTP_ATTEMPTS_PATH, 0o600)
+    os.chown(TOTP_ATTEMPTS_PATH, 0, 0)
+
+    # Generate and print the QR code to the terminal.
+    import qrcode  # type: ignore[import-untyped]
+
+    uri = pyotp.TOTP(secret).provisioning_uri(name="Kai", issuer_name="Kai")
+    qr = qrcode.QRCode()
+    qr.add_data(uri)
+    qr.make(fit=True)
+    print("\nScan this QR code with your authenticator app:\n")
+    qr.print_ascii(invert=True)
+
+    # Also print the raw secret for manual entry.
+    print(f"\nManual entry secret: {secret}")
+    print("Account: Kai / Issuer: Kai\n")
+
+    # Confirm setup with a live code from the authenticator.
+    code = input("Enter a 6-digit code to confirm setup: ").strip()
+    if verify_code(code):
+        print("TOTP setup complete.")
+    else:
+        print("Code incorrect. Setup files written but verification failed.")
+        print("Run 'sudo python -m kai totp reset' and try again.")
+        sys.exit(1)
+
+    # Print the sudoers rule so the user can configure it immediately.
+    print("\nAdd the following lines to /etc/sudoers.d/kai (via visudo -f /etc/sudoers.d/kai):\n")
+    print(f"kai ALL=(root) NOPASSWD: {_CAT} {TOTP_SECRET_PATH}")
+    print(f"kai ALL=(root) NOPASSWD: {_CAT} {TOTP_ATTEMPTS_PATH}")
+    print(f"kai ALL=(root) NOPASSWD: {_TEE} {TOTP_ATTEMPTS_PATH}")
+
+
+def _cmd_status() -> None:
+    """
+    Report whether the TOTP secret file is present and readable via sudo.
+
+    Does not require root - reads via the sudoers-authorized sudo call.
+    """
+    if is_totp_configured():
+        print("TOTP is configured.")
+    else:
+        print("TOTP is not configured.")
+
+
+def _cmd_reset() -> None:
+    """
+    Delete /etc/kai/totp.secret and /etc/kai/totp.attempts.
+
+    Must be run as root. After reset, the bot will start without TOTP authentication.
+    """
+    if os.geteuid() != 0:
+        print("Error: 'totp reset' must be run as root (try: sudo python -m kai totp reset)")
+        sys.exit(1)
+
+    removed = []
+    for path in (TOTP_SECRET_PATH, TOTP_ATTEMPTS_PATH):
+        try:
+            os.remove(path)
+            removed.append(path)
+        except FileNotFoundError:
+            pass  # already gone, that's fine
+
+    if removed:
+        print(f"Removed: {', '.join(removed)}")
+    else:
+        print("Nothing to remove (TOTP was not configured).")
+
+
+def cli(args: list[str]) -> None:
+    """
+    Dispatch TOTP CLI subcommands.
+
+    Usage:
+        python -m kai totp setup    -- generate secret, show QR, confirm
+        python -m kai totp status   -- check whether TOTP is configured
+        python -m kai totp reset    -- remove secret and attempts files
+    """
+    subcommands = {"setup": _cmd_setup, "status": _cmd_status, "reset": _cmd_reset}
+
+    if not args or args[0] not in subcommands:
+        print("Usage: python -m kai totp {setup|status|reset}")
+        sys.exit(1)
+
+    subcommands[args[0]]()
