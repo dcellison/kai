@@ -29,6 +29,8 @@ Context injection on first message of each session:
 import asyncio
 import json
 import logging
+import os
+import signal
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -102,6 +104,7 @@ class PersistentClaude:
         max_budget_usd: float = 1.0,
         timeout_seconds: int = 120,
         services_info: list[dict] | None = None,
+        claude_user: str | None = None,
     ):
         self.model = model
         self.workspace = workspace
@@ -111,6 +114,7 @@ class PersistentClaude:
         self.max_budget_usd = max_budget_usd
         self.timeout_seconds = timeout_seconds
         self.services_info = services_info or []
+        self.claude_user = claude_user
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()  # Serializes all message sends
         self._session_id: str | None = None
@@ -135,13 +139,19 @@ class PersistentClaude:
         for headless operation), and the configured model and budget. The process
         runs in the current workspace directory and persists across messages.
 
+        When claude_user is set, the process is spawned via sudo -u to run as
+        a different OS user. The subprocess is started in its own process group
+        (start_new_session=True) so the entire tree (sudo + claude) can be
+        killed reliably via os.killpg().
+
         The stdout buffer limit is raised to 1 MiB (from the default 64 KiB)
         because large tool results from Claude can exceed the default.
         """
         if self.is_alive:
             return
 
-        cmd = [
+        # Build the Claude command arguments.
+        claude_cmd = [
             "claude",
             "--input-format",
             "stream-json",
@@ -155,7 +165,20 @@ class PersistentClaude:
             "--max-budget-usd",
             str(self.max_budget_usd),
         ]
-        log.info("Starting persistent Claude process (model=%s)", self.model)
+
+        # When running as a different user, spawn via sudo -u.
+        # The subprocess runs with the target user's UID, home directory,
+        # and environment - completely isolated from the bot user.
+        if self.claude_user:
+            cmd = ["sudo", "-u", self.claude_user, "--"] + claude_cmd
+        else:
+            cmd = claude_cmd
+
+        log.info(
+            "Starting persistent Claude process (model=%s, user=%s)",
+            self.model,
+            self.claude_user or "(same as bot)",
+        )
 
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -164,6 +187,10 @@ class PersistentClaude:
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.workspace),
             limit=1024 * 1024,  # 1 MiB; default 64 KiB too small for large tool results
+            # When spawned via sudo, start in a new process group so we can
+            # kill the entire tree (sudo + claude) via os.killpg(). Without
+            # this, killing sudo may orphan the claude process.
+            start_new_session=bool(self.claude_user),
         )
         self._session_id = None
         self._fresh_session = True
@@ -188,6 +215,27 @@ class PersistentClaude:
                     log.debug("Claude stderr: %s", text[:200])
             except Exception:
                 break
+
+    def _kill_proc(self, sig: int = signal.SIGKILL) -> None:
+        """
+        Send a signal to the Claude subprocess.
+
+        When claude_user is set, the process runs in its own process group
+        (via start_new_session=True). We must kill the entire group to
+        ensure the actual claude process dies, not just the sudo wrapper.
+
+        Args:
+            sig: Signal to send. Defaults to SIGKILL.
+        """
+        if not self._proc or self._proc.returncode is not None:
+            return
+        try:
+            if self.claude_user:
+                os.killpg(os.getpgid(self._proc.pid), sig)
+            else:
+                self._proc.send_signal(sig)
+        except (ProcessLookupError, PermissionError):
+            pass
 
     async def send(self, prompt: str | list) -> AsyncIterator[StreamEvent]:
         """
@@ -479,11 +527,7 @@ class PersistentClaude:
         existing error-handling path. Does not await process termination
         (that happens in the streaming loop).
         """
-        if self._proc and self._proc.returncode is None:
-            try:
-                self._proc.kill()
-            except ProcessLookupError:
-                pass
+        self._kill_proc(signal.SIGKILL)
 
     async def change_workspace(self, new_workspace: Path) -> None:
         """
@@ -510,14 +554,11 @@ class PersistentClaude:
         Kill the subprocess and clean up resources.
 
         Sends SIGKILL, waits for the process to exit, clears the session ID,
-        and cancels the stderr drain task. Idempotent — safe to call even if
+        and cancels the stderr drain task. Idempotent - safe to call even if
         the process has already exited.
         """
         if self._proc:
-            try:
-                self._proc.kill()
-            except ProcessLookupError:
-                pass
+            self._kill_proc(signal.SIGKILL)
             try:
                 await self._proc.wait()
             except Exception:
@@ -537,11 +578,18 @@ class PersistentClaude:
         Called during bot shutdown from main.py.
         """
         if self._proc and self._proc.returncode is None:
-            self._proc.terminate()
+            self._kill_proc(signal.SIGTERM)
             try:
+                # Note: when claude_user is set, self._proc is the sudo process.
+                # SIGTERM is sent to the entire process group (sudo + claude), but
+                # sudo may exit before claude finishes handling the signal. This
+                # wait() returns when sudo exits, not necessarily when claude does.
+                # In practice claude exits near-instantly after SIGTERM, but if
+                # orphaned claude processes are ever observed after graceful
+                # shutdown, this is the place to investigate.
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except TimeoutError:
-                self._proc.kill()
+                self._kill_proc(signal.SIGKILL)
                 await self._proc.wait()
         self._proc = None
         if self._stderr_task:

@@ -19,6 +19,7 @@ _CONFIG_ENV_VARS = [
     "TTS_ENABLED",
     "WORKSPACE_BASE",
     "ALLOWED_WORKSPACES",
+    "CLAUDE_USER",
 ]
 
 
@@ -175,6 +176,21 @@ class TestLoadConfigOptional:
         monkeypatch.setenv("ALLOWED_WORKSPACES", f"{dir_a},{non_canonical}")
         config = load_config()
         assert len(config.allowed_workspaces) == 1
+
+    def test_claude_user_default_none(self, monkeypatch):
+        _set_required(monkeypatch)
+        assert load_config().claude_user is None
+
+    def test_claude_user_from_env(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_USER", "daniel")
+        assert load_config().claude_user == "daniel"
+
+    def test_claude_user_empty_string_becomes_none(self, monkeypatch):
+        # Empty CLAUDE_USER is treated as unset (the `or None` coercion)
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_USER", "")
+        assert load_config().claude_user is None
 
 
 # ── Telegram webhook config ─────────────────────────────────────────

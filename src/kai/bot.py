@@ -1693,6 +1693,7 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
         max_budget_usd=config.claude_max_budget_usd,
         timeout_seconds=config.claude_timeout_seconds,
         services_info=services.get_available_services(),
+        claude_user=config.claude_user,
     )
 
     # Command handlers (alphabetical registration, but order doesn't matter for commands)

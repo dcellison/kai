@@ -56,6 +56,9 @@ class Config:
         allowed_workspaces: Additional workspace directories accessible by name, from config only.
             These appear as pinned workspaces in /workspaces and are reachable via /workspace <name>
             without being under WORKSPACE_BASE. Non-existent paths are skipped at startup.
+        claude_user: OS user for the inner Claude process. When set, Claude is spawned
+            via 'sudo -u <user>' for OS-level isolation. Must be a non-admin user.
+            When None, Claude runs as the same user as the bot (development default).
     """
 
     # Required fields - no defaults, must be provided
@@ -92,6 +95,12 @@ class Config:
     # Workspace switching
     workspace_base: Path | None = None
     allowed_workspaces: list[Path] = field(default_factory=list)
+
+    # User separation: run Claude as a different OS user for process isolation.
+    # When set, the bot spawns Claude via 'sudo -u <user> claude ...'.
+    # The user must exist on the system and must NOT have admin/sudo privileges.
+    # When unset, Claude runs as the same user as the bot (development default).
+    claude_user: str | None = None
 
 
 def load_config() -> Config:
@@ -195,4 +204,5 @@ def load_config() -> Config:
         tts_enabled=os.environ.get("TTS_ENABLED", "").lower() in ("1", "true", "yes"),
         workspace_base=workspace_base,
         allowed_workspaces=allowed_workspaces,
+        claude_user=os.environ.get("CLAUDE_USER") or None,
     )
