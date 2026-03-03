@@ -42,6 +42,7 @@ from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -165,11 +166,13 @@ async def _reply_safe(msg: Message, text: str) -> Message:
 
     Telegram's Markdown parser is strict about balanced formatting characters.
     Rather than trying to escape everything, we just retry without parse_mode
-    if the first attempt fails.
+    if the first attempt fails. Only catches BadRequest (Telegram rejecting the
+    markup) - network errors and timeouts propagate normally to avoid sending
+    duplicate messages.
     """
     try:
         return await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-    except Exception:
+    except BadRequest:
         return await msg.reply_text(text)
 
 
@@ -177,18 +180,21 @@ async def _edit_message_safe(msg: Message, text: str) -> None:
     """
     Edit an existing message with Markdown, falling back to plain text.
 
-    Used during streaming to update the live response message. Silently
-    ignores errors from the final fallback (e.g., message not modified,
-    message deleted by user).
+    Used during streaming to update the live response message. On BadRequest
+    (Telegram rejecting the markup), retries without parse_mode. All other
+    errors are silently ignored since edits are best-effort during streaming
+    (e.g., message not modified, message deleted by user, network blip).
     """
     truncated = _truncate_for_telegram(text)
     try:
         await msg.edit_text(truncated, parse_mode=ParseMode.MARKDOWN)
-    except Exception:
+    except BadRequest:
         try:
             await msg.edit_text(truncated)
         except Exception:
             pass
+    except Exception:
+        pass
 
 
 def _chunk_text(text: str, max_len: int = 4096) -> list[str]:
