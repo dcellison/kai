@@ -1472,6 +1472,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 remaining = lockout_attempts - get_failure_count()
                 await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
             return
+
+        # Auth is still valid - refresh the timestamp so the session
+        # timeout measures inactivity, not time since login.
+        context.user_data["totp_authenticated_at"] = time.time()
     # ── End TOTP gate ─────────────────────────────────────────────────────
 
     chat_id = _chat_id(update)
