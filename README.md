@@ -191,10 +191,7 @@ Create `~/Library/LaunchAgents/com.kai.bot.plist`:
     <true/>
 
     <key>KeepAlive</key>
-    <dict>
-        <key>NetworkState</key>
-        <true/>
-    </dict>
+    <true/>
 
     <key>ProcessType</key>
     <string>Background</string>
