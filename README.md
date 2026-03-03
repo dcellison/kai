@@ -5,11 +5,34 @@
 [![License](https://img.shields.io/github/license/dcellison/kai)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dcellison/kai?label=version)](https://github.com/dcellison/kai/releases)
 
-A personal AI assistant accessed via Telegram, powered by [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
-
-Kai is a Telegram gateway to a persistent Claude Code process. Messages are forwarded to Claude with full tool access (shell, files, web search), and responses stream back in real time. Everything runs locally — conversations and credentials never leave your machine.
+A personal AI assistant that lives in Telegram and runs entirely on your machine. Powered by [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with full tool access - shell, filesystem, web search - and a security model designed around the fact that it has all of that.
 
 For detailed guides on setup, architecture, and optional features, see the **[Wiki](https://github.com/dcellison/kai/wiki)**.
+
+## Why local?
+
+Kai bridges Telegram and a persistent Claude Code process running on your hardware. Messages go in, streaming responses come back, and Claude has real access to your system. That power is the point - and it's why the security model is non-negotiable.
+
+Everything runs locally. Conversations never transit a relay server. Voice transcription and synthesis happen on-device. API keys are proxied through an internal service layer so they never appear in conversation context. There is no cloud component between you and your machine.
+
+## Security model
+
+Giving an AI agent shell access is a real trust decision. Kai's approach is layered defense - each layer independent, so no single failure is catastrophic:
+
+- **Telegram auth** - only explicitly whitelisted user IDs can interact. Unauthorized messages are silently dropped before reaching any handler.
+- **TOTP gate** (optional) - two-factor authentication via time-based one-time passwords. After a configurable idle timeout, Kai requires a 6-digit authenticator code before processing anything. The secret lives in a root-owned file (mode 0600) that the bot process cannot read directly; it verifies codes through narrowly-scoped sudoers rules. Even if someone compromises your Telegram account, they can't use your assistant without your authenticator device. Rate limiting with disk-persisted lockout protects against brute force.
+- **Process isolation** - authentication state lives in the bot's in-memory context, not in the filesystem or conversation history. The inner Claude process cannot read, manipulate, or bypass the auth gate.
+- **Path confinement** - file exchange operations are restricted to the active workspace via `Path.relative_to()`. Traversal attempts are rejected.
+- **Service proxy** - external API keys live in server-side config (`services.yaml`) and are injected at request time. Claude calls APIs through a local proxy endpoint; the keys never enter the conversation.
+
+Setup for TOTP requires the optional dependency group and root access:
+
+```bash
+pip install -e '.[totp]'             # adds pyotp and qrcode
+sudo python -m kai totp setup        # generate secret, display QR code, confirm
+```
+
+For the full architecture, see [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture). For TOTP details, see [TOTP Authentication](https://github.com/dcellison/kai/wiki/TOTP-Authentication).
 
 ## Features
 
@@ -23,7 +46,7 @@ Switch between Opus, Sonnet, and Haiku via `/models` (interactive picker) or `/m
 
 ### Workspaces
 
-Point Claude at any project with `/workspace <name>`. Names resolve relative to `WORKSPACE_BASE` (set in `.env`). Identity and memory from the home workspace carry over. Create new workspaces with `/workspace new <name>`. Absolute paths are not accepted — all workspaces must live under the configured base directory.
+Point Claude at any project with `/workspace <name>`. Names resolve relative to `WORKSPACE_BASE` (set in `.env`). Identity and memory from the home workspace carry over. Create new workspaces with `/workspace new <name>`. Absolute paths are not accepted - all workspaces must live under the configured base directory.
 
 ### File exchange
 
@@ -31,7 +54,7 @@ Send any file type directly in chat -- photos, documents, PDFs, archives, anythi
 
 ### Voice input
 
-Voice notes are transcribed locally using [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and forwarded to Claude. Requires `ffmpeg` and `whisper-cpp`. Disabled by default — set `VOICE_ENABLED=true` after installing dependencies. See the [Voice Setup](https://github.com/dcellison/kai/wiki/Voice-Setup) wiki page.
+Voice notes are transcribed locally using [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and forwarded to Claude. Requires `ffmpeg` and `whisper-cpp`. Disabled by default - set `VOICE_ENABLED=true` after installing dependencies. See the [Voice Setup](https://github.com/dcellison/kai/wiki/Voice-Setup) wiki page.
 
 ### Voice responses (TTS)
 
@@ -53,26 +76,11 @@ Reminders and recurring Claude jobs with one-shot, daily, and interval schedules
 
 Three layers of persistent context:
 
-1. **Auto-memory** — managed by Claude Code per-workspace. Project architecture and patterns.
-2. **Home memory** (`workspace/.claude/MEMORY.md`) — personal memory, always injected regardless of current workspace. Proactively updated by Kai.
-3. **Conversation history** (`workspace/.claude/history/`) — JSONL logs, one file per day. Searchable for past conversations.
+1. **Auto-memory** - managed by Claude Code per-workspace. Project architecture and patterns.
+2. **Home memory** (`workspace/.claude/MEMORY.md`) - personal memory, always injected regardless of current workspace. Proactively updated by Kai.
+3. **Conversation history** (`workspace/.claude/history/`) - JSONL logs, one file per day. Searchable for past conversations.
 
 Foreign workspaces also get their own `.claude/MEMORY.md` injected alongside home memory. See [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture).
-
-### TOTP authentication
-
-Optional two-factor authentication using time-based one-time passwords. When enabled, the bot requires a 6-digit authenticator code before processing messages after a configurable session timeout. The TOTP secret is stored in a root-owned file (`/etc/kai/totp.secret`, mode 0600) that is inaccessible to the bot user and any subprocesses it spawns. The bot reads the secret via narrowly-scoped sudoers rules at verification time only.
-
-Setup requires the optional dependency group and root access:
-
-```bash
-pip install -e '.[totp]'             # adds pyotp and qrcode
-sudo python -m kai totp setup        # generate secret, display QR code, confirm
-python -m kai totp status            # check configuration state
-sudo python -m kai totp reset        # remove secret and attempts files
-```
-
-Rate limiting locks the account after consecutive failed attempts (configurable, default 3). Lockout state is persisted to disk so it survives restarts. Code messages are deleted from Telegram immediately after verification. All settings are configurable via environment variables (see below).
 
 ### Crash recovery
 
