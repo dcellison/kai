@@ -538,6 +538,8 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
                 <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
                 <key>KAI_DATA_DIR</key>
                 <string>{data_dir}</string>
+                <key>KAI_INSTALL_DIR</key>
+                <string>{install_dir}</string>
             </dict>
 
             <key>RunAtLoad</key>
@@ -584,6 +586,7 @@ def _generate_systemd_unit(install_dir: str, data_dir: str, service_user: str) -
         RestartSec=5
         Environment=PATH=/usr/local/bin:/usr/bin:/bin
         Environment=KAI_DATA_DIR={data_dir}
+        Environment=KAI_INSTALL_DIR={install_dir}
 
         [Install]
         WantedBy=multi-user.target

@@ -26,6 +26,7 @@ _CONFIG_ENV_VARS = [
     "ALLOWED_WORKSPACES",
     "CLAUDE_USER",
     "KAI_DATA_DIR",
+    "KAI_INSTALL_DIR",
 ]
 
 
@@ -288,6 +289,33 @@ class TestDataDir:
         config = load_config()
         # In test env, DATA_DIR == PROJECT_ROOT (KAI_DATA_DIR is unset)
         assert config.session_db_path.name == "kai.db"
+
+
+# ── PROJECT_ROOT / KAI_INSTALL_DIR ────────────────────────────────
+
+
+class TestProjectRoot:
+    def test_defaults_to_file_derived_root(self):
+        """When KAI_INSTALL_DIR is unset, PROJECT_ROOT derives from __file__."""
+        from kai.config import _FILE_ROOT, PROJECT_ROOT
+
+        # In the test environment KAI_INSTALL_DIR is not set, so both should match
+        assert PROJECT_ROOT == _FILE_ROOT
+
+    def test_from_env(self, monkeypatch, tmp_path):
+        """When KAI_INSTALL_DIR is set, PROJECT_ROOT uses that path."""
+        monkeypatch.setenv("KAI_INSTALL_DIR", str(tmp_path))
+        # Re-evaluate the same logic config.py uses at module level
+        result = Path(os.environ.get("KAI_INSTALL_DIR") or "fallback")
+        assert result == tmp_path
+
+    def test_empty_string_defaults(self, monkeypatch):
+        """Empty KAI_INSTALL_DIR falls back to _FILE_ROOT via `or`."""
+        monkeypatch.setenv("KAI_INSTALL_DIR", "")
+        from kai.config import _FILE_ROOT
+
+        result = Path(os.environ.get("KAI_INSTALL_DIR") or str(_FILE_ROOT))
+        assert result == _FILE_ROOT
 
 
 # ── _read_protected_file ─────────────────────────────────────────

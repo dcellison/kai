@@ -20,8 +20,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Derive project root from file location: src/kai/config.py -> src/kai -> src -> project root
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+# Derive project root from file location: src/kai/config.py -> src/kai -> src -> project root.
+# In a pip-installed deployment (e.g., /opt/kai/venv/lib/.../site-packages/kai/), this
+# resolves to site-packages/ instead of the install root. KAI_INSTALL_DIR overrides it.
+_FILE_ROOT = Path(__file__).resolve().parent.parent.parent
+PROJECT_ROOT = Path(os.environ.get("KAI_INSTALL_DIR") or str(_FILE_ROOT))
 
 # Writable data directory for runtime artifacts (database, logs, crash flag).
 # Defaults to PROJECT_ROOT for development. In a protected installation where
