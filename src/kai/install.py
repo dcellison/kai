@@ -513,6 +513,27 @@ def _user_home(username: str) -> str:
         return f"/home/{username}"
 
 
+def _resolve_python(install_dir: str) -> str:
+    """
+    Resolve the venv Python binary to its real path.
+
+    On macOS with Homebrew Python, the venv's python3 is a symlink to
+    the framework binary at .../bin/python3.13, which re-execs itself
+    through Python.app. This re-exec changes the process PID, causing
+    launchd to lose track of the service and spawn duplicates.
+
+    Resolving to the real binary path avoids the re-exec entirely.
+    Falls back to the venv symlink if resolution fails (e.g., during
+    tests or dry runs before the venv exists).
+    """
+    venv_python = Path(install_dir) / "venv" / "bin" / "python3"
+    try:
+        resolved = venv_python.resolve(strict=True)
+        return str(resolved)
+    except (OSError, ValueError):
+        return str(venv_python)
+
+
 def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) -> str:
     """
     Generate a launchd plist for macOS.
@@ -523,6 +544,10 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
     to the writable directory, and includes PATH entries for common tool locations.
     The service user's ~/.local/bin is included in PATH so the inner Claude Code
     process can find the `claude` binary (installed via the native installer).
+
+    The Python binary path is resolved to the real binary (not the venv symlink)
+    to prevent Homebrew Python's framework re-exec from changing the PID, which
+    causes launchd to lose track of the process and spawn duplicates.
 
     Args:
         install_dir: Root of the protected installation (e.g., /opt/kai).
@@ -535,6 +560,7 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
     # Resolve the service user's home directory for ~/.local/bin PATH entry.
     # Claude Code's native installer places the binary there.
     user_home = _user_home(service_user)
+    python_bin = _resolve_python(install_dir)
     return textwrap.dedent(f"""\
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -548,7 +574,7 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
 
             <key>ProgramArguments</key>
             <array>
-                <string>{install_dir}/venv/bin/python</string>
+                <string>{python_bin}</string>
                 <string>-m</string>
                 <string>kai</string>
             </array>
