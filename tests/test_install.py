@@ -1,6 +1,7 @@
 """Tests for the protected installation module (install.py)."""
 
 import json
+import shutil
 import subprocess
 
 import pytest
@@ -155,14 +156,18 @@ class TestGenerateSudoers:
         assert "kai ALL=" in result
 
     def test_contains_cat_rules(self):
+        """Sudoers uses the resolved cat path (may be /bin/cat or /usr/bin/cat)."""
         result = _generate_sudoers("testuser")
-        assert "/bin/cat /etc/kai/env" in result
-        assert "/bin/cat /etc/kai/services.yaml" in result
-        assert "/bin/cat /etc/kai/totp.secret" in result
+        cat_path = shutil.which("cat") or "/bin/cat"
+        assert f"{cat_path} /etc/kai/env" in result
+        assert f"{cat_path} /etc/kai/services.yaml" in result
+        assert f"{cat_path} /etc/kai/totp.secret" in result
 
     def test_contains_tee_rule(self):
+        """Sudoers uses the resolved tee path (may be /usr/bin/tee)."""
         result = _generate_sudoers("kai")
-        assert "/usr/bin/tee /etc/kai/totp.attempts" in result
+        tee_path = shutil.which("tee") or "/usr/bin/tee"
+        assert f"{tee_path} /etc/kai/totp.attempts" in result
 
     def test_nopasswd(self):
         result = _generate_sudoers("kai")
@@ -479,3 +484,18 @@ class TestCli:
         monkeypatch.setattr("kai.install._cmd_apply", lambda: called.append(True))
         cli(["apply"])
         assert called
+
+    def test_dry_run_flag_sets_env(self, monkeypatch):
+        """--dry-run flag sets DRY_RUN=1 in the environment before calling apply."""
+        import os
+
+        captured_env = {}
+        monkeypatch.delenv("DRY_RUN", raising=False)
+
+        def mock_apply():
+            # Capture the env var at call time
+            captured_env["DRY_RUN"] = os.environ.get("DRY_RUN")
+
+        monkeypatch.setattr("kai.install._cmd_apply", mock_apply)
+        cli(["apply", "--dry-run"])
+        assert captured_env.get("DRY_RUN") == "1"

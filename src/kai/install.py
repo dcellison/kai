@@ -469,19 +469,29 @@ def _generate_sudoers(service_user: str) -> str:
     The rules allow passwordless `sudo cat` on specific files only. This is
     validated with `visudo -cf` before being written to /etc/sudoers.d/.
 
+    Uses shutil.which() to resolve the actual paths of `cat` and `tee`,
+    since they live at /bin/ on macOS but /usr/bin/ on many Linux distros.
+    Falls back to /bin/cat and /usr/bin/tee if the binaries aren't found
+    in the current PATH (e.g., when running in a minimal environment).
+
     Args:
         service_user: The OS username that runs the Kai service.
 
     Returns:
         The sudoers file contents as a string.
     """
+    # Resolve actual binary paths. macOS: /bin/cat, /usr/bin/tee.
+    # Many Linux distros: /usr/bin/cat, /usr/bin/tee.
+    cat_path = shutil.which("cat") or "/bin/cat"
+    tee_path = shutil.which("tee") or "/usr/bin/tee"
+
     return textwrap.dedent(f"""\
         # Kai - allow service user to read protected config files.
         # Managed by 'python -m kai install apply'. Do not edit manually.
-        {service_user} ALL=(root) NOPASSWD: /bin/cat /etc/kai/env
-        {service_user} ALL=(root) NOPASSWD: /bin/cat /etc/kai/services.yaml
-        {service_user} ALL=(root) NOPASSWD: /bin/cat /etc/kai/totp.secret
-        {service_user} ALL=(root) NOPASSWD: /usr/bin/tee /etc/kai/totp.attempts
+        {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/env
+        {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/services.yaml
+        {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/totp.secret
+        {service_user} ALL=(root) NOPASSWD: {tee_path} /etc/kai/totp.attempts
     """)
 
 
@@ -757,14 +767,14 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
             check=True,
         )
 
-    # Install the package with optional dependencies
+    # Install the package with optional dependencies.
+    # Uses a non-editable install (not -e) so the venv is self-contained
+    # and doesn't depend on the source directory being writable.
     pip = str(venv_path / "bin" / "pip")
-    # Build extras string based on what's available
-    extras = "totp"
-    # Check if piper-tts could work (Linux only, or if available)
+    extras = "totp,tts"
     install_spec = f"{install_path}[{extras}]"
     subprocess.run(
-        [pip, "install", "-e", install_spec],
+        [pip, "install", install_spec],
         check=True,
     )
     print("  Installed package into venv")
@@ -940,21 +950,15 @@ def _cmd_status() -> None:
     Checks for the existence of installation directories, config files,
     and service status. Reports ownership for security verification.
     """
-    # Try to determine platform from install.conf, falling back to detection
+    # Load install.conf once for platform, install_dir, and data_dir.
+    # Falls back to auto-detected platform and default paths if missing.
     platform = "darwin" if sys.platform == "darwin" else "linux"
-    if INSTALL_CONF.exists():
-        try:
-            conf = json.loads(INSTALL_CONF.read_text())
-            platform = conf.get("platform", platform)
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    # Default paths (may be overridden by install.conf)
     install_dir = _DEFAULT_INSTALL_DIR
     data_dir = _DEFAULT_DATA_DIR
     if INSTALL_CONF.exists():
         try:
             conf = json.loads(INSTALL_CONF.read_text())
+            platform = conf.get("platform", platform)
             install_dir = conf.get("install_dir", install_dir)
             data_dir = conf.get("data_dir", data_dir)
         except (json.JSONDecodeError, OSError):
@@ -987,9 +991,9 @@ def cli(args: list[str]) -> None:
     Dispatch install CLI subcommands.
 
     Usage:
-        python -m kai install config   -- interactive Q&A, writes install.conf
-        python -m kai install apply    -- reads install.conf, creates /opt layout
-        python -m kai install status   -- shows current installation state
+        python -m kai install config              -- interactive Q&A, writes install.conf
+        python -m kai install apply [--dry-run]    -- reads install.conf, creates /opt layout
+        python -m kai install status               -- shows current installation state
     """
     subcommands = {
         "config": _cmd_config,
@@ -1001,4 +1005,11 @@ def cli(args: list[str]) -> None:
         print("Usage: python -m kai install {config|apply|status}")
         sys.exit(1)
 
-    subcommands[args[0]]()
+    subcmd = args[0]
+    remaining = args[1:]
+
+    # The apply subcommand accepts --dry-run as an alternative to DRY_RUN=1
+    if subcmd == "apply" and "--dry-run" in remaining:
+        os.environ["DRY_RUN"] = "1"
+
+    subcommands[subcmd]()
