@@ -2,7 +2,7 @@
 # where tools are installed globally (no .venv).
 BIN = .venv/bin/
 
-.PHONY: run lint format check test install tts-model
+.PHONY: run lint format check test setup config install install-status tts-model
 
 run:
 	$(BIN)python -m kai
@@ -19,8 +19,19 @@ check: lint
 test:
 	$(BIN)python -m pytest tests/ -v
 
-install:
+# Development environment setup (editable install with dev tools)
+setup:
 	$(BIN)pip install -e '.[dev]'
+
+# Protected installation targets
+config:
+	$(BIN)python -m kai install config
+
+install:
+	sudo $(BIN)python -m kai install apply
+
+install-status:
+	$(BIN)python -m kai install status
 
 models/ggml-base.en.bin:
 	mkdir -p models

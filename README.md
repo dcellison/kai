@@ -284,7 +284,7 @@ kai/
 ## Development
 
 ```bash
-make install    # Install in editable mode with dev tools
+make setup      # Install in editable mode with dev tools
 make lint       # Run ruff linter
 make format     # Auto-format with ruff
 make check      # Lint + format check (CI-friendly)

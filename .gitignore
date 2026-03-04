@@ -21,6 +21,7 @@ kai.db
 logs/
 .responding_to
 models/
+install.conf
 
 # Claude Code local config
 CLAUDE.md
