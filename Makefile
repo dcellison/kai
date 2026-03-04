@@ -28,7 +28,7 @@ config:
 	$(BIN)python -m kai install config
 
 install:
-	sudo $(BIN)python -m kai install apply
+	sudo DRY_RUN="$(DRY_RUN)" $(BIN)python -m kai install apply
 
 install-status:
 	$(BIN)python -m kai install status
