@@ -527,14 +527,39 @@ def _generate_launcher_script(install_dir: str) -> str:
         # Launcher script for Kai launchd service.
         # Keeps bash as the tracked PID so launchd can manage the service
         # even when Homebrew Python re-execs through the framework bundle.
+        #
+        # Homebrew Python's framework binary fork+execs through Python.app,
+        # creating a grandchild process with a new PID. Launchd tracks this
+        # bash script instead, and we forward signals to the real Python.
+        {install_dir}/venv/bin/python3 -m kai &
+
+        # Wait for Python to re-exec and start listening
+        sleep 2
+
+        # Find the actual Python process (the re-exec'd grandchild)
+        REAL_PID=$(lsof -ti :8080 -sTCP:LISTEN 2>/dev/null)
+        if [ -z "$REAL_PID" ]; then
+            # Hasn't bound yet; wait a bit more
+            sleep 3
+            REAL_PID=$(lsof -ti :8080 -sTCP:LISTEN 2>/dev/null)
+        fi
+
         cleanup() {{
-            kill -TERM "$PID" 2>/dev/null
-            wait "$PID"
+            kill -TERM "$REAL_PID" 2>/dev/null
+            # Poll until the process is gone (can't use wait on non-children)
+            while kill -0 "$REAL_PID" 2>/dev/null; do sleep 0.5; done
         }}
         trap cleanup TERM INT
-        {install_dir}/venv/bin/python3 -m kai &
-        PID=$!
-        wait $PID
+
+        # Poll for the real Python process to exit.
+        # kill -0 checks if PID exists without sending a signal.
+        # This is macOS-compatible (no GNU tail --pid needed).
+        if [ -n "$REAL_PID" ]; then
+            while kill -0 "$REAL_PID" 2>/dev/null; do sleep 1; done
+        else
+            # Could not find the process; wait indefinitely
+            sleep infinity
+        fi
     """)
 
 
