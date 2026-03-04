@@ -513,25 +513,29 @@ def _user_home(username: str) -> str:
         return f"/home/{username}"
 
 
-def _resolve_python(install_dir: str) -> str:
+def _generate_launcher_script(install_dir: str) -> str:
     """
-    Resolve the venv Python binary to its real path.
+    Generate a launcher script for launchd.
 
-    On macOS with Homebrew Python, the venv's python3 is a symlink to
-    the framework binary at .../bin/python3.13, which re-execs itself
-    through Python.app. This re-exec changes the process PID, causing
-    launchd to lose track of the service and spawn duplicates.
-
-    Resolving to the real binary path avoids the re-exec entirely.
-    Falls back to the venv symlink if resolution fails (e.g., during
-    tests or dry runs before the venv exists).
+    Homebrew Python's framework binary re-execs itself through Python.app,
+    creating a new PID. This causes launchd to lose track of the service
+    process. The launcher script stays as the parent process that launchd
+    tracks, and forwards SIGTERM to the Python child for graceful shutdown.
     """
-    venv_python = Path(install_dir) / "venv" / "bin" / "python3"
-    try:
-        resolved = venv_python.resolve(strict=True)
-        return str(resolved)
-    except (OSError, ValueError):
-        return str(venv_python)
+    return textwrap.dedent(f"""\
+        #!/bin/bash
+        # Launcher script for Kai launchd service.
+        # Keeps bash as the tracked PID so launchd can manage the service
+        # even when Homebrew Python re-execs through the framework bundle.
+        cleanup() {{
+            kill -TERM "$PID" 2>/dev/null
+            wait "$PID"
+        }}
+        trap cleanup TERM INT
+        {install_dir}/venv/bin/python3 -m kai &
+        PID=$!
+        wait $PID
+    """)
 
 
 def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) -> str:
@@ -545,9 +549,10 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
     The service user's ~/.local/bin is included in PATH so the inner Claude Code
     process can find the `claude` binary (installed via the native installer).
 
-    The Python binary path is resolved to the real binary (not the venv symlink)
-    to prevent Homebrew Python's framework re-exec from changing the PID, which
-    causes launchd to lose track of the process and spawn duplicates.
+    ProgramArguments points to a launcher script instead of Python directly.
+    Homebrew Python re-execs through Python.app (changing the PID), which causes
+    launchd to lose track of the process. The launcher script stays as the
+    tracked parent and forwards signals to Python.
 
     Args:
         install_dir: Root of the protected installation (e.g., /opt/kai).
@@ -560,7 +565,6 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
     # Resolve the service user's home directory for ~/.local/bin PATH entry.
     # Claude Code's native installer places the binary there.
     user_home = _user_home(service_user)
-    python_bin = _resolve_python(install_dir)
     return textwrap.dedent(f"""\
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -574,9 +578,7 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
 
             <key>ProgramArguments</key>
             <array>
-                <string>{python_bin}</string>
-                <string>-m</string>
-                <string>kai</string>
+                <string>{install_dir}/run.sh</string>
             </array>
 
             <key>WorkingDirectory</key>
@@ -1066,14 +1068,25 @@ def _apply_service(install_dir: str, data_dir: str, service_user: str, platform:
         # system domain at boot, independent of any user login session.
         plist_dir = Path("/Library/LaunchDaemons")
         plist_path = plist_dir / f"{_LAUNCHD_LABEL}.plist"
-        content = _generate_launchd_plist(install_dir, data_dir, service_user)
+        plist_content = _generate_launchd_plist(install_dir, data_dir, service_user)
+
+        # Launcher script keeps bash as the tracked PID so launchd can
+        # manage the service even when Homebrew Python re-execs.
+        launcher_path = Path(install_dir) / "run.sh"
+        launcher_content = _generate_launcher_script(install_dir)
 
         if dry_run:
+            print(f"[DRY RUN] Would write: {launcher_path}")
             print(f"[DRY RUN] Would write: {plist_path}")
             return
 
+        launcher_path.write_text(launcher_content)
+        os.chmod(launcher_path, 0o755)
+        os.chown(launcher_path, 0, 0)
+        print(f"  Wrote {launcher_path}")
+
         plist_dir.mkdir(parents=True, exist_ok=True)
-        plist_path.write_text(content)
+        plist_path.write_text(plist_content)
         # LaunchDaemons must be owned by root:wheel
         os.chown(plist_path, 0, 0)
         os.chmod(plist_path, 0o644)

@@ -184,9 +184,8 @@ class TestGenerateLaunchdPlist:
 
     def test_contains_install_dir(self):
         result = _generate_launchd_plist("/opt/kai", "/var/lib/kai", "kai")
-        # Python binary is resolved to the real path, so check for
-        # the install dir in WorkingDirectory and python somewhere in ProgramArguments
-        assert "python" in result
+        # Plist uses launcher script, not python directly
+        assert "/opt/kai/run.sh" in result
         assert "<string>/opt/kai</string>" in result
 
     def test_contains_data_dir(self):
