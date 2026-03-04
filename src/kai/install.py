@@ -495,13 +495,33 @@ def _generate_sudoers(service_user: str) -> str:
     """)
 
 
+def _user_home(username: str) -> str:
+    """
+    Resolve a user's home directory via pwd lookup.
+
+    Falls back to a platform-appropriate default if the user doesn't exist
+    on the current system (e.g., generating a plist for a user that will be
+    created later, or during tests with fake usernames).
+    """
+    try:
+        return pwd.getpwnam(username).pw_dir
+    except KeyError:
+        # User doesn't exist yet (pre-install) or is a test fixture.
+        # Use the platform convention so the generated config is plausible.
+        if sys.platform == "darwin":
+            return f"/Users/{username}"
+        return f"/home/{username}"
+
+
 def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) -> str:
     """
     Generate a launchd plist for macOS.
 
     The plist runs the bot as the service user, sets KAI_DATA_DIR so runtime
     data goes to the writable directory, and includes PATH entries for common
-    tool locations.
+    tool locations. The service user's ~/.local/bin is included in PATH so the
+    inner Claude Code process can find the `claude` binary (installed via the
+    native installer at ~/.local/bin/claude).
 
     Args:
         install_dir: Root of the protected installation (e.g., /opt/kai).
@@ -511,6 +531,9 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
     Returns:
         The plist XML as a string.
     """
+    # Resolve the service user's home directory for ~/.local/bin PATH entry.
+    # Claude Code's native installer places the binary there.
+    user_home = _user_home(service_user)
     return textwrap.dedent(f"""\
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -535,7 +558,7 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
             <key>EnvironmentVariables</key>
             <dict>
                 <key>PATH</key>
-                <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+                <string>{user_home}/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
                 <key>KAI_DATA_DIR</key>
                 <string>{data_dir}</string>
                 <key>KAI_INSTALL_DIR</key>
@@ -561,7 +584,8 @@ def _generate_systemd_unit(install_dir: str, data_dir: str, service_user: str) -
 
     The unit runs the bot as the service user with KAI_DATA_DIR pointing to the
     writable data directory. Waits for network-online.target to avoid DNS
-    failures during boot.
+    failures during boot. The service user's ~/.local/bin is included in PATH
+    so the inner Claude Code process can find the `claude` binary.
 
     Args:
         install_dir: Root of the protected installation (e.g., /opt/kai).
@@ -571,6 +595,9 @@ def _generate_systemd_unit(install_dir: str, data_dir: str, service_user: str) -
     Returns:
         The systemd unit file contents as a string.
     """
+    # Resolve the service user's home directory for ~/.local/bin PATH entry.
+    # Claude Code's native installer places the binary there.
+    user_home = _user_home(service_user)
     return textwrap.dedent(f"""\
         [Unit]
         Description=Kai Telegram Bot
@@ -584,7 +611,7 @@ def _generate_systemd_unit(install_dir: str, data_dir: str, service_user: str) -
         ExecStart={install_dir}/venv/bin/python -m kai
         Restart=always
         RestartSec=5
-        Environment=PATH=/usr/local/bin:/usr/bin:/bin
+        Environment=PATH={user_home}/.local/bin:/usr/local/bin:/usr/bin:/bin
         Environment=KAI_DATA_DIR={data_dir}
         Environment=KAI_INSTALL_DIR={install_dir}
 
