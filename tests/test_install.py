@@ -601,7 +601,7 @@ class TestApplyMigrate:
 
 class TestStopService:
     def test_darwin(self, monkeypatch, tmp_path):
-        """Calls launchctl bootout on macOS."""
+        """Calls launchctl bootout on macOS with system domain."""
         calls: list[list[str]] = []
 
         def mock_run(cmd, **kwargs):
@@ -609,15 +609,13 @@ class TestStopService:
             return subprocess.CompletedProcess(args=cmd, returncode=0)
 
         monkeypatch.setattr("kai.install.subprocess.run", mock_run)
-        # Mock expanduser since "kai" user may not exist on CI runners
-        monkeypatch.setattr("kai.install.Path.expanduser", lambda self: tmp_path / "home")
 
         _stop_service("darwin", svc_uid=501, service_user="kai", dry_run=False)
 
         assert len(calls) == 1
         assert calls[0][0] == "launchctl"
         assert calls[0][1] == "bootout"
-        assert "gui/501" in calls[0][2]
+        assert calls[0][2] == "system/com.syrinx.kai"
 
     def test_linux(self, monkeypatch):
         """Calls systemctl stop on Linux."""
@@ -640,8 +638,6 @@ class TestStopService:
             "kai.install.subprocess.run",
             lambda *a, **kw: calls.append(True),
         )
-        # Mock expanduser since "kai" user may not exist on CI runners
-        monkeypatch.setattr("kai.install.Path.expanduser", lambda self: tmp_path / "home")
 
         _stop_service("darwin", svc_uid=501, service_user="kai", dry_run=True)
 
@@ -652,7 +648,7 @@ class TestStopService:
 
 class TestStartService:
     def test_darwin(self, monkeypatch, tmp_path):
-        """Calls launchctl bootstrap on macOS."""
+        """Calls launchctl bootstrap on macOS with system domain."""
         calls: list[list[str]] = []
 
         def mock_run(cmd, **kwargs):
@@ -660,15 +656,13 @@ class TestStartService:
             return subprocess.CompletedProcess(args=cmd, returncode=0)
 
         monkeypatch.setattr("kai.install.subprocess.run", mock_run)
-        # Mock expanduser since "kai" user may not exist on CI runners
-        monkeypatch.setattr("kai.install.Path.expanduser", lambda self: tmp_path / "home")
 
         _start_service("darwin", svc_uid=501, service_user="kai", dry_run=False)
 
         assert len(calls) == 1
         assert calls[0][0] == "launchctl"
         assert calls[0][1] == "bootstrap"
-        assert "gui/501" in calls[0][2]
+        assert calls[0][2] == "system"
 
     def test_linux(self, monkeypatch):
         """Calls systemctl start on Linux."""

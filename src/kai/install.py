@@ -517,11 +517,12 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
     """
     Generate a launchd plist for macOS.
 
-    The plist runs the bot as the service user, sets KAI_DATA_DIR so runtime
-    data goes to the writable directory, and includes PATH entries for common
-    tool locations. The service user's ~/.local/bin is included in PATH so the
-    inner Claude Code process can find the `claude` binary (installed via the
-    native installer at ~/.local/bin/claude).
+    The plist is installed as a LaunchDaemon (not a LaunchAgent) so the service
+    runs under the system domain at boot, independent of any user login session.
+    It runs the bot as the service user, sets KAI_DATA_DIR so runtime data goes
+    to the writable directory, and includes PATH entries for common tool locations.
+    The service user's ~/.local/bin is included in PATH so the inner Claude Code
+    process can find the `claude` binary (installed via the native installer).
 
     Args:
         install_dir: Root of the protected installation (e.g., /opt/kai).
@@ -570,6 +571,9 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
 
             <key>KeepAlive</key>
             <true/>
+
+            <key>ThrottleInterval</key>
+            <integer>10</integer>
 
             <key>ProcessType</key>
             <string>Background</string>
@@ -629,13 +633,13 @@ def _stop_service(platform: str, svc_uid: int, service_user: str, dry_run: bool)
 
     Args:
         platform: "darwin" or "linux".
-        svc_uid: Numeric UID of the service user (for launchctl gui domain).
-        service_user: OS username that runs the service.
+        svc_uid: Numeric UID of the service user (unused, kept for API compat).
+        service_user: OS username that runs the service (unused on macOS).
         dry_run: If True, print the command without executing.
     """
     if platform == "darwin":
-        plist_path = Path(f"~{service_user}").expanduser() / "Library" / "LaunchAgents" / f"{_LAUNCHD_LABEL}.plist"
-        cmd = ["launchctl", "bootout", f"gui/{svc_uid}", str(plist_path)]
+        # Boot out from the system domain (LaunchDaemon, not LaunchAgent)
+        cmd = ["launchctl", "bootout", f"system/{_LAUNCHD_LABEL}"]
     elif platform == "linux":
         cmd = ["systemctl", "stop", "kai"]
     else:
@@ -658,13 +662,13 @@ def _start_service(platform: str, svc_uid: int, service_user: str, dry_run: bool
 
     Args:
         platform: "darwin" or "linux".
-        svc_uid: Numeric UID of the service user (for launchctl gui domain).
-        service_user: OS username that runs the service.
+        svc_uid: Numeric UID of the service user (unused, kept for API compat).
+        service_user: OS username that runs the service (unused on macOS).
         dry_run: If True, print the command without executing.
     """
     if platform == "darwin":
-        plist_path = Path(f"~{service_user}").expanduser() / "Library" / "LaunchAgents" / f"{_LAUNCHD_LABEL}.plist"
-        cmd = ["launchctl", "bootstrap", f"gui/{svc_uid}", str(plist_path)]
+        plist_path = Path("/Library/LaunchDaemons") / f"{_LAUNCHD_LABEL}.plist"
+        cmd = ["launchctl", "bootstrap", "system", str(plist_path)]
     elif platform == "linux":
         cmd = ["systemctl", "start", "kai"]
     else:
@@ -852,8 +856,13 @@ def _cmd_apply() -> None:
 
 def _apply_directories(install_path: Path, data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
     """Create the directory structure for the installation."""
+    # The workspace dir under the install path must be writable by the service
+    # user so history.py can create .claude/history/ inside it. The rest of
+    # the install tree stays root-owned and read-only.
+    workspace_path = install_path / "workspace"
     dirs = [
         (install_path, 0, 0, 0o755),  # root-owned install dir
+        (workspace_path, svc_uid, svc_gid, 0o755),  # user-writable workspace
         (data_path, svc_uid, svc_gid, 0o755),  # user-owned data dir
         (data_path / "logs", svc_uid, svc_gid, 0o755),
         (data_path / "files", svc_uid, svc_gid, 0o755),
@@ -1027,7 +1036,9 @@ def _apply_sudoers(service_user: str, dry_run: bool) -> None:
 def _apply_service(install_dir: str, data_dir: str, service_user: str, platform: str, dry_run: bool) -> None:
     """Generate the platform-specific service definition."""
     if platform == "darwin":
-        plist_dir = Path(f"~{service_user}").expanduser() / "Library" / "LaunchAgents"
+        # LaunchDaemons (not LaunchAgents) so the service runs under the
+        # system domain at boot, independent of any user login session.
+        plist_dir = Path("/Library/LaunchDaemons")
         plist_path = plist_dir / f"{_LAUNCHD_LABEL}.plist"
         content = _generate_launchd_plist(install_dir, data_dir, service_user)
 
@@ -1037,9 +1048,9 @@ def _apply_service(install_dir: str, data_dir: str, service_user: str, platform:
 
         plist_dir.mkdir(parents=True, exist_ok=True)
         plist_path.write_text(content)
-        # Plist should be owned by the service user
-        user_info = pwd.getpwnam(service_user)
-        os.chown(plist_path, user_info.pw_uid, user_info.pw_gid)
+        # LaunchDaemons must be owned by root:wheel
+        os.chown(plist_path, 0, 0)
+        os.chmod(plist_path, 0o644)
         print(f"  Wrote {plist_path}")
 
     elif platform == "linux":
@@ -1089,8 +1100,9 @@ def _check_path(path: Path, label: str) -> str:
 def _check_service_status(platform: str) -> str:
     """Check if the Kai service is running on the current platform."""
     if platform == "darwin":
+        # Check the system domain (LaunchDaemon, not per-user LaunchAgent)
         result = subprocess.run(
-            ["launchctl", "list", _LAUNCHD_LABEL],
+            ["launchctl", "print", f"system/{_LAUNCHD_LABEL}"],
             capture_output=True,
             text=True,
         )
