@@ -42,7 +42,7 @@ from telegram.error import NetworkError
 
 from kai import cron, services, sessions, webhook
 from kai.bot import _is_workspace_allowed, create_bot
-from kai.config import PROJECT_ROOT, load_config
+from kai.config import DATA_DIR, PROJECT_ROOT, _read_protected_file, load_config
 
 
 def setup_logging() -> None:
@@ -57,8 +57,9 @@ def setup_logging() -> None:
 
     Creates the logs/ directory if it doesn't already exist.
     """
-    log_dir = PROJECT_ROOT / "logs"
-    log_dir.mkdir(exist_ok=True)
+    # Logs go under DATA_DIR so they're writable even when source is read-only
+    log_dir = DATA_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     formatter = logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
 
@@ -100,8 +101,13 @@ def main() -> None:
     config = load_config()
     logging.info("Kai starting (model=%s, users=%s)", config.claude_model, config.allowed_user_ids)
 
-    # Load external service definitions from services.yaml (missing file is fine — graceful degradation)
-    loaded = services.load_services(PROJECT_ROOT / "services.yaml")
+    # Load external service definitions. In a protected installation, services.yaml
+    # lives in /etc/kai/ (root-owned). Falls back to PROJECT_ROOT for development.
+    protected_yaml = _read_protected_file("/etc/kai/services.yaml")
+    if protected_yaml:
+        loaded = services.load_services_from_string(protected_yaml)
+    else:
+        loaded = services.load_services(PROJECT_ROOT / "services.yaml")
     if loaded:
         names = ", ".join(loaded.keys())
         logging.info("Loaded %d service(s): %s", len(loaded), names)
@@ -204,7 +210,8 @@ def main() -> None:
             # bot.py writes this flag file when it starts processing a message
             # and deletes it when done. If it exists at startup, the process
             # crashed mid-response and the user should be notified.
-            flag = PROJECT_ROOT / ".responding_to"
+            # Flag file is under DATA_DIR (writable) not PROJECT_ROOT (may be read-only)
+            flag = DATA_DIR / ".responding_to"
             try:
                 chat_id = int(flag.read_text().strip())
                 await app.bot.send_message(

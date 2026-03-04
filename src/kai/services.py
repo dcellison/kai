@@ -117,51 +117,32 @@ class ServiceResponse:
 # ── Service loading and validation ──────────────────────────────────
 
 
-def load_services(config_path: Path) -> dict[str, ServiceDef]:
+def _load_and_register(raw: object) -> dict[str, ServiceDef]:
     """
-    Parse a services.yaml file, validate each entry, and populate the module registry.
+    Validate parsed YAML data and populate the module-level service registry.
 
-    Missing file is not an error — returns an empty dict (graceful degradation).
-    Invalid YAML syntax is a fatal error — raises SystemExit to prevent startup
-    with a silently broken config.
-
-    For each service entry:
-    - Validates URL is present and auth type is recognized
-    - Checks that the referenced env var is set (skips the service with a warning
-      if missing, unless auth.optional is True)
-    - Normalizes the HTTP method to uppercase
+    Shared implementation for both file-based and string-based loading. Expects
+    the already-parsed YAML output (from yaml.safe_load). Each service entry is
+    validated for required fields, auth type, and env var availability.
 
     Args:
-        config_path: Path to the services.yaml file.
+        raw: Parsed YAML data (output of yaml.safe_load). May be None, a dict,
+            or any other type if the YAML was empty or malformed.
 
     Returns:
         Dict mapping service names to their validated ServiceDef objects.
-
-    Raises:
-        SystemExit: If the YAML file exists but contains invalid syntax.
     """
     global _services
 
-    if not config_path.exists():
-        log.info("No services config at %s — external services disabled", config_path)
-        _services = {}
-        return _services
-
-    try:
-        raw = yaml.safe_load(config_path.read_text())
-    except yaml.YAMLError as e:
-        log.critical("Invalid YAML in %s: %s", config_path, e)
-        raise SystemExit(1) from e
-
     # Handle empty file or non-dict top level
     if not isinstance(raw, dict):
-        log.warning("Services config is not a YAML mapping — ignoring")
+        log.warning("Services config is not a YAML mapping - ignoring")
         _services = {}
         return _services
 
     services_raw = raw.get("services", {})
     if not isinstance(services_raw, dict):
-        log.warning("'services' key is not a mapping — ignoring")
+        log.warning("'services' key is not a mapping - ignoring")
         _services = {}
         return _services
 
@@ -169,24 +150,24 @@ def load_services(config_path: Path) -> dict[str, ServiceDef]:
 
     for name, entry in services_raw.items():
         if not isinstance(entry, dict):
-            log.warning("Service '%s': entry is not a mapping — skipping", name)
+            log.warning("Service '%s': entry is not a mapping - skipping", name)
             continue
 
         # URL is required
         url = entry.get("url")
         if not url:
-            log.warning("Service '%s': missing 'url' — skipping", name)
+            log.warning("Service '%s': missing 'url' - skipping", name)
             continue
 
         # Parse and validate auth config
         auth_raw = entry.get("auth", {})
         if not isinstance(auth_raw, dict):
-            log.warning("Service '%s': 'auth' is not a mapping — skipping", name)
+            log.warning("Service '%s': 'auth' is not a mapping - skipping", name)
             continue
 
         auth_type = auth_raw.get("type", "none")
         if auth_type not in _VALID_AUTH_TYPES:
-            log.warning("Service '%s': invalid auth type '%s' — skipping", name, auth_type)
+            log.warning("Service '%s': invalid auth type '%s' - skipping", name, auth_type)
             continue
 
         auth = AuthConfig(
@@ -199,9 +180,9 @@ def load_services(config_path: Path) -> dict[str, ServiceDef]:
         # Check that the referenced env var is actually set
         if auth.type != "none" and auth.env and not os.environ.get(auth.env):
             if auth.optional:
-                log.info("Service '%s': env var %s not set (optional) — available without auth", name, auth.env)
+                log.info("Service '%s': env var %s not set (optional) - available without auth", name, auth.env)
             else:
-                log.warning("Service '%s': env var %s not set — skipping", name, auth.env)
+                log.warning("Service '%s': env var %s not set - skipping", name, auth.env)
                 continue
 
         # Parse static headers and params
@@ -228,6 +209,70 @@ def load_services(config_path: Path) -> dict[str, ServiceDef]:
 
     _services = result
     return _services
+
+
+def load_services(config_path: Path) -> dict[str, ServiceDef]:
+    """
+    Parse a services.yaml file, validate each entry, and populate the module registry.
+
+    Missing file is not an error - returns an empty dict (graceful degradation).
+    Invalid YAML syntax is a fatal error - raises SystemExit to prevent startup
+    with a silently broken config.
+
+    For each service entry:
+    - Validates URL is present and auth type is recognized
+    - Checks that the referenced env var is set (skips the service with a warning
+      if missing, unless auth.optional is True)
+    - Normalizes the HTTP method to uppercase
+
+    Args:
+        config_path: Path to the services.yaml file.
+
+    Returns:
+        Dict mapping service names to their validated ServiceDef objects.
+
+    Raises:
+        SystemExit: If the YAML file exists but contains invalid syntax.
+    """
+    global _services
+
+    if not config_path.exists():
+        log.info("No services config at %s - external services disabled", config_path)
+        _services = {}
+        return _services
+
+    try:
+        raw = yaml.safe_load(config_path.read_text())
+    except yaml.YAMLError as e:
+        log.critical("Invalid YAML in %s: %s", config_path, e)
+        raise SystemExit(1) from e
+
+    return _load_and_register(raw)
+
+
+def load_services_from_string(text: str) -> dict[str, ServiceDef]:
+    """
+    Parse a YAML string, validate each entry, and populate the module registry.
+
+    Same validation as load_services() but reads from a string instead of a file.
+    Used when loading services.yaml via sudo from /etc/kai/ in a protected installation.
+
+    Args:
+        text: Raw YAML string containing service definitions.
+
+    Returns:
+        Dict mapping service names to their validated ServiceDef objects.
+
+    Raises:
+        SystemExit: If the YAML string contains invalid syntax.
+    """
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        log.critical("Invalid YAML in protected services config: %s", e)
+        raise SystemExit(1) from e
+
+    return _load_and_register(raw)
 
 
 # ── Module-level accessors ──────────────────────────────────────────

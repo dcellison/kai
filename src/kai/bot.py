@@ -54,7 +54,7 @@ from telegram.ext import (
 
 from kai import services, sessions, webhook
 from kai.claude import PersistentClaude
-from kai.config import PROJECT_ROOT, Config
+from kai.config import DATA_DIR, Config
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
 from kai.transcribe import TranscriptionError, transcribe_voice
@@ -89,8 +89,9 @@ log = logging.getLogger(__name__)
 EDIT_INTERVAL = 2.0
 
 # Flag file written while processing a message. If the process crashes mid-response,
-# main.py detects this file at startup and notifies the user to resend.
-_RESPONDING_FLAG = PROJECT_ROOT / ".responding_to"
+# main.py detects this file at startup and notifies the user to resend. Lives under
+# DATA_DIR so it's writable even when source is in read-only /opt/kai/.
+_RESPONDING_FLAG = DATA_DIR / ".responding_to"
 
 
 # ── Crash recovery flag ──────────────────────────────────────────────

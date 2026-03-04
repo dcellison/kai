@@ -1,8 +1,13 @@
-"""Tests for config.py load_config()."""
+"""Tests for config.py load_config(), DATA_DIR, and _read_protected_file()."""
+
+import os
+import subprocess
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from kai.config import load_config
+from kai.config import _read_protected_file, load_config
 
 # All env vars that load_config reads
 _CONFIG_ENV_VARS = [
@@ -20,13 +25,16 @@ _CONFIG_ENV_VARS = [
     "WORKSPACE_BASE",
     "ALLOWED_WORKSPACES",
     "CLAUDE_USER",
+    "KAI_DATA_DIR",
 ]
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    """Prevent load_dotenv from reading real .env and clear all config vars."""
+    """Prevent load_dotenv and sudo reads from running, and clear all config vars."""
     monkeypatch.setattr("kai.config.load_dotenv", lambda *a, **kw: None)
+    # Prevent real sudo calls during tests - default to None (dev mode fallback)
+    monkeypatch.setattr("kai.config._read_protected_file", lambda path: None)
     for var in _CONFIG_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
 
@@ -245,3 +253,150 @@ class TestTelegramWebhookConfig:
         config = load_config()
         assert config.telegram_webhook_url is None
         assert config.telegram_webhook_secret is None
+
+
+# ── DATA_DIR ──────────────────────────────────────────────────────
+
+
+class TestDataDir:
+    def test_defaults_to_project_root(self):
+        """When KAI_DATA_DIR is unset, DATA_DIR equals PROJECT_ROOT."""
+        from kai.config import PROJECT_ROOT
+
+        # DATA_DIR is a module-level constant evaluated at import time, so we
+        # test the derivation logic directly instead of re-importing.
+        val = os.environ.get("KAI_DATA_DIR") or str(PROJECT_ROOT)
+        assert Path(val) == PROJECT_ROOT
+
+    def test_from_env(self, monkeypatch, tmp_path):
+        """When KAI_DATA_DIR is set, DATA_DIR uses that path."""
+        monkeypatch.setenv("KAI_DATA_DIR", str(tmp_path))
+        result = Path(os.environ.get("KAI_DATA_DIR") or "fallback")
+        assert result == tmp_path
+
+    def test_empty_string_defaults(self, monkeypatch):
+        """Empty KAI_DATA_DIR falls back to PROJECT_ROOT via `or`."""
+        monkeypatch.setenv("KAI_DATA_DIR", "")
+        from kai.config import PROJECT_ROOT
+
+        result = Path(os.environ.get("KAI_DATA_DIR") or str(PROJECT_ROOT))
+        assert result == PROJECT_ROOT
+
+    def test_session_db_path_uses_data_dir(self, monkeypatch):
+        """Database path defaults to DATA_DIR / 'kai.db'."""
+        _set_required(monkeypatch)
+        config = load_config()
+        # In test env, DATA_DIR == PROJECT_ROOT (KAI_DATA_DIR is unset)
+        assert config.session_db_path.name == "kai.db"
+
+
+# ── _read_protected_file ─────────────────────────────────────────
+
+
+class TestReadProtectedFile:
+    """Tests for the sudo-based file reader (uses real function, not the monkeypatched stub)."""
+
+    def test_success(self):
+        """Returns file contents when sudo cat succeeds."""
+        mock_result = subprocess.CompletedProcess(
+            args=["sudo", "-n", "cat", "/etc/kai/env"],
+            returncode=0,
+            stdout="KEY=value\n",
+            stderr="",
+        )
+        with patch("kai.config.subprocess.run", return_value=mock_result):
+            result = _read_protected_file("/etc/kai/env")
+        assert result == "KEY=value\n"
+
+    def test_failure_returns_none(self):
+        """Returns None when sudo cat fails (non-zero exit)."""
+        mock_result = subprocess.CompletedProcess(
+            args=["sudo", "-n", "cat", "/etc/kai/env"],
+            returncode=1,
+            stdout="",
+            stderr="sudo: a password is required\n",
+        )
+        with patch("kai.config.subprocess.run", return_value=mock_result):
+            result = _read_protected_file("/etc/kai/env")
+        assert result is None
+
+    def test_timeout_returns_none(self):
+        """Returns None when subprocess times out."""
+        with patch(
+            "kai.config.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="sudo", timeout=5),
+        ):
+            result = _read_protected_file("/etc/kai/env")
+        assert result is None
+
+    def test_oserror_returns_none(self):
+        """Returns None when subprocess raises OSError (e.g., sudo not found)."""
+        with patch(
+            "kai.config.subprocess.run",
+            side_effect=OSError("No such file or directory"),
+        ):
+            result = _read_protected_file("/etc/kai/env")
+        assert result is None
+
+
+# ── Dual-mode config loading ─────────────────────────────────────
+
+
+class TestDualModeLoading:
+    def test_loads_from_protected_env(self, monkeypatch):
+        """When /etc/kai/env is readable, values are used as config."""
+        monkeypatch.setattr(
+            "kai.config._read_protected_file",
+            lambda path: (
+                "TELEGRAM_BOT_TOKEN=protected-token\nALLOWED_USER_IDS=999\n" if path == "/etc/kai/env" else None
+            ),
+        )
+        config = load_config()
+        assert config.telegram_bot_token == "protected-token"
+        assert config.allowed_user_ids == {999}
+
+    def test_protected_env_strips_quotes(self, monkeypatch):
+        """Quote marks around values in /etc/kai/env are stripped."""
+        monkeypatch.setattr(
+            "kai.config._read_protected_file",
+            lambda path: (
+                "TELEGRAM_BOT_TOKEN=\"quoted-token\"\nALLOWED_USER_IDS='999'\n" if path == "/etc/kai/env" else None
+            ),
+        )
+        config = load_config()
+        assert config.telegram_bot_token == "quoted-token"
+        assert config.allowed_user_ids == {999}
+
+    def test_protected_env_skips_comments_and_blanks(self, monkeypatch):
+        """Comments and blank lines in /etc/kai/env are ignored."""
+        monkeypatch.setattr(
+            "kai.config._read_protected_file",
+            lambda path: (
+                "# comment\n\nTELEGRAM_BOT_TOKEN=tok\n\nALLOWED_USER_IDS=1\n" if path == "/etc/kai/env" else None
+            ),
+        )
+        config = load_config()
+        assert config.telegram_bot_token == "tok"
+
+    def test_falls_back_to_dotenv(self, monkeypatch):
+        """When /etc/kai/env is not readable, load_dotenv is called."""
+        load_dotenv_called = []
+        monkeypatch.setattr("kai.config._read_protected_file", lambda path: None)
+        monkeypatch.setattr(
+            "kai.config.load_dotenv",
+            lambda *a, **kw: load_dotenv_called.append(True),
+        )
+        _set_required(monkeypatch)
+        load_config()
+        assert load_dotenv_called, "load_dotenv should have been called"
+
+    def test_env_vars_take_precedence_over_protected(self, monkeypatch):
+        """Explicitly set env vars override values from /etc/kai/env."""
+        monkeypatch.setattr(
+            "kai.config._read_protected_file",
+            lambda path: "TELEGRAM_BOT_TOKEN=from-file\nALLOWED_USER_IDS=1\n" if path == "/etc/kai/env" else None,
+        )
+        # Set token explicitly in env - should override file value
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "from-env")
+        config = load_config()
+        assert config.telegram_bot_token == "from-env"

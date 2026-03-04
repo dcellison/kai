@@ -14,6 +14,7 @@ derived from this file's location in the source tree: src/kai/config.py -> proje
 
 import logging
 import os
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,6 +22,12 @@ from dotenv import load_dotenv
 
 # Derive project root from file location: src/kai/config.py -> src/kai -> src -> project root
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# Writable data directory for runtime artifacts (database, logs, crash flag).
+# Defaults to PROJECT_ROOT for development. In a protected installation where
+# source lives in read-only /opt/kai/, this points to user-owned /var/lib/kai/.
+# Uses `or` so that an empty string also falls back (same pattern as CLAUDE_USER).
+DATA_DIR = Path(os.environ.get("KAI_DATA_DIR") or str(PROJECT_ROOT))
 
 
 @dataclass(frozen=True)
@@ -77,8 +84,8 @@ class Config:
     claude_max_budget_usd: float = 10.0
     claude_workspace: Path = field(default_factory=lambda: PROJECT_ROOT / "workspace")
 
-    # Database
-    session_db_path: Path = field(default_factory=lambda: PROJECT_ROOT / "kai.db")
+    # Database - uses DATA_DIR so the db lands in the writable data directory
+    session_db_path: Path = field(default_factory=lambda: DATA_DIR / "kai.db")
 
     # Webhook server
     webhook_port: int = 8080
@@ -103,6 +110,30 @@ class Config:
     claude_user: str | None = None
 
 
+def _read_protected_file(path: str) -> str | None:
+    """
+    Read a root-owned file via sudo cat.
+
+    Used to load config from /etc/kai/ in a protected installation where the
+    bot process runs as an unprivileged user. The -n flag ensures sudo fails
+    immediately if no NOPASSWD rule exists (avoids blocking on a password prompt).
+
+    Returns:
+        File contents as a string, or None on any failure (missing file,
+        no sudoers rule, timeout, etc.).
+    """
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "cat", path],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.stdout if result.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
 def load_config() -> Config:
     """
     Load application configuration from environment variables.
@@ -118,7 +149,19 @@ def load_config() -> Config:
     Raises:
         SystemExit: If required environment variables are missing or invalid.
     """
-    load_dotenv(PROJECT_ROOT / ".env")
+    # Try protected config first (/etc/kai/env, root-owned). In a protected
+    # installation, secrets live here instead of .env. Falls back to local
+    # .env for development. Uses setdefault so explicitly set env vars
+    # (e.g., from the launchd plist) take precedence - same as load_dotenv().
+    protected_env = _read_protected_file("/etc/kai/env")
+    if protected_env:
+        for line in protected_env.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+    else:
+        load_dotenv(PROJECT_ROOT / ".env")
 
     # Validate required: Telegram bot token
     token = os.environ.get("TELEGRAM_BOT_TOKEN")

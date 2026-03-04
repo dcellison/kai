@@ -9,6 +9,7 @@ from kai.services import (
     call_service,
     get_available_services,
     load_services,
+    load_services_from_string,
 )
 
 # ── Fixtures ────────────────────────────────────────────────────────
@@ -643,7 +644,58 @@ services:
         with patch("kai.services.aiohttp.ClientSession", return_value=mock_session):
             result = await call_service("api", body={"query": "test"})
 
-        # HTTP completed, even though status is 429 — that's still success=True
+        # HTTP completed, even though status is 429 - that's still success=True
         assert result.success is True
         assert result.status == 429
         assert "rate limited" in result.body
+
+
+# ── TestLoadServicesFromString ────────────────────────────────────
+
+
+class TestLoadServicesFromString:
+    """Tests for loading service definitions from a YAML string (sudo-read path)."""
+
+    def test_valid_yaml_string(self, monkeypatch):
+        """Valid YAML string populates the registry just like file-based loading."""
+        monkeypatch.setenv("TEST_KEY", "secret123")
+        yaml_text = """
+services:
+  testapi:
+    url: https://api.example.com/v1
+    method: POST
+    auth:
+      type: bearer
+      env: TEST_KEY
+    description: Test API
+"""
+        result = load_services_from_string(yaml_text)
+        assert "testapi" in result
+        assert result["testapi"].url == "https://api.example.com/v1"
+        assert result["testapi"].method == "POST"
+        assert result["testapi"].auth.type == "bearer"
+
+    def test_invalid_yaml_raises_system_exit(self):
+        """Malformed YAML string causes SystemExit (same as file-based loading)."""
+        with pytest.raises(SystemExit):
+            load_services_from_string("services:\n  bad: [unbalanced: {")
+
+    def test_empty_string_returns_empty(self):
+        """Empty YAML string returns an empty registry."""
+        result = load_services_from_string("")
+        assert result == {}
+
+    def test_missing_env_var_skips_service(self, monkeypatch):
+        """Services with missing required env vars are skipped (same as file-based)."""
+        monkeypatch.delenv("NOPE_KEY", raising=False)
+        yaml_text = """
+services:
+  broken:
+    url: https://api.example.com
+    method: GET
+    auth:
+      type: bearer
+      env: NOPE_KEY
+"""
+        result = load_services_from_string(yaml_text)
+        assert "broken" not in result
