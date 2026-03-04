@@ -600,7 +600,7 @@ class TestApplyMigrate:
 
 
 class TestStopService:
-    def test_darwin(self, monkeypatch):
+    def test_darwin(self, monkeypatch, tmp_path):
         """Calls launchctl bootout on macOS."""
         calls: list[list[str]] = []
 
@@ -609,6 +609,8 @@ class TestStopService:
             return subprocess.CompletedProcess(args=cmd, returncode=0)
 
         monkeypatch.setattr("kai.install.subprocess.run", mock_run)
+        # Mock expanduser since "kai" user may not exist on CI runners
+        monkeypatch.setattr("kai.install.Path.expanduser", lambda self: tmp_path / "home")
 
         _stop_service("darwin", svc_uid=501, service_user="kai", dry_run=False)
 
@@ -631,13 +633,15 @@ class TestStopService:
 
         assert calls == [["systemctl", "stop", "kai"]]
 
-    def test_dry_run(self, monkeypatch, capsys):
+    def test_dry_run(self, monkeypatch, tmp_path, capsys):
         """Dry run prints the command without executing."""
         calls: list = []
         monkeypatch.setattr(
             "kai.install.subprocess.run",
             lambda *a, **kw: calls.append(True),
         )
+        # Mock expanduser since "kai" user may not exist on CI runners
+        monkeypatch.setattr("kai.install.Path.expanduser", lambda self: tmp_path / "home")
 
         _stop_service("darwin", svc_uid=501, service_user="kai", dry_run=True)
 
@@ -647,7 +651,7 @@ class TestStopService:
 
 
 class TestStartService:
-    def test_darwin(self, monkeypatch):
+    def test_darwin(self, monkeypatch, tmp_path):
         """Calls launchctl bootstrap on macOS."""
         calls: list[list[str]] = []
 
@@ -656,6 +660,8 @@ class TestStartService:
             return subprocess.CompletedProcess(args=cmd, returncode=0)
 
         monkeypatch.setattr("kai.install.subprocess.run", mock_run)
+        # Mock expanduser since "kai" user may not exist on CI runners
+        monkeypatch.setattr("kai.install.Path.expanduser", lambda self: tmp_path / "home")
 
         _start_service("darwin", svc_uid=501, service_user="kai", dry_run=False)
 

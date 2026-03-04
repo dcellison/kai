@@ -1036,7 +1036,11 @@ def _apply_service(install_dir: str, data_dir: str, service_user: str, platform:
 
 def _check_path(path: Path, label: str) -> str:
     """Check if a path exists and report its ownership."""
-    if not path.exists():
+    try:
+        exists = path.exists()
+    except PermissionError:
+        return f"{label}: {path} (permission denied)"
+    if not exists:
         return f"{label}: {path} (not found)"
 
     stat = path.stat()
