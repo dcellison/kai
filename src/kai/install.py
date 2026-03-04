@@ -590,14 +590,140 @@ def _generate_systemd_unit(install_dir: str, data_dir: str, service_user: str) -
     """)
 
 
+def _stop_service(platform: str, svc_uid: int, service_user: str, dry_run: bool) -> None:
+    """
+    Stop the Kai service before applying changes.
+
+    Best-effort: uses check=False since the service may not be running
+    (first install) or may not exist yet. Failing to stop is not fatal.
+
+    Args:
+        platform: "darwin" or "linux".
+        svc_uid: Numeric UID of the service user (for launchctl gui domain).
+        service_user: OS username that runs the service.
+        dry_run: If True, print the command without executing.
+    """
+    if platform == "darwin":
+        plist_path = Path(f"~{service_user}").expanduser() / "Library" / "LaunchAgents" / f"{_LAUNCHD_LABEL}.plist"
+        cmd = ["launchctl", "bootout", f"gui/{svc_uid}", str(plist_path)]
+    elif platform == "linux":
+        cmd = ["systemctl", "stop", "kai"]
+    else:
+        print(f"  Warning: cannot stop service on platform '{platform}'")
+        return
+
+    if dry_run:
+        print(f"[DRY RUN] Would run: {' '.join(cmd)}")
+    else:
+        subprocess.run(cmd, check=False, capture_output=True)
+        print(f"  Stopped service ({' '.join(cmd[:2])})")
+
+
+def _start_service(platform: str, svc_uid: int, service_user: str, dry_run: bool) -> None:
+    """
+    Start the Kai service after applying changes.
+
+    Best-effort: uses check=False since launchctl/systemctl may report
+    warnings that aren't actually failures (e.g., service already running).
+
+    Args:
+        platform: "darwin" or "linux".
+        svc_uid: Numeric UID of the service user (for launchctl gui domain).
+        service_user: OS username that runs the service.
+        dry_run: If True, print the command without executing.
+    """
+    if platform == "darwin":
+        plist_path = Path(f"~{service_user}").expanduser() / "Library" / "LaunchAgents" / f"{_LAUNCHD_LABEL}.plist"
+        cmd = ["launchctl", "bootstrap", f"gui/{svc_uid}", str(plist_path)]
+    elif platform == "linux":
+        cmd = ["systemctl", "start", "kai"]
+    else:
+        print(f"  Warning: cannot start service on platform '{platform}'")
+        return
+
+    if dry_run:
+        print(f"[DRY RUN] Would run: {' '.join(cmd)}")
+    else:
+        subprocess.run(cmd, check=False, capture_output=True)
+        print(f"  Started service ({' '.join(cmd[:2])})")
+
+
+def _apply_migrate(data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
+    """
+    Migrate runtime data from the development directory to the data directory.
+
+    One-time migration of database and log files. Safe to run multiple times:
+    existing files at the destination are never overwritten, and source files
+    are never deleted (they serve as backups).
+
+    Args:
+        data_path: Writable data directory (e.g., /var/lib/kai).
+        svc_uid: Numeric UID for file ownership.
+        svc_gid: Numeric GID for file ownership.
+        dry_run: If True, print actions without executing.
+    """
+    # -- Database migration --
+    db_src = PROJECT_ROOT / "kai.db"
+    db_dst = data_path / "kai.db"
+
+    if db_src.exists() and not db_dst.exists():
+        if dry_run:
+            print(f"[DRY RUN] Would copy database: {db_src} -> {db_dst}")
+            print(f"[DRY RUN] Would verify integrity: sqlite3 {db_dst} 'PRAGMA integrity_check;'")
+            print(f"[DRY RUN] Would set ownership: {db_dst} ({svc_uid}:{svc_gid})")
+        else:
+            shutil.copy2(db_src, db_dst)
+            print(f"  Copied database to {db_dst}")
+
+            # Verify the copied database is intact
+            result = subprocess.run(
+                ["sqlite3", str(db_dst), "PRAGMA integrity_check;"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0 or "ok" not in result.stdout.lower():
+                print(f"  Warning: database integrity check failed: {result.stderr.strip()}")
+            else:
+                print("  Database integrity check passed")
+
+            os.chown(db_dst, svc_uid, svc_gid)
+    elif db_dst.exists():
+        print("  Database already exists at destination, skipping migration")
+    elif not db_src.exists():
+        print("  No source database found, skipping migration")
+
+    # -- Log migration --
+    logs_src = PROJECT_ROOT / "logs"
+    logs_dst = data_path / "logs"
+
+    if logs_src.exists():
+        # Collect all log files (daily rotation produces .log, .log.1, etc.)
+        log_files = list(logs_src.glob("*.log*"))
+        if log_files:
+            if dry_run:
+                for f in log_files:
+                    print(f"[DRY RUN] Would copy log: {f} -> {logs_dst / f.name}")
+                print(f"[DRY RUN] Would set ownership: {logs_dst} ({svc_uid}:{svc_gid})")
+            else:
+                for f in log_files:
+                    dst = logs_dst / f.name
+                    if not dst.exists():
+                        shutil.copy2(f, dst)
+                        print(f"  Copied log: {f.name}")
+                # Set ownership on the entire logs directory
+                _set_ownership(logs_dst, svc_uid, svc_gid, recursive=True)
+
+
 def _cmd_apply() -> None:
     """
     Read install.conf and perform the installation. Requires root.
 
     First-time installation creates the directory structure, copies source,
-    creates a venv, writes secrets, configures sudoers, and generates a
-    service definition. Updates detect existing installations and only
-    change what's needed.
+    creates a venv, writes secrets, configures sudoers, migrates data,
+    and generates a service definition. The service is stopped before
+    changes begin and started after everything completes. Updates detect
+    existing installations and only change what's needed.
 
     When DRY_RUN=1 is set in the environment, every action is printed
     without being executed.
@@ -651,6 +777,9 @@ def _cmd_apply() -> None:
         print(f"Creating new installation at {install_dir}")
     print()
 
+    # -- Stop service before making changes --
+    _stop_service(platform, svc_uid, service_user, dry_run)
+
     # -- Step 1: Create directories --
     _apply_directories(install_path, data_path, svc_uid, svc_gid, dry_run)
 
@@ -669,8 +798,14 @@ def _cmd_apply() -> None:
     # -- Step 6: Configure sudoers --
     _apply_sudoers(service_user, dry_run)
 
-    # -- Step 7: Generate service definition --
+    # -- Step 7: Migrate runtime data --
+    _apply_migrate(data_path, svc_uid, svc_gid, dry_run)
+
+    # -- Step 8: Generate service definition --
     _apply_service(install_dir, data_dir, service_user, platform, dry_run)
+
+    # -- Start service after all changes --
+    _start_service(platform, svc_uid, service_user, dry_run)
 
     # -- Summary --
     print()
@@ -683,8 +818,6 @@ def _cmd_apply() -> None:
         print(f"  Data:    {data_dir}")
         print("  Secrets: /etc/kai/env")
         print(f"  User:    {service_user}")
-        if is_update:
-            print("\nRestart the service to pick up changes.")
 
 
 def _apply_directories(install_path: Path, data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:

@@ -33,6 +33,11 @@ Requires **Python 3.13+**. See the
 [Getting Started](https://github.com/dcellison/kai/wiki/Getting-Started)
 wiki page for full setup instructions including `.env` configuration.
 
+**Development vs. production:** `make setup` installs in editable mode with dev
+dependencies for local development. For a protected deployment to `/opt/kai/`,
+use `python -m kai install config` followed by `sudo python -m kai install apply`
+instead. See the README for details.
+
 ## Branch and PR Workflow
 
 Direct pushes to `main` are blocked. All changes go through pull requests

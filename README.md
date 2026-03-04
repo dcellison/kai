@@ -254,31 +254,47 @@ sudo systemctl stop kai
 ## Project Structure
 
 ```
-kai/
-├── src/kai/              # Source package
-│   ├── __init__.py       # Version
-│   ├── __main__.py       # python -m kai entry point
-│   ├── main.py           # Async startup and shutdown
-│   ├── bot.py            # Telegram handlers, commands, message routing
-│   ├── claude.py         # Persistent Claude Code subprocess management
-│   ├── config.py         # Environment config loading
-│   ├── sessions.py       # SQLite session, job, and settings storage
-│   ├── cron.py           # Scheduled job execution (APScheduler)
-│   ├── webhook.py        # HTTP server: GitHub/generic webhooks, scheduling API
-│   ├── history.py        # Conversation history (read/write JSONL logs)
-│   ├── locks.py          # Per-chat async locks and stop events
-│   ├── totp.py           # TOTP verification, rate limiting, and CLI
-│   ├── transcribe.py     # Voice message transcription (ffmpeg + whisper-cpp)
-│   └── tts.py            # Text-to-speech synthesis (Piper TTS + ffmpeg)
-├── tests/                # Test suite
-├── logs/                 # Daily-rotated log files (gitignored)
-├── models/               # Whisper and Piper model files (gitignored)
-├── workspace/            # Claude Code working directory
-│   └── .claude/          # Identity, memory, and chat history
-├── pyproject.toml        # Package metadata and dependencies
-├── Makefile              # Common dev commands
-├── .env.example          # Environment variable template
-└── LICENSE               # Apache 2.0
+kai/                          # Development layout
+├── src/kai/                  # Source package
+│   ├── __init__.py           # Version
+│   ├── __main__.py           # python -m kai entry point
+│   ├── main.py               # Async startup and shutdown
+│   ├── bot.py                # Telegram handlers, commands, message routing
+│   ├── claude.py             # Persistent Claude Code subprocess management
+│   ├── config.py             # Environment config loading
+│   ├── sessions.py           # SQLite session, job, and settings storage
+│   ├── cron.py               # Scheduled job execution (APScheduler)
+│   ├── webhook.py            # HTTP server: GitHub/generic webhooks, scheduling API
+│   ├── history.py            # Conversation history (read/write JSONL logs)
+│   ├── locks.py              # Per-chat async locks and stop events
+│   ├── install.py            # Protected installation tooling
+│   ├── totp.py               # TOTP verification, rate limiting, and CLI
+│   ├── transcribe.py         # Voice message transcription (ffmpeg + whisper-cpp)
+│   └── tts.py                # Text-to-speech synthesis (Piper TTS + ffmpeg)
+├── tests/                    # Test suite
+├── logs/                     # Daily-rotated log files (gitignored)
+├── models/                   # Whisper and Piper model files (gitignored)
+├── workspace/                # Claude Code working directory
+│   └── .claude/              # Identity, memory, and chat history
+├── pyproject.toml            # Package metadata and dependencies
+├── Makefile                  # Common dev commands
+├── .env.example              # Environment variable template
+└── LICENSE                   # Apache 2.0
+
+/opt/kai/                     # Production layout (created by install apply)
+├── src/kai/                  # Read-only source (root-owned)
+├── venv/                     # Self-contained virtualenv (root-owned)
+└── models/                   # Whisper/Piper models (root-owned)
+
+/var/lib/kai/                 # Runtime data (service-user-owned)
+├── kai.db                    # SQLite database
+├── logs/                     # Log files
+└── files/                    # File exchange directory
+
+/etc/kai/                     # Secrets (root-owned, mode 0600)
+├── env                       # Environment variables
+├── services.yaml             # External service configs
+└── totp.secret               # TOTP secret (if enabled)
 ```
 
 ## Development
@@ -291,6 +307,26 @@ make check      # Lint + format check (CI-friendly)
 make test       # Run test suite
 make run        # Start the bot
 ```
+
+## Production deployment
+
+For a hardened installation that separates source, data, and secrets across protected directories:
+
+```bash
+python -m kai install config       # Interactive Q&A, writes install.conf (no sudo)
+sudo python -m kai install apply   # Creates /opt layout, migrates data (root)
+python -m kai install status       # Shows current installation state (no sudo)
+```
+
+This creates a split layout:
+
+- `/opt/kai/` - read-only source and venv (root-owned)
+- `/var/lib/kai/` - writable runtime data: database, logs, files (service-user-owned)
+- `/etc/kai/` - secrets: env file, service configs, TOTP (root-owned, mode 0600)
+
+The install module handles directory creation, source copying, venv setup, secret deployment, sudoers rules, data migration, service definition generation, and service lifecycle (stop/start). Use `--dry-run` (or `DRY_RUN=1`) to preview changes without applying them.
+
+The service user reads secrets via narrowly-scoped sudoers rules (`sudo cat` on specific files only). The inner Claude process cannot read secrets or modify source code.
 
 ## License
 

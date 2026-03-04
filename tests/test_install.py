@@ -8,6 +8,7 @@ import pytest
 
 from kai.install import (
     _LAUNCHD_LABEL,
+    _apply_migrate,
     _check_path,
     _check_service_status,
     _cmd_apply,
@@ -18,6 +19,8 @@ from kai.install import (
     _generate_launchd_plist,
     _generate_sudoers,
     _generate_systemd_unit,
+    _start_service,
+    _stop_service,
     _validate_port,
     _validate_positive_float,
     _validate_positive_int,
@@ -450,6 +453,244 @@ class TestCmdStatus:
         _cmd_status()
         output = capsys.readouterr().out
         assert "Installation Status" in output
+
+
+# ── Migration ────────────────────────────────────────────────────────
+
+
+class TestApplyMigrate:
+    def test_copies_database(self, tmp_path, monkeypatch):
+        """Copies kai.db from PROJECT_ROOT to data_path when destination doesn't exist."""
+        # Set up source database
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "kai.db").write_text("fake-db-content")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+
+        # Mock subprocess (sqlite3 integrity check) and os.chown
+        monkeypatch.setattr(
+            "kai.install.subprocess.run",
+            lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=0, stdout="ok\n"),
+        )
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        assert (data_path / "kai.db").exists()
+        assert (data_path / "kai.db").read_text() == "fake-db-content"
+
+    def test_verifies_integrity(self, tmp_path, monkeypatch):
+        """Runs PRAGMA integrity_check on the copied database."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "kai.db").write_text("fake-db")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+
+        # Capture the subprocess call to verify the integrity check command
+        calls: list[list[str]] = []
+
+        def mock_run(*args, **kwargs):
+            if args:
+                calls.append(list(args[0]))
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="ok\n")
+
+        monkeypatch.setattr("kai.install.subprocess.run", mock_run)
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        # Find the sqlite3 call
+        sqlite_calls = [c for c in calls if "sqlite3" in c[0]]
+        assert len(sqlite_calls) == 1
+        assert "PRAGMA integrity_check;" in sqlite_calls[0][2]
+
+    def test_skips_if_target_exists(self, tmp_path, monkeypatch, capsys):
+        """Does not overwrite an existing database at the destination."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "kai.db").write_text("source-content")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "kai.db").write_text("existing-content")
+
+        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        # Destination should be unchanged
+        assert (data_path / "kai.db").read_text() == "existing-content"
+        assert "already exists" in capsys.readouterr().out
+
+    def test_copies_logs(self, tmp_path, monkeypatch):
+        """Copies log files from PROJECT_ROOT/logs to data_path/logs."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+        logs_src = tmp_path / "src" / "logs"
+        logs_src.mkdir()
+        (logs_src / "kai.log").write_text("log1")
+        (logs_src / "kai.log.1").write_text("log2")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        logs_dst = data_path / "logs"
+        logs_dst.mkdir()
+
+        # Mock os.chown for ownership setting
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        assert (logs_dst / "kai.log").read_text() == "log1"
+        assert (logs_dst / "kai.log.1").read_text() == "log2"
+
+    def test_preserves_original(self, tmp_path, monkeypatch):
+        """Source files are never deleted during migration."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "kai.db").write_text("original")
+        logs_src = tmp_path / "src" / "logs"
+        logs_src.mkdir()
+        (logs_src / "kai.log").write_text("original-log")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+
+        monkeypatch.setattr(
+            "kai.install.subprocess.run",
+            lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=0, stdout="ok\n"),
+        )
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        # Source files must still exist
+        assert (tmp_path / "src" / "kai.db").exists()
+        assert (logs_src / "kai.log").exists()
+
+    def test_dry_run(self, tmp_path, monkeypatch, capsys):
+        """Dry run prints actions without copying anything."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "kai.db").write_text("fake-db")
+        logs_src = tmp_path / "src" / "logs"
+        logs_src.mkdir()
+        (logs_src / "kai.log").write_text("log-content")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+
+        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=True)
+
+        output = capsys.readouterr().out
+        assert "[DRY RUN]" in output
+        # Nothing should have been copied
+        assert not (data_path / "kai.db").exists()
+        assert not (data_path / "logs" / "kai.log").exists()
+
+
+# ── Service lifecycle ────────────────────────────────────────────────
+
+
+class TestStopService:
+    def test_darwin(self, monkeypatch):
+        """Calls launchctl bootout on macOS."""
+        calls: list[list[str]] = []
+
+        def mock_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(args=cmd, returncode=0)
+
+        monkeypatch.setattr("kai.install.subprocess.run", mock_run)
+
+        _stop_service("darwin", svc_uid=501, service_user="kai", dry_run=False)
+
+        assert len(calls) == 1
+        assert calls[0][0] == "launchctl"
+        assert calls[0][1] == "bootout"
+        assert "gui/501" in calls[0][2]
+
+    def test_linux(self, monkeypatch):
+        """Calls systemctl stop on Linux."""
+        calls: list[list[str]] = []
+
+        def mock_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(args=cmd, returncode=0)
+
+        monkeypatch.setattr("kai.install.subprocess.run", mock_run)
+
+        _stop_service("linux", svc_uid=1000, service_user="kai", dry_run=False)
+
+        assert calls == [["systemctl", "stop", "kai"]]
+
+    def test_dry_run(self, monkeypatch, capsys):
+        """Dry run prints the command without executing."""
+        calls: list = []
+        monkeypatch.setattr(
+            "kai.install.subprocess.run",
+            lambda *a, **kw: calls.append(True),
+        )
+
+        _stop_service("darwin", svc_uid=501, service_user="kai", dry_run=True)
+
+        output = capsys.readouterr().out
+        assert "[DRY RUN]" in output
+        assert len(calls) == 0
+
+
+class TestStartService:
+    def test_darwin(self, monkeypatch):
+        """Calls launchctl bootstrap on macOS."""
+        calls: list[list[str]] = []
+
+        def mock_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(args=cmd, returncode=0)
+
+        monkeypatch.setattr("kai.install.subprocess.run", mock_run)
+
+        _start_service("darwin", svc_uid=501, service_user="kai", dry_run=False)
+
+        assert len(calls) == 1
+        assert calls[0][0] == "launchctl"
+        assert calls[0][1] == "bootstrap"
+        assert "gui/501" in calls[0][2]
+
+    def test_linux(self, monkeypatch):
+        """Calls systemctl start on Linux."""
+        calls: list[list[str]] = []
+
+        def mock_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(args=cmd, returncode=0)
+
+        monkeypatch.setattr("kai.install.subprocess.run", mock_run)
+
+        _start_service("linux", svc_uid=1000, service_user="kai", dry_run=False)
+
+        assert calls == [["systemctl", "start", "kai"]]
+
+    def test_dry_run(self, monkeypatch, capsys):
+        """Dry run prints the command without executing."""
+        calls: list = []
+        monkeypatch.setattr(
+            "kai.install.subprocess.run",
+            lambda *a, **kw: calls.append(True),
+        )
+
+        _start_service("linux", svc_uid=1000, service_user="kai", dry_run=True)
+
+        output = capsys.readouterr().out
+        assert "[DRY RUN]" in output
+        assert len(calls) == 0
 
 
 # ── CLI dispatch ─────────────────────────────────────────────────────
