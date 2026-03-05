@@ -1294,10 +1294,7 @@ def _check_traversal(path: Path, service_user: str) -> str | None:
                 fix = f"chmod g+x {parent}"
             else:
                 fix = f"chmod o+x {parent}"
-            return (
-                f"{parent} lacks execute permission for {service_user}. "
-                f"Fix: {fix}"
-            )
+            return f"{parent} lacks execute permission for {service_user}. Fix: {fix}"
 
     return None
 
