@@ -536,12 +536,13 @@ def _generate_launcher_script(install_dir: str) -> str:
         # Wait for Python to re-exec and start listening
         sleep 2
 
-        # Find the actual Python process (the re-exec'd grandchild)
-        REAL_PID=$(lsof -ti :8080 -sTCP:LISTEN 2>/dev/null)
+        # Find the actual Python process (the re-exec'd grandchild).
+        # lsof lives at /usr/sbin/ which may not be in the service PATH.
+        REAL_PID=$(/usr/sbin/lsof -ti :8080 -sTCP:LISTEN 2>/dev/null)
         if [ -z "$REAL_PID" ]; then
             # Hasn't bound yet; wait a bit more
             sleep 3
-            REAL_PID=$(lsof -ti :8080 -sTCP:LISTEN 2>/dev/null)
+            REAL_PID=$(/usr/sbin/lsof -ti :8080 -sTCP:LISTEN 2>/dev/null)
         fi
 
         cleanup() {{
@@ -557,8 +558,9 @@ def _generate_launcher_script(install_dir: str) -> str:
         if [ -n "$REAL_PID" ]; then
             while kill -0 "$REAL_PID" 2>/dev/null; do sleep 1; done
         else
-            # Could not find the process; wait indefinitely
-            sleep infinity
+            # Could not find the process; wait indefinitely.
+            # BSD sleep doesn't support "infinity", so loop with a long sleep.
+            while true; do sleep 86400; done
         fi
     """)
 
