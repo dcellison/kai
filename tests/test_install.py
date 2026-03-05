@@ -168,6 +168,7 @@ class TestGenerateSudoers:
         assert f"{cat_path} /etc/kai/env" in result
         assert f"{cat_path} /etc/kai/services.yaml" in result
         assert f"{cat_path} /etc/kai/totp.secret" in result
+        assert f"{cat_path} /etc/kai/totp.attempts" in result
 
     def test_contains_tee_rule(self):
         """Sudoers uses the resolved tee path (may be /usr/bin/tee)."""

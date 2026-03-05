@@ -491,6 +491,7 @@ def _generate_sudoers(service_user: str) -> str:
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/env
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/services.yaml
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/totp.secret
+        {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/totp.attempts
         {service_user} ALL=(root) NOPASSWD: {tee_path} /etc/kai/totp.attempts
     """)
 
