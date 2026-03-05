@@ -340,6 +340,11 @@ def _cmd_config() -> None:
         "Text-to-speech",
         existing_env.get("TTS_ENABLED", "false").lower() in ("1", "true", "yes"),
     )
+
+    claude_user = _prompt(
+        "Claude subprocess user (optional, for process isolation)",
+        existing_env.get("CLAUDE_USER", ""),
+    )
     print()
 
     # -- External services --
@@ -374,6 +379,8 @@ def _cmd_config() -> None:
         env["WORKSPACE_BASE"] = workspace_base
     if allowed_workspaces:
         env["ALLOWED_WORKSPACES"] = allowed_workspaces
+    if claude_user:
+        env["CLAUDE_USER"] = claude_user
     if perplexity_key:
         env["PERPLEXITY_API_KEY"] = perplexity_key
 
@@ -462,7 +469,7 @@ def _generate_env_file(env: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-def _generate_sudoers(service_user: str) -> str:
+def _generate_sudoers(service_user: str, claude_user: str | None = None) -> str:
     """
     Generate sudoers rules for the service user to read protected config files.
 
@@ -474,8 +481,12 @@ def _generate_sudoers(service_user: str) -> str:
     Falls back to /bin/cat and /usr/bin/tee if the binaries aren't found
     in the current PATH (e.g., when running in a minimal environment).
 
+    When claude_user is set, an additional rule allows the service user to
+    run the claude binary as that user (for process isolation via sudo -u).
+
     Args:
         service_user: The OS username that runs the Kai service.
+        claude_user: Optional OS username for the inner Claude process.
 
     Returns:
         The sudoers file contents as a string.
@@ -485,7 +496,7 @@ def _generate_sudoers(service_user: str) -> str:
     cat_path = shutil.which("cat") or "/bin/cat"
     tee_path = shutil.which("tee") or "/usr/bin/tee"
 
-    return textwrap.dedent(f"""\
+    rules = textwrap.dedent(f"""\
         # Kai - allow service user to read protected config files.
         # Managed by 'python -m kai install apply'. Do not edit manually.
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/env
@@ -494,6 +505,15 @@ def _generate_sudoers(service_user: str) -> str:
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/totp.attempts
         {service_user} ALL=(root) NOPASSWD: {tee_path} /etc/kai/totp.attempts
     """)
+
+    # Allow running the claude binary as the CLAUDE_USER for process isolation.
+    # The binary lives in the target user's ~/.local/bin/ (native installer).
+    if claude_user:
+        claude_home = _user_home(claude_user)
+        claude_bin = f"{claude_home}/.local/bin/claude"
+        rules += f"{service_user} ALL=({claude_user}) NOPASSWD: {claude_bin}\n"
+
+    return rules
 
 
 def _user_home(username: str) -> str:
@@ -899,7 +919,8 @@ def _cmd_apply() -> None:
     _apply_secrets(env, dry_run)
 
     # -- Step 6: Configure sudoers --
-    _apply_sudoers(service_user, dry_run)
+    claude_user = env.get("CLAUDE_USER") or None
+    _apply_sudoers(service_user, dry_run, claude_user)
 
     # -- Step 7: Migrate runtime data --
     _apply_migrate(data_path, svc_uid, svc_gid, dry_run)
@@ -1100,10 +1121,10 @@ def _apply_secrets(env: dict[str, str], dry_run: bool) -> None:
         print(f"  Copied {services_dst}")
 
 
-def _apply_sudoers(service_user: str, dry_run: bool) -> None:
+def _apply_sudoers(service_user: str, dry_run: bool, claude_user: str | None = None) -> None:
     """Write sudoers rules for the service user to read protected config."""
     sudoers_path = Path("/etc/sudoers.d/kai")
-    sudoers_content = _generate_sudoers(service_user)
+    sudoers_content = _generate_sudoers(service_user, claude_user)
 
     if dry_run:
         print(f"[DRY RUN] Would write: {sudoers_path} (mode 0440)")

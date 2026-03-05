@@ -180,6 +180,17 @@ class TestGenerateSudoers:
         result = _generate_sudoers("kai")
         assert "NOPASSWD" in result
 
+    def test_no_claude_user_rule_by_default(self):
+        """No claude binary rule when claude_user is None."""
+        result = _generate_sudoers("kai")
+        assert "claude" not in result
+
+    def test_claude_user_rule(self, monkeypatch):
+        """Adds a rule to run claude as the specified user."""
+        monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
+        result = _generate_sudoers("kai", claude_user="mmx")
+        assert "kai ALL=(mmx) NOPASSWD: /home/mmx/.local/bin/claude" in result
+
 
 class TestGenerateLaunchdPlist:
     def test_contains_label(self):
@@ -256,6 +267,7 @@ class TestCmdConfig:
                 "",  # allowed workspaces (empty)
                 "false",  # voice
                 "false",  # tts
+                "",  # claude user (empty)
                 "",  # perplexity key (empty)
             ]
         )
