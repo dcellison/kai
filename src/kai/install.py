@@ -1287,9 +1287,16 @@ def _check_traversal(path: Path, service_user: str) -> str | None:
             has_x = bool(mode & 0o001)
 
         if not has_x:
+            # Suggest the correct chmod class based on which check failed
+            if st.st_uid == svc_uid:
+                fix = f"chmod u+x {parent}"
+            elif st.st_gid in svc_groups:
+                fix = f"chmod g+x {parent}"
+            else:
+                fix = f"chmod o+x {parent}"
             return (
                 f"{parent} lacks execute permission for {service_user}. "
-                f"Fix: chmod o+x {parent}"
+                f"Fix: {fix}"
             )
 
     return None

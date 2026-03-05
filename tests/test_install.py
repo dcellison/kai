@@ -538,7 +538,7 @@ class TestCheckTraversal:
             result = _check_traversal(target, "testuser")
             assert result is not None
             assert str(blocker) in result
-            assert "chmod o+x" in result
+            assert "chmod u+x" in result
         finally:
             # Restore so pytest can clean up tmp_path
             blocker.chmod(0o755)
