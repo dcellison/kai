@@ -8,6 +8,7 @@ import pytest
 
 from kai.install import (
     _LAUNCHD_LABEL,
+    _apply_directories,
     _apply_migrate,
     _check_path,
     _check_service_status,
@@ -397,6 +398,63 @@ class TestCmdApply:
         assert "[Unit]" in unit
         assert "[Service]" in unit
         assert "KAI_DATA_DIR=/var/lib/kai" in unit
+
+
+# ── Directory creation ───────────────────────────────────────────────
+
+
+class TestApplyDirectories:
+    """Tests for _apply_directories(), which creates the install layout."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_chown(self, monkeypatch):
+        """Stub os.chown since tests don't run as root."""
+        monkeypatch.setattr("os.chown", lambda path, uid, gid: None)
+
+    def test_creates_workspace_base(self, tmp_path):
+        """WORKSPACE_BASE is created when passed to _apply_directories."""
+        install = tmp_path / "opt" / "kai"
+        data = tmp_path / "var" / "lib" / "kai"
+        ws_base = tmp_path / "home" / "kai" / "workspaces"
+
+        _apply_directories(install, data, 503, 20, dry_run=False, workspace_base=ws_base)
+
+        assert ws_base.exists()
+        assert ws_base.is_dir()
+
+    def test_skips_workspace_base_when_none(self, tmp_path):
+        """No extra directory is created when workspace_base is None."""
+        install = tmp_path / "opt" / "kai"
+        data = tmp_path / "var" / "lib" / "kai"
+        ws_base = tmp_path / "home" / "kai" / "workspaces"
+
+        _apply_directories(install, data, 503, 20, dry_run=False, workspace_base=None)
+
+        assert not ws_base.exists()
+
+    def test_workspace_base_dry_run(self, tmp_path, capsys):
+        """Dry run prints the workspace base without creating it."""
+        install = tmp_path / "opt" / "kai"
+        data = tmp_path / "var" / "lib" / "kai"
+        ws_base = tmp_path / "home" / "kai" / "workspaces"
+
+        _apply_directories(install, data, 503, 20, dry_run=True, workspace_base=ws_base)
+
+        assert not ws_base.exists()
+        output = capsys.readouterr().out
+        assert str(ws_base) in output
+
+    def test_workspace_base_already_exists(self, tmp_path):
+        """Existing workspace base is left alone (no error)."""
+        install = tmp_path / "opt" / "kai"
+        data = tmp_path / "var" / "lib" / "kai"
+        ws_base = tmp_path / "home" / "kai" / "workspaces"
+        ws_base.mkdir(parents=True)
+
+        # Should not raise
+        _apply_directories(install, data, 503, 20, dry_run=False, workspace_base=ws_base)
+
+        assert ws_base.exists()
 
 
 # ── Status subcommand ────────────────────────────────────────────────

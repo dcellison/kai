@@ -317,7 +317,7 @@ def _cmd_config() -> None:
     print("-- Workspaces --")
     workspace_base = _prompt(
         "Workspace base directory",
-        existing_env.get("WORKSPACE_BASE", "~/Projects"),
+        existing_env.get("WORKSPACE_BASE", ""),
     )
     # Expand ~ for display but store as-is (load_config handles expansion)
     if workspace_base.startswith("~"):
@@ -870,7 +870,17 @@ def _cmd_apply() -> None:
     _stop_service(platform, svc_uid, service_user, dry_run)
 
     # -- Step 1: Create directories --
-    _apply_directories(install_path, data_path, svc_uid, svc_gid, dry_run)
+    # Resolve WORKSPACE_BASE, expanding ~ relative to the service user's home
+    # (not root's, since we're running under sudo).
+    ws_base_raw = env.get("WORKSPACE_BASE", "")
+    ws_base: Path | None = None
+    if ws_base_raw:
+        if ws_base_raw.startswith("~"):
+            svc_home = _user_home(service_user)
+            ws_base = Path(svc_home) / ws_base_raw.removeprefix("~/")
+        else:
+            ws_base = Path(ws_base_raw)
+    _apply_directories(install_path, data_path, svc_uid, svc_gid, dry_run, ws_base)
 
     # -- Step 2: Copy source --
     _apply_source(install_path, dry_run)
@@ -909,13 +919,20 @@ def _cmd_apply() -> None:
         print(f"  User:    {service_user}")
 
 
-def _apply_directories(install_path: Path, data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
+def _apply_directories(
+    install_path: Path,
+    data_path: Path,
+    svc_uid: int,
+    svc_gid: int,
+    dry_run: bool,
+    workspace_base: Path | None = None,
+) -> None:
     """Create the directory structure for the installation."""
     # The workspace dir under the install path must be writable by the service
     # user so history.py can create .claude/history/ inside it. The rest of
     # the install tree stays root-owned and read-only.
     workspace_path = install_path / "workspace"
-    dirs = [
+    dirs: list[tuple[Path, int, int, int]] = [
         (install_path, 0, 0, 0o755),  # root-owned install dir
         (workspace_path, svc_uid, svc_gid, 0o755),  # user-writable workspace
         (data_path, svc_uid, svc_gid, 0o755),  # user-owned data dir
@@ -923,6 +940,11 @@ def _apply_directories(install_path: Path, data_path: Path, svc_uid: int, svc_gi
         (data_path / "files", svc_uid, svc_gid, 0o755),
         (Path("/etc/kai"), 0, 0, 0o755),
     ]
+
+    # Create WORKSPACE_BASE if configured. The bot validates this directory
+    # exists at startup, and on a fresh install it won't exist yet.
+    if workspace_base:
+        dirs.append((workspace_base, svc_uid, svc_gid, 0o755))
 
     for path, uid, gid, mode in dirs:
         if path.exists():
