@@ -908,6 +908,20 @@ def _cmd_apply() -> None:
             ws_base = Path(ws_base_raw)
     _apply_directories(install_path, data_path, svc_uid, svc_gid, dry_run, ws_base)
 
+    # Warn about traversal issues for workspace paths. These are non-fatal
+    # since the user may fix permissions separately after install.
+    ws_paths: list[Path] = []
+    if ws_base:
+        ws_paths.append(ws_base)
+    for ws_raw in env.get("ALLOWED_WORKSPACES", "").split(","):
+        ws_raw = ws_raw.strip()
+        if ws_raw:
+            ws_paths.append(Path(ws_raw))
+    for ws_path in ws_paths:
+        warning = _check_traversal(ws_path, service_user)
+        if warning:
+            print(f"  WARNING: {warning}")
+
     # -- Step 2: Copy source --
     _apply_source(install_path, dry_run)
 
@@ -1230,6 +1244,57 @@ def _check_path(path: Path, label: str) -> str:
     return f"{label}: {path} (exists, {owner}:{group})"
 
 
+def _check_traversal(path: Path, service_user: str) -> str | None:
+    """
+    Check if every component of path is traversable by the service user.
+
+    Walks from the root down to path, checking execute permission on each
+    directory. Returns a warning string if any parent lacks traverse
+    permission for the service user, or None if fully traversable.
+
+    Args:
+        path: The directory path to check.
+        service_user: The OS username that needs to traverse the path.
+
+    Returns:
+        A warning string naming the blocking directory, or None.
+    """
+    try:
+        user_info = pwd.getpwnam(service_user)
+    except KeyError:
+        return f"User '{service_user}' does not exist; cannot check traversal"
+
+    svc_uid = user_info.pw_uid
+    svc_gid = user_info.pw_gid
+    try:
+        svc_groups = set(os.getgrouplist(service_user, svc_gid))
+    except KeyError:
+        svc_groups = {svc_gid}
+
+    # Walk each component from root to the target path
+    for parent in reversed(path.resolve().parents):
+        if not parent.exists():
+            continue
+        st = parent.stat()
+        mode = st.st_mode
+
+        # Check execute bit for the appropriate permission class
+        if st.st_uid == svc_uid:
+            has_x = bool(mode & 0o100)
+        elif st.st_gid in svc_groups:
+            has_x = bool(mode & 0o010)
+        else:
+            has_x = bool(mode & 0o001)
+
+        if not has_x:
+            return (
+                f"{parent} lacks execute permission for {service_user}. "
+                f"Fix: chmod o+x {parent}"
+            )
+
+    return None
+
+
 def _check_service_status(platform: str) -> str:
     """Check if the Kai service is running on the current platform."""
     if platform == "darwin":
@@ -1284,6 +1349,28 @@ def _cmd_status() -> None:
     print(_check_path(Path("/etc/kai/services.yaml"), "Services"))
     print(_check_path(Path("/etc/sudoers.d/kai"), "Sudoers"))
     print(_check_service_status(platform))
+
+    # Check workspace path traversal if install.conf has a service user
+    if INSTALL_CONF.exists():
+        try:
+            conf = json.loads(INSTALL_CONF.read_text())
+            svc_user = conf.get("service_user", "")
+            env = conf.get("env", {})
+            if svc_user:
+                ws_paths: list[Path] = []
+                ws_base = env.get("WORKSPACE_BASE", "")
+                if ws_base:
+                    ws_paths.append(Path(ws_base))
+                for ws_raw in env.get("ALLOWED_WORKSPACES", "").split(","):
+                    ws_raw = ws_raw.strip()
+                    if ws_raw:
+                        ws_paths.append(Path(ws_raw))
+                for ws_path in ws_paths:
+                    warning = _check_traversal(ws_path, svc_user)
+                    if warning:
+                        print(f"WARNING: {warning}")
+        except (json.JSONDecodeError, OSError):
+            pass
 
     # Show version if installed
     init_path = Path(install_dir) / "src" / "kai" / "__init__.py"

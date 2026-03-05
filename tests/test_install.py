@@ -1,6 +1,7 @@
 """Tests for the protected installation module (install.py)."""
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -14,6 +15,7 @@ from kai.install import (
     _apply_venv,
     _check_path,
     _check_service_status,
+    _check_traversal,
     _cmd_apply,
     _cmd_config,
     _cmd_status,
@@ -493,6 +495,75 @@ class TestApplyDirectories:
 
 
 # ── Status subcommand ────────────────────────────────────────────────
+
+
+class TestCheckTraversal:
+    """Tests for _check_traversal(), which checks directory execute permissions."""
+
+    def _mock_user(self, monkeypatch, uid=1001, gid=1001, groups=None):
+        """Set up a fake service user for traversal checks."""
+        import types
+
+        user_info = types.SimpleNamespace(pw_uid=uid, pw_gid=gid, pw_dir="/home/testuser")
+        monkeypatch.setattr("pwd.getpwnam", lambda name: user_info)
+        monkeypatch.setattr("os.getgrouplist", lambda name, gid: groups or [gid])
+
+    def test_fully_traversable(self, tmp_path, monkeypatch):
+        """Returns None when all parents are traversable by the user."""
+        # Use the real uid/gid so the check passes on all intermediate dirs
+        uid = os.getuid()
+        gid = os.getgid()
+        self._mock_user(monkeypatch, uid=uid, gid=gid)
+        target = tmp_path / "a" / "b" / "c"
+        target.mkdir(parents=True)
+
+        result = _check_traversal(target, "testuser")
+        assert result is None
+
+    def test_blocked_by_parent(self, tmp_path, monkeypatch):
+        """Returns warning naming the directory that lacks execute permission."""
+        # Use the real uid/gid so traversal passes system dirs, then block
+        # on the directory we explicitly restrict.
+        uid = os.getuid()
+        gid = os.getgid()
+        self._mock_user(monkeypatch, uid=uid, gid=gid)
+
+        blocker = tmp_path / "restricted"
+        target = blocker / "child"
+        target.mkdir(parents=True)
+        # Remove execute for owner (our uid owns these dirs)
+        blocker.chmod(0o600)
+
+        try:
+            result = _check_traversal(target, "testuser")
+            assert result is not None
+            assert str(blocker) in result
+            assert "chmod o+x" in result
+        finally:
+            # Restore so pytest can clean up tmp_path
+            blocker.chmod(0o755)
+
+    def test_owner_traverses_via_ux(self, tmp_path, monkeypatch):
+        """Owner with u+x on a parent can traverse even without g+x or o+x."""
+        uid = os.getuid()
+        gid = os.getgid()
+        self._mock_user(monkeypatch, uid=uid, gid=gid)
+
+        parent = tmp_path / "owner_only"
+        target = parent / "child"
+        target.mkdir(parents=True)
+        # Parent: owner has rwx, group/other have nothing
+        parent.chmod(0o700)
+
+        result = _check_traversal(target, "testuser")
+        assert result is None
+
+    def test_nonexistent_user(self, monkeypatch):
+        """Returns warning when service user does not exist."""
+        monkeypatch.setattr("pwd.getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+        result = _check_traversal(Path("/tmp"), "nobody99")
+        assert result is not None
+        assert "does not exist" in result
 
 
 class TestCheckPath:
