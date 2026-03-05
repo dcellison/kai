@@ -507,10 +507,12 @@ def _generate_sudoers(service_user: str, claude_user: str | None = None) -> str:
     """)
 
     # Allow running the claude binary as the CLAUDE_USER for process isolation.
-    # The binary lives in the target user's ~/.local/bin/ (native installer).
+    # Resolve the actual binary location; fall back to the native installer's
+    # default path under the service user's home if claude is not on PATH
+    # (e.g., when running under sudo with a stripped environment).
     if claude_user:
-        claude_home = _user_home(claude_user)
-        claude_bin = f"{claude_home}/.local/bin/claude"
+        svc_home = _user_home(service_user)
+        claude_bin = shutil.which("claude") or f"{svc_home}/.local/bin/claude"
         rules += f"{service_user} ALL=({claude_user}) NOPASSWD: {claude_bin}\n"
 
     return rules

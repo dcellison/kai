@@ -185,11 +185,20 @@ class TestGenerateSudoers:
         result = _generate_sudoers("kai")
         assert "claude" not in result
 
-    def test_claude_user_rule(self, monkeypatch):
-        """Adds a rule to run claude as the specified user."""
-        monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
+    def test_claude_user_rule_with_which(self, monkeypatch):
+        """Uses shutil.which to resolve the claude binary location."""
+        real_which = shutil.which
+        monkeypatch.setattr(shutil, "which", lambda n: "/usr/local/bin/claude" if n == "claude" else real_which(n))
         result = _generate_sudoers("kai", claude_user="mmx")
-        assert "kai ALL=(mmx) NOPASSWD: /home/mmx/.local/bin/claude" in result
+        assert "kai ALL=(mmx) NOPASSWD: /usr/local/bin/claude" in result
+
+    def test_claude_user_rule_fallback(self, monkeypatch):
+        """Falls back to service user home when claude is not on PATH."""
+        monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
+        real_which = shutil.which
+        monkeypatch.setattr(shutil, "which", lambda n: None if n == "claude" else real_which(n))
+        result = _generate_sudoers("kai", claude_user="mmx")
+        assert "kai ALL=(mmx) NOPASSWD: /home/kai/.local/bin/claude" in result
 
 
 class TestGenerateLaunchdPlist:
