@@ -877,7 +877,10 @@ def _cmd_apply() -> None:
     if ws_base_raw:
         if ws_base_raw.startswith("~"):
             svc_home = _user_home(service_user)
-            ws_base = Path(svc_home) / ws_base_raw.removeprefix("~/")
+            # Strip ~ or ~/ prefix, then join with the service user's home.
+            # Bare "~" produces an empty suffix, which resolves to svc_home itself.
+            suffix = ws_base_raw.removeprefix("~").lstrip("/")
+            ws_base = Path(svc_home) / suffix if suffix else Path(svc_home)
         else:
             ws_base = Path(ws_base_raw)
     _apply_directories(install_path, data_path, svc_uid, svc_gid, dry_run, ws_base)
