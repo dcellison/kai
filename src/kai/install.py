@@ -1014,6 +1014,24 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
         print(f"  Creating venv at {venv_path}...")
         # Find Python 3.13+
         python = shutil.which("python3.13") or shutil.which("python3") or "python3"
+
+        # Verify the resolved Python meets the minimum version before creating
+        # the venv. Without this, a 3.12 venv gets built successfully but pip
+        # install fails later with a confusing requires-python error.
+        result = subprocess.run(
+            [python, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            major, minor = result.stdout.strip().split(".")
+            if (int(major), int(minor)) < (3, 13):
+                raise SystemExit(
+                    f"Python >= 3.13 required, but {python} is {result.stdout.strip()}. "
+                    f"Install Python 3.13+ and ensure it is on PATH."
+                )
+
         subprocess.run(
             [python, "-m", "venv", str(venv_path)],
             check=True,

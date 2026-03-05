@@ -3,6 +3,7 @@
 import json
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +11,7 @@ from kai.install import (
     _LAUNCHD_LABEL,
     _apply_directories,
     _apply_migrate,
+    _apply_venv,
     _check_path,
     _check_service_status,
     _cmd_apply,
@@ -407,9 +409,20 @@ class TestApplyDirectories:
     """Tests for _apply_directories(), which creates the install layout."""
 
     @pytest.fixture(autouse=True)
-    def _stub_chown(self, monkeypatch):
-        """Stub os.chown since tests don't run as root."""
+    def _stub_os_calls(self, monkeypatch):
+        """Stub os.chown/chmod and patch out /etc/kai (needs root on CI)."""
         monkeypatch.setattr("os.chown", lambda path, uid, gid: None)
+        monkeypatch.setattr("os.chmod", lambda path, mode: None)
+        # The dirs list includes hardcoded Path("/etc/kai") which cannot be
+        # created without root. Patch Path.mkdir to silently skip /etc paths.
+        original_mkdir = Path.mkdir
+
+        def safe_mkdir(self, *args, **kwargs):
+            if str(self).startswith("/etc"):
+                return
+            return original_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", safe_mkdir)
 
     def test_creates_workspace_base(self, tmp_path):
         """WORKSPACE_BASE is created when passed to _apply_directories."""
@@ -512,6 +525,37 @@ class TestCmdStatus:
         _cmd_status()
         output = capsys.readouterr().out
         assert "Installation Status" in output
+
+
+# ── Venv creation ────────────────────────────────────────────────────
+
+
+class TestApplyVenv:
+    """Tests for _apply_venv(), which creates the virtual environment."""
+
+    def test_rejects_old_python(self, tmp_path, monkeypatch):
+        """Exits with a clear error if the resolved Python is below 3.13."""
+        install = tmp_path / "opt" / "kai"
+        install.mkdir(parents=True)
+        # Write a dummy pyproject.toml so the checksum logic has something
+        (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+
+        # Mock shutil.which to return a fake python path
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/python3")
+
+        # Mock subprocess.run to return version "3.12" for the version check
+        original_run = subprocess.run
+
+        def fake_run(cmd, **kwargs):
+            # Intercept the version-check command
+            if isinstance(cmd, list) and "-c" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="3.12\n", stderr="")
+            return original_run(cmd, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        with pytest.raises(SystemExit, match=r"Python >= 3\.13 required"):
+            _apply_venv(install, is_update=False, dry_run=False)
 
 
 # ── Migration ────────────────────────────────────────────────────────
