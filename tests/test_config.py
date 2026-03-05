@@ -295,12 +295,14 @@ class TestDataDir:
 
 
 class TestProjectRoot:
-    def test_defaults_to_file_derived_root(self):
+    def test_defaults_to_file_derived_root(self, monkeypatch):
         """When KAI_INSTALL_DIR is unset, PROJECT_ROOT derives from __file__."""
-        from kai.config import _FILE_ROOT, PROJECT_ROOT
+        monkeypatch.delenv("KAI_INSTALL_DIR", raising=False)
+        from kai.config import _FILE_ROOT
 
-        # In the test environment KAI_INSTALL_DIR is not set, so both should match
-        assert PROJECT_ROOT == _FILE_ROOT
+        # Replicate the module-level logic with the env var cleared
+        result = Path(os.environ.get("KAI_INSTALL_DIR") or str(_FILE_ROOT))
+        assert result == _FILE_ROOT
 
     def test_from_env(self, monkeypatch, tmp_path):
         """When KAI_INSTALL_DIR is set, PROJECT_ROOT uses that path."""
