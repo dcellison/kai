@@ -50,7 +50,7 @@ Point Claude at any project with `/workspace <name>`. Names resolve relative to 
 
 ### File exchange
 
-Send any file type directly in chat -- photos, documents, PDFs, archives, anything. Files are saved to `workspace/files/` with timestamped names, and Claude gets the path so it can work with them via shell tools. Claude can also send files back to you through the internal API. Images render inline; everything else arrives as a document attachment.
+Send any file type directly in chat - photos, documents, PDFs, archives, anything. Files are saved to a `files/` directory inside the active workspace with timestamped names, and Claude gets the path so it can work with them via shell tools. Claude can also send files back to you through the internal API. Images render inline; everything else arrives as a document attachment.
 
 ### Voice input
 
@@ -138,6 +138,7 @@ cp .env.example .env
 | `CLAUDE_TIMEOUT_SECONDS` | No | `120` | Per-message timeout |
 | `CLAUDE_MAX_BUDGET_USD` | No | `10.0` | Session budget cap |
 | `WORKSPACE_BASE` | No | | Base directory for workspace name resolution |
+| `ALLOWED_WORKSPACES` | No | | Comma-separated absolute paths accessible as workspaces outside `WORKSPACE_BASE` |
 | `WEBHOOK_PORT` | No | `8080` | HTTP server port for webhooks and scheduling API |
 | `WEBHOOK_SECRET` | No | | Secret for webhook validation and scheduling API auth |
 | `TELEGRAM_WEBHOOK_URL` | No | | Telegram webhook URL (enables webhook mode; omit for polling) |
@@ -148,6 +149,7 @@ cp .env.example .env
 | `TOTP_CHALLENGE_SECONDS` | No | `120` | Seconds the code entry window stays open |
 | `TOTP_LOCKOUT_ATTEMPTS` | No | `3` | Failed TOTP attempts before temporary lockout |
 | `TOTP_LOCKOUT_MINUTES` | No | `15` | TOTP lockout duration in minutes |
+| `CLAUDE_USER` | No | | OS user for the inner Claude process (enables process isolation via `sudo -u`) |
 
 `CLAUDE_MAX_BUDGET_USD` limits how much work Claude can do in a single session via Claude Code's `--max-budget-usd` flag. On Pro/Max plans this is purely a runaway prevention mechanism (no per-token charges). The session resets on `/new`, model switch, or workspace switch.
 
@@ -201,8 +203,6 @@ Create `~/Library/LaunchAgents/com.kai.bot.plist`:
 
 Replace `/path/to/kai` with your actual project path. The `PATH` must include directories for `claude`, `ffmpeg`, and any other tools Kai shells out to.
 
-The `NetworkState` condition ensures launchd waits for network availability before starting Kai, preventing DNS failures during boot when the network isn't ready yet.
-
 ```bash
 launchctl load ~/Library/LaunchAgents/com.kai.bot.plist
 ```
@@ -254,7 +254,7 @@ sudo systemctl stop kai
 ## Project Structure
 
 ```
-kai/                          # Development layout
+kai/
 ├── src/kai/                  # Source package
 │   ├── __init__.py           # Version
 │   ├── __main__.py           # python -m kai entry point
@@ -272,29 +272,17 @@ kai/                          # Development layout
 │   ├── transcribe.py         # Voice message transcription (ffmpeg + whisper-cpp)
 │   └── tts.py                # Text-to-speech synthesis (Piper TTS + ffmpeg)
 ├── tests/                    # Test suite
+├── workspace/                # Claude Code working directory
+│   ├── .claude/              # Identity, memory, and chat history
+│   └── files/                # File exchange directory (created at runtime)
+├── kai.db                    # SQLite database (gitignored, created at runtime)
 ├── logs/                     # Daily-rotated log files (gitignored)
 ├── models/                   # Whisper and Piper model files (gitignored)
-├── workspace/                # Claude Code working directory
-│   └── .claude/              # Identity, memory, and chat history
+├── services.yaml             # External service configs (gitignored)
 ├── pyproject.toml            # Package metadata and dependencies
 ├── Makefile                  # Common dev commands
-├── .env.example              # Environment variable template
+├── .env                      # Environment variables (gitignored, copy from .env.example)
 └── LICENSE                   # Apache 2.0
-
-/opt/kai/                     # Production layout (created by install apply)
-├── src/kai/                  # Read-only source (root-owned)
-├── venv/                     # Self-contained virtualenv (root-owned)
-└── models/                   # Whisper/Piper models (root-owned)
-
-/var/lib/kai/                 # Runtime data (service-user-owned)
-├── kai.db                    # SQLite database
-├── logs/                     # Log files
-└── files/                    # File exchange directory
-
-/etc/kai/                     # Secrets (root-owned, mode 0600)
-├── env                       # Environment variables
-├── services.yaml             # External service configs
-└── totp.secret               # TOTP secret (if enabled)
 ```
 
 ## Development
