@@ -16,6 +16,7 @@ CLI usage (run as root or with sudo):
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -196,10 +197,10 @@ def verify_code(code: str, lockout_attempts: int = 3, lockout_minutes: int = 15)
 
 # ── CLI entry point (python -m kai totp <subcommand>) ────────────────
 
-# Platform-specific binary paths for the sudoers rule.
-# macOS ships cat at /bin/cat; most Linux distros put it at /usr/bin/cat.
-_CAT = "/bin/cat" if sys.platform == "darwin" else "/usr/bin/cat"
-_TEE = "/usr/bin/tee"
+# Resolve binary paths for the sudoers rule. shutil.which() finds the
+# binary on the current PATH; fallbacks match platform conventions.
+_CAT = shutil.which("cat") or ("/bin/cat" if sys.platform == "darwin" else "/usr/bin/cat")
+_TEE = shutil.which("tee") or "/usr/bin/tee"
 
 
 def _cmd_setup() -> None:
@@ -211,7 +212,7 @@ def _cmd_setup() -> None:
     files owned by root. Exits with a non-zero status on any failure.
     """
     if os.geteuid() != 0:
-        print("Error: 'totp setup' must be run as root (try: sudo python -m kai totp setup)")
+        print("'totp setup' must be run as root (try: sudo python -m kai totp setup)")
         sys.exit(1)
 
     # Create /etc/kai/ if it doesn't exist, owned by root.
@@ -267,8 +268,10 @@ def _cmd_setup() -> None:
     if verify_code(code):
         print("TOTP setup complete.")
     else:
-        print("Code incorrect. Setup files written but verification failed.")
-        print("Run 'sudo python -m kai totp reset' and try again.")
+        print(
+            "Code incorrect. Setup files written but verification failed.\n"
+            "Run 'sudo python -m kai totp reset' and try again."
+        )
         sys.exit(1)
 
 
@@ -291,7 +294,7 @@ def _cmd_reset() -> None:
     Must be run as root. After reset, the bot will start without TOTP authentication.
     """
     if os.geteuid() != 0:
-        print("Error: 'totp reset' must be run as root (try: sudo python -m kai totp reset)")
+        print("'totp reset' must be run as root (try: sudo python -m kai totp reset)")
         sys.exit(1)
 
     removed = []

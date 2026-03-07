@@ -244,8 +244,7 @@ def load_services(config_path: Path) -> dict[str, ServiceDef]:
     try:
         raw = yaml.safe_load(config_path.read_text())
     except yaml.YAMLError as e:
-        log.critical("Invalid YAML in %s: %s", config_path, e)
-        raise SystemExit(1) from e
+        raise SystemExit(f"Invalid YAML in {config_path}: {e}") from e
 
     return _load_and_register(raw)
 
@@ -269,8 +268,7 @@ def load_services_from_string(text: str) -> dict[str, ServiceDef]:
     try:
         raw = yaml.safe_load(text)
     except yaml.YAMLError as e:
-        log.critical("Invalid YAML in protected services config: %s", e)
-        raise SystemExit(1) from e
+        raise SystemExit(f"Invalid YAML in protected services config: {e}") from e
 
     return _load_and_register(raw)
 

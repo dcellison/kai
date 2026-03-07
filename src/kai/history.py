@@ -27,7 +27,9 @@ from kai.config import PROJECT_ROOT
 
 log = logging.getLogger(__name__)
 
-# History files live inside the workspace so the inner Claude can access them
+# History files live inside the home workspace so the inner Claude can access them.
+# Intentionally NOT updated when workspace switches - all conversation history
+# stays in the canonical home workspace location regardless of active workspace.
 _LOG_DIR = PROJECT_ROOT / "workspace" / ".claude" / "history"
 
 # Limits for the recent-history summary injected at session start

@@ -34,7 +34,7 @@ import tempfile
 import textwrap
 from pathlib import Path
 
-from kai.config import PROJECT_ROOT
+from kai.config import PROJECT_ROOT, VALID_MODELS
 
 # Config file written by `config`, read by `apply`.
 # Anchored to PROJECT_ROOT so it resolves correctly regardless of CWD.
@@ -49,8 +49,6 @@ _DEFAULT_SERVICE_USER = "kai"
 _CONF_VERSION = 1
 
 # Valid Claude model names
-_VALID_MODELS = {"haiku", "sonnet", "opus"}
-
 # Plist label for the launchd service
 _LAUNCHD_LABEL = "com.syrinx.kai"
 
@@ -208,16 +206,14 @@ def _cmd_config() -> None:
         existing.get("install_dir", _DEFAULT_INSTALL_DIR),
     )
     if not os.path.isabs(install_dir):
-        print("Error: install location must be an absolute path.")
-        sys.exit(1)
+        raise SystemExit("Install location must be an absolute path.")
 
     data_dir = _prompt(
         "Data directory",
         existing.get("data_dir", _DEFAULT_DATA_DIR),
     )
     if not os.path.isabs(data_dir):
-        print("Error: data directory must be an absolute path.")
-        sys.exit(1)
+        raise SystemExit("Data directory must be an absolute path.")
 
     service_user = _prompt(
         "Service user",
@@ -274,7 +270,7 @@ def _cmd_config() -> None:
     print("-- Claude --")
     model = _prompt_choice(
         "Claude model",
-        ["haiku", "sonnet", "opus"],
+        sorted(VALID_MODELS),
         existing_env.get("CLAUDE_MODEL", "sonnet"),
     )
 
@@ -404,6 +400,12 @@ def _cmd_config() -> None:
 
 
 # ── Apply subcommand ─────────────────────────────────────────────────
+
+
+def _parse_workspaces(env: dict[str, str]) -> list[Path]:
+    """Parse ALLOWED_WORKSPACES from an env dict into a list of Paths."""
+    raw = env.get("ALLOWED_WORKSPACES", "")
+    return [Path(ws.strip()) for ws in raw.split(",") if ws.strip()]
 
 
 def _file_checksum(path: Path) -> str:
@@ -709,7 +711,7 @@ def _generate_systemd_unit(install_dir: str, data_dir: str, service_user: str) -
     """)
 
 
-def _stop_service(platform: str, svc_uid: int, service_user: str, dry_run: bool) -> None:
+def _stop_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
     """
     Stop the Kai service before applying changes.
 
@@ -718,8 +720,6 @@ def _stop_service(platform: str, svc_uid: int, service_user: str, dry_run: bool)
 
     Args:
         platform: "darwin" or "linux".
-        svc_uid: Numeric UID of the service user (unused, kept for API compat).
-        service_user: OS username that runs the service (unused on macOS).
         dry_run: If True, print the command without executing.
     """
     if platform == "darwin":
@@ -742,7 +742,7 @@ def _stop_service(platform: str, svc_uid: int, service_user: str, dry_run: bool)
             print(f"  Service not running ({' '.join(cmd[:2])})")
 
 
-def _start_service(platform: str, svc_uid: int, service_user: str, dry_run: bool) -> None:
+def _start_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
     """
     Start the Kai service after applying changes.
 
@@ -751,8 +751,6 @@ def _start_service(platform: str, svc_uid: int, service_user: str, dry_run: bool
 
     Args:
         platform: "darwin" or "linux".
-        svc_uid: Numeric UID of the service user (unused, kept for API compat).
-        service_user: OS username that runs the service (unused on macOS).
         dry_run: If True, print the command without executing.
     """
     if platform == "darwin":
@@ -856,18 +854,15 @@ def _cmd_apply() -> None:
     """
     # -- Validate preconditions --
     if os.geteuid() != 0:
-        print("Error: 'install apply' must be run as root (try: sudo python -m kai install apply)")
-        sys.exit(1)
+        raise SystemExit("'install apply' must be run as root (try: sudo python -m kai install apply)")
 
     if not INSTALL_CONF.exists():
-        print(f"Error: {INSTALL_CONF} not found. Run 'python -m kai install config' first.")
-        sys.exit(1)
+        raise SystemExit(f"{INSTALL_CONF} not found. Run 'python -m kai install config' first.")
 
     try:
         conf = json.loads(INSTALL_CONF.read_text())
     except (json.JSONDecodeError, OSError) as e:
-        print(f"Error: could not read {INSTALL_CONF}: {e}")
-        sys.exit(1)
+        raise SystemExit(f"Could not read {INSTALL_CONF}: {e}") from e
 
     # Validate required fields
     install_dir = conf.get("install_dir")
@@ -877,8 +872,7 @@ def _cmd_apply() -> None:
     env = conf.get("env", {})
 
     if not all([install_dir, data_dir, service_user, platform]):
-        print("Error: install.conf is missing required fields.")
-        sys.exit(1)
+        raise SystemExit("install.conf is missing required fields.")
 
     # Validate service user exists
     try:
@@ -886,8 +880,7 @@ def _cmd_apply() -> None:
         svc_uid = user_info.pw_uid
         svc_gid = user_info.pw_gid
     except KeyError:
-        print(f"Error: service user '{service_user}' does not exist on this system.")
-        sys.exit(1)
+        raise SystemExit(f"Service user '{service_user}' does not exist on this system.") from None
 
     dry_run = os.environ.get("DRY_RUN", "").strip() in ("1", "true", "yes")
     if dry_run:
@@ -904,7 +897,7 @@ def _cmd_apply() -> None:
     print()
 
     # -- Stop service before making changes --
-    _stop_service(platform, svc_uid, service_user, dry_run)
+    _stop_service(platform, dry_run)
 
     # -- Step 1: Create directories --
     # Resolve WORKSPACE_BASE, expanding ~ relative to the service user's home
@@ -927,10 +920,7 @@ def _cmd_apply() -> None:
     ws_paths: list[Path] = []
     if ws_base:
         ws_paths.append(ws_base)
-    for ws_raw in env.get("ALLOWED_WORKSPACES", "").split(","):
-        ws_raw = ws_raw.strip()
-        if ws_raw:
-            ws_paths.append(Path(ws_raw))
+    ws_paths.extend(_parse_workspaces(env))
     for ws_path in ws_paths:
         warning = _check_traversal(ws_path, service_user)
         if warning:
@@ -960,7 +950,7 @@ def _cmd_apply() -> None:
     _apply_service(install_dir, data_dir, service_user, platform, dry_run, webhook_port)
 
     # -- Start service after all changes --
-    _start_service(platform, svc_uid, service_user, dry_run)
+    _start_service(platform, dry_run)
 
     # -- Summary --
     print()
@@ -1178,9 +1168,10 @@ def _apply_sudoers(service_user: str, dry_run: bool, claude_user: str | None = N
             text=True,
         )
         if result.returncode != 0:
-            print(f"Error: sudoers validation failed: {result.stderr.strip()}")
-            print("  Sudoers file was NOT written. Fix the issue and re-run.")
-            sys.exit(1)
+            raise SystemExit(
+                f"Sudoers validation failed: {result.stderr.strip()}\n"
+                "  Sudoers file was NOT written. Fix the issue and re-run."
+            )
 
         shutil.move(tmp_name, str(sudoers_path))
     finally:
@@ -1390,10 +1381,7 @@ def _cmd_status() -> None:
                 ws_base = env.get("WORKSPACE_BASE", "")
                 if ws_base:
                     ws_paths.append(Path(ws_base))
-                for ws_raw in env.get("ALLOWED_WORKSPACES", "").split(","):
-                    ws_raw = ws_raw.strip()
-                    if ws_raw:
-                        ws_paths.append(Path(ws_raw))
+                ws_paths.extend(_parse_workspaces(env))
                 for ws_path in ws_paths:
                     warning = _check_traversal(ws_path, svc_user)
                     if warning:
@@ -1430,8 +1418,7 @@ def cli(args: list[str]) -> None:
     }
 
     if not args or args[0] not in subcommands:
-        print("Usage: python -m kai install {config|apply|status}")
-        sys.exit(1)
+        raise SystemExit("Usage: python -m kai install {config|apply|status}")
 
     subcmd = args[0]
     remaining = args[1:]

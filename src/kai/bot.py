@@ -35,7 +35,6 @@ import functools
 import json
 import logging
 import math
-import os
 import shutil
 import time
 from datetime import datetime
@@ -55,7 +54,7 @@ from telegram.ext import (
 
 from kai import services, sessions, webhook
 from kai.claude import PersistentClaude
-from kai.config import DATA_DIR, Config
+from kai.config import DATA_DIR, IMAGE_EXTENSIONS, Config
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
 from kai.transcribe import TranscriptionError, transcribe_voice
@@ -272,6 +271,8 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ── Model selection ──────────────────────────────────────────────────
 
 # Available Claude models with display names (emoji prefix for visual distinction)
+# Keys must match VALID_MODELS in config.py (the single source of truth
+# for valid model identifiers). Values are display names for Telegram.
 _AVAILABLE_MODELS = {
     "opus": "\U0001f9e0 Claude Opus 4.6",
     "sonnet": "\u26a1 Claude Sonnet 4.5",
@@ -622,7 +623,8 @@ def _resolve_workspace_path(target: str, base: Path | None) -> Path | None:
     """
     if not base:
         return None
-    resolved = (base / target).resolve()
+    # expanduser() handles ~ in the target path (e.g., "~/Projects/foo")
+    resolved = (base / target).expanduser().resolve()
     # Resolve base too so symlinks in the base path don't bypass the check
     resolved_base = base.resolve()
     if not str(resolved).startswith(str(resolved_base) + "/") and resolved != resolved_base:
@@ -1210,9 +1212,6 @@ _TEXT_EXTENSIONS = {
     ".erl",
 }
 
-# Image extensions that can be sent as documents (uncompressed)
-_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-
 # Map image file extensions to MIME types for Claude's image content blocks
 _IMAGE_MEDIA_TYPES = {
     ".png": "image/png",
@@ -1246,7 +1245,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     claude = _get_claude(context)
     model = claude.model
 
-    if suffix in _IMAGE_EXTENSIONS:
+    if suffix in IMAGE_EXTENSIONS:
         # Handle images sent as documents (uncompressed upload)
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
@@ -1416,9 +1415,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         assert context.user_data is not None
         assert update.effective_chat is not None
 
+        # Read TOTP timing from the centralized Config object rather than
+        # raw os.environ, so defaults and validation happen in one place.
+        totp_cfg = context.bot_data["config"]
+        session_min = totp_cfg.totp_session_minutes if isinstance(totp_cfg, Config) else 30
+        challenge_sec = totp_cfg.totp_challenge_seconds if isinstance(totp_cfg, Config) else 120
+
         auth_time = context.user_data.get("totp_authenticated_at", 0)
-        session_minutes = int(os.environ.get("TOTP_SESSION_MINUTES", "30"))
-        totp_expired = time.time() - auth_time > session_minutes * 60
+        totp_expired = time.time() - auth_time > session_min * 60
 
         if totp_expired:
             pending = context.user_data.get("totp_pending")
@@ -1426,9 +1430,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if not pending:
                 # First message after auth expired - send the challenge and
                 # store a pending state so the next message is treated as a code.
-                challenge_seconds = int(os.environ.get("TOTP_CHALLENGE_SECONDS", "120"))
                 context.user_data["totp_pending"] = {
-                    "expires_at": time.time() + challenge_seconds,
+                    "expires_at": time.time() + challenge_sec,
                 }
                 await update.message.reply_text("Session expired. Enter code from authenticator.")
                 return
@@ -1457,8 +1460,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
                 return
 
-            lockout_attempts = int(os.environ.get("TOTP_LOCKOUT_ATTEMPTS", "3"))
-            lockout_minutes = int(os.environ.get("TOTP_LOCKOUT_MINUTES", "15"))
+            lockout_attempts = totp_cfg.totp_lockout_attempts if isinstance(totp_cfg, Config) else 3
+            lockout_minutes = totp_cfg.totp_lockout_minutes if isinstance(totp_cfg, Config) else 15
 
             if verify_code(code, lockout_attempts, lockout_minutes):
                 del context.user_data["totp_pending"]
