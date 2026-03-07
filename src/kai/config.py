@@ -22,6 +22,9 @@ from dotenv import load_dotenv
 
 log = logging.getLogger(__name__)
 
+
+# ── Module-level paths and constants ─────────────────────────────────
+
 # Derive project root from file location: src/kai/config.py -> src/kai -> src -> project root.
 # In a pip-installed deployment (e.g., /opt/kai/venv/lib/.../site-packages/kai/), this
 # resolves to site-packages/ instead of the install root. KAI_INSTALL_DIR overrides it.
@@ -41,6 +44,10 @@ VALID_MODELS = {"haiku", "sonnet", "opus"}
 # Image file extensions that Telegram renders inline as photos.
 # Shared between bot.py (inbound document handling) and webhook.py (send-file API).
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+
+# ── Config dataclass ─────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
@@ -127,6 +134,10 @@ class Config:
     totp_challenge_seconds: int = 120
     totp_lockout_attempts: int = 3
     totp_lockout_minutes: int = 15
+
+
+
+# ── Config loading ───────────────────────────────────────────────────
 
 
 def _read_protected_file(path: str) -> str | None:

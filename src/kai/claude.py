@@ -40,6 +40,9 @@ from kai.history import get_recent_history
 log = logging.getLogger(__name__)
 
 
+# ── Protocol types ───────────────────────────────────────────────────
+
+
 @dataclass
 class ClaudeResponse:
     """
@@ -79,6 +82,10 @@ class StreamEvent:
     text_so_far: str
     done: bool = False
     response: ClaudeResponse | None = None
+
+
+
+# ── Persistent Claude process ────────────────────────────────────────
 
 
 class PersistentClaude:

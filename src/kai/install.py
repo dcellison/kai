@@ -48,7 +48,6 @@ _DEFAULT_SERVICE_USER = "kai"
 # Current install.conf schema version
 _CONF_VERSION = 1
 
-# Valid Claude model names
 # Plist label for the launchd service
 _LAUNCHD_LABEL = "com.syrinx.kai"
 
@@ -973,7 +972,22 @@ def _apply_directories(
     dry_run: bool,
     workspace_base: Path | None = None,
 ) -> None:
-    """Create the directory structure for the installation."""
+    """
+    Create the directory structure for the installation.
+
+    Builds a list of (path, uid, gid, mode) tuples for all required
+    directories and creates any that don't already exist. The install
+    tree is root-owned except for the workspace and data directories,
+    which must be writable by the service user.
+
+    Args:
+        install_path: Root of the install tree (e.g., /opt/kai).
+        data_path: Writable data directory (e.g., /var/lib/kai).
+        svc_uid: UID of the service user.
+        svc_gid: GID of the service user.
+        dry_run: If True, print what would be created without doing it.
+        workspace_base: Optional base directory for workspace name resolution.
+    """
     # The workspace dir under the install path must be writable by the service
     # user so history.py can create .claude/history/ inside it. The rest of
     # the install tree stays root-owned and read-only.
@@ -1027,7 +1041,19 @@ def _apply_source(install_path: Path, dry_run: bool) -> None:
 
 
 def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
-    """Create or update the virtual environment in the install location."""
+    """
+    Create or update the virtual environment in the install location.
+
+    On a fresh install, creates a venv with the system Python and pip-installs
+    the package with optional extras (totp, tts). On update, compares the
+    pyproject.toml checksum to detect dependency changes and only reinstalls
+    if needed. Rejects Python versions below 3.12.
+
+    Args:
+        install_path: Root of the install tree containing src/ and pyproject.toml.
+        is_update: True if updating an existing installation (vs fresh install).
+        dry_run: If True, print what would be done without doing it.
+    """
     venv_path = install_path / "venv"
     pyproject_dst = install_path / "pyproject.toml"
 
@@ -1186,7 +1212,22 @@ def _apply_sudoers(service_user: str, dry_run: bool, claude_user: str | None = N
 def _apply_service(
     install_dir: str, data_dir: str, service_user: str, platform: str, dry_run: bool, webhook_port: int = 8080
 ) -> None:
-    """Generate the platform-specific service definition."""
+    """
+    Generate and install the platform-specific service definition.
+
+    On macOS, writes a LaunchDaemon plist and a launcher shell script
+    (the script keeps bash as the tracked PID so launchd can manage the
+    service even when Homebrew Python re-execs). On Linux, writes a
+    systemd unit file.
+
+    Args:
+        install_dir: Root of the install tree (e.g., /opt/kai).
+        data_dir: Writable data directory (e.g., /var/lib/kai).
+        service_user: OS username the service runs as.
+        platform: "darwin" or "linux".
+        dry_run: If True, print what would be written without doing it.
+        webhook_port: Port for the webhook/API server (passed to launcher).
+    """
     if platform == "darwin":
         # LaunchDaemons (not LaunchAgents) so the service runs under the
         # system domain at boot, independent of any user login session.
