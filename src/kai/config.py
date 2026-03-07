@@ -46,7 +46,6 @@ VALID_MODELS = {"haiku", "sonnet", "opus"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 
-
 # ── Config dataclass ─────────────────────────────────────────────────
 
 
@@ -134,7 +133,6 @@ class Config:
     totp_challenge_seconds: int = 120
     totp_lockout_attempts: int = 3
     totp_lockout_minutes: int = 15
-
 
 
 # ── Config loading ───────────────────────────────────────────────────

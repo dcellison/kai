@@ -90,6 +90,7 @@ def _strip_markdown(text: str) -> str:
 def _require_secret(handler):
     """Decorator that validates the X-Webhook-Secret header before
     calling the route handler. Returns 401 on mismatch."""
+
     @functools.wraps(handler)
     async def wrapper(request: web.Request) -> web.Response:
         secret = request.app["webhook_secret"]
@@ -98,6 +99,7 @@ def _require_secret(handler):
             log.warning("Auth failure on %s from %s", request.path, request.remote)
             return web.Response(status=401, text="Invalid secret")
         return await handler(request)
+
     return wrapper
 
 
@@ -660,6 +662,7 @@ async def _handle_service_call(request: web.Request) -> web.Response:
 
 
 # ── File exchange ────────────────────────────────────────────────────
+
 
 @_require_secret
 async def _handle_send_file(request: web.Request) -> web.Response:

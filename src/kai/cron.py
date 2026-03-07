@@ -41,7 +41,9 @@ log = logging.getLogger(__name__)
 # Claude is instructed to begin its response with one of these markers.
 # Matching is case-insensitive and checks the start of the first non-empty line.
 _CONDITION_MET_PREFIX = "CONDITION_MET:"
-_CONDITION_NOT_MET_PREFIX = "CONDITION_NOT_MET"  # No trailing colon (unlike MET) because bare "CONDITION_NOT_MET" is valid
+_CONDITION_NOT_MET_PREFIX = (
+    "CONDITION_NOT_MET"  # No trailing colon (unlike MET) because bare "CONDITION_NOT_MET" is valid
+)
 
 
 # ── Job registration ─────────────────────────────────────────────────

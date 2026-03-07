@@ -84,7 +84,6 @@ class StreamEvent:
     response: ClaudeResponse | None = None
 
 
-
 # ── Persistent Claude process ────────────────────────────────────────
 
 
