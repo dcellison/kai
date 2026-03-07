@@ -104,12 +104,17 @@ def get_recent_history() -> str:
     for path in files:
         file_messages: list[dict] = []
         try:
-            for line in path.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    file_messages.append(json.loads(line))
-        except (OSError, json.JSONDecodeError):
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
             log.exception("Failed to read history file %s", path)
             continue
+        for line in raw.splitlines():
+            if line.strip():
+                try:
+                    file_messages.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # Skip individual bad lines rather than discarding the whole file
+                    log.debug("Skipping malformed JSON line in %s: %s", path.name, line[:100])
 
         # Prepend this file's messages (older days go before newer days)
         messages = file_messages + messages

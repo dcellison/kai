@@ -143,8 +143,8 @@ class TestGenerateEnvFile:
     def test_produces_key_value_lines(self):
         env = {"TOKEN": "abc123", "PORT": "8080"}
         result = _generate_env_file(env)
-        assert "PORT=8080" in result
-        assert "TOKEN=abc123" in result
+        assert 'PORT="8080"' in result
+        assert 'TOKEN="abc123"' in result
 
     def test_sorted_keys(self):
         env = {"Z_KEY": "z", "A_KEY": "a"}
@@ -407,9 +407,9 @@ class TestCmdApply:
             "WEBHOOK_PORT": "8080",
         }
         content = _generate_env_file(env)
-        assert "TELEGRAM_BOT_TOKEN=test-token" in content
-        assert "ALLOWED_USER_IDS=123" in content
-        assert "WEBHOOK_PORT=8080" in content
+        assert 'TELEGRAM_BOT_TOKEN="test-token"' in content
+        assert 'ALLOWED_USER_IDS="123"' in content
+        assert 'WEBHOOK_PORT="8080"' in content
 
     def test_generates_launchd_plist_for_darwin(self):
         """macOS platform generates a valid launchd plist."""

@@ -161,6 +161,8 @@ def load_config() -> Config:
         for line in protected_env.splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
+                # Handle `export KEY=VALUE` lines (common in shell-sourced env files)
+                line = line.removeprefix("export ")
                 key, _, value = line.partition("=")
                 os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
     else:
@@ -236,15 +238,30 @@ def load_config() -> Config:
             else:
                 logging.warning("ALLOWED_WORKSPACES: skipping non-existent path: %s", p)
 
+    # Validate numeric config - fail fast with clear messages rather than
+    # cryptic ValueError tracebacks from int()/float() on bad input
+    try:
+        claude_timeout_seconds = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "120"))
+    except ValueError:
+        raise SystemExit("CLAUDE_TIMEOUT_SECONDS must be an integer") from None
+    try:
+        claude_max_budget_usd = float(os.environ.get("CLAUDE_MAX_BUDGET_USD", "10.0"))
+    except ValueError:
+        raise SystemExit("CLAUDE_MAX_BUDGET_USD must be a number") from None
+    try:
+        webhook_port = int(os.environ.get("WEBHOOK_PORT", "8080"))
+    except ValueError:
+        raise SystemExit("WEBHOOK_PORT must be an integer") from None
+
     return Config(
         telegram_bot_token=token,
         telegram_webhook_url=telegram_webhook_url,
         telegram_webhook_secret=telegram_webhook_secret,
         allowed_user_ids=allowed_ids,
         claude_model=os.environ.get("CLAUDE_MODEL", "sonnet"),
-        claude_timeout_seconds=int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "120")),
-        claude_max_budget_usd=float(os.environ.get("CLAUDE_MAX_BUDGET_USD", "10.0")),
-        webhook_port=int(os.environ.get("WEBHOOK_PORT", "8080")),
+        claude_timeout_seconds=claude_timeout_seconds,
+        claude_max_budget_usd=claude_max_budget_usd,
+        webhook_port=webhook_port,
         webhook_secret=os.environ.get("WEBHOOK_SECRET", ""),
         voice_enabled=os.environ.get("VOICE_ENABLED", "").lower() in ("1", "true", "yes"),
         tts_enabled=os.environ.get("TTS_ENABLED", "").lower() in ("1", "true", "yes"),

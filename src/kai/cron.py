@@ -41,7 +41,7 @@ log = logging.getLogger(__name__)
 # Claude is instructed to begin its response with one of these markers.
 # Matching is case-insensitive and checks the start of the first non-empty line.
 _CONDITION_MET_PREFIX = "CONDITION_MET:"
-_CONDITION_NOT_MET_PREFIX = "CONDITION_NOT_MET"
+_CONDITION_NOT_MET_PREFIX = "CONDITION_NOT_MET"  # No trailing colon (unlike MET) because bare "CONDITION_NOT_MET" is valid
 
 
 # ── Job registration ─────────────────────────────────────────────────
@@ -245,7 +245,10 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         except Exception:
             log.exception("Failed to send reminder for job %d", job_id)
-        # One-shot reminders auto-deactivate after firing
+        # One-shot reminders auto-deactivate after firing.
+        # No schedule_removal() needed here - APScheduler's run_once already
+        # removes the job from the queue after it fires (unlike the Forbidden
+        # handler above, which must remove recurring jobs explicitly).
         if data["schedule_type"] == "once":
             await sessions.deactivate_job(job_id)
         return
@@ -275,6 +278,10 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         if final_response is None or not final_response.success:
+            if final_response is None:
+                # Stream ended without a done event; helps distinguish from
+                # a done event with an error (which sets final_response.success=False)
+                log.warning("Job %d '%s': Claude stream ended without a done event", job_id, data["name"])
             error = final_response.error if final_response else "No response"
             log.error("Job %d Claude error: %s", job_id, error)
             return
@@ -306,9 +313,11 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             # Condition not met — notify user if notify_on_check is enabled, otherwise silent
             notify_on_check = data.get("notify_on_check", False)
             if notify_on_check:
-                # Extract and send the message after the marker (same logic as CONDITION_MET)
+                # Extract and send the message after the marker (same logic as CONDITION_MET).
+                # lstrip(":") handles the optional colon since _CONDITION_NOT_MET_PREFIX
+                # doesn't include it (bare "CONDITION_NOT_MET" is valid, unlike MET).
                 lines = response_text.strip().split("\n", 1)
-                after_marker = lines[0].strip()[len(_CONDITION_NOT_MET_PREFIX) :].strip()
+                after_marker = lines[0].strip()[len(_CONDITION_NOT_MET_PREFIX) :].lstrip(":").strip()
                 rest = lines[1].strip() if len(lines) > 1 else ""
                 clean_text = f"{after_marker}\n{rest}".strip() if after_marker else rest
                 msg = (

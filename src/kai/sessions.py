@@ -34,7 +34,9 @@ _db: aiosqlite.Connection | None = None
 
 def _get_db() -> aiosqlite.Connection:
     """Return the database connection, raising if init_db() hasn't been called."""
-    assert _db is not None, "Database not initialized — call init_db() first"
+    # RuntimeError instead of assert so this guard survives python -O
+    if _db is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
     return _db
 
 
@@ -195,7 +197,10 @@ async def create_job(
         (chat_id, name, job_type, prompt, schedule_type, schedule_data, int(auto_remove), int(notify_on_check)),
     )
     await _get_db().commit()
-    assert cursor.lastrowid is not None
+    # RuntimeError instead of assert so this guard survives python -O.
+    # SQLite always sets lastrowid on INSERT, but guard against None defensively.
+    if cursor.lastrowid is None:
+        raise RuntimeError("INSERT did not return a row ID")
     return cursor.lastrowid
 
 
@@ -383,5 +388,9 @@ async def close_db() -> None:
     """Close the database connection. Called during shutdown from main.py."""
     global _db
     if _db:
-        await _get_db().close()
-        _db = None
+        try:
+            await _get_db().close()
+        finally:
+            # Clear even if close() raises so subsequent _get_db() calls
+            # get a clear RuntimeError instead of using a broken connection
+            _db = None

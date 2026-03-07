@@ -221,8 +221,9 @@ def main() -> None:
                 flag.unlink(missing_ok=True)
             except FileNotFoundError:
                 pass
-            except Exception as e:
-                logging.warning("Failed to send interrupted-response notice: %s", e)
+            except Exception:
+                # Full traceback helps diagnose issues like corrupt flag file content
+                logging.exception("Failed to send interrupted-response notice")
                 flag.unlink(missing_ok=True)
 
             logging.info("Kai is running. Press Ctrl+C to stop.")
