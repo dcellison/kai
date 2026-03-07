@@ -30,13 +30,15 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 
 from kai.config import PROJECT_ROOT
 
-# Config file written by `config`, read by `apply`
-INSTALL_CONF = Path("install.conf")
+# Config file written by `config`, read by `apply`.
+# Anchored to PROJECT_ROOT so it resolves correctly regardless of CWD.
+INSTALL_CONF = PROJECT_ROOT / "install.conf"
 
 # Default installation paths
 _DEFAULT_INSTALL_DIR = "/opt/kai"
@@ -395,6 +397,8 @@ def _cmd_config() -> None:
     }
 
     INSTALL_CONF.write_text(json.dumps(conf, indent=2) + "\n")
+    # Restrict permissions since the file contains secrets (bot token, webhook secret)
+    os.chmod(INSTALL_CONF, 0o600)
     print(f"Configuration written to {INSTALL_CONF}")
     print("Review the file, then run: sudo python -m kai install apply")
 
@@ -464,7 +468,10 @@ def _generate_env_file(env: dict[str, str]) -> str:
     lines.append("# Do not edit manually; re-run install config + apply instead.")
     lines.append("")
     for key, value in sorted(env.items()):
-        lines.append(f"{key}={value}")
+        # Quote values to handle spaces and special characters. Escape
+        # embedded backslashes and double quotes so the file parses correctly.
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'{key}="{escaped}"')
     lines.append("")
     return "\n".join(lines)
 
@@ -536,7 +543,7 @@ def _user_home(username: str) -> str:
         return f"/home/{username}"
 
 
-def _generate_launcher_script(install_dir: str) -> str:
+def _generate_launcher_script(install_dir: str, webhook_port: int = 8080) -> str:
     """
     Generate a launcher script for launchd.
 
@@ -561,11 +568,11 @@ def _generate_launcher_script(install_dir: str) -> str:
 
         # Find the actual Python process (the re-exec'd grandchild).
         # lsof lives at /usr/sbin/ which may not be in the service PATH.
-        REAL_PID=$(/usr/sbin/lsof -ti :8080 -sTCP:LISTEN 2>/dev/null)
+        REAL_PID=$(/usr/sbin/lsof -ti :{webhook_port} -sTCP:LISTEN 2>/dev/null)
         if [ -z "$REAL_PID" ]; then
             # Hasn't bound yet; wait a bit more
             sleep 3
-            REAL_PID=$(/usr/sbin/lsof -ti :8080 -sTCP:LISTEN 2>/dev/null)
+            REAL_PID=$(/usr/sbin/lsof -ti :{webhook_port} -sTCP:LISTEN 2>/dev/null)
         fi
 
         cleanup() {{
@@ -727,8 +734,12 @@ def _stop_service(platform: str, svc_uid: int, service_user: str, dry_run: bool)
     if dry_run:
         print(f"[DRY RUN] Would run: {' '.join(cmd)}")
     else:
-        subprocess.run(cmd, check=False, capture_output=True)
-        print(f"  Stopped service ({' '.join(cmd[:2])})")
+        result = subprocess.run(cmd, check=False, capture_output=True)
+        if result.returncode == 0:
+            print(f"  Stopped service ({' '.join(cmd[:2])})")
+        else:
+            # Non-zero is expected on first install (service not yet registered)
+            print(f"  Service not running ({' '.join(cmd[:2])})")
 
 
 def _start_service(platform: str, svc_uid: int, service_user: str, dry_run: bool) -> None:
@@ -756,8 +767,11 @@ def _start_service(platform: str, svc_uid: int, service_user: str, dry_run: bool
     if dry_run:
         print(f"[DRY RUN] Would run: {' '.join(cmd)}")
     else:
-        subprocess.run(cmd, check=False, capture_output=True)
-        print(f"  Started service ({' '.join(cmd[:2])})")
+        result = subprocess.run(cmd, check=False, capture_output=True)
+        if result.returncode == 0:
+            print(f"  Started service ({' '.join(cmd[:2])})")
+        else:
+            print(f"  Warning: service start returned non-zero ({' '.join(cmd[:2])})")
 
 
 def _apply_migrate(data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
@@ -942,7 +956,8 @@ def _cmd_apply() -> None:
     _apply_migrate(data_path, svc_uid, svc_gid, dry_run)
 
     # -- Step 8: Generate service definition --
-    _apply_service(install_dir, data_dir, service_user, platform, dry_run)
+    webhook_port = int(env.get("WEBHOOK_PORT", "8080"))
+    _apply_service(install_dir, data_dir, service_user, platform, dry_run, webhook_port)
 
     # -- Start service after all changes --
     _start_service(platform, svc_uid, service_user, dry_run)
@@ -1063,7 +1078,9 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
             check=False,
         )
         if result.returncode == 0:
-            major, minor = result.stdout.strip().split(".")
+            # Split with maxsplit=2 to handle patch versions like "3.13.1"
+            parts = result.stdout.strip().split(".", maxsplit=2)
+            major, minor = parts[0], parts[1]
             if (int(major), int(minor)) < (3, 13):
                 raise SystemExit(
                     f"Python >= 3.13 required, but {python} is {result.stdout.strip()}. "
@@ -1147,29 +1164,37 @@ def _apply_sudoers(service_user: str, dry_run: bool, claude_user: str | None = N
         print("[DRY RUN] Would validate with visudo -cf")
         return
 
-    # Write to a temp file first, validate, then move into place.
-    # This prevents writing an invalid sudoers file that locks out sudo.
-    tmp_path = Path("/tmp/kai-sudoers-check")
-    tmp_path.write_text(sudoers_content)
+    # Write to a secure temp file first, validate, then move into place.
+    # Uses mkstemp (random name, restrictive permissions) instead of a
+    # predictable path in /tmp to prevent symlink attacks when running as root.
+    fd, tmp_name = tempfile.mkstemp(prefix="kai-sudoers-", suffix=".tmp")
+    try:
+        os.write(fd, sudoers_content.encode())
+        os.close(fd)
 
-    result = subprocess.run(
-        ["visudo", "-cf", str(tmp_path)],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        tmp_path.unlink(missing_ok=True)
-        print(f"Error: sudoers validation failed: {result.stderr.strip()}")
-        print("  Sudoers file was NOT written. Fix the issue and re-run.")
-        sys.exit(1)
+        result = subprocess.run(
+            ["visudo", "-cf", tmp_name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            print(f"Error: sudoers validation failed: {result.stderr.strip()}")
+            print("  Sudoers file was NOT written. Fix the issue and re-run.")
+            sys.exit(1)
 
-    shutil.move(str(tmp_path), str(sudoers_path))
+        shutil.move(tmp_name, str(sudoers_path))
+    finally:
+        # Clean up the temp file if it still exists (move succeeded or error)
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
     os.chmod(sudoers_path, 0o440)
     os.chown(sudoers_path, 0, 0)
     print(f"  Wrote {sudoers_path}")
 
 
-def _apply_service(install_dir: str, data_dir: str, service_user: str, platform: str, dry_run: bool) -> None:
+def _apply_service(
+    install_dir: str, data_dir: str, service_user: str, platform: str, dry_run: bool, webhook_port: int = 8080
+) -> None:
     """Generate the platform-specific service definition."""
     if platform == "darwin":
         # LaunchDaemons (not LaunchAgents) so the service runs under the
@@ -1181,7 +1206,7 @@ def _apply_service(install_dir: str, data_dir: str, service_user: str, platform:
         # Launcher script keeps bash as the tracked PID so launchd can
         # manage the service even when Homebrew Python re-execs.
         launcher_path = Path(install_dir) / "run.sh"
-        launcher_content = _generate_launcher_script(install_dir)
+        launcher_content = _generate_launcher_script(install_dir, webhook_port)
 
         if dry_run:
             print(f"[DRY RUN] Would write: {launcher_path}")

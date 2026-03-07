@@ -180,12 +180,21 @@ class PersistentClaude:
             self.claude_user or "(same as bot)",
         )
 
+        # Pass the webhook secret via environment variable so it never
+        # appears in prompt text, Claude Code session logs, or Anthropic's
+        # API logs. The inner Claude references $KAI_WEBHOOK_SECRET in curl
+        # commands instead of a literal secret value.
+        env = os.environ.copy()
+        if self.webhook_secret:
+            env["KAI_WEBHOOK_SECRET"] = self.webhook_secret
+
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.workspace),
+            env=env,
             limit=1024 * 1024,  # 1 MiB; default 64 KiB too small for large tool results
             # When spawned via sudo, start in a new process group so we can
             # kill the entire tree (sudo + claude) via os.killpg(). Without
@@ -214,6 +223,7 @@ class PersistentClaude:
                 if text:
                     log.debug("Claude stderr: %s", text[:200])
             except Exception:
+                log.warning("Unexpected error in stderr drain", exc_info=True)
                 break
 
     def _kill_proc(self, sig: int = signal.SIGKILL) -> None:
@@ -234,7 +244,9 @@ class PersistentClaude:
                 os.killpg(os.getpgid(self._proc.pid), sig)
             else:
                 self._proc.send_signal(sig)
-        except (ProcessLookupError, PermissionError):
+        except OSError:
+            # Catches ProcessLookupError, PermissionError, and any other
+            # OS-level error from getpgid() or signal delivery
             pass
 
     async def send(self, prompt: str | list) -> AsyncIterator[StreamEvent]:
@@ -321,12 +333,14 @@ class PersistentClaude:
             if recent:
                 parts.append(f"[Recent conversations (search .claude/history/ for full logs):]\n{recent}")
 
-            # Inject scheduling API info (always, so cron works from any workspace)
+            # Inject scheduling API info (always, so cron works from any workspace).
+            # The secret is passed via $KAI_WEBHOOK_SECRET env var (not embedded
+            # in prompt text) to prevent leakage through session logs.
             if self.webhook_secret:
                 api_note = (
                     f"[Scheduling API: To create jobs, POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/schedule "
-                    f"with header 'X-Webhook-Secret: {self.webhook_secret}'. "
+                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
                     f"Required fields: name, prompt, schedule_type, schedule_data. "
                     f"Optional: job_type (reminder|claude), auto_remove (bool). "
                     f"To list jobs: GET /api/jobs. To update: PATCH /api/jobs/{{id}}. "
@@ -344,7 +358,7 @@ class PersistentClaude:
                 parts.append(
                     f"[File API: To send a file to the user, POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/send-file "
-                    f"with header 'X-Webhook-Secret: {self.webhook_secret}'. "
+                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
                     f'Required: "path" (absolute file path within the current workspace {self.workspace}). '
                     f'Optional: "caption". Images are sent as photos, '
                     f"everything else as documents.\n"
@@ -358,11 +372,11 @@ class PersistentClaude:
                 svc_lines = [
                     "[External Services: To call external APIs, POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/services/{{name}} "
-                    f"with header 'X-Webhook-Secret: {self.webhook_secret}'. "
+                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
                     "Request JSON fields (all optional): "
-                    '"body" (dict — forwarded as JSON), '
-                    '"params" (dict — query parameters), '
-                    '"path_suffix" (str — appended to base URL).',
+                    '"body" (dict - forwarded as JSON), '
+                    '"params" (dict - query parameters), '
+                    '"path_suffix" (str - appended to base URL).',
                     "",
                     "Available services:",
                 ]
@@ -375,7 +389,7 @@ class PersistentClaude:
                     "Example (Perplexity web search):\n"
                     f"  curl -s -X POST http://localhost:{self.webhook_port}/api/services/perplexity "
                     f"-H 'Content-Type: application/json' "
-                    f"-H 'X-Webhook-Secret: {self.webhook_secret}' "
+                    f"""-H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET" """
                     """-d '{"body": {"model": "sonar", "messages": [{"role": "user", "content": "your query"}]}}'"""
                 )
                 svc_lines.append(
@@ -472,6 +486,7 @@ class PersistentClaude:
                 try:
                     event = json.loads(line.decode())
                 except json.JSONDecodeError:
+                    log.debug("Skipping non-JSON stdout line: %s", line.decode().strip()[:200])
                     continue
 
                 etype = event.get("type")
@@ -482,11 +497,12 @@ class PersistentClaude:
                         self._session_id = sid
 
                 elif etype == "result":
-                    # The result event's text may only contain the final
-                    # assistant message; accumulated_text has everything
-                    # (including text before tool use).
+                    # Prefer accumulated_text (which includes text before tool
+                    # use) over the result event's text (which may only contain
+                    # the final assistant message). Fall back to result_text
+                    # when nothing was accumulated (e.g., system-only responses).
                     result_text = event.get("result", "")
-                    text = accumulated_text if len(accumulated_text) > len(result_text) else result_text
+                    text = accumulated_text if accumulated_text else result_text
                     response = ClaudeResponse(
                         success=not event.get("is_error", False),
                         text=text,
@@ -522,10 +538,12 @@ class PersistentClaude:
         """
         Kill the subprocess immediately. Safe to call without holding the lock.
 
-        Called by /stop to abort an in-flight response. The streaming loop
-        in _send_locked() will see EOF on stdout and clean up via its
-        existing error-handling path. Does not await process termination
-        (that happens in the streaming loop).
+        Called by /stop to abort an in-flight response. There is a race window
+        between _ensure_started() and the stdin write in _send_locked(), but
+        it is safe: killing the process causes EOF on stdout, which the
+        streaming loop handles by yielding a done event and calling _kill()
+        to clean up. No lock acquisition is needed here because _kill_proc()
+        only sends a signal and is itself idempotent.
         """
         self._kill_proc(signal.SIGKILL)
 
@@ -539,6 +557,9 @@ class PersistentClaude:
         Args:
             new_workspace: Path to the new working directory.
         """
+        # No lock needed: _kill() terminates the process, and the next send()
+        # call will start fresh in the new workspace via _ensure_started().
+        # Any in-flight send() will see EOF on stdout and clean up.
         self.workspace = new_workspace
         await self._kill()
 
@@ -590,7 +611,11 @@ class PersistentClaude:
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except TimeoutError:
                 self._kill_proc(signal.SIGKILL)
-                await self._proc.wait()
+                try:
+                    # Timeout prevents blocking forever on a zombie process
+                    await asyncio.wait_for(self._proc.wait(), timeout=5)
+                except TimeoutError:
+                    log.warning("Process did not exit after SIGKILL; abandoning")
         self._proc = None
         if self._stderr_task:
             self._stderr_task.cancel()

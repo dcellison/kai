@@ -348,8 +348,10 @@ async def _handle_generic(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         return web.Response(status=400, text="Invalid JSON")
 
-    # Use the "message" field if present, otherwise dump the full JSON
-    text = payload.get("message") or json.dumps(payload, indent=2)
+    # Use the "message" field if present (including empty string),
+    # otherwise dump the full JSON. `is not None` avoids treating "" as absent.
+    msg = payload.get("message")
+    text = msg if msg is not None else json.dumps(payload, indent=2)
     if len(text) > 4096:
         text = text[:4093] + "..."
 
@@ -405,7 +407,9 @@ async def _handle_schedule(request: web.Request) -> web.Response:
     schedule_type = payload.get("schedule_type")
     schedule_data = payload.get("schedule_data")
 
-    if not all([name, prompt, schedule_type, schedule_data]):
+    # Use `is None` checks so empty strings (e.g., prompt="") are not
+    # rejected as missing. Truthiness would treat "" as absent.
+    if name is None or prompt is None or schedule_type is None or schedule_data is None:
         return web.json_response(
             {"error": "Missing required fields: name, prompt, schedule_type, schedule_data"},
             status=400,
@@ -716,13 +720,16 @@ async def _handle_send_file(request: web.Request) -> web.Response:
     # Confine to the current workspace to prevent path traversal. Uses
     # Path.relative_to() which raises ValueError on escape, unlike string
     # prefix matching which is bypassable via symlinks.
+    # Fail closed: if workspace is somehow unset, deny all file access
+    # rather than allowing reads from anywhere on the filesystem.
     workspace = request.app.get("workspace")
-    if workspace:
-        workspace_resolved = Path(workspace).resolve()
-        try:
-            path.relative_to(workspace_resolved)
-        except ValueError:
-            return web.json_response({"error": "Path outside workspace"}, status=403)
+    if not workspace:
+        return web.json_response({"error": "No workspace configured"}, status=403)
+    workspace_resolved = Path(workspace).resolve()
+    try:
+        path.relative_to(workspace_resolved)
+    except ValueError:
+        return web.json_response({"error": "Path outside workspace"}, status=403)
 
     if not path.is_file():
         return web.json_response({"error": f"File not found: {file_path}"}, status=404)
@@ -775,8 +782,13 @@ async def start(telegram_app, config) -> None:
     _app["telegram_bot"] = telegram_app.bot
     _app["webhook_secret"] = config.webhook_secret
 
-    # Use first allowed user ID as the notification target
-    _app["chat_id"] = next(iter(config.allowed_user_ids))
+    # Use first allowed user ID as the notification target.
+    # Config validation ensures allowed_user_ids is non-empty, but guard
+    # against edge cases to avoid a StopIteration crash at startup.
+    chat_id = next(iter(config.allowed_user_ids), None)
+    if chat_id is None:
+        raise SystemExit("No allowed user IDs configured; cannot start webhook server")
+    _app["chat_id"] = chat_id
 
     # Store workspace path for send-file path confinement
     _app["workspace"] = str(config.claude_workspace)
