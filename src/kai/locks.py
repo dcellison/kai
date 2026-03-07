@@ -41,10 +41,14 @@ def get_lock(chat_id: int) -> asyncio.Lock:
     lock = _chat_locks.get(chat_id)
     if lock is not None:
         return lock
-    # Evict oldest entry if at capacity
+    # Evict oldest entry if at capacity, but skip any lock that is currently
+    # held - evicting an active lock would break the serialization guarantee
+    # for that chat (a new get_lock() call would create a different lock).
     if len(_chat_locks) >= _MAX_LOCKS:
-        oldest = next(iter(_chat_locks))
-        del _chat_locks[oldest]
+        for candidate in list(_chat_locks):
+            if not _chat_locks[candidate].locked():
+                del _chat_locks[candidate]
+                break
     lock = asyncio.Lock()
     _chat_locks[chat_id] = lock
     return lock
@@ -67,10 +71,14 @@ def get_stop_event(chat_id: int) -> asyncio.Event:
     event = _stop_events.get(chat_id)
     if event is not None:
         return event
-    # Evict oldest entry if at capacity
+    # Evict oldest entry if at capacity, but skip any event that is currently
+    # set - evicting an active stop event would cause /stop to create a new
+    # event the in-flight streaming loop never sees.
     if len(_stop_events) >= _MAX_LOCKS:
-        oldest = next(iter(_stop_events))
-        del _stop_events[oldest]
+        for candidate in list(_stop_events):
+            if not _stop_events[candidate].is_set():
+                del _stop_events[candidate]
+                break
     event = asyncio.Event()
     _stop_events[chat_id] = event
     return event

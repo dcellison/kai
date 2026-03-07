@@ -132,6 +132,7 @@ async def _run(*cmd: str, label: str) -> str:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
     except TimeoutError:
         proc.kill()
+        await proc.wait()  # Reap the killed process to avoid zombies
         raise TranscriptionError(f"{label} timed out after 30 seconds") from None
 
     if proc.returncode != 0:

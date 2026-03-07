@@ -46,7 +46,7 @@ def _read_secret() -> str | None:
     """
     try:
         result = subprocess.run(
-            ["sudo", "cat", TOTP_SECRET_PATH],
+            ["sudo", "-n", "cat", TOTP_SECRET_PATH],
             capture_output=True,
             text=True,
             timeout=5,
@@ -70,13 +70,17 @@ def _read_attempts() -> dict:
     """
     try:
         result = subprocess.run(
-            ["sudo", "cat", TOTP_ATTEMPTS_PATH],
+            ["sudo", "-n", "cat", TOTP_ATTEMPTS_PATH],
             capture_output=True,
             text=True,
             timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout.strip())
+            data = json.loads(result.stdout.strip())
+            # Validate expected types to avoid TypeError on arithmetic later
+            # (e.g., "failures": "abc" would crash on + 1)
+            if isinstance(data, dict) and isinstance(data.get("failures"), (int, float)):
+                return data
     except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
         pass
     return {"failures": 0, "lockout_until": 0}
@@ -92,7 +96,7 @@ def _write_attempts(state: dict) -> None:
     """
     try:
         subprocess.run(
-            ["sudo", "tee", TOTP_ATTEMPTS_PATH],
+            ["sudo", "-n", "tee", TOTP_ATTEMPTS_PATH],
             input=json.dumps(state),
             capture_output=True,
             text=True,
@@ -217,16 +221,18 @@ def _cmd_setup() -> None:
     # Generate a cryptographically random base32 secret.
     secret = pyotp.random_base32()
 
-    # Write secret file: root:root 0600.
-    with open(TOTP_SECRET_PATH, "w") as f:
+    # Write secret file: root:root 0600. Uses os.open() with explicit mode
+    # to avoid a TOCTOU window where the file briefly exists with default
+    # umask permissions before chmod() tightens them.
+    fd = os.open(TOTP_SECRET_PATH, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write(secret)
-    os.chmod(TOTP_SECRET_PATH, 0o600)
     os.chown(TOTP_SECRET_PATH, 0, 0)
 
     # Create a clean attempts file: root:root 0600.
-    with open(TOTP_ATTEMPTS_PATH, "w") as f:
+    fd = os.open(TOTP_ATTEMPTS_PATH, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write(json.dumps({"failures": 0, "lockout_until": 0}))
-    os.chmod(TOTP_ATTEMPTS_PATH, 0o600)
     os.chown(TOTP_ATTEMPTS_PATH, 0, 0)
 
     # Generate and print the QR code to the terminal.

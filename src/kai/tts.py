@@ -124,6 +124,7 @@ async def synthesize_speech(text: str, model_dir: Path, voice: str = DEFAULT_VOI
             )
         except TimeoutError:
             proc.kill()
+            await proc.wait()  # Reap the killed process to avoid zombies
             raise TTSError("Piper TTS timed out after 120 seconds") from None
 
         if proc.returncode != 0:
@@ -152,6 +153,7 @@ async def synthesize_speech(text: str, model_dir: Path, voice: str = DEFAULT_VOI
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
         except TimeoutError:
             proc.kill()
+            await proc.wait()  # Reap the killed process to avoid zombies
             raise TTSError("ffmpeg timed out after 30 seconds") from None
 
         if proc.returncode != 0:
