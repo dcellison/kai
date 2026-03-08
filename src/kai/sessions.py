@@ -212,7 +212,10 @@ async def get_jobs(chat_id: int) -> list[dict]:
     ) as cursor:
         rows = await cursor.fetchall()
         # SQLite stores booleans as integers; convert back to bool
-        return [{**dict(r), "auto_remove": bool(r["auto_remove"]), "notify_on_check": bool(r["notify_on_check"])} for r in rows]
+        return [
+            {**dict(r), "auto_remove": bool(r["auto_remove"]), "notify_on_check": bool(r["notify_on_check"])}
+            for r in rows
+        ]
 
 
 async def get_job_by_id(job_id: int) -> dict | None:
@@ -233,7 +236,10 @@ async def get_all_active_jobs() -> list[dict]:
         "SELECT id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check FROM jobs WHERE active = 1"
     ) as cursor:
         rows = await cursor.fetchall()
-        return [{**dict(r), "auto_remove": bool(r["auto_remove"]), "notify_on_check": bool(r["notify_on_check"])} for r in rows]
+        return [
+            {**dict(r), "auto_remove": bool(r["auto_remove"]), "notify_on_check": bool(r["notify_on_check"])}
+            for r in rows
+        ]
 
 
 async def delete_job(job_id: int) -> bool:
