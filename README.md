@@ -312,7 +312,7 @@ This creates a split layout:
 - `/var/lib/kai/` - writable runtime data: database, logs, files (service-user-owned)
 - `/etc/kai/` - secrets: env file, service configs, TOTP (root-owned, mode 0600)
 
-The install module handles directory creation, source copying, venv setup, secret deployment, sudoers rules, data migration, service definition generation, and service lifecycle (stop/start). Use `--dry-run` (or `DRY_RUN=1`) to preview changes without applying them.
+The install module handles directory creation, source copying, venv setup, secret deployment, sudoers rules, data migration, service definition generation, and service lifecycle (stop/start). Use `--dry-run` to preview changes without applying them.
 
 The service user reads secrets via narrowly-scoped sudoers rules (`sudo cat` on specific files only). The inner Claude process cannot read secrets or modify source code.
 
