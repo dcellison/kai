@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 
 from kai.config import PROJECT_ROOT, VALID_MODELS
@@ -740,8 +741,6 @@ def _stop_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
             # Without this, a subsequent bootstrap can fail transiently
             # on KeepAlive daemons.
             if platform == "darwin":
-                import time
-
                 time.sleep(2)
         else:
             # Non-zero is expected on first install (service not yet registered)
@@ -784,8 +783,6 @@ def _start_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
     # On macOS, bootstrap can fail transiently after bootout.
     # Wait briefly for launchd to finish tearing down, then retry.
     if platform == "darwin":
-        import time
-
         stderr_msg = result.stderr.decode().strip()
         print(f"  Bootstrap failed ({stderr_msg or 'unknown'}), retrying...")
         time.sleep(2)
@@ -1076,7 +1073,7 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
     On a fresh install, creates a venv with the system Python and pip-installs
     the package with optional extras (totp, tts). On update, compares the
     pyproject.toml checksum to detect dependency changes and only reinstalls
-    if needed. Rejects Python versions below 3.12.
+    if needed. Rejects Python versions below 3.13.
 
     Args:
         install_path: Root of the install tree containing src/ and pyproject.toml.
@@ -1123,8 +1120,7 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
             check=False,
         )
         if result.returncode == 0:
-            # Split with maxsplit=2 to handle patch versions like "3.13.1"
-            parts = result.stdout.strip().split(".", maxsplit=2)
+            parts = result.stdout.strip().split(".")
             major, minor = parts[0], parts[1]
             if (int(major), int(minor)) < (3, 13):
                 raise SystemExit(

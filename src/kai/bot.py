@@ -54,7 +54,7 @@ from telegram.ext import (
 
 from kai import services, sessions, webhook
 from kai.claude import PersistentClaude
-from kai.config import DATA_DIR, IMAGE_EXTENSIONS, Config
+from kai.config import DATA_DIR, Config
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
 from kai.transcribe import TranscriptionError, transcribe_voice
@@ -1245,7 +1245,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     claude = _get_claude(context)
     model = claude.model
 
-    if suffix in IMAGE_EXTENSIONS:
+    if suffix in _IMAGE_MEDIA_TYPES:
         # Handle images sent as documents (uncompressed upload)
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
@@ -1417,9 +1417,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         # Read TOTP timing from the centralized Config object rather than
         # raw os.environ, so defaults and validation happen in one place.
-        totp_cfg = context.bot_data["config"]
-        session_min = totp_cfg.totp_session_minutes if isinstance(totp_cfg, Config) else 30
-        challenge_sec = totp_cfg.totp_challenge_seconds if isinstance(totp_cfg, Config) else 120
+        totp_cfg: Config = context.bot_data["config"]
+        session_min = totp_cfg.totp_session_minutes
+        challenge_sec = totp_cfg.totp_challenge_seconds
 
         auth_time = context.user_data.get("totp_authenticated_at", 0)
         totp_expired = time.time() - auth_time > session_min * 60
@@ -1460,8 +1460,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
                 return
 
-            lockout_attempts = totp_cfg.totp_lockout_attempts if isinstance(totp_cfg, Config) else 3
-            lockout_minutes = totp_cfg.totp_lockout_minutes if isinstance(totp_cfg, Config) else 15
+            lockout_attempts = totp_cfg.totp_lockout_attempts
+            lockout_minutes = totp_cfg.totp_lockout_minutes
 
             if verify_code(code, lockout_attempts, lockout_minutes):
                 del context.user_data["totp_pending"]

@@ -47,7 +47,7 @@ from pathlib import Path
 from aiohttp import web
 from telegram import Update
 
-from kai import cron, sessions
+from kai import cron, services, sessions
 from kai.config import IMAGE_EXTENSIONS
 
 log = logging.getLogger(__name__)
@@ -644,9 +644,6 @@ async def _handle_service_call(request: web.Request) -> web.Response:
         path_suffix = payload.get("path_suffix", "")
     except json.JSONDecodeError:
         pass  # No body is fine — all fields are optional
-
-    # Import inside handler to avoid circular imports at module level
-    from kai import services
 
     result = await services.call_service(
         service_name,
