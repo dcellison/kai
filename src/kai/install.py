@@ -736,6 +736,13 @@ def _stop_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
         result = subprocess.run(cmd, check=False, capture_output=True)
         if result.returncode == 0:
             print(f"  Stopped service ({' '.join(cmd[:2])})")
+            # Give launchd time to fully release the service domain.
+            # Without this, a subsequent bootstrap can fail transiently
+            # on KeepAlive daemons.
+            if platform == "darwin":
+                import time
+
+                time.sleep(2)
         else:
             # Non-zero is expected on first install (service not yet registered)
             print(f"  Service not running ({' '.join(cmd[:2])})")
@@ -747,6 +754,10 @@ def _start_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
 
     Best-effort: uses check=False since launchctl/systemctl may report
     warnings that aren't actually failures (e.g., service already running).
+
+    On macOS, launchctl bootstrap can fail transiently after a bootout
+    if launchd hasn't fully released the service domain (common with
+    KeepAlive daemons). We retry once after a brief delay to handle this.
 
     Args:
         platform: "darwin" or "linux".
@@ -763,12 +774,30 @@ def _start_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
 
     if dry_run:
         print(f"[DRY RUN] Would run: {' '.join(cmd)}")
-    else:
+        return
+
+    result = subprocess.run(cmd, check=False, capture_output=True)
+    if result.returncode == 0:
+        print(f"  Started service ({' '.join(cmd[:2])})")
+        return
+
+    # On macOS, bootstrap can fail transiently after bootout.
+    # Wait briefly for launchd to finish tearing down, then retry.
+    if platform == "darwin":
+        import time
+
+        stderr_msg = result.stderr.decode().strip()
+        print(f"  Bootstrap failed ({stderr_msg or 'unknown'}), retrying...")
+        time.sleep(2)
         result = subprocess.run(cmd, check=False, capture_output=True)
         if result.returncode == 0:
             print(f"  Started service ({' '.join(cmd[:2])})")
-        else:
-            print(f"  Warning: service start returned non-zero ({' '.join(cmd[:2])})")
+            return
+
+    # Show the actual error so the user knows what went wrong
+    stderr_text = result.stderr.decode().strip()
+    hint = f": {stderr_text}" if stderr_text else ""
+    print(f"  Warning: service start failed ({' '.join(cmd[:2])}){hint}")
 
 
 def _apply_migrate(data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
