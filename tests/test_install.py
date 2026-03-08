@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -12,6 +13,11 @@ from kai.install import (
     _LAUNCHD_LABEL,
     _apply_directories,
     _apply_migrate,
+    _apply_models,
+    _apply_secrets,
+    _apply_service,
+    _apply_source,
+    _apply_sudoers,
     _apply_venv,
     _check_path,
     _check_service_status,
@@ -19,13 +25,17 @@ from kai.install import (
     _cmd_apply,
     _cmd_config,
     _cmd_status,
+    _copy_tree,
     _file_checksum,
     _generate_env_file,
     _generate_launchd_plist,
+    _generate_launcher_script,
     _generate_sudoers,
     _generate_systemd_unit,
+    _set_ownership,
     _start_service,
     _stop_service,
+    _user_home,
     _validate_port,
     _validate_positive_float,
     _validate_positive_int,
@@ -936,3 +946,235 @@ class TestCli:
         monkeypatch.setattr("kai.install._cmd_apply", mock_apply)
         cli(["apply", "--dry-run"])
         assert captured_env.get("DRY_RUN") == "1"
+
+
+# ── _set_ownership ───────────────────────────────────────────────────
+
+
+class TestSetOwnership:
+    def test_single_file(self, tmp_path):
+        """Sets ownership on a single file."""
+        f = tmp_path / "file.txt"
+        f.touch()
+        with patch("os.chown") as mock_chown:
+            _set_ownership(f, 1000, 1000)
+        mock_chown.assert_called_once_with(f, 1000, 1000)
+
+    def test_recursive(self, tmp_path):
+        """Recursive: sets ownership on directory and all children."""
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "a.txt").touch()
+        (sub / "b.txt").touch()
+        with patch("os.chown") as mock_chown:
+            _set_ownership(tmp_path, 0, 0, recursive=True)
+        # Should chown the root, sub dir, and both files
+        chowned_paths = {call[0][0] for call in mock_chown.call_args_list}
+        assert tmp_path in chowned_paths
+        assert sub in chowned_paths
+        assert sub / "a.txt" in chowned_paths
+        assert sub / "b.txt" in chowned_paths
+
+
+# ── _copy_tree ───────────────────────────────────────────────────────
+
+
+class TestCopyTree:
+    def test_copies_tree(self, tmp_path):
+        """Copies source tree to destination."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "file.py").write_text("code")
+        dst = tmp_path / "dst"
+        _copy_tree(src, dst)
+        assert (dst / "file.py").read_text() == "code"
+
+    def test_excludes_patterns(self, tmp_path):
+        """Excluded patterns are not copied."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "file.py").write_text("code")
+        cache = src / "__pycache__"
+        cache.mkdir()
+        (cache / "file.pyc").write_bytes(b"\x00")
+        dst = tmp_path / "dst"
+        _copy_tree(src, dst, excludes={"__pycache__"})
+        assert (dst / "file.py").exists()
+        assert not (dst / "__pycache__").exists()
+
+    def test_overwrites_existing(self, tmp_path):
+        """Existing destination is removed before copy."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "new.py").write_text("new")
+        dst = tmp_path / "dst"
+        dst.mkdir()
+        (dst / "old.py").write_text("old")
+        _copy_tree(src, dst)
+        assert (dst / "new.py").exists()
+        assert not (dst / "old.py").exists()
+
+
+# ── _user_home ───────────────────────────────────────────────────────
+
+
+class TestUserHome:
+    def test_known_user(self):
+        """Known user returns their actual home dir from pwd."""
+        import getpass
+
+        current = getpass.getuser()
+        result = _user_home(current)
+        assert Path(result).is_dir()
+
+    def test_unknown_user_darwin(self, monkeypatch):
+        """Unknown user on Darwin: returns /Users/<username>."""
+        monkeypatch.setattr("kai.install.pwd.getpwnam", MagicMock(side_effect=KeyError))
+        monkeypatch.setattr("kai.install.sys.platform", "darwin")
+        assert _user_home("testuser") == "/Users/testuser"
+
+    def test_unknown_user_linux(self, monkeypatch):
+        """Unknown user on Linux: returns /home/<username>."""
+        monkeypatch.setattr("kai.install.pwd.getpwnam", MagicMock(side_effect=KeyError))
+        monkeypatch.setattr("kai.install.sys.platform", "linux")
+        assert _user_home("testuser") == "/home/testuser"
+
+
+# ── _generate_launcher_script ────────────────────────────────────────
+
+
+class TestGenerateLauncherScript:
+    def test_contains_install_dir(self):
+        script = _generate_launcher_script("/opt/kai")
+        assert "/opt/kai" in script
+
+    def test_contains_webhook_port(self):
+        script = _generate_launcher_script("/opt/kai", webhook_port=9090)
+        assert "9090" in script
+
+    def test_starts_with_shebang(self):
+        script = _generate_launcher_script("/opt/kai")
+        assert script.startswith("#!/bin/bash")
+
+    def test_contains_signal_forwarding(self):
+        script = _generate_launcher_script("/opt/kai")
+        assert "trap" in script
+        assert "TERM" in script
+
+
+# ── _apply_source ────────────────────────────────────────────────────
+
+
+class TestApplySource:
+    def test_dry_run(self, tmp_path, capsys):
+        """Dry run: prints messages, doesn't copy."""
+        with patch("kai.install.PROJECT_ROOT", tmp_path):
+            _apply_source(tmp_path / "install", dry_run=True)
+        output = capsys.readouterr().out
+        assert "DRY RUN" in output
+        assert "Would copy" in output
+
+    def test_actual(self, tmp_path):
+        """Actual: calls _copy_tree, _set_ownership, and copies pyproject.toml."""
+        # Set up source structure
+        src = tmp_path / "source"
+        (src / "src").mkdir(parents=True)
+        (src / "src" / "module.py").write_text("code")
+        (src / "pyproject.toml").write_text("[project]")
+        install = tmp_path / "install"
+        install.mkdir()
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._copy_tree") as mock_copy,
+            patch("kai.install._set_ownership") as mock_own,
+            patch("shutil.copy2") as mock_cp,
+            patch("os.chown"),
+        ):
+            _apply_source(install, dry_run=False)
+        mock_copy.assert_called_once()
+        mock_own.assert_called_once()
+        mock_cp.assert_called_once()
+
+
+# ── _apply_models ────────────────────────────────────────────────────
+
+
+class TestApplyModels:
+    def test_no_models_dir(self, tmp_path):
+        """No models directory: returns early."""
+        with patch("kai.install.PROJECT_ROOT", tmp_path):
+            _apply_models(tmp_path / "install", dry_run=False)
+        # No exception, no output
+
+    def test_empty_models_dir(self, tmp_path):
+        """Empty models directory: returns early."""
+        (tmp_path / "models").mkdir()
+        with patch("kai.install.PROJECT_ROOT", tmp_path):
+            _apply_models(tmp_path / "install", dry_run=False)
+
+    def test_dry_run(self, tmp_path, capsys):
+        """Dry run with models: prints message."""
+        models = tmp_path / "models"
+        models.mkdir()
+        (models / "model.bin").touch()
+        with patch("kai.install.PROJECT_ROOT", tmp_path):
+            _apply_models(tmp_path / "install", dry_run=True)
+        assert "DRY RUN" in capsys.readouterr().out
+
+    def test_actual(self, tmp_path):
+        """Actual: calls _copy_tree and _set_ownership."""
+        models = tmp_path / "models"
+        models.mkdir()
+        (models / "model.bin").touch()
+        with (
+            patch("kai.install.PROJECT_ROOT", tmp_path),
+            patch("kai.install._copy_tree") as mock_copy,
+            patch("kai.install._set_ownership") as mock_own,
+        ):
+            _apply_models(tmp_path / "install", dry_run=False)
+        mock_copy.assert_called_once()
+        mock_own.assert_called_once()
+
+
+# ── _apply_secrets dry run ───────────────────────────────────────────
+
+
+class TestApplySecretsDryRun:
+    def test_dry_run(self, capsys):
+        """Dry run: prints message, doesn't write files."""
+        _apply_secrets({"TELEGRAM_BOT_TOKEN": "test"}, dry_run=True)
+        output = capsys.readouterr().out
+        assert "DRY RUN" in output
+        assert "env" in output
+
+
+# ── _apply_sudoers dry run ───────────────────────────────────────────
+
+
+class TestApplySudoersDryRun:
+    def test_dry_run(self, capsys):
+        """Dry run: prints expected messages."""
+        _apply_sudoers("kai", dry_run=True)
+        output = capsys.readouterr().out
+        assert "DRY RUN" in output
+        assert "sudoers" in output.lower() or "visudo" in output.lower()
+
+
+# ── _apply_service dry run ───────────────────────────────────────────
+
+
+class TestApplyServiceDryRun:
+    def test_dry_run_darwin(self, capsys):
+        """Dry run on Darwin: prints launcher and plist messages."""
+        _apply_service("/opt/kai", "/var/lib/kai", "kai", "darwin", dry_run=True)
+        output = capsys.readouterr().out
+        assert "DRY RUN" in output
+        assert "launcher" in output.lower() or "run.sh" in output.lower()
+        assert "plist" in output.lower() or "LaunchDaemon" in output
+
+    def test_dry_run_linux(self, capsys):
+        """Dry run on Linux: prints unit file message."""
+        _apply_service("/opt/kai", "/var/lib/kai", "kai", "linux", dry_run=True)
+        output = capsys.readouterr().out
+        assert "DRY RUN" in output

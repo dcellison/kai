@@ -1,18 +1,26 @@
 """Integration tests for webhook HTTP API endpoints (jobs CRUD, file exchange)."""
 
 import asyncio
+import hashlib
+import hmac as hmac_mod
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
 
 import kai.webhook as webhook_mod
 from kai import sessions
+from kai.services import ServiceResponse
 from kai.webhook import (
     _handle_delete_job,
+    _handle_generic,
+    _handle_get_job,
+    _handle_get_jobs,
+    _handle_github,
     _handle_schedule,
     _handle_send_file,
+    _handle_service_call,
     _handle_telegram_update,
     _handle_update_job,
     update_workspace,
@@ -481,3 +489,614 @@ class TestTelegramUpdate:
 
         assert resp.status == 200
         telegram_request.app["telegram_app"].process_update.assert_not_called()
+
+
+# ── GitHub webhook helpers ─────────────────────────────────────────
+
+
+def _sign_body(secret: str, body: bytes) -> str:
+    """Compute a valid GitHub HMAC-SHA256 signature for test payloads."""
+    digest = hmac_mod.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return f"sha256={digest}"
+
+
+@pytest.fixture()
+def github_request():
+    """Create a mock request for the GitHub webhook endpoint."""
+    request = MagicMock(spec=web.Request)
+    request.app = {
+        "webhook_secret": "test-secret",
+        "telegram_bot": AsyncMock(),
+        "chat_id": 12345,
+    }
+    request.headers = {}
+    return request
+
+
+def _github_push_payload() -> dict:
+    """Minimal GitHub push event payload for testing."""
+    return {
+        "pusher": {"name": "testuser"},
+        "ref": "refs/heads/main",
+        "commits": [{"id": "abc1234def5678", "message": "Fix bug"}],
+        "repository": {"full_name": "testuser/repo"},
+        "compare": "https://github.com/testuser/repo/compare/abc...def",
+    }
+
+
+# ── POST /webhook/github ──────────────────────────────────────────
+
+
+class TestGitHubWebhook:
+    async def test_valid_push_sends_markdown(self, github_request):
+        """Valid signature + push event sends a Markdown-formatted message."""
+        payload = _github_push_payload()
+        body = json.dumps(payload).encode()
+        github_request.read = AsyncMock(return_value=body)
+        github_request.headers = {
+            "X-Hub-Signature-256": _sign_body("test-secret", body),
+            "X-GitHub-Event": "push",
+        }
+
+        resp = await _handle_github(github_request)
+
+        assert resp.status == 200
+        bot = github_request.app["telegram_bot"]
+        bot.send_message.assert_called_once()
+        call_kwargs = bot.send_message.call_args
+        assert call_kwargs.kwargs.get("parse_mode") == "Markdown" or call_kwargs[2] == "Markdown"
+
+    async def test_markdown_failure_falls_back_to_plain(self, github_request):
+        """When Markdown parse fails, resends as stripped plain text."""
+        payload = _github_push_payload()
+        body = json.dumps(payload).encode()
+        github_request.read = AsyncMock(return_value=body)
+        github_request.headers = {
+            "X-Hub-Signature-256": _sign_body("test-secret", body),
+            "X-GitHub-Event": "push",
+        }
+        bot = github_request.app["telegram_bot"]
+        # First call (Markdown) fails, second call (plain) succeeds
+        bot.send_message = AsyncMock(side_effect=[Exception("parse error"), None])
+
+        resp = await _handle_github(github_request)
+
+        assert resp.status == 200
+        assert bot.send_message.call_count == 2
+
+    async def test_both_sends_fail_returns_error(self, github_request):
+        """When both Markdown and plain text fail, returns error response."""
+        payload = _github_push_payload()
+        body = json.dumps(payload).encode()
+        github_request.read = AsyncMock(return_value=body)
+        github_request.headers = {
+            "X-Hub-Signature-256": _sign_body("test-secret", body),
+            "X-GitHub-Event": "push",
+        }
+        bot = github_request.app["telegram_bot"]
+        bot.send_message = AsyncMock(side_effect=Exception("always fails"))
+
+        resp = await _handle_github(github_request)
+
+        body_json = json.loads(resp.body.decode())
+        assert body_json["msg"] == "error"
+
+    async def test_invalid_signature_returns_401(self, github_request):
+        """Requests with an invalid HMAC signature are rejected."""
+        body = b'{"any": "payload"}'
+        github_request.read = AsyncMock(return_value=body)
+        github_request.headers = {
+            "X-Hub-Signature-256": "sha256=invalid",
+            "X-GitHub-Event": "push",
+        }
+
+        resp = await _handle_github(github_request)
+
+        assert resp.status == 401
+        github_request.app["telegram_bot"].send_message.assert_not_called()
+
+    async def test_ping_event_returns_pong(self, github_request):
+        """GitHub ping events are acknowledged without sending to Telegram."""
+        body = b'{"zen": "testing"}'
+        github_request.read = AsyncMock(return_value=body)
+        github_request.headers = {
+            "X-Hub-Signature-256": _sign_body("test-secret", body),
+            "X-GitHub-Event": "ping",
+        }
+
+        resp = await _handle_github(github_request)
+
+        body_json = json.loads(resp.body.decode())
+        assert body_json["msg"] == "pong"
+        github_request.app["telegram_bot"].send_message.assert_not_called()
+
+    async def test_unknown_event_type_ignored(self, github_request):
+        """Unsupported event types (e.g. 'star') are silently ignored."""
+        payload = {"action": "created"}
+        body = json.dumps(payload).encode()
+        github_request.read = AsyncMock(return_value=body)
+        github_request.headers = {
+            "X-Hub-Signature-256": _sign_body("test-secret", body),
+            "X-GitHub-Event": "star",
+        }
+
+        resp = await _handle_github(github_request)
+
+        body_json = json.loads(resp.body.decode())
+        assert body_json["msg"] == "ignored"
+
+    async def test_filtered_action_ignored(self, github_request):
+        """Known event type with filtered action (e.g. PR 'edited') is ignored."""
+        # PR "edited" is not in the formatter's accepted actions
+        payload = {"action": "edited", "pull_request": {"title": "test"}}
+        body = json.dumps(payload).encode()
+        github_request.read = AsyncMock(return_value=body)
+        github_request.headers = {
+            "X-Hub-Signature-256": _sign_body("test-secret", body),
+            "X-GitHub-Event": "pull_request",
+        }
+
+        resp = await _handle_github(github_request)
+
+        body_json = json.loads(resp.body.decode())
+        assert body_json["msg"] == "ignored"
+
+    async def test_invalid_json_after_valid_signature_returns_400(self, github_request):
+        """Valid signature over malformed JSON body returns 400."""
+        body = b"not valid json"
+        github_request.read = AsyncMock(return_value=body)
+        github_request.headers = {
+            "X-Hub-Signature-256": _sign_body("test-secret", body),
+            # Use a known event type so JSON parsing is attempted
+            "X-GitHub-Event": "push",
+        }
+
+        resp = await _handle_github(github_request)
+
+        assert resp.status == 400
+
+
+# ── POST /webhook (generic) ───────────────────────────────────────
+
+
+@pytest.fixture()
+def generic_request():
+    """Create a mock request for the generic webhook endpoint."""
+    request = MagicMock(spec=web.Request)
+    request.app = {
+        "webhook_secret": "test-secret",
+        "telegram_bot": AsyncMock(),
+        "chat_id": 12345,
+    }
+    request.headers = {"X-Webhook-Secret": "test-secret"}
+    return request
+
+
+class TestGenericWebhook:
+    async def test_sends_message_field(self, generic_request):
+        """Payload with a 'message' field sends that string to Telegram."""
+        generic_request.json = AsyncMock(return_value={"message": "Alert: disk full"})
+
+        resp = await _handle_generic(generic_request)
+
+        assert resp.status == 200
+        generic_request.app["telegram_bot"].send_message.assert_called_once_with(12345, "Alert: disk full")
+
+    async def test_dumps_full_payload_when_no_message(self, generic_request):
+        """Payload without 'message' sends the full JSON dump to Telegram."""
+        payload = {"key": "value", "count": 42}
+        generic_request.json = AsyncMock(return_value=payload)
+
+        resp = await _handle_generic(generic_request)
+
+        assert resp.status == 200
+        sent_text = generic_request.app["telegram_bot"].send_message.call_args[0][1]
+        # Should be a pretty-printed JSON dump
+        assert '"key": "value"' in sent_text
+        assert '"count": 42' in sent_text
+
+    async def test_empty_message_field_sends_empty_string(self, generic_request):
+        """Empty string 'message' is sent as-is (not treated as missing)."""
+        generic_request.json = AsyncMock(return_value={"message": ""})
+
+        resp = await _handle_generic(generic_request)
+
+        assert resp.status == 200
+        sent_text = generic_request.app["telegram_bot"].send_message.call_args[0][1]
+        assert sent_text == ""
+
+    async def test_long_message_truncated(self, generic_request):
+        """Messages over 4096 chars are truncated with '...' suffix."""
+        long_msg = "x" * 5000
+        generic_request.json = AsyncMock(return_value={"message": long_msg})
+
+        resp = await _handle_generic(generic_request)
+
+        assert resp.status == 200
+        sent_text = generic_request.app["telegram_bot"].send_message.call_args[0][1]
+        assert len(sent_text) == 4096
+        assert sent_text.endswith("...")
+
+    async def test_invalid_json_returns_400(self, generic_request):
+        """Malformed JSON body returns 400."""
+        generic_request.json = AsyncMock(side_effect=json.JSONDecodeError("test", "doc", 0))
+
+        resp = await _handle_generic(generic_request)
+
+        assert resp.status == 400
+
+    async def test_send_failure_still_returns_ok(self, generic_request):
+        """Telegram send failures are logged but the response is still 200/ok."""
+        generic_request.json = AsyncMock(return_value={"message": "test"})
+        generic_request.app["telegram_bot"].send_message = AsyncMock(side_effect=RuntimeError("network error"))
+
+        resp = await _handle_generic(generic_request)
+
+        assert resp.status == 200
+        body_json = json.loads(resp.body.decode())
+        assert body_json["status"] == "ok"
+
+    async def test_missing_secret_returns_401(self, generic_request):
+        """Missing webhook secret header returns 401."""
+        generic_request.headers = {}
+        generic_request.json = AsyncMock(return_value={"message": "test"})
+
+        resp = await _handle_generic(generic_request)
+
+        assert resp.status == 401
+
+
+# ── GET /api/jobs ──────────────────────────────────────────────────
+
+
+class TestGetJobs:
+    async def test_returns_active_jobs(self, db, mock_request):
+        """Returns a list of active jobs for the configured chat."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+
+        await sessions.create_job(
+            chat_id=123,
+            name="Job A",
+            job_type="reminder",
+            prompt="hello",
+            schedule_type="daily",
+            schedule_data='{"times": ["09:00"]}',
+        )
+        await sessions.create_job(
+            chat_id=123,
+            name="Job B",
+            job_type="claude",
+            prompt="check",
+            schedule_type="interval",
+            schedule_data='{"seconds": 3600}',
+        )
+
+        resp = await _handle_get_jobs(mock_request)
+
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        assert len(body) == 2
+        names = {j["name"] for j in body}
+        assert names == {"Job A", "Job B"}
+
+    async def test_returns_empty_list_when_no_jobs(self, db, mock_request):
+        """Returns an empty list when no jobs exist."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+
+        resp = await _handle_get_jobs(mock_request)
+
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        assert body == []
+
+    async def test_missing_secret_returns_401(self, db, mock_request):
+        """Missing webhook secret returns 401."""
+        mock_request.headers = {}
+        mock_request.app["chat_id"] = 123
+
+        resp = await _handle_get_jobs(mock_request)
+
+        assert resp.status == 401
+
+
+# ── GET /api/jobs/{id} ─────────────────────────────────────────────
+
+
+class TestGetJob:
+    async def test_returns_existing_job(self, db, mock_request):
+        """Returns the full job record for a valid ID."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        job_id = await sessions.create_job(
+            chat_id=123,
+            name="My Job",
+            job_type="reminder",
+            prompt="test prompt",
+            schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_get_job(mock_request)
+
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        assert body["name"] == "My Job"
+        assert body["id"] == job_id
+
+    async def test_nonexistent_job_returns_404(self, db, mock_request):
+        """Returns 404 for a job ID that doesn't exist."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.match_info = {"id": "999"}
+
+        resp = await _handle_get_job(mock_request)
+
+        assert resp.status == 404
+
+    async def test_invalid_id_returns_400(self, db, mock_request):
+        """Returns 400 for a non-numeric job ID."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.match_info = {"id": "abc"}
+
+        resp = await _handle_get_job(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "invalid" in body["error"].lower()
+
+    async def test_missing_secret_returns_401(self, db, mock_request):
+        """Missing webhook secret returns 401."""
+        mock_request.headers = {}
+        mock_request.match_info = {"id": "1"}
+
+        resp = await _handle_get_job(mock_request)
+
+        assert resp.status == 401
+
+
+# ── POST /api/schedule (additional coverage) ───────────────────────
+
+
+class TestScheduleValidation:
+    async def test_missing_required_fields_returns_400(self, db, mock_request):
+        """Returns 400 when required fields are missing."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        # Missing prompt, schedule_type, and schedule_data
+        mock_request.json = AsyncMock(return_value={"name": "incomplete"})
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "required" in body["error"].lower()
+
+    async def test_invalid_schedule_type_returns_400(self, db, mock_request):
+        """Returns 400 for unrecognized schedule_type."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "test",
+                "prompt": "test",
+                "schedule_type": "weekly",
+                "schedule_data": {},
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "schedule_type" in body["error"]
+
+    async def test_dict_schedule_data_serialized_to_json(self, db, mock_request):
+        """schedule_data as a dict is serialized to a JSON string for DB storage."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "dict test",
+                "prompt": "test",
+                "schedule_type": "interval",
+                "schedule_data": {"seconds": 600},
+            }
+        )
+        with patch("kai.cron.register_job_by_id", new_callable=AsyncMock):
+            resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        # Verify the stored data is valid JSON
+        job = await sessions.get_job_by_id(body["job_id"])
+        assert job is not None
+        stored = json.loads(job["schedule_data"])
+        assert stored["seconds"] == 600
+
+    async def test_string_schedule_data_passed_through(self, db, mock_request):
+        """schedule_data as a pre-serialized string is stored as-is."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "string test",
+                "prompt": "test",
+                "schedule_type": "interval",
+                "schedule_data": '{"seconds": 900}',
+            }
+        )
+        with patch("kai.cron.register_job_by_id", new_callable=AsyncMock):
+            resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        job = await sessions.get_job_by_id(body["job_id"])
+        assert job is not None
+        assert job["schedule_data"] == '{"seconds": 900}'
+
+    async def test_defaults_for_optional_fields(self, db, mock_request):
+        """auto_remove defaults to False when omitted. job_type defaults to 'reminder'."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "defaults test",
+                "prompt": "test",
+                "schedule_type": "once",
+                "schedule_data": {"run_at": "2026-06-01T12:00:00+00:00"},
+            }
+        )
+        with patch("kai.cron.register_job_by_id", new_callable=AsyncMock):
+            resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        job = await sessions.get_job_by_id(body["job_id"])
+        assert job is not None
+        assert job["auto_remove"] is False
+        assert job["job_type"] == "reminder"
+
+    async def test_db_failure_returns_500(self, db, mock_request):
+        """Database create failure returns 500 with an error message."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "fail test",
+                "prompt": "test",
+                "schedule_type": "daily",
+                "schedule_data": {"times": ["09:00"]},
+            }
+        )
+        with patch(
+            "kai.webhook.sessions.create_job",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("DB locked"),
+        ):
+            resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 500
+        body = json.loads(resp.body.decode())
+        assert "error" in body
+
+    async def test_successful_creation_registers_with_scheduler(self, db, mock_request):
+        """Successful job creation calls register_job_by_id with the new ID."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "scheduler test",
+                "prompt": "test",
+                "schedule_type": "interval",
+                "schedule_data": {"seconds": 300},
+            }
+        )
+        with patch("kai.cron.register_job_by_id", new_callable=AsyncMock) as mock_register:
+            resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        mock_register.assert_called_once_with(mock_request.app["telegram_app"], body["job_id"])
+
+    async def test_invalid_json_returns_400(self, db, mock_request):
+        """Malformed JSON body returns 400."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(side_effect=json.JSONDecodeError("test", "doc", 0))
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+
+
+# ── POST /api/services/{name} ─────────────────────────────────────
+
+
+@pytest.fixture()
+def service_request():
+    """Create a mock request for the service proxy endpoint."""
+    request = MagicMock(spec=web.Request)
+    request.app = {
+        "webhook_secret": "test-secret",
+    }
+    request.headers = {"X-Webhook-Secret": "test-secret"}
+    request.match_info = {"name": "perplexity"}
+    return request
+
+
+class TestServiceCall:
+    async def test_successful_call_returns_status_and_body(self, service_request):
+        """Successful service call returns the status code and response body."""
+        service_request.json = AsyncMock(return_value={"body": {"model": "sonar", "messages": []}})
+        mock_result = ServiceResponse(success=True, status=200, body='{"answer": "42"}')
+        with patch("kai.services.call_service", new_callable=AsyncMock, return_value=mock_result):
+            resp = await _handle_service_call(service_request)
+
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        assert body["status"] == 200
+        assert body["body"] == '{"answer": "42"}'
+
+    async def test_failed_call_returns_502(self, service_request):
+        """Failed service call (success=False) returns 502 with error message."""
+        service_request.json = AsyncMock(return_value={"body": {}})
+        mock_result = ServiceResponse(success=False, error="Connection refused")
+        with patch("kai.services.call_service", new_callable=AsyncMock, return_value=mock_result):
+            resp = await _handle_service_call(service_request)
+
+        assert resp.status == 502
+        body = json.loads(resp.body.decode())
+        assert "Connection refused" in body["error"]
+
+    async def test_forwards_body_params_and_path_suffix(self, service_request):
+        """All request fields (body, params, path_suffix) are forwarded to call_service."""
+        service_request.json = AsyncMock(
+            return_value={
+                "body": {"query": "test"},
+                "params": {"limit": "10"},
+                "path_suffix": "/search",
+            }
+        )
+        mock_result = ServiceResponse(success=True, status=200, body="ok")
+        with patch("kai.services.call_service", new_callable=AsyncMock, return_value=mock_result) as mock_call:
+            await _handle_service_call(service_request)
+
+        mock_call.assert_called_once_with(
+            "perplexity",
+            body={"query": "test"},
+            params={"limit": "10"},
+            path_suffix="/search",
+        )
+
+    async def test_no_json_body_passes_defaults(self, service_request):
+        """Request with no JSON body passes None/defaults to call_service."""
+        service_request.json = AsyncMock(side_effect=json.JSONDecodeError("test", "doc", 0))
+        mock_result = ServiceResponse(success=True, status=200, body="ok")
+        with patch("kai.services.call_service", new_callable=AsyncMock, return_value=mock_result) as mock_call:
+            await _handle_service_call(service_request)
+
+        mock_call.assert_called_once_with(
+            "perplexity",
+            body=None,
+            params=None,
+            path_suffix="",
+        )
+
+    async def test_invalid_json_treated_as_no_body(self, service_request):
+        """Invalid JSON is silently ignored (all fields are optional)."""
+        service_request.json = AsyncMock(side_effect=json.JSONDecodeError("test", "doc", 0))
+        mock_result = ServiceResponse(success=True, status=200, body="ok")
+        with patch("kai.services.call_service", new_callable=AsyncMock, return_value=mock_result):
+            resp = await _handle_service_call(service_request)
+
+        # Should NOT return 400 - invalid JSON is fine for this endpoint
+        assert resp.status == 200
+
+    async def test_missing_secret_returns_401(self, service_request):
+        """Missing webhook secret returns 401."""
+        service_request.headers = {}
+
+        resp = await _handle_service_call(service_request)
+
+        assert resp.status == 401
