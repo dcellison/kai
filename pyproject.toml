@@ -27,7 +27,6 @@ dev = [
 ]
 tts = [
     "piper-tts>=1.4.0",
-    "pathvalidate>=3.0.0",
 ]
 totp = [
     "pyotp>=2.9",
