@@ -43,6 +43,13 @@ def _make_context(user_data: dict | None = None) -> MagicMock:
     """Create a mock PTB context with controllable user_data."""
     ctx = MagicMock()
     ctx.user_data = user_data if user_data is not None else {}
+    # Set TOTP config attributes on the mock so the gate can read them
+    # directly (matching how real Config provides typed defaults).
+    cfg = ctx.bot_data["config"]
+    cfg.totp_session_minutes = 30
+    cfg.totp_challenge_seconds = 120
+    cfg.totp_lockout_attempts = 3
+    cfg.totp_lockout_minutes = 15
     return ctx
 
 
