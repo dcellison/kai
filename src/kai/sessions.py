@@ -207,33 +207,33 @@ async def create_job(
 async def get_jobs(chat_id: int) -> list[dict]:
     """Get all active jobs for a specific chat. Used by /jobs command."""
     async with _get_db().execute(
-        "SELECT id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, created_at FROM jobs WHERE chat_id = ? AND active = 1",
+        "SELECT id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check, created_at FROM jobs WHERE chat_id = ? AND active = 1",
         (chat_id,),
     ) as cursor:
         rows = await cursor.fetchall()
-        # SQLite stores booleans as integers; convert auto_remove back to bool
-        return [{**dict(r), "auto_remove": bool(r["auto_remove"])} for r in rows]
+        # SQLite stores booleans as integers; convert back to bool
+        return [{**dict(r), "auto_remove": bool(r["auto_remove"]), "notify_on_check": bool(r["notify_on_check"])} for r in rows]
 
 
 async def get_job_by_id(job_id: int) -> dict | None:
     """Get a single job by ID, or None if not found. Used by cron.register_job_by_id()."""
     async with _get_db().execute(
-        "SELECT id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove FROM jobs WHERE id = ?",
+        "SELECT id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check FROM jobs WHERE id = ?",
         (job_id,),
     ) as cursor:
         row = await cursor.fetchone()
         if not row:
             return None
-        return {**dict(row), "auto_remove": bool(row["auto_remove"])}
+        return {**dict(row), "auto_remove": bool(row["auto_remove"]), "notify_on_check": bool(row["notify_on_check"])}
 
 
 async def get_all_active_jobs() -> list[dict]:
     """Get all active jobs across all chats. Used at startup to register with APScheduler."""
     async with _get_db().execute(
-        "SELECT id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove FROM jobs WHERE active = 1"
+        "SELECT id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check FROM jobs WHERE active = 1"
     ) as cursor:
         rows = await cursor.fetchall()
-        return [{**dict(r), "auto_remove": bool(r["auto_remove"])} for r in rows]
+        return [{**dict(r), "auto_remove": bool(r["auto_remove"]), "notify_on_check": bool(r["notify_on_check"])} for r in rows]
 
 
 async def delete_job(job_id: int) -> bool:

@@ -162,6 +162,7 @@ def _register_job(app: Application, job: dict) -> None:
         "job_type": job["job_type"],
         "prompt": job["prompt"],
         "auto_remove": job["auto_remove"],
+        "notify_on_check": job.get("notify_on_check", False),
         "name": job["name"],
         "schedule_type": job["schedule_type"],
     }
