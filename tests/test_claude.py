@@ -833,8 +833,9 @@ class TestContextInjection:
         prompt = self._extract_prompt(proc)
         # Identity from home workspace should be injected
         assert "You are Kai" in prompt
-        # Foreign workspace memory should be injected
-        assert "Foreign workspace memory" in prompt
+        # Foreign workspace memory should NOT be injected (Claude Code reads
+        # it natively from cwd; bot-side reads risk PermissionError on Linux)
+        assert "Foreign workspace memory" not in prompt
         # Per-message reminder should be present
         assert "IMPORTANT" in prompt
         assert "Respond ONLY" in prompt

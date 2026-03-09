@@ -326,13 +326,10 @@ class PersistentClaude:
                 if memory:
                     parts.append(f"[Your persistent memory from home workspace:]\n{memory}")
 
-            # Inject current workspace memory if different from home
-            if self.workspace != self.home_workspace:
-                ws_memory_path = self.workspace / ".claude" / "MEMORY.md"
-                if ws_memory_path.exists():
-                    ws_memory = ws_memory_path.read_text().strip()
-                    if ws_memory:
-                        parts.append(f"[Your memory for this workspace ({self.workspace.name}):]\n{ws_memory}")
+            # NOTE: Foreign workspace memory (.claude/MEMORY.md) is NOT injected
+            # here. Claude Code reads it natively from its cwd (built-in auto-memory).
+            # Bot-side reads are redundant and can cause PermissionError on Linux
+            # when the workspace is owned by a different user (CLAUDE_USER).
 
             # Inject recent conversation history for continuity
             recent = get_recent_history()
