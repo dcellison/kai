@@ -359,8 +359,18 @@ class PersistentClaude:
                     )
                 parts.append(api_note)
 
-            # Inject file exchange API info so Claude can send files to the user
+            # Inject messaging and file exchange API info so Claude can
+            # proactively send text or files to the user (e.g., when a
+            # background task completes or a scheduled job has results).
             if self.webhook_secret:
+                parts.append(
+                    f"[Messaging API: To send a text message to the user proactively "
+                    f"(e.g., background task results), POST JSON to "
+                    f"http://localhost:{self.webhook_port}/api/send-message "
+                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
+                    f'Required: "text" (the message content). '
+                    f"Long messages are automatically split at Telegram's 4096-char limit.]"
+                )
                 parts.append(
                     f"[File API: To send a file to the user, POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/send-file "
