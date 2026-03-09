@@ -1623,13 +1623,21 @@ async def _handle_response(
 
     # Handle error cases. Skip the error message if /stop was used -
     # the user already saw the "(stopped)" edit and doesn't need a false alarm.
+    # Failed responses are logged to history so that after a session restart,
+    # the injected history shows the message was attempted (not unanswered).
+    # Without this, Claude sees an unanswered user message in history and may
+    # try to address it instead of the current message.
     if final_response is None:
-        if not stopped_by_user:
+        if stopped_by_user:
+            log_message(direction="assistant", chat_id=chat_id, text="[stopped by user]")
+        else:
+            log_message(direction="assistant", chat_id=chat_id, text="[no response]")
             await update.message.reply_text("Error: No response from Claude")
         return
 
     if not final_response.success:
         error_text = f"Error: {final_response.error}"
+        log_message(direction="assistant", chat_id=chat_id, text=f"[error: {final_response.error}]")
         if live_msg:
             await _edit_message_safe(live_msg, error_text)
         else:

@@ -20,6 +20,7 @@ from kai.webhook import (
     _handle_github,
     _handle_schedule,
     _handle_send_file,
+    _handle_send_message,
     _handle_service_call,
     _handle_telegram_update,
     _handle_update_job,
@@ -397,6 +398,77 @@ class TestSendFile:
         send_file_request.json = AsyncMock(return_value={"path": "/any"})
         resp = await _handle_send_file(send_file_request)
         assert resp.status == 401
+
+
+# ── POST /api/send-message ────────────────────────────────────────────
+
+
+@pytest.fixture
+def send_message_request():
+    """Create a mock request for the send-message endpoint."""
+    request = MagicMock(spec=web.Request)
+    request.app = {
+        "webhook_secret": "test-secret",
+        "telegram_bot": AsyncMock(),
+        "chat_id": 123,
+    }
+    request.headers = {"X-Webhook-Secret": "test-secret"}
+    return request
+
+
+class TestSendMessage:
+    async def test_sends_short_message(self, send_message_request):
+        """Short messages are sent as a single Telegram message."""
+        send_message_request.json = AsyncMock(return_value={"text": "Hello!"})
+        resp = await _handle_send_message(send_message_request)
+
+        assert resp.status == 200
+        body = json.loads(resp.body)
+        assert body["status"] == "sent"
+        send_message_request.app["telegram_bot"].send_message.assert_called_once_with(123, "Hello!")
+
+    async def test_splits_long_message(self, send_message_request):
+        """Messages exceeding 4096 chars are split into multiple sends."""
+        # Create a message with two paragraphs, each over 2048 chars
+        long_text = ("A" * 2100) + "\n\n" + ("B" * 2100)
+        send_message_request.json = AsyncMock(return_value={"text": long_text})
+        resp = await _handle_send_message(send_message_request)
+
+        assert resp.status == 200
+        bot = send_message_request.app["telegram_bot"]
+        assert bot.send_message.call_count == 2
+
+    async def test_missing_text_returns_400(self, send_message_request):
+        """Returns 400 when the required text field is absent."""
+        send_message_request.json = AsyncMock(return_value={})
+        resp = await _handle_send_message(send_message_request)
+        assert resp.status == 400
+
+    async def test_empty_text_returns_400(self, send_message_request):
+        """Returns 400 when text is an empty string."""
+        send_message_request.json = AsyncMock(return_value={"text": "   "})
+        resp = await _handle_send_message(send_message_request)
+        assert resp.status == 400
+
+    async def test_invalid_json_returns_400(self, send_message_request):
+        """Returns 400 for malformed JSON body."""
+        send_message_request.json = AsyncMock(side_effect=json.JSONDecodeError("test", "doc", 0))
+        resp = await _handle_send_message(send_message_request)
+        assert resp.status == 400
+
+    async def test_missing_secret_returns_401(self, send_message_request):
+        """Returns 401 without a valid webhook secret."""
+        send_message_request.headers = {}
+        send_message_request.json = AsyncMock(return_value={"text": "Hello"})
+        resp = await _handle_send_message(send_message_request)
+        assert resp.status == 401
+
+    async def test_telegram_error_returns_500(self, send_message_request):
+        """Returns 500 when the Telegram send fails."""
+        send_message_request.json = AsyncMock(return_value={"text": "Hello"})
+        send_message_request.app["telegram_bot"].send_message = AsyncMock(side_effect=RuntimeError("Boom"))
+        resp = await _handle_send_message(send_message_request)
+        assert resp.status == 500
 
 
 # ── update_workspace() ──────────────────────────────────────────────
