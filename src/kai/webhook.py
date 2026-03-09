@@ -815,51 +815,67 @@ async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str) -> No
     backed off far enough, the bot appears completely dead - no errors in
     our logs, no pending_update_count on Telegram's side.
 
-    This loop calls getWebhookInfo every _HEALTH_CHECK_INTERVAL seconds.
-    If Telegram reports a recent error, it deletes and re-registers the
-    webhook to reset the backoff state. This is the same fix as a manual
-    restart, but automated.
+    This loop calls getWebhookInfo every _HEALTH_CHECK_INTERVAL seconds
+    and re-registers the webhook when any of these conditions are met:
 
-    Also detects if the webhook URL was cleared (e.g., by another bot
-    instance or a manual deleteWebhook call) and re-registers it.
+    1. The webhook URL was cleared (manual intervention, competing instance)
+    2. Telegram reports a recent delivery error (last_error_date within
+       _ERROR_RECENCY_THRESHOLD)
+    3. pending_update_count has been >0 for two consecutive checks,
+       meaning Telegram is queuing updates it cannot deliver
+
+    Condition 3 requires two consecutive checks to avoid false positives
+    from normal message bursts (a single check catching in-flight updates).
     """
     import time
 
     await asyncio.sleep(_HEALTH_CHECK_INTERVAL)  # skip the first check (just registered)
 
+    # Track pending updates across consecutive checks. A single non-zero
+    # reading is normal (messages in flight); two in a row means delivery
+    # is stalled - Telegram is queuing but not successfully pushing.
+    prev_pending: int = 0
+
     while True:
         try:
             info = await bot.get_webhook_info()
+            needs_reregister = False
+            reason = ""
 
             # Re-register if the URL was cleared (e.g., by manual intervention
             # or a competing bot instance calling deleteWebhook)
             if not info.url:
-                log.warning("Webhook URL is empty, re-registering")
-                await bot.delete_webhook()
-                await bot.set_webhook(
-                    url=webhook_url,
-                    secret_token=webhook_secret,
-                    allowed_updates=["message", "callback_query"],
-                )
-                log.info("Webhook re-registered (was empty)")
+                needs_reregister = True
+                reason = "webhook URL is empty"
 
             # Re-register if Telegram reports a recent delivery error.
             # last_error_date is a Unix timestamp (0 or None if no errors).
             elif info.last_error_date:
                 error_age = time.time() - info.last_error_date
                 if error_age < _ERROR_RECENCY_THRESHOLD:
-                    log.warning(
-                        "Webhook has recent error (%ds ago): %s - re-registering",
-                        int(error_age),
-                        info.last_error_message or "unknown",
-                    )
-                    await bot.delete_webhook()
-                    await bot.set_webhook(
-                        url=webhook_url,
-                        secret_token=webhook_secret,
-                        allowed_updates=["message", "callback_query"],
-                    )
-                    log.info("Webhook re-registered (clearing error state)")
+                    needs_reregister = True
+                    reason = f"recent error ({int(error_age)}s ago): {info.last_error_message or 'unknown'}"
+
+            # Re-register if pending updates have been non-zero for two
+            # consecutive checks - Telegram is queuing but can't deliver.
+            current_pending = info.pending_update_count or 0
+            if not needs_reregister and current_pending > 0 and prev_pending > 0:
+                needs_reregister = True
+                reason = f"pending_update_count stuck at {current_pending} (was {prev_pending} on previous check)"
+            prev_pending = current_pending
+
+            if needs_reregister:
+                log.warning("Webhook health: %s - re-registering", reason)
+                await bot.delete_webhook()
+                await bot.set_webhook(
+                    url=webhook_url,
+                    secret_token=webhook_secret,
+                    allowed_updates=["message", "callback_query"],
+                )
+                log.info("Webhook re-registered (self-healing)")
+                # Reset pending tracker after re-registration so we don't
+                # immediately trigger again on the next check
+                prev_pending = 0
 
         except Exception:
             # Don't let a failed health check kill the monitor loop.
