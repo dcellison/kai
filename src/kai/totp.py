@@ -78,9 +78,15 @@ def _read_attempts() -> dict:
         )
         if result.returncode == 0 and result.stdout.strip():
             data = json.loads(result.stdout.strip())
-            # Validate expected types to avoid TypeError on arithmetic later
-            # (e.g., "failures": "abc" would crash on + 1)
-            if isinstance(data, dict) and isinstance(data.get("failures"), (int, float)):
+            # Validate expected types to avoid TypeError on arithmetic later.
+            # Both fields are used in numeric operations: failures gets + 1,
+            # lockout_until gets compared to time.time(). A corrupted or
+            # hand-edited file with string values would crash without this.
+            if (
+                isinstance(data, dict)
+                and isinstance(data.get("failures"), (int, float))
+                and isinstance(data.get("lockout_until"), (int, float))
+            ):
                 return data
     except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
         pass

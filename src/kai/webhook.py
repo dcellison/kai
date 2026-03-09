@@ -9,7 +9,8 @@ Provides functionality to:
 4. Expose a scheduling API for creating cron-style jobs via HTTP
 5. Expose a jobs query API for listing and fetching scheduled jobs
 6. Proxy authenticated requests to external services (service layer)
-7. Send files from the workspace to the Telegram chat (file exchange API)
+7. Send text messages and files to the Telegram chat (messaging APIs)
+8. Monitor webhook health and auto-recover from Telegram delivery failures
 
 The server always runs on aiohttp alongside the Telegram bot in the same event
 loop, regardless of transport mode. In polling mode, Telegram updates arrive via
@@ -23,6 +24,7 @@ Routes are organized into these groups:
     - /api/jobs             - Job listing and detail API
     - /api/jobs/{id}        - Job detail (GET), deletion (DELETE), and update (PATCH)
     - /api/services/{name}  - External service proxy (injects auth from .env)
+    - /api/send-message     - Send a text message to the Telegram chat
     - /api/send-file        - Send a file from the filesystem to the Telegram chat
 
 The Telegram webhook route uses its own secret (TELEGRAM_WEBHOOK_SECRET) and is
@@ -64,6 +66,20 @@ _webhook_registered: bool = False
 # tasks, so an unreferenced task can be silently collected mid-execution).
 # Each task removes itself from the set via a done callback.
 _background_tasks: set[asyncio.Task] = set()
+
+# Webhook health monitor task, started in start() and cancelled in stop().
+# Periodically checks Telegram's getWebhookInfo for delivery errors and
+# re-registers the webhook if needed to reset exponential backoff.
+_health_monitor_task: asyncio.Task | None = None
+
+# How often to check webhook health (seconds). Frequent enough to catch
+# problems quickly, infrequent enough to avoid API rate limits.
+_HEALTH_CHECK_INTERVAL = 300  # 5 minutes
+
+# If Telegram reports an error within this window, re-register the webhook.
+# Slightly longer than the check interval so a single transient error
+# in the previous cycle triggers a re-registration on the next check.
+_ERROR_RECENCY_THRESHOLD = 600  # 10 minutes
 
 
 def _strip_markdown(text: str) -> str:
@@ -658,6 +674,65 @@ async def _handle_service_call(request: web.Request) -> web.Response:
         return web.json_response({"error": result.error}, status=502)
 
 
+# ── Messaging ────────────────────────────────────────────────────────
+
+
+@_require_secret
+async def _handle_send_message(request: web.Request) -> web.Response:
+    """
+    Send a text message to the Telegram chat.
+
+    Called by the inner Claude process to proactively notify the user - e.g.,
+    when a background task completes, or a scheduled job wants to report
+    results without going through the full Claude prompt cycle.
+
+    Accepts a JSON body with a required "text" field. Messages longer than
+    Telegram's 4096-character limit are split into chunks.
+
+    Returns:
+        JSON {"status": "sent"} on success, or an appropriate HTTP error.
+    """
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    text = payload.get("text", "").strip()
+    if not text:
+        return web.json_response({"error": "Missing required field: text"}, status=400)
+
+    bot = request.app["telegram_bot"]
+    chat_id = request.app["chat_id"]
+
+    try:
+        # Telegram limits messages to 4096 characters. Split long messages
+        # at newline boundaries to avoid cutting mid-word.
+        if len(text) <= 4096:
+            await bot.send_message(chat_id, text)
+        else:
+            # Simple chunking: split on double-newline first, then single
+            # newline, then hard-cut at 4096.
+            remaining = text
+            while remaining:
+                if len(remaining) <= 4096:
+                    await bot.send_message(chat_id, remaining)
+                    break
+                # Find the last newline before the limit
+                cut = remaining[:4096].rfind("\n\n")
+                if cut < 100:
+                    cut = remaining[:4096].rfind("\n")
+                if cut < 100:
+                    cut = 4096
+                await bot.send_message(chat_id, remaining[:cut])
+                remaining = remaining[cut:].lstrip("\n")
+    except Exception:
+        log.exception("Failed to send message to chat %d via API", chat_id)
+        return web.json_response({"error": "Failed to send message"}, status=500)
+
+    log.info("Sent message to chat %d via API (%d chars)", chat_id, len(text))
+    return web.json_response({"status": "sent"})
+
+
 # ── File exchange ────────────────────────────────────────────────────
 
 
@@ -728,6 +803,88 @@ async def _handle_send_file(request: web.Request) -> web.Response:
     return web.json_response({"status": "sent", "file": path.name})
 
 
+# ── Webhook health monitor ───────────────────────────────────────────
+
+
+async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str) -> None:
+    """
+    Periodically check Telegram webhook health and re-register if needed.
+
+    Telegram silently drops updates after repeated delivery failures (502s
+    from Cloudflare tunnel hiccups, etc.) via exponential backoff. Once
+    backed off far enough, the bot appears completely dead - no errors in
+    our logs, no pending_update_count on Telegram's side.
+
+    This loop calls getWebhookInfo every _HEALTH_CHECK_INTERVAL seconds
+    and re-registers the webhook when any of these conditions are met:
+
+    1. The webhook URL was cleared (manual intervention, competing instance)
+    2. Telegram reports a recent delivery error (last_error_date within
+       _ERROR_RECENCY_THRESHOLD)
+    3. pending_update_count has been >0 for two consecutive checks,
+       meaning Telegram is queuing updates it cannot deliver
+
+    Condition 3 requires two consecutive checks to avoid false positives
+    from normal message bursts (a single check catching in-flight updates).
+    """
+    import time
+
+    await asyncio.sleep(_HEALTH_CHECK_INTERVAL)  # skip the first check (just registered)
+
+    # Track pending updates across consecutive checks. A single non-zero
+    # reading is normal (messages in flight); two in a row means delivery
+    # is stalled - Telegram is queuing but not successfully pushing.
+    prev_pending: int = 0
+
+    while True:
+        try:
+            info = await bot.get_webhook_info()
+            needs_reregister = False
+            reason = ""
+
+            # Re-register if the URL was cleared (e.g., by manual intervention
+            # or a competing bot instance calling deleteWebhook)
+            if not info.url:
+                needs_reregister = True
+                reason = "webhook URL is empty"
+
+            # Re-register if Telegram reports a recent delivery error.
+            # last_error_date is a Unix timestamp (0 or None if no errors).
+            elif info.last_error_date:
+                error_age = time.time() - info.last_error_date
+                if error_age < _ERROR_RECENCY_THRESHOLD:
+                    needs_reregister = True
+                    reason = f"recent error ({int(error_age)}s ago): {info.last_error_message or 'unknown'}"
+
+            # Re-register if pending updates have been non-zero for two
+            # consecutive checks - Telegram is queuing but can't deliver.
+            current_pending = info.pending_update_count or 0
+            if not needs_reregister and current_pending > 0 and prev_pending > 0:
+                needs_reregister = True
+                reason = f"pending_update_count stuck at {current_pending} (was {prev_pending} on previous check)"
+            prev_pending = current_pending
+
+            if needs_reregister:
+                log.warning("Webhook health: %s - re-registering", reason)
+                await bot.delete_webhook()
+                await bot.set_webhook(
+                    url=webhook_url,
+                    secret_token=webhook_secret,
+                    allowed_updates=["message", "callback_query"],
+                )
+                log.info("Webhook re-registered (self-healing)")
+                # Reset pending tracker after re-registration so we don't
+                # immediately trigger again on the next check
+                prev_pending = 0
+
+        except Exception:
+            # Don't let a failed health check kill the monitor loop.
+            # Network blips, API rate limits, etc. are transient.
+            log.exception("Webhook health check failed")
+
+        await asyncio.sleep(_HEALTH_CHECK_INTERVAL)
+
+
 # ── Lifecycle ────────────────────────────────────────────────────────
 
 
@@ -747,7 +904,7 @@ async def start(telegram_app, config) -> None:
         telegram_app: The python-telegram-bot Application instance.
         config: The application Config instance.
     """
-    global _app, _runner, _webhook_registered
+    global _app, _runner, _webhook_registered, _health_monitor_task
 
     _app = web.Application()
     _app["telegram_app"] = telegram_app
@@ -782,6 +939,7 @@ async def start(telegram_app, config) -> None:
         _app.router.add_delete("/api/jobs/{id}", _handle_delete_job)
         _app.router.add_patch("/api/jobs/{id}", _handle_update_job)
         _app.router.add_post("/api/services/{name}", _handle_service_call)
+        _app.router.add_post("/api/send-message", _handle_send_message)
         _app.router.add_post("/api/send-file", _handle_send_file)
     else:
         log.warning("WEBHOOK_SECRET not set - webhook and scheduling endpoints disabled")
@@ -807,6 +965,17 @@ async def start(telegram_app, config) -> None:
         _webhook_registered = True
         log.info("Registered Telegram webhook: %s", config.telegram_webhook_url)
 
+        # Start the background health monitor to detect and recover from
+        # Telegram delivery failures (e.g., Cloudflare tunnel drops causing
+        # 502s that trigger Telegram's exponential backoff).
+        _health_monitor_task = asyncio.create_task(
+            _webhook_health_loop(
+                telegram_app.bot,
+                config.telegram_webhook_url,
+                config.telegram_webhook_secret,
+            )
+        )
+
 
 async def stop() -> None:
     """
@@ -821,7 +990,16 @@ async def stop() -> None:
     if the network is down at shutdown time, Telegram will just overwrite the
     stale webhook on the next set_webhook call at startup.
     """
-    global _app, _runner, _webhook_registered
+    global _app, _runner, _webhook_registered, _health_monitor_task
+    # Cancel the webhook health monitor before tearing down the server
+    if _health_monitor_task is not None:
+        _health_monitor_task.cancel()
+        try:
+            await _health_monitor_task
+        except asyncio.CancelledError:
+            pass
+        _health_monitor_task = None
+
     # Only deregister if we registered a webhook (i.e., webhook mode was active)
     if _webhook_registered and _app is not None:
         telegram_bot = _app.get("telegram_bot")

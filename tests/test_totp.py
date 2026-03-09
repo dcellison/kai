@@ -242,3 +242,34 @@ def test_get_failure_count_returns_zero_on_clean_state():
         count = get_failure_count()
 
     assert count == 0
+
+
+# ── _read_attempts validation ────────────────────────────────────────
+
+
+def test_corrupt_lockout_until_falls_back_to_defaults():
+    """A non-numeric lockout_until in the attempts file triggers the fallback.
+
+    Fixes #36: the validation checked failures but not lockout_until,
+    so a corrupted value like "abc" would pass validation and later
+    crash on comparison with time.time().
+    """
+    corrupt = MagicMock()
+    corrupt.returncode = 0
+    corrupt.stdout = json.dumps({"failures": 0, "lockout_until": "abc"})
+    with patch("kai.totp.subprocess.run", return_value=corrupt):
+        remaining = get_lockout_remaining()
+
+    # Default state has lockout_until=0, so remaining should be 0
+    assert remaining == 0
+
+
+def test_corrupt_failures_falls_back_to_defaults():
+    """A non-numeric failures field triggers the fallback to defaults."""
+    corrupt = MagicMock()
+    corrupt.returncode = 0
+    corrupt.stdout = json.dumps({"failures": "xyz", "lockout_until": 0})
+    with patch("kai.totp.subprocess.run", return_value=corrupt):
+        count = get_failure_count()
+
+    assert count == 0
