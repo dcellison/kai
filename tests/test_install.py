@@ -1068,15 +1068,55 @@ class TestGenerateLauncherScript:
 class TestApplySource:
     def test_dry_run(self, tmp_path, capsys):
         """Dry run: prints messages, doesn't copy."""
+        # Create workspace/.claude/ so the dry-run message appears
+        ws_claude = tmp_path / "workspace" / ".claude"
+        ws_claude.mkdir(parents=True)
+        (ws_claude / "CLAUDE.md").write_text("identity")
         with patch("kai.install.PROJECT_ROOT", tmp_path):
             _apply_source(tmp_path / "install", dry_run=True)
         output = capsys.readouterr().out
         assert "DRY RUN" in output
         assert "Would copy" in output
+        # Dry run should NOT create workspace/.claude/ at the destination
+        assert not (tmp_path / "install" / "workspace" / ".claude").exists()
+
+    def test_dry_run_no_workspace_claude(self, tmp_path, capsys):
+        """Dry run without workspace/.claude/: no workspace copy message."""
+        with patch("kai.install.PROJECT_ROOT", tmp_path):
+            _apply_source(tmp_path / "install", dry_run=True)
+        output = capsys.readouterr().out
+        assert "DRY RUN" in output
+        assert "workspace" not in output.lower() or "workspace config" not in output
 
     def test_actual(self, tmp_path):
-        """Actual: calls _copy_tree, _set_ownership, and copies pyproject.toml."""
+        """Actual: copies source, pyproject.toml, and workspace/.claude/."""
         # Set up source structure
+        src = tmp_path / "source"
+        (src / "src").mkdir(parents=True)
+        (src / "src" / "module.py").write_text("code")
+        (src / "pyproject.toml").write_text("[project]")
+        ws_claude = src / "workspace" / ".claude"
+        ws_claude.mkdir(parents=True)
+        (ws_claude / "CLAUDE.md").write_text("identity")
+        install = tmp_path / "install"
+        install.mkdir()
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._copy_tree") as mock_copy,
+            patch("kai.install._set_ownership") as mock_own,
+            patch("shutil.copy2") as mock_cp,
+            patch("os.chown"),
+        ):
+            _apply_source(install, dry_run=False)
+        # Should call _copy_tree twice: once for src/, once for workspace/.claude/
+        assert mock_copy.call_count == 2
+        # Should call _set_ownership twice: once for src/, once for workspace/.claude/
+        assert mock_own.call_count == 2
+        mock_cp.assert_called_once()
+
+    def test_actual_no_workspace_claude(self, tmp_path):
+        """Actual without workspace/.claude/: copies source only, no error."""
         src = tmp_path / "source"
         (src / "src").mkdir(parents=True)
         (src / "src" / "module.py").write_text("code")
@@ -1092,9 +1132,37 @@ class TestApplySource:
             patch("os.chown"),
         ):
             _apply_source(install, dry_run=False)
+        # Only one _copy_tree call (src/), no workspace/.claude/ copy
         mock_copy.assert_called_once()
         mock_own.assert_called_once()
         mock_cp.assert_called_once()
+
+    def test_workspace_claude_excludes(self, tmp_path):
+        """Workspace copy excludes history/, MEMORY.md, skills/, __pycache__."""
+        from kai.install import _WORKSPACE_CLAUDE_EXCLUDES
+
+        src = tmp_path / "source"
+        (src / "src").mkdir(parents=True)
+        (src / "src" / "module.py").write_text("code")
+        (src / "pyproject.toml").write_text("[project]")
+        ws_claude = src / "workspace" / ".claude"
+        ws_claude.mkdir(parents=True)
+        (ws_claude / "CLAUDE.md").write_text("identity")
+        install = tmp_path / "install"
+        install.mkdir()
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._copy_tree") as mock_copy,
+            patch("kai.install._set_ownership"),
+            patch("shutil.copy2"),
+            patch("os.chown"),
+        ):
+            _apply_source(install, dry_run=False)
+
+        # Second _copy_tree call is for workspace/.claude/
+        ws_call = mock_copy.call_args_list[1]
+        assert ws_call[0][2] == _WORKSPACE_CLAUDE_EXCLUDES
 
 
 # ── _apply_models ────────────────────────────────────────────────────
