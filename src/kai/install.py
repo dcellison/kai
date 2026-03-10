@@ -56,6 +56,13 @@ _LAUNCHD_LABEL = "com.syrinx.kai"
 # Excludes __pycache__, .pyc, and other build artifacts.
 _SOURCE_EXCLUDES = {"__pycache__", "*.pyc", "*.egg-info", ".git", ".venv", ".env"}
 
+# Excludes for workspace/.claude/ copy. These are runtime-generated or
+# personal data that should not be part of a clean install:
+#   history/    - conversation logs written by history.py at runtime
+#   MEMORY.md   - personal data (gitignored), user creates from .example
+#   skills/     - downloaded skills, environment-specific
+_WORKSPACE_CLAUDE_EXCLUDES = {"history", "MEMORY.md", "skills", "__pycache__"}
+
 
 # ── Input helpers ────────────────────────────────────────────────────
 
@@ -1046,15 +1053,19 @@ def _apply_directories(
 
 
 def _apply_source(install_path: Path, dry_run: bool) -> None:
-    """Copy source tree from PROJECT_ROOT to the install location."""
+    """Copy source tree and workspace config from PROJECT_ROOT to the install location."""
     src_src = PROJECT_ROOT / "src"
     src_dst = install_path / "src"
     pyproject_src = PROJECT_ROOT / "pyproject.toml"
     pyproject_dst = install_path / "pyproject.toml"
+    ws_claude_src = PROJECT_ROOT / "workspace" / ".claude"
+    ws_claude_dst = install_path / "workspace" / ".claude"
 
     if dry_run:
         print(f"[DRY RUN] Would copy: {src_src} -> {src_dst}")
         print(f"[DRY RUN] Would copy: {pyproject_src} -> {pyproject_dst}")
+        if ws_claude_src.is_dir():
+            print(f"[DRY RUN] Would copy: {ws_claude_src} -> {ws_claude_dst}")
         return
 
     _copy_tree(src_src, src_dst, _SOURCE_EXCLUDES)
@@ -1064,6 +1075,15 @@ def _apply_source(install_path: Path, dry_run: bool) -> None:
     shutil.copy2(pyproject_src, pyproject_dst)
     os.chown(pyproject_dst, 0, 0)
     print(f"  Copied {pyproject_dst}")
+
+    # Copy workspace/.claude/ (bot identity, memory template) excluding
+    # runtime data. Without CLAUDE.md, the bot has no identity in the home
+    # workspace and nothing to inject into foreign workspace sessions.
+    if ws_claude_src.is_dir():
+        ws_claude_dst.parent.mkdir(parents=True, exist_ok=True)
+        _copy_tree(ws_claude_src, ws_claude_dst, _WORKSPACE_CLAUDE_EXCLUDES)
+        _set_ownership(ws_claude_dst, 0, 0, recursive=True)
+        print(f"  Copied workspace config to {ws_claude_dst}")
 
 
 def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
