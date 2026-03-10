@@ -675,12 +675,8 @@ class TestApplyVenv:
         (src / "main.py").write_text("print('hello')")
 
         # Pre-populate checksum files as if a previous install wrote them
-        (install / ".pyproject.sha256").write_text(
-            _file_checksum(install / "pyproject.toml") + "\n"
-        )
-        (install / ".src.sha256").write_text(
-            _src_checksum(install / "src") + "\n"
-        )
+        (install / ".pyproject.sha256").write_text(_file_checksum(install / "pyproject.toml") + "\n")
+        (install / ".src.sha256").write_text(_src_checksum(install / "src") + "\n")
 
         _apply_venv(install, is_update=True, dry_run=False)
 
@@ -701,19 +697,16 @@ class TestApplyVenv:
         (src / "__init__.py").write_text("# init")
 
         # Save checksums for the initial state
-        (install / ".pyproject.sha256").write_text(
-            _file_checksum(install / "pyproject.toml") + "\n"
-        )
-        (install / ".src.sha256").write_text(
-            _src_checksum(install / "src") + "\n"
-        )
+        (install / ".pyproject.sha256").write_text(_file_checksum(install / "pyproject.toml") + "\n")
+        (install / ".src.sha256").write_text(_src_checksum(install / "src") + "\n")
 
         # Modify a source file (simulates _apply_source copying new code)
         (src / "__init__.py").write_text("# init v2 - changed")
 
         # Mock subprocess.run so pip install doesn't actually run
         monkeypatch.setattr(
-            subprocess, "run",
+            subprocess,
+            "run",
             lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=0),
         )
         # Mock _set_ownership so chown doesn't need root
@@ -737,12 +730,8 @@ class TestApplyVenv:
         (src / "bot.py").write_text("# bot v1")
 
         # Save checksums, then modify source
-        (install / ".pyproject.sha256").write_text(
-            _file_checksum(install / "pyproject.toml") + "\n"
-        )
-        (install / ".src.sha256").write_text(
-            _src_checksum(install / "src") + "\n"
-        )
+        (install / ".pyproject.sha256").write_text(_file_checksum(install / "pyproject.toml") + "\n")
+        (install / ".src.sha256").write_text(_src_checksum(install / "src") + "\n")
         (src / "bot.py").write_text("# bot v2 - new feature")
 
         _apply_venv(install, is_update=True, dry_run=True)
@@ -764,7 +753,8 @@ class TestApplyVenv:
 
         # Fresh update with no previous checksums - should trigger reinstall
         monkeypatch.setattr(
-            subprocess, "run",
+            subprocess,
+            "run",
             lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=0),
         )
         monkeypatch.setattr("kai.install._set_ownership", lambda *a, **kw: None)
@@ -776,12 +766,8 @@ class TestApplyVenv:
         assert (install / ".src.sha256").exists()
 
         # And they should contain the correct checksums
-        assert (install / ".pyproject.sha256").read_text().strip() == _file_checksum(
-            install / "pyproject.toml"
-        )
-        assert (install / ".src.sha256").read_text().strip() == _src_checksum(
-            install / "src"
-        )
+        assert (install / ".pyproject.sha256").read_text().strip() == _file_checksum(install / "pyproject.toml")
+        assert (install / ".src.sha256").read_text().strip() == _src_checksum(install / "src")
 
     def test_first_update_without_src_checksum(self, tmp_path, monkeypatch, capsys):
         """First update after this fix triggers reinstall (no .src.sha256 from old install)."""
@@ -795,12 +781,11 @@ class TestApplyVenv:
         (src / "__init__.py").write_text("# init")
 
         # Only the old-style pyproject checksum exists (no .src.sha256)
-        (install / ".pyproject.sha256").write_text(
-            _file_checksum(install / "pyproject.toml") + "\n"
-        )
+        (install / ".pyproject.sha256").write_text(_file_checksum(install / "pyproject.toml") + "\n")
 
         monkeypatch.setattr(
-            subprocess, "run",
+            subprocess,
+            "run",
             lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=0),
         )
         monkeypatch.setattr("kai.install._set_ownership", lambda *a, **kw: None)
