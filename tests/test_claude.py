@@ -174,7 +174,7 @@ class TestCommandConstruction:
 
 
 class TestProcessSignals:
-    """Verify _kill_proc() and force_kill() use the right signal strategy."""
+    """Verify _send_signal() and force_kill() use the right signal strategy."""
 
     def test_force_kill_same_user(self):
         """Without claude_user, force_kill sends SIGKILL via proc.send_signal()."""
@@ -189,38 +189,47 @@ class TestProcessSignals:
         mock_proc.send_signal.assert_called_once_with(signal.SIGKILL)
 
     def test_force_kill_different_user(self):
-        """With claude_user, force_kill sends SIGKILL to the entire process group."""
+        """With claude_user, force_kill sends SIGKILL via saved PGID."""
         claude = _make_claude(claude_user="daniel")
         mock_proc = MagicMock()
-        mock_proc.returncode = None
         mock_proc.pid = 12345
         claude._proc = mock_proc
+        claude._pgid = 12345  # Saved at spawn time
 
-        with patch("os.getpgid", return_value=12345) as mock_getpgid, patch("os.killpg") as mock_killpg:
+        with patch("os.killpg") as mock_killpg:
             claude.force_kill()
 
-            mock_getpgid.assert_called_once_with(12345)
+            # Uses saved PGID, not os.getpgid()
             mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
 
-    def test_kill_proc_noop_when_no_process(self):
-        """_kill_proc() is a no-op when there's no subprocess."""
+    def test_send_signal_noop_when_no_process(self):
+        """_send_signal() is a no-op when there's no subprocess or PGID."""
         claude = _make_claude()
-        # _proc is None by default; should not raise
-        claude._kill_proc(signal.SIGKILL)
+        # _proc is None, _pgid is None by default; should not raise
+        claude._send_signal(signal.SIGKILL)
 
-    def test_kill_proc_noop_when_already_exited(self):
-        """_kill_proc() is a no-op when the process has already exited."""
-        claude = _make_claude()
+    def test_send_signal_ignores_returncode(self):
+        """_send_signal() sends signal even when returncode is set.
+
+        This is the key behavioral change from the old _kill_proc(). When
+        claude_user is set, self._proc tracks sudo - if sudo exits before
+        claude, we still need to signal the process group via saved PGID.
+        """
+        claude = _make_claude(claude_user="daniel")
         mock_proc = MagicMock()
-        mock_proc.returncode = 0  # Already exited
+        mock_proc.returncode = 0  # sudo already exited
+        mock_proc.pid = 12345
         claude._proc = mock_proc
+        claude._pgid = 12345
 
-        claude._kill_proc(signal.SIGKILL)
+        with patch("os.killpg") as mock_killpg:
+            claude._send_signal(signal.SIGKILL)
 
-        mock_proc.send_signal.assert_not_called()
+            # Signal sent despite returncode being set
+            mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
 
-    def test_kill_proc_handles_process_lookup_error(self):
-        """_kill_proc() swallows ProcessLookupError (race between check and kill)."""
+    def test_send_signal_handles_process_lookup_error(self):
+        """_send_signal() swallows ProcessLookupError (process already dead)."""
         claude = _make_claude()
         mock_proc = MagicMock()
         mock_proc.returncode = None
@@ -228,19 +237,19 @@ class TestProcessSignals:
         claude._proc = mock_proc
 
         # Should not raise
-        claude._kill_proc(signal.SIGKILL)
+        claude._send_signal(signal.SIGKILL)
 
-    def test_kill_proc_handles_permission_error(self):
-        """_kill_proc() swallows PermissionError (process owned by another user)."""
+    def test_send_signal_handles_permission_error_with_pgid(self):
+        """_send_signal() swallows PermissionError on killpg()."""
         claude = _make_claude(claude_user="daniel")
         mock_proc = MagicMock()
-        mock_proc.returncode = None
         mock_proc.pid = 12345
         claude._proc = mock_proc
+        claude._pgid = 12345
 
-        with patch("os.getpgid", return_value=12345), patch("os.killpg", side_effect=PermissionError):
+        with patch("os.killpg", side_effect=PermissionError):
             # Should not raise
-            claude._kill_proc(signal.SIGKILL)
+            claude._send_signal(signal.SIGKILL)
 
 
 # ── Properties ───────────────────────────────────────────────────────
@@ -1014,7 +1023,7 @@ class TestSendLock:
 class TestKill:
     @pytest.mark.asyncio
     async def test_kills_and_clears_state(self):
-        """_kill sends SIGKILL, waits, and clears _proc and _session_id."""
+        """_kill sends SIGKILL, waits, and clears _proc, _pgid, and _session_id."""
         claude = _make_claude()
         mock_proc = MagicMock()
         mock_proc.returncode = None
@@ -1027,7 +1036,24 @@ class TestKill:
 
         mock_proc.send_signal.assert_called_with(signal.SIGKILL)
         assert claude._proc is None
+        assert claude._pgid is None
         assert claude._session_id is None
+
+    @pytest.mark.asyncio
+    async def test_clears_pgid_with_claude_user(self):
+        """_kill clears _pgid when claude_user is set."""
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+        claude._pgid = 12345
+
+        with patch("os.killpg"):
+            await claude._kill()
+
+        assert claude._pgid is None
+        assert claude._proc is None
 
     @pytest.mark.asyncio
     async def test_cancels_stderr_task(self):
@@ -1050,18 +1076,26 @@ class TestKill:
         await claude._kill()
 
     @pytest.mark.asyncio
-    async def test_handles_wait_exception(self):
-        """_kill handles exceptions from _proc.wait() without crashing."""
+    async def test_wait_timeout_does_not_hang(self):
+        """_kill does not hang if wait() times out after SIGKILL."""
         claude = _make_claude()
         mock_proc = MagicMock()
         mock_proc.returncode = None
         mock_proc.send_signal = MagicMock()
-        mock_proc.wait = AsyncMock(side_effect=ProcessLookupError)
+        # wait() never completes - simulates a zombie process
+        mock_proc.wait = AsyncMock()
         claude._proc = mock_proc
 
-        # Should not raise
-        await claude._kill()
+        async def timeout_wait(coro, timeout):
+            coro.close()
+            raise TimeoutError
+
+        with patch("asyncio.wait_for", side_effect=timeout_wait):
+            await claude._kill()
+
+        # State is cleaned up even when wait times out
         assert claude._proc is None
+        assert claude._session_id is None
 
 
 # ── shutdown ─────────────────────────────────────────────────────────
@@ -1082,6 +1116,7 @@ class TestShutdown:
 
         mock_proc.send_signal.assert_called_with(signal.SIGTERM)
         assert claude._proc is None
+        assert claude._pgid is None
 
     @pytest.mark.asyncio
     async def test_falls_back_to_sigkill_on_timeout(self):
@@ -1117,17 +1152,65 @@ class TestShutdown:
         assert claude._proc is None
 
     @pytest.mark.asyncio
-    async def test_noop_when_already_exited(self):
-        """No-op when process has already exited (returncode is set)."""
+    async def test_sigkill_fallback_when_sudo_exits_before_claude(self):
+        """SIGKILL fallback fires even when sudo has already exited.
+
+        This is the core bug fix: the old _kill_proc() checked returncode
+        before sending signals. When sudo exited from SIGTERM (setting
+        returncode), the SIGKILL fallback was skipped - orphaning claude.
+        Now _send_signal() uses the saved PGID and ignores returncode.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+        claude._pgid = 12345
+
+        call_count = 0
+        original_wait_for = asyncio.wait_for
+
+        async def sudo_exits_then_timeout(coro, timeout):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # sudo exits from SIGTERM (returncode becomes set)
+                mock_proc.returncode = 0
+                coro.close()
+                raise TimeoutError
+            return await original_wait_for(coro, timeout=timeout)
+
+        with (
+            patch("asyncio.wait_for", side_effect=sudo_exits_then_timeout),
+            patch("os.killpg") as mock_killpg,
+        ):
+            await claude.shutdown()
+
+        # SIGKILL was sent to the process group despite returncode being set
+        killpg_calls = [call.args[1] for call in mock_killpg.call_args_list]
+        assert signal.SIGTERM in killpg_calls
+        assert signal.SIGKILL in killpg_calls
+        assert claude._proc is None
+        assert claude._pgid is None
+
+    @pytest.mark.asyncio
+    async def test_still_sends_sigterm_when_already_exited(self):
+        """shutdown sends SIGTERM even when returncode is already set.
+
+        When the process is already dead, _send_signal() catches the OSError
+        and wait() returns immediately. State is still cleaned up.
+        """
         claude = _make_claude()
         mock_proc = MagicMock()
         mock_proc.returncode = 0  # Already exited
+        mock_proc.send_signal = MagicMock(side_effect=ProcessLookupError)
+        mock_proc.wait = AsyncMock()
         claude._proc = mock_proc
 
         await claude.shutdown()
 
-        mock_proc.send_signal.assert_not_called()
-        # Should still clear state
+        # Signal attempted (caught by _send_signal), state cleaned up
+        mock_proc.send_signal.assert_called_with(signal.SIGTERM)
         assert claude._proc is None
 
     @pytest.mark.asyncio
@@ -1135,7 +1218,9 @@ class TestShutdown:
         """shutdown cancels the stderr drain task."""
         claude = _make_claude()
         mock_proc = MagicMock()
-        mock_proc.returncode = 0
+        mock_proc.returncode = None
+        mock_proc.send_signal = MagicMock()
+        mock_proc.wait = AsyncMock()
         claude._proc = mock_proc
         mock_task = MagicMock()
         claude._stderr_task = mock_task

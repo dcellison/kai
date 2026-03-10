@@ -21,9 +21,8 @@ The stream-json protocol:
 Context injection on first message of each session:
     1. Identity (CLAUDE.md from home workspace, when in a foreign workspace)
     2. Personal memory (MEMORY.md from home workspace)
-    3. Workspace memory (MEMORY.md from current workspace, if different from home)
-    4. Recent conversation history (last 20 messages from JSONL logs)
-    5. Scheduling API endpoint info (URL, secret, field reference)
+    3. Recent conversation history (last 20 messages from JSONL logs)
+    4. Scheduling API endpoint info (URL, secret, field reference)
 """
 
 import asyncio
@@ -122,6 +121,7 @@ class PersistentClaude:
         self.services_info = services_info or []
         self.claude_user = claude_user
         self._proc: asyncio.subprocess.Process | None = None
+        self._pgid: int | None = None  # Process group ID for reliable signal delivery
         self._lock = asyncio.Lock()  # Serializes all message sends
         self._session_id: str | None = None
         self._fresh_session = True  # True until the first message is sent
@@ -210,6 +210,16 @@ class PersistentClaude:
         self._session_id = None
         self._fresh_session = True
 
+        # Save the process group ID for reliable signal delivery.
+        # When claude_user is set, start_new_session=True creates a new group
+        # with PGID == PID (session leader). Save it now because os.getpgid()
+        # fails after the process exits, but os.killpg() works as long as any
+        # group member is still alive (i.e., the actual claude process).
+        if self.claude_user:
+            self._pgid = self._proc.pid  # PGID == PID for session leaders
+        else:
+            self._pgid = None
+
         # Drain stderr in background to prevent pipe buffer deadlock
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
@@ -232,28 +242,34 @@ class PersistentClaude:
                 log.warning("Unexpected error in stderr drain", exc_info=True)
                 break
 
-    def _kill_proc(self, sig: int = signal.SIGKILL) -> None:
+    def _send_signal(self, sig: int) -> None:
         """
-        Send a signal to the Claude subprocess.
+        Send a signal to the Claude process (or process group if claude_user).
 
-        When claude_user is set, the process runs in its own process group
-        (via start_new_session=True). We must kill the entire group to
-        ensure the actual claude process dies, not just the sudo wrapper.
+        Deliberately does NOT check self._proc.returncode. When claude_user
+        is set, self._proc tracks the sudo wrapper, not the actual claude
+        process. If sudo exits before claude (e.g., from SIGTERM), checking
+        returncode would skip sending further signals - leaving claude
+        orphaned. Instead, we always attempt delivery and let OSError handle
+        the already-dead case cleanly:
+        - claude_user path: os.killpg() raises OSError if the group is gone
+        - direct path: send_signal() calls os.kill() which raises OSError
 
         Args:
-            sig: Signal to send. Defaults to SIGKILL.
+            sig: Signal to send (e.g., signal.SIGTERM, signal.SIGKILL).
         """
-        if not self._proc or self._proc.returncode is not None:
-            return
-        try:
-            if self.claude_user:
-                os.killpg(os.getpgid(self._proc.pid), sig)
-            else:
+        if self._pgid is not None:
+            # claude_user mode: signal the entire process group (sudo + claude)
+            # using the PGID saved at spawn time
+            try:
+                os.killpg(self._pgid, sig)
+            except OSError:
+                pass
+        elif self._proc is not None:
+            try:
                 self._proc.send_signal(sig)
-        except OSError:
-            # Catches ProcessLookupError, PermissionError, and any other
-            # OS-level error from getpgid() or signal delivery
-            pass
+            except OSError:
+                pass
 
     async def send(self, prompt: str | list) -> AsyncIterator[StreamEvent]:
         """
@@ -555,10 +571,10 @@ class PersistentClaude:
         between _ensure_started() and the stdin write in _send_locked(), but
         it is safe: killing the process causes EOF on stdout, which the
         streaming loop handles by yielding a done event and calling _kill()
-        to clean up. No lock acquisition is needed here because _kill_proc()
+        to clean up. No lock acquisition is needed here because _send_signal()
         only sends a signal and is itself idempotent.
         """
-        self._kill_proc(signal.SIGKILL)
+        self._send_signal(signal.SIGKILL)
 
     async def change_workspace(self, new_workspace: Path) -> None:
         """
@@ -585,19 +601,21 @@ class PersistentClaude:
 
     async def _kill(self) -> None:
         """
-        Kill the subprocess and clean up resources.
+        Kill the subprocess immediately and clean up resources.
 
-        Sends SIGKILL, waits for the process to exit, clears the session ID,
-        and cancels the stderr drain task. Idempotent - safe to call even if
-        the process has already exited.
+        Sends SIGKILL, waits up to 5 seconds for exit, then clears all
+        process state. The timeout prevents hanging on zombie processes
+        (the previous bare wait() had no timeout). Idempotent - safe to
+        call even if the process has already exited.
         """
         if self._proc:
-            self._kill_proc(signal.SIGKILL)
+            self._send_signal(signal.SIGKILL)
             try:
-                await self._proc.wait()
-            except Exception:
+                await asyncio.wait_for(self._proc.wait(), timeout=5)
+            except TimeoutError:
                 pass
             self._proc = None
+            self._pgid = None
             self._session_id = None
         if self._stderr_task:
             self._stderr_task.cancel()
@@ -610,26 +628,26 @@ class PersistentClaude:
         Sends SIGTERM first and waits up to 5 seconds for clean exit.
         Falls back to SIGKILL if the process doesn't terminate in time.
         Called during bot shutdown from main.py.
+
+        Unlike the old implementation, this does NOT check returncode before
+        sending signals. When claude_user is set, self._proc tracks sudo,
+        not claude - if sudo exits from SIGTERM before claude does, the
+        returncode guard would skip the SIGKILL fallback, orphaning claude.
+        _send_signal() handles already-dead processes via OSError instead.
         """
-        if self._proc and self._proc.returncode is None:
-            self._kill_proc(signal.SIGTERM)
+        if self._proc:
+            self._send_signal(signal.SIGTERM)
             try:
-                # Note: when claude_user is set, self._proc is the sudo process.
-                # SIGTERM is sent to the entire process group (sudo + claude), but
-                # sudo may exit before claude finishes handling the signal. This
-                # wait() returns when sudo exits, not necessarily when claude does.
-                # In practice claude exits near-instantly after SIGTERM, but if
-                # orphaned claude processes are ever observed after graceful
-                # shutdown, this is the place to investigate.
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except TimeoutError:
-                self._kill_proc(signal.SIGKILL)
+                self._send_signal(signal.SIGKILL)
                 try:
-                    # Timeout prevents blocking forever on a zombie process
                     await asyncio.wait_for(self._proc.wait(), timeout=5)
                 except TimeoutError:
                     log.warning("Process did not exit after SIGKILL; abandoning")
+        # Clean up state regardless of how (or whether) the process exited
         self._proc = None
+        self._pgid = None
         if self._stderr_task:
             self._stderr_task.cancel()
             self._stderr_task = None
