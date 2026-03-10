@@ -632,11 +632,20 @@ class PersistentClaude:
         Kill the subprocess immediately and clean up resources.
 
         Sends SIGKILL, waits up to 5 seconds for exit, then clears all
-        process state. The timeout prevents hanging on zombie processes
-        (the previous bare wait() had no timeout). Idempotent - safe to
-        call even if the process has already exited.
+        process state. After clearing, sends one final SIGKILL to the
+        saved process group to catch any orphaned children that survived
+        the initial signal (e.g., claude reparented to init after sudo
+        died). The timeout prevents hanging on zombie processes.
+        Idempotent - safe to call even if the process has already exited.
         """
         if self._proc:
+            # Save pgid before clearing - the EOF handler in _send_locked()
+            # may call _kill() again after we clear self._pgid, but we need
+            # to ensure the process group gets signaled at least once more
+            # after the wait completes (belt-and-suspenders for the race
+            # where sudo dies but claude survives the initial SIGKILL).
+            saved_pgid = self._pgid
+
             self._send_signal(signal.SIGKILL)
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
@@ -646,6 +655,17 @@ class PersistentClaude:
             self._pgid = None
             self._session_id = None
             self._session_started_at = None
+
+            # Final cleanup: signal the saved process group one more time.
+            # If claude was reparented to init during the wait, this catches
+            # it. If everything is already dead, killpg raises OSError which
+            # we ignore. Only applies to claude_user mode (pgid is None
+            # otherwise).
+            if saved_pgid is not None:
+                try:
+                    os.killpg(saved_pgid, signal.SIGKILL)
+                except OSError:
+                    pass
         if self._stderr_task:
             self._stderr_task.cancel()
             self._stderr_task = None
@@ -665,6 +685,8 @@ class PersistentClaude:
         _send_signal() handles already-dead processes via OSError instead.
         """
         if self._proc:
+            saved_pgid = self._pgid
+
             self._send_signal(signal.SIGTERM)
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
@@ -674,6 +696,9 @@ class PersistentClaude:
                     await asyncio.wait_for(self._proc.wait(), timeout=5)
                 except TimeoutError:
                     log.warning("Process did not exit after SIGKILL; abandoning")
+        else:
+            saved_pgid = None
+
         # Clean up state regardless of how (or whether) the process exited
         self._proc = None
         self._pgid = None
@@ -681,3 +706,11 @@ class PersistentClaude:
         if self._stderr_task:
             self._stderr_task.cancel()
             self._stderr_task = None
+
+        # Final cleanup: signal the saved process group one more time
+        # to catch any orphaned children that survived the initial signals.
+        if saved_pgid is not None:
+            try:
+                os.killpg(saved_pgid, signal.SIGKILL)
+            except OSError:
+                pass

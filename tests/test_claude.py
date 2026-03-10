@@ -1206,6 +1206,83 @@ class TestKill:
         assert claude._proc is None
         assert claude._session_id is None
 
+    @pytest.mark.asyncio
+    async def test_kill_signals_saved_pgid_after_clearing(self):
+        """_kill sends a final SIGKILL to the saved pgid after clearing state.
+
+        This is the core fix for the orphan race: even after self._pgid is
+        cleared (making subsequent _kill() calls no-ops), the saved pgid
+        gets one final signal to catch any claude process that survived
+        the initial SIGKILL (e.g., reparented to init after sudo died).
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+        claude._pgid = 12345
+
+        with patch("os.killpg") as mock_killpg:
+            await claude._kill()
+
+        # killpg called at least twice: once from _send_signal (initial SIGKILL)
+        # and once from the final cleanup after state is cleared
+        killpg_calls = [call.args for call in mock_killpg.call_args_list]
+        assert len(killpg_calls) >= 2
+        assert (12345, signal.SIGKILL) in killpg_calls
+
+    @pytest.mark.asyncio
+    async def test_kill_no_final_signal_without_pgid(self):
+        """Final cleanup is skipped when _pgid is None (non-claude_user mode).
+
+        Without claude_user, _proc IS the claude process and send_signal()
+        on the proc is sufficient. No process group signal needed.
+        """
+        claude = _make_claude()
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.send_signal = MagicMock()
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+        # _pgid is None (no claude_user)
+
+        with patch("os.killpg") as mock_killpg:
+            await claude._kill()
+
+        # killpg should never be called in non-claude_user mode
+        mock_killpg.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_second_kill_is_noop_but_orphan_already_handled(self):
+        """Simulates the race: first _kill() handles the orphan, second is a no-op.
+
+        change_workspace() calls _kill() while the streaming loop is active.
+        The streaming loop sees EOF and calls _kill() again. The second call
+        is a no-op (self._proc is None), but the first call already sent the
+        final signal to the saved pgid, so the orphan is handled.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+        claude._pgid = 12345
+
+        with patch("os.killpg") as mock_killpg:
+            # First call: from change_workspace() - signals and clears state
+            await claude._kill()
+            first_call_count = mock_killpg.call_count
+
+            # Verify state is cleared
+            assert claude._proc is None
+            assert claude._pgid is None
+
+            # Second call: from EOF handler - no-op since _proc is None
+            await claude._kill()
+
+            # No additional killpg calls from the second _kill()
+            assert mock_killpg.call_count == first_call_count
+
 
 # ── shutdown ─────────────────────────────────────────────────────────
 
@@ -1362,6 +1439,31 @@ class TestShutdown:
 
         assert "did not exit" in caplog.text.lower()
         assert claude._proc is None
+
+    @pytest.mark.asyncio
+    async def test_shutdown_signals_saved_pgid_after_clearing(self):
+        """shutdown sends a final SIGKILL to the saved pgid after state cleanup.
+
+        Same belt-and-suspenders pattern as _kill(): saves the pgid before
+        clearing state, then signals the process group one final time to
+        catch any orphaned claude process that survived the initial signals.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+        claude._pgid = 12345
+
+        with patch("os.killpg") as mock_killpg:
+            await claude.shutdown()
+
+        # Final killpg call should be SIGKILL to the saved pgid
+        killpg_calls = [call.args for call in mock_killpg.call_args_list]
+        # At least: SIGTERM from _send_signal, and final SIGKILL cleanup
+        assert (12345, signal.SIGKILL) in killpg_calls
+        assert claude._proc is None
+        assert claude._pgid is None
 
 
 # ── change_workspace ─────────────────────────────────────────────────
