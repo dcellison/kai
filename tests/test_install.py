@@ -33,6 +33,7 @@ from kai.install import (
     _generate_sudoers,
     _generate_systemd_unit,
     _set_ownership,
+    _src_checksum,
     _start_service,
     _stop_service,
     _user_home,
@@ -659,6 +660,248 @@ class TestApplyVenv:
 
         with pytest.raises(SystemExit, match=r"Python >= 3\.13 required"):
             _apply_venv(install, is_update=False, dry_run=False)
+
+    def test_skips_when_checksums_match(self, tmp_path, capsys):
+        """Skips reinstall when both pyproject.toml and source checksums match."""
+        install = tmp_path / "opt" / "kai"
+        install.mkdir(parents=True)
+        (install / "venv").mkdir()
+
+        # Write pyproject.toml and source files
+        (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        src = install / "src" / "kai"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("# init")
+        (src / "main.py").write_text("print('hello')")
+
+        # Pre-populate checksum files as if a previous install wrote them
+        (install / ".pyproject.sha256").write_text(
+            _file_checksum(install / "pyproject.toml") + "\n"
+        )
+        (install / ".src.sha256").write_text(
+            _src_checksum(install / "src") + "\n"
+        )
+
+        _apply_venv(install, is_update=True, dry_run=False)
+
+        output = capsys.readouterr().out
+        assert "Venv unchanged" in output
+        assert "checksums match" in output
+
+    def test_reinstalls_on_source_change(self, tmp_path, monkeypatch, capsys):
+        """Triggers reinstall when source files change but pyproject.toml does not."""
+        install = tmp_path / "opt" / "kai"
+        install.mkdir(parents=True)
+        (install / "venv" / "bin").mkdir(parents=True)
+
+        # Write pyproject.toml and initial source
+        (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        src = install / "src" / "kai"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("# init")
+
+        # Save checksums for the initial state
+        (install / ".pyproject.sha256").write_text(
+            _file_checksum(install / "pyproject.toml") + "\n"
+        )
+        (install / ".src.sha256").write_text(
+            _src_checksum(install / "src") + "\n"
+        )
+
+        # Modify a source file (simulates _apply_source copying new code)
+        (src / "__init__.py").write_text("# init v2 - changed")
+
+        # Mock subprocess.run so pip install doesn't actually run
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=0),
+        )
+        # Mock _set_ownership so chown doesn't need root
+        monkeypatch.setattr("kai.install._set_ownership", lambda *a, **kw: None)
+
+        _apply_venv(install, is_update=True, dry_run=False)
+
+        output = capsys.readouterr().out
+        assert "source changed" in output
+        assert "Installed package into venv" in output
+
+    def test_reinstalls_on_source_change_dry_run(self, tmp_path, capsys):
+        """Dry run reports source change without actually reinstalling."""
+        install = tmp_path / "opt" / "kai"
+        install.mkdir(parents=True)
+        (install / "venv").mkdir()
+
+        (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        src = install / "src" / "kai"
+        src.mkdir(parents=True)
+        (src / "bot.py").write_text("# bot v1")
+
+        # Save checksums, then modify source
+        (install / ".pyproject.sha256").write_text(
+            _file_checksum(install / "pyproject.toml") + "\n"
+        )
+        (install / ".src.sha256").write_text(
+            _src_checksum(install / "src") + "\n"
+        )
+        (src / "bot.py").write_text("# bot v2 - new feature")
+
+        _apply_venv(install, is_update=True, dry_run=True)
+
+        output = capsys.readouterr().out
+        assert "DRY RUN" in output
+        assert "source changed" in output
+
+    def test_saves_both_checksums_after_install(self, tmp_path, monkeypatch):
+        """Both .pyproject.sha256 and .src.sha256 are written after a successful install."""
+        install = tmp_path / "opt" / "kai"
+        install.mkdir(parents=True)
+        (install / "venv" / "bin").mkdir(parents=True)
+
+        (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        src = install / "src" / "kai"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("# init")
+
+        # Fresh update with no previous checksums - should trigger reinstall
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=0),
+        )
+        monkeypatch.setattr("kai.install._set_ownership", lambda *a, **kw: None)
+
+        _apply_venv(install, is_update=True, dry_run=False)
+
+        # Both checksum files should exist now
+        assert (install / ".pyproject.sha256").exists()
+        assert (install / ".src.sha256").exists()
+
+        # And they should contain the correct checksums
+        assert (install / ".pyproject.sha256").read_text().strip() == _file_checksum(
+            install / "pyproject.toml"
+        )
+        assert (install / ".src.sha256").read_text().strip() == _src_checksum(
+            install / "src"
+        )
+
+    def test_first_update_without_src_checksum(self, tmp_path, monkeypatch, capsys):
+        """First update after this fix triggers reinstall (no .src.sha256 from old install)."""
+        install = tmp_path / "opt" / "kai"
+        install.mkdir(parents=True)
+        (install / "venv" / "bin").mkdir(parents=True)
+
+        (install / "pyproject.toml").write_text("[project]\nname = 'kai'\n")
+        src = install / "src" / "kai"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("# init")
+
+        # Only the old-style pyproject checksum exists (no .src.sha256)
+        (install / ".pyproject.sha256").write_text(
+            _file_checksum(install / "pyproject.toml") + "\n"
+        )
+
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=0),
+        )
+        monkeypatch.setattr("kai.install._set_ownership", lambda *a, **kw: None)
+
+        _apply_venv(install, is_update=True, dry_run=False)
+
+        output = capsys.readouterr().out
+        # Should reinstall because .src.sha256 is missing (old_src == "" != new_src)
+        assert "source changed" in output
+        assert "Installed package into venv" in output
+
+
+class TestSrcChecksum:
+    """Tests for _src_checksum(), the directory content hasher."""
+
+    def test_empty_dir(self, tmp_path):
+        """Empty directory (no .py files) returns a hash (of zero inputs)."""
+        d = tmp_path / "src"
+        d.mkdir()
+        result = _src_checksum(d)
+        # A hash of nothing is still a valid hex digest
+        assert len(result) == 64
+
+    def test_missing_dir(self, tmp_path):
+        """Non-existent directory returns empty string."""
+        assert _src_checksum(tmp_path / "nonexistent") == ""
+
+    def test_deterministic(self, tmp_path):
+        """Same files produce the same hash across calls."""
+        d = tmp_path / "src"
+        d.mkdir()
+        (d / "a.py").write_text("hello")
+        (d / "b.py").write_text("world")
+
+        assert _src_checksum(d) == _src_checksum(d)
+
+    def test_content_change_changes_hash(self, tmp_path):
+        """Modifying a file changes the hash."""
+        d = tmp_path / "src"
+        d.mkdir()
+        (d / "a.py").write_text("version 1")
+        h1 = _src_checksum(d)
+
+        (d / "a.py").write_text("version 2")
+        h2 = _src_checksum(d)
+
+        assert h1 != h2
+
+    def test_new_file_changes_hash(self, tmp_path):
+        """Adding a new .py file changes the hash."""
+        d = tmp_path / "src"
+        d.mkdir()
+        (d / "a.py").write_text("hello")
+        h1 = _src_checksum(d)
+
+        (d / "b.py").write_text("world")
+        h2 = _src_checksum(d)
+
+        assert h1 != h2
+
+    def test_ignores_non_py_files(self, tmp_path):
+        """Non-.py files do not affect the hash."""
+        d = tmp_path / "src"
+        d.mkdir()
+        (d / "a.py").write_text("hello")
+        h1 = _src_checksum(d)
+
+        # Add non-Python files - hash should not change
+        (d / "readme.md").write_text("docs")
+        (d / "data.json").write_text("{}")
+        h2 = _src_checksum(d)
+
+        assert h1 == h2
+
+    def test_rename_changes_hash(self, tmp_path):
+        """Renaming a file changes the hash (path is included in the digest)."""
+        d = tmp_path / "src"
+        d.mkdir()
+        (d / "old_name.py").write_text("content")
+        h1 = _src_checksum(d)
+
+        (d / "old_name.py").rename(d / "new_name.py")
+        h2 = _src_checksum(d)
+
+        assert h1 != h2
+
+    def test_nested_files(self, tmp_path):
+        """Recurses into subdirectories."""
+        d = tmp_path / "src"
+        sub = d / "kai" / "sub"
+        sub.mkdir(parents=True)
+        (sub / "module.py").write_text("nested")
+        h1 = _src_checksum(d)
+
+        # Hash should be non-empty and a valid hex digest
+        assert len(h1) == 64
+
+        # Changing the nested file should change the hash
+        (sub / "module.py").write_text("nested v2")
+        h2 = _src_checksum(d)
+        assert h1 != h2
 
 
 # ── Migration ────────────────────────────────────────────────────────

@@ -422,6 +422,26 @@ def _file_checksum(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _src_checksum(src_dir: Path) -> str:
+    """
+    Return a SHA-256 digest representing the contents of all .py files under src_dir.
+
+    Walks the directory tree in sorted order (for determinism), feeding each
+    file's relative path and content into a rolling hash. Returns an empty
+    string if the directory doesn't exist. Used alongside _file_checksum() on
+    pyproject.toml to detect source-only changes that require a pip reinstall.
+    """
+    if not src_dir.is_dir():
+        return ""
+    h = hashlib.sha256()
+    # Sort for deterministic ordering across platforms and filesystems
+    for py_file in sorted(src_dir.rglob("*.py")):
+        # Include the relative path so renames/moves change the hash
+        h.update(str(py_file.relative_to(src_dir)).encode())
+        h.update(py_file.read_bytes())
+    return h.hexdigest()
+
+
 def _set_ownership(path: Path, uid: int, gid: int, recursive: bool = False) -> None:
     """
     Set ownership of a path, optionally recursing into directories.
@@ -1095,9 +1115,12 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
     Create or update the virtual environment in the install location.
 
     On a fresh install, creates a venv with the system Python and pip-installs
-    the package with optional extras (totp, tts). On update, compares the
-    pyproject.toml checksum to detect dependency changes and only reinstalls
-    if needed. Rejects Python versions below 3.13.
+    the package with optional extras (totp, tts). On update, compares both the
+    pyproject.toml and src/ checksums to detect changes and only reinstalls if
+    needed. Both checks are required because the install is non-editable; pip
+    copies the package into site-packages, so source changes at the install
+    path are not reflected in the venv without a reinstall. Rejects Python
+    versions below 3.13.
 
     Args:
         install_path: Root of the install tree containing src/ and pyproject.toml.
@@ -1106,24 +1129,42 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
     """
     venv_path = install_path / "venv"
     pyproject_dst = install_path / "pyproject.toml"
+    src_dst = install_path / "src"
 
     if is_update and venv_path.exists():
-        # Check if pyproject.toml changed (dependencies might have changed)
-        installed_checksum_file = install_path / ".pyproject.sha256"
-        old_checksum = ""
-        if installed_checksum_file.exists():
-            old_checksum = installed_checksum_file.read_text().strip()
-        new_checksum = _file_checksum(pyproject_dst)
+        # Check if pyproject.toml or source files changed. Both are needed
+        # because the install is non-editable: pip copies code into the venv's
+        # site-packages, so updating src/ at the install path alone does
+        # nothing. A pyproject.toml change means dependencies may have changed;
+        # a source change means the installed package code is stale.
+        pyproject_checksum_file = install_path / ".pyproject.sha256"
+        old_pyproject = ""
+        if pyproject_checksum_file.exists():
+            old_pyproject = pyproject_checksum_file.read_text().strip()
+        new_pyproject = _file_checksum(pyproject_dst)
 
-        if old_checksum == new_checksum:
-            print("  Venv unchanged (pyproject.toml checksum matches)")
+        src_checksum_file = install_path / ".src.sha256"
+        old_src = ""
+        if src_checksum_file.exists():
+            old_src = src_checksum_file.read_text().strip()
+        new_src = _src_checksum(src_dst)
+
+        if old_pyproject == new_pyproject and old_src == new_src:
+            print("  Venv unchanged (pyproject.toml and source checksums match)")
             return
+
+        # Report what changed for operator visibility
+        changed: list[str] = []
+        if old_pyproject != new_pyproject:
+            changed.append("pyproject.toml")
+        if old_src != new_src:
+            changed.append("source")
 
         if dry_run:
-            print("[DRY RUN] Would update venv (pyproject.toml changed)")
+            print(f"[DRY RUN] Would update venv ({' and '.join(changed)} changed)")
             return
 
-        print("  Updating venv (pyproject.toml changed)...")
+        print(f"  Updating venv ({' and '.join(changed)} changed)...")
     else:
         if dry_run:
             print(f"[DRY RUN] Would create venv: {venv_path}")
@@ -1169,9 +1210,11 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
     )
     print("  Installed package into venv")
 
-    # Save checksum for future update detection
-    checksum = _file_checksum(pyproject_dst)
-    (install_path / ".pyproject.sha256").write_text(checksum + "\n")
+    # Save checksums for future update detection. Both are written after a
+    # successful install so that a partial failure (e.g., pip crash mid-install)
+    # leaves stale checksums and triggers a retry on the next run.
+    (install_path / ".pyproject.sha256").write_text(_file_checksum(pyproject_dst) + "\n")
+    (install_path / ".src.sha256").write_text(_src_checksum(src_dst) + "\n")
 
     # Set venv ownership to root (read-only for service user)
     _set_ownership(venv_path, 0, 0, recursive=True)
