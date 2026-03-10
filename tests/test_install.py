@@ -1073,7 +1073,7 @@ class TestApplySource:
         ws_claude.mkdir(parents=True)
         (ws_claude / "CLAUDE.md").write_text("identity")
         with patch("kai.install.PROJECT_ROOT", tmp_path):
-            _apply_source(tmp_path / "install", dry_run=True)
+            _apply_source(tmp_path / "install", svc_uid=1000, svc_gid=1000, dry_run=True)
         output = capsys.readouterr().out
         assert "DRY RUN" in output
         assert "Would copy" in output
@@ -1083,7 +1083,7 @@ class TestApplySource:
     def test_dry_run_no_workspace_claude(self, tmp_path, capsys):
         """Dry run without workspace/.claude/: no workspace copy message."""
         with patch("kai.install.PROJECT_ROOT", tmp_path):
-            _apply_source(tmp_path / "install", dry_run=True)
+            _apply_source(tmp_path / "install", svc_uid=1000, svc_gid=1000, dry_run=True)
         output = capsys.readouterr().out
         assert "DRY RUN" in output
         assert "workspace" not in output.lower() or "workspace config" not in output
@@ -1106,14 +1106,21 @@ class TestApplySource:
             patch("kai.install._copy_tree") as mock_copy,
             patch("kai.install._set_ownership") as mock_own,
             patch("shutil.copy2") as mock_cp,
-            patch("os.chown"),
+            patch("os.chown") as mock_chown,
         ):
-            _apply_source(install, dry_run=False)
+            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
         # Should call _copy_tree twice: once for src/, once for workspace/.claude/
         assert mock_copy.call_count == 2
         # Should call _set_ownership twice: once for src/, once for workspace/.claude/
         assert mock_own.call_count == 2
         mock_cp.assert_called_once()
+        # os.chown called twice: once for pyproject.toml (root), once for
+        # the .claude/ directory itself (service user)
+        ws_claude_dst = install / "workspace" / ".claude"
+        chown_calls = mock_chown.call_args_list
+        assert any(c.args == (ws_claude_dst, 1000, 1000) for c in chown_calls), (
+            f"Expected os.chown({ws_claude_dst}, 1000, 1000) in {chown_calls}"
+        )
 
     def test_actual_no_workspace_claude(self, tmp_path):
         """Actual without workspace/.claude/: copies source only, no error."""
@@ -1131,7 +1138,7 @@ class TestApplySource:
             patch("shutil.copy2") as mock_cp,
             patch("os.chown"),
         ):
-            _apply_source(install, dry_run=False)
+            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
         # Only one _copy_tree call (src/), no workspace/.claude/ copy
         mock_copy.assert_called_once()
         mock_own.assert_called_once()
@@ -1158,7 +1165,7 @@ class TestApplySource:
             patch("shutil.copy2"),
             patch("os.chown"),
         ):
-            _apply_source(install, dry_run=False)
+            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
 
         # Second _copy_tree call is for workspace/.claude/
         ws_call = mock_copy.call_args_list[1]
