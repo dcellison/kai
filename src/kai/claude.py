@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import signal
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -110,6 +111,7 @@ class PersistentClaude:
         timeout_seconds: int = 120,
         services_info: list[dict] | None = None,
         claude_user: str | None = None,
+        max_session_hours: float = 0,
     ):
         self.model = model
         self.workspace = workspace
@@ -120,12 +122,14 @@ class PersistentClaude:
         self.timeout_seconds = timeout_seconds
         self.services_info = services_info or []
         self.claude_user = claude_user
+        self.max_session_hours = max_session_hours
         self._proc: asyncio.subprocess.Process | None = None
         self._pgid: int | None = None  # Process group ID for reliable signal delivery
         self._lock = asyncio.Lock()  # Serializes all message sends
         self._session_id: str | None = None
         self._fresh_session = True  # True until the first message is sent
         self._stderr_task: asyncio.Task | None = None  # Background stderr drain
+        self._session_started_at: float | None = None  # time.monotonic() at process start
 
     @property
     def is_alive(self) -> bool:
@@ -136,6 +140,16 @@ class PersistentClaude:
     def session_id(self) -> str | None:
         """The current Claude session ID, or None if no session is active."""
         return self._session_id
+
+    def _session_age_hours(self) -> float:
+        """Hours elapsed since the current session started."""
+        if self._session_started_at is None:
+            return 0.0
+        return (time.monotonic() - self._session_started_at) / 3600
+
+    def _should_recycle(self) -> bool:
+        """True if the session has exceeded the configured age limit."""
+        return self.max_session_hours > 0 and self.is_alive and self._session_age_hours() >= self.max_session_hours
 
     async def _ensure_started(self) -> None:
         """
@@ -209,6 +223,7 @@ class PersistentClaude:
         )
         self._session_id = None
         self._fresh_session = True
+        self._session_started_at = time.monotonic()
 
         # Save the process group ID for reliable signal delivery.
         # When claude_user is set, start_new_session=True creates a new group
@@ -312,6 +327,19 @@ class PersistentClaude:
             StreamEvent objects with accumulated text. The final event has
             done=True and includes the complete ClaudeResponse.
         """
+        # Recycle the session if it has exceeded the age limit. This prevents
+        # unbounded memory growth in the inner Claude process (Node.js/V8),
+        # which can cause macOS kernel panics via Jetsam on memory-constrained
+        # machines. Only checked before starting a new interaction, never
+        # during one, so in-flight responses complete normally.
+        if self._should_recycle():
+            log.info(
+                "Session age %.1f hours exceeds limit of %.1f hours; recycling",
+                self._session_age_hours(),
+                self.max_session_hours,
+            )
+            await self._kill()
+
         try:
             await self._ensure_started()
         except FileNotFoundError:
@@ -617,6 +645,7 @@ class PersistentClaude:
             self._proc = None
             self._pgid = None
             self._session_id = None
+            self._session_started_at = None
         if self._stderr_task:
             self._stderr_task.cancel()
             self._stderr_task = None
@@ -648,6 +677,7 @@ class PersistentClaude:
         # Clean up state regardless of how (or whether) the process exited
         self._proc = None
         self._pgid = None
+        self._session_started_at = None
         if self._stderr_task:
             self._stderr_task.cancel()
             self._stderr_task = None

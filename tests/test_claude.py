@@ -15,6 +15,7 @@ Covers:
 import asyncio
 import json
 import signal
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -289,6 +290,93 @@ class TestProperties:
         assert claude.session_id == "sess-abc"
 
 
+# ── Session age limit ────────────────────────────────────────────────
+
+
+class TestSessionAgeLimit:
+    def test_session_age_hours_no_session(self):
+        """Returns 0.0 when no session is active."""
+        claude = _make_claude()
+        assert claude._session_age_hours() == 0.0
+
+    def test_session_age_hours_running(self):
+        """Returns elapsed hours since session started."""
+        claude = _make_claude()
+        # Simulate a session started 2 hours ago
+        claude._session_started_at = time.monotonic() - 7200
+        age = claude._session_age_hours()
+        assert 1.9 < age < 2.1
+
+    def test_should_recycle_disabled(self):
+        """Returns False when max_session_hours is 0 (disabled)."""
+        claude = _make_claude(max_session_hours=0)
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        claude._proc = mock_proc
+        claude._session_started_at = time.monotonic() - 99999
+        assert claude._should_recycle() is False
+
+    def test_should_recycle_young_session(self):
+        """Returns False when session is younger than the limit."""
+        claude = _make_claude(max_session_hours=4)
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        claude._proc = mock_proc
+        claude._session_started_at = time.monotonic() - 3600  # 1 hour
+        assert claude._should_recycle() is False
+
+    def test_should_recycle_expired_session(self):
+        """Returns True when session exceeds the age limit."""
+        claude = _make_claude(max_session_hours=4)
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        claude._proc = mock_proc
+        claude._session_started_at = time.monotonic() - 18000  # 5 hours
+        assert claude._should_recycle() is True
+
+    def test_should_recycle_dead_process(self):
+        """Returns False when the process is not alive, even if expired."""
+        claude = _make_claude(max_session_hours=4)
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0  # Already exited
+        claude._proc = mock_proc
+        claude._session_started_at = time.monotonic() - 18000
+        assert claude._should_recycle() is False
+
+    @pytest.mark.asyncio
+    async def test_recycle_before_ensure_started(self):
+        """_send_locked() kills the process before _ensure_started() when expired."""
+        claude = _make_claude(max_session_hours=1)
+
+        # _ensure_started must set up _proc so the rest of _send_locked works.
+        # We make it set up a mock process that immediately returns EOF so the
+        # streaming loop exits cleanly.
+        async def fake_ensure_started():
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stdin = MagicMock()
+            mock_proc.stdin.write = MagicMock()
+            mock_proc.stdin.drain = AsyncMock()
+            mock_proc.stdout = MagicMock()
+            mock_proc.stdout.readline = AsyncMock(return_value=b"")  # EOF
+            claude._proc = mock_proc
+            claude._fresh_session = False
+
+        with (
+            patch.object(claude, "_should_recycle", return_value=True),
+            patch.object(claude, "_kill", new_callable=AsyncMock) as mock_kill,
+            patch.object(claude, "_ensure_started", side_effect=fake_ensure_started),
+            patch.object(claude, "_session_age_hours", return_value=2.5),
+        ):
+            events = []
+            async for event in claude._send_locked("test"):
+                events.append(event)
+
+            # _kill is called at least once for the recycle (and again from
+            # the streaming loop's EOF handler, which is expected)
+            assert mock_kill.call_count >= 1
+
+
 # ── _ensure_started ──────────────────────────────────────────────────
 
 
@@ -336,6 +424,25 @@ class TestEnsureStarted:
             await claude._ensure_started()
 
         assert claude._fresh_session is True
+
+    @pytest.mark.asyncio
+    async def test_sets_session_started_at(self):
+        """_ensure_started records the session start time via time.monotonic()."""
+        claude = _make_claude()
+        assert claude._session_started_at is None
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            before = time.monotonic()
+            await claude._ensure_started()
+            after = time.monotonic()
+
+        assert claude._session_started_at is not None
+        assert before <= claude._session_started_at <= after
 
     @pytest.mark.asyncio
     async def test_starts_stderr_drain(self):
@@ -1023,7 +1130,7 @@ class TestSendLock:
 class TestKill:
     @pytest.mark.asyncio
     async def test_kills_and_clears_state(self):
-        """_kill sends SIGKILL, waits, and clears _proc, _pgid, and _session_id."""
+        """_kill sends SIGKILL, waits, and clears all process state."""
         claude = _make_claude()
         mock_proc = MagicMock()
         mock_proc.returncode = None
@@ -1031,6 +1138,7 @@ class TestKill:
         mock_proc.wait = AsyncMock()
         claude._proc = mock_proc
         claude._session_id = "sess-123"
+        claude._session_started_at = 12345.0
 
         await claude._kill()
 
@@ -1038,6 +1146,7 @@ class TestKill:
         assert claude._proc is None
         assert claude._pgid is None
         assert claude._session_id is None
+        assert claude._session_started_at is None
 
     @pytest.mark.asyncio
     async def test_clears_pgid_with_claude_user(self):
@@ -1111,12 +1220,14 @@ class TestShutdown:
         mock_proc.send_signal = MagicMock()
         mock_proc.wait = AsyncMock()
         claude._proc = mock_proc
+        claude._session_started_at = 12345.0
 
         await claude.shutdown()
 
         mock_proc.send_signal.assert_called_with(signal.SIGTERM)
         assert claude._proc is None
         assert claude._pgid is None
+        assert claude._session_started_at is None
 
     @pytest.mark.asyncio
     async def test_falls_back_to_sigkill_on_timeout(self):

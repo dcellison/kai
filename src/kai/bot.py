@@ -1731,6 +1731,7 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
         timeout_seconds=config.claude_timeout_seconds,
         services_info=services.get_available_services(),
         claude_user=config.claude_user,
+        max_session_hours=config.claude_max_session_hours,
     )
 
     # Command handlers (alphabetical registration, but order doesn't matter for commands)

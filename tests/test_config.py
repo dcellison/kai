@@ -18,6 +18,7 @@ _CONFIG_ENV_VARS = [
     "CLAUDE_MODEL",
     "CLAUDE_TIMEOUT_SECONDS",
     "CLAUDE_MAX_BUDGET_USD",
+    "CLAUDE_MAX_SESSION_HOURS",
     "WEBHOOK_PORT",
     "WEBHOOK_SECRET",
     "VOICE_ENABLED",
@@ -66,6 +67,7 @@ class TestLoadConfigDefaults:
         assert config.claude_model == "sonnet"
         assert config.claude_timeout_seconds == 120
         assert config.claude_max_budget_usd == 10.0
+        assert config.claude_max_session_hours == 0
         assert config.webhook_port == 8080
         # Without TELEGRAM_WEBHOOK_URL, defaults to polling mode
         assert config.telegram_webhook_url is None
@@ -99,6 +101,18 @@ class TestLoadConfigErrors:
         monkeypatch.setenv("WORKSPACE_BASE", str(tmp_path / "nope"))
         with pytest.raises(SystemExit, match="not an existing directory"):
             load_config()
+
+    def test_invalid_session_hours(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_MAX_SESSION_HOURS", "not-a-number")
+        with pytest.raises(SystemExit, match="CLAUDE_MAX_SESSION_HOURS"):
+            load_config()
+
+    def test_session_hours_from_env(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_MAX_SESSION_HOURS", "4.5")
+        config = load_config()
+        assert config.claude_max_session_hours == 4.5
 
 
 # ── Optional fields ──────────────────────────────────────────────────
