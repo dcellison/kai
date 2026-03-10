@@ -959,7 +959,7 @@ def _cmd_apply() -> None:
             print(f"  WARNING: {warning}")
 
     # -- Step 2: Copy source --
-    _apply_source(install_path, dry_run)
+    _apply_source(install_path, svc_uid, svc_gid, dry_run)
 
     # -- Step 3: Create/update venv --
     _apply_venv(install_path, is_update, dry_run)
@@ -1052,7 +1052,7 @@ def _apply_directories(
             print(f"  Created {path}")
 
 
-def _apply_source(install_path: Path, dry_run: bool) -> None:
+def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
     """Copy source tree and workspace config from PROJECT_ROOT to the install location."""
     src_src = PROJECT_ROOT / "src"
     src_dst = install_path / "src"
@@ -1079,10 +1079,14 @@ def _apply_source(install_path: Path, dry_run: bool) -> None:
     # Copy workspace/.claude/ (bot identity, memory template) excluding
     # runtime data. Without CLAUDE.md, the bot has no identity in the home
     # workspace and nothing to inject into foreign workspace sessions.
+    # Files inside are root-owned (read-only config), but the directory
+    # itself is service-user-owned so history.py can create history/ at
+    # runtime.
     if ws_claude_src.is_dir():
         ws_claude_dst.parent.mkdir(parents=True, exist_ok=True)
         _copy_tree(ws_claude_src, ws_claude_dst, _WORKSPACE_CLAUDE_EXCLUDES)
         _set_ownership(ws_claude_dst, 0, 0, recursive=True)
+        os.chown(ws_claude_dst, svc_uid, svc_gid)
         print(f"  Copied workspace config to {ws_claude_dst}")
 
 
