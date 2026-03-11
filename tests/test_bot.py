@@ -10,7 +10,6 @@ handler using mock Telegram Update/Context objects.
 import asyncio
 import json
 import logging
-from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,12 +17,15 @@ import pytest
 from telegram.error import BadRequest
 
 from kai.bot import (
+    _QUEUED_MESSAGE_MARKER,
     _chunk_text,
     _clear_responding,
     _edit_message_safe,
     _is_authorized,
     _is_workspace_allowed,
     _models_keyboard,
+    _notify_if_queued,
+    _prepend_queue_marker,
     _reply_safe,
     _require_auth,
     _resolve_workspace_path,
@@ -458,10 +460,14 @@ def _make_context(config=None, claude=None, args=None, user_data=None, job_queue
     return ctx
 
 
-@asynccontextmanager
-async def _fake_lock(*_args, **_kwargs):
-    """Async context manager stand-in for the per-chat asyncio.Lock."""
-    yield
+def _fake_lock(*_args, **_kwargs):
+    """Return a real asyncio.Lock to stand in for the per-chat lock.
+
+    Uses a real Lock instead of a bare async context manager so that both
+    async-with and .locked() work (the latter is needed by _notify_if_queued).
+    The lock starts unlocked, so _notify_if_queued correctly skips notification.
+    """
+    return asyncio.Lock()
 
 
 def _text_event(text: str) -> StreamEvent:
@@ -2157,3 +2163,151 @@ class TestHandleResponse:
             await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
 
         # If we got here without hanging, the typing task was properly cancelled
+
+
+# ── _notify_if_queued ────────────────────────────────────────────────
+
+
+class TestNotifyIfQueued:
+    """Tests for the pre-lock queue notification and context-switch marker."""
+
+    @pytest.mark.asyncio
+    async def test_sends_when_locked(self):
+        """Sends a notification and returns True when the lock is already held."""
+        update = _make_update()
+        chat_id = 12345
+
+        # Acquire the lock to simulate Kai being busy
+        from kai.locks import get_lock
+
+        lock = get_lock(chat_id)
+        await lock.acquire()
+        try:
+            result = await _notify_if_queued(update, chat_id)
+            assert result is True
+            # The notification goes via reply_text (called by _reply_safe)
+            update.message.reply_text.assert_called()
+            call_text = update.message.reply_text.call_args[0][0]
+            assert "Got your message" in call_text
+            assert "/stop" in call_text
+        finally:
+            lock.release()
+
+    @pytest.mark.asyncio
+    async def test_silent_when_unlocked(self):
+        """Does nothing and returns False when the lock is free."""
+        update = _make_update()
+        # Use a unique chat_id to avoid lock state from other tests
+        chat_id = 99999
+
+        result = await _notify_if_queued(update, chat_id)
+
+        assert result is False
+        update.message.reply_text.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_notification_not_sent_to_claude(self):
+        """The notification goes directly to Telegram, not through Claude."""
+        update = _make_update()
+        chat_id = 12345
+
+        from kai.locks import get_lock
+
+        lock = get_lock(chat_id)
+        await lock.acquire()
+        try:
+            # Mock Claude's send to verify it's never called
+            mock_claude = _make_mock_claude()
+            mock_claude.send = MagicMock()
+
+            await _notify_if_queued(update, chat_id)
+
+            # Claude.send was never called; the notification uses reply_text
+            mock_claude.send.assert_not_called()
+            update.message.reply_text.assert_called()
+        finally:
+            lock.release()
+
+    @pytest.mark.asyncio
+    async def test_queued_message_gets_notification_then_processes(self):
+        """Integration test: message B gets a notification while A holds the lock.
+
+        Simulates two concurrent messages: A acquires the lock and processes,
+        B arrives while A is busy, gets a notification, then processes after
+        A releases. Proves the full flow works end to end.
+        """
+        update_b = _make_update(text="second message")
+        chat_id = 77777
+
+        from kai.locks import get_lock
+
+        lock = get_lock(chat_id)
+
+        # Track ordering of events
+        events: list[str] = []
+
+        async def handler_a():
+            """Simulate message A holding the lock."""
+            async with lock:
+                events.append("a_acquired")
+                # Simulate processing time so B's handler runs
+                await asyncio.sleep(0.05)
+                events.append("a_released")
+
+        async def handler_b():
+            """Simulate message B arriving while A is busy."""
+            # Small delay so A grabs the lock first
+            await asyncio.sleep(0.01)
+            # This is the pre-lock notification
+            result = await _notify_if_queued(update_b, chat_id)
+            assert result is True
+            events.append("b_notified")
+            async with lock:
+                events.append("b_acquired")
+
+        await asyncio.gather(handler_a(), handler_b())
+
+        # B's notification happened while A held the lock
+        assert events.index("b_notified") > events.index("a_acquired")
+        assert events.index("b_notified") < events.index("a_released")
+        # B acquired the lock after A released
+        assert events.index("b_acquired") > events.index("a_released")
+        # B got the notification
+        update_b.message.reply_text.assert_called()
+        call_text = update_b.message.reply_text.call_args[0][0]
+        assert "Got your message" in call_text
+
+
+class TestPrependQueueMarker:
+    """Tests for _prepend_queue_marker(), the context-switch prompt helper."""
+
+    def test_string_prompt(self):
+        """Prepends marker to a plain string prompt."""
+        result = _prepend_queue_marker("hello world")
+        assert result.startswith(_QUEUED_MESSAGE_MARKER)
+        assert result.endswith("hello world")
+
+    def test_multimodal_prompt(self):
+        """Prepends marker to the first text block of a multimodal list."""
+        content = [
+            {"type": "text", "text": "Photo caption"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "abc"}},
+        ]
+        result = _prepend_queue_marker(content)
+        assert isinstance(result, list)
+        assert len(result) == 2
+        # First block has marker prepended
+        assert result[0]["text"].startswith(_QUEUED_MESSAGE_MARKER)
+        assert result[0]["text"].endswith("Photo caption")
+        # Second block (image) is unchanged
+        assert result[1] == content[1]
+
+    def test_does_not_mutate_original(self):
+        """Returns a new list; does not mutate the original content."""
+        content = [
+            {"type": "text", "text": "original"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "abc"}},
+        ]
+        _prepend_queue_marker(content)
+        # Original is untouched
+        assert content[0]["text"] == "original"

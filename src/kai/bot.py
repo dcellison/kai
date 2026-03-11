@@ -107,6 +107,57 @@ def _clear_responding() -> None:
     _RESPONDING_FLAG.unlink(missing_ok=True)
 
 
+async def _notify_if_queued(update: Update, chat_id: int) -> bool:
+    """Send a notification if the user's message will queue behind the lock.
+
+    Called immediately before acquiring the per-chat lock. If the lock is
+    already held (Kai is mid-response), sends a one-line Telegram message
+    so the user knows their message was received. The notification goes
+    directly to Telegram via _reply_safe - Claude never sees it. Do NOT
+    add a log_message call here; the notification is purely for the user.
+
+    Returns True if the message is queuing (lock was held), False otherwise.
+    The caller uses this to decide whether to prepend a context-switch
+    marker to the prompt via _prepend_queue_marker().
+
+    There is a harmless TOCTOU gap: if the lock holder releases between
+    the locked() check and the subsequent acquire, the user sees "finishing
+    something up" followed by an instant response, and Claude gets a
+    context-switch marker for a task that already finished. Both are
+    harmless and not worth fixing.
+    """
+    if get_lock(chat_id).locked():
+        assert update.message is not None
+        await _reply_safe(
+            update.message,
+            "Got your message - finishing something up. /stop to interrupt.",
+        )
+        return True
+    return False
+
+
+# Prepended to prompts that waited behind the lock, so Claude focuses on the
+# new message instead of continuing from the previous task's tool output.
+_QUEUED_MESSAGE_MARKER = (
+    "[The user sent this while you were working on something else. "
+    "Their previous task is done. Focus on this new message.]\n\n"
+)
+
+
+def _prepend_queue_marker(prompt: str | list[dict[str, str]]) -> str | list[dict[str, str]]:
+    """Prepend context-switch marker to a prompt that waited behind the lock.
+
+    Handles both plain string prompts (text, document, voice) and multimodal
+    content lists (photo). For lists, prepends to the first text block's text
+    field and passes subsequent blocks (e.g., base64 image) through unchanged.
+    """
+    if isinstance(prompt, list):
+        # Multimodal content (photo): prepend to the first text block
+        first = prompt[0]
+        return [{"type": "text", "text": _QUEUED_MESSAGE_MARKER + first["text"]}] + prompt[1:]
+    return _QUEUED_MESSAGE_MARKER + prompt
+
+
 # ── Update property helpers (Pyright can't narrow @property returns) ─
 
 
@@ -1152,10 +1203,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
     ]
 
+    was_queued = await _notify_if_queued(update, chat_id)
     async with get_lock(chat_id):
         _set_responding(chat_id)
         try:
-            await _handle_response(update, context, chat_id, content, claude, model)
+            await _handle_response(
+                update,
+                context,
+                chat_id,
+                _prepend_queue_marker(content) if was_queued else content,
+                claude,
+                model,
+            )
         finally:
             _clear_responding()
 
@@ -1308,10 +1367,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         content = (caption or f"File received: {file_name}") + f"\n[File saved to: {saved}]"
 
+    was_queued = await _notify_if_queued(update, chat_id)
     async with get_lock(chat_id):
         _set_responding(chat_id)
         try:
-            await _handle_response(update, context, chat_id, content, claude, model)
+            await _handle_response(
+                update,
+                context,
+                chat_id,
+                _prepend_queue_marker(content) if was_queued else content,
+                claude,
+                model,
+            )
         finally:
             _clear_responding()
 
@@ -1380,10 +1447,18 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     prompt = f"[Voice message transcription]: {transcript}"
     model = claude.model
 
+    was_queued = await _notify_if_queued(update, chat_id)
     async with get_lock(chat_id):
         _set_responding(chat_id)
         try:
-            await _handle_response(update, context, chat_id, prompt, claude, model)
+            await _handle_response(
+                update,
+                context,
+                chat_id,
+                _prepend_queue_marker(prompt) if was_queued else prompt,
+                claude,
+                model,
+            )
         finally:
             _clear_responding()
 
@@ -1495,10 +1570,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     claude = _get_claude(context)
     model = claude.model
 
+    was_queued = await _notify_if_queued(update, chat_id)
     async with get_lock(chat_id):
         _set_responding(chat_id)
         try:
-            await _handle_response(update, context, chat_id, prompt, claude, model)
+            await _handle_response(
+                update,
+                context,
+                chat_id,
+                _prepend_queue_marker(prompt) if was_queued else prompt,
+                claude,
+                model,
+            )
         finally:
             _clear_responding()
 

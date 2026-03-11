@@ -14,8 +14,8 @@ wrapped by @_require_auth which silently drops updates from unauthorized users
 access control, we bypass the auth check in all cases.
 """
 
+import asyncio
 import time
-from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kai.bot import handle_message
@@ -53,10 +53,13 @@ def _make_context(user_data: dict | None = None) -> MagicMock:
     return ctx
 
 
-@asynccontextmanager
-async def _fake_lock(*_args, **_kwargs):
-    """Async context manager stand-in for the per-chat asyncio.Lock."""
-    yield
+def _fake_lock(*_args, **_kwargs):
+    """Return a real asyncio.Lock to stand in for the per-chat lock.
+
+    Uses a real Lock instead of a bare async context manager so that both
+    async-with and .locked() work (the latter is needed by _notify_if_queued).
+    """
+    return asyncio.Lock()
 
 
 def _downstream_patches() -> dict:
