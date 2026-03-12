@@ -90,6 +90,11 @@ def _gh_comment(
     }
 
 
+def _ndjson(comments: list[dict]) -> bytes:
+    """Encode comments as newline-delimited JSON (gh api --jq '.[]' output)."""
+    return "\n".join(json.dumps(c) for c in comments).encode()
+
+
 # ── extract_pr_metadata ────────────────────────────────────────────
 
 
@@ -254,7 +259,7 @@ class TestFetchPriorComments:
             _gh_comment("Just a regular comment.", login="alice"),
             _gh_comment("Another comment.", login="bob"),
         ]
-        mock_proc = _mock_process(stdout=json.dumps(comments).encode())
+        mock_proc = _mock_process(stdout=_ndjson(comments))
 
         with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await fetch_prior_comments("owner/repo", 42)
@@ -271,7 +276,7 @@ class TestFetchPriorComments:
                 created_at="2026-03-12T14:00:00Z",
             ),
         ]
-        mock_proc = _mock_process(stdout=json.dumps(comments).encode())
+        mock_proc = _mock_process(stdout=_ndjson(comments))
 
         with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await fetch_prior_comments("owner/repo", 42)
@@ -301,7 +306,7 @@ class TestFetchPriorComments:
                 created_at="2026-03-12T16:00:00Z",
             ),
         ]
-        mock_proc = _mock_process(stdout=json.dumps(comments).encode())
+        mock_proc = _mock_process(stdout=_ndjson(comments))
 
         with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await fetch_prior_comments("owner/repo", 42)
@@ -327,7 +332,7 @@ class TestFetchPriorComments:
                 created_at="2026-03-12T14:00:00Z",
             ),
         ]
-        mock_proc = _mock_process(stdout=json.dumps(comments).encode())
+        mock_proc = _mock_process(stdout=_ndjson(comments))
 
         with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await fetch_prior_comments("owner/repo", 42)
@@ -347,7 +352,7 @@ class TestFetchPriorComments:
             _gh_comment(big_body, login="kai-bot", created_at="2026-03-12T14:00:00Z"),
             _gh_comment(small_body, login="kai-bot", created_at="2026-03-12T16:00:00Z"),
         ]
-        mock_proc = _mock_process(stdout=json.dumps(comments).encode())
+        mock_proc = _mock_process(stdout=_ndjson(comments))
 
         with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await fetch_prior_comments("owner/repo", 42)
@@ -356,6 +361,22 @@ class TestFetchPriorComments:
         # The recent review should survive; the old one should be dropped
         assert "Recent review is small." in result
         assert len(result) <= _MAX_PRIOR_COMMENTS_CHARS
+
+    @pytest.mark.asyncio
+    async def test_single_thread_truncation_adds_marker(self):
+        """When a single thread exceeds the cap, it is truncated with a marker."""
+        big_body = f"{_REVIEW_HEADER}{'z' * (_MAX_PRIOR_COMMENTS_CHARS + 5000)}"
+        comments = [
+            _gh_comment(big_body, login="kai-bot", created_at="2026-03-12T14:00:00Z"),
+        ]
+        mock_proc = _mock_process(stdout=_ndjson(comments))
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await fetch_prior_comments("owner/repo", 42)
+
+        assert result is not None
+        assert len(result) <= _MAX_PRIOR_COMMENTS_CHARS
+        assert result.startswith("[... earlier comments truncated ...]")
 
     @pytest.mark.asyncio
     async def test_api_failure_returns_none(self):
@@ -380,8 +401,8 @@ class TestFetchPriorComments:
 
     @pytest.mark.asyncio
     async def test_empty_comments_returns_none(self):
-        """Empty comment list returns None."""
-        mock_proc = _mock_process(stdout=b"[]")
+        """Empty comment list returns None (--jq '.[]' produces empty output)."""
+        mock_proc = _mock_process(stdout=b"")
 
         with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await fetch_prior_comments("owner/repo", 42)
@@ -400,7 +421,7 @@ class TestFetchPriorComments:
                 created_at="2026-03-12T14:00:00Z",
             ),
         ]
-        mock_proc = _mock_process(stdout=json.dumps(comments).encode())
+        mock_proc = _mock_process(stdout=_ndjson(comments))
 
         with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await fetch_prior_comments("owner/repo", 42)

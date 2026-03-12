@@ -291,6 +291,8 @@ async def fetch_prior_comments(repo: str, pr_number: int) -> str | None:
             "api",
             f"repos/{repo}/issues/{pr_number}/comments",
             "--paginate",
+            "--jq",
+            ".[]",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -306,7 +308,13 @@ async def fetch_prior_comments(repo: str, pr_number: int) -> str | None:
             )
             return None
 
-        comments = json.loads(stdout.decode())
+        # --jq '.[]' flattens paginated arrays into newline-delimited JSON
+        # objects. Without this, --paginate concatenates JSON arrays
+        # ("[...][...]") which json.loads() cannot parse.
+        raw = stdout.decode().strip()
+        if not raw:
+            return None
+        comments = [json.loads(line) for line in raw.splitlines() if line.strip()]
     except Exception:
         log.warning(
             "Failed to fetch prior comments for %s#%d",
@@ -330,8 +338,10 @@ async def fetch_prior_comments(repo: str, pr_number: int) -> str | None:
         author = comment.get("user", {}).get("login", "unknown")
         timestamp = comment.get("created_at", "")
 
-        # Check if this comment is a review by Kai
-        is_review = body.startswith(_REVIEW_HEADER) or body.startswith(_REVIEW_HEADER.rstrip())
+        # Check if this comment is a review by Kai. Use the stripped
+        # header ("## Review by Kai") to match regardless of trailing
+        # newlines in the actual comment body.
+        is_review = body.startswith(_REVIEW_HEADER.rstrip())
 
         if is_review:
             # Start a new thread segment. Save the previous one if it exists.
@@ -364,9 +374,12 @@ async def fetch_prior_comments(repo: str, pr_number: int) -> str | None:
             if len(full_text) <= _MAX_PRIOR_COMMENTS_CHARS:
                 break
 
-        # If a single thread still exceeds the cap, truncate from the start
+        # If a single thread still exceeds the cap, truncate from the
+        # start and prepend a marker so Claude knows the context is partial.
         if len(full_text) > _MAX_PRIOR_COMMENTS_CHARS:
-            full_text = full_text[-_MAX_PRIOR_COMMENTS_CHARS:]
+            truncation_marker = "[... earlier comments truncated ...]\n"
+            available = _MAX_PRIOR_COMMENTS_CHARS - len(truncation_marker)
+            full_text = truncation_marker + full_text[-available:]
 
     return full_text
 
