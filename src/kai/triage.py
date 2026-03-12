@@ -387,12 +387,26 @@ def _parse_triage_json(raw: str) -> dict:
     text = raw.strip()
     # Strip markdown code fences (```json or just ```)
     if text.startswith("```"):
-        # Remove opening fence (with optional language tag)
-        first_newline = text.index("\n")
-        text = text[first_newline + 1 :]
+        # Remove opening fence (with optional language tag).
+        # Use find() instead of index() to avoid ValueError when the
+        # opening fence has no newline (e.g., "```{...}```").
+        first_newline = text.find("\n")
+        if first_newline == -1:
+            text = text[3:]
+        else:
+            text = text[first_newline + 1 :]
     if text.endswith("```"):
         text = text[:-3]
     text = text.strip()
+
+    # If Claude added preamble text before the JSON (e.g., "Here's the
+    # analysis:\n{...}"), try to extract the outermost JSON object.
+    if text and not text.startswith("{"):
+        brace_start = text.find("{")
+        brace_end = text.rfind("}")
+        if brace_start != -1 and brace_end > brace_start:
+            text = text[brace_start : brace_end + 1]
+
     try:
         result = json.loads(text)
     except json.JSONDecodeError as e:
@@ -472,6 +486,7 @@ async def apply_triage(
     triage_result: dict,
     webhook_port: int,
     webhook_secret: str,
+    projects_json: str = "[]",
 ) -> None:
     """
     Apply triage results: labels, project assignment, comment, and notification.
@@ -485,6 +500,8 @@ async def apply_triage(
         triage_result: Parsed triage JSON dict from _parse_triage_json().
         webhook_port: Local webhook server port (for the send-message API).
         webhook_secret: Secret for authenticating with the send-message API.
+        projects_json: Raw JSON from list_projects(), reused to avoid a
+            redundant gh project list call when looking up project numbers.
     """
     labels = triage_result.get("labels", [])
     duplicate_of = triage_result.get("duplicate_of")
@@ -525,71 +542,56 @@ async def apply_triage(
         else:
             log.info("Added label '%s' to %s#%d", label, metadata.repo, metadata.number)
 
-    # Step 2: Add to project board if assigned
+    # Step 2: Add to project board if assigned.
+    # Reuses projects_json from the earlier list_projects() call instead of
+    # shelling out to gh project list again.
     if project:
-        # Extract owner from repo name (e.g., "dcellison" from "dcellison/kai")
         owner = metadata.repo.split("/")[0]
 
-        # Look up the project number from the project title
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "gh",
-                "project",
-                "list",
-                "--owner",
-                owner,
-                "--format",
-                "json",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
+            projects_data = json.loads(projects_json) if projects_json else []
+            # gh project list --format json returns {"projects": [...]} as a dict
+            project_list = projects_data.get("projects", []) if isinstance(projects_data, dict) else projects_data
 
-            if proc.returncode == 0:
-                projects_data = json.loads(stdout.decode())
-                # Find the matching project by title
-                project_number = None
-                project_list = (
-                    projects_data.get("projects", projects_data) if isinstance(projects_data, dict) else projects_data
+            project_number = None
+            if isinstance(project_list, list):
+                for p in project_list:
+                    if p.get("title", "").lower() == project.lower():
+                        project_number = p.get("number")
+                        break
+
+            if project_number:
+                proc = await asyncio.create_subprocess_exec(
+                    "gh",
+                    "project",
+                    "item-add",
+                    str(project_number),
+                    "--owner",
+                    owner,
+                    "--url",
+                    metadata.url,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-                if isinstance(project_list, list):
-                    for p in project_list:
-                        if p.get("title", "").lower() == project.lower():
-                            project_number = p.get("number")
-                            break
+                _, stderr = await proc.communicate()
 
-                if project_number:
-                    proc = await asyncio.create_subprocess_exec(
-                        "gh",
-                        "project",
-                        "item-add",
-                        str(project_number),
-                        "--owner",
-                        owner,
-                        "--url",
-                        metadata.url,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
+                if proc.returncode == 0:
+                    log.info(
+                        "Added %s#%d to project '%s'",
+                        metadata.repo,
+                        metadata.number,
+                        project,
                     )
-                    _, stderr = await proc.communicate()
-
-                    if proc.returncode == 0:
-                        log.info(
-                            "Added %s#%d to project '%s'",
-                            metadata.repo,
-                            metadata.number,
-                            project,
-                        )
-                    else:
-                        log.warning(
-                            "Failed to add %s#%d to project '%s': %s",
-                            metadata.repo,
-                            metadata.number,
-                            project,
-                            stderr.decode().strip(),
-                        )
                 else:
-                    log.warning("Project '%s' not found for %s", project, owner)
+                    log.warning(
+                        "Failed to add %s#%d to project '%s': %s",
+                        metadata.repo,
+                        metadata.number,
+                        project,
+                        stderr.decode().strip(),
+                    )
+            else:
+                log.warning("Project '%s' not found for %s", project, owner)
         except Exception:
             log.exception("Failed to add %s#%d to project", metadata.repo, metadata.number)
 
@@ -698,9 +700,13 @@ async def triage_issue(
         webhook_secret: Webhook secret for API auth.
         claude_user: Optional OS user for the Claude subprocess.
     """
-    metadata = extract_issue_metadata(payload)
+    # Metadata extraction is inside try/except so a malformed payload
+    # doesn't produce an unhandled exception in the background task.
+    metadata: IssueMetadata | None = None
 
     try:
+        metadata = extract_issue_metadata(payload)
+
         # Step 1: Search for related/duplicate issues
         related_issues = await search_related_issues(metadata.repo, metadata.title, metadata.body)
 
@@ -722,16 +728,25 @@ async def triage_issue(
         # Step 5: Parse the JSON response
         triage_result = _parse_triage_json(raw_response)
 
-        # Step 6: Apply triage (labels, project, comment, telegram)
-        await apply_triage(metadata, triage_result, webhook_port, webhook_secret)
+        # Step 6: Apply triage (labels, project, comment, telegram).
+        # Pass projects JSON to avoid a redundant gh project list call.
+        await apply_triage(metadata, triage_result, webhook_port, webhook_secret, projects_json=projects)
 
-    except Exception:
-        log.exception("Triage failed for %s#%d", metadata.repo, metadata.number)
-        # Best-effort failure notification so the user knows something broke
+    except Exception as exc:
+        log.exception(
+            "Triage failed for %s#%d",
+            metadata.repo if metadata else "unknown",
+            metadata.number if metadata else 0,
+        )
+        # Best-effort failure notification so the user knows something broke.
+        # If metadata extraction itself failed, we can't build a useful
+        # notification, so just log and bail.
+        if metadata is None:
+            return
         try:
             await _send_error_notification(
                 metadata,
-                "See bot logs for details",
+                str(exc),
                 webhook_port,
                 webhook_secret,
             )

@@ -328,6 +328,18 @@ class TestParseTriageJson:
         result = _parse_triage_json(raw)
         assert result == {"labels": []}
 
+    def test_fencing_without_newline(self):
+        """Fencing like ```{"labels": []}``` (no newline) is handled."""
+        raw = '```{"labels": ["bug"]}```'
+        result = _parse_triage_json(raw)
+        assert result == {"labels": ["bug"]}
+
+    def test_preamble_before_json(self):
+        """JSON preceded by preamble text is extracted."""
+        raw = 'Here is the analysis:\n{"labels": ["bug"], "priority": "high"}'
+        result = _parse_triage_json(raw)
+        assert result == {"labels": ["bug"], "priority": "high"}
+
 
 # ── _sanitize_search_query ──────────────────────────────────────────
 
@@ -384,9 +396,15 @@ class TestApplyTriage:
             mock_session_cls.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             await apply_triage(meta, result, 8080, "secret")
 
-        # Should have called gh for label operations and commenting
-        gh_commands = [cmd for cmd in commands_run if cmd[0] == "gh"]
-        assert len(gh_commands) > 0
+        # Verify gh issue edit --add-label was called for both labels
+        add_label_calls = [cmd for cmd in commands_run if "issue" in cmd and "edit" in cmd and "--add-label" in cmd]
+        applied_labels = {cmd[list(cmd).index("--add-label") + 1] for cmd in add_label_calls}
+        assert "bug" in applied_labels
+        assert "enhancement" in applied_labels
+
+        # Verify a comment was posted
+        comment_calls = [cmd for cmd in commands_run if "issue" in cmd and "comment" in cmd]
+        assert len(comment_calls) == 1
 
     @pytest.mark.asyncio
     async def test_skips_existing_labels(self):
@@ -423,14 +441,12 @@ class TestApplyTriage:
         meta = _make_metadata()
         result = _triage_result(project="Sprint 1")
 
-        project_list_json = json.dumps({"projects": [{"title": "Sprint 1", "number": 1}]})
+        # Pass the project list JSON directly (no longer fetched inside apply_triage)
+        projects_json = json.dumps({"projects": [{"title": "Sprint 1", "number": 1}]})
         commands_run = []
 
         async def mock_exec(*args, **kwargs):
             commands_run.append(args)
-            # Return project list for the lookup call
-            if "project" in args and "list" in args:
-                return _mock_subprocess(stdout=project_list_json)
             return _mock_subprocess(stdout="[]")
 
         with (
@@ -442,7 +458,7 @@ class TestApplyTriage:
             mock_resp.status = 200
             mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
             mock_session_cls.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            await apply_triage(meta, result, 8080, "secret")
+            await apply_triage(meta, result, 8080, "secret", projects_json=projects_json)
 
         # Should have called gh project item-add
         item_add_calls = [cmd for cmd in commands_run if "project" in cmd and "item-add" in cmd]
