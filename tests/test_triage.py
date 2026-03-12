@@ -383,7 +383,13 @@ class TestApplyTriage:
 
         async def mock_exec(*args, **kwargs):
             commands_run.append(args)
-            return _mock_subprocess(stdout='[{"name": "bug"}]')
+            # Return accurate label search results: "bug" exists, others don't
+            if "label" in args and "list" in args and "--search" in args:
+                search_term = args[list(args).index("--search") + 1]
+                if search_term == "bug":
+                    return _mock_subprocess(stdout='[{"name": "bug"}]')
+                return _mock_subprocess(stdout="[]")
+            return _mock_subprocess(stdout="")
 
         with (
             patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
@@ -575,6 +581,33 @@ class TestApplyTriage:
         # Should have called gh label create
         create_calls = [cmd for cmd in commands_run if "label" in cmd and "create" in cmd]
         assert len(create_calls) > 0
+
+    @pytest.mark.asyncio
+    async def test_labels_string_ignored(self):
+        """If Claude returns labels as a string instead of list, no labels are applied."""
+        meta = _make_metadata(labels=[])
+        result = _triage_result(labels="bug")  # type: ignore[arg-type]
+
+        commands_run = []
+
+        async def mock_exec(*args, **kwargs):
+            commands_run.append(args)
+            return _mock_subprocess(stdout="[]")
+
+        with (
+            patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
+            patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
+        ):
+            mock_session = AsyncMock()
+            mock_resp = AsyncMock()
+            mock_resp.status = 200
+            mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+            mock_session_cls.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            await apply_triage(meta, result, 8080, "secret")
+
+        # No --add-label calls should have been made
+        add_label_calls = [cmd for cmd in commands_run if "issue" in cmd and "edit" in cmd and "--add-label" in cmd]
+        assert len(add_label_calls) == 0
 
 
 # ── triage_issue (full pipeline) ────────────────────────────────────

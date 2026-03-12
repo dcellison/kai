@@ -503,9 +503,16 @@ async def apply_triage(
         projects_json: Raw JSON from list_projects(), reused to avoid a
             redundant gh project list call when looking up project numbers.
     """
+    # Type-guard Claude's response fields. If Claude returns "labels": "bug"
+    # instead of ["bug"], iterating over the string would produce single-char
+    # labels ("b", "u", "g"). Same risk for "related".
     labels = triage_result.get("labels", [])
+    if not isinstance(labels, list):
+        labels = []
     duplicate_of = triage_result.get("duplicate_of")
     related = triage_result.get("related", [])
+    if not isinstance(related, list):
+        related = []
     project = triage_result.get("project")
     summary = triage_result.get("summary", "No summary provided.")
     priority = triage_result.get("priority", "medium")
