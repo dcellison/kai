@@ -21,6 +21,7 @@ from kai.webhook import (
     _review_cooldowns,
     _should_skip_review,
     _strip_markdown,
+    _triage_cooldowns,
     _verify_github_signature,
 )
 
@@ -315,12 +316,17 @@ def _make_pr_payload(action: str, pr_number: int = 42, merged: bool = False) -> 
     }
 
 
-def _build_test_app(pr_review_enabled: bool = True, cooldown: int = 300) -> web.Application:
+def _build_test_app(
+    pr_review_enabled: bool = True,
+    cooldown: int = 300,
+    issue_triage_enabled: bool = False,
+) -> web.Application:
     """Build a minimal aiohttp app with _handle_github wired up."""
     app = web.Application()
     app["webhook_secret"] = _TEST_SECRET
     app["pr_review_enabled"] = pr_review_enabled
     app["pr_review_cooldown"] = cooldown
+    app["issue_triage_enabled"] = issue_triage_enabled
     # Config needed by review background tasks
     app["webhook_port"] = 8080
     app["claude_user"] = None
@@ -341,10 +347,12 @@ def _build_test_app(pr_review_enabled: bool = True, cooldown: int = 300) -> web.
 
 @pytest.fixture
 def _clear_cooldowns():
-    """Clear the review cooldown dict before each routing test."""
+    """Clear review and triage cooldown dicts before each routing test."""
     _review_cooldowns.clear()
+    _triage_cooldowns.clear()
     yield
     _review_cooldowns.clear()
+    _triage_cooldowns.clear()
 
 
 @pytest.fixture(autouse=False)
@@ -710,3 +718,126 @@ class TestResolveLocalRepo:
 
             # Verify _resolve_local_repo was called with the repo name
             mock_resolve.assert_called_once_with("owner/repo", app)
+
+
+# ── Issue triage routing ─────────────────────────────────────────────
+
+
+def _make_issue_payload(action: str = "opened", issue_number: int = 10) -> dict:
+    """Build a minimal issues webhook payload."""
+    return {
+        "action": action,
+        "issue": {
+            "number": issue_number,
+            "title": "Test issue",
+            "body": "Test body",
+            "user": {"login": "testuser"},
+            "html_url": f"https://github.com/owner/repo/issues/{issue_number}",
+            "labels": [],
+        },
+        "repository": {"full_name": "owner/repo"},
+    }
+
+
+class TestIssueTriageRouting:
+    """Integration tests for issue triage routing in _handle_github."""
+
+    @pytest.mark.asyncio
+    async def test_routes_opened_when_enabled(self, _clear_cooldowns):
+        """Opened issues are routed to triage pipeline when enabled."""
+        app = _build_test_app(issue_triage_enabled=True)
+        payload = _make_issue_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with patch("kai.webhook.triage.triage_issue", new_callable=AsyncMock):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "issues",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                data = await resp.json()
+                assert resp.status == 200
+                assert data["status"] == "triage_triggered"
+                # Should NOT have sent a standard Telegram notification
+                app["telegram_bot"].send_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_falls_through_when_disabled(self, _clear_cooldowns):
+        """With issue triage disabled, opened events go to the notification formatter."""
+        app = _build_test_app(issue_triage_enabled=False)
+        payload = _make_issue_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/webhook/github",
+                data=body,
+                headers={
+                    "X-GitHub-Event": "issues",
+                    "X-Hub-Signature-256": sig,
+                },
+            )
+            await resp.json()
+            assert resp.status == 200
+            # Falls through to standard formatter, which sends a Telegram message
+            app["telegram_bot"].send_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cooldown(self, _clear_cooldowns):
+        """Second opened event within cooldown returns triage_cooldown."""
+        app = _build_test_app(issue_triage_enabled=True)
+        payload = _make_issue_payload("opened", issue_number=10)
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with patch("kai.webhook.triage.triage_issue", new_callable=AsyncMock):
+            async with TestClient(TestServer(app)) as client:
+                # First event - triggers triage
+                resp1 = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "issues",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert (await resp1.json())["status"] == "triage_triggered"
+
+                # Second event - cooldown
+                resp2 = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "issues",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert (await resp2.json())["msg"] == "triage_cooldown"
+
+    @pytest.mark.asyncio
+    async def test_closed_still_notifies(self, _clear_cooldowns):
+        """Closed issues still go through the standard notification path."""
+        app = _build_test_app(issue_triage_enabled=True)
+        payload = _make_issue_payload("closed")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/webhook/github",
+                data=body,
+                headers={
+                    "X-GitHub-Event": "issues",
+                    "X-Hub-Signature-256": sig,
+                },
+            )
+            await resp.json()
+            assert resp.status == 200
+            # Closed events fall through to standard formatter
+            app["telegram_bot"].send_message.assert_called_once()

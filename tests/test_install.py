@@ -288,6 +288,7 @@ class TestCmdConfig:
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces (empty)
                 "false",  # pr review enabled
+                "false",  # issue triage enabled
                 "false",  # voice
                 "false",  # tts
                 "",  # claude user (empty)

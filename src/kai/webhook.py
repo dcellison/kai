@@ -50,7 +50,7 @@ from pathlib import Path
 from aiohttp import web
 from telegram import Update
 
-from kai import cron, review, services, sessions
+from kai import cron, review, services, sessions, triage
 from kai.config import IMAGE_EXTENSIONS
 
 log = logging.getLogger(__name__)
@@ -122,6 +122,51 @@ def _record_review(repo: str, pr_number: int) -> None:
         pr_number: The PR number.
     """
     _review_cooldowns[(repo, pr_number)] = time.time()
+
+
+# ── Issue triage rate limiting ─────────────────────────────────────────
+# In-memory cooldown dict: (repo_full_name, issue_number) -> last_triage_timestamp.
+# Prevents duplicate triage if GitHub sends multiple webhook deliveries
+# for the same event (retries, duplicate deliveries). 60-second cooldown.
+_triage_cooldowns: dict[tuple[str, int], float] = {}
+
+# Fixed cooldown for triage - much shorter than PR review (300s) because
+# issues don't have the force-push burst problem. This is purely for
+# duplicate delivery protection.
+_TRIAGE_COOLDOWN_SECONDS = 60
+
+
+def _should_skip_triage(repo: str, issue_number: int) -> bool:
+    """
+    Check if an issue was triaged recently enough to skip this event.
+
+    Uses the in-memory cooldown dict to absorb duplicate deliveries.
+    Returns True if the issue should NOT be triaged (still in cooldown).
+
+    Args:
+        repo: GitHub repo full name (e.g., "dcellison/kai").
+        issue_number: The issue number.
+    """
+    key = (repo, issue_number)
+    last_triage = _triage_cooldowns.get(key)
+    if last_triage is None:
+        return False
+    return (time.time() - last_triage) < _TRIAGE_COOLDOWN_SECONDS
+
+
+def _record_triage(repo: str, issue_number: int) -> None:
+    """
+    Record that an issue triage was just initiated.
+
+    Called after a triage is successfully launched (not after it completes,
+    since the triage runs as a background task and we want to prevent
+    duplicate launches, not duplicate completions).
+
+    Args:
+        repo: GitHub repo full name (e.g., "dcellison/kai").
+        issue_number: The issue number.
+    """
+    _triage_cooldowns[(repo, issue_number)] = time.time()
 
 
 async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str | None:
@@ -474,6 +519,47 @@ async def _handle_github(request: web.Request) -> web.Response:
 
             log.info("PR review triggered for %s PR #%d (%s)", repo, pr_number, action)
             return web.json_response({"status": "review_triggered"})
+
+    # ── Issue triage routing ────────────────────────────────────
+    # When issue triage is enabled, opened issues are routed to the
+    # triage pipeline. The triage Telegram summary replaces the basic
+    # _fmt_issues() notification (richer content). Non-triaged actions
+    # (closed, reopened) still fall through to the standard formatter.
+    issue_triage_enabled = request.app.get("issue_triage_enabled", False)
+    if issue_triage_enabled and event_type == "issues":
+        action = payload.get("action", "")
+        if action == "opened":
+            issue = payload.get("issue", {})
+            issue_number = issue.get("number", 0)
+            repo = payload.get("repository", {}).get("full_name", "")
+
+            if _should_skip_triage(repo, issue_number):
+                log.info(
+                    "Skipping triage of %s issue #%d (cooldown)",
+                    repo,
+                    issue_number,
+                )
+                return web.json_response({"msg": "triage_cooldown"})
+
+            _record_triage(repo, issue_number)
+
+            task = asyncio.create_task(
+                triage.triage_issue(
+                    payload,
+                    webhook_port=request.app["webhook_port"],
+                    webhook_secret=request.app["webhook_secret"],
+                    claude_user=request.app.get("claude_user"),
+                )
+            )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+
+            log.info(
+                "Issue triage triggered for %s issue #%d",
+                repo,
+                issue_number,
+            )
+            return web.json_response({"status": "triage_triggered"})
 
     # ── Standard notification path ───────────────────────────────
     # Look up the formatter for this event type
@@ -1074,6 +1160,9 @@ async def start(telegram_app, config) -> None:
     _app["workspace_base"] = str(config.workspace_base) if config.workspace_base else None
     _app["allowed_workspaces"] = [str(p) for p in config.allowed_workspaces]
     _app["spec_dir"] = config.spec_dir
+
+    # Issue triage agent config
+    _app["issue_triage_enabled"] = config.issue_triage_enabled
 
     _app.router.add_get("/health", _handle_health)
 

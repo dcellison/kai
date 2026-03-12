@@ -358,6 +358,15 @@ def _cmd_config() -> None:
             print("  Must be a positive integer.")
     print()
 
+    # -- Issue triage agent --
+    # Independent from PR review - you might want one without the other.
+    print("-- Issue triage agent --")
+    issue_triage_enabled = _prompt_bool(
+        "Enable issue triage agent",
+        existing_env.get("ISSUE_TRIAGE_ENABLED", "false").lower() in ("1", "true", "yes"),
+    )
+    print()
+
     # -- Optional features --
     print("-- Optional features --")
     voice_enabled = _prompt_bool(
@@ -417,6 +426,8 @@ def _cmd_config() -> None:
             env["PR_REVIEW_COOLDOWN"] = pr_review_cooldown
         if spec_dir != "specs":
             env["SPEC_DIR"] = spec_dir
+    if issue_triage_enabled:
+        env["ISSUE_TRIAGE_ENABLED"] = "true"
 
     # Build and write install.conf
     conf = {

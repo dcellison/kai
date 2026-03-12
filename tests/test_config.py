@@ -30,6 +30,7 @@ _CONFIG_ENV_VARS = [
     "PR_REVIEW_COOLDOWN",
     "GITHUB_REPO",
     "SPEC_DIR",
+    "ISSUE_TRIAGE_ENABLED",
     "KAI_DATA_DIR",
     "KAI_INSTALL_DIR",
 ]
@@ -496,3 +497,21 @@ class TestPRReviewConfig:
         monkeypatch.setenv("SPEC_DIR", "workspace/specs")
         config = load_config()
         assert config.spec_dir == "workspace/specs"
+
+
+# ── Issue triage config ─────────────────────────────────────────────
+
+
+class TestIssueTriageConfig:
+    def test_defaults(self, monkeypatch):
+        """Issue triage is disabled by default."""
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.issue_triage_enabled is False
+
+    def test_enabled(self, monkeypatch):
+        """ISSUE_TRIAGE_ENABLED=true enables the triage agent."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("ISSUE_TRIAGE_ENABLED", "true")
+        config = load_config()
+        assert config.issue_triage_enabled is True

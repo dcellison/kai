@@ -146,6 +146,10 @@ class Config:
     # which accepts any path relative to the repo root.
     spec_dir: str = "specs"
 
+    # Issue triage agent: automatically triage new issues when webhooks fire.
+    # Disabled by default so existing users are not surprised by automatic triage.
+    issue_triage_enabled: bool = False
+
     # TOTP two-factor authentication timing (only relevant when TOTP is enabled)
     totp_session_minutes: int = 30
     totp_challenge_seconds: int = 120
@@ -307,6 +311,9 @@ def load_config() -> Config:
     except ValueError:
         raise SystemExit("PR_REVIEW_COOLDOWN must be an integer") from None
 
+    # Issue triage agent config
+    issue_triage_enabled = os.environ.get("ISSUE_TRIAGE_ENABLED", "").lower() in ("1", "true", "yes")
+
     try:
         totp_session_minutes = int(os.environ.get("TOTP_SESSION_MINUTES", "30"))
     except ValueError:
@@ -344,6 +351,7 @@ def load_config() -> Config:
         pr_review_cooldown=pr_review_cooldown,
         github_repo=os.getenv("GITHUB_REPO", ""),
         spec_dir=os.getenv("SPEC_DIR", "specs"),
+        issue_triage_enabled=issue_triage_enabled,
         totp_session_minutes=totp_session_minutes,
         totp_challenge_seconds=totp_challenge_seconds,
         totp_lockout_attempts=totp_lockout_attempts,
