@@ -140,6 +140,10 @@ class Config:
     # GitHub repository name (just the repo part, not owner/repo). Used by the
     # review agent to identify the local repo path for spec and convention resolution.
     github_repo: str = ""
+    # Directory (relative to repo root) where spec files live for
+    # branch-name matching. Does not affect body marker resolution,
+    # which accepts any path relative to the repo root.
+    spec_dir: str = "specs"
 
     # TOTP two-factor authentication timing (only relevant when TOTP is enabled)
     totp_session_minutes: int = 30
@@ -338,6 +342,7 @@ def load_config() -> Config:
         pr_review_enabled=pr_review_enabled,
         pr_review_cooldown=pr_review_cooldown,
         github_repo=os.getenv("GITHUB_REPO", ""),
+        spec_dir=os.getenv("SPEC_DIR", "specs"),
         totp_session_minutes=totp_session_minutes,
         totp_challenge_seconds=totp_challenge_seconds,
         totp_lockout_attempts=totp_lockout_attempts,

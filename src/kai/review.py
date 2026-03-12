@@ -125,13 +125,16 @@ def resolve_spec_from_body(description: str) -> str | None:
     return None
 
 
-def resolve_spec_from_branch(branch: str, repo_path: str) -> str | None:
+def resolve_spec_from_branch(
+    branch: str, repo_path: str, spec_dir: str = "specs"
+) -> str | None:
     """
     Find a spec file matching the branch name by glob pattern.
 
     Strips the branch prefix (everything before the first '/') and
-    searches workspace/specs/ for a matching markdown file. Returns the
-    first match (sorted alphabetically), or None if no match is found.
+    searches the configured spec directory for a matching markdown file.
+    Returns the first match (sorted alphabetically), or None if no
+    match is found.
 
     Only works for repos that exist locally on the machine. Remote-only
     repos will not have a local specs directory to search.
@@ -139,6 +142,7 @@ def resolve_spec_from_branch(branch: str, repo_path: str) -> str | None:
     Args:
         branch: The source branch name (e.g., "feature/pr-review-routing").
         repo_path: Absolute path to the local repo checkout.
+        spec_dir: Spec directory relative to repo root (default: "specs").
 
     Returns:
         Absolute path to the matching spec file, or None if not found.
@@ -148,7 +152,7 @@ def resolve_spec_from_branch(branch: str, repo_path: str) -> str | None:
     # without maintaining a hardcoded list.
     name = branch.split("/", 1)[-1] if "/" in branch else branch
 
-    specs_dir = Path(repo_path) / "workspace" / "specs"
+    specs_dir = Path(repo_path) / spec_dir
     if not specs_dir.is_dir():
         return None
 
@@ -161,22 +165,23 @@ def resolve_spec_from_branch(branch: str, repo_path: str) -> str | None:
 async def load_spec(
     metadata: PRMetadata,
     local_repo_path: str | None = None,
+    spec_dir: str = "specs",
 ) -> str | None:
     """
     Attempt to load a spec file for the PR being reviewed.
 
     Tries two resolution strategies in order:
     1. Explicit 'spec: <path>' marker in the PR body
-    2. Branch name matching against workspace/specs/
+    2. Branch name matching against the configured spec directory
 
-    Both strategies read from the local filesystem. Spec files live in
-    the local repo (workspace/specs/), so there is no need to fetch
-    from the GitHub API. The body marker path is resolved relative to
-    local_repo_path.
+    Both strategies read from the local filesystem. The body marker
+    path is resolved relative to local_repo_path. Branch-name matching
+    searches the spec_dir subdirectory.
 
     Args:
         metadata: PR metadata with description and branch name.
         local_repo_path: Optional absolute path to a local repo checkout.
+        spec_dir: Spec directory relative to repo root (default: "specs").
 
     Returns:
         The spec file content as a string, or None if no spec is found.
@@ -195,8 +200,8 @@ async def load_spec(
         except OSError:
             log.warning("Failed to read spec from body marker: %s", spec_path)
 
-    # Strategy 2: branch name matching
-    local_spec = resolve_spec_from_branch(metadata.branch, local_repo_path)
+    # Strategy 2: branch name matching against configured spec directory
+    local_spec = resolve_spec_from_branch(metadata.branch, local_repo_path, spec_dir)
     if local_spec:
         try:
             content = Path(local_spec).read_text()
@@ -552,6 +557,7 @@ async def review_pr(
     webhook_secret: str,
     claude_user: str | None = None,
     local_repo_path: str | None = None,
+    spec_dir: str = "specs",
 ) -> None:
     """
     Full review pipeline: fetch diff, build prompt, run review, post results.
@@ -570,6 +576,7 @@ async def review_pr(
         webhook_secret: Webhook secret for API auth.
         claude_user: Optional OS user for the Claude subprocess.
         local_repo_path: Optional path to local repo checkout for spec resolution.
+        spec_dir: Spec directory relative to repo root (default: "specs").
     """
     metadata = extract_pr_metadata(payload)
 
@@ -582,7 +589,7 @@ async def review_pr(
             return
 
         # Step 1.5: Load spec if referenced (agentic engineering layer)
-        spec = await load_spec(metadata, local_repo_path)
+        spec = await load_spec(metadata, local_repo_path, spec_dir)
 
         # Step 1.6: Load project conventions from CLAUDE.md (issue #58)
         conventions = await load_conventions(metadata, local_repo_path)

@@ -29,6 +29,7 @@ _CONFIG_ENV_VARS = [
     "PR_REVIEW_ENABLED",
     "PR_REVIEW_COOLDOWN",
     "GITHUB_REPO",
+    "SPEC_DIR",
     "KAI_DATA_DIR",
     "KAI_INSTALL_DIR",
 ]
@@ -485,3 +486,13 @@ class TestPRReviewConfig:
         monkeypatch.setenv("GITHUB_REPO", "kai")
         config = load_config()
         assert config.github_repo == "kai"
+
+    def test_spec_dir_from_env(self, monkeypatch):
+        """SPEC_DIR is picked up from env, defaults to 'specs'."""
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.spec_dir == "specs"
+
+        monkeypatch.setenv("SPEC_DIR", "workspace/specs")
+        config = load_config()
+        assert config.spec_dir == "workspace/specs"

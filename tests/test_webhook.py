@@ -323,10 +323,11 @@ def _build_test_app(pr_review_enabled: bool = True, cooldown: int = 300) -> web.
     # Config needed by review background tasks
     app["webhook_port"] = 8080
     app["claude_user"] = None
-    # Spec resolution config (#57): workspace path and repo name for
-    # resolving local repo paths when launching review background tasks.
+    # Spec/convention resolution config: workspace path, repo name, and
+    # spec directory for launching review background tasks.
     app["workspace"] = "/home/user/workspace"
     app["home_repo_name"] = "repo"
+    app["spec_dir"] = "specs"
     # Mock bot that records sent messages
     mock_bot = AsyncMock()
     app["telegram_bot"] = mock_bot

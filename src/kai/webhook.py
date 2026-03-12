@@ -419,6 +419,7 @@ async def _handle_github(request: web.Request) -> web.Response:
                     webhook_secret=request.app["webhook_secret"],
                     claude_user=request.app.get("claude_user"),
                     local_repo_path=local_repo_path,
+                    spec_dir=request.app.get("spec_dir", "specs"),
                 )
             )
             _background_tasks.add(task)
@@ -1024,6 +1025,7 @@ async def start(telegram_app, config) -> None:
     # Configured via GITHUB_REPO env var. Used to resolve local repo
     # paths for spec compliance checking (#57) and conventions (#58).
     _app["home_repo_name"] = config.github_repo
+    _app["spec_dir"] = config.spec_dir
 
     _app.router.add_get("/health", _handle_health)
 

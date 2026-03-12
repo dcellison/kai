@@ -567,6 +567,27 @@ class TestReviewPR:
         mock_conv.assert_called_once()
         assert mock_build.call_args[1].get("conventions") is None
 
+    @pytest.mark.asyncio
+    async def test_passes_spec_dir_to_load_spec(self):
+        """spec_dir is forwarded from review_pr to load_spec."""
+        payload = _webhook_payload()
+
+        with (
+            patch("kai.review.fetch_pr_diff", return_value="diff content"),
+            patch("kai.review.load_spec", return_value=None) as mock_load,
+            patch("kai.review.load_conventions", return_value=None),
+            patch("kai.review.build_review_prompt", return_value="prompt"),
+            patch("kai.review.run_review", return_value="review output"),
+            patch("kai.review.post_review_comment", return_value=True),
+            patch("kai.review.send_review_summary"),
+        ):
+            await review_pr(
+                payload, 8080, "secret", local_repo_path="/repo", spec_dir="my/specs"
+            )
+
+        # Verify spec_dir was passed through to load_spec
+        assert mock_load.call_args[0][2] == "my/specs"
+
 
 # ── resolve_spec_from_body ─────────────────────────────────────────
 
@@ -613,7 +634,9 @@ class TestResolveSpecFromBranch:
         spec_file = specs_dir / "issue-54-pr-review-routing.md"
         spec_file.write_text("spec content")
 
-        result = resolve_spec_from_branch("feature/pr-review-routing", str(tmp_path))
+        result = resolve_spec_from_branch(
+            "feature/pr-review-routing", str(tmp_path), spec_dir="workspace/specs"
+        )
         assert result == str(spec_file)
 
     def test_no_match(self, tmp_path):
@@ -622,12 +645,16 @@ class TestResolveSpecFromBranch:
         specs_dir.mkdir(parents=True)
         (specs_dir / "unrelated-spec.md").write_text("content")
 
-        result = resolve_spec_from_branch("feature/something-else", str(tmp_path))
+        result = resolve_spec_from_branch(
+            "feature/something-else", str(tmp_path), spec_dir="workspace/specs"
+        )
         assert result is None
 
     def test_no_specs_dir(self, tmp_path):
-        """Returns None when workspace/specs/ does not exist."""
-        result = resolve_spec_from_branch("feature/anything", str(tmp_path))
+        """Returns None when the spec directory does not exist."""
+        result = resolve_spec_from_branch(
+            "feature/anything", str(tmp_path), spec_dir="workspace/specs"
+        )
         assert result is None
 
     def test_strips_prefix(self, tmp_path):
@@ -638,9 +665,10 @@ class TestResolveSpecFromBranch:
         spec_file.write_text("content")
 
         # Various prefixes should all match
-        assert resolve_spec_from_branch("fix/some-bug-fix", str(tmp_path)) == str(spec_file)
-        assert resolve_spec_from_branch("docs/some-bug-fix", str(tmp_path)) == str(spec_file)
-        assert resolve_spec_from_branch("custom/some-bug-fix", str(tmp_path)) == str(spec_file)
+        for prefix in ("fix", "docs", "custom"):
+            assert resolve_spec_from_branch(
+                f"{prefix}/some-bug-fix", str(tmp_path), spec_dir="workspace/specs"
+            ) == str(spec_file)
 
     def test_no_prefix_branch(self, tmp_path):
         """Branches without a '/' are used as-is for matching."""
@@ -649,7 +677,9 @@ class TestResolveSpecFromBranch:
         spec_file = specs_dir / "my-branch-spec.md"
         spec_file.write_text("content")
 
-        result = resolve_spec_from_branch("my-branch", str(tmp_path))
+        result = resolve_spec_from_branch(
+            "my-branch", str(tmp_path), spec_dir="workspace/specs"
+        )
         assert result == str(spec_file)
 
     def test_first_match_sorted(self, tmp_path):
@@ -659,8 +689,33 @@ class TestResolveSpecFromBranch:
         (specs_dir / "a-routing.md").write_text("a")
         (specs_dir / "b-routing.md").write_text("b")
 
-        result = resolve_spec_from_branch("feature/routing", str(tmp_path))
+        result = resolve_spec_from_branch(
+            "feature/routing", str(tmp_path), spec_dir="workspace/specs"
+        )
         assert result == str(specs_dir / "a-routing.md")
+
+    def test_custom_dir(self, tmp_path):
+        """Finds specs in a custom directory path."""
+        specs_dir = tmp_path / "docs" / "specs"
+        specs_dir.mkdir(parents=True)
+        spec_file = specs_dir / "issue-42-feature.md"
+        spec_file.write_text("custom dir spec")
+
+        result = resolve_spec_from_branch(
+            "feature/feature", str(tmp_path), spec_dir="docs/specs"
+        )
+        assert result == str(spec_file)
+
+    def test_default_dir(self, tmp_path):
+        """Default spec_dir uses 'specs' at repo root."""
+        specs_dir = tmp_path / "specs"
+        specs_dir.mkdir()
+        spec_file = specs_dir / "my-spec.md"
+        spec_file.write_text("default dir spec")
+
+        # No spec_dir argument - should use default "specs"
+        result = resolve_spec_from_branch("feature/my-spec", str(tmp_path))
+        assert result == str(spec_file)
 
 
 # ── load_spec ──────────────────────────────────────────────────────
@@ -683,7 +738,9 @@ class TestLoadSpec:
             branch="feature/branch-match",
         )
 
-        result = await load_spec(meta, local_repo_path=str(tmp_path))
+        result = await load_spec(
+            meta, local_repo_path=str(tmp_path), spec_dir="workspace/specs"
+        )
         assert result == "body spec content"
 
     @pytest.mark.asyncio
@@ -695,7 +752,9 @@ class TestLoadSpec:
 
         meta = _metadata(description="No spec marker here.", branch="feature/my-feature")
 
-        result = await load_spec(meta, local_repo_path=str(tmp_path))
+        result = await load_spec(
+            meta, local_repo_path=str(tmp_path), spec_dir="workspace/specs"
+        )
         assert result == "branch spec"
 
     @pytest.mark.asyncio
@@ -706,7 +765,9 @@ class TestLoadSpec:
 
         meta = _metadata(description="No spec.", branch="feature/no-match")
 
-        result = await load_spec(meta, local_repo_path=str(tmp_path))
+        result = await load_spec(
+            meta, local_repo_path=str(tmp_path), spec_dir="workspace/specs"
+        )
         assert result is None
 
     @pytest.mark.asyncio
@@ -728,8 +789,20 @@ class TestLoadSpec:
             branch="feature/fallback",
         )
 
-        result = await load_spec(meta, local_repo_path=str(tmp_path))
+        result = await load_spec(
+            meta, local_repo_path=str(tmp_path), spec_dir="workspace/specs"
+        )
         assert result == "fallback content"
+
+    @pytest.mark.asyncio
+    async def test_passes_spec_dir_to_branch_resolver(self):
+        """spec_dir is forwarded to resolve_spec_from_branch."""
+        meta = _metadata(description="No marker.", branch="feature/thing")
+
+        with patch("kai.review.resolve_spec_from_branch", return_value=None) as mock_resolve:
+            await load_spec(meta, local_repo_path="/repo", spec_dir="custom/path")
+
+        mock_resolve.assert_called_once_with("feature/thing", "/repo", "custom/path")
 
 
 # ── load_conventions ───────────────────────────────────────────────
