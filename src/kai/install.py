@@ -338,15 +338,13 @@ def _cmd_config() -> None:
     # -- PR review --
     print("-- PR review --")
     github_repo = _prompt(
-        "GitHub repo for PR reviews (owner/name, leave blank to skip)",
+        "GitHub repo for PR reviews (owner/name, optional)",
         existing_env.get("GITHUB_REPO", ""),
     )
-    spec_dir = "specs"
-    if github_repo:
-        spec_dir = _prompt(
-            "Spec directory relative to repo root",
-            existing_env.get("SPEC_DIR", "specs"),
-        )
+    spec_dir = _prompt(
+        "Spec directory relative to repo root",
+        existing_env.get("SPEC_DIR", "specs"),
+    )
     print()
 
     # -- Optional features --
