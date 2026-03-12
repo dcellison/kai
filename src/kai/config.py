@@ -137,8 +137,9 @@ class Config:
     # Minimum seconds between reviews of the same PR. Absorbs force-push bursts
     # so rapid pushes to an open PR don't trigger a review for each one.
     pr_review_cooldown: int = 300
-    # GitHub repository name (just the repo part, not owner/repo). Used by the
-    # review agent to identify the local repo path for spec and convention resolution.
+    # Deprecated: review agent now resolves repos via workspace config.
+    # Kept for backwards compatibility with existing .env files; the value
+    # is parsed but no longer used by webhook.py.
     github_repo: str = ""
     # Directory (relative to repo root) where spec files live for
     # branch-name matching. Does not affect body marker resolution,

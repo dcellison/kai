@@ -17,6 +17,7 @@ from kai.webhook import (
     _fmt_push,
     _handle_github,
     _record_review,
+    _resolve_local_repo,
     _review_cooldowns,
     _should_skip_review,
     _strip_markdown,
@@ -323,10 +324,12 @@ def _build_test_app(pr_review_enabled: bool = True, cooldown: int = 300) -> web.
     # Config needed by review background tasks
     app["webhook_port"] = 8080
     app["claude_user"] = None
-    # Spec/convention resolution config: workspace path, repo name, and
-    # spec directory for launching review background tasks.
-    app["workspace"] = "/home/user/workspace"
-    app["home_repo_name"] = "repo"
+    # Workspace config for review agent repo resolution. The workspace
+    # path parent name ("repo") matches the test payload repo name so
+    # _resolve_local_repo() finds it via the home workspace check.
+    app["workspace"] = "/home/user/repo/workspace"
+    app["workspace_base"] = None
+    app["allowed_workspaces"] = []
     app["spec_dir"] = "specs"
     # Mock bot that records sent messages
     mock_bot = AsyncMock()
@@ -344,11 +347,18 @@ def _clear_cooldowns():
     _review_cooldowns.clear()
 
 
+@pytest.fixture(autouse=False)
+def _mock_resolve_repo():
+    """Mock _resolve_local_repo so routing tests skip filesystem/DB checks."""
+    with patch("kai.webhook._resolve_local_repo", new_callable=AsyncMock, return_value=None):
+        yield
+
+
 class TestPRReviewRouting:
     """Integration tests for PR review routing in _handle_github."""
 
     @pytest.mark.asyncio
-    async def test_routes_opened_when_enabled(self, _clear_cooldowns):
+    async def test_routes_opened_when_enabled(self, _clear_cooldowns, _mock_resolve_repo):
         """Reviewable PR events are routed to review pipeline, not Telegram."""
         app = _build_test_app(pr_review_enabled=True)
         payload = _make_pr_payload("opened")
@@ -394,7 +404,7 @@ class TestPRReviewRouting:
             app["telegram_bot"].send_message.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_cooldown_skips_recent(self, _clear_cooldowns):
+    async def test_cooldown_skips_recent(self, _clear_cooldowns, _mock_resolve_repo):
         """Second event for the same PR within cooldown returns review_cooldown."""
         app = _build_test_app(pr_review_enabled=True, cooldown=300)
         payload = _make_pr_payload("synchronize", pr_number=10)
@@ -427,7 +437,7 @@ class TestPRReviewRouting:
             assert data2["msg"] == "review_cooldown"
 
     @pytest.mark.asyncio
-    async def test_cooldown_allows_after_expiry(self, _clear_cooldowns):
+    async def test_cooldown_allows_after_expiry(self, _clear_cooldowns, _mock_resolve_repo):
         """After cooldown expires, the same PR can be reviewed again."""
         from unittest.mock import patch
 
@@ -487,7 +497,7 @@ class TestPRReviewRouting:
             app["telegram_bot"].send_message.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_synchronize_routed(self, _clear_cooldowns):
+    async def test_synchronize_routed(self, _clear_cooldowns, _mock_resolve_repo):
         """synchronize events (new push to existing PR) are routed to review."""
         app = _build_test_app(pr_review_enabled=True)
         payload = _make_pr_payload("synchronize", pr_number=99)
@@ -507,7 +517,7 @@ class TestPRReviewRouting:
             assert data["status"] == "review_triggered"
 
     @pytest.mark.asyncio
-    async def test_launches_background_task(self, _clear_cooldowns):
+    async def test_launches_background_task(self, _clear_cooldowns, _mock_resolve_repo):
         """Reviewable PR events launch review.review_pr as a background task."""
         app = _build_test_app(pr_review_enabled=True)
         payload = _make_pr_payload("opened")
@@ -537,7 +547,166 @@ class TestPRReviewRouting:
             assert call_kwargs[0][0] == payload
             assert call_kwargs[1]["webhook_port"] == 8080
             assert call_kwargs[1]["webhook_secret"] == _TEST_SECRET
-            # local_repo_path should be the parent of workspace (repo root,
-            # not the workspace subdirectory) since the payload repo matches
-            # home_repo_name.
-            assert call_kwargs[1]["local_repo_path"] == "/home/user"
+            # _resolve_local_repo is mocked to return None here;
+            # dedicated tests for resolution logic are in TestResolveLocalRepo.
+            assert call_kwargs[1]["local_repo_path"] is None
+
+
+# ── _resolve_local_repo ─────────────────────────────────────────────
+
+
+class TestResolveLocalRepo:
+    """Tests for workspace-aware repo resolution."""
+
+    @pytest.mark.asyncio
+    async def test_home_workspace(self, tmp_path):
+        """Resolves via home workspace when parent dir name matches repo."""
+        # Create a directory structure like /tmp/.../kai/workspace
+        repo_dir = tmp_path / "kai"
+        repo_dir.mkdir()
+        workspace_dir = repo_dir / "workspace"
+        workspace_dir.mkdir()
+
+        app = web.Application()
+        app["workspace"] = str(workspace_dir)
+        app["workspace_base"] = None
+        app["allowed_workspaces"] = []
+
+        result = await _resolve_local_repo("dcellison/kai", app)
+        assert result == str(repo_dir)
+
+    @pytest.mark.asyncio
+    async def test_workspace_base(self, tmp_path):
+        """Resolves via WORKSPACE_BASE when a child dir matches repo name."""
+        # Create ~/Projects/anvil/ structure
+        anvil_dir = tmp_path / "anvil"
+        anvil_dir.mkdir()
+
+        app = web.Application()
+        app["workspace"] = "/nonexistent/workspace"
+        app["workspace_base"] = str(tmp_path)
+        app["allowed_workspaces"] = []
+
+        result = await _resolve_local_repo("dcellison/anvil", app)
+        assert result == str(anvil_dir)
+
+    @pytest.mark.asyncio
+    async def test_allowed_workspaces(self, tmp_path):
+        """Resolves via ALLOWED_WORKSPACES when dir name matches."""
+        myrepo = tmp_path / "myrepo"
+        myrepo.mkdir()
+
+        app = web.Application()
+        app["workspace"] = "/nonexistent/workspace"
+        app["workspace_base"] = None
+        app["allowed_workspaces"] = [str(myrepo)]
+
+        result = await _resolve_local_repo("owner/myrepo", app)
+        assert result == str(myrepo)
+
+    @pytest.mark.asyncio
+    async def test_workspace_history(self, tmp_path):
+        """Resolves via workspace_history entries from the database."""
+        history_repo = tmp_path / "historic"
+        history_repo.mkdir()
+
+        app = web.Application()
+        app["workspace"] = "/nonexistent/workspace"
+        app["workspace_base"] = None
+        app["allowed_workspaces"] = []
+
+        with patch(
+            "kai.webhook.sessions.get_workspace_history",
+            new_callable=AsyncMock,
+            return_value=[{"path": str(history_repo)}],
+        ):
+            result = await _resolve_local_repo("owner/historic", app)
+        assert result == str(history_repo)
+
+    @pytest.mark.asyncio
+    async def test_priority_order(self, tmp_path):
+        """Home workspace wins over workspace_base."""
+        # Both home and base have a matching "kai" directory
+        home_repo = tmp_path / "home" / "kai"
+        home_repo.mkdir(parents=True)
+        home_workspace = home_repo / "workspace"
+        home_workspace.mkdir()
+
+        base_dir = tmp_path / "base"
+        base_kai = base_dir / "kai"
+        base_kai.mkdir(parents=True)
+
+        app = web.Application()
+        app["workspace"] = str(home_workspace)
+        app["workspace_base"] = str(base_dir)
+        app["allowed_workspaces"] = []
+
+        result = await _resolve_local_repo("dcellison/kai", app)
+        # Home workspace should win
+        assert result == str(home_repo)
+
+    @pytest.mark.asyncio
+    async def test_no_match(self, tmp_path):
+        """Returns None when no workspace matches the repo."""
+        app = web.Application()
+        app["workspace"] = str(tmp_path / "unrelated" / "workspace")
+        app["workspace_base"] = str(tmp_path)
+        app["allowed_workspaces"] = []
+
+        with patch(
+            "kai.webhook.sessions.get_workspace_history",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            result = await _resolve_local_repo("owner/nonexistent", app)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_nonexistent_dir_skipped(self, tmp_path):
+        """History entries pointing to deleted directories are skipped."""
+        app = web.Application()
+        app["workspace"] = "/nonexistent/workspace"
+        app["workspace_base"] = None
+        app["allowed_workspaces"] = []
+
+        with patch(
+            "kai.webhook.sessions.get_workspace_history",
+            new_callable=AsyncMock,
+            return_value=[{"path": "/gone/deleted-repo"}],
+        ):
+            result = await _resolve_local_repo("owner/deleted-repo", app)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_handler_uses_resolve(self, _clear_cooldowns):
+        """_handle_github calls _resolve_local_repo instead of old home_repo_name logic."""
+        app = _build_test_app(pr_review_enabled=True)
+        payload = _make_pr_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with (
+            patch(
+                "kai.webhook._resolve_local_repo",
+                new_callable=AsyncMock,
+                return_value="/resolved/path",
+            ) as mock_resolve,
+            patch("kai.webhook.review.review_pr", new_callable=AsyncMock),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert (await resp.json())["status"] == "review_triggered"
+
+            import asyncio
+
+            await asyncio.sleep(0.01)
+
+            # Verify _resolve_local_repo was called with the repo name
+            mock_resolve.assert_called_once_with("owner/repo", app)

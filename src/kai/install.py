@@ -333,6 +333,10 @@ def _cmd_config() -> None:
         "Allowed workspaces (comma-separated paths, optional)",
         existing_env.get("ALLOWED_WORKSPACES", ""),
     )
+    spec_dir = _prompt(
+        "Spec directory relative to repo root (for PR review agent)",
+        existing_env.get("SPEC_DIR", "specs"),
+    )
     print()
 
     # -- Optional features --
@@ -388,6 +392,9 @@ def _cmd_config() -> None:
         env["CLAUDE_USER"] = claude_user
     if perplexity_key:
         env["PERPLEXITY_API_KEY"] = perplexity_key
+    if spec_dir != "specs":
+        # Only write if non-default; config.py defaults to "specs"
+        env["SPEC_DIR"] = spec_dir
 
     # Build and write install.conf
     conf = {

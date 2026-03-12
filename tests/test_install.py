@@ -287,6 +287,7 @@ class TestCmdConfig:
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces (empty)
+                "specs",  # spec dir (default)
                 "false",  # voice
                 "false",  # tts
                 "",  # claude user (empty)

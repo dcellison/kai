@@ -124,6 +124,59 @@ def _record_review(repo: str, pr_number: int) -> None:
     _review_cooldowns[(repo, pr_number)] = time.time()
 
 
+async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str | None:
+    """
+    Resolve a GitHub repo name to a local filesystem path.
+
+    Matches the repo part of the full name (e.g., "kai" from "dcellison/kai")
+    against known workspace locations. Checks in priority order:
+
+    1. Home workspace (derived from app["workspace"] parent)
+    2. WORKSPACE_BASE children
+    3. ALLOWED_WORKSPACES entries
+    4. workspace_history entries from the database
+
+    Args:
+        repo_full_name: Full GitHub repo name (e.g., "dcellison/kai").
+        app: The aiohttp application with workspace config.
+
+    Returns:
+        Absolute path to the local repo checkout, or None if not found.
+    """
+    # Extract just the repo name from "owner/repo"
+    repo_name = repo_full_name.split("/")[-1]
+
+    # 1. Home workspace - the workspace parent is the repo root.
+    # app["workspace"] is the workspace subdirectory (e.g., /opt/kai/workspace),
+    # so .parent gives the repo root (e.g., /opt/kai/).
+    workspace = app.get("workspace")
+    if workspace:
+        home_path = Path(workspace).parent
+        if home_path.name == repo_name and home_path.is_dir():
+            return str(home_path)
+
+    # 2. WORKSPACE_BASE - scan immediate children for matching dir name
+    workspace_base = app.get("workspace_base")
+    if workspace_base:
+        candidate = Path(workspace_base) / repo_name
+        if candidate.is_dir():
+            return str(candidate)
+
+    # 3. ALLOWED_WORKSPACES - check each entry's directory name
+    for allowed in app.get("allowed_workspaces", []):
+        if Path(allowed).name == repo_name and Path(allowed).is_dir():
+            return str(allowed)
+
+    # 4. workspace_history - check each entry's directory name
+    history = await sessions.get_workspace_history(limit=50)
+    for entry in history:
+        path = Path(entry["path"])
+        if path.name == repo_name and path.is_dir():
+            return str(path)
+
+    return None
+
+
 def _strip_markdown(text: str) -> str:
     """
     Remove markdown syntax so text reads cleanly as plain Telegram text.
@@ -399,15 +452,9 @@ async def _handle_github(request: web.Request) -> web.Response:
             _record_review(repo, pr_number)
 
             # Resolve a local repo path for spec/convention loading.
-            # If the webhook event is for the home repo, derive the repo
-            # root from the workspace path. app["workspace"] stores the
-            # workspace subdirectory (e.g., /opt/kai/workspace), but spec
-            # paths are relative to the repo root, so we need the parent.
-            local_repo_path = None
-            workspace = request.app.get("workspace")
-            home_repo = request.app.get("home_repo_name")
-            if home_repo and workspace and repo.endswith(f"/{home_repo}"):
-                local_repo_path = str(Path(workspace).parent)
+            # Checks home workspace, WORKSPACE_BASE, ALLOWED_WORKSPACES,
+            # and workspace history for a directory matching the repo name.
+            local_repo_path = await _resolve_local_repo(repo, request.app)
 
             # Launch the review as a fire-and-forget background task.
             # Same pattern as Telegram update processing: create_task +
@@ -1021,10 +1068,11 @@ async def start(telegram_app, config) -> None:
     _app["webhook_port"] = config.webhook_port
     _app["claude_user"] = config.claude_user
 
-    # The GitHub repo name for the home workspace (e.g., "kai").
-    # Configured via GITHUB_REPO env var. Used to resolve local repo
-    # paths for spec compliance checking (#57) and conventions (#58).
-    _app["home_repo_name"] = config.github_repo
+    # Workspace config for review agent repo resolution. These let
+    # _resolve_local_repo() match incoming PR webhook repos against
+    # local checkouts without a hardcoded GITHUB_REPO setting.
+    _app["workspace_base"] = str(config.workspace_base) if config.workspace_base else None
+    _app["allowed_workspaces"] = [str(p) for p in config.allowed_workspaces]
     _app["spec_dir"] = config.spec_dir
 
     _app.router.add_get("/health", _handle_health)
