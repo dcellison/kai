@@ -509,7 +509,7 @@ async def apply_triage(
     labels = triage_result.get("labels", [])
     if not isinstance(labels, list):
         labels = []
-    labels = [lbl for lbl in labels if isinstance(lbl, str)]
+    labels = [lbl for lbl in labels if isinstance(lbl, str) and lbl.strip()]
 
     duplicate_of = triage_result.get("duplicate_of")
     if not isinstance(duplicate_of, int):
@@ -521,6 +521,8 @@ async def apply_triage(
     related = [n for n in related if isinstance(n, int)]
 
     project = triage_result.get("project")
+    if not isinstance(project, str) or not project.strip():
+        project = None
     summary = triage_result.get("summary", "No summary provided.")
     priority = triage_result.get("priority", "medium")
 
