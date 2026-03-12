@@ -333,10 +333,25 @@ def _cmd_config() -> None:
         "Allowed workspaces (comma-separated paths, optional)",
         existing_env.get("ALLOWED_WORKSPACES", ""),
     )
-    spec_dir = _prompt(
-        "Spec directory relative to repo root (for PR review agent)",
-        existing_env.get("SPEC_DIR", "specs"),
+    print()
+
+    # -- PR review agent --
+    print("-- PR review agent --")
+    pr_review_enabled = _prompt_bool(
+        "Enable PR review agent",
+        existing_env.get("PR_REVIEW_ENABLED", "false").lower() in ("1", "true", "yes"),
     )
+    spec_dir = "specs"
+    pr_review_cooldown = "300"
+    if pr_review_enabled:
+        spec_dir = _prompt(
+            "Spec directory relative to repo root",
+            existing_env.get("SPEC_DIR", "specs"),
+        )
+        pr_review_cooldown = _prompt(
+            "Review cooldown in seconds (prevents spam from rapid pushes)",
+            existing_env.get("PR_REVIEW_COOLDOWN", "300"),
+        )
     print()
 
     # -- Optional features --
@@ -392,9 +407,12 @@ def _cmd_config() -> None:
         env["CLAUDE_USER"] = claude_user
     if perplexity_key:
         env["PERPLEXITY_API_KEY"] = perplexity_key
-    if spec_dir != "specs":
-        # Only write if non-default; config.py defaults to "specs"
-        env["SPEC_DIR"] = spec_dir
+    if pr_review_enabled:
+        env["PR_REVIEW_ENABLED"] = "true"
+        if pr_review_cooldown != "300":
+            env["PR_REVIEW_COOLDOWN"] = pr_review_cooldown
+        if spec_dir != "specs":
+            env["SPEC_DIR"] = spec_dir
 
     # Build and write install.conf
     conf = {
