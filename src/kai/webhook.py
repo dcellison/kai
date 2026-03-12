@@ -940,9 +940,9 @@ async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str) -> No
                 reason = "webhook URL is empty"
 
             # Re-register if Telegram reports a recent delivery error.
-            # last_error_date is a Unix timestamp (0 or None if no errors).
+            # last_error_date is a datetime (None if no errors).
             elif info.last_error_date:
-                error_age = time.time() - info.last_error_date
+                error_age = time.time() - info.last_error_date.timestamp()
                 if error_age < _ERROR_RECENCY_THRESHOLD:
                     needs_reregister = True
                     reason = f"recent error ({int(error_age)}s ago): {info.last_error_message or 'unknown'}"
