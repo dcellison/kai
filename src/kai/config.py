@@ -137,6 +137,9 @@ class Config:
     # Minimum seconds between reviews of the same PR. Absorbs force-push bursts
     # so rapid pushes to an open PR don't trigger a review for each one.
     pr_review_cooldown: int = 300
+    # GitHub repository name (just the repo part, not owner/repo). Used by the
+    # review agent to identify the local repo path for spec and convention resolution.
+    github_repo: str = ""
 
     # TOTP two-factor authentication timing (only relevant when TOTP is enabled)
     totp_session_minutes: int = 30
@@ -334,6 +337,7 @@ def load_config() -> Config:
         claude_user=os.environ.get("CLAUDE_USER") or None,
         pr_review_enabled=pr_review_enabled,
         pr_review_cooldown=pr_review_cooldown,
+        github_repo=os.getenv("GITHUB_REPO", ""),
         totp_session_minutes=totp_session_minutes,
         totp_challenge_seconds=totp_challenge_seconds,
         totp_lockout_attempts=totp_lockout_attempts,

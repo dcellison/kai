@@ -28,6 +28,7 @@ _CONFIG_ENV_VARS = [
     "CLAUDE_USER",
     "PR_REVIEW_ENABLED",
     "PR_REVIEW_COOLDOWN",
+    "GITHUB_REPO",
     "KAI_DATA_DIR",
     "KAI_INSTALL_DIR",
 ]
@@ -474,3 +475,13 @@ class TestPRReviewConfig:
         monkeypatch.setenv("PR_REVIEW_COOLDOWN", "not_a_number")
         with pytest.raises(SystemExit, match="PR_REVIEW_COOLDOWN"):
             load_config()
+
+    def test_github_repo_from_env(self, monkeypatch):
+        """GITHUB_REPO is picked up from env, defaults to empty string."""
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.github_repo == ""
+
+        monkeypatch.setenv("GITHUB_REPO", "kai")
+        config = load_config()
+        assert config.github_repo == "kai"

@@ -11,7 +11,10 @@ from kai.review import (
     build_review_prompt,
     extract_pr_metadata,
     fetch_pr_diff,
+    load_spec,
     post_review_comment,
+    resolve_spec_from_body,
+    resolve_spec_from_branch,
     review_pr,
     run_review,
     send_review_summary,
@@ -504,3 +507,186 @@ class TestReviewPR:
         mock_post.assert_not_called()
         mock_summary.assert_called_once()
         assert mock_summary.call_args[0][1] is False
+
+    @pytest.mark.asyncio
+    async def test_spec_injected_into_prompt(self):
+        """When load_spec returns content, it is passed to build_review_prompt."""
+        payload = _webhook_payload()
+
+        with (
+            patch("kai.review.fetch_pr_diff", return_value="diff content"),
+            patch("kai.review.load_spec", return_value="Must implement feature Y.") as mock_load,
+            patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
+            patch("kai.review.run_review", return_value="review output"),
+            patch("kai.review.post_review_comment", return_value=True),
+            patch("kai.review.send_review_summary"),
+        ):
+            await review_pr(payload, 8080, "secret", local_repo_path="/repo")
+
+        mock_load.assert_called_once()
+        # Verify spec content was passed through to the prompt builder
+        assert mock_build.call_args[1].get("spec") == "Must implement feature Y."
+
+
+# ── resolve_spec_from_body ─────────────────────────────────────────
+
+
+class TestResolveSpecFromBody:
+    def test_found(self):
+        """Extracts path from a 'spec: <path>' line in the PR body."""
+        body = "This PR implements the new feature.\nspec: workspace/specs/issue-54-pr-review-routing.md\n"
+        assert resolve_spec_from_body(body) == "workspace/specs/issue-54-pr-review-routing.md"
+
+    def test_case_insensitive(self):
+        """Spec marker is matched case-insensitively."""
+        body = "Spec: path/to/spec.md"
+        assert resolve_spec_from_body(body) == "path/to/spec.md"
+
+    def test_not_found(self):
+        """Returns None when no spec marker is present."""
+        body = "Just a normal PR description.\nNo spec here."
+        assert resolve_spec_from_body(body) is None
+
+    def test_empty_path(self):
+        """Returns None when 'spec:' has no path after the colon."""
+        body = "spec:  \nMore text."
+        assert resolve_spec_from_body(body) is None
+
+    def test_empty_description(self):
+        """Returns None for an empty description string."""
+        assert resolve_spec_from_body("") is None
+
+    def test_whitespace_around_marker(self):
+        """Handles leading/trailing whitespace on the spec line."""
+        body = "  spec:   workspace/specs/my-spec.md  "
+        assert resolve_spec_from_body(body) == "workspace/specs/my-spec.md"
+
+
+# ── resolve_spec_from_branch ───────────────────────────────────────
+
+
+class TestResolveSpecFromBranch:
+    def test_found(self, tmp_path):
+        """Finds a spec file matching the branch name fragment."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        spec_file = specs_dir / "issue-54-pr-review-routing.md"
+        spec_file.write_text("spec content")
+
+        result = resolve_spec_from_branch("feature/pr-review-routing", str(tmp_path))
+        assert result == str(spec_file)
+
+    def test_no_match(self, tmp_path):
+        """Returns None when no spec files match the branch name."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        (specs_dir / "unrelated-spec.md").write_text("content")
+
+        result = resolve_spec_from_branch("feature/something-else", str(tmp_path))
+        assert result is None
+
+    def test_no_specs_dir(self, tmp_path):
+        """Returns None when workspace/specs/ does not exist."""
+        result = resolve_spec_from_branch("feature/anything", str(tmp_path))
+        assert result is None
+
+    def test_strips_prefix(self, tmp_path):
+        """Strips everything before the first '/' before matching."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        spec_file = specs_dir / "some-bug-fix.md"
+        spec_file.write_text("content")
+
+        # Various prefixes should all match
+        assert resolve_spec_from_branch("fix/some-bug-fix", str(tmp_path)) == str(spec_file)
+        assert resolve_spec_from_branch("docs/some-bug-fix", str(tmp_path)) == str(spec_file)
+        assert resolve_spec_from_branch("custom/some-bug-fix", str(tmp_path)) == str(spec_file)
+
+    def test_no_prefix_branch(self, tmp_path):
+        """Branches without a '/' are used as-is for matching."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        spec_file = specs_dir / "my-branch-spec.md"
+        spec_file.write_text("content")
+
+        result = resolve_spec_from_branch("my-branch", str(tmp_path))
+        assert result == str(spec_file)
+
+    def test_first_match_sorted(self, tmp_path):
+        """When multiple specs match, returns the first alphabetically."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        (specs_dir / "a-routing.md").write_text("a")
+        (specs_dir / "b-routing.md").write_text("b")
+
+        result = resolve_spec_from_branch("feature/routing", str(tmp_path))
+        assert result == str(specs_dir / "a-routing.md")
+
+
+# ── load_spec ──────────────────────────────────────────────────────
+
+
+class TestLoadSpec:
+    @pytest.mark.asyncio
+    async def test_body_marker_priority(self, tmp_path):
+        """Body marker takes priority over branch name matching."""
+        # Set up both a body-marker spec and a branch-matching spec
+        spec_from_body = tmp_path / "workspace" / "specs" / "explicit.md"
+        spec_from_body.parent.mkdir(parents=True)
+        spec_from_body.write_text("body spec content")
+
+        spec_from_branch = tmp_path / "workspace" / "specs" / "branch-match.md"
+        spec_from_branch.write_text("branch spec content")
+
+        meta = _metadata(
+            description="spec: workspace/specs/explicit.md",
+            branch="feature/branch-match",
+        )
+
+        result = await load_spec(meta, local_repo_path=str(tmp_path))
+        assert result == "body spec content"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_branch(self, tmp_path):
+        """Uses branch name matching when no body marker is present."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        (specs_dir / "issue-99-my-feature.md").write_text("branch spec")
+
+        meta = _metadata(description="No spec marker here.", branch="feature/my-feature")
+
+        result = await load_spec(meta, local_repo_path=str(tmp_path))
+        assert result == "branch spec"
+
+    @pytest.mark.asyncio
+    async def test_no_spec_found(self, tmp_path):
+        """Returns None when neither strategy finds a spec."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+
+        meta = _metadata(description="No spec.", branch="feature/no-match")
+
+        result = await load_spec(meta, local_repo_path=str(tmp_path))
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_no_local_repo_path(self):
+        """Returns None immediately when local_repo_path is not provided."""
+        meta = _metadata(description="spec: workspace/specs/something.md")
+        result = await load_spec(meta, local_repo_path=None)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_body_marker_file_missing(self, tmp_path):
+        """Falls back to branch matching when body-referenced file does not exist."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        (specs_dir / "fallback-spec.md").write_text("fallback content")
+
+        meta = _metadata(
+            description="spec: workspace/specs/nonexistent.md",
+            branch="feature/fallback",
+        )
+
+        result = await load_spec(meta, local_repo_path=str(tmp_path))
+        assert result == "fallback content"

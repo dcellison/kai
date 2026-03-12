@@ -398,6 +398,15 @@ async def _handle_github(request: web.Request) -> web.Response:
 
             _record_review(repo, pr_number)
 
+            # Resolve a local repo path for spec/convention loading.
+            # If the webhook event is for the home repo, use the workspace
+            # directory. Otherwise no local path is available.
+            local_repo_path = None
+            workspace = request.app.get("workspace")
+            home_repo = request.app.get("home_repo_name")
+            if home_repo and repo.endswith(f"/{home_repo}"):
+                local_repo_path = workspace
+
             # Launch the review as a fire-and-forget background task.
             # Same pattern as Telegram update processing: create_task +
             # _background_tasks set to prevent GC during execution.
@@ -407,6 +416,7 @@ async def _handle_github(request: web.Request) -> web.Response:
                     webhook_port=request.app["webhook_port"],
                     webhook_secret=request.app["webhook_secret"],
                     claude_user=request.app.get("claude_user"),
+                    local_repo_path=local_repo_path,
                 )
             )
             _background_tasks.add(task)
@@ -1007,6 +1017,11 @@ async def start(telegram_app, config) -> None:
     # Additional config needed by review background tasks
     _app["webhook_port"] = config.webhook_port
     _app["claude_user"] = config.claude_user
+
+    # The GitHub repo name for the home workspace (e.g., "kai").
+    # Configured via GITHUB_REPO env var. Used to resolve local repo
+    # paths for spec compliance checking (#57) and conventions (#58).
+    _app["home_repo_name"] = config.github_repo
 
     _app.router.add_get("/health", _handle_health)
 

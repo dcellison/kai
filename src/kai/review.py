@@ -4,10 +4,11 @@ PR review agent - one-shot Claude subprocess for automated code review.
 Provides functionality to:
 1. Fetch PR diffs and metadata via the GitHub CLI
 2. Construct XML-delimited review prompts (prompt injection prevention)
-3. Spawn a one-shot Claude subprocess in --print mode for review
-4. Post review output as a GitHub PR comment via gh CLI
-5. Send review summaries to Telegram via the send-message API
-6. Orchestrate the full pipeline from webhook event to posted review
+3. Resolve and load spec files for compliance checking
+4. Spawn a one-shot Claude subprocess in --print mode for review
+5. Post review output as a GitHub PR comment via gh CLI
+6. Send review summaries to Telegram via the send-message API
+7. Orchestrate the full pipeline from webhook event to posted review
 
 The review agent is deliberately stateless: each review is a fresh Claude
 invocation with the full diff in context. No persistent sessions, no
@@ -20,8 +21,10 @@ hitting shell argument length limits. Output is captured as plain text.
 """
 
 import asyncio
+import glob as glob_mod
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import aiohttp
 
@@ -95,6 +98,114 @@ def extract_pr_metadata(payload: dict) -> PRMetadata:
         author=pr.get("user", {}).get("login", ""),
         branch=pr.get("head", {}).get("ref", ""),
     )
+
+
+# ── Spec resolution ─────────────────────────────────────────────────
+
+
+def resolve_spec_from_body(description: str) -> str | None:
+    """
+    Extract a spec file path from a 'spec: <path>' marker in the PR body.
+
+    Scans the PR description line by line for a line starting with 'spec:'
+    (case-insensitive). Returns the path portion, stripped of whitespace.
+
+    Args:
+        description: The PR body/description text.
+
+    Returns:
+        The spec file path string, or None if no marker is found.
+    """
+    for line in description.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("spec:"):
+            path = stripped[5:].strip()
+            if path:
+                return path
+    return None
+
+
+def resolve_spec_from_branch(branch: str, repo_path: str) -> str | None:
+    """
+    Find a spec file matching the branch name by glob pattern.
+
+    Strips the branch prefix (everything before the first '/') and
+    searches workspace/specs/ for a matching markdown file. Returns the
+    first match (sorted alphabetically), or None if no match is found.
+
+    Only works for repos that exist locally on the machine. Remote-only
+    repos will not have a local specs directory to search.
+
+    Args:
+        branch: The source branch name (e.g., "feature/pr-review-routing").
+        repo_path: Absolute path to the local repo checkout.
+
+    Returns:
+        Absolute path to the matching spec file, or None if not found.
+    """
+    # Strip branch prefix (e.g., "feature/", "fix/") to get the
+    # descriptive part. Split on first "/" handles any prefix convention
+    # without maintaining a hardcoded list.
+    name = branch.split("/", 1)[-1] if "/" in branch else branch
+
+    specs_dir = Path(repo_path) / "workspace" / "specs"
+    if not specs_dir.is_dir():
+        return None
+
+    # Glob for spec files containing the branch name fragment
+    pattern = str(specs_dir / f"*{name}*.md")
+    matches = sorted(glob_mod.glob(pattern))
+    return matches[0] if matches else None
+
+
+async def load_spec(
+    metadata: PRMetadata,
+    local_repo_path: str | None = None,
+) -> str | None:
+    """
+    Attempt to load a spec file for the PR being reviewed.
+
+    Tries two resolution strategies in order:
+    1. Explicit 'spec: <path>' marker in the PR body
+    2. Branch name matching against workspace/specs/
+
+    Both strategies read from the local filesystem. Spec files live in
+    the local repo (workspace/specs/), so there is no need to fetch
+    from the GitHub API. The body marker path is resolved relative to
+    local_repo_path.
+
+    Args:
+        metadata: PR metadata with description and branch name.
+        local_repo_path: Optional absolute path to a local repo checkout.
+
+    Returns:
+        The spec file content as a string, or None if no spec is found.
+    """
+    if not local_repo_path:
+        return None
+
+    # Strategy 1: explicit marker in PR body
+    spec_path = resolve_spec_from_body(metadata.description)
+    if spec_path:
+        try:
+            full_path = Path(local_repo_path) / spec_path
+            content = full_path.read_text()
+            log.info("Loaded spec from PR body marker: %s", spec_path)
+            return content
+        except OSError:
+            log.warning("Failed to read spec from body marker: %s", spec_path)
+
+    # Strategy 2: branch name matching
+    local_spec = resolve_spec_from_branch(metadata.branch, local_repo_path)
+    if local_spec:
+        try:
+            content = Path(local_spec).read_text()
+            log.info("Loaded spec from branch name match: %s", local_spec)
+            return content
+        except OSError:
+            log.warning("Failed to read local spec: %s", local_spec)
+
+    return None
 
 
 def build_review_prompt(
@@ -402,6 +513,7 @@ async def review_pr(
     webhook_port: int,
     webhook_secret: str,
     claude_user: str | None = None,
+    local_repo_path: str | None = None,
 ) -> None:
     """
     Full review pipeline: fetch diff, build prompt, run review, post results.
@@ -419,6 +531,7 @@ async def review_pr(
         webhook_port: Local webhook server port.
         webhook_secret: Webhook secret for API auth.
         claude_user: Optional OS user for the Claude subprocess.
+        local_repo_path: Optional path to local repo checkout for spec resolution.
     """
     metadata = extract_pr_metadata(payload)
 
@@ -430,8 +543,11 @@ async def review_pr(
             log.info("Empty diff for %s#%d, skipping review", metadata.repo, metadata.number)
             return
 
-        # Step 2: Build the review prompt
-        prompt = build_review_prompt(metadata, diff)
+        # Step 1.5: Load spec if referenced (agentic engineering layer)
+        spec = await load_spec(metadata, local_repo_path)
+
+        # Step 2: Build the review prompt (with optional spec)
+        prompt = build_review_prompt(metadata, diff, spec=spec)
 
         # Step 3: Run the Claude review subprocess
         review_text = await run_review(prompt, claude_user=claude_user)
