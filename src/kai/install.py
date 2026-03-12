@@ -335,6 +335,18 @@ def _cmd_config() -> None:
     )
     print()
 
+    # -- PR review --
+    print("-- PR review --")
+    github_repo = _prompt(
+        "GitHub repo for PR reviews (owner/name, optional)",
+        existing_env.get("GITHUB_REPO", ""),
+    )
+    spec_dir = _prompt(
+        "Spec directory relative to repo root",
+        existing_env.get("SPEC_DIR", "specs"),
+    )
+    print()
+
     # -- Optional features --
     print("-- Optional features --")
     voice_enabled = _prompt_bool(
@@ -388,6 +400,11 @@ def _cmd_config() -> None:
         env["CLAUDE_USER"] = claude_user
     if perplexity_key:
         env["PERPLEXITY_API_KEY"] = perplexity_key
+    if github_repo:
+        env["GITHUB_REPO"] = github_repo
+    if spec_dir != "specs":
+        # Only write if non-default; config.py defaults to "specs"
+        env["SPEC_DIR"] = spec_dir
 
     # Build and write install.conf
     conf = {
