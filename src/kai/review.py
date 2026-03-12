@@ -9,11 +9,14 @@ Provides functionality to:
 5. Post review output as a GitHub PR comment via gh CLI
 6. Send review summaries to Telegram via the send-message API
 7. Orchestrate the full pipeline from webhook event to posted review
+8. Incorporate prior review comments to avoid re-flagging dismissed issues
 
-The review agent is deliberately stateless: each review is a fresh Claude
-invocation with the full diff in context. No persistent sessions, no
-conversation continuity across pushes. If the same bug survives two pushes,
-Claude flags it again. Simplicity over sophistication.
+The review agent stores no persistent state, but reads prior GitHub PR
+comments for conversational awareness within a single PR. Each review is
+a fresh Claude invocation with the full diff and any prior review thread
+in context, so issues that were already raised and dismissed are not
+repeated. If the relevant code has materially changed, the agent may
+re-evaluate a prior finding.
 
 The Claude subprocess runs in --print mode (non-interactive, no tools, no
 streaming). The prompt goes in via stdin to handle large diffs without
@@ -22,6 +25,7 @@ hitting shell argument length limits. Output is captured as plain text.
 
 import asyncio
 import glob as glob_mod
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +56,11 @@ _REVIEW_TIMEOUT = 300
 # Header prepended to every review comment on GitHub. Distinguishes
 # automated reviews from human comments. Per design decision #11.
 _REVIEW_HEADER = "## Review by Kai\n\n"
+
+# Maximum total characters of prior review comments to include in the
+# prompt. Oldest reviews are truncated first if the cap is exceeded,
+# since the most recent review thread is the most relevant context.
+_MAX_PRIOR_COMMENTS_CHARS = 50_000
 
 
 @dataclass(frozen=True)
@@ -249,11 +258,125 @@ async def load_conventions(
     return None
 
 
+# ── Prior comment awareness ────────────────────────────────────────
+
+
+async def fetch_prior_comments(repo: str, pr_number: int) -> str | None:
+    """
+    Fetch prior review comments from the PR's comment thread.
+
+    Uses the GitHub API via gh to retrieve top-level PR comments (issue
+    comments endpoint, not inline review comments). Filters for comments
+    that start with the "## Review by Kai" header, plus any comments that
+    appear after each review comment (likely replies or reactions).
+
+    Comments before the first review comment are excluded since they
+    predate any review context.
+
+    Returns a formatted string of the comment thread suitable for
+    inclusion in the review prompt, or None if no prior reviews exist.
+    If the API call fails, logs a warning and returns None so the
+    review proceeds without context rather than failing entirely.
+
+    Args:
+        repo: Full repository name (e.g., "dcellison/kai").
+        pr_number: The PR number.
+
+    Returns:
+        Formatted comment thread string, or None if no prior reviews.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "gh",
+            "api",
+            f"repos/{repo}/issues/{pr_number}/comments",
+            "--paginate",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            error = stderr.decode().strip()
+            log.warning(
+                "Failed to fetch prior comments for %s#%d: %s",
+                repo,
+                pr_number,
+                error,
+            )
+            return None
+
+        comments = json.loads(stdout.decode())
+    except Exception:
+        log.warning(
+            "Failed to fetch prior comments for %s#%d",
+            repo,
+            pr_number,
+            exc_info=True,
+        )
+        return None
+
+    if not isinstance(comments, list) or not comments:
+        return None
+
+    # Build thread segments: each segment starts with a "Review by Kai"
+    # comment and includes all subsequent comments until the next review.
+    # Comments before the first review are ignored.
+    threads: list[list[str]] = []
+    current_thread: list[str] | None = None
+
+    for comment in comments:
+        body = comment.get("body", "")
+        author = comment.get("user", {}).get("login", "unknown")
+        timestamp = comment.get("created_at", "")
+
+        # Check if this comment is a review by Kai
+        is_review = body.startswith(_REVIEW_HEADER) or body.startswith(_REVIEW_HEADER.rstrip())
+
+        if is_review:
+            # Start a new thread segment. Save the previous one if it exists.
+            if current_thread is not None:
+                threads.append(current_thread)
+            current_thread = []
+
+        # Only include comments once we've found the first review
+        if current_thread is not None:
+            current_thread.append(f"[{timestamp}] {author}:\n{body}")
+
+    # Don't forget the last thread
+    if current_thread is not None:
+        threads.append(current_thread)
+
+    if not threads:
+        return None
+
+    # Join each thread's comments with separators, then join threads
+    formatted_threads = ["\n---\n".join(segment) for segment in threads]
+    full_text = "\n\n---\n\n".join(formatted_threads)
+
+    # Cap at _MAX_PRIOR_COMMENTS_CHARS, dropping oldest threads first.
+    # The most recent review is the most relevant for understanding what
+    # has already been discussed.
+    if len(full_text) > _MAX_PRIOR_COMMENTS_CHARS:
+        while len(formatted_threads) > 1:
+            formatted_threads.pop(0)
+            full_text = "\n\n---\n\n".join(formatted_threads)
+            if len(full_text) <= _MAX_PRIOR_COMMENTS_CHARS:
+                break
+
+        # If a single thread still exceeds the cap, truncate from the start
+        if len(full_text) > _MAX_PRIOR_COMMENTS_CHARS:
+            full_text = full_text[-_MAX_PRIOR_COMMENTS_CHARS:]
+
+    return full_text
+
+
 def build_review_prompt(
     metadata: PRMetadata,
     diff: str,
     spec: str | None = None,
     conventions: str | None = None,
+    prior_comments: str | None = None,
 ) -> str:
     """
     Construct the review prompt with XML-delimited untrusted data.
@@ -272,6 +395,8 @@ def build_review_prompt(
         diff: The unified diff string from gh pr diff.
         spec: Optional spec file content for compliance checking (issue #57).
         conventions: Optional CLAUDE.md content for convention enforcement (issue #58).
+        prior_comments: Optional formatted thread of prior review comments
+            and replies, used to avoid re-flagging dismissed issues.
 
     Returns:
         The complete review prompt string, ready to pipe to Claude's stdin.
@@ -325,6 +450,25 @@ def build_review_prompt(
                 "",
                 conventions,
                 "</conventions>",
+                "",
+            ]
+        )
+
+    # Optional: prior review thread for context awareness. Prevents
+    # the agent from re-flagging issues that were already raised and
+    # dismissed in prior review rounds on this same PR.
+    if prior_comments:
+        parts.extend(
+            [
+                "<prior-review-thread>",
+                "The following are comments from previous reviews of this PR. "
+                "Do not re-raise issues from prior reviews unless the relevant "
+                "code has materially changed. If an issue was raised and the "
+                "author did not address it, they have seen it and made their "
+                "decision.",
+                "",
+                prior_comments,
+                "</prior-review-thread>",
                 "",
             ]
         )
@@ -592,8 +736,27 @@ async def review_pr(
         # Step 1.6: Load project conventions from CLAUDE.md (issue #58)
         conventions = await load_conventions(metadata, local_repo_path)
 
-        # Step 2: Build the review prompt (with optional spec and conventions)
-        prompt = build_review_prompt(metadata, diff, spec=spec, conventions=conventions)
+        # Step 1.7: Fetch prior review comments for context awareness.
+        # If prior reviews exist, Claude will see what was already flagged
+        # and avoid repeating dismissed findings.
+        prior_comments = await fetch_prior_comments(metadata.repo, metadata.number)
+        if prior_comments:
+            log.info(
+                "Loaded %d chars of prior review comments for %s#%d",
+                len(prior_comments),
+                metadata.repo,
+                metadata.number,
+            )
+
+        # Step 2: Build the review prompt (with optional spec, conventions,
+        # and prior review comments)
+        prompt = build_review_prompt(
+            metadata,
+            diff,
+            spec=spec,
+            conventions=conventions,
+            prior_comments=prior_comments,
+        )
 
         # Step 3: Run the Claude review subprocess
         review_text = await run_review(prompt, claude_user=claude_user)

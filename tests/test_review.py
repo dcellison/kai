@@ -1,16 +1,19 @@
 """Tests for review.py PR review agent - metadata, prompts, subprocess, and output."""
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from kai.review import (
     _MAX_DIFF_CHARS,
+    _MAX_PRIOR_COMMENTS_CHARS,
     _REVIEW_HEADER,
     PRMetadata,
     build_review_prompt,
     extract_pr_metadata,
     fetch_pr_diff,
+    fetch_prior_comments,
     load_conventions,
     load_spec,
     post_review_comment,
@@ -72,6 +75,19 @@ def _mock_process(stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0)
     proc.kill = MagicMock()
     proc.wait = AsyncMock()
     return proc
+
+
+def _gh_comment(
+    body: str,
+    login: str = "someone",
+    created_at: str = "2026-03-12T14:00:00Z",
+) -> dict:
+    """Build a single GitHub issue comment API response object."""
+    return {
+        "body": body,
+        "user": {"login": login},
+        "created_at": created_at,
+    }
 
 
 # ── extract_pr_metadata ────────────────────────────────────────────
@@ -195,6 +211,202 @@ class TestBuildReviewPrompt:
         meta = _metadata()
         prompt = build_review_prompt(meta, "diff")
         assert "<conventions>" not in prompt
+
+    def test_no_prior_comments_tags_when_omitted(self):
+        """When prior_comments is None, no prior-review-thread tags appear."""
+        meta = _metadata()
+        prompt = build_review_prompt(meta, "diff")
+        assert "<prior-review-thread>" not in prompt
+
+    def test_with_prior_comments(self):
+        """Prior comments are wrapped in <prior-review-thread> tags with instructions."""
+        meta = _metadata()
+        prior = "[2026-03-12T14:00:00Z] kai-bot:\n## Review by Kai\n\nFound a bug."
+        prompt = build_review_prompt(meta, "diff", prior_comments=prior)
+        assert "<prior-review-thread>" in prompt
+        assert "Found a bug." in prompt
+        assert "</prior-review-thread>" in prompt
+        assert "Do not re-raise issues from prior reviews" in prompt
+
+    def test_prior_comments_between_conventions_and_diff(self):
+        """Prior comments block appears after conventions but before the diff."""
+        meta = _metadata()
+        prompt = build_review_prompt(
+            meta,
+            "diff content",
+            conventions="Use snake_case.",
+            prior_comments="prior review text",
+        )
+        conv_end = prompt.index("</conventions>")
+        prior_start = prompt.index("<prior-review-thread>")
+        diff_start = prompt.index("<diff>")
+        assert conv_end < prior_start < diff_start
+
+
+# ── fetch_prior_comments ──────────────────────────────────────────
+
+
+class TestFetchPriorComments:
+    @pytest.mark.asyncio
+    async def test_no_review_comments_returns_none(self):
+        """Returns None when no review comments exist on the PR."""
+        comments = [
+            _gh_comment("Just a regular comment.", login="alice"),
+            _gh_comment("Another comment.", login="bob"),
+        ]
+        mock_proc = _mock_process(stdout=json.dumps(comments).encode())
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await fetch_prior_comments("owner/repo", 42)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_single_review_comment(self):
+        """Single review comment is returned as a formatted thread."""
+        comments = [
+            _gh_comment(
+                f"{_REVIEW_HEADER}Found a bug in handler.py.",
+                login="kai-bot",
+                created_at="2026-03-12T14:00:00Z",
+            ),
+        ]
+        mock_proc = _mock_process(stdout=json.dumps(comments).encode())
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await fetch_prior_comments("owner/repo", 42)
+
+        assert result is not None
+        assert "kai-bot" in result
+        assert "Found a bug" in result
+        assert "2026-03-12T14:00:00Z" in result
+
+    @pytest.mark.asyncio
+    async def test_multiple_reviews_chronological(self):
+        """Multiple review comments are ordered chronologically with replies."""
+        comments = [
+            _gh_comment(
+                f"{_REVIEW_HEADER}First review.",
+                login="kai-bot",
+                created_at="2026-03-12T14:00:00Z",
+            ),
+            _gh_comment(
+                "I'll fix that.",
+                login="alice",
+                created_at="2026-03-12T14:30:00Z",
+            ),
+            _gh_comment(
+                f"{_REVIEW_HEADER}Second review.",
+                login="kai-bot",
+                created_at="2026-03-12T16:00:00Z",
+            ),
+        ]
+        mock_proc = _mock_process(stdout=json.dumps(comments).encode())
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await fetch_prior_comments("owner/repo", 42)
+
+        assert result is not None
+        # Both reviews should be present
+        assert "First review." in result
+        assert "Second review." in result
+        # The reply should be included between the reviews
+        assert "I'll fix that." in result
+        # First review should appear before second
+        assert result.index("First review.") < result.index("Second review.")
+
+    @pytest.mark.asyncio
+    async def test_comments_before_first_review_excluded(self):
+        """Comments before the first review comment are not included."""
+        comments = [
+            _gh_comment("Pre-review comment.", login="alice", created_at="2026-03-12T10:00:00Z"),
+            _gh_comment("Another early comment.", login="bob", created_at="2026-03-12T11:00:00Z"),
+            _gh_comment(
+                f"{_REVIEW_HEADER}First review.",
+                login="kai-bot",
+                created_at="2026-03-12T14:00:00Z",
+            ),
+        ]
+        mock_proc = _mock_process(stdout=json.dumps(comments).encode())
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await fetch_prior_comments("owner/repo", 42)
+
+        assert result is not None
+        assert "Pre-review comment." not in result
+        assert "Another early comment." not in result
+        assert "First review." in result
+
+    @pytest.mark.asyncio
+    async def test_truncates_oldest_reviews_first(self):
+        """When prior comments exceed the cap, oldest threads are dropped first."""
+        # Create a large first review that alone exceeds the cap
+        big_body = f"{_REVIEW_HEADER}{'x' * (_MAX_PRIOR_COMMENTS_CHARS + 1000)}"
+        small_body = f"{_REVIEW_HEADER}Recent review is small."
+        comments = [
+            _gh_comment(big_body, login="kai-bot", created_at="2026-03-12T14:00:00Z"),
+            _gh_comment(small_body, login="kai-bot", created_at="2026-03-12T16:00:00Z"),
+        ]
+        mock_proc = _mock_process(stdout=json.dumps(comments).encode())
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await fetch_prior_comments("owner/repo", 42)
+
+        assert result is not None
+        # The recent review should survive; the old one should be dropped
+        assert "Recent review is small." in result
+        assert len(result) <= _MAX_PRIOR_COMMENTS_CHARS
+
+    @pytest.mark.asyncio
+    async def test_api_failure_returns_none(self):
+        """API failure returns None for graceful degradation."""
+        mock_proc = _mock_process(stderr=b"API rate limit exceeded", returncode=1)
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await fetch_prior_comments("owner/repo", 42)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_exception_returns_none(self):
+        """Unexpected exceptions return None instead of propagating."""
+        with patch(
+            "kai.review.asyncio.create_subprocess_exec",
+            side_effect=OSError("subprocess failed"),
+        ):
+            result = await fetch_prior_comments("owner/repo", 42)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_empty_comments_returns_none(self):
+        """Empty comment list returns None."""
+        mock_proc = _mock_process(stdout=b"[]")
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await fetch_prior_comments("owner/repo", 42)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_review_header_without_trailing_newlines(self):
+        """Matches review comments even if the header has no trailing newlines."""
+        # _REVIEW_HEADER is "## Review by Kai\n\n" but some comments
+        # might have the header without trailing whitespace
+        comments = [
+            _gh_comment(
+                "## Review by Kai\nFound a bug.",
+                login="kai-bot",
+                created_at="2026-03-12T14:00:00Z",
+            ),
+        ]
+        mock_proc = _mock_process(stdout=json.dumps(comments).encode())
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await fetch_prior_comments("owner/repo", 42)
+
+        assert result is not None
+        assert "Found a bug." in result
 
 
 # ── fetch_pr_diff ───────────────────────────────────────────────────
@@ -423,6 +635,7 @@ class TestReviewPR:
 
         with (
             patch("kai.review.fetch_pr_diff", return_value="diff content") as mock_diff,
+            patch("kai.review.fetch_prior_comments", return_value=None),
             patch("kai.review.run_review", return_value="review output") as mock_run,
             patch("kai.review.post_review_comment", return_value=True) as mock_post,
             patch("kai.review.send_review_summary") as mock_summary,
@@ -483,6 +696,7 @@ class TestReviewPR:
 
         with (
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
+            patch("kai.review.fetch_prior_comments", return_value=None),
             patch("kai.review.run_review", side_effect=RuntimeError("Claude crashed")),
             patch("kai.review.send_review_summary") as mock_summary,
         ):
@@ -498,6 +712,7 @@ class TestReviewPR:
 
         with (
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
+            patch("kai.review.fetch_prior_comments", return_value=None),
             patch("kai.review.run_review", return_value="  "),
             patch("kai.review.post_review_comment") as mock_post,
             patch("kai.review.send_review_summary") as mock_summary,
@@ -518,6 +733,7 @@ class TestReviewPR:
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
             patch("kai.review.load_spec", return_value="Must implement feature Y.") as mock_load,
             patch("kai.review.load_conventions", return_value=None),
+            patch("kai.review.fetch_prior_comments", return_value=None),
             patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
             patch("kai.review.run_review", return_value="review output"),
             patch("kai.review.post_review_comment", return_value=True),
@@ -538,6 +754,7 @@ class TestReviewPR:
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
             patch("kai.review.load_spec", return_value=None),
             patch("kai.review.load_conventions", return_value="Use snake_case.") as mock_conv,
+            patch("kai.review.fetch_prior_comments", return_value=None),
             patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
             patch("kai.review.run_review", return_value="review output"),
             patch("kai.review.post_review_comment", return_value=True),
@@ -557,6 +774,7 @@ class TestReviewPR:
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
             patch("kai.review.load_spec", return_value=None),
             patch("kai.review.load_conventions", return_value=None) as mock_conv,
+            patch("kai.review.fetch_prior_comments", return_value=None),
             patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
             patch("kai.review.run_review", return_value="review output"),
             patch("kai.review.post_review_comment", return_value=True),
@@ -576,6 +794,7 @@ class TestReviewPR:
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
             patch("kai.review.load_spec", return_value=None) as mock_load,
             patch("kai.review.load_conventions", return_value=None),
+            patch("kai.review.fetch_prior_comments", return_value=None),
             patch("kai.review.build_review_prompt", return_value="prompt"),
             patch("kai.review.run_review", return_value="review output"),
             patch("kai.review.post_review_comment", return_value=True),
@@ -585,6 +804,47 @@ class TestReviewPR:
 
         # Verify spec_dir was passed through to load_spec
         assert mock_load.call_args[0][2] == "my/specs"
+
+    @pytest.mark.asyncio
+    async def test_prior_comments_injected_into_prompt(self):
+        """When fetch_prior_comments returns a thread, it is passed to build_review_prompt."""
+        payload = _webhook_payload()
+        prior_thread = "[2026-03-12T14:00:00Z] kai-bot:\n## Review by Kai\n\nFound a bug."
+
+        with (
+            patch("kai.review.fetch_pr_diff", return_value="diff content"),
+            patch("kai.review.load_spec", return_value=None),
+            patch("kai.review.load_conventions", return_value=None),
+            patch("kai.review.fetch_prior_comments", return_value=prior_thread) as mock_prior,
+            patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
+            patch("kai.review.run_review", return_value="review output"),
+            patch("kai.review.post_review_comment", return_value=True),
+            patch("kai.review.send_review_summary"),
+        ):
+            await review_pr(payload, 8080, "secret", local_repo_path="/repo")
+
+        mock_prior.assert_called_once_with("owner/repo", 42)
+        assert mock_build.call_args[1].get("prior_comments") == prior_thread
+
+    @pytest.mark.asyncio
+    async def test_prior_comments_failure_does_not_block(self):
+        """When fetch_prior_comments returns None, review proceeds without context."""
+        payload = _webhook_payload()
+
+        with (
+            patch("kai.review.fetch_pr_diff", return_value="diff content"),
+            patch("kai.review.load_spec", return_value=None),
+            patch("kai.review.load_conventions", return_value=None),
+            patch("kai.review.fetch_prior_comments", return_value=None),
+            patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
+            patch("kai.review.run_review", return_value="review output"),
+            patch("kai.review.post_review_comment", return_value=True),
+            patch("kai.review.send_review_summary"),
+        ):
+            await review_pr(payload, 8080, "secret", local_repo_path="/repo")
+
+        # prior_comments should be None, review should still proceed
+        assert mock_build.call_args[1].get("prior_comments") is None
 
 
 # ── resolve_spec_from_body ─────────────────────────────────────────
