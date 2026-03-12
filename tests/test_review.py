@@ -11,6 +11,7 @@ from kai.review import (
     build_review_prompt,
     extract_pr_metadata,
     fetch_pr_diff,
+    load_conventions,
     load_spec,
     post_review_comment,
     resolve_spec_from_body,
@@ -516,6 +517,7 @@ class TestReviewPR:
         with (
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
             patch("kai.review.load_spec", return_value="Must implement feature Y.") as mock_load,
+            patch("kai.review.load_conventions", return_value=None),
             patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
             patch("kai.review.run_review", return_value="review output"),
             patch("kai.review.post_review_comment", return_value=True),
@@ -526,6 +528,44 @@ class TestReviewPR:
         mock_load.assert_called_once()
         # Verify spec content was passed through to the prompt builder
         assert mock_build.call_args[1].get("spec") == "Must implement feature Y."
+
+    @pytest.mark.asyncio
+    async def test_conventions_injected_into_prompt(self):
+        """When load_conventions returns content, it is passed to build_review_prompt."""
+        payload = _webhook_payload()
+
+        with (
+            patch("kai.review.fetch_pr_diff", return_value="diff content"),
+            patch("kai.review.load_spec", return_value=None),
+            patch("kai.review.load_conventions", return_value="Use snake_case.") as mock_conv,
+            patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
+            patch("kai.review.run_review", return_value="review output"),
+            patch("kai.review.post_review_comment", return_value=True),
+            patch("kai.review.send_review_summary"),
+        ):
+            await review_pr(payload, 8080, "secret", local_repo_path="/repo")
+
+        mock_conv.assert_called_once()
+        assert mock_build.call_args[1].get("conventions") == "Use snake_case."
+
+    @pytest.mark.asyncio
+    async def test_no_conventions_passes_none(self):
+        """When load_conventions returns None, conventions=None is passed to the prompt."""
+        payload = _webhook_payload()
+
+        with (
+            patch("kai.review.fetch_pr_diff", return_value="diff content"),
+            patch("kai.review.load_spec", return_value=None),
+            patch("kai.review.load_conventions", return_value=None) as mock_conv,
+            patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
+            patch("kai.review.run_review", return_value="review output"),
+            patch("kai.review.post_review_comment", return_value=True),
+            patch("kai.review.send_review_summary"),
+        ):
+            await review_pr(payload, 8080, "secret", local_repo_path="/repo")
+
+        mock_conv.assert_called_once()
+        assert mock_build.call_args[1].get("conventions") is None
 
 
 # ── resolve_spec_from_body ─────────────────────────────────────────
@@ -690,3 +730,54 @@ class TestLoadSpec:
 
         result = await load_spec(meta, local_repo_path=str(tmp_path))
         assert result == "fallback content"
+
+
+# ── load_conventions ───────────────────────────────────────────────
+
+
+class TestLoadConventions:
+    @pytest.mark.asyncio
+    async def test_local_dot_claude(self, tmp_path):
+        """Loads CLAUDE.md from .claude/ subdirectory."""
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        (claude_dir / "CLAUDE.md").write_text("# Project conventions\nUse snake_case.")
+
+        meta = _metadata()
+        result = await load_conventions(meta, local_repo_path=str(tmp_path))
+        assert result == "# Project conventions\nUse snake_case."
+
+    @pytest.mark.asyncio
+    async def test_local_root(self, tmp_path):
+        """Loads CLAUDE.md from repo root when .claude/ does not exist."""
+        (tmp_path / "CLAUDE.md").write_text("Root conventions.")
+
+        meta = _metadata()
+        result = await load_conventions(meta, local_repo_path=str(tmp_path))
+        assert result == "Root conventions."
+
+    @pytest.mark.asyncio
+    async def test_local_prefers_dot_claude(self, tmp_path):
+        """When both locations exist, .claude/CLAUDE.md takes priority."""
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        (claude_dir / "CLAUDE.md").write_text("dot-claude version")
+        (tmp_path / "CLAUDE.md").write_text("root version")
+
+        meta = _metadata()
+        result = await load_conventions(meta, local_repo_path=str(tmp_path))
+        assert result == "dot-claude version"
+
+    @pytest.mark.asyncio
+    async def test_no_local_repo_path(self):
+        """Returns None immediately when no local repo path is provided."""
+        meta = _metadata()
+        result = await load_conventions(meta, local_repo_path=None)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_no_claude_md(self, tmp_path):
+        """Returns None when no CLAUDE.md exists at either candidate location."""
+        meta = _metadata()
+        result = await load_conventions(meta, local_repo_path=str(tmp_path))
+        assert result is None

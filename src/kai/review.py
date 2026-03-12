@@ -208,6 +208,44 @@ async def load_spec(
     return None
 
 
+async def load_conventions(
+    metadata: PRMetadata,
+    local_repo_path: str | None = None,
+) -> str | None:
+    """
+    Load the target repo's CLAUDE.md for convention enforcement.
+
+    Reads from the local filesystem only. Checks .claude/CLAUDE.md first,
+    then CLAUDE.md at the repo root. Returns None if no CLAUDE.md exists
+    or if no local repo path is provided.
+
+    Args:
+        metadata: PR metadata (unused, kept for interface consistency with load_spec).
+        local_repo_path: Optional absolute path to a local repo checkout.
+
+    Returns:
+        The CLAUDE.md content as a string, or None if not found.
+    """
+    if not local_repo_path:
+        return None
+
+    # Check .claude/CLAUDE.md first (standard location), then repo root.
+    # First hit wins; most projects use .claude/ so it's checked first.
+    for candidate in [
+        Path(local_repo_path) / ".claude" / "CLAUDE.md",
+        Path(local_repo_path) / "CLAUDE.md",
+    ]:
+        if candidate.is_file():
+            try:
+                content = candidate.read_text()
+                log.info("Loaded conventions from local: %s", candidate)
+                return content
+            except OSError:
+                log.warning("Failed to read local CLAUDE.md: %s", candidate)
+
+    return None
+
+
 def build_review_prompt(
     metadata: PRMetadata,
     diff: str,
@@ -546,8 +584,11 @@ async def review_pr(
         # Step 1.5: Load spec if referenced (agentic engineering layer)
         spec = await load_spec(metadata, local_repo_path)
 
-        # Step 2: Build the review prompt (with optional spec)
-        prompt = build_review_prompt(metadata, diff, spec=spec)
+        # Step 1.6: Load project conventions from CLAUDE.md (issue #58)
+        conventions = await load_conventions(metadata, local_repo_path)
+
+        # Step 2: Build the review prompt (with optional spec and conventions)
+        prompt = build_review_prompt(metadata, diff, spec=spec, conventions=conventions)
 
         # Step 3: Run the Claude review subprocess
         review_text = await run_review(prompt, claude_user=claude_user)
