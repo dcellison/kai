@@ -3,7 +3,7 @@
 import hashlib
 import hmac
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from aiohttp import web
@@ -320,6 +320,9 @@ def _build_test_app(pr_review_enabled: bool = True, cooldown: int = 300) -> web.
     app["webhook_secret"] = _TEST_SECRET
     app["pr_review_enabled"] = pr_review_enabled
     app["pr_review_cooldown"] = cooldown
+    # Config needed by review background tasks
+    app["webhook_port"] = 8080
+    app["claude_user"] = None
     # Mock bot that records sent messages
     mock_bot = AsyncMock()
     app["telegram_bot"] = mock_bot
@@ -497,3 +500,35 @@ class TestPRReviewRouting:
             )
             data = await resp.json()
             assert data["status"] == "review_triggered"
+
+    @pytest.mark.asyncio
+    async def test_launches_background_task(self, _clear_cooldowns):
+        """Reviewable PR events launch review.review_pr as a background task."""
+        app = _build_test_app(pr_review_enabled=True)
+        payload = _make_pr_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with patch("kai.webhook.review.review_pr", new_callable=AsyncMock) as mock_review:
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert (await resp.json())["status"] == "review_triggered"
+
+            # Allow the background task to complete
+            import asyncio
+
+            await asyncio.sleep(0.01)
+
+            mock_review.assert_called_once()
+            call_kwargs = mock_review.call_args
+            # Verify the payload and config were passed correctly
+            assert call_kwargs[0][0] == payload
+            assert call_kwargs[1]["webhook_port"] == 8080
+            assert call_kwargs[1]["webhook_secret"] == _TEST_SECRET

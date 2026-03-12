@@ -5,7 +5,9 @@ Provides functionality to:
 1. Fetch PR diffs and metadata via the GitHub CLI
 2. Construct XML-delimited review prompts (prompt injection prevention)
 3. Spawn a one-shot Claude subprocess in --print mode for review
-4. Return structured review output for posting
+4. Post review output as a GitHub PR comment via gh CLI
+5. Send review summaries to Telegram via the send-message API
+6. Orchestrate the full pipeline from webhook event to posted review
 
 The review agent is deliberately stateless: each review is a fresh Claude
 invocation with the full diff in context. No persistent sessions, no
@@ -20,6 +22,8 @@ hitting shell argument length limits. Output is captured as plain text.
 import asyncio
 import logging
 from dataclasses import dataclass
+
+import aiohttp
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +45,10 @@ _REVIEW_BUDGET_USD = 1.0
 # Timeout for the Claude subprocess in seconds. Large diffs may take a
 # while to analyze, but anything beyond 5 minutes is likely stuck.
 _REVIEW_TIMEOUT = 300
+
+# Header prepended to every review comment on GitHub. Distinguishes
+# automated reviews from human comments. Per design decision #11.
+_REVIEW_HEADER = "## Review by Kai\n\n"
 
 
 @dataclass(frozen=True)
@@ -299,3 +307,150 @@ async def run_review(
         raise RuntimeError(f"Review subprocess failed (exit {proc.returncode}): {error}")
 
     return stdout.decode().strip()
+
+
+async def post_review_comment(repo: str, pr_number: int, review: str) -> bool:
+    """
+    Post the review as a single GitHub PR comment via the gh CLI.
+
+    Prepends the "Review by Kai" header to distinguish automated reviews
+    from human comments. Uses `gh pr comment` which handles auth via the
+    existing gh CLI configuration.
+
+    Args:
+        repo: Full repository name (e.g., "dcellison/kai").
+        pr_number: The PR number.
+        review: The review text from Claude.
+
+    Returns:
+        True if the comment was posted successfully, False otherwise.
+    """
+    comment_body = _REVIEW_HEADER + review
+
+    proc = await asyncio.create_subprocess_exec(
+        "gh",
+        "pr",
+        "comment",
+        str(pr_number),
+        "--repo",
+        repo,
+        "--body",
+        comment_body,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        error = stderr.decode().strip()
+        log.error("Failed to post review comment on %s#%d: %s", repo, pr_number, error)
+        return False
+
+    log.info("Posted review comment on %s#%d", repo, pr_number)
+    return True
+
+
+async def send_review_summary(
+    metadata: PRMetadata,
+    success: bool,
+    webhook_port: int,
+    webhook_secret: str,
+) -> None:
+    """
+    Send a brief review summary to Telegram via the send-message API.
+
+    On success, includes the PR link so the user can read the full review
+    on GitHub. On failure, includes the error so the user knows something
+    went wrong.
+
+    Args:
+        metadata: PR metadata for the reviewed PR.
+        success: Whether the review was posted successfully.
+        webhook_port: Local webhook server port (for the send-message API).
+        webhook_secret: Secret for authenticating with the send-message API.
+    """
+    pr_url = f"https://github.com/{metadata.repo}/pull/{metadata.number}"
+
+    if success:
+        text = f"Reviewed PR #{metadata.number} in {metadata.repo}\n{metadata.title}\n{pr_url}"
+    else:
+        text = f"Failed to review PR #{metadata.number} in {metadata.repo}\n{metadata.title}\n{pr_url}"
+
+    url = f"http://localhost:{webhook_port}/api/send-message"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Webhook-Secret": webhook_secret,
+    }
+
+    try:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.post(url, json={"text": text}, headers=headers) as resp,
+        ):
+            if resp.status != 200:
+                log.warning("send-message API returned %d for review summary", resp.status)
+    except Exception:
+        log.exception("Failed to send review summary to Telegram")
+
+
+async def review_pr(
+    payload: dict,
+    webhook_port: int,
+    webhook_secret: str,
+    claude_user: str | None = None,
+) -> None:
+    """
+    Full review pipeline: fetch diff, build prompt, run review, post results.
+
+    This is the top-level function called from webhook.py as a background
+    task. It orchestrates all steps and handles errors at each stage so
+    a failure in one step does not crash the webhook server.
+
+    The review replaces the standard PR notification for reviewable actions.
+    If the review fails, a failure notification is sent to Telegram so the
+    user knows something went wrong (rather than silent failure).
+
+    Args:
+        payload: The full GitHub webhook payload dict.
+        webhook_port: Local webhook server port.
+        webhook_secret: Webhook secret for API auth.
+        claude_user: Optional OS user for the Claude subprocess.
+    """
+    metadata = extract_pr_metadata(payload)
+
+    try:
+        # Step 1: Fetch the diff
+        diff = await fetch_pr_diff(metadata.repo, metadata.number)
+
+        if not diff.strip():
+            log.info("Empty diff for %s#%d, skipping review", metadata.repo, metadata.number)
+            return
+
+        # Step 2: Build the review prompt
+        prompt = build_review_prompt(metadata, diff)
+
+        # Step 3: Run the Claude review subprocess
+        review_text = await run_review(prompt, claude_user=claude_user)
+
+        if not review_text.strip():
+            log.warning("Empty review output for %s#%d", metadata.repo, metadata.number)
+            await send_review_summary(metadata, False, webhook_port, webhook_secret)
+            return
+
+        # Step 4: Post the review as a GitHub PR comment
+        posted = await post_review_comment(metadata.repo, metadata.number, review_text)
+
+        # Step 5: Send Telegram summary
+        await send_review_summary(metadata, posted, webhook_port, webhook_secret)
+
+    except Exception:
+        log.exception("Review failed for %s#%d", metadata.repo, metadata.number)
+        # Best-effort failure notification so the user knows something broke
+        try:
+            await send_review_summary(metadata, False, webhook_port, webhook_secret)
+        except Exception:
+            log.exception(
+                "Failed to send failure notification for %s#%d",
+                metadata.repo,
+                metadata.number,
+            )

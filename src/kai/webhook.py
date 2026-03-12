@@ -50,7 +50,7 @@ from pathlib import Path
 from aiohttp import web
 from telegram import Update
 
-from kai import cron, services, sessions
+from kai import cron, review, services, sessions
 from kai.config import IMAGE_EXTENSIONS
 
 log = logging.getLogger(__name__)
@@ -398,11 +398,21 @@ async def _handle_github(request: web.Request) -> web.Response:
 
             _record_review(repo, pr_number)
 
-            # Launch the review as a background task. The actual review
-            # logic is in review.py (issue #55/#56). For now, just log.
-            # This will be wired up in issue #56.
+            # Launch the review as a fire-and-forget background task.
+            # Same pattern as Telegram update processing: create_task +
+            # _background_tasks set to prevent GC during execution.
+            task = asyncio.create_task(
+                review.review_pr(
+                    payload,
+                    webhook_port=request.app["webhook_port"],
+                    webhook_secret=request.app["webhook_secret"],
+                    claude_user=request.app.get("claude_user"),
+                )
+            )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+
             log.info("PR review triggered for %s PR #%d (%s)", repo, pr_number, action)
-            # TODO(#56): launch review background task here
             return web.json_response({"status": "review_triggered"})
 
     # ── Standard notification path ───────────────────────────────
@@ -993,6 +1003,10 @@ async def start(telegram_app, config) -> None:
     # PR review agent config - stored in app for access by _handle_github()
     _app["pr_review_enabled"] = config.pr_review_enabled
     _app["pr_review_cooldown"] = config.pr_review_cooldown
+
+    # Additional config needed by review background tasks
+    _app["webhook_port"] = config.webhook_port
+    _app["claude_user"] = config.claude_user
 
     _app.router.add_get("/health", _handle_health)
 

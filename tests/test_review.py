@@ -1,4 +1,4 @@
-"""Tests for review.py PR review agent - metadata, prompts, and subprocess mocking."""
+"""Tests for review.py PR review agent - metadata, prompts, subprocess, and output."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -6,11 +6,15 @@ import pytest
 
 from kai.review import (
     _MAX_DIFF_CHARS,
+    _REVIEW_HEADER,
     PRMetadata,
     build_review_prompt,
     extract_pr_metadata,
     fetch_pr_diff,
+    post_review_comment,
+    review_pr,
     run_review,
+    send_review_summary,
 )
 
 # ── Fixtures ────────────────────────────────────────────────────────
@@ -307,3 +311,183 @@ class TestRunReview:
         call_kwargs = mock_proc.communicate.call_args
         # The input kwarg contains the encoded prompt
         assert call_kwargs[1]["input"] == b"the review prompt"
+
+
+# ── post_review_comment ─────────────────────────────────────────────
+
+
+class TestPostReviewComment:
+    @pytest.mark.asyncio
+    async def test_success(self):
+        """Successful gh pr comment returns True and includes the review header."""
+        mock_proc = _mock_process(returncode=0)
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            result = await post_review_comment("owner/repo", 42, "Looks good.")
+
+        assert result is True
+        # Verify the comment body includes the header
+        cmd = mock_exec.call_args[0]
+        assert "gh" in cmd
+        assert "--body" in cmd
+        body_idx = list(cmd).index("--body") + 1
+        assert cmd[body_idx].startswith(_REVIEW_HEADER)
+        assert "Looks good." in cmd[body_idx]
+
+    @pytest.mark.asyncio
+    async def test_failure_returns_false(self):
+        """Failed gh pr comment returns False."""
+        mock_proc = _mock_process(stderr=b"not found", returncode=1)
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await post_review_comment("owner/repo", 99, "review text")
+
+        assert result is False
+
+
+# ── send_review_summary ─────────────────────────────────────────────
+
+
+class TestSendReviewSummary:
+    @pytest.mark.asyncio
+    async def test_success_message(self):
+        """Success summary includes PR link and title."""
+        meta = _metadata(repo="owner/repo", number=42, title="Add feature X")
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_session = AsyncMock()
+        mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kai.review.aiohttp.ClientSession") as mock_cs:
+            mock_cs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_cs.return_value.__aexit__ = AsyncMock(return_value=False)
+            await send_review_summary(meta, True, 8080, "secret")
+
+        # Verify the POST was made with correct URL and content
+        call_args = mock_session.post.call_args
+        assert "localhost:8080/api/send-message" in call_args[0][0]
+        body = call_args[1]["json"]
+        assert "Reviewed PR #42" in body["text"]
+        assert "owner/repo" in body["text"]
+        assert "https://github.com/owner/repo/pull/42" in body["text"]
+
+    @pytest.mark.asyncio
+    async def test_failure_message(self):
+        """Failure summary says 'Failed to review'."""
+        meta = _metadata()
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_session = AsyncMock()
+        mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kai.review.aiohttp.ClientSession") as mock_cs:
+            mock_cs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_cs.return_value.__aexit__ = AsyncMock(return_value=False)
+            await send_review_summary(meta, False, 8080, "secret")
+
+        body = mock_session.post.call_args[1]["json"]
+        assert "Failed to review" in body["text"]
+
+    @pytest.mark.asyncio
+    async def test_network_error_does_not_propagate(self):
+        """Network errors during summary send are caught, not raised."""
+        meta = _metadata()
+
+        with patch("kai.review.aiohttp.ClientSession", side_effect=Exception("network error")):
+            # Should not raise
+            await send_review_summary(meta, True, 8080, "secret")
+
+
+# ── review_pr (orchestrator) ────────────────────────────────────────
+
+
+class TestReviewPR:
+    @pytest.mark.asyncio
+    async def test_full_pipeline(self):
+        """All steps are called in order with correct arguments."""
+        payload = _webhook_payload()
+
+        with (
+            patch("kai.review.fetch_pr_diff", return_value="diff content") as mock_diff,
+            patch("kai.review.run_review", return_value="review output") as mock_run,
+            patch("kai.review.post_review_comment", return_value=True) as mock_post,
+            patch("kai.review.send_review_summary") as mock_summary,
+        ):
+            await review_pr(payload, 8080, "secret", claude_user="kai")
+
+        mock_diff.assert_called_once_with("owner/repo", 42)
+        mock_run.assert_called_once()
+        mock_post.assert_called_once_with("owner/repo", 42, "review output")
+        mock_summary.assert_called_once_with(
+            mock_summary.call_args[0][0],  # metadata (any PRMetadata)
+            True,
+            8080,
+            "secret",
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_diff_skips_review(self):
+        """Empty diffs skip the review entirely without sending notifications."""
+        payload = _webhook_payload()
+
+        with (
+            patch("kai.review.fetch_pr_diff", return_value="  \n"),
+            patch("kai.review.run_review") as mock_run,
+            patch("kai.review.send_review_summary") as mock_summary,
+        ):
+            await review_pr(payload, 8080, "secret")
+
+        mock_run.assert_not_called()
+        mock_summary.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_diff_failure_sends_notification(self):
+        """When diff fetching fails, a failure notification is sent."""
+        payload = _webhook_payload()
+
+        with (
+            patch("kai.review.fetch_pr_diff", side_effect=RuntimeError("gh failed")),
+            patch("kai.review.send_review_summary") as mock_summary,
+        ):
+            await review_pr(payload, 8080, "secret")
+
+        # Failure notification should have been sent
+        mock_summary.assert_called_once()
+        assert mock_summary.call_args[0][1] is False  # success=False
+
+    @pytest.mark.asyncio
+    async def test_claude_failure_sends_notification(self):
+        """When Claude subprocess fails, a failure notification is sent."""
+        payload = _webhook_payload()
+
+        with (
+            patch("kai.review.fetch_pr_diff", return_value="diff content"),
+            patch("kai.review.run_review", side_effect=RuntimeError("Claude crashed")),
+            patch("kai.review.send_review_summary") as mock_summary,
+        ):
+            await review_pr(payload, 8080, "secret")
+
+        mock_summary.assert_called_once()
+        assert mock_summary.call_args[0][1] is False
+
+    @pytest.mark.asyncio
+    async def test_empty_review_sends_failure(self):
+        """Empty Claude output sends a failure notification."""
+        payload = _webhook_payload()
+
+        with (
+            patch("kai.review.fetch_pr_diff", return_value="diff content"),
+            patch("kai.review.run_review", return_value="  "),
+            patch("kai.review.post_review_comment") as mock_post,
+            patch("kai.review.send_review_summary") as mock_summary,
+        ):
+            await review_pr(payload, 8080, "secret")
+
+        # Should not attempt to post an empty review
+        mock_post.assert_not_called()
+        mock_summary.assert_called_once()
+        assert mock_summary.call_args[0][1] is False
