@@ -253,8 +253,8 @@ class TestRunReview:
     async def test_timeout_raises(self):
         """Hanging subprocess is killed and raises RuntimeError."""
         mock_proc = AsyncMock()
-        # Simulate a subprocess that never completes
-        mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
+        # communicate's return value doesn't matter here - wait_for is
+        # patched to raise TimeoutError before communicate is ever called.
         mock_proc.kill = MagicMock()
         mock_proc.wait = AsyncMock()
 
