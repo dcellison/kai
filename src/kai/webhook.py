@@ -44,6 +44,7 @@ import hmac
 import json
 import logging
 import re
+import time
 from pathlib import Path
 
 from aiohttp import web
@@ -80,6 +81,47 @@ _HEALTH_CHECK_INTERVAL = 300  # 5 minutes
 # Slightly longer than the check interval so a single transient error
 # in the previous cycle triggers a re-registration on the next check.
 _ERROR_RECENCY_THRESHOLD = 600  # 10 minutes
+
+
+# ── PR review rate limiting ─────────────────────────────────────────
+# In-memory cooldown dict: (repo_full_name, pr_number) -> last_review_timestamp.
+# Resets on restart, which is acceptable - worst case is one extra review
+# after a restart. No database table needed for stateless reviews.
+_review_cooldowns: dict[tuple[str, int], float] = {}
+
+
+def _should_skip_review(repo: str, pr_number: int, cooldown: int) -> bool:
+    """
+    Check if a PR was reviewed recently enough to skip this event.
+
+    Uses the in-memory cooldown dict to absorb force-push bursts.
+    Returns True if the PR should NOT be reviewed (still in cooldown).
+
+    Args:
+        repo: GitHub repo full name (e.g., "dcellison/kai").
+        pr_number: The PR number.
+        cooldown: Minimum seconds between reviews of the same PR.
+    """
+    key = (repo, pr_number)
+    last_review = _review_cooldowns.get(key)
+    if last_review is None:
+        return False
+    return (time.time() - last_review) < cooldown
+
+
+def _record_review(repo: str, pr_number: int) -> None:
+    """
+    Record that a PR review was just initiated, updating the cooldown timestamp.
+
+    Called after a review is successfully launched (not after it completes,
+    since the review runs as a background task and we want to prevent
+    duplicate launches, not duplicate completions).
+
+    Args:
+        repo: GitHub repo full name (e.g., "dcellison/kai").
+        pr_number: The PR number.
+    """
+    _review_cooldowns[(repo, pr_number)] = time.time()
 
 
 def _strip_markdown(text: str) -> str:
@@ -336,6 +378,34 @@ async def _handle_github(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         return web.Response(status=400, text="Invalid JSON")
 
+    # ── PR review routing ────────────────────────────────────────
+    # When PR review is enabled, reviewable PR events (opened, reopened,
+    # synchronize) are routed to the review pipeline instead of the
+    # notification formatter. Non-reviewable actions (closed, merged)
+    # still get the standard Telegram notification.
+    pr_review_enabled = request.app.get("pr_review_enabled", False)
+    if pr_review_enabled and event_type == "pull_request":
+        action = payload.get("action", "")
+        if action in ("opened", "reopened", "synchronize"):
+            pr = payload.get("pull_request", {})
+            pr_number = pr.get("number", 0)
+            repo = payload.get("repository", {}).get("full_name", "")
+            cooldown = request.app.get("pr_review_cooldown", 300)
+
+            if _should_skip_review(repo, pr_number, cooldown):
+                log.info("Skipping review of %s PR #%d (cooldown)", repo, pr_number)
+                return web.json_response({"msg": "review_cooldown"})
+
+            _record_review(repo, pr_number)
+
+            # Launch the review as a background task. The actual review
+            # logic is in review.py (issue #55/#56). For now, just log.
+            # This will be wired up in issue #56.
+            log.info("PR review triggered for %s PR #%d (%s)", repo, pr_number, action)
+            # TODO(#56): launch review background task here
+            return web.json_response({"status": "review_triggered"})
+
+    # ── Standard notification path ───────────────────────────────
     # Look up the formatter for this event type
     formatter = _GITHUB_FORMATTERS.get(event_type)
     if not formatter:
@@ -827,8 +897,6 @@ async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str) -> No
     Condition 3 requires two consecutive checks to avoid false positives
     from normal message bursts (a single check catching in-flight updates).
     """
-    import time
-
     await asyncio.sleep(_HEALTH_CHECK_INTERVAL)  # skip the first check (just registered)
 
     # Track pending updates across consecutive checks. A single non-zero
@@ -921,6 +989,10 @@ async def start(telegram_app, config) -> None:
 
     # Store workspace path for send-file path confinement
     _app["workspace"] = str(config.claude_workspace)
+
+    # PR review agent config - stored in app for access by _handle_github()
+    _app["pr_review_enabled"] = config.pr_review_enabled
+    _app["pr_review_cooldown"] = config.pr_review_cooldown
 
     _app.router.add_get("/health", _handle_health)
 

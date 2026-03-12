@@ -26,6 +26,8 @@ _CONFIG_ENV_VARS = [
     "WORKSPACE_BASE",
     "ALLOWED_WORKSPACES",
     "CLAUDE_USER",
+    "PR_REVIEW_ENABLED",
+    "PR_REVIEW_COOLDOWN",
     "KAI_DATA_DIR",
     "KAI_INSTALL_DIR",
 ]
@@ -444,3 +446,31 @@ class TestDualModeLoading:
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "from-env")
         config = load_config()
         assert config.telegram_bot_token == "from-env"
+
+
+# ── PR review config ─────────────────────────────────────────────
+
+
+class TestPRReviewConfig:
+    def test_defaults(self, monkeypatch):
+        """PR review is disabled by default with a 5-minute cooldown."""
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.pr_review_enabled is False
+        assert config.pr_review_cooldown == 300
+
+    def test_enabled_with_custom_cooldown(self, monkeypatch):
+        """PR_REVIEW_ENABLED and PR_REVIEW_COOLDOWN are picked up from env."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("PR_REVIEW_ENABLED", "true")
+        monkeypatch.setenv("PR_REVIEW_COOLDOWN", "60")
+        config = load_config()
+        assert config.pr_review_enabled is True
+        assert config.pr_review_cooldown == 60
+
+    def test_cooldown_invalid_raises(self, monkeypatch):
+        """Non-numeric PR_REVIEW_COOLDOWN raises SystemExit."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("PR_REVIEW_COOLDOWN", "not_a_number")
+        with pytest.raises(SystemExit, match="PR_REVIEW_COOLDOWN"):
+            load_config()

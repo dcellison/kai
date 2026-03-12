@@ -131,6 +131,13 @@ class Config:
     # When unset, Claude runs as the same user as the bot (development default).
     claude_user: str | None = None
 
+    # PR review agent: automatically review PRs when GitHub webhooks fire.
+    # Disabled by default so existing users are not surprised by automatic reviews.
+    pr_review_enabled: bool = False
+    # Minimum seconds between reviews of the same PR. Absorbs force-push bursts
+    # so rapid pushes to an open PR don't trigger a review for each one.
+    pr_review_cooldown: int = 300
+
     # TOTP two-factor authentication timing (only relevant when TOTP is enabled)
     totp_session_minutes: int = 30
     totp_challenge_seconds: int = 120
@@ -284,6 +291,14 @@ def load_config() -> Config:
         webhook_port = int(os.environ.get("WEBHOOK_PORT", "8080"))
     except ValueError:
         raise SystemExit("WEBHOOK_PORT must be an integer") from None
+
+    # PR review agent config
+    pr_review_enabled = os.environ.get("PR_REVIEW_ENABLED", "").lower() in ("1", "true", "yes")
+    try:
+        pr_review_cooldown = int(os.environ.get("PR_REVIEW_COOLDOWN", "300"))
+    except ValueError:
+        raise SystemExit("PR_REVIEW_COOLDOWN must be an integer") from None
+
     try:
         totp_session_minutes = int(os.environ.get("TOTP_SESSION_MINUTES", "30"))
     except ValueError:
@@ -317,6 +332,8 @@ def load_config() -> Config:
         workspace_base=workspace_base,
         allowed_workspaces=allowed_workspaces,
         claude_user=os.environ.get("CLAUDE_USER") or None,
+        pr_review_enabled=pr_review_enabled,
+        pr_review_cooldown=pr_review_cooldown,
         totp_session_minutes=totp_session_minutes,
         totp_challenge_seconds=totp_challenge_seconds,
         totp_lockout_attempts=totp_lockout_attempts,
