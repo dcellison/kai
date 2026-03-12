@@ -348,10 +348,14 @@ def _cmd_config() -> None:
             "Spec directory relative to repo root",
             existing_env.get("SPEC_DIR", "specs"),
         )
-        pr_review_cooldown = _prompt(
-            "Review cooldown in seconds (prevents spam from rapid pushes)",
-            existing_env.get("PR_REVIEW_COOLDOWN", "300"),
-        )
+        while True:
+            pr_review_cooldown = _prompt(
+                "Review cooldown in seconds (prevents spam from rapid pushes)",
+                existing_env.get("PR_REVIEW_COOLDOWN", "300"),
+            )
+            if _validate_positive_int(pr_review_cooldown):
+                break
+            print("  Must be a positive integer.")
     print()
 
     # -- Optional features --
