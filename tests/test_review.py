@@ -319,20 +319,26 @@ class TestRunReview:
 class TestPostReviewComment:
     @pytest.mark.asyncio
     async def test_success(self):
-        """Successful gh pr comment returns True and includes the review header."""
+        """Successful gh pr comment returns True and sends body via stdin."""
         mock_proc = _mock_process(returncode=0)
 
         with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
             result = await post_review_comment("owner/repo", 42, "Looks good.")
 
         assert result is True
-        # Verify the comment body includes the header
+
+        # Verify gh is called with --body-file - (stdin) instead of --body
         cmd = mock_exec.call_args[0]
         assert "gh" in cmd
-        assert "--body" in cmd
-        body_idx = list(cmd).index("--body") + 1
-        assert cmd[body_idx].startswith(_REVIEW_HEADER)
-        assert "Looks good." in cmd[body_idx]
+        assert "--body-file" in cmd
+        assert "-" in cmd
+        assert "--body" not in cmd
+
+        # Verify the comment body (header + review) was sent via stdin
+        stdin_bytes = mock_proc.communicate.call_args[1]["input"]
+        stdin_text = stdin_bytes.decode()
+        assert stdin_text.startswith(_REVIEW_HEADER)
+        assert "Looks good." in stdin_text
 
     @pytest.mark.asyncio
     async def test_failure_returns_false(self):
@@ -422,12 +428,19 @@ class TestReviewPR:
         mock_diff.assert_called_once_with("owner/repo", 42)
         mock_run.assert_called_once()
         mock_post.assert_called_once_with("owner/repo", 42, "review output")
-        mock_summary.assert_called_once_with(
-            mock_summary.call_args[0][0],  # metadata (any PRMetadata)
-            True,
-            8080,
-            "secret",
+
+        # Construct the expected metadata independently to verify
+        # extract_pr_metadata produced the right values - not just
+        # asserting the mock's captured args against themselves.
+        expected_meta = PRMetadata(
+            repo="owner/repo",
+            number=42,
+            title="Add feature X",
+            description="This PR adds feature X.",
+            author="alice",
+            branch="feature/x",
         )
+        mock_summary.assert_called_once_with(expected_meta, True, 8080, "secret")
 
     @pytest.mark.asyncio
     async def test_empty_diff_skips_review(self):

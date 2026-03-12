@@ -327,6 +327,9 @@ async def post_review_comment(repo: str, pr_number: int, review: str) -> bool:
     """
     comment_body = _REVIEW_HEADER + review
 
+    # Pipe the comment body via stdin instead of --body to avoid hitting
+    # execve(2) argument length limits on large reviews. Same pattern as
+    # run_review() uses for large diffs.
     proc = await asyncio.create_subprocess_exec(
         "gh",
         "pr",
@@ -334,12 +337,13 @@ async def post_review_comment(repo: str, pr_number: int, review: str) -> bool:
         str(pr_number),
         "--repo",
         repo,
-        "--body",
-        comment_body,
+        "--body-file",
+        "-",
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, stderr = await proc.communicate()
+    _, stderr = await proc.communicate(input=comment_body.encode())
 
     if proc.returncode != 0:
         error = stderr.decode().strip()
