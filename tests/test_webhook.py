@@ -536,3 +536,7 @@ class TestPRReviewRouting:
             assert call_kwargs[0][0] == payload
             assert call_kwargs[1]["webhook_port"] == 8080
             assert call_kwargs[1]["webhook_secret"] == _TEST_SECRET
+            # local_repo_path should be the parent of workspace (repo root,
+            # not the workspace subdirectory) since the payload repo matches
+            # home_repo_name.
+            assert call_kwargs[1]["local_repo_path"] == "/home/user"

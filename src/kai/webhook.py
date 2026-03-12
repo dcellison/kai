@@ -399,13 +399,15 @@ async def _handle_github(request: web.Request) -> web.Response:
             _record_review(repo, pr_number)
 
             # Resolve a local repo path for spec/convention loading.
-            # If the webhook event is for the home repo, use the workspace
-            # directory. Otherwise no local path is available.
+            # If the webhook event is for the home repo, derive the repo
+            # root from the workspace path. app["workspace"] stores the
+            # workspace subdirectory (e.g., /opt/kai/workspace), but spec
+            # paths are relative to the repo root, so we need the parent.
             local_repo_path = None
             workspace = request.app.get("workspace")
             home_repo = request.app.get("home_repo_name")
-            if home_repo and repo.endswith(f"/{home_repo}"):
-                local_repo_path = workspace
+            if home_repo and workspace and repo.endswith(f"/{home_repo}"):
+                local_repo_path = str(Path(workspace).parent)
 
             # Launch the review as a fire-and-forget background task.
             # Same pattern as Telegram update processing: create_task +
