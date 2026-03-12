@@ -524,7 +524,11 @@ async def apply_triage(
     if not isinstance(project, str) or not project.strip():
         project = None
     summary = triage_result.get("summary", "No summary provided.")
+    if not isinstance(summary, str) or not summary.strip():
+        summary = "No summary provided."
     priority = triage_result.get("priority", "medium")
+    if priority not in ("low", "medium", "high", "critical"):
+        priority = "medium"
 
     # Step 1: Apply labels (skip any already on the issue)
     existing_labels = {lbl.lower() for lbl in metadata.labels}
