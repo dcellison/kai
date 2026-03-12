@@ -5,13 +5,15 @@
 [![License](https://img.shields.io/github/license/dcellison/kai)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dcellison/kai?label=version)](https://github.com/dcellison/kai/releases)
 
-A personal AI assistant that lives in Telegram and runs entirely on your machine. Powered by [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with full tool access - shell, filesystem, web search - and a security model designed around the fact that it has all of that.
+An AI agent, not a chatbot. Kai wraps a persistent [Claude Code](https://docs.anthropic.com/en/docs/claude-code) process running on your hardware and connects it to Telegram as a control surface. Shell, filesystem, git, web search, scheduling - the agent has real access to your system and can take real action on it. It reviews PRs when code is pushed, monitors conditions on a schedule, and operates across any project on your machine.
 
 For detailed guides on setup, architecture, and optional features, see the **[Wiki](https://github.com/dcellison/kai/wiki)**.
 
-## Why local?
+## Architecture
 
-Kai bridges Telegram and a persistent Claude Code process running on your hardware. Messages go in, streaming responses come back, and Claude has real access to your system. That power is the point - and it's why the security model is non-negotiable.
+Kai is two processes: an outer Python application that handles Telegram, HTTP, and scheduling, and an inner Claude Code subprocess that does the thinking and acting. The outer process manages lifecycle, authentication, and transport. The inner process has persistent state, tool access, and a working directory on your filesystem.
+
+This is what separates Kai from API-wrapper bots that send text to a model endpoint and relay the response. Claude Code is a full agentic runtime - it reads files, runs shell commands, searches the web, writes and commits code, and maintains context across a session. Kai gives that runtime a durable home, a scheduling system, event-driven inputs, persistent memory, and a security model designed around the fact that it has all of this power.
 
 Everything runs locally. Conversations never transit a relay server. Voice transcription and synthesis happen on-device. API keys are proxied through an internal service layer so they never appear in conversation context. There is no cloud component between you and your machine.
 
@@ -36,6 +38,32 @@ For the full architecture, see [System Architecture](https://github.com/dcelliso
 
 ## Features
 
+### Workspaces
+
+Switch the agent between projects on your system with `/workspace <name>`. Names resolve relative to `WORKSPACE_BASE` (set in `.env`). Identity and memory carry over from the home workspace, so Kai retains full context regardless of what it's working on. Create new workspaces with `/workspace new <name>`. Absolute paths are not accepted - all workspaces must live under the configured base directory.
+
+### Memory
+
+Three layers of persistent context give the agent continuity across sessions:
+
+1. **Auto-memory** - managed by Claude Code per-workspace. Project architecture and patterns.
+2. **Home memory** (`workspace/.claude/MEMORY.md`) - personal memory, always injected regardless of current workspace. Proactively updated by Kai.
+3. **Conversation history** (`workspace/.claude/history/`) - JSONL logs, one file per day. Searchable for past conversations.
+
+Foreign workspaces also get their own `.claude/MEMORY.md` injected alongside home memory. See [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture).
+
+### Scheduled jobs
+
+Reminders and recurring agent jobs with one-shot, daily, and interval schedules. Ask naturally ("remind me at 3pm") or use the HTTP API (`POST /api/schedule`). Agent jobs run as full Claude Code sessions - Kai can check conditions, search the web, run commands, and report back on a schedule. Auto-remove jobs support monitoring use cases where the agent watches for a condition and deactivates itself when it's met. See [Scheduling and Conditional Jobs](https://github.com/dcellison/kai/wiki/Scheduling-and-Conditional-Jobs).
+
+### Webhooks
+
+An HTTP server receives external events and routes them to the agent. GitHub webhooks (pushes, PRs, issues, comments, reviews) are validated via HMAC-SHA256. A generic endpoint (`POST /webhook`) accepts JSON from any service - CI pipelines, monitoring alerts, deployment hooks, anything that can POST JSON. See [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet).
+
+### File exchange
+
+Send any file type directly in chat - photos, documents, PDFs, archives, anything. Files are saved to a `files/` directory inside the active workspace with timestamped names, and the agent gets the path so it can work with them via shell tools. Kai can also send files back to you through the internal API. Images render inline; everything else arrives as a document attachment.
+
 ### Streaming responses
 
 Responses stream into Telegram in real time, updating the message every 2 seconds.
@@ -44,17 +72,9 @@ Responses stream into Telegram in real time, updating the message every 2 second
 
 Switch between Opus, Sonnet, and Haiku via `/models` (interactive picker) or `/model <name>` (direct). Changing models restarts the session.
 
-### Workspaces
-
-Point Claude at any project with `/workspace <name>`. Names resolve relative to `WORKSPACE_BASE` (set in `.env`). Identity and memory from the home workspace carry over. Create new workspaces with `/workspace new <name>`. Absolute paths are not accepted - all workspaces must live under the configured base directory.
-
-### File exchange
-
-Send any file type directly in chat - photos, documents, PDFs, archives, anything. Files are saved to a `files/` directory inside the active workspace with timestamped names, and Claude gets the path so it can work with them via shell tools. Claude can also send files back to you through the internal API. Images render inline; everything else arrives as a document attachment.
-
 ### Voice input
 
-Voice notes are transcribed locally using [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and forwarded to Claude. Requires `ffmpeg` and `whisper-cpp`. Disabled by default - set `VOICE_ENABLED=true` after installing dependencies. See the [Voice Setup](https://github.com/dcellison/kai/wiki/Voice-Setup) wiki page.
+Voice notes are transcribed locally using [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and forwarded to the agent. Requires `ffmpeg` and `whisper-cpp`. Disabled by default - set `VOICE_ENABLED=true` after installing dependencies. See the [Voice Setup](https://github.com/dcellison/kai/wiki/Voice-Setup) wiki page.
 
 ### Voice responses (TTS)
 
@@ -63,24 +83,6 @@ Text-to-speech via [Piper TTS](https://github.com/rhasspy/piper). Three modes: `
 ### Dual-mode Telegram transport
 
 Kai supports two ways of receiving Telegram updates: **long polling** (default) and **webhooks**. Polling works out of the box behind NAT with zero infrastructure. Set `TELEGRAM_WEBHOOK_URL` in `.env` to switch to webhook mode for lower latency - this requires a tunnel or reverse proxy (see [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet)).
-
-### Webhooks
-
-An HTTP server receives GitHub webhook events (pushes, PRs, issues, comments, reviews) and forwards them to Telegram. Signatures are validated via HMAC-SHA256. A generic webhook endpoint (`POST /webhook`) accepts JSON from any service. See [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet).
-
-### Scheduled jobs
-
-Reminders and recurring Claude jobs with one-shot, daily, and interval schedules. Ask naturally ("remind me at 3pm") or use the HTTP API (`POST /api/schedule`). Claude jobs support conditional auto-remove for monitoring use cases (`CONDITION_MET` / `CONDITION_NOT_MET` protocol). See [Scheduling and Conditional Jobs](https://github.com/dcellison/kai/wiki/Scheduling-and-Conditional-Jobs).
-
-### Memory
-
-Three layers of persistent context:
-
-1. **Auto-memory** - managed by Claude Code per-workspace. Project architecture and patterns.
-2. **Home memory** (`workspace/.claude/MEMORY.md`) - personal memory, always injected regardless of current workspace. Proactively updated by Kai.
-3. **Conversation history** (`workspace/.claude/history/`) - JSONL logs, one file per day. Searchable for past conversations.
-
-Foreign workspaces also get their own `.claude/MEMORY.md` injected alongside home memory. See [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture).
 
 ### Crash recovery
 
