@@ -125,9 +125,7 @@ def resolve_spec_from_body(description: str) -> str | None:
     return None
 
 
-def resolve_spec_from_branch(
-    branch: str, repo_path: str, spec_dir: str = "specs"
-) -> str | None:
+def resolve_spec_from_branch(branch: str, repo_path: str, spec_dir: str = "specs") -> str | None:
     """
     Find a spec file matching the branch name by glob pattern.
 
