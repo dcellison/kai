@@ -509,8 +509,36 @@ class PersistentClaude:
             return
 
         accumulated_text = ""
+        # Wall-clock limit for the entire interaction. The per-readline
+        # timeout below catches dead processes (no output for 6 min), but
+        # a process stuck in a tool-use loop emits progress events that
+        # reset the readline timer indefinitely. This outer limit catches
+        # that case: if the total interaction exceeds N minutes regardless
+        # of output, kill the process.
+        interaction_start = time.monotonic()
+        max_interaction_seconds = self.timeout_seconds * 5  # 10 min at default 120s
         try:
             while True:
+                # Check wall-clock limit before each readline
+                elapsed = time.monotonic() - interaction_start
+                if elapsed > max_interaction_seconds:
+                    log.error(
+                        "Interaction exceeded wall-clock limit (%.0fs > %ds)",
+                        elapsed,
+                        max_interaction_seconds,
+                    )
+                    await self._kill()
+                    yield StreamEvent(
+                        text_so_far=accumulated_text,
+                        done=True,
+                        response=ClaudeResponse(
+                            success=False,
+                            text=accumulated_text,
+                            error="Claude interaction timed out (too long)",
+                        ),
+                    )
+                    return
+
                 try:
                     # Opus with tool use can go minutes between output lines
                     timeout = self.timeout_seconds * 3

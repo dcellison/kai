@@ -143,6 +143,48 @@ _QUEUED_MESSAGE_MARKER = (
     "Their previous task is done. Focus on this new message.]\n\n"
 )
 
+# Safety-net timeout for acquiring the per-chat lock (seconds). If the
+# wall-clock timeout in claude.py doesn't fire for some reason, this
+# prevents a stuck interaction from blocking all future messages. Set
+# slightly longer than claude.py's wall-clock limit (timeout_seconds * 5)
+# so the inner timeout fires first in normal operation.
+_LOCK_ACQUIRE_TIMEOUT = 660  # 11 minutes
+
+
+async def _acquire_lock_or_kill(
+    chat_id: int,
+    claude: "PersistentClaude",
+    update: Update,
+) -> asyncio.Lock | None:
+    """Acquire the per-chat lock with a timeout, force-killing if stuck.
+
+    Returns the acquired lock on success (caller must call lock.release()
+    in a finally block). Returns None if the lock timed out, in which case
+    the stuck Claude process was killed and the user was notified - caller
+    should return without further action.
+
+    Returns the lock object directly rather than a bool so the caller
+    releases the same object that was acquired (avoids issues if get_lock
+    is called again and returns a different instance).
+    """
+    lock = get_lock(chat_id)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=_LOCK_ACQUIRE_TIMEOUT)
+        return lock
+    except TimeoutError:
+        log.error(
+            "Lock acquisition timed out for chat %d after %ds; force-killing Claude",
+            chat_id,
+            _LOCK_ACQUIRE_TIMEOUT,
+        )
+        claude.force_kill()
+        assert update.message is not None
+        await _reply_safe(
+            update.message,
+            "Previous task timed out and was stopped. Please send your message again.",
+        )
+        return None
+
 
 def _prepend_queue_marker(prompt: str | list[dict[str, str]]) -> str | list[dict[str, str]]:
     """Prepend context-switch marker to a prompt that waited behind the lock.
@@ -1204,7 +1246,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ]
 
     was_queued = await _notify_if_queued(update, chat_id)
-    async with get_lock(chat_id):
+    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    if lock is None:
+        return
+    try:
         _set_responding(chat_id)
         try:
             await _handle_response(
@@ -1217,6 +1262,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
         finally:
             _clear_responding()
+    finally:
+        lock.release()
 
 
 # File extensions treated as readable text (sent to Claude as code blocks)
@@ -1368,7 +1415,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         content = (caption or f"File received: {file_name}") + f"\n[File saved to: {saved}]"
 
     was_queued = await _notify_if_queued(update, chat_id)
-    async with get_lock(chat_id):
+    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    if lock is None:
+        return
+    try:
         _set_responding(chat_id)
         try:
             await _handle_response(
@@ -1381,6 +1431,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         finally:
             _clear_responding()
+    finally:
+        lock.release()
 
 
 @_require_auth
@@ -1448,7 +1500,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     model = claude.model
 
     was_queued = await _notify_if_queued(update, chat_id)
-    async with get_lock(chat_id):
+    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    if lock is None:
+        return
+    try:
         _set_responding(chat_id)
         try:
             await _handle_response(
@@ -1461,6 +1516,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
         finally:
             _clear_responding()
+    finally:
+        lock.release()
 
 
 # ── Main message handler ─────────────────────────────────────────────
@@ -1571,7 +1628,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     model = claude.model
 
     was_queued = await _notify_if_queued(update, chat_id)
-    async with get_lock(chat_id):
+    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    if lock is None:
+        return
+    try:
         _set_responding(chat_id)
         try:
             await _handle_response(
@@ -1584,6 +1644,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
         finally:
             _clear_responding()
+    finally:
+        lock.release()
 
 
 # ── Streaming response handler ───────────────────────────────────────

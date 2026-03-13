@@ -752,6 +752,63 @@ class TestSendLockedErrors:
         assert "timed out" in events[-1].response.error.lower()
 
     @pytest.mark.asyncio
+    async def test_wall_clock_timeout(self):
+        """Interaction killed when total elapsed time exceeds wall-clock limit.
+
+        Simulates a tool-use loop: the process keeps emitting assistant
+        events (resetting the per-readline timeout) but the overall
+        interaction exceeds timeout_seconds * 5. The wall-clock guard
+        should fire and kill the process.
+        """
+        claude = _make_claude(timeout_seconds=1)  # wall-clock limit = 5s
+
+        # Feed assistant events indefinitely (simulating a chatty tool loop)
+        call_count = 0
+
+        async def slow_readline():
+            nonlocal call_count
+            call_count += 1
+            # Each readline returns an assistant event after a short delay.
+            # After enough calls, the wall-clock limit is exceeded.
+            await asyncio.sleep(0.3)
+            return _assistant_event(f"Tool output {call_count}")
+
+        proc = _make_mock_proc([])
+        proc.stdout.readline = slow_readline
+        claude._proc = proc
+        claude._fresh_session = False
+
+        # Patch wait_for to actually respect the real timeout (not mock it)
+        events = await _collect_events(claude)
+
+        # Should get the wall-clock timeout error, not a readline timeout
+        done_event = events[-1]
+        assert done_event.done is True
+        assert done_event.response.success is False
+        assert "too long" in done_event.response.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_wall_clock_normal_completion_unaffected(self):
+        """Normal interactions that complete quickly are not affected by wall-clock limit."""
+        proc = _make_mock_proc(
+            [
+                _system_event(),
+                _assistant_event("Hello"),
+                _result_event("Done"),
+            ]
+        )
+        claude = _make_claude(timeout_seconds=1)  # wall-clock = 5s
+        claude._proc = proc
+        claude._fresh_session = False
+
+        events = await _collect_events(claude)
+
+        done_event = events[-1]
+        assert done_event.done is True
+        assert done_event.response.success is True
+        assert done_event.response.error is None
+
+    @pytest.mark.asyncio
     async def test_eof_with_text(self):
         """EOF with accumulated text yields success=True, error=None."""
         proc = _make_mock_proc(

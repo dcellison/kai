@@ -18,6 +18,7 @@ from telegram.error import BadRequest
 
 from kai.bot import (
     _QUEUED_MESSAGE_MARKER,
+    _acquire_lock_or_kill,
     _chunk_text,
     _clear_responding,
     _edit_message_safe,
@@ -2311,3 +2312,94 @@ class TestPrependQueueMarker:
         _prepend_queue_marker(content)
         # Original is untouched
         assert content[0]["text"] == "original"
+
+
+# ── _acquire_lock_or_kill ───────────────────────────────────────────
+
+
+class TestAcquireLockOrKill:
+    """Tests for the lock-with-timeout safety net."""
+
+    @pytest.mark.asyncio
+    async def test_acquires_free_lock(self):
+        """Returns the lock when it's free - normal fast path."""
+        update = _make_update()
+        claude = _make_mock_claude()
+        # Use a unique chat_id to avoid state from other tests
+        chat_id = 88801
+
+        lock = await _acquire_lock_or_kill(chat_id, claude, update)
+
+        assert lock is not None
+        assert lock.locked()
+        lock.release()
+        claude.force_kill.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_timeout_kills_claude(self):
+        """When the lock is held too long, force-kills Claude and notifies user."""
+        update = _make_update()
+        claude = _make_mock_claude()
+        chat_id = 88802
+
+        from kai.locks import get_lock
+
+        held_lock = get_lock(chat_id)
+        await held_lock.acquire()
+
+        try:
+            # Patch the timeout to something tiny so the test doesn't wait 11 min
+            with patch("kai.bot._LOCK_ACQUIRE_TIMEOUT", 0.05):
+                result = await _acquire_lock_or_kill(chat_id, claude, update)
+        finally:
+            held_lock.release()
+
+        assert result is None
+        claude.force_kill.assert_called_once()
+        update.message.reply_text.assert_called()
+        msg = update.message.reply_text.call_args[0][0]
+        assert "timed out" in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_returns_same_lock_object(self):
+        """The returned lock is the same object from get_lock, not a copy."""
+        update = _make_update()
+        claude = _make_mock_claude()
+        chat_id = 88803
+
+        from kai.locks import get_lock
+
+        expected_lock = get_lock(chat_id)
+        returned_lock = await _acquire_lock_or_kill(chat_id, claude, update)
+
+        assert returned_lock is expected_lock
+        returned_lock.release()
+
+    @pytest.mark.asyncio
+    async def test_handle_message_releases_lock_on_error(self):
+        """Lock is released even when _handle_response raises."""
+        update = _make_update()
+        ctx = _make_context()
+        chat_id = 88804
+
+        from kai.locks import get_lock
+
+        lock = get_lock(chat_id)
+
+        with (
+            patch("kai.bot.is_totp_configured", return_value=False),
+            patch(
+                "kai.bot._handle_response",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("boom"),
+            ),
+            patch("kai.bot.log_message"),
+            patch("kai.bot._set_responding"),
+            patch("kai.bot._clear_responding"),
+            # Use real get_lock so we can verify the lock state after
+            pytest.raises(RuntimeError),
+        ):
+            await handle_message(update, ctx)
+
+        # Lock must be released after the error
+        assert not lock.locked()
