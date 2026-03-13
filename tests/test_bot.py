@@ -2387,6 +2387,8 @@ class TestAcquireLockOrKill:
         lock = get_lock(chat_id)
 
         with (
+            # Bypass the TOTP gate so handle_message reaches the lock
+            # acquisition and _handle_response code paths under test.
             patch("kai.bot.is_totp_configured", return_value=False),
             patch(
                 "kai.bot._handle_response",
