@@ -368,10 +368,12 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
                 )
                 continue
 
-        # Validate budget
+        # Validate budget (same bool guard as timeout - float(True) is 1.0)
         budget = claude_section.get("budget")
         if budget is not None:
             try:
+                if isinstance(budget, bool):
+                    raise ValueError("must be a number, not a boolean")
                 budget = float(budget)
                 if budget <= 0:
                     raise ValueError("must be positive")
@@ -402,7 +404,6 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
             if not isinstance(env, dict):
                 log.warning("workspaces.yaml: invalid env for %s; skipping entry", path)
                 continue
-            # Coerce all values to strings
             # Coerce all values to strings. YAML auto-types true/false
             # as Python bools; str(True) gives "True" not "true", which
             # breaks apps checking os.environ["DEBUG"] == "true". Emit

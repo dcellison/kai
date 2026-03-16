@@ -286,6 +286,26 @@ class TestLoadWorkspaceConfigs:
             configs = _load_workspace_configs()
         assert configs == {}
 
+    def test_bool_budget_rejected(self, tmp_path):
+        """Boolean budget (e.g. true) is rejected, not silently cast to $1.00."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            workspaces:
+              - path: {ws}
+                claude:
+                  budget: true
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_workspace_configs()
+        assert configs == {}
+
     def test_negative_budget(self, tmp_path):
         """Negative budget causes the entry to be skipped."""
         ws = tmp_path / "ws"
@@ -476,13 +496,15 @@ class TestLoadWorkspaceConfigs:
         """Integer-like float (e.g. 300.0 from YAML) is accepted."""
         ws = tmp_path / "ws"
         ws.mkdir()
+        # Use 300.0 (not 300) to exercise the is_integer() path.
+        # YAML parses 300 as int, but 300.0 as float.
         self._write_yaml(
             tmp_path,
             f"""\
             workspaces:
               - path: {ws}
                 claude:
-                  timeout: 300
+                  timeout: 300.0
             """,
         )
         with (
