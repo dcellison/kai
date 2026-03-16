@@ -21,6 +21,7 @@ from kai.bot import (
     _acquire_lock_or_kill,
     _chunk_text,
     _clear_responding,
+    _do_switch_workspace,
     _edit_message_safe,
     _is_authorized,
     _is_workspace_allowed,
@@ -35,6 +36,7 @@ from kai.bot import (
     _short_workspace_name,
     _truncate_for_telegram,
     _voices_keyboard,
+    _workspace_config_suffix,
     _workspaces_keyboard,
     create_bot,
     handle_canceljob,
@@ -1515,6 +1517,109 @@ class TestHandleWorkspaceCallback:
         await handle_workspace_callback(update, ctx)
         edit_text = update.callback_query.edit_message_text.call_args[0][0]
         assert "No change" in edit_text
+
+
+# ── Workspace config in bot layer ────────────────────────────────────
+
+
+class TestWorkspaceConfigSuffix:
+    def test_with_model_and_budget(self):
+        """Shows model and budget when both are configured."""
+        from kai.config import WorkspaceConfig
+
+        ws = WorkspaceConfig(path=Path("/tmp/ws"), model="opus", budget=15.0)
+        assert _workspace_config_suffix(ws) == " (model: opus, budget: $15.00)"
+
+    def test_model_only(self):
+        """Shows model only when budget is not set."""
+        from kai.config import WorkspaceConfig
+
+        ws = WorkspaceConfig(path=Path("/tmp/ws"), model="haiku")
+        assert _workspace_config_suffix(ws) == " (model: haiku)"
+
+    def test_no_config(self):
+        """Returns empty string when no config is provided."""
+        assert _workspace_config_suffix(None) == ""
+
+    def test_config_with_no_overrides(self):
+        """Returns empty string when config has no model or budget."""
+        from kai.config import WorkspaceConfig
+
+        ws = WorkspaceConfig(path=Path("/tmp/ws"))
+        assert _workspace_config_suffix(ws) == ""
+
+
+class TestSwitchWorkspaceConfig:
+    @pytest.mark.asyncio
+    async def test_switch_passes_config_to_change_workspace(self, tmp_path):
+        """_do_switch_workspace passes the workspace config to Claude."""
+        from kai.config import WorkspaceConfig
+
+        ws_path = tmp_path / "ws"
+        ws_path.mkdir()
+        ws_config = WorkspaceConfig(path=ws_path.resolve(), model="opus")
+        config = _make_config(
+            claude_workspace=Path("/home/workspace"),
+            workspace_configs={ws_path.resolve(): ws_config},
+        )
+        claude = _make_mock_claude()
+        ctx = _make_context(config=config, claude=claude)
+
+        with (
+            patch("kai.bot.sessions", new_callable=AsyncMock),
+            patch("kai.bot.webhook"),
+        ):
+            result = await _do_switch_workspace(ctx, 12345, ws_path.resolve())
+
+        # Config was returned and passed to change_workspace
+        assert result is ws_config
+        claude.change_workspace.assert_called_once_with(ws_path.resolve(), workspace_config=ws_config)
+
+    @pytest.mark.asyncio
+    async def test_switch_unconfigured_passes_none(self, tmp_path):
+        """_do_switch_workspace passes None for unconfigured workspaces."""
+        ws_path = tmp_path / "ws"
+        ws_path.mkdir()
+        config = _make_config(claude_workspace=Path("/home/workspace"))
+        claude = _make_mock_claude()
+        ctx = _make_context(config=config, claude=claude)
+
+        with (
+            patch("kai.bot.sessions", new_callable=AsyncMock),
+            patch("kai.bot.webhook"),
+        ):
+            result = await _do_switch_workspace(ctx, 12345, ws_path.resolve())
+
+        assert result is None
+        claude.change_workspace.assert_called_once_with(ws_path.resolve(), workspace_config=None)
+
+    @pytest.mark.asyncio
+    async def test_switch_shows_config_info(self, tmp_path):
+        """_switch_workspace confirmation includes model when configured."""
+        from kai.config import WorkspaceConfig
+
+        ws_path = tmp_path / "ws"
+        ws_path.mkdir()
+        ws_config = WorkspaceConfig(path=ws_path.resolve(), model="opus", budget=20.0)
+        config = _make_config(
+            claude_workspace=Path("/home/workspace"),
+            workspace_configs={ws_path.resolve(): ws_config},
+        )
+        claude = _make_mock_claude(workspace=Path("/home/workspace"))
+        update = _make_update()
+        ctx = _make_context(config=config, claude=claude)
+
+        with (
+            patch("kai.bot.sessions", new_callable=AsyncMock),
+            patch("kai.bot.webhook"),
+        ):
+            from kai.bot import _switch_workspace
+
+            await _switch_workspace(update, ctx, ws_path.resolve())
+
+        reply_text = update.message.reply_text.call_args[0][0]
+        assert "model: opus" in reply_text
+        assert "budget: $20.00" in reply_text
 
 
 # ── handle_message (non-TOTP) ────────────────────────────────────────
