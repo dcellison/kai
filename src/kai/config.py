@@ -237,15 +237,14 @@ def _read_protected_file(path: str) -> str | None:
 _YAML_MALFORMED = object()
 
 
-def _read_protected_yaml(filename: str) -> dict | None:
+def _read_protected_yaml(filename: str) -> dict | object | None:
     """
     Read a YAML file from /etc/kai/ via sudo.
 
     Returns:
         Parsed dict on success, None if the file does not exist or cannot
         be read, or the _YAML_MALFORMED sentinel if the file exists but
-        is invalid (callers must check ``is _YAML_MALFORMED`` before use;
-        the sentinel is not a dict or None).
+        is invalid. Callers must check ``is _YAML_MALFORMED`` before use.
     """
     content = _read_protected_file(f"/etc/kai/{filename}")
     if content is None:
@@ -326,7 +325,18 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
 
     entries = data.get("workspaces")
     if not isinstance(entries, list):
+        if entries is not None:
+            log.warning("workspaces.yaml: 'workspaces' must be a list, got %s", type(entries).__name__)
         return {}
+
+    # Helper for coercing YAML env values to strings. Defined once
+    # outside the loop rather than re-created per workspace entry.
+    def _coerce_env_value(v: object) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, bool):
+            return str(v).lower()
+        return str(v)
 
     configs: dict[Path, WorkspaceConfig] = {}
     for entry in entries:
@@ -404,19 +414,6 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
             if not isinstance(env, dict):
                 log.warning("workspaces.yaml: invalid env for %s; skipping entry", path)
                 continue
-
-            # Coerce all values to strings. YAML auto-types true/false
-            # as Python bools; str(True) gives "True" not "true", which
-            # breaks apps checking os.environ["DEBUG"] == "true". Emit
-            # lowercase for bools to match what users expect from .env files.
-            # YAML null/~/empty values become Python None; map to empty
-            # string rather than the literal string "None".
-            def _coerce_env_value(v: object) -> str:
-                if v is None:
-                    return ""
-                if isinstance(v, bool):
-                    return str(v).lower()
-                return str(v)
 
             env = {str(k): _coerce_env_value(v) for k, v in env.items()}
 
