@@ -54,7 +54,7 @@ from telegram.ext import (
 
 from kai import services, sessions, webhook
 from kai.claude import PersistentClaude
-from kai.config import DATA_DIR, Config
+from kai.config import DATA_DIR, Config, WorkspaceConfig
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
 from kai.transcribe import TranscriptionError, transcribe_voice
@@ -770,7 +770,7 @@ def _short_workspace_name(path: str, base: Path | None) -> str:
     return Path(path).name
 
 
-async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path: Path) -> None:
+async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path: Path) -> WorkspaceConfig | None:
     """
     Core workspace switch logic shared by command and callback handlers.
 
@@ -778,6 +778,9 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     message), clears the session, and persists the new workspace to settings.
     Switching to home deletes the setting (home is the default). Looks up
     per-workspace config from workspaces.yaml and passes it to Claude.
+
+    Returns the WorkspaceConfig for the target workspace (or None) so
+    callers can display config details without a redundant lookup.
     """
     claude = _get_claude(context)
     config: Config = context.bot_data["config"]
@@ -797,6 +800,8 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         await sessions.set_setting("workspace", str(path))
         await sessions.upsert_workspace_history(str(path))
 
+    return ws_config
+
 
 async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, path: Path) -> None:
     """
@@ -814,14 +819,12 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text("Already in that workspace.")
         return
 
-    await _do_switch_workspace(context, _chat_id(update), path)
+    ws_config = await _do_switch_workspace(context, _chat_id(update), path)
 
     if path == home:
         await update.message.reply_text("Switched to home workspace. Session cleared.")
     else:
         # Show useful metadata about the workspace
-        config: Config = context.bot_data["config"]
-        ws_config = config.get_workspace_config(path)
         notes = []
         if (path / ".git").is_dir():
             notes.append("Git repo")

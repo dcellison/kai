@@ -231,23 +231,30 @@ def _read_protected_file(path: str) -> str | None:
         return None
 
 
-def _read_protected_yaml(filename: str) -> dict | None:
+# Sentinel returned by _read_protected_yaml when the file exists but
+# contains invalid YAML. Distinct from None (file absent) so callers
+# can stop on malformed config rather than falling through to a local file.
+_YAML_MALFORMED = object()
+
+
+def _read_protected_yaml(filename: str) -> dict | object | None:
     """
     Read a YAML file from /etc/kai/ via sudo.
 
-    Returns parsed YAML as a dict, or None if the file does not exist
-    or cannot be read. Uses the same sudo -n pattern as
-    _read_protected_file() to avoid blocking on password prompts.
+    Returns:
+        Parsed dict on success, None if the file does not exist or cannot
+        be read, or _YAML_MALFORMED if the file exists but contains
+        invalid YAML.
     """
     content = _read_protected_file(f"/etc/kai/{filename}")
     if content is None:
         return None
     try:
         result = yaml.safe_load(content)
-        return result if isinstance(result, dict) else None
+        return result if isinstance(result, dict) else _YAML_MALFORMED
     except yaml.YAMLError as e:
         log.error("Invalid YAML in /etc/kai/%s: %s", filename, e)
-        return None
+        return _YAML_MALFORMED
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -258,7 +265,8 @@ def parse_env_file(path: Path) -> dict[str, str]:
     - Lines with KEY=VALUE or KEY="VALUE" or KEY='VALUE'
     - Lines starting with 'export ' (stripped)
     - Comments (lines starting with #) and blank lines (skipped)
-    - Surrounding quotes on values (stripped)
+    - Surrounding quotes on values (stripped via str.strip, not matched
+      pairs - same limitation as the main .env parser in load_config)
 
     Same parsing logic as _read_protected_file() uses for /etc/kai/env.
     Re-reads the file each time to pick up changes without restart.
@@ -290,8 +298,13 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
 
     Returns a dict keyed by canonical resolved path for O(1) lookup.
     """
-    # Try protected file first, fall back to local
+    # Try protected file first, fall back to local. A malformed
+    # protected file stops loading entirely rather than silently
+    # falling through to a local file (which could contain stale
+    # or dev config on a production system).
     data = _read_protected_yaml("workspaces.yaml")
+    if data is _YAML_MALFORMED:
+        return {}
     if data is None:
         local_path = PROJECT_ROOT / "workspaces.yaml"
         if not local_path.exists():
@@ -360,10 +373,12 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
                 log.warning("workspaces.yaml: invalid budget for %s: %s; skipping entry", path, e)
                 continue
 
-        # Validate timeout
+        # Validate timeout (must be a positive integer, not a float)
         timeout = claude_section.get("timeout")
         if timeout is not None:
             try:
+                if isinstance(timeout, float) and not timeout.is_integer():
+                    raise ValueError("must be an integer, not a float")
                 timeout = int(timeout)
                 if timeout <= 0:
                     raise ValueError("must be positive")

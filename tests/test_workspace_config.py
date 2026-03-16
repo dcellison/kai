@@ -131,17 +131,21 @@ class TestReadProtectedYaml:
             result = _read_protected_yaml("workspaces.yaml")
         assert result is None
 
-    def test_returns_none_on_invalid_yaml(self):
-        """Returns None on malformed YAML."""
-        with patch("kai.config._read_protected_file", return_value="{{invalid: yaml: ["):
-            result = _read_protected_yaml("workspaces.yaml")
-        assert result is None
+    def test_returns_malformed_on_non_dict(self):
+        """Returns _YAML_MALFORMED when YAML parses to a non-dict."""
+        from kai.config import _YAML_MALFORMED
 
-    def test_returns_none_on_non_dict(self):
-        """Returns None when YAML parses to a non-dict (e.g., a list)."""
         with patch("kai.config._read_protected_file", return_value="- item1\n- item2\n"):
             result = _read_protected_yaml("workspaces.yaml")
-        assert result is None
+        assert result is _YAML_MALFORMED
+
+    def test_returns_malformed_on_invalid_yaml(self):
+        """Returns _YAML_MALFORMED (not None) when YAML is invalid."""
+        from kai.config import _YAML_MALFORMED
+
+        with patch("kai.config._read_protected_file", return_value="{{bad["):
+            result = _read_protected_yaml("workspaces.yaml")
+        assert result is _YAML_MALFORMED
 
 
 # ── _load_workspace_configs ─────────────────────────────────────────
@@ -410,6 +414,63 @@ class TestLoadWorkspaceConfigs:
         cfg = configs[ws.resolve()]
         assert cfg.system_prompt_file == prompt_file.resolve()
         assert cfg.system_prompt_file.read_text() == "Be concise."
+
+    def test_malformed_protected_yaml_does_not_fallthrough(self, tmp_path):
+        """Malformed /etc/kai/workspaces.yaml stops loading, doesn't fall to local."""
+        from kai.config import _YAML_MALFORMED
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        # Local file exists with valid config
+        self._write_yaml(tmp_path, f"workspaces:\n  - path: {ws}\n")
+        # But the protected file is malformed
+        with (
+            patch("kai.config._read_protected_yaml", return_value=_YAML_MALFORMED),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_workspace_configs()
+        # Should NOT have loaded the local file
+        assert configs == {}
+
+    def test_float_timeout_rejected(self, tmp_path):
+        """Non-integer float timeout (e.g. 3.7) is rejected."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            workspaces:
+              - path: {ws}
+                claude:
+                  timeout: 3.7
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_workspace_configs()
+        assert configs == {}
+
+    def test_integer_like_float_timeout_accepted(self, tmp_path):
+        """Integer-like float (e.g. 300.0 from YAML) is accepted."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            workspaces:
+              - path: {ws}
+                claude:
+                  timeout: 300
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_workspace_configs()
+        assert configs[ws.resolve()].timeout == 300
 
     def test_protected_installation_tried_first(self, tmp_path):
         """Protected file (/etc/kai/workspaces.yaml) is tried before local."""
