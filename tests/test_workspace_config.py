@@ -564,6 +564,34 @@ class TestLoadWorkspaceConfigs:
         # to match .env file conventions (avoids "True" vs "true" bugs)
         assert env == {"PORT": "5432", "DEBUG": "true"}
 
+    def test_env_null_values_become_empty_string(self, tmp_path):
+        """YAML null/~/empty env values become empty strings, not 'None'."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            workspaces:
+              - path: {ws}
+                claude:
+                  env:
+                    EMPTY_VAR:
+                    NULL_VAR: null
+                    TILDE_VAR: ~
+                    REAL_VAR: hello
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_workspace_configs()
+        env = configs[ws.resolve()].env
+        assert env["EMPTY_VAR"] == ""
+        assert env["NULL_VAR"] == ""
+        assert env["TILDE_VAR"] == ""
+        assert env["REAL_VAR"] == "hello"
+
     def test_inline_system_prompt(self, tmp_path):
         """Inline system_prompt is stored as a string."""
         ws = tmp_path / "ws"

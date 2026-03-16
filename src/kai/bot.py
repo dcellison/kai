@@ -770,6 +770,19 @@ def _short_workspace_name(path: str, base: Path | None) -> str:
     return Path(path).name
 
 
+def _workspace_config_suffix(ws_config: WorkspaceConfig | None) -> str:
+    """Build a parenthesized suffix showing workspace config details.
+
+    Returns e.g. " (model: opus, budget: $15.00)" or "" if no config.
+    """
+    extras = []
+    if ws_config and ws_config.model:
+        extras.append(f"model: {ws_config.model}")
+    if ws_config and ws_config.budget is not None:
+        extras.append(f"budget: ${ws_config.budget:.2f}")
+    return f" ({', '.join(extras)})" if extras else ""
+
+
 async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path: Path) -> WorkspaceConfig | None:
     """
     Core workspace switch logic shared by command and callback handlers.
@@ -821,16 +834,10 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     ws_config = await _do_switch_workspace(context, _chat_id(update), path)
 
-    # Build config details suffix (applies to both home and non-home)
-    extras = []
-    if ws_config and ws_config.model:
-        extras.append(f"model: {ws_config.model}")
-    if ws_config and ws_config.budget is not None:
-        extras.append(f"budget: ${ws_config.budget:.2f}")
+    config_suffix = _workspace_config_suffix(ws_config)
 
     if path == home:
-        suffix = f" ({', '.join(extras)})" if extras else ""
-        await update.message.reply_text(f"Switched to home workspace{suffix}. Session cleared.")
+        await update.message.reply_text(f"Switched to home workspace{config_suffix}. Session cleared.")
     else:
         # Show filesystem metadata alongside config details
         notes = []
@@ -838,9 +845,8 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             notes.append("Git repo")
         if (path / ".claude" / "CLAUDE.md").exists():
             notes.append("Has CLAUDE.md")
-        all_info = notes + extras
-        suffix = f" ({', '.join(all_info)})" if all_info else ""
-        await update.message.reply_text(f"Workspace: {path}{suffix}\nSession cleared.")
+        note_suffix = f" ({', '.join(notes)})" if notes else ""
+        await update.message.reply_text(f"Workspace: {path}{note_suffix}{config_suffix}\nSession cleared.")
 
 
 async def _workspaces_keyboard(
@@ -1015,12 +1021,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     # Switch and confirm, showing any per-workspace config details
     await query.answer()
     ws_config = await _do_switch_workspace(context, _chat_id(update), path)
-    extras = []
-    if ws_config and ws_config.model:
-        extras.append(f"model: {ws_config.model}")
-    if ws_config and ws_config.budget is not None:
-        extras.append(f"budget: ${ws_config.budget:.2f}")
-    suffix = f" ({', '.join(extras)})" if extras else ""
+    suffix = _workspace_config_suffix(ws_config)
     await query.edit_message_text(
         f"Switched to {label}{suffix}. Session cleared.",
         reply_markup=InlineKeyboardMarkup([]),
