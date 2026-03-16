@@ -1008,11 +1008,17 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
         return
 
-    # Switch and confirm
+    # Switch and confirm, showing any per-workspace config details
     await query.answer()
-    await _do_switch_workspace(context, _chat_id(update), path)
+    ws_config = await _do_switch_workspace(context, _chat_id(update), path)
+    extras = []
+    if ws_config and ws_config.model:
+        extras.append(f"model: {ws_config.model}")
+    if ws_config and ws_config.budget is not None:
+        extras.append(f"budget: ${ws_config.budget:.2f}")
+    suffix = f" ({', '.join(extras)})" if extras else ""
     await query.edit_message_text(
-        f"Switched to {label}. Session cleared.",
+        f"Switched to {label}{suffix}. Session cleared.",
         reply_markup=InlineKeyboardMarkup([]),
     )
 

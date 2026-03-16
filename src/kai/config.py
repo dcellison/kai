@@ -237,21 +237,25 @@ def _read_protected_file(path: str) -> str | None:
 _YAML_MALFORMED = object()
 
 
-def _read_protected_yaml(filename: str) -> dict | object | None:
+def _read_protected_yaml(filename: str) -> dict | None:
     """
     Read a YAML file from /etc/kai/ via sudo.
 
     Returns:
         Parsed dict on success, None if the file does not exist or cannot
-        be read, or _YAML_MALFORMED if the file exists but contains
-        invalid YAML.
+        be read, or the _YAML_MALFORMED sentinel if the file exists but
+        is invalid (callers must check ``is _YAML_MALFORMED`` before use;
+        the sentinel is not a dict or None).
     """
     content = _read_protected_file(f"/etc/kai/{filename}")
     if content is None:
         return None
     try:
         result = yaml.safe_load(content)
-        return result if isinstance(result, dict) else _YAML_MALFORMED
+        if isinstance(result, dict):
+            return result
+        log.warning("/etc/kai/%s: expected a YAML dict, got %s", filename, type(result).__name__)
+        return _YAML_MALFORMED
     except yaml.YAMLError as e:
         log.error("Invalid YAML in /etc/kai/%s: %s", filename, e)
         return _YAML_MALFORMED
@@ -304,6 +308,7 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
     # or dev config on a production system).
     data = _read_protected_yaml("workspaces.yaml")
     if data is _YAML_MALFORMED:
+        log.warning("Skipping workspace config: /etc/kai/workspaces.yaml is malformed or empty")
         return {}
     if data is None:
         local_path = PROJECT_ROOT / "workspaces.yaml"
