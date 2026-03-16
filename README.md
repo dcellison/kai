@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/github/license/dcellison/kai)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dcellison/kai?label=version)](https://github.com/dcellison/kai/releases)
 
-An AI agent, not a chatbot. Kai wraps a persistent [Claude Code](https://docs.anthropic.com/en/docs/claude-code) process running on your hardware and connects it to Telegram as a control surface. Shell, filesystem, git, web search, scheduling - the agent has real access to your system and can take real action on it. It reviews PRs when code is pushed, monitors conditions on a schedule, and operates across any project on your machine.
+An AI agent, not a chatbot. Kai wraps a persistent [Claude Code](https://docs.anthropic.com/en/docs/claude-code) process running on your hardware and connects it to Telegram as a control surface. Shell, filesystem, git, web search, scheduling - the agent has real access to your system and can take real action on it. It reviews PRs when code is pushed, triages issues when they're opened, monitors conditions on a schedule, and operates across any project on your machine.
 
 For detailed guides on setup, architecture, and optional features, see the **[Wiki](https://github.com/dcellison/kai/wiki)**.
 
@@ -41,6 +41,8 @@ For the full architecture, see [System Architecture](https://github.com/dcelliso
 ### Workspaces
 
 Switch the agent between projects on your system with `/workspace <name>`. Names resolve relative to `WORKSPACE_BASE` (set in `.env`). Identity and memory carry over from the home workspace, so Kai retains full context regardless of what it's working on. Create new workspaces with `/workspace new <name>`. Absolute paths are not accepted - all workspaces must live under the configured base directory.
+
+Per-workspace configuration is supported via `workspaces.yaml` (or `/etc/kai/workspaces.yaml` for protected installations). Each workspace can override the Claude model, budget, timeout, environment variables, and system prompt. See `workspaces.yaml.example` for the full format.
 
 ### Memory
 
@@ -263,7 +265,7 @@ kai/
 │   ├── main.py               # Async startup and shutdown
 │   ├── bot.py                # Telegram handlers, commands, message routing
 │   ├── claude.py             # Persistent Claude Code subprocess management
-│   ├── config.py             # Environment config loading
+│   ├── config.py             # Environment and per-workspace config loading
 │   ├── sessions.py           # SQLite session, job, and settings storage
 │   ├── cron.py               # Scheduled job execution (APScheduler)
 │   ├── webhook.py            # HTTP server: GitHub/generic webhooks, scheduling API
@@ -281,6 +283,7 @@ kai/
 ├── logs/                     # Daily-rotated log files (gitignored)
 ├── models/                   # Whisper and Piper model files (gitignored)
 ├── services.yaml             # External service configs (gitignored)
+├── workspaces.yaml.example   # Per-workspace config template
 ├── pyproject.toml            # Package metadata and dependencies
 ├── Makefile                  # Common dev commands
 ├── .env                      # Environment variables (gitignored, copy from .env.example)
