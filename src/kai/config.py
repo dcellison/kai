@@ -378,7 +378,11 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
                 log.warning("workspaces.yaml: invalid env for %s; skipping entry", path)
                 continue
             # Coerce all values to strings
-            env = {str(k): str(v) for k, v in env.items()}
+            # Coerce all values to strings. YAML auto-types true/false
+            # as Python bools; str(True) gives "True" not "true", which
+            # breaks apps checking os.environ["DEBUG"] == "true". Emit
+            # lowercase for bools to match what users expect from .env files.
+            env = {str(k): str(v).lower() if isinstance(v, bool) else str(v) for k, v in env.items()}
 
         # Validate env_file
         env_file = claude_section.get("env_file")

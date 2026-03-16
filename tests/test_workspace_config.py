@@ -457,7 +457,9 @@ class TestLoadWorkspaceConfigs:
         ):
             configs = _load_workspace_configs()
         env = configs[ws.resolve()].env
-        assert env == {"PORT": "5432", "DEBUG": "True"}
+        # YAML parses `true` as Python bool; coercion emits lowercase
+        # to match .env file conventions (avoids "True" vs "true" bugs)
+        assert env == {"PORT": "5432", "DEBUG": "true"}
 
     def test_inline_system_prompt(self, tmp_path):
         """Inline system_prompt is stored as a string."""
