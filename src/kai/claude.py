@@ -35,6 +35,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from kai.config import WorkspaceConfig, parse_env_file
 from kai.history import get_recent_history
 
 log = logging.getLogger(__name__)
@@ -112,6 +113,7 @@ class PersistentClaude:
         services_info: list[dict] | None = None,
         claude_user: str | None = None,
         max_session_hours: float = 0,
+        workspace_config: WorkspaceConfig | None = None,
     ):
         self.model = model
         self.workspace = workspace
@@ -123,6 +125,25 @@ class PersistentClaude:
         self.services_info = services_info or []
         self.claude_user = claude_user
         self.max_session_hours = max_session_hours
+        self.workspace_config = workspace_config
+
+        # Global defaults, preserved so we can restore them when
+        # switching away from a configured workspace.
+        self._default_model = model
+        self._default_budget = max_budget_usd
+        self._default_timeout = timeout_seconds
+
+        # Apply per-workspace overrides (if configured). These become
+        # the "effective" values for this workspace. The /model command
+        # can still override model within a session.
+        if workspace_config:
+            if workspace_config.model:
+                self.model = workspace_config.model
+            if workspace_config.budget is not None:
+                self.max_budget_usd = workspace_config.budget
+            if workspace_config.timeout is not None:
+                self.timeout_seconds = workspace_config.timeout
+
         self._proc: asyncio.subprocess.Process | None = None
         self._pgid: int | None = None  # Process group ID for reliable signal delivery
         self._lock = asyncio.Lock()  # Serializes all message sends
@@ -200,11 +221,18 @@ class PersistentClaude:
             self.claude_user or "(same as bot)",
         )
 
-        # Pass the webhook secret via environment variable so it never
-        # appears in prompt text, Claude Code session logs, or Anthropic's
-        # API logs. The inner Claude references $KAI_WEBHOOK_SECRET in curl
-        # commands instead of a literal secret value.
+        # Build the subprocess environment. Merge order:
+        # 1. Base environment (inherited from parent process)
+        # 2. Per-workspace env_file values (shared .env file)
+        # 3. Per-workspace inline env values (override env_file)
+        # 4. Webhook secret (LAST - workspace env can't override it)
         env = os.environ.copy()
+        if self.workspace_config:
+            if self.workspace_config.env_file:
+                env.update(parse_env_file(self.workspace_config.env_file))
+            if self.workspace_config.env:
+                env.update(self.workspace_config.env)
+        # Webhook secret last - ensures workspace env can't override it.
         if self.webhook_secret:
             env["KAI_WEBHOOK_SECRET"] = self.webhook_secret
 
@@ -374,6 +402,13 @@ class PersistentClaude:
             # here. Claude Code reads it natively from its cwd (built-in auto-memory).
             # Bot-side reads are redundant and can cause PermissionError on Linux
             # when the workspace is owned by a different user (CLAUDE_USER).
+
+            # Per-workspace system prompt from workspaces.yaml. Injected
+            # between the identity/memory block and conversation history,
+            # so it acts as workspace-specific instructions.
+            ws_prompt = self._get_workspace_system_prompt()
+            if ws_prompt:
+                parts.append(f"## Workspace Instructions\n\n{ws_prompt}")
 
             # Inject recent conversation history for continuity
             recent = get_recent_history()
@@ -632,20 +667,67 @@ class PersistentClaude:
         """
         self._send_signal(signal.SIGKILL)
 
-    async def change_workspace(self, new_workspace: Path) -> None:
+    def _get_workspace_system_prompt(self) -> str | None:
         """
-        Switch the working directory for future Claude sessions.
+        Get the system prompt for the current workspace config.
 
-        Kills the current process so the next send() call will restart
-        Claude in the new directory. Called by /workspace command.
+        Returns the inline system_prompt if set, or reads from
+        system_prompt_file on each invocation to pick up changes.
+        Returns None if neither is configured.
+        """
+        if not self.workspace_config:
+            return None
+        if self.workspace_config.system_prompt:
+            return self.workspace_config.system_prompt
+        if self.workspace_config.system_prompt_file:
+            # File path was validated at config load time (fail-fast on typos).
+            # Read content here so updates are picked up without restart.
+            try:
+                return self.workspace_config.system_prompt_file.read_text()
+            except OSError:
+                log.warning("Cannot read system_prompt_file: %s", self.workspace_config.system_prompt_file)
+                return None
+        return None
+
+    async def change_workspace(
+        self,
+        new_workspace: Path,
+        workspace_config: WorkspaceConfig | None = None,
+    ) -> None:
+        """
+        Switch to a new workspace directory and apply its config.
+
+        Kills the current subprocess. The next send() restarts Claude
+        in the new directory with the new config applied.
 
         Args:
             new_workspace: Path to the new working directory.
+            workspace_config: Per-workspace config for the target, or
+                None to use global defaults.
         """
         # No lock needed: _kill() terminates the process, and the next send()
         # call will start fresh in the new workspace via _ensure_started().
         # Any in-flight send() will see EOF on stdout and clean up.
         self.workspace = new_workspace
+        self.workspace_config = workspace_config
+
+        # Always revert to global defaults first, then apply overrides.
+        # This prevents stale values when switching from a fully-configured
+        # workspace to a partially-configured one (e.g., workspace A has
+        # budget=15.0 but workspace B only sets model - without the reset,
+        # budget would carry over from A instead of reverting to default).
+        self.model = self._default_model
+        self.max_budget_usd = self._default_budget
+        self.timeout_seconds = self._default_timeout
+
+        if workspace_config:
+            if workspace_config.model:
+                self.model = workspace_config.model
+            if workspace_config.budget is not None:
+                self.max_budget_usd = workspace_config.budget
+            if workspace_config.timeout is not None:
+                self.timeout_seconds = workspace_config.timeout
+
         await self._kill()
 
     async def restart(self) -> None:

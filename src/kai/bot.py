@@ -776,13 +776,16 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
 
     Kills the Claude process (it will restart in the new directory on next
     message), clears the session, and persists the new workspace to settings.
-    Switching to home deletes the setting (home is the default).
+    Switching to home deletes the setting (home is the default). Looks up
+    per-workspace config from workspaces.yaml and passes it to Claude.
     """
     claude = _get_claude(context)
     config: Config = context.bot_data["config"]
     home = config.claude_workspace
 
-    await claude.change_workspace(path)
+    # Look up per-workspace config for the target workspace.
+    ws_config = config.get_workspace_config(path)
+    await claude.change_workspace(path, workspace_config=ws_config)
     # Keep the webhook server's confinement path in sync so send-file accepts
     # files from the new workspace rather than rejecting them with 403.
     webhook.update_workspace(str(path))
@@ -817,11 +820,18 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text("Switched to home workspace. Session cleared.")
     else:
         # Show useful metadata about the workspace
+        config: Config = context.bot_data["config"]
+        ws_config = config.get_workspace_config(path)
         notes = []
         if (path / ".git").is_dir():
             notes.append("Git repo")
         if (path / ".claude" / "CLAUDE.md").exists():
             notes.append("Has CLAUDE.md")
+        # Show applied per-workspace config details
+        if ws_config and ws_config.model:
+            notes.append(f"model: {ws_config.model}")
+        if ws_config and ws_config.budget is not None:
+            notes.append(f"budget: ${ws_config.budget:.2f}")
         suffix = f" ({', '.join(notes)})" if notes else ""
         await update.message.reply_text(f"Workspace: {path}{suffix}\nSession cleared.")
 
@@ -1871,6 +1881,9 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
 
     app = builder.build()
     app.bot_data["config"] = config
+    # Apply per-workspace config for the startup workspace (if any).
+    initial_ws_config = config.get_workspace_config(config.claude_workspace)
+
     app.bot_data["claude"] = PersistentClaude(
         model=config.claude_model,
         workspace=config.claude_workspace,
@@ -1882,6 +1895,7 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
         services_info=services.get_available_services(),
         claude_user=config.claude_user,
         max_session_hours=config.claude_max_session_hours,
+        workspace_config=initial_ws_config,
     )
 
     # Command handlers (alphabetical registration, but order doesn't matter for commands)

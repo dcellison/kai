@@ -18,6 +18,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import yaml
 from dotenv import load_dotenv
 
 log = logging.getLogger(__name__)
@@ -44,6 +45,39 @@ VALID_MODELS = {"haiku", "sonnet", "opus"}
 # Image file extensions that Telegram renders inline as photos.
 # Shared between bot.py (inbound document handling) and webhook.py (send-file API).
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+# ── Per-workspace configuration ──────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class WorkspaceConfig:
+    """
+    Per-workspace configuration loaded from workspaces.yaml.
+
+    All fields except path are optional. When None, the global default
+    from Config is used instead. This lets workspaces override only
+    the settings they care about.
+
+    Attributes:
+        path: Canonical resolved workspace directory.
+        model: Claude model override (haiku/sonnet/opus).
+        budget: Per-session spending cap in USD.
+        timeout: Per-readline timeout in seconds.
+        env: Inline environment variables for the Claude subprocess.
+        env_file: Path to a KEY=VALUE file to load as environment vars.
+        system_prompt: Inline system prompt text.
+        system_prompt_file: Path to a file containing the system prompt.
+    """
+
+    path: Path
+    model: str | None = None
+    budget: float | None = None
+    timeout: int | None = None
+    env: dict[str, str] | None = None
+    env_file: Path | None = None
+    system_prompt: str | None = None
+    system_prompt_file: Path | None = None
 
 
 # ── Config dataclass ─────────────────────────────────────────────────
@@ -125,6 +159,10 @@ class Config:
     workspace_base: Path | None = None
     allowed_workspaces: list[Path] = field(default_factory=list)
 
+    # Per-workspace configuration from workspaces.yaml. Keyed by
+    # canonical resolved path. Empty dict if no config file exists.
+    workspace_configs: dict[Path, WorkspaceConfig] = field(default_factory=dict)
+
     # User separation: run Claude as a different OS user for process isolation.
     # When set, the bot spawns Claude via 'sudo -u <user> claude ...'.
     # The user must exist on the system and must NOT have admin/sudo privileges.
@@ -156,6 +194,15 @@ class Config:
     totp_lockout_attempts: int = 3
     totp_lockout_minutes: int = 15
 
+    def get_workspace_config(self, workspace: Path) -> WorkspaceConfig | None:
+        """
+        Get per-workspace config for a path, or None for global defaults.
+
+        Resolves the path before lookup to handle symlinks and relative
+        paths consistently.
+        """
+        return self.workspace_configs.get(workspace.resolve())
+
 
 # ── Config loading ───────────────────────────────────────────────────
 
@@ -182,6 +229,198 @@ def _read_protected_file(path: str) -> str | None:
         return result.stdout if result.returncode == 0 else None
     except (subprocess.TimeoutExpired, OSError):
         return None
+
+
+def _read_protected_yaml(filename: str) -> dict | None:
+    """
+    Read a YAML file from /etc/kai/ via sudo.
+
+    Returns parsed YAML as a dict, or None if the file does not exist
+    or cannot be read. Uses the same sudo -n pattern as
+    _read_protected_file() to avoid blocking on password prompts.
+    """
+    content = _read_protected_file(f"/etc/kai/{filename}")
+    if content is None:
+        return None
+    try:
+        result = yaml.safe_load(content)
+        return result if isinstance(result, dict) else None
+    except yaml.YAMLError as e:
+        log.error("Invalid YAML in /etc/kai/%s: %s", filename, e)
+        return None
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    """
+    Parse a KEY=VALUE file into a dict.
+
+    Handles:
+    - Lines with KEY=VALUE or KEY="VALUE" or KEY='VALUE'
+    - Lines starting with 'export ' (stripped)
+    - Comments (lines starting with #) and blank lines (skipped)
+    - Surrounding quotes on values (stripped)
+
+    Same parsing logic as _read_protected_file() uses for /etc/kai/env.
+    Re-reads the file each time to pick up changes without restart.
+    """
+    env: dict[str, str] = {}
+    try:
+        text = path.read_text()
+    except OSError as e:
+        log.warning("Cannot read env file %s: %s", path, e)
+        return env
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        # Handle `export KEY=VALUE` lines (common in shell-sourced env files)
+        line = line.removeprefix("export ")
+        key, _, value = line.partition("=")
+        env[key.strip()] = value.strip().strip("\"'")
+    return env
+
+
+def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
+    """
+    Load per-workspace configs from workspaces.yaml.
+
+    Tries /etc/kai/workspaces.yaml first (protected installation),
+    falls back to PROJECT_ROOT/workspaces.yaml (development). Returns
+    an empty dict if neither file exists.
+
+    Returns a dict keyed by canonical resolved path for O(1) lookup.
+    """
+    # Try protected file first, fall back to local
+    data = _read_protected_yaml("workspaces.yaml")
+    if data is None:
+        local_path = PROJECT_ROOT / "workspaces.yaml"
+        if not local_path.exists():
+            return {}
+        try:
+            with open(local_path) as f:
+                data = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            log.error("Invalid YAML in %s: %s", local_path, e)
+            return {}
+        if not isinstance(data, dict):
+            return {}
+
+    entries = data.get("workspaces")
+    if not isinstance(entries, list):
+        return {}
+
+    configs: dict[Path, WorkspaceConfig] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            log.warning("workspaces.yaml: skipping non-dict entry: %s", entry)
+            continue
+
+        # Validate required path field
+        raw_path = entry.get("path")
+        if not raw_path:
+            log.warning("workspaces.yaml: skipping entry without path")
+            continue
+        path = Path(str(raw_path)).expanduser().resolve()
+        if not path.is_dir():
+            log.warning("workspaces.yaml: skipping non-existent path: %s", path)
+            continue
+
+        # Duplicate check: first wins
+        if path in configs:
+            log.warning("workspaces.yaml: duplicate path %s; using first entry", path)
+            continue
+
+        # Parse the optional claude: section
+        claude_section = entry.get("claude") or {}
+        if not isinstance(claude_section, dict):
+            log.warning("workspaces.yaml: invalid claude section for %s", path)
+            continue
+
+        # Validate model
+        model = claude_section.get("model")
+        if model is not None:
+            model = str(model)
+            if model not in VALID_MODELS:
+                log.warning(
+                    "workspaces.yaml: invalid model '%s' for %s (must be one of %s); skipping entry",
+                    model,
+                    path,
+                    VALID_MODELS,
+                )
+                continue
+
+        # Validate budget
+        budget = claude_section.get("budget")
+        if budget is not None:
+            try:
+                budget = float(budget)
+                if budget <= 0:
+                    raise ValueError("must be positive")
+            except (TypeError, ValueError) as e:
+                log.warning("workspaces.yaml: invalid budget for %s: %s; skipping entry", path, e)
+                continue
+
+        # Validate timeout
+        timeout = claude_section.get("timeout")
+        if timeout is not None:
+            try:
+                timeout = int(timeout)
+                if timeout <= 0:
+                    raise ValueError("must be positive")
+            except (TypeError, ValueError) as e:
+                log.warning("workspaces.yaml: invalid timeout for %s: %s; skipping entry", path, e)
+                continue
+
+        # Parse env vars (inline dict)
+        env = claude_section.get("env")
+        if env is not None:
+            if not isinstance(env, dict):
+                log.warning("workspaces.yaml: invalid env for %s; skipping entry", path)
+                continue
+            # Coerce all values to strings
+            env = {str(k): str(v) for k, v in env.items()}
+
+        # Validate env_file
+        env_file = claude_section.get("env_file")
+        if env_file is not None:
+            env_file = Path(str(env_file)).expanduser().resolve()
+            if not env_file.is_file():
+                log.warning("workspaces.yaml: env_file not found for %s: %s; skipping entry", path, env_file)
+                continue
+
+        # Validate system_prompt / system_prompt_file mutual exclusion
+        system_prompt = claude_section.get("system_prompt")
+        system_prompt_file = claude_section.get("system_prompt_file")
+        if system_prompt is not None and system_prompt_file is not None:
+            log.error(
+                "workspaces.yaml: both system_prompt and system_prompt_file set for %s; skipping entry",
+                path,
+            )
+            continue
+        if system_prompt is not None:
+            system_prompt = str(system_prompt)
+        if system_prompt_file is not None:
+            system_prompt_file = Path(str(system_prompt_file)).expanduser().resolve()
+            if not system_prompt_file.is_file():
+                log.warning(
+                    "workspaces.yaml: system_prompt_file not found for %s: %s; skipping entry",
+                    path,
+                    system_prompt_file,
+                )
+                continue
+
+        configs[path] = WorkspaceConfig(
+            path=path,
+            model=model,
+            budget=budget,
+            timeout=timeout,
+            env=env,
+            env_file=env_file,
+            system_prompt=system_prompt,
+            system_prompt_file=system_prompt_file,
+        )
+
+    return configs
 
 
 def load_config() -> Config:
@@ -331,6 +570,17 @@ def load_config() -> Config:
     except ValueError:
         raise SystemExit("TOTP_LOCKOUT_MINUTES must be an integer") from None
 
+    # Per-workspace configuration. Loaded after ALLOWED_WORKSPACES so
+    # YAML-defined workspaces can be merged into the allowed set.
+    workspace_configs = _load_workspace_configs()
+
+    # Merge YAML workspace paths into allowed_workspaces. Workspaces
+    # defined in the config file are implicitly allowed.
+    for p in workspace_configs:
+        if p not in seen_allowed:
+            seen_allowed.add(p)
+            allowed_workspaces.append(p)
+
     return Config(
         telegram_bot_token=token,
         telegram_webhook_url=telegram_webhook_url,
@@ -346,6 +596,7 @@ def load_config() -> Config:
         tts_enabled=os.environ.get("TTS_ENABLED", "").lower() in ("1", "true", "yes"),
         workspace_base=workspace_base,
         allowed_workspaces=allowed_workspaces,
+        workspace_configs=workspace_configs,
         claude_user=os.environ.get("CLAUDE_USER") or None,
         pr_review_enabled=pr_review_enabled,
         pr_review_cooldown=pr_review_cooldown,

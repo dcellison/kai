@@ -1,0 +1,42 @@
+# Per-workspace configuration for Kai.
+#
+# Copy to workspaces.yaml (or /etc/kai/workspaces.yaml for protected
+# installations) and customize.
+#
+# All fields except path are optional. Unset fields use the global
+# defaults from .env / /etc/kai/env.
+
+workspaces:
+  # Example: heavy-duty workspace with Opus and a generous budget
+  # - path: ~/projects/complex-app
+  #   claude:
+  #     model: opus
+  #     budget: 20.0
+  #     timeout: 300
+  #     env:
+  #       DATABASE_URL: "postgres://localhost/myapp"
+  #     system_prompt: |
+  #       This is a Django application. Run tests with pytest.
+
+  # Example: env vars from an existing file (avoids dual-maintenance)
+  # - path: ~/projects/data-pipeline
+  #   claude:
+  #     model: sonnet
+  #     env_file: ~/projects/data-pipeline/.env.kai
+
+  # Example: env_file as a base with inline overrides on top
+  # - path: ~/projects/staging
+  #   claude:
+  #     env_file: ~/projects/staging/.env
+  #     env:
+  #       RAILS_ENV: "staging"
+
+  # Example: lightweight docs workspace with Haiku
+  # - path: ~/projects/docs
+  #   claude:
+  #     model: haiku
+
+  # Example: workspace with a system prompt from a file
+  # - path: ~/projects/firmware
+  #   claude:
+  #     system_prompt_file: /etc/kai/prompts/firmware.txt

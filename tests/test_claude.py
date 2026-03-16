@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kai.claude import PersistentClaude, StreamEvent
+from kai.config import WorkspaceConfig
 
 # ── Shared helpers ───────────────────────────────────────────────────
 
@@ -1553,3 +1554,234 @@ class TestRestart:
             await claude.restart()
 
         mock_kill.assert_called_once()
+
+
+# ── Workspace config ────────────────────────────────────────────────
+
+
+class TestWorkspaceConfig:
+    def test_constructor_with_workspace_config(self):
+        """WorkspaceConfig overrides model, budget, and timeout."""
+        ws_config = WorkspaceConfig(
+            path=Path("/tmp/ws"),
+            model="opus",
+            budget=15.0,
+            timeout=300,
+        )
+        claude = _make_claude(workspace_config=ws_config)
+        assert claude.model == "opus"
+        assert claude.max_budget_usd == 15.0
+        assert claude.timeout_seconds == 300
+
+    def test_constructor_without_workspace_config(self):
+        """Without config, global defaults are used."""
+        claude = _make_claude()
+        assert claude.model == "sonnet"
+        assert claude.max_budget_usd == 1.0
+        assert claude.timeout_seconds == 30
+
+    def test_constructor_partial_workspace_config(self):
+        """Config with only model set leaves budget and timeout at defaults."""
+        ws_config = WorkspaceConfig(path=Path("/tmp/ws"), model="haiku")
+        claude = _make_claude(workspace_config=ws_config)
+        assert claude.model == "haiku"
+        assert claude.max_budget_usd == 1.0  # unchanged
+        assert claude.timeout_seconds == 30  # unchanged
+
+    def test_defaults_preserved(self):
+        """Constructor stores the original global defaults."""
+        ws_config = WorkspaceConfig(path=Path("/tmp/ws"), model="opus", budget=20.0)
+        claude = _make_claude(workspace_config=ws_config)
+        assert claude._default_model == "sonnet"
+        assert claude._default_budget == 1.0
+        assert claude._default_timeout == 30
+
+    @pytest.mark.asyncio
+    async def test_change_workspace_with_config(self):
+        """Switching to a configured workspace applies overrides."""
+        claude = _make_claude()
+        ws_config = WorkspaceConfig(path=Path("/tmp/ws2"), model="opus", budget=20.0)
+
+        with patch.object(claude, "_kill", new_callable=AsyncMock):
+            await claude.change_workspace(Path("/tmp/ws2"), workspace_config=ws_config)
+
+        assert claude.model == "opus"
+        assert claude.max_budget_usd == 20.0
+
+    @pytest.mark.asyncio
+    async def test_change_workspace_to_unconfigured(self):
+        """Switching from configured to unconfigured reverts to global defaults."""
+        ws_config = WorkspaceConfig(path=Path("/tmp/ws"), model="opus", budget=20.0)
+        claude = _make_claude(workspace_config=ws_config)
+        assert claude.model == "opus"
+
+        with patch.object(claude, "_kill", new_callable=AsyncMock):
+            await claude.change_workspace(Path("/tmp/other"))
+
+        assert claude.model == "sonnet"  # reverted to default
+        assert claude.max_budget_usd == 1.0  # reverted to default
+
+    @pytest.mark.asyncio
+    async def test_change_workspace_no_stale_values(self):
+        """Partial config doesn't carry over values from previous workspace.
+
+        Scenario: workspace A has budget=20.0. Switch to workspace B
+        which only sets model. Budget must revert to the global default,
+        not carry over workspace A's 20.0.
+        """
+        ws_a = WorkspaceConfig(path=Path("/tmp/a"), model="opus", budget=20.0)
+        ws_b = WorkspaceConfig(path=Path("/tmp/b"), model="haiku")
+        claude = _make_claude(workspace_config=ws_a)
+
+        with patch.object(claude, "_kill", new_callable=AsyncMock):
+            await claude.change_workspace(Path("/tmp/b"), workspace_config=ws_b)
+
+        assert claude.model == "haiku"
+        assert claude.max_budget_usd == 1.0  # global default, not 20.0
+
+    @pytest.mark.asyncio
+    async def test_change_workspace_model_override_cycle(self):
+        """Config model restored after /model override and workspace switch.
+
+        Scenario: configured workspace (opus), user does /model haiku,
+        switches away, switches back. The workspace config model (opus)
+        should be restored, not the /model override (haiku).
+        """
+        ws_config = WorkspaceConfig(path=Path("/tmp/ws"), model="opus")
+        claude = _make_claude(workspace_config=ws_config)
+        assert claude.model == "opus"
+
+        # User overrides model via /model command
+        claude.model = "haiku"
+        assert claude.model == "haiku"
+
+        # Switch away (unconfigured workspace)
+        with patch.object(claude, "_kill", new_callable=AsyncMock):
+            await claude.change_workspace(Path("/tmp/other"))
+        assert claude.model == "sonnet"  # global default
+
+        # Switch back to configured workspace
+        with patch.object(claude, "_kill", new_callable=AsyncMock):
+            await claude.change_workspace(Path("/tmp/ws"), workspace_config=ws_config)
+        assert claude.model == "opus"  # config model, not haiku
+
+    def test_system_prompt_inline(self):
+        """_get_workspace_system_prompt returns inline prompt."""
+        ws_config = WorkspaceConfig(path=Path("/tmp/ws"), system_prompt="Be concise.")
+        claude = _make_claude(workspace_config=ws_config)
+        assert claude._get_workspace_system_prompt() == "Be concise."
+
+    def test_system_prompt_from_file(self, tmp_path):
+        """_get_workspace_system_prompt reads from file."""
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("Use pytest.")
+        ws_config = WorkspaceConfig(path=Path("/tmp/ws"), system_prompt_file=prompt_file)
+        claude = _make_claude(workspace_config=ws_config)
+        assert claude._get_workspace_system_prompt() == "Use pytest."
+
+    def test_system_prompt_file_deleted(self, tmp_path):
+        """Returns None if system_prompt_file is deleted after load."""
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("hello")
+        ws_config = WorkspaceConfig(path=Path("/tmp/ws"), system_prompt_file=prompt_file)
+        claude = _make_claude(workspace_config=ws_config)
+        prompt_file.unlink()
+        assert claude._get_workspace_system_prompt() is None
+
+    def test_system_prompt_none_without_config(self):
+        """Returns None when no workspace config is set."""
+        claude = _make_claude()
+        assert claude._get_workspace_system_prompt() is None
+
+    @pytest.mark.asyncio
+    async def test_env_merge_in_ensure_started(self):
+        """Per-workspace env vars are merged into the subprocess environment."""
+        ws_config = WorkspaceConfig(
+            path=Path("/tmp/ws"),
+            env={"MY_VAR": "my_value"},
+        )
+        claude = _make_claude(workspace_config=ws_config)
+        claude._fresh_session = False
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            # Check the env kwarg passed to create_subprocess_exec
+            call_kwargs = mock_exec.call_args.kwargs
+            assert call_kwargs["env"]["MY_VAR"] == "my_value"
+
+    @pytest.mark.asyncio
+    async def test_env_merge_webhook_secret_preserved(self):
+        """Workspace env can't override the webhook secret."""
+        ws_config = WorkspaceConfig(
+            path=Path("/tmp/ws"),
+            env={"KAI_WEBHOOK_SECRET": "evil"},
+        )
+        claude = _make_claude(workspace_config=ws_config)
+        claude.webhook_secret = "real_secret"
+        claude._fresh_session = False
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            call_kwargs = mock_exec.call_args.kwargs
+            # Webhook secret is set LAST and overrides workspace env
+            assert call_kwargs["env"]["KAI_WEBHOOK_SECRET"] == "real_secret"
+
+    @pytest.mark.asyncio
+    async def test_env_file_loading(self, tmp_path):
+        """Per-workspace env_file values are merged into subprocess env."""
+        env_file = tmp_path / ".env.kai"
+        env_file.write_text("FROM_FILE=hello\n")
+        ws_config = WorkspaceConfig(path=Path("/tmp/ws"), env_file=env_file)
+        claude = _make_claude(workspace_config=ws_config)
+        claude._fresh_session = False
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            call_kwargs = mock_exec.call_args.kwargs
+            assert call_kwargs["env"]["FROM_FILE"] == "hello"
+
+    @pytest.mark.asyncio
+    async def test_env_file_overridden_by_inline(self, tmp_path):
+        """Inline env overrides env_file values for the same key."""
+        env_file = tmp_path / ".env.kai"
+        env_file.write_text("SHARED=from_file\n")
+        ws_config = WorkspaceConfig(
+            path=Path("/tmp/ws"),
+            env_file=env_file,
+            env={"SHARED": "from_inline"},
+        )
+        claude = _make_claude(workspace_config=ws_config)
+        claude._fresh_session = False
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = MagicMock()
+            mock_proc.stderr.readline = AsyncMock(return_value=b"")
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            call_kwargs = mock_exec.call_args.kwargs
+            assert call_kwargs["env"]["SHARED"] == "from_inline"
