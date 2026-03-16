@@ -317,10 +317,11 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
         try:
             with open(local_path) as f:
                 data = yaml.safe_load(f)
-        except yaml.YAMLError as e:
-            log.error("Invalid YAML in %s: %s", local_path, e)
+        except (yaml.YAMLError, OSError) as e:
+            log.error("Cannot load %s: %s", local_path, e)
             return {}
         if not isinstance(data, dict):
+            log.warning("%s: expected a YAML dict, got %s", local_path, type(data).__name__)
             return {}
 
     entries = data.get("workspaces")
@@ -378,10 +379,14 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
                 log.warning("workspaces.yaml: invalid budget for %s: %s; skipping entry", path, e)
                 continue
 
-        # Validate timeout (must be a positive integer, not a float)
+        # Validate timeout (must be a positive integer, not a float or bool).
+        # bool is a subclass of int in Python, so `timeout: true` would
+        # silently become 1 without an explicit check.
         timeout = claude_section.get("timeout")
         if timeout is not None:
             try:
+                if isinstance(timeout, bool):
+                    raise ValueError("must be an integer, not a boolean")
                 if isinstance(timeout, float) and not timeout.is_integer():
                     raise ValueError("must be an integer, not a float")
                 timeout = int(timeout)

@@ -452,6 +452,26 @@ class TestLoadWorkspaceConfigs:
             configs = _load_workspace_configs()
         assert configs == {}
 
+    def test_bool_timeout_rejected(self, tmp_path):
+        """Boolean timeout (e.g. true) is rejected, not silently cast to 1."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            workspaces:
+              - path: {ws}
+                claude:
+                  timeout: true
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_workspace_configs()
+        assert configs == {}
+
     def test_integer_like_float_timeout_accepted(self, tmp_path):
         """Integer-like float (e.g. 300.0 from YAML) is accepted."""
         ws = tmp_path / "ws"

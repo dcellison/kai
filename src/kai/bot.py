@@ -824,18 +824,19 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if path == home:
         await update.message.reply_text("Switched to home workspace. Session cleared.")
     else:
-        # Show useful metadata about the workspace
+        # Show filesystem metadata and per-workspace config separately
         notes = []
         if (path / ".git").is_dir():
             notes.append("Git repo")
         if (path / ".claude" / "CLAUDE.md").exists():
             notes.append("Has CLAUDE.md")
-        # Show applied per-workspace config details
+        extras = []
         if ws_config and ws_config.model:
-            notes.append(f"model: {ws_config.model}")
+            extras.append(f"model: {ws_config.model}")
         if ws_config and ws_config.budget is not None:
-            notes.append(f"budget: ${ws_config.budget:.2f}")
-        suffix = f" ({', '.join(notes)})" if notes else ""
+            extras.append(f"budget: ${ws_config.budget:.2f}")
+        all_info = notes + extras
+        suffix = f" ({', '.join(all_info)})" if all_info else ""
         await update.message.reply_text(f"Workspace: {path}{suffix}\nSession cleared.")
 
 
