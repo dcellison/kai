@@ -34,6 +34,7 @@ from kai.bot import (
     _save_to_workspace,
     _set_responding,
     _short_workspace_name,
+    _switch_workspace,
     _truncate_for_telegram,
     _voices_keyboard,
     _workspace_config_suffix,
@@ -1615,8 +1616,6 @@ class TestSwitchWorkspaceConfig:
             patch("kai.bot.sessions", new_callable=AsyncMock),
             patch("kai.bot.webhook"),
         ):
-            from kai.bot import _switch_workspace
-
             await _switch_workspace(update, ctx, ws_path.resolve())
 
         reply_text = update.message.reply_text.call_args[0][0]
@@ -1624,17 +1623,20 @@ class TestSwitchWorkspaceConfig:
         assert "budget: $20.00" in reply_text
 
     @pytest.mark.asyncio
-    async def test_switch_deleted_directory(self):
+    async def test_switch_deleted_directory(self, tmp_path):
         """Switching to a workspace whose directory no longer exists shows an error."""
-        from kai.bot import _switch_workspace
+        home = tmp_path / "home"
+        home.mkdir()
+        gone = tmp_path / "gone"
+        gone.mkdir()
+        gone.rmdir()  # create then delete so the path is guaranteed absent
 
-        config = _make_config(claude_workspace=Path("/home/workspace"))
-        claude = _make_mock_claude(workspace=Path("/home/workspace"))
+        config = _make_config(claude_workspace=home)
+        claude = _make_mock_claude(workspace=home)
         update = _make_update()
         ctx = _make_context(config=config, claude=claude)
 
-        # Path that never existed on disk - no mocking needed
-        await _switch_workspace(update, ctx, Path("/tmp/nonexistent-workspace-12345"))
+        await _switch_workspace(update, ctx, gone)
 
         update.message.reply_text.assert_called_with("That workspace no longer exists.")
 
