@@ -151,10 +151,15 @@ ISSUE_NUM=77           # the issue number to update
 ITEM_ID=$(gh project item-list $PROJECT_NUM --owner dcellison --format json \
   | jq -r ".items[] | select(.content.number == $ISSUE_NUM) | .id")
 
-# Look up the project ID, Status field ID, and option IDs
-gh project field-list $PROJECT_NUM --owner dcellison --format json
+# Look up the project node ID
+PROJECT_ID=$(gh project list --owner dcellison --format json \
+  | jq -r ".projects[] | select(.number == $PROJECT_NUM) | .id")
 
-# Update the status (use field/option IDs from the command above)
+# Look up the Status field ID and option IDs
+gh project field-list $PROJECT_NUM --owner dcellison --format json
+# Set FIELD_ID and OPTION_ID from the output above
+
+# Update the status
 gh project item-edit --project-id "$PROJECT_ID" --id "$ITEM_ID" \
   --field-id "$FIELD_ID" --single-select-option-id "$OPTION_ID"
 ```
