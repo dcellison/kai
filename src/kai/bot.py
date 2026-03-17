@@ -832,6 +832,11 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text("Already in that workspace.")
         return
 
+    # Guard against directories deleted after startup (matches keyboard path behavior)
+    if not path.is_dir():
+        await update.message.reply_text("That workspace no longer exists.")
+        return
+
     ws_config = await _do_switch_workspace(context, _chat_id(update), path)
 
     config_suffix = _workspace_config_suffix(ws_config)

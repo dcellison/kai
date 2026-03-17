@@ -1192,10 +1192,12 @@ class TestHandleWorkspace:
         assert "Home" in reply or "workspace" in reply.lower()
 
     @pytest.mark.asyncio
-    async def test_home_switches(self):
+    async def test_home_switches(self, tmp_path):
         """'home' keyword switches to home workspace."""
+        home = tmp_path / "home"
+        home.mkdir()
         claude = _make_mock_claude(workspace=Path("/other"))
-        config = _make_config(claude_workspace=Path("/home/workspace"))
+        config = _make_config(claude_workspace=home)
         update = _make_update()
         ctx = _make_context(claude=claude, config=config, args=["home"])
         with (
@@ -1620,6 +1622,21 @@ class TestSwitchWorkspaceConfig:
         reply_text = update.message.reply_text.call_args[0][0]
         assert "model: opus" in reply_text
         assert "budget: $20.00" in reply_text
+
+    @pytest.mark.asyncio
+    async def test_switch_deleted_directory(self):
+        """Switching to a workspace whose directory no longer exists shows an error."""
+        from kai.bot import _switch_workspace
+
+        config = _make_config(claude_workspace=Path("/home/workspace"))
+        claude = _make_mock_claude(workspace=Path("/home/workspace"))
+        update = _make_update()
+        ctx = _make_context(config=config, claude=claude)
+
+        # Path that never existed on disk - no mocking needed
+        await _switch_workspace(update, ctx, Path("/tmp/nonexistent-workspace-12345"))
+
+        update.message.reply_text.assert_called_with("That workspace no longer exists.")
 
 
 # ── handle_message (non-TOTP) ────────────────────────────────────────
