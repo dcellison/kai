@@ -78,7 +78,7 @@ curl -s -X POST http://localhost:8080/api/schedule \
 curl -s -X POST http://localhost:8080/api/schedule \
   -H 'Content-Type: application/json' \
   -H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET" \
-  -d '{"name": "Package tracker", "prompt": "Has my package arrived?", "job_type": "claude", "auto_remove": true, "notify_on_check": true, "schedule_type": "interval", "schedule_data": {"seconds": 3600}}'
+  -d '{"name": "Package tracker", "prompt": "Has my package arrived? Give a brief status update.", "job_type": "claude", "auto_remove": true, "notify_on_check": true, "schedule_type": "interval", "schedule_data": {"seconds": 3600}}'
 ```
 
 For auto-remove jobs, start your response with `CONDITION_MET: <message>` when the condition is satisfied, or `CONDITION_NOT_MET` to silently continue. If `notify_on_check` is enabled, use `CONDITION_NOT_MET: <status message>` to send progress updates while continuing to monitor.
@@ -143,19 +143,21 @@ When working on issues tracked in a GitHub Project, update the board:
 
 To move an issue to "In Progress", look up IDs dynamically:
 ```bash
-# Find the item on the project board
-ITEM_ID=$(gh project item-list PROJECT_NUM --owner dcellison --format json \
-  | jq -r '.items[] | select(.content.number == ISSUE_NUM) | .id')
+# Set these for your specific issue and project
+PROJECT_NUM=1          # from gh project list --owner dcellison
+ISSUE_NUM=77           # the issue number to update
 
-# Look up the Status field ID and option IDs
-gh project field-list PROJECT_NUM --owner dcellison --format json
+# Find the item on the project board
+ITEM_ID=$(gh project item-list $PROJECT_NUM --owner dcellison --format json \
+  | jq -r ".items[] | select(.content.number == $ISSUE_NUM) | .id")
+
+# Look up the project ID, Status field ID, and option IDs
+gh project field-list $PROJECT_NUM --owner dcellison --format json
 
 # Update the status (use field/option IDs from the command above)
-gh project item-edit --project-id PROJECT_ID --id "$ITEM_ID" \
-  --field-id FIELD_ID --single-select-option-id OPTION_ID
+gh project item-edit --project-id "$PROJECT_ID" --id "$ITEM_ID" \
+  --field-id "$FIELD_ID" --single-select-option-id "$OPTION_ID"
 ```
-
-Replace `PROJECT_NUM`, `ISSUE_NUM`, `PROJECT_ID`, `FIELD_ID`, and `OPTION_ID` with values from `gh project` commands.
 
 ## External Services
 
