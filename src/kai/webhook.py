@@ -58,17 +58,23 @@ log = logging.getLogger(__name__)
 _RESPONDING_FLAG = DATA_DIR / ".responding_to"
 
 
-def _active_chat_id(app: web.Application) -> int:
+async def _active_chat_id(app: web.Application) -> int:
     """Return the chat ID of the user currently being served.
 
     While *bot.py* is processing a message it writes the requester's
     chat ID to a flag file.  Prefer that value so webhook responses
     (files, notifications) reach the correct user.  Fall back to the
     app-level default when the flag is absent.
+
+    Note: this assumes only one user is being served at a time.  If two
+    users are processed concurrently, bot.py's _set_responding() calls
+    will race on the same flag file.  A proper fix requires passing
+    chat_id through the MCP tool call.
     """
     try:
-        return int(_RESPONDING_FLAG.read_text().strip())
-    except (FileNotFoundError, ValueError):
+        text = await asyncio.to_thread(_RESPONDING_FLAG.read_text)
+        return int(text.strip())
+    except (OSError, ValueError):
         return app["chat_id"]
 
 
@@ -472,7 +478,7 @@ async def _handle_github(request: web.Request) -> web.Response:
     """
     secret = request.app["webhook_secret"]
     bot = request.app["telegram_bot"]
-    chat_id = _active_chat_id(request.app)
+    chat_id = request.app["chat_id"]
 
     body = await request.read()
 
@@ -612,7 +618,7 @@ async def _handle_generic(request: web.Request) -> web.Response:
     4096-char limit.
     """
     bot = request.app["telegram_bot"]
-    chat_id = _active_chat_id(request.app)
+    chat_id = request.app["chat_id"]
 
     try:
         payload = await request.json()
@@ -695,7 +701,7 @@ async def _handle_schedule(request: web.Request) -> web.Response:
         )
     auto_remove = payload.get("auto_remove", False)
     notify_on_check = payload.get("notify_on_check", False)
-    chat_id = _active_chat_id(request.app)
+    chat_id = await _active_chat_id(request.app)
 
     # schedule_data can arrive as a JSON object or a pre-serialized string
     if isinstance(schedule_data, dict):
@@ -739,7 +745,7 @@ async def _handle_get_jobs(request: web.Request) -> web.Response:
     without needing to parse Telegram bot command output.
     """
 
-    chat_id = _active_chat_id(request.app)
+    chat_id = await _active_chat_id(request.app)
     jobs = await sessions.get_jobs(chat_id)
     return web.json_response(jobs)
 
@@ -945,7 +951,7 @@ async def _handle_send_message(request: web.Request) -> web.Response:
         return web.json_response({"error": "Missing required field: text"}, status=400)
 
     bot = request.app["telegram_bot"]
-    chat_id = _active_chat_id(request.app)
+    chat_id = await _active_chat_id(request.app)
 
     try:
         # Telegram limits messages to 4096 characters. Split long messages
@@ -1025,7 +1031,7 @@ async def _handle_send_file(request: web.Request) -> web.Response:
         return web.json_response({"error": f"File not found: {file_path}"}, status=404)
 
     bot = request.app["telegram_bot"]
-    chat_id = _active_chat_id(request.app)
+    chat_id = await _active_chat_id(request.app)
     caption = payload.get("caption", "")
 
     # Send images as photos (Telegram renders them inline) and everything
