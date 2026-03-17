@@ -58,11 +58,11 @@ Foreign workspaces also get their own `.claude/MEMORY.md` injected alongside hom
 
 Reminders and recurring agent jobs with one-shot, daily, and interval schedules. Ask naturally ("remind me at 3pm") or use the HTTP API (`POST /api/schedule`). Agent jobs run as full Claude Code sessions - Kai can check conditions, search the web, run commands, and report back on a schedule. Auto-remove jobs support monitoring use cases where the agent watches for a condition and deactivates itself when it's met. See [Scheduling and Conditional Jobs](https://github.com/dcellison/kai/wiki/Scheduling-and-Conditional-Jobs).
 
-### PR review agent
+### PR Review Agent
 
 When code is pushed to a pull request, Kai automatically reviews it. A one-shot Claude subprocess analyzes the diff, checks for bugs, style issues, and spec compliance, and posts a review comment directly on the PR. If you push fixes, it reviews again - and checks its own prior comments so it doesn't nag about things you already addressed. See [PR Review Agent](https://github.com/dcellison/kai/wiki/PR-Review-Agent).
 
-### Issue triage agent
+### Issue Triage Agent
 
 When a new issue is opened, Kai triages it automatically. A one-shot Claude subprocess reads the issue, applies labels (creating them if they don't exist), checks for duplicates and related issues, assigns it to a project board if appropriate, posts a triage summary comment, and sends you a Telegram notification. See [Issue Triage Agent](https://github.com/dcellison/kai/wiki/Issue-Triage-Agent).
 
