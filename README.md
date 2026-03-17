@@ -42,7 +42,7 @@ For the full architecture, see [System Architecture](https://github.com/dcelliso
 
 Switch the agent between projects on your system with `/workspace <name>`. Names resolve relative to `WORKSPACE_BASE` (set in `.env`). Identity and memory carry over from the home workspace, so Kai retains full context regardless of what it's working on. Create new workspaces with `/workspace new <name>`. Absolute paths are not accepted - all workspaces must live under the configured base directory.
 
-Per-workspace configuration is supported via `workspaces.yaml` (or `/etc/kai/workspaces.yaml` for protected installations). Each workspace can override the Claude model, budget, timeout, environment variables, and system prompt. See `workspaces.yaml.example` for the full format.
+Per-workspace configuration is supported via `workspaces.yaml` (or `/etc/kai/workspaces.yaml` for protected installations). Each workspace can override the Claude model, budget, timeout, environment variables, and system prompt. See `workspaces.example.yaml` for the full format.
 
 ### Memory
 
@@ -57,6 +57,16 @@ Foreign workspaces also get their own `.claude/MEMORY.md` injected alongside hom
 ### Scheduled jobs
 
 Reminders and recurring agent jobs with one-shot, daily, and interval schedules. Ask naturally ("remind me at 3pm") or use the HTTP API (`POST /api/schedule`). Agent jobs run as full Claude Code sessions - Kai can check conditions, search the web, run commands, and report back on a schedule. Auto-remove jobs support monitoring use cases where the agent watches for a condition and deactivates itself when it's met. See [Scheduling and Conditional Jobs](https://github.com/dcellison/kai/wiki/Scheduling-and-Conditional-Jobs).
+
+### PR review agent
+
+When code is pushed to a pull request, Kai automatically reviews it. A one-shot Claude subprocess analyzes the diff, checks for bugs, style issues, and spec compliance, and posts a review comment directly on the PR. If you push fixes, it reviews again - and checks its own prior comments so it doesn't nag about things you already addressed. See [PR Review Agent](https://github.com/dcellison/kai/wiki/PR-Review-Agent).
+
+### Issue triage agent
+
+When a new issue is opened, Kai triages it automatically. A one-shot Claude subprocess reads the issue, applies labels (creating them if they don't exist), checks for duplicates and related issues, assigns it to a project board if appropriate, posts a triage summary comment, and sends you a Telegram notification. See [Issue Triage Agent](https://github.com/dcellison/kai/wiki/Issue-Triage-Agent).
+
+Both agents are fire-and-forget background tasks that run independently of your chat session. They use separate Claude processes, so a review or triage can happen while you're mid-conversation. Opt-in via `PR_REVIEW_ENABLED` and `ISSUE_TRIAGE_ENABLED` in `.env`.
 
 ### Webhooks
 
@@ -147,6 +157,8 @@ cp .env.example .env
 | `WEBHOOK_SECRET` | No | | Secret for webhook validation and scheduling API auth |
 | `TELEGRAM_WEBHOOK_URL` | No | | Telegram webhook URL (enables webhook mode; omit for polling) |
 | `TELEGRAM_WEBHOOK_SECRET` | No | | Separate secret for Telegram webhook auth (defaults to `WEBHOOK_SECRET`) |
+| `PR_REVIEW_ENABLED` | No | `false` | Enable automatic PR review on push |
+| `ISSUE_TRIAGE_ENABLED` | No | `false` | Enable automatic issue triage on open |
 | `VOICE_ENABLED` | No | `false` | Enable voice message transcription |
 | `TTS_ENABLED` | No | `false` | Enable text-to-speech voice responses |
 | `TOTP_SESSION_MINUTES` | No | `30` | Minutes before TOTP re-authentication is required |
@@ -273,6 +285,9 @@ kai/
 │   ├── locks.py              # Per-chat async locks and stop events
 │   ├── install.py            # Protected installation tooling
 │   ├── totp.py               # TOTP verification, rate limiting, and CLI
+│   ├── review.py             # PR review agent (one-shot Claude subprocess)
+│   ├── triage.py             # Issue triage agent (one-shot Claude subprocess)
+│   ├── services.py           # External service proxy for third-party APIs
 │   ├── transcribe.py         # Voice message transcription (ffmpeg + whisper-cpp)
 │   └── tts.py                # Text-to-speech synthesis (Piper TTS + ffmpeg)
 ├── tests/                    # Test suite
@@ -283,7 +298,7 @@ kai/
 ├── logs/                     # Daily-rotated log files (gitignored)
 ├── models/                   # Whisper and Piper model files (gitignored)
 ├── services.yaml             # External service configs (gitignored)
-├── workspaces.yaml.example   # Per-workspace config template
+├── workspaces.example.yaml   # Per-workspace config template
 ├── pyproject.toml            # Package metadata and dependencies
 ├── Makefile                  # Common dev commands
 ├── .env                      # Environment variables (gitignored, copy from .env.example)
