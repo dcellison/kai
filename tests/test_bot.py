@@ -49,6 +49,7 @@ from kai.bot import (
     handle_model_callback,
     handle_models,
     handle_new,
+    handle_notifications,
     handle_photo,
     handle_start,
     handle_stats,
@@ -1250,6 +1251,34 @@ class TestHandleWebhooks:
             await handle_webhooks(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "WEBHOOK_SECRET not set" in reply
+
+
+# ── handle_notifications ─────────────────────────────────────────────
+
+
+class TestHandleNotifications:
+    @pytest.mark.asyncio
+    async def test_github_on_displays_correctly(self):
+        """'github' source must display as 'GitHub', not 'Github'."""
+        update = _make_update()
+        ctx = _make_context()
+        ctx.args = ["github", "on"]
+        with patch("kai.bot.sessions") as mock_sessions:
+            mock_sessions.set_setting = AsyncMock()
+            await handle_notifications(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert reply == "GitHub notifications: on"
+
+    @pytest.mark.asyncio
+    async def test_webhook_off_displays_correctly(self):
+        update = _make_update()
+        ctx = _make_context()
+        ctx.args = ["webhook", "off"]
+        with patch("kai.bot.sessions") as mock_sessions:
+            mock_sessions.set_setting = AsyncMock()
+            await handle_notifications(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert reply == "Webhook notifications: off"
 
 
 # ── handle_workspace ─────────────────────────────────────────────────

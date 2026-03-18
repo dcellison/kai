@@ -1280,7 +1280,8 @@ async def handle_notifications(update: Update, context: ContextTypes.DEFAULT_TYP
     key = f"{source}_notifications"
     value = "true" if state == "on" else "false"
     await sessions.set_setting(user_id, key, value)
-    await update.message.reply_text(f"{source.title()} notifications: {state}")
+    display = {"github": "GitHub", "webhook": "Webhook"}
+    await update.message.reply_text(f"{display[source]} notifications: {state}")
 
 
 @_require_auth

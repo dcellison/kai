@@ -357,9 +357,9 @@ kai/
 │   ├── transcribe.py         # Voice message transcription (ffmpeg + whisper-cpp)
 │   └── tts.py                # Text-to-speech synthesis (Piper TTS + ffmpeg)
 ├── tests/                    # Test suite
-├── workspace/                # Claude Code working directory
-│   ├── .claude/              # Identity, memory, and chat history
-│   └── files/                # File exchange directory (created at runtime)
+├── workspace/                # Template workspace (copied to per-user dirs on first access)
+│   └── .claude/              # CLAUDE.md template, MEMORY.md.example
+├── users/                    # Per-user data (gitignored, created at runtime)
 ├── kai.db                    # SQLite database (gitignored, created at runtime)
 ├── logs/                     # Daily-rotated log files (gitignored)
 ├── models/                   # Whisper and Piper model files (gitignored)

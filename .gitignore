@@ -39,9 +39,9 @@ workspace/.claude/*
 .vscode/
 *.swp
 
-# Claude
-.claude/
+# Claude Code local config (root only)
+/.claude/
 
-# Users
-users/
+# Per-user runtime data (root only)
+/users/
 
