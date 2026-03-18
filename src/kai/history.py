@@ -22,13 +22,14 @@ summary of the last few messages for ambient recall at session start.
 
 import asyncio
 import json
-import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
+import structlog
+
 from kai.config import DATA_DIR
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger("kai.history")
 
 # Limits for the recent-history summary injected at session start
 _MAX_RECENT_MESSAGES = 20
@@ -85,7 +86,7 @@ async def log_message(
     try:
         await asyncio.to_thread(_write_log_line, filepath, record)
     except OSError:
-        log.exception("Failed to write chat log")
+        log.exception("history.write_failed")
 
 
 def get_recent_history(user_id: int) -> str:
@@ -126,7 +127,7 @@ def get_recent_history(user_id: int) -> str:
         try:
             raw = path.read_text(encoding="utf-8")
         except OSError:
-            log.exception("Failed to read history file %s", path)
+            log.exception("history.read_failed", path=str(path))
             continue
         for line in raw.splitlines():
             if line.strip():
@@ -134,7 +135,7 @@ def get_recent_history(user_id: int) -> str:
                     file_messages.append(json.loads(line))
                 except json.JSONDecodeError:
                     # Skip individual bad lines rather than discarding the whole file
-                    log.debug("Skipping malformed JSON line in %s: %s", path.name, line[:100])
+                    log.debug("history.malformed_line", file=path.name, line=line[:100])
 
         # Prepend this file's messages (older days go before newer days)
         messages = file_messages + messages

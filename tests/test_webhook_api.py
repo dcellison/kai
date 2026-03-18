@@ -586,7 +586,9 @@ def github_request():
         "webhook_secret": "test-secret",
         "telegram_bot": AsyncMock(),
         "allowed_user_ids": {12345},
-        "user_workspaces": {},
+        # Match the test repo name ("testuser/repo") so _users_for_repo routes
+        # notifications to our test user (unmatched repos get no notifications).
+        "user_workspaces": {12345: "/workspace/repo"},
     }
     request.headers = {}
     return request

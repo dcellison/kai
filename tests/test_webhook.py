@@ -338,7 +338,10 @@ def _build_test_app(
     mock_bot = AsyncMock()
     app["telegram_bot"] = mock_bot
     app["allowed_user_ids"] = {12345}
-    app["user_workspaces"] = {}
+    # Set a workspace matching the test repo name ("owner/repo") so _users_for_repo
+    # routes notifications to our test user. Without this, unmatched repos get no
+    # notifications (by design — only users with matching workspaces are notified).
+    app["user_workspaces"] = {12345: "/workspace/repo"}
     app.router.add_post("/webhook/github", _handle_github)
     return app
 

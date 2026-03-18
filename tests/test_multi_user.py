@@ -18,14 +18,12 @@ from kai.bot import (
     _clear_responding,
     _reset_session_id,
     _set_responding,
-    _user_home,
     handle_document,
     handle_jobs,
     handle_message,
     handle_model_callback,
     handle_models,
     handle_new,
-    handle_notifications,
     handle_photo,
     handle_stats,
     handle_stop,
@@ -362,7 +360,7 @@ class TestHandlerUserRouting:
         assert called_claude is not claude_b  # Explicit isolation check
 
     async def test_handle_photo_saves_to_user_session_dir(self, tmp_path):
-        claude_a, claude_b, manager, config = _two_user_setup()
+        _claude_a, _claude_b, manager, config = _two_user_setup()
 
         update = _make_update(user_id=USER_A)
         photo = MagicMock()
@@ -411,7 +409,7 @@ class TestHandlerUserRouting:
         assert not has_opus_marker
 
     async def test_handle_document_saves_to_user_session_dir(self, tmp_path):
-        claude_a, claude_b, manager, config = _two_user_setup()
+        _claude_a, _claude_b, manager, config = _two_user_setup()
 
         update = _make_update(user_id=USER_A)
         doc = MagicMock()
@@ -470,7 +468,7 @@ class TestHandlerUserRouting:
         claude_b.change_workspace.assert_not_called()
 
     async def test_stats_shows_correct_user(self):
-        claude_a, claude_b, manager, config = _two_user_setup()
+        _claude_a, _claude_b, manager, config = _two_user_setup()
         stats_data = {
             USER_A: {"session_id": "a1", "model": "opus", "created_at": "2026-01-01", "last_used_at": "2026-01-02", "total_cost_usd": 5.0},
             USER_B: {"session_id": "b1", "model": "sonnet", "created_at": "2026-01-01", "last_used_at": "2026-01-02", "total_cost_usd": 1.0},
@@ -488,7 +486,7 @@ class TestHandlerUserRouting:
         assert "1.0" in reply
 
     async def test_jobs_shows_correct_user(self):
-        claude_a, claude_b, manager, config = _two_user_setup()
+        _claude_a, _claude_b, manager, config = _two_user_setup()
         jobs_data = {
             USER_A: [
                 {

@@ -16,11 +16,12 @@ from raw audio bytes to transcript string.
 """
 
 import asyncio
-import logging
 import tempfile
 from pathlib import Path
 
-log = logging.getLogger(__name__)
+import structlog
+
+log = structlog.get_logger("kai.transcribe")
 
 
 class TranscriptionError(Exception):
@@ -57,6 +58,9 @@ async def transcribe_voice(audio_data: bytes, model_path: Path) -> str:
             f"Whisper model not found at {model_path}. Download with: make models/ggml-base.en.bin"
         )
 
+    # Isolation note: tempfile.TemporaryDirectory() creates a unique directory per
+    # call (random suffix). The context manager deletes it on exit. No cross-user
+    # data leakage possible. On process crash, OS tmpwatch handles cleanup.
     with tempfile.TemporaryDirectory() as tmpdir:
         ogg_path = Path(tmpdir) / "voice.oga"
         wav_path = Path(tmpdir) / "voice.wav"
@@ -93,7 +97,7 @@ async def transcribe_voice(audio_data: bytes, model_path: Path) -> str:
         )
 
     transcript = stdout.strip()
-    log.info("Transcribed %d bytes of audio → %d chars", len(audio_data), len(transcript))
+    log.info("transcription.completed", audio_bytes=len(audio_data), transcript_chars=len(transcript))
     return transcript
 
 

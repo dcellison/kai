@@ -192,11 +192,7 @@ async def _acquire_lock_or_kill(
         await asyncio.wait_for(lock.acquire(), timeout=_LOCK_ACQUIRE_TIMEOUT)
         return lock
     except TimeoutError:
-        log.error(
-            "Lock acquisition timed out for user %d after %ds; force-killing Claude",
-            user_id,
-            _LOCK_ACQUIRE_TIMEOUT,
-        )
+        log.error("lock.timeout", user_id=user_id, timeout_seconds=_LOCK_ACQUIRE_TIMEOUT)
         claude.force_kill()
         # update.message can be None for edited messages or callback
         # queries, so guard rather than assert.
@@ -310,9 +306,9 @@ async def _edit_message_safe(msg: Message, text: str) -> None:
         except Exception:
             # Editing is best-effort during streaming; log at debug so persistent
             # issues (e.g., revoked bot token) leave a diagnostic trail
-            log.debug("Failed to edit message (plain-text fallback)", exc_info=True)
+            log.debug("message.edit_failed", fallback="plain_text", exc_info=True)
     except Exception:
-        log.debug("Failed to edit message", exc_info=True)
+        log.debug("message.edit_failed", exc_info=True)
 
 
 def _chunk_text(text: str, max_len: int = 4096) -> list[str]:
@@ -1955,7 +1951,7 @@ async def _handle_response(
             await context.bot.send_voice(chat_id=chat_id, voice=audio)
             return
         except TTSError as e:
-            log.warning("TTS failed, falling back to text: %s", e)
+            log.warning("tts.failed", error=str(e), fallback="text")
 
     # Send text response (normal mode, or voice-only fallback)
     if live_msg:
@@ -1979,7 +1975,7 @@ async def _handle_response(
             audio = await synthesize_speech(final_text, config.piper_model_dir, voice_name)
             await context.bot.send_voice(chat_id=chat_id, voice=audio)
         except TTSError as e:
-            log.warning("TTS failed: %s", e)
+            log.warning("tts.failed", error=str(e))
 
 
 # ── Application factory ─────────────────────────────────────────────

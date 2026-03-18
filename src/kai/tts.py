@@ -18,12 +18,13 @@ for Telegram's send_voice() API.
 """
 
 import asyncio
-import logging
 import sys
 import tempfile
 from pathlib import Path
 
-log = logging.getLogger(__name__)
+import structlog
+
+log = structlog.get_logger("kai.tts")
 
 # Curated English voices — displayed in /voices inline keyboard.
 # Keys are short names used in settings and commands.
@@ -96,6 +97,9 @@ async def synthesize_speech(text: str, model_dir: Path, voice: str = DEFAULT_VOI
     if not model_path.exists():
         raise TTSError(f"Piper model not found at {model_path}. Download with: make tts-model")
 
+    # Isolation note: tempfile.TemporaryDirectory() creates a unique directory per
+    # call (random suffix). The context manager deletes it on exit. No cross-user
+    # data leakage possible. On process crash, OS tmpwatch handles cleanup.
     with tempfile.TemporaryDirectory() as tmpdir:
         wav_path = Path(tmpdir) / "speech.wav"
         ogg_path = Path(tmpdir) / "speech.ogg"
@@ -162,5 +166,5 @@ async def synthesize_speech(text: str, model_dir: Path, voice: str = DEFAULT_VOI
 
         audio_bytes = ogg_path.read_bytes()
 
-    log.info("Synthesized %d chars → %d bytes OGG (%s)", len(text), len(audio_bytes), voice)
+    log.info("tts.synthesized", input_chars=len(text), output_bytes=len(audio_bytes), voice=voice)
     return audio_bytes

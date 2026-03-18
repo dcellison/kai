@@ -88,6 +88,9 @@ _ERROR_RECENCY_THRESHOLD = 600  # 10 minutes
 # In-memory cooldown dict: (repo_full_name, pr_number) -> last_review_timestamp.
 # Resets on restart, which is acceptable - worst case is one extra review
 # after a restart. No database table needed for stateless reviews.
+# Multi-user note: Cooldowns are intentionally keyed by (repo, number) without
+# user_id. Reviewing the same PR twice within the cooldown window wastes API
+# budget regardless of which user triggered it — the reviews would be identical.
 _review_cooldowns: dict[tuple[str, int], float] = {}
 
 
@@ -129,6 +132,8 @@ def _record_review(repo: str, pr_number: int) -> None:
 # In-memory cooldown dict: (repo_full_name, issue_number) -> last_triage_timestamp.
 # Prevents duplicate triage if GitHub sends multiple webhook deliveries
 # for the same event (retries, duplicate deliveries). 60-second cooldown.
+# Multi-user note: Same cross-user cooldown rationale as _review_cooldowns above.
+# Triaging the same issue twice wastes API budget with identical results.
 _triage_cooldowns: dict[tuple[str, int], float] = {}
 
 # Fixed cooldown for triage - much shorter than PR review (300s) because
@@ -222,18 +227,15 @@ async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str 
 def _users_for_repo(repo_full_name: str, app: web.Application) -> list[int]:
     """Determine which users should receive notifications for a GitHub repo.
 
-    Matches the repo name against active per-user workspace paths. Falls back
-    to all allowed users if no workspace matches, so notifications are never
-    silently dropped.
+    Matches the repo name against active per-user workspace paths. Returns an
+    empty list if no workspace matches — unmatched repos produce no notifications
+    to avoid spamming users with events from repos they don't work on.
     """
     repo_name = repo_full_name.split("/")[-1]
     matched: list[int] = []
     for uid, ws_path in (app.get("user_workspaces") or {}).items():
         if (ws_path and Path(ws_path).name == repo_name) or (ws_path and Path(ws_path).parent.name == repo_name):
             matched.append(uid)
-    # Fall back to all users if no workspace matches the repo
-    if not matched:
-        matched = list(app["allowed_user_ids"])
     return matched
 
 
@@ -649,8 +651,8 @@ async def _handle_generic(request: web.Request) -> web.Response:
 def _extract_user_id(request: web.Request, body: dict | None = None) -> int | None:
     """Extract user_id from X-User-Id header or request body chat_id.
 
-    Returns None if the user_id is not in the allowed set.
-    Falls back to the first allowed user for single-user compatibility.
+    Returns None if no valid user_id is found or the user is not in the
+    allowed set. Callers should handle None by returning 403.
     """
     allowed: set[int] = request.app["allowed_user_ids"]
 
@@ -1379,6 +1381,8 @@ def is_running() -> bool:
     return _runner is not None
 
 
+# Thread-safety: dict assignment is atomic in CPython and this function is only
+# called from the single-threaded asyncio event loop. No lock needed.
 def update_workspace(user_id: int, workspace: str) -> None:
     """
     Update the workspace path used by the send-file endpoint's confinement check.

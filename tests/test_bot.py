@@ -23,6 +23,7 @@ from kai.bot import (
     _clear_responding,
     _do_switch_workspace,
     _edit_message_safe,
+    _get_session_id,
     _is_authorized,
     _is_workspace_allowed,
     _models_keyboard,
@@ -30,11 +31,9 @@ from kai.bot import (
     _prepend_queue_marker,
     _reply_safe,
     _require_auth,
-    _resolve_workspace_path,
-    _get_session_id,
     _reset_session_id,
+    _resolve_workspace_path,
     _save_to_user_files,
-    _user_home,
     _set_responding,
     _short_workspace_name,
     _switch_workspace,
@@ -49,7 +48,6 @@ from kai.bot import (
     handle_jobs,
     handle_message,
     handle_model,
-    handle_notifications,
     handle_model_callback,
     handle_models,
     handle_new,
@@ -651,7 +649,7 @@ class TestEditMessageSafe:
         msg.edit_text = AsyncMock(side_effect=[BadRequest("bad"), RuntimeError("fail")])
         with caplog.at_level(logging.DEBUG, logger="kai.bot"):
             await _edit_message_safe(msg, "text")
-        assert "Failed to edit message" in caplog.text
+        assert "message.edit_failed" in caplog.text
 
     @pytest.mark.asyncio
     async def test_non_badrequest_exception(self, caplog):
@@ -660,7 +658,7 @@ class TestEditMessageSafe:
         msg.edit_text = AsyncMock(side_effect=RuntimeError("network"))
         with caplog.at_level(logging.DEBUG, logger="kai.bot"):
             await _edit_message_safe(msg, "text")
-        assert "Failed to edit message" in caplog.text
+        assert "message.edit_failed" in caplog.text
 
     @pytest.mark.asyncio
     async def test_long_text_truncated(self):

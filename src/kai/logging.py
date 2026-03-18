@@ -42,6 +42,10 @@ ctx_operation: ContextVar[str | None] = ContextVar("ctx_operation", default=None
 # ── Per-user session tracking ─────────────────────────────────────────
 # Moved here from bot.py to avoid circular imports (decorators need session_id).
 
+# Thread-safety: This dict is only read/written from the main asyncio event
+# loop thread (get_session_id/reset_session_id are called from async handlers,
+# never from asyncio.to_thread). CPython's GIL protects dict operations, but
+# the single-thread guarantee is the actual safety contract.
 _user_sessions: dict[int, str] = {}
 
 

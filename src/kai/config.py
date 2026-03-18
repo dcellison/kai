@@ -12,16 +12,16 @@ All paths are resolved relative to PROJECT_ROOT (the repository root), which is
 derived from this file's location in the source tree: src/kai/config.py -> project root.
 """
 
-import logging
 import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import structlog
 import yaml
 from dotenv import load_dotenv
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger("kai.config")
 
 
 # ── Module-level paths and constants ─────────────────────────────────
@@ -253,10 +253,10 @@ def _read_protected_yaml(filename: str) -> dict | object | None:
         result = yaml.safe_load(content)
         if isinstance(result, dict):
             return result
-        log.warning("/etc/kai/%s: expected a YAML dict, got %s", filename, type(result).__name__)
+        log.warning("config.protected_invalid", file=filename, got_type=type(result).__name__)
         return _YAML_MALFORMED
     except yaml.YAMLError as e:
-        log.error("Invalid YAML in /etc/kai/%s: %s", filename, e)
+        log.error("config.protected_yaml_error", file=filename, error=str(e))
         return _YAML_MALFORMED
 
 
@@ -281,7 +281,7 @@ def parse_env_file(path: Path) -> dict[str, str]:
         # would silently prepend \ufeff to the first key name.
         text = path.read_text(encoding="utf-8-sig")
     except OSError as e:
-        log.warning("Cannot read env file %s: %s", path, e)
+        log.warning("config.env_file_unreadable", path=str(path), error=str(e))
         return env
     for line in text.splitlines():
         line = line.strip()
@@ -310,7 +310,7 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
     # or dev config on a production system).
     data = _read_protected_yaml("workspaces.yaml")
     if data is _YAML_MALFORMED:
-        log.warning("Skipping workspace config: /etc/kai/workspaces.yaml is malformed or empty")
+        log.warning("config.workspaces_malformed", file="/etc/kai/workspaces.yaml")
         return {}
     if data is None:
         local_path = PROJECT_ROOT / "workspaces.yaml"
@@ -320,16 +320,16 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
             with open(local_path) as f:
                 data = yaml.safe_load(f)
         except (yaml.YAMLError, OSError) as e:
-            log.error("Cannot load %s: %s", local_path, e)
+            log.error("config.workspaces_load_error", path=str(local_path), error=str(e))
             return {}
         if not isinstance(data, dict):
-            log.warning("%s: expected a YAML dict, got %s", local_path, type(data).__name__)
+            log.warning("config.workspaces_invalid", path=str(local_path), got_type=type(data).__name__)
             return {}
 
     entries = data.get("workspaces")
     if not isinstance(entries, list):
         if entries is not None:
-            log.warning("workspaces.yaml: 'workspaces' must be a list, got %s", type(entries).__name__)
+            log.warning("config.workspaces_not_list", got_type=type(entries).__name__)
         return {}
 
     # Helper for coercing YAML env values to strings. Defined once
@@ -344,28 +344,28 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
     configs: dict[Path, WorkspaceConfig] = {}
     for entry in entries:
         if not isinstance(entry, dict):
-            log.warning("workspaces.yaml: skipping non-dict entry: %s", entry)
+            log.warning("config.workspace_entry_not_dict", entry=entry)
             continue
 
         # Validate required path field
         raw_path = entry.get("path")
         if not raw_path:
-            log.warning("workspaces.yaml: skipping entry without path")
+            log.warning("config.workspace_missing_path")
             continue
         path = Path(str(raw_path)).expanduser().resolve()
         if not path.is_dir():
-            log.warning("workspaces.yaml: skipping non-existent path: %s", path)
+            log.warning("config.workspace_path_missing", path=str(path))
             continue
 
         # Duplicate check: first wins
         if path in configs:
-            log.warning("workspaces.yaml: duplicate path %s; using first entry", path)
+            log.warning("config.workspace_duplicate", path=str(path))
             continue
 
         # Parse the optional claude: section
         claude_section = entry.get("claude") or {}
         if not isinstance(claude_section, dict):
-            log.warning("workspaces.yaml: invalid claude section for %s", path)
+            log.warning("config.workspace_invalid_claude", path=str(path))
             continue
 
         # Validate model
@@ -374,10 +374,10 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
             model = str(model)
             if model not in VALID_MODELS:
                 log.warning(
-                    "workspaces.yaml: invalid model '%s' for %s (must be one of %s); skipping entry",
-                    model,
-                    path,
-                    VALID_MODELS,
+                    "config.workspace_invalid_model",
+                    model=model,
+                    path=str(path),
+                    valid=sorted(VALID_MODELS),
                 )
                 continue
 
@@ -391,7 +391,7 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
                 if budget <= 0:
                     raise ValueError("must be positive")
             except (TypeError, ValueError) as e:
-                log.warning("workspaces.yaml: invalid budget for %s: %s; skipping entry", path, e)
+                log.warning("config.workspace_invalid_budget", path=str(path), error=str(e))
                 continue
 
         # Validate timeout (must be a positive integer, not a float or bool).
@@ -408,14 +408,14 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
                 if timeout <= 0:
                     raise ValueError("must be positive")
             except (TypeError, ValueError) as e:
-                log.warning("workspaces.yaml: invalid timeout for %s: %s; skipping entry", path, e)
+                log.warning("config.workspace_invalid_timeout", path=str(path), error=str(e))
                 continue
 
         # Parse env vars (inline dict)
         env = claude_section.get("env")
         if env is not None:
             if not isinstance(env, dict):
-                log.warning("workspaces.yaml: invalid env for %s; skipping entry", path)
+                log.warning("config.workspace_invalid_env", path=str(path))
                 continue
 
             env = {str(k): _coerce_env_value(v) for k, v in env.items()}
@@ -425,7 +425,7 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
         if env_file is not None:
             env_file = Path(str(env_file)).expanduser().resolve()
             if not env_file.is_file():
-                log.warning("workspaces.yaml: env_file not found for %s: %s; skipping entry", path, env_file)
+                log.warning("config.workspace_env_file_missing", path=str(path), env_file=str(env_file))
                 continue
 
         # Validate system_prompt / system_prompt_file mutual exclusion
@@ -433,8 +433,8 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
         system_prompt_file = claude_section.get("system_prompt_file")
         if system_prompt is not None and system_prompt_file is not None:
             log.error(
-                "workspaces.yaml: both system_prompt and system_prompt_file set for %s; skipping entry",
-                path,
+                "config.workspace_prompt_conflict",
+                path=str(path),
             )
             continue
         if system_prompt is not None:
@@ -443,9 +443,9 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
             system_prompt_file = Path(str(system_prompt_file)).expanduser().resolve()
             if not system_prompt_file.is_file():
                 log.warning(
-                    "workspaces.yaml: system_prompt_file not found for %s: %s; skipping entry",
-                    path,
-                    system_prompt_file,
+                    "config.workspace_prompt_file_missing",
+                    path=str(path),
+                    prompt_file=str(system_prompt_file),
                 )
                 continue
 
@@ -522,9 +522,9 @@ def load_config() -> Config:
                 "when TELEGRAM_WEBHOOK_URL is set. Without it, anyone could POST fake updates "
                 "to the Telegram webhook endpoint."
             )
-        log.info("Telegram transport: webhook (%s)", telegram_webhook_url)
+        log.info("config.transport_webhook", url=telegram_webhook_url)
     else:
-        log.info("Telegram transport: polling (TELEGRAM_WEBHOOK_URL not set)")
+        log.info("config.transport_polling")
 
     # Validate required: allowed user IDs (comma-separated numeric Telegram user IDs)
     raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
@@ -562,7 +562,7 @@ def load_config() -> Config:
             if p.is_dir():
                 allowed_workspaces.append(p)
             else:
-                log.warning("ALLOWED_WORKSPACES: skipping non-existent path: %s", p)
+                log.warning("config.allowed_workspace_missing", path=str(p))
 
     # Validate numeric config - fail fast with clear messages rather than
     # cryptic ValueError tracebacks from int()/float() on bad input
