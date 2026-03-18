@@ -154,6 +154,7 @@ class PersistentClaude:
         self._fresh_session = True  # True until the first message is sent
         self._stderr_task: asyncio.Task | None = None  # Background stderr drain
         self._session_started_at: float | None = None  # time.monotonic() at process start
+        self._last_activity: float = time.monotonic()  # For idle eviction
 
     @property
     def is_alive(self) -> bool:
@@ -174,6 +175,11 @@ class PersistentClaude:
     def _should_recycle(self) -> bool:
         """True if the session has exceeded the configured age limit."""
         return self.max_session_hours > 0 and self.is_alive and self._session_age_hours() >= self.max_session_hours
+
+    @property
+    def idle_hours(self) -> float:
+        """Hours since the last message was sent to this instance."""
+        return (time.monotonic() - self._last_activity) / 3600
 
     async def _ensure_started(self) -> None:
         """
@@ -361,6 +367,8 @@ class PersistentClaude:
             StreamEvent objects with accumulated text. The final event has
             done=True and includes the complete ClaudeResponse.
         """
+        self._last_activity = time.monotonic()
+
         # Recycle the session if it has exceeded the age limit. This prevents
         # unbounded memory growth in the inner Claude process (Node.js/V8),
         # which can cause macOS kernel panics via Jetsam on memory-constrained
@@ -461,7 +469,7 @@ class PersistentClaude:
                     f'Optional: "caption". Images are sent as photos, '
                     f"everything else as documents.\n"
                     f"Incoming files from the user are auto-saved to "
-                    f"{self.workspace}/files/ and their paths are included "
+                    f"the user's session directory and their paths are included "
                     f"in the message.]"
                 )
 
@@ -878,6 +886,17 @@ class ClaudeManager:
 
     def _user_home(self, user_id: int) -> Path:
         return DATA_DIR / "users" / str(user_id) / "home"
+
+    async def evict_idle(self, max_idle_hours: float = 4.0) -> int:
+        """Shut down idle instances. Returns count evicted."""
+        to_evict = [
+            uid for uid, inst in self._instances.items()
+            if inst.idle_hours >= max_idle_hours and not inst._lock.locked()
+        ]
+        for uid in to_evict:
+            await self._instances[uid].shutdown()
+            del self._instances[uid]
+        return len(to_evict)
 
     async def shutdown_all(self) -> None:
         """Shut down all Claude instances."""

@@ -37,6 +37,7 @@ import logging
 import math
 import shutil
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -102,6 +103,29 @@ def _clear_responding(user_id: int) -> None:
     """Remove the per-user flag file, indicating the response completed (or failed gracefully)."""
     flag = DATA_DIR / "users" / str(user_id) / ".responding_to"
     flag.unlink(missing_ok=True)
+
+
+# ── Per-user session tracking ──────────────────────────────────────
+
+# Per-user Kai session IDs (reset on /new, generated on first interaction)
+_user_sessions: dict[int, str] = {}
+
+
+def _get_session_id(user_id: int) -> str:
+    """Get or create a session ID for this user."""
+    if user_id not in _user_sessions:
+        _user_sessions[user_id] = uuid.uuid4().hex[:12]
+    return _user_sessions[user_id]
+
+
+def _reset_session_id(user_id: int) -> None:
+    """Reset session ID (called on /new, workspace switch)."""
+    _user_sessions.pop(user_id, None)
+
+
+def _user_home(user_id: int) -> Path:
+    """Return the per-user home workspace path."""
+    return DATA_DIR / "users" / str(user_id) / "home"
 
 
 async def _notify_if_queued(update: Update, user_id: int) -> bool:
@@ -362,6 +386,7 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     claude = _get_claude(context, user_id)
     await claude.restart()
     await sessions.clear_session(user_id)
+    _reset_session_id(user_id)
     await update.message.reply_text("Session cleared. Starting fresh.")
 
 
@@ -796,16 +821,17 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, user_id: int,
     callers can display config details without a redundant lookup.
     """
     claude = _get_claude(context, user_id)
-    config: Config = context.bot_data["config"]
-    home = config.claude_workspace
+    home = _user_home(user_id)
 
     # Look up per-workspace config for the target workspace.
+    config: Config = context.bot_data["config"]
     ws_config = config.get_workspace_config(path)
     await claude.change_workspace(path, workspace_config=ws_config)
     # Keep the webhook server's confinement path in sync so send-file accepts
     # files from the new workspace rather than rejecting them with 403.
     webhook.update_workspace(user_id, str(path))
     await sessions.clear_session(user_id)
+    _reset_session_id(user_id)
 
     if path == home:
         await sessions.delete_setting(user_id, "workspace")
@@ -826,8 +852,7 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     assert update.message is not None
     user_id = _user_id(update)
     claude = _get_claude(context, user_id)
-    config: Config = context.bot_data["config"]
-    home = config.claude_workspace
+    home = _user_home(user_id)
 
     if path == claude.workspace:
         await update.message.reply_text("Already in that workspace.")
@@ -928,7 +953,7 @@ async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     claude = _get_claude(context, user_id)
     config: Config = context.bot_data["config"]
     current = str(claude.workspace)
-    home = str(config.claude_workspace)
+    home = str(_user_home(user_id))
 
     if not history and not config.allowed_workspaces and current == home:
         await update.message.reply_text("No workspace history yet.\nUse /workspace new <name> to create one.")
@@ -957,7 +982,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     data = query.data.removeprefix("ws:")
     user_id = _user_id(update)
     claude = _get_claude(context, user_id)
-    home = config.claude_workspace
+    home = _user_home(user_id)
     base = config.workspace_base
 
     # Resolve target path from callback data
@@ -1054,9 +1079,10 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     checks WORKSPACE_BASE first, then ALLOWED_WORKSPACES (by directory name).
     """
     assert update.message is not None
-    claude = _get_claude(context, _user_id(update))
+    user_id = _user_id(update)
+    claude = _get_claude(context, user_id)
     config: Config = context.bot_data["config"]
-    home = config.claude_workspace
+    home = _user_home(user_id)
     base = config.workspace_base
 
     # No args: show current workspace
@@ -1203,9 +1229,46 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/stats - Show session info and cost\n"
         "/jobs - List scheduled jobs\n"
         "/canceljob <id> - Cancel a job\n"
+        "/notifications - Toggle webhook/GitHub notifications\n"
         "/webhooks - Show webhook server status\n"
         "/help - This message"
     )
+
+
+@_require_auth
+async def handle_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /notifications — toggle GitHub/webhook notification preferences."""
+    assert update.message is not None
+    user_id = _user_id(update)
+
+    if not context.args:
+        gh = await sessions.get_setting(user_id, "github_notifications") or "true"
+        wh = await sessions.get_setting(user_id, "webhook_notifications") or "true"
+        await update.message.reply_text(
+            f"Notification settings:\n"
+            f"  GitHub: {gh}\n"
+            f"  Webhooks: {wh}\n\n"
+            f"Usage:\n"
+            f"  /notifications github off\n"
+            f"  /notifications webhook on"
+        )
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /notifications <github|webhook> <on|off>")
+        return
+
+    source = context.args[0].lower()
+    state = context.args[1].lower()
+
+    if source not in ("github", "webhook") or state not in ("on", "off"):
+        await update.message.reply_text("Usage: /notifications <github|webhook> <on|off>")
+        return
+
+    key = f"{source}_notifications"
+    value = "true" if state == "on" else "false"
+    await sessions.set_setting(user_id, key, value)
+    await update.message.reply_text(f"{source.title()} notifications: {state}")
 
 
 @_require_auth
@@ -1220,25 +1283,24 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
 # ── Media message handlers ──────────────────────────────────────────
 
 
-def _save_to_workspace(data: bytes, filename: str, workspace: Path) -> Path:
+def _save_to_user_files(data: bytes, filename: str, user_id: int) -> Path:
     """
-    Save file bytes to the workspace/files/ directory with a timestamped name.
+    Save file bytes to the user's session directory with a timestamped name.
 
-    Creates the files/ directory if it doesn't exist. Filenames are prefixed
-    with a timestamp to avoid collisions and sanitized to remove slashes and
-    spaces. Returns the absolute path to the saved file so Claude can
-    reference it in subsequent commands.
+    Files are stored in DATA_DIR/users/{user_id}/sessions/{session_id}/files/
+    to ensure complete per-user isolation regardless of workspace.
 
     Args:
         data: Raw file bytes to write.
         filename: Original filename from Telegram (sanitized before use).
-        workspace: The current workspace root directory.
+        user_id: Telegram user ID for per-user isolation.
 
     Returns:
         Absolute path to the saved file.
     """
-    files_dir = workspace / "files"
-    files_dir.mkdir(exist_ok=True)
+    session_id = _get_session_id(user_id)
+    files_dir = DATA_DIR / "users" / str(user_id) / "sessions" / session_id / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
 
     # Timestamp prefix ensures unique names even if the same file is sent twice
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1272,8 +1334,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     raw = bytes(data)
     b64 = base64.b64encode(raw).decode()
 
-    # Save to workspace so Claude can access the file via shell tools
-    saved = _save_to_workspace(raw, f"photo_{photo.file_unique_id}.jpg", claude.workspace)
+    # Save to per-user session directory so Claude can access the file
+    saved = _save_to_user_files(raw, f"photo_{photo.file_unique_id}.jpg", user_id)
 
     caption = update.message.caption or "What's in this image?"
     caption += f"\n[File saved to: {saved}]"
@@ -1399,8 +1461,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         b64 = base64.b64encode(raw).decode()
         media_type = _IMAGE_MEDIA_TYPES[suffix]
 
-        # Save to workspace so Claude can access the file via shell tools
-        saved = _save_to_workspace(raw, file_name, claude.workspace)
+        # Save to per-user session directory so Claude can access the file
+        saved = _save_to_user_files(raw, file_name, user_id)
         img_caption = caption or f"What's in this image ({file_name})?"
         img_caption += f"\n[File saved to: {saved}]"
 
@@ -1426,8 +1488,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text(f"Couldn't decode {file_name} as text.")
             return
 
-        # Save to workspace so Claude can access the file via shell tools
-        saved = _save_to_workspace(raw, file_name, claude.workspace)
+        # Save to per-user session directory so Claude can access the file
+        saved = _save_to_user_files(raw, file_name, user_id)
         header = f"File: {file_name}\n```\n{text_content}\n```\n[File saved to: {saved}]"
 
         log_message(
@@ -1446,7 +1508,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # can work with the file via shell tools (e.g., unzip, pdftotext, etc.)
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
-        saved = _save_to_workspace(bytes(data), file_name, claude.workspace)
+        saved = _save_to_user_files(bytes(data), file_name, user_id)
 
         log_message(
             direction="user",
@@ -1936,6 +1998,7 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
     app.add_handler(CommandHandler("voice", handle_voice_command))
     app.add_handler(CommandHandler("voices", handle_voices))
     app.add_handler(CommandHandler("webhooks", handle_webhooks))
+    app.add_handler(CommandHandler("notifications", handle_notifications))
     app.add_handler(CommandHandler("stop", handle_stop))
 
     # Callback query handlers for inline keyboards (pattern-matched)

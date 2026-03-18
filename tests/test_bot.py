@@ -31,7 +31,10 @@ from kai.bot import (
     _reply_safe,
     _require_auth,
     _resolve_workspace_path,
-    _save_to_workspace,
+    _get_session_id,
+    _reset_session_id,
+    _save_to_user_files,
+    _user_home,
     _set_responding,
     _short_workspace_name,
     _switch_workspace,
@@ -46,6 +49,7 @@ from kai.bot import (
     handle_jobs,
     handle_message,
     handle_model,
+    handle_notifications,
     handle_model_callback,
     handle_models,
     handle_new,
@@ -152,29 +156,38 @@ class TestTruncateForTelegram:
         assert _truncate_for_telegram(text, 50) == text
 
 
-# ── _save_to_workspace ──────────────────────────────────────────────
+# ── _save_to_user_files ─────────────────────────────────────────────
 
 
-class TestSaveToWorkspace:
-    def test_creates_files_directory(self, tmp_path):
-        """Automatically creates the files/ subdirectory if missing."""
-        _save_to_workspace(b"hello", "test.txt", tmp_path)
-        assert (tmp_path / "files").is_dir()
+class TestSaveToUserFiles:
+    def test_creates_session_files_directory(self, tmp_path):
+        """Automatically creates the session files/ directory."""
+        with patch("kai.bot.DATA_DIR", tmp_path):
+            _save_to_user_files(b"hello", "test.txt", 12345)
+        # Check that files are in users/{uid}/sessions/{sid}/files/
+        users_dir = tmp_path / "users" / "12345" / "sessions"
+        assert users_dir.is_dir()
+        session_dirs = list(users_dir.iterdir())
+        assert len(session_dirs) == 1
+        assert (session_dirs[0] / "files").is_dir()
 
     def test_saves_content_correctly(self, tmp_path):
         """Written bytes match the input exactly."""
         data = b"binary content here"
-        result = _save_to_workspace(data, "doc.pdf", tmp_path)
+        with patch("kai.bot.DATA_DIR", tmp_path):
+            result = _save_to_user_files(data, "doc.pdf", 12345)
         assert result.read_bytes() == data
 
     def test_filename_contains_original_name(self, tmp_path):
         """Saved filename preserves the original name after the timestamp."""
-        result = _save_to_workspace(b"x", "report.pdf", tmp_path)
+        with patch("kai.bot.DATA_DIR", tmp_path):
+            result = _save_to_user_files(b"x", "report.pdf", 12345)
         assert "report.pdf" in result.name
 
     def test_timestamp_prefix_format(self, tmp_path):
         """Filename starts with YYYYMMDD_HHMMSS_ffffff timestamp."""
-        result = _save_to_workspace(b"x", "file.txt", tmp_path)
+        with patch("kai.bot.DATA_DIR", tmp_path):
+            result = _save_to_user_files(b"x", "file.txt", 12345)
         # Format: YYYYMMDD_HHMMSS_ffffff_file.txt
         parts = result.name.split("_", 3)
         assert len(parts[0]) == 8  # date
@@ -183,15 +196,34 @@ class TestSaveToWorkspace:
 
     def test_sanitizes_slashes_and_spaces(self, tmp_path):
         """Slashes and spaces in filenames are replaced with underscores."""
-        result = _save_to_workspace(b"x", "my file/name.txt", tmp_path)
+        with patch("kai.bot.DATA_DIR", tmp_path):
+            result = _save_to_user_files(b"x", "my file/name.txt", 12345)
         assert "/" not in result.name
         assert " " not in result.name
 
     def test_returns_absolute_path(self, tmp_path):
         """Returned path is absolute and points to an existing file."""
-        result = _save_to_workspace(b"x", "test.txt", tmp_path)
+        with patch("kai.bot.DATA_DIR", tmp_path):
+            result = _save_to_user_files(b"x", "test.txt", 12345)
         assert result.is_absolute()
         assert result.is_file()
+
+    def test_same_session_for_same_user(self):
+        """Same user gets consistent session ID."""
+        _reset_session_id(99999)  # ensure clean state
+        sid1 = _get_session_id(99999)
+        sid2 = _get_session_id(99999)
+        assert sid1 == sid2
+        _reset_session_id(99999)
+
+    def test_reset_generates_new_session(self):
+        """After reset, a new session ID is generated."""
+        _reset_session_id(99998)
+        sid1 = _get_session_id(99998)
+        _reset_session_id(99998)
+        sid2 = _get_session_id(99998)
+        assert sid1 != sid2
+        _reset_session_id(99998)
 
 
 # ── _workspaces_keyboard ────────────────────────────────────────────
@@ -1210,6 +1242,7 @@ class TestHandleWorkspace:
         update = _make_update()
         ctx = _make_context(claude=claude, config=config, args=["home"])
         with (
+            patch("kai.bot._user_home", return_value=home),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.delete_setting", new_callable=AsyncMock),
             patch("kai.bot.webhook.update_workspace"),
@@ -1361,11 +1394,15 @@ class TestHandleWorkspace:
 class TestHandleWorkspaces:
     @pytest.mark.asyncio
     async def test_no_history_at_home(self):
+        home = Path("/home/workspace")
         update = _make_update()
-        claude = _make_mock_claude(workspace=Path("/home/workspace"))
-        config = _make_config(claude_workspace=Path("/home/workspace"))
+        claude = _make_mock_claude(workspace=home)
+        config = _make_config(claude_workspace=home)
         ctx = _make_context(config=config, claude=claude)
-        with patch("kai.bot.sessions.get_workspace_history", new_callable=AsyncMock, return_value=[]):
+        with (
+            patch("kai.bot._user_home", return_value=home),
+            patch("kai.bot.sessions.get_workspace_history", new_callable=AsyncMock, return_value=[]),
+        ):
             await handle_workspaces(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "No workspace history" in reply
@@ -1525,7 +1562,8 @@ class TestHandleWorkspaceCallback:
         config = _make_config(claude_workspace=home)
         update = _make_callback_update(data="ws:home")
         ctx = _make_context(config=config, claude=claude)
-        await handle_workspace_callback(update, ctx)
+        with patch("kai.bot._user_home", return_value=home):
+            await handle_workspace_callback(update, ctx)
         edit_text = update.callback_query.edit_message_text.call_args[0][0]
         assert "No change" in edit_text
 

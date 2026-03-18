@@ -16,13 +16,16 @@ import pytest
 from kai import history, locks, sessions
 from kai.bot import (
     _clear_responding,
+    _reset_session_id,
     _set_responding,
+    _user_home,
     handle_document,
     handle_jobs,
     handle_message,
     handle_model_callback,
     handle_models,
     handle_new,
+    handle_notifications,
     handle_photo,
     handle_stats,
     handle_stop,
@@ -358,14 +361,8 @@ class TestHandlerUserRouting:
         assert called_claude is claude_a
         assert called_claude is not claude_b  # Explicit isolation check
 
-    async def test_handle_photo_saves_to_correct_workspace(self, tmp_path):
+    async def test_handle_photo_saves_to_user_session_dir(self, tmp_path):
         claude_a, claude_b, manager, config = _two_user_setup()
-        ws_a = tmp_path / "ws_a"
-        ws_b = tmp_path / "ws_b"
-        ws_a.mkdir()
-        ws_b.mkdir()
-        claude_a.workspace = ws_a
-        claude_b.workspace = ws_b
 
         update = _make_update(user_id=USER_A)
         photo = MagicMock()
@@ -378,7 +375,9 @@ class TestHandlerUserRouting:
         ctx = _make_two_user_context(manager, config)
         ctx.bot.get_file = AsyncMock(return_value=mock_file)
 
+        _reset_session_id(USER_A)
         with (
+            patch("kai.bot.DATA_DIR", tmp_path),
             patch("kai.bot._handle_response", new_callable=AsyncMock),
             patch("kai.bot.log_message"),
             patch("kai.bot._set_responding"),
@@ -386,9 +385,12 @@ class TestHandlerUserRouting:
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_photo(update, ctx)
-        # Photo should be saved under claude_a's workspace, not claude_b's
-        assert (ws_a / "files").is_dir()
-        assert not (ws_b / "files").exists()
+        # Photo should be saved under user A's session dir
+        user_a_sessions = tmp_path / "users" / str(USER_A) / "sessions"
+        assert user_a_sessions.is_dir()
+        # User B should have no session files
+        user_b_sessions = tmp_path / "users" / str(USER_B) / "sessions"
+        assert not user_b_sessions.exists()
 
     async def test_models_shows_correct_user_model(self):
         claude_a, claude_b, manager, config = _two_user_setup()
@@ -408,14 +410,8 @@ class TestHandlerUserRouting:
         assert has_sonnet_marker
         assert not has_opus_marker
 
-    async def test_handle_document_routes_to_correct_workspace(self, tmp_path):
+    async def test_handle_document_saves_to_user_session_dir(self, tmp_path):
         claude_a, claude_b, manager, config = _two_user_setup()
-        ws_a = tmp_path / "ws_a"
-        ws_b = tmp_path / "ws_b"
-        ws_a.mkdir()
-        ws_b.mkdir()
-        claude_a.workspace = ws_a
-        claude_b.workspace = ws_b
 
         update = _make_update(user_id=USER_A)
         doc = MagicMock()
@@ -429,7 +425,9 @@ class TestHandlerUserRouting:
         ctx = _make_two_user_context(manager, config)
         ctx.bot.get_file = AsyncMock(return_value=mock_file)
 
+        _reset_session_id(USER_A)
         with (
+            patch("kai.bot.DATA_DIR", tmp_path),
             patch("kai.bot._handle_response", new_callable=AsyncMock),
             patch("kai.bot.log_message"),
             patch("kai.bot._set_responding"),
@@ -437,9 +435,11 @@ class TestHandlerUserRouting:
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_document(update, ctx)
-        # Document should be saved under claude_a's workspace, not claude_b's
-        assert (ws_a / "files").is_dir()
-        assert not (ws_b / "files").exists()
+        # Document should be saved under user A's session dir
+        user_a_sessions = tmp_path / "users" / str(USER_A) / "sessions"
+        assert user_a_sessions.is_dir()
+        user_b_sessions = tmp_path / "users" / str(USER_B) / "sessions"
+        assert not user_b_sessions.exists()
 
     async def test_handle_model_callback_isolated(self):
         claude_a, claude_b, manager, config = _two_user_setup()
@@ -529,11 +529,10 @@ class TestWebhookUserRouting:
         req = self._make_request()
         assert _extract_user_id(req, body={"chat_id": 200}) == USER_B
 
-    def test_unknown_user_falls_back(self):
+    def test_unknown_user_returns_none(self):
         req = self._make_request(headers={"X-User-Id": "999"})
         result = _extract_user_id(req)
-        assert result is not None
-        assert result in {USER_A, USER_B}
+        assert result is None
 
     def test_update_workspace_per_user(self):
         import kai.webhook as wh

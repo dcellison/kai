@@ -183,6 +183,7 @@ def main() -> None:
                     BotCommand("canceljob", "Cancel a scheduled job"),
                     BotCommand("voice", "Toggle voice responses / set voice"),
                     BotCommand("voices", "Choose a voice (inline buttons)"),
+                    BotCommand("notifications", "Toggle notification preferences"),
                     BotCommand("webhooks", "Show webhook server status"),
                     BotCommand("help", "Show available commands"),
                 ]
@@ -203,6 +204,8 @@ def main() -> None:
                 saved = await sessions.get_setting(uid, "workspace")
                 if saved:
                     webhook.update_workspace(uid, saved)
+                else:
+                    webhook.update_workspace(uid, str(DATA_DIR / "users" / str(uid) / "home"))
 
             # In polling mode, start the Updater's long-polling loop. PTB's
             # start_polling() automatically calls delete_webhook() first, which
@@ -233,21 +236,24 @@ def main() -> None:
                         except Exception:
                             logging.exception("Failed to send interrupted-response notice")
                             flag.unlink(missing_ok=True)
-            # Also check the legacy single-user flag location
-            legacy_flag = DATA_DIR / ".responding_to"
-            if legacy_flag.exists():
-                try:
-                    chat_id = int(legacy_flag.read_text().strip())
-                    await app.bot.send_message(
-                        chat_id, "Sorry, my previous response was interrupted. Please resend your last message."
-                    )
-                    legacy_flag.unlink(missing_ok=True)
-                except Exception:
-                    legacy_flag.unlink(missing_ok=True)
+            # Start periodic idle Claude instance eviction
+            async def _idle_eviction_loop():
+                while True:
+                    await asyncio.sleep(1800)  # Every 30 minutes
+                    count = await manager.evict_idle()
+                    if count:
+                        logging.info("Evicted %d idle Claude instance(s)", count)
+
+            eviction_task = asyncio.create_task(_idle_eviction_loop())
 
             logging.info("Kai is running. Press Ctrl+C to stop.")
             await asyncio.Event().wait()  # Block forever until shutdown signal
         finally:
+            # Cancel the eviction task
+            try:
+                eviction_task.cancel()
+            except NameError:
+                pass
             # Shutdown in reverse order of startup
             await webhook.stop()
             # Stop the polling Updater if it was running (no-op in webhook mode

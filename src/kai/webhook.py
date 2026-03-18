@@ -51,7 +51,7 @@ from aiohttp import web
 from telegram import Update
 
 from kai import cron, review, services, sessions, triage
-from kai.config import IMAGE_EXTENSIONS
+from kai.config import DATA_DIR, IMAGE_EXTENSIONS
 
 log = logging.getLogger(__name__)
 
@@ -176,7 +176,7 @@ async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str 
     Matches the repo part of the full name (e.g., "kai" from "dcellison/kai")
     against known workspace locations. Checks in priority order:
 
-    1. Home workspace (derived from app["workspace"] parent)
+    1. User workspaces (derived from per-user workspace paths)
     2. WORKSPACE_BASE children
     3. ALLOWED_WORKSPACES entries
     4. workspace_history entries from the database
@@ -191,14 +191,14 @@ async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str 
     # Extract just the repo name from "owner/repo"
     repo_name = repo_full_name.split("/")[-1]
 
-    # 1. Home workspace - the workspace parent is the repo root.
-    # app["workspace"] is the workspace subdirectory (e.g., /opt/kai/workspace),
+    # 1. User workspaces - check all active per-user workspace paths.
+    # Each workspace may be a subdirectory of the repo root (e.g., /opt/kai/workspace),
     # so .parent gives the repo root (e.g., /opt/kai/).
-    workspace = app.get("workspace")
-    if workspace:
-        home_path = Path(workspace).parent
-        if home_path.name == repo_name and home_path.is_dir():
-            return str(home_path)
+    for ws_path in (app.get("user_workspaces") or {}).values():
+        if ws_path:
+            home_path = Path(ws_path).parent
+            if home_path.name == repo_name and home_path.is_dir():
+                return str(home_path)
 
     # 2. WORKSPACE_BASE - scan immediate children for matching dir name
     workspace_base = app.get("workspace_base")
@@ -570,16 +570,22 @@ async def _handle_github(request: web.Request) -> web.Response:
     if not message:
         return web.json_response({"msg": "ignored", "event": event_type})
 
-    # Send to all allowed users
+    # Send to users who have GitHub notifications enabled (default: on)
+    sent_count = 0
     for uid in request.app["allowed_user_ids"]:
+        pref = await sessions.get_setting(uid, "github_notifications")
+        if pref == "false":
+            continue
         try:
             await bot.send_message(uid, message, parse_mode="Markdown")
+            sent_count += 1
         except Exception:
             try:
                 await bot.send_message(uid, _strip_markdown(message))
+                sent_count += 1
             except Exception:
                 log.exception("Failed to send GitHub notification to user %d", uid)
-    log.info("Sent GitHub %s notification to %d user(s)", event_type, len(request.app["allowed_user_ids"]))
+    log.info("Sent GitHub %s notification to %d user(s)", event_type, sent_count)
 
     return web.json_response({"status": "ok"})
 
@@ -607,8 +613,11 @@ async def _handle_generic(request: web.Request) -> web.Response:
     if len(text) > 4096:
         text = text[:4093] + "..."
 
-    # Broadcast to all allowed users
+    # Broadcast to users who have webhook notifications enabled (default: on)
     for uid in request.app["allowed_user_ids"]:
+        pref = await sessions.get_setting(uid, "webhook_notifications")
+        if pref == "false":
+            continue
         try:
             await bot.send_message(uid, text)
         except Exception:
@@ -647,8 +656,9 @@ def _extract_user_id(request: web.Request, body: dict | None = None) -> int | No
         except (ValueError, TypeError):
             pass
 
-    # Fall back to first allowed user (single-user compatibility)
-    return next(iter(allowed), None)
+    # No fallback — if user can't be identified, return None (callers handle with 403)
+    log.warning("Could not extract user_id from request (no valid X-User-Id header or chat_id)")
+    return None
 
 
 # ── Scheduling API ───────────────────────────────────────────────────
@@ -1043,14 +1053,24 @@ async def _handle_send_file(request: web.Request) -> web.Response:
         return web.json_response({"error": "Cannot determine user"}, status=403)
     # Look up the user's workspace from the per-user workspace mapping
     user_workspaces = request.app.get("user_workspaces", {})
-    workspace = user_workspaces.get(user_id) or request.app.get("workspace")
+    workspace = user_workspaces.get(user_id)
     if not workspace:
-        return web.json_response({"error": "No workspace configured"}, status=403)
+        workspace = str(DATA_DIR / "users" / str(user_id) / "home")
+
+    # Allow files from the user's workspace AND their per-user directory
+    # (covers session files, home workspace files, etc.)
     workspace_resolved = Path(workspace).resolve()
-    try:
-        path.relative_to(workspace_resolved)
-    except ValueError:
-        return web.json_response({"error": "Path outside workspace"}, status=403)
+    user_base_resolved = (DATA_DIR / "users" / str(user_id)).resolve()
+    allowed = False
+    for base in [workspace_resolved, user_base_resolved]:
+        try:
+            path.relative_to(base)
+            allowed = True
+            break
+        except ValueError:
+            continue
+    if not allowed:
+        return web.json_response({"error": "Path outside allowed directories"}, status=403)
 
     if not path.is_file():
         return web.json_response({"error": f"File not found: {file_path}"}, status=404)
@@ -1186,8 +1206,6 @@ async def start(telegram_app, config) -> None:
     # Store all allowed user IDs for multi-user routing
     _app["allowed_user_ids"] = config.allowed_user_ids
 
-    # Store default workspace path for send-file path confinement
-    _app["workspace"] = str(config.claude_workspace)
     # Per-user workspace mapping (populated as users switch workspaces)
     _app["user_workspaces"] = {}
 
