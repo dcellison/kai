@@ -949,6 +949,96 @@ class TestGetJob:
         assert resp.status == 401
 
 
+# ── Job user_id isolation ──────────────────────────────────────────
+
+
+class TestJobUserIsolation:
+    """Verify that GET/DELETE/PATCH job endpoints enforce user_id ownership."""
+
+    async def _create_job_for_user(self, user_id: int) -> int:
+        return await sessions.create_job(
+            user_id=user_id,
+            chat_id=user_id,
+            name=f"job-{user_id}",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+
+    async def test_get_own_job_succeeds(self, db, mock_request):
+        """GET /api/jobs/{id} returns a job owned by the requesting user."""
+        job_id = await self._create_job_for_user(123)
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_get_job(mock_request)
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        assert body["id"] == job_id
+
+    async def test_get_other_users_job_returns_404(self, db, mock_request):
+        """GET /api/jobs/{id} returns 404 for a job owned by another user."""
+        job_id = await self._create_job_for_user(999)
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_get_job(mock_request)
+        assert resp.status == 404
+
+    async def test_delete_other_users_job_returns_404(self, db, mock_request):
+        """DELETE /api/jobs/{id} returns 404 for a job owned by another user."""
+        job_id = await self._create_job_for_user(999)
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_delete_job(mock_request)
+        assert resp.status == 404
+        # Job still exists in database (not deleted)
+        job = await sessions.get_job_by_id(job_id)
+        assert job is not None
+
+    async def test_update_other_users_job_returns_404(self, db, mock_request):
+        """PATCH /api/jobs/{id} returns 404 for a job owned by another user."""
+        job_id = await self._create_job_for_user(999)
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+        mock_request.match_info = {"id": str(job_id)}
+        mock_request.json = AsyncMock(return_value={"name": "hijacked"})
+
+        resp = await _handle_update_job(mock_request)
+        assert resp.status == 404
+        # Job name unchanged
+        job = await sessions.get_job_by_id(job_id)
+        assert job["name"] == "job-999"
+
+    async def test_get_missing_user_id_returns_403(self, db, mock_request):
+        """GET /api/jobs/{id} returns 403 when no valid user_id is provided."""
+        job_id = await self._create_job_for_user(123)
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["allowed_user_ids"] = {123}
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_get_job(mock_request)
+        assert resp.status == 403
+
+    async def test_delete_missing_user_id_returns_403(self, db, mock_request):
+        """DELETE /api/jobs/{id} returns 403 when no valid user_id is provided."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.match_info = {"id": "1"}
+
+        resp = await _handle_delete_job(mock_request)
+        assert resp.status == 403
+
+    async def test_update_missing_user_id_returns_403(self, db, mock_request):
+        """PATCH /api/jobs/{id} returns 403 when no valid user_id is provided."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.match_info = {"id": "1"}
+        mock_request.json = AsyncMock(return_value={"name": "new"})
+
+        resp = await _handle_update_job(mock_request)
+        assert resp.status == 403
+
+
 # ── POST /api/schedule (additional coverage) ───────────────────────
 
 

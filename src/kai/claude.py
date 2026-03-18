@@ -857,10 +857,10 @@ class ClaudeManager:
         self._config = config
         self._services_info = services_info or []
 
-    def get_or_create(self, user_id: int) -> PersistentClaude:
+    async def get_or_create(self, user_id: int) -> PersistentClaude:
         """Get existing instance or create new one for this user."""
         if user_id not in self._instances:
-            self._ensure_user_dirs(user_id)
+            await asyncio.to_thread(self._ensure_user_dirs, user_id)
             home = self._user_home(user_id)
             ws_config = self._config.get_workspace_config(home)
             self._instances[user_id] = PersistentClaude(

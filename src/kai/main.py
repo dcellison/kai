@@ -94,7 +94,7 @@ def main() -> None:
                     log.warning("workspace.disallowed", user_id=uid, workspace=saved_workspace)
                     await sessions.delete_setting(uid, "workspace")
                 elif ws_path.is_dir():
-                    claude = manager.get_or_create(uid)
+                    claude = await manager.get_or_create(uid)
                     ws_config = config.get_workspace_config(ws_path)
                     await claude.change_workspace(ws_path, workspace_config=ws_config)
                     webhook.update_workspace(uid, str(ws_path))

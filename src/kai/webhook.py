@@ -805,6 +805,7 @@ async def _handle_get_job(request: web.Request) -> web.Response:
     Get a single job by its database ID.
 
     Returns the full job record as JSON, or 404 if not found.
+    Only returns jobs owned by the authenticated user.
     """
 
     try:
@@ -812,7 +813,11 @@ async def _handle_get_job(request: web.Request) -> web.Response:
     except ValueError:
         return web.json_response({"error": "Invalid job ID"}, status=400)
 
-    job = await sessions.get_job_by_id(job_id)
+    user_id = _extract_user_id(request)
+    if user_id is None:
+        return web.json_response({"error": "Cannot determine user"}, status=403)
+
+    job = await sessions.get_job_by_id(job_id, user_id=user_id)
     if not job:
         return web.json_response({"error": "Job not found"}, status=404)
     return web.json_response(job)
@@ -826,7 +831,7 @@ async def _handle_delete_job(request: web.Request) -> web.Response:
 
     Removes the job from both the database and APScheduler's in-memory
     queue. Uses the same logic as the /canceljob Telegram command.
-    Returns 404 if the job doesn't exist.
+    Returns 404 if the job doesn't exist or belongs to another user.
     """
 
     try:
@@ -834,7 +839,11 @@ async def _handle_delete_job(request: web.Request) -> web.Response:
     except ValueError:
         return web.json_response({"error": "Invalid job ID"}, status=400)
 
-    deleted = await sessions.delete_job(job_id)
+    user_id = _extract_user_id(request)
+    if user_id is None:
+        return web.json_response({"error": "Cannot determine user"}, status=403)
+
+    deleted = await sessions.delete_job(job_id, user_id=user_id)
     if not deleted:
         return web.json_response({"error": "Job not found"}, status=404)
 
@@ -864,13 +873,18 @@ async def _handle_update_job(request: web.Request) -> web.Response:
     are updated. If the schedule changes (type or data), the job is
     re-registered with APScheduler to pick up the new timing.
 
-    Returns 404 if the job doesn't exist or is inactive.
+    Returns 404 if the job doesn't exist, is inactive, or belongs to
+    another user.
     """
 
     try:
         job_id = int(request.match_info["id"])
     except ValueError:
         return web.json_response({"error": "Invalid job ID"}, status=400)
+
+    user_id = _extract_user_id(request)
+    if user_id is None:
+        return web.json_response({"error": "Cannot determine user"}, status=403)
 
     try:
         payload = await request.json()
@@ -892,6 +906,7 @@ async def _handle_update_job(request: web.Request) -> web.Response:
 
     updated = await sessions.update_job(
         job_id,
+        user_id=user_id,
         name=payload.get("name"),
         prompt=payload.get("prompt"),
         schedule_type=new_schedule_type,

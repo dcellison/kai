@@ -239,6 +239,10 @@ def _is_authorized(config: Config, user_id: int) -> bool:
     return user_id in config.allowed_user_ids
 
 
+# NOTE: @_require_auth is always the OUTERMOST decorator on handlers.
+# This means unauthorized requests are silently dropped BEFORE @log_handler
+# runs — intentional: we don't log or acknowledge unauthorized access to
+# avoid revealing the bot's existence during probing.
 def _require_auth(func):
     """
     Decorator that silently drops updates from unauthorized users.
@@ -345,10 +349,10 @@ async def _send_response(update: Update, text: str) -> None:
         await _reply_safe(update.message, chunk)
 
 
-def _get_claude(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> PersistentClaude:
+async def _get_claude(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> PersistentClaude:
     """Retrieve the PersistentClaude instance for a user via ClaudeManager."""
     manager: ClaudeManager = context.bot_data["claude_manager"]
-    return manager.get_or_create(user_id)
+    return await manager.get_or_create(user_id)
 
 
 # ── Basic command handlers ───────────────────────────────────────────
@@ -373,7 +377,7 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """
     assert update.message is not None
     user_id = _user_id(update)
-    claude = _get_claude(context, user_id)
+    claude = await _get_claude(context, user_id)
     await claude.restart()
     await sessions.clear_session(user_id)
     reset_session_id(user_id)
@@ -406,7 +410,7 @@ def _models_keyboard(current: str) -> InlineKeyboardMarkup:
 async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /models — show an inline keyboard for model selection."""
     assert update.message is not None
-    claude = _get_claude(context, _user_id(update))
+    claude = await _get_claude(context, _user_id(update))
     await update.message.reply_text(
         "Choose a model:",
         reply_markup=_models_keyboard(claude.model),
@@ -419,7 +423,7 @@ async def _switch_model(context: ContextTypes.DEFAULT_TYPE, user_id: int, model:
 
     Called by both the inline keyboard callback and the /model text command.
     """
-    claude = _get_claude(context, user_id)
+    claude = await _get_claude(context, user_id)
     claude.model = model
     await claude.restart()
     await sessions.clear_session(user_id)
@@ -446,7 +450,7 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("Invalid model.")
         return
 
-    claude = _get_claude(context, _user_id(update))
+    claude = await _get_claude(context, _user_id(update))
     if model == claude.model:
         await query.answer()
         await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
@@ -617,7 +621,7 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Handle /stats — show session info, model, cost, and process status."""
     assert update.message is not None
     user_id = _user_id(update)
-    claude = _get_claude(context, user_id)
+    claude = await _get_claude(context, user_id)
     stats = await sessions.get_stats(user_id)
     alive = claude.is_alive
     if not stats:
@@ -719,7 +723,7 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """
     assert update.message is not None
     user_id = _user_id(update)
-    claude = _get_claude(context, user_id)
+    claude = await _get_claude(context, user_id)
     stop_event = get_stop_event(user_id)
     stop_event.set()
     claude.force_kill()
@@ -820,7 +824,7 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, user_id: int,
     Returns the WorkspaceConfig for the target workspace (or None) so
     callers can display config details without a redundant lookup.
     """
-    claude = _get_claude(context, user_id)
+    claude = await _get_claude(context, user_id)
     home = _user_home(user_id)
 
     # Look up per-workspace config for the target workspace.
@@ -851,7 +855,7 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     """
     assert update.message is not None
     user_id = _user_id(update)
-    claude = _get_claude(context, user_id)
+    claude = await _get_claude(context, user_id)
     home = _user_home(user_id)
 
     if path == claude.workspace:
@@ -951,7 +955,7 @@ async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     assert update.message is not None
     user_id = _user_id(update)
     history = await sessions.get_workspace_history(user_id)
-    claude = _get_claude(context, user_id)
+    claude = await _get_claude(context, user_id)
     config: Config = context.bot_data["config"]
     current = str(claude.workspace)
     home = str(_user_home(user_id))
@@ -983,7 +987,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     assert query.data is not None
     data = query.data.removeprefix("ws:")
     user_id = _user_id(update)
-    claude = _get_claude(context, user_id)
+    claude = await _get_claude(context, user_id)
     home = _user_home(user_id)
     base = config.workspace_base
 
@@ -1083,7 +1087,7 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """
     assert update.message is not None
     user_id = _user_id(update)
-    claude = _get_claude(context, user_id)
+    claude = await _get_claude(context, user_id)
     config: Config = context.bot_data["config"]
     home = _user_home(user_id)
     base = config.workspace_base
@@ -1332,7 +1336,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     user_id = _user_id(update)
     chat_id = _chat_id(update)
-    claude = _get_claude(context, user_id)
+    claude = await _get_claude(context, user_id)
     model = claude.model
 
     # Download the largest available resolution (last in the list)
@@ -1460,7 +1464,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     user_id = _user_id(update)
     chat_id = _chat_id(update)
-    claude = _get_claude(context, user_id)
+    claude = await _get_claude(context, user_id)
     model = claude.model
 
     if suffix in _IMAGE_MEDIA_TYPES:
@@ -1575,7 +1579,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     user_id = _user_id(update)
     chat_id = _chat_id(update)
-    claude = _get_claude(context, user_id)
+    claude = await _get_claude(context, user_id)
     config: Config = context.bot_data["config"]
 
     if not config.voice_enabled:
@@ -1761,7 +1765,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     prompt = update.message.text
     await log_message(direction="user", user_id=user_id, chat_id=chat_id, text=prompt)
     audit_user_message(user_id, chat_id, prompt)
-    claude = _get_claude(context, user_id)
+    claude = await _get_claude(context, user_id)
     model = claude.model
 
     was_queued = await _notify_if_queued(update, user_id)

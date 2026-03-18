@@ -244,7 +244,9 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
         # Strip stray backslash escapes (e.g. \! from bash double-quoting in curl)
         prompt = prompt.replace("\\!", "!").replace("\\.", ".").replace("\\?", "?")
         try:
-            await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=f"[Reminder: {data['name']}] {prompt}")
+            await log_message(
+                direction="assistant", user_id=user_id, chat_id=chat_id, text=f"[Reminder: {data['name']}] {prompt}"
+            )
             await context.bot.send_message(chat_id=chat_id, text=prompt)
         except Forbidden:
             log.warning("job.chat_gone", job_id=job_id, chat_id=chat_id)
@@ -269,7 +271,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.error("job.no_claude_manager", job_id=job_id)
         audit_job_event(job_id, user_id, "failed", error="no_claude_manager")
         return
-    claude = manager.get_or_create(user_id)
+    claude = await manager.get_or_create(user_id)
 
     async with get_lock(user_id):
         # Show typing indicator while Claude processes the prompt

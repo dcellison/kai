@@ -488,7 +488,7 @@ def _make_mock_manager(claude=None):
     """Create a mock ClaudeManager."""
     c = claude or _make_mock_claude()
     manager = MagicMock()
-    manager.get_or_create = MagicMock(return_value=c)
+    manager.get_or_create = AsyncMock(return_value=c)
     return manager
 
 

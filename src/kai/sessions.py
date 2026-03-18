@@ -208,7 +208,17 @@ async def create_job(
     cursor = await _get_db().execute(
         """INSERT INTO jobs (user_id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (user_id, chat_id, name, job_type, prompt, schedule_type, schedule_data, int(auto_remove), int(notify_on_check)),
+        (
+            user_id,
+            chat_id,
+            name,
+            job_type,
+            prompt,
+            schedule_type,
+            schedule_data,
+            int(auto_remove),
+            int(notify_on_check),
+        ),
     )
     await _get_db().commit()
     # RuntimeError instead of assert so this guard survives python -O.
@@ -232,12 +242,21 @@ async def get_jobs(user_id: int) -> list[dict]:
         ]
 
 
-async def get_job_by_id(job_id: int) -> dict | None:
-    """Get a single job by ID, or None if not found. Used by cron.register_job_by_id()."""
-    async with _get_db().execute(
-        "SELECT id, user_id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check FROM jobs WHERE id = ?",
-        (job_id,),
-    ) as cursor:
+async def get_job_by_id(job_id: int, *, user_id: int | None = None) -> dict | None:
+    """Get a single job by ID, or None if not found.
+
+    Args:
+        job_id: Database ID of the job.
+        user_id: If provided, only return the job if it belongs to this user.
+            Internal callers (cron, startup) omit this to access any job.
+    """
+    if user_id is not None:
+        query = "SELECT id, user_id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check FROM jobs WHERE id = ? AND user_id = ?"
+        params = (job_id, user_id)
+    else:
+        query = "SELECT id, user_id, chat_id, name, job_type, prompt, schedule_type, schedule_data, auto_remove, notify_on_check FROM jobs WHERE id = ?"
+        params = (job_id,)
+    async with _get_db().execute(query, params) as cursor:
         row = await cursor.fetchone()
         if not row:
             return None
@@ -256,9 +275,18 @@ async def get_all_active_jobs() -> list[dict]:
         ]
 
 
-async def delete_job(job_id: int) -> bool:
-    """Permanently delete a job. Returns True if a row was deleted, False if not found."""
-    cursor = await _get_db().execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+async def delete_job(job_id: int, *, user_id: int | None = None) -> bool:
+    """Permanently delete a job. Returns True if a row was deleted, False if not found.
+
+    Args:
+        job_id: Database ID of the job.
+        user_id: If provided, only delete if the job belongs to this user.
+            Internal callers (cron) omit this to delete any job.
+    """
+    if user_id is not None:
+        cursor = await _get_db().execute("DELETE FROM jobs WHERE id = ? AND user_id = ?", (job_id, user_id))
+    else:
+        cursor = await _get_db().execute("DELETE FROM jobs WHERE id = ?", (job_id,))
     await _get_db().commit()
     return cursor.rowcount > 0
 
@@ -272,6 +300,7 @@ async def deactivate_job(job_id: int) -> None:
 async def update_job(
     job_id: int,
     *,
+    user_id: int | None = None,
     name: str | None = None,
     prompt: str | None = None,
     schedule_type: str | None = None,
@@ -292,6 +321,7 @@ async def update_job(
 
     Args:
         job_id: Database ID of the job to update.
+        user_id: If provided, only update if the job belongs to this user.
         name: New job name.
         prompt: New prompt text.
         schedule_type: New schedule type ("once", "daily", "interval").
@@ -329,7 +359,11 @@ async def update_job(
         return False
 
     values.append(job_id)
-    sql = f"UPDATE jobs SET {', '.join(updates)} WHERE id = ? AND active = 1"
+    conditions = "id = ? AND active = 1"
+    if user_id is not None:
+        conditions += " AND user_id = ?"
+        values.append(user_id)
+    sql = f"UPDATE jobs SET {', '.join(updates)} WHERE {conditions}"
     cursor = await _get_db().execute(sql, values)
     await _get_db().commit()
     return cursor.rowcount > 0
@@ -344,9 +378,7 @@ async def get_setting(user_id: int, key: str) -> str | None:
 
     Common keys: "workspace", "voice_mode", "voice_name".
     """
-    async with _get_db().execute(
-        "SELECT value FROM settings WHERE user_id = ? AND key = ?", (user_id, key)
-    ) as cursor:
+    async with _get_db().execute("SELECT value FROM settings WHERE user_id = ? AND key = ?", (user_id, key)) as cursor:
         row = await cursor.fetchone()
         return row["value"] if row else None
 

@@ -69,33 +69,33 @@ class TestClaudeManagerIsolation:
             mgr = ClaudeManager(config=config)
             yield mgr
 
-    def test_separate_instances_per_user(self, manager):
-        a = manager.get_or_create(USER_A)
-        b = manager.get_or_create(USER_B)
+    async def test_separate_instances_per_user(self, manager):
+        a = await manager.get_or_create(USER_A)
+        b = await manager.get_or_create(USER_B)
         assert a is not b
         assert a.user_id == USER_A
         assert b.user_id == USER_B
 
-    def test_same_instance_on_repeat_call(self, manager):
-        first = manager.get_or_create(USER_A)
-        second = manager.get_or_create(USER_A)
+    async def test_same_instance_on_repeat_call(self, manager):
+        first = await manager.get_or_create(USER_A)
+        second = await manager.get_or_create(USER_A)
         assert first is second
 
-    def test_user_home_dirs_created(self, tmp_path, manager):
-        manager.get_or_create(USER_A)
-        manager.get_or_create(USER_B)
+    async def test_user_home_dirs_created(self, tmp_path, manager):
+        await manager.get_or_create(USER_A)
+        await manager.get_or_create(USER_B)
         assert (tmp_path / "users" / "100" / "home" / ".claude" / "history").is_dir()
         assert (tmp_path / "users" / "200" / "home" / "files").is_dir()
 
-    def test_template_claude_md_copied(self, tmp_path, manager):
+    async def test_template_claude_md_copied(self, tmp_path, manager):
         # Create template CLAUDE.md in the workspace
         ws = tmp_path / "workspace"
         template = ws / ".claude" / "CLAUDE.md"
         template.parent.mkdir(parents=True, exist_ok=True)
         template.write_text("# Template Instructions")
 
-        manager.get_or_create(USER_A)
-        manager.get_or_create(USER_B)
+        await manager.get_or_create(USER_A)
+        await manager.get_or_create(USER_B)
 
         a_md = tmp_path / "users" / "100" / "home" / ".claude" / "CLAUDE.md"
         b_md = tmp_path / "users" / "200" / "home" / ".claude" / "CLAUDE.md"
@@ -107,16 +107,16 @@ class TestClaudeManagerIsolation:
         assert b_md.read_text() == "# Template Instructions"
 
     async def test_shutdown_user_preserves_other(self, manager):
-        manager.get_or_create(USER_A)
-        manager.get_or_create(USER_B)
+        await manager.get_or_create(USER_A)
+        await manager.get_or_create(USER_B)
         with patch.object(manager._instances[USER_A], "shutdown", new_callable=AsyncMock):
             await manager.shutdown_user(USER_A)
         assert USER_A not in manager._instances
         assert USER_B in manager._instances
 
     async def test_shutdown_all_clears_everything(self, manager):
-        manager.get_or_create(USER_A)
-        manager.get_or_create(USER_B)
+        await manager.get_or_create(USER_A)
+        await manager.get_or_create(USER_B)
         with (
             patch.object(manager._instances[USER_A], "shutdown", new_callable=AsyncMock),
             patch.object(manager._instances[USER_B], "shutdown", new_callable=AsyncMock),
@@ -309,7 +309,7 @@ def _two_user_setup():
     claude_b = _make_mock_claude()
     instances = {USER_A: claude_a, USER_B: claude_b}
     manager = MagicMock()
-    manager.get_or_create = MagicMock(side_effect=lambda uid: instances[uid])
+    manager.get_or_create = AsyncMock(side_effect=lambda uid: instances[uid])
     config = _make_config(allowed_user_ids={USER_A, USER_B})
     return claude_a, claude_b, manager, config
 
@@ -576,7 +576,7 @@ class TestCronJobUserRouting:
         claude_b = _make_mock_claude()
         instances = {USER_A: claude_a, USER_B: claude_b}
         manager = MagicMock()
-        manager.get_or_create = MagicMock(side_effect=lambda uid: instances[uid])
+        manager.get_or_create = AsyncMock(side_effect=lambda uid: instances[uid])
 
         # Set up a done event for the stream
         done = _done_event(text="reminder sent")

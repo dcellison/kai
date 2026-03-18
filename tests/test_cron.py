@@ -129,14 +129,14 @@ def _make_claude_manager(text="The response", success=True, error=None):
     mock_claude.send = fake_send
 
     manager = MagicMock()
-    manager.get_or_create.return_value = mock_claude
+    manager.get_or_create = AsyncMock(return_value=mock_claude)
     return manager
 
 
 def _make_claude_manager_with_custom_claude(mock_claude):
     """Wrap a custom mock Claude instance in a manager mock."""
     manager = MagicMock()
-    manager.get_or_create.return_value = mock_claude
+    manager.get_or_create = AsyncMock(return_value=mock_claude)
     return manager
 
 
