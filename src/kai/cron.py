@@ -23,10 +23,10 @@ same event loop as the Telegram bot.
 """
 
 import json
-import logging
 from datetime import UTC, datetime
 from datetime import time as dt_time
 
+import structlog
 from telegram.constants import ChatAction
 from telegram.error import Forbidden
 from telegram.ext import Application, ContextTypes
@@ -34,8 +34,9 @@ from telegram.ext import Application, ContextTypes
 from kai import sessions
 from kai.history import log_message
 from kai.locks import get_lock
+from kai.logging import audit_job_event, bind_user_context
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger("kai.cron")
 
 # Protocol markers for conditional auto-remove jobs.
 # Claude is instructed to begin its response with one of these markers.
@@ -109,7 +110,7 @@ async def _register_new_jobs(app: Application) -> int:
             run_at = _ensure_utc(datetime.fromisoformat(schedule["run_at"]))
             if run_at <= now:
                 await sessions.deactivate_job(job["id"])
-                log.info("Skipped expired one-shot job %d: %s", job["id"], job["name"])
+                log.info("job.expired", job_id=job["id"], name=job["name"])
                 continue
         _register_job(app, job)
         count += 1
@@ -131,7 +132,7 @@ async def register_job_by_id(app: Application, job_id: int) -> bool:
     """
     job = await sessions.get_job_by_id(job_id)
     if not job:
-        log.error("Job %d not found in DB", job_id)
+        log.error("job.not_found", job_id=job_id)
         return False
     _register_job(app, job)
     return True
@@ -171,12 +172,12 @@ def _register_job(app: Application, job: dict) -> None:
     if job["schedule_type"] == "once":
         run_at = _ensure_utc(datetime.fromisoformat(schedule["run_at"]))
         jq.run_once(_job_callback, when=run_at, name=job_name, data=callback_data)
-        log.info("Scheduled one-shot job %d '%s' at %s", job["id"], job["name"], run_at)
+        log.info("job.registered", job_id=job["id"], name=job["name"], schedule="once", run_at=str(run_at))
 
     elif job["schedule_type"] == "interval":
         seconds = schedule["seconds"]
         jq.run_repeating(_job_callback, interval=seconds, name=job_name, data=callback_data)
-        log.info("Scheduled repeating job %d '%s' every %ds", job["id"], job["name"], seconds)
+        log.info("job.registered", job_id=job["id"], name=job["name"], schedule="interval", seconds=seconds)
 
     elif job["schedule_type"] == "daily":
         times = schedule["times"]
@@ -186,19 +187,19 @@ def _register_job(app: Application, job: dict) -> None:
                 parts = time_str.split(":")
                 hour, minute = int(parts[0]), int(parts[1])
             except (ValueError, IndexError):
-                log.error("Invalid time %s for job %d, skipping", time_str, job["id"])
+                log.error("job.invalid_time", job_id=job["id"], time_str=time_str)
                 continue
             if not (0 <= hour <= 23 and 0 <= minute <= 59):
-                log.error("Invalid time %s for job %d, skipping", time_str, job["id"])
+                log.error("job.invalid_time", job_id=job["id"], time_str=time_str)
                 continue
             t = dt_time(hour, minute, tzinfo=UTC)
             # Suffix name for multi-time daily jobs to avoid APScheduler name collisions
             name_suffix = f"{job_name}_{i}" if len(times) > 1 else job_name
             jq.run_daily(_job_callback, time=t, name=name_suffix, data=callback_data)
-            log.info("Scheduled daily job %d '%s' at %s UTC", job["id"], job["name"], time_str)
+            log.info("job.registered", job_id=job["id"], name=job["name"], schedule="daily", time_utc=time_str)
 
     else:
-        log.warning("Unknown schedule type '%s' for job %d, skipping", job["schedule_type"], job["id"])
+        log.warning("job.unknown_schedule", job_id=job["id"], schedule_type=job["schedule_type"])
 
 
 # ── Job execution ────────────────────────────────────────────────────
@@ -234,7 +235,9 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
     auto_remove = data["auto_remove"]
     job_id = data["job_id"]
 
-    log.info("Job %d '%s' fired (type=%s)", job_id, data["name"], job_type)
+    structlog.contextvars.clear_contextvars()
+    bind_user_context(user_id=user_id, operation=f"cron_{job_type}_{job_id}")
+    audit_job_event(job_id, user_id, "fired", job_type=job_type, name=data["name"])
 
     # ── Reminder jobs: send prompt text directly ──
     if job_type == "reminder":
@@ -244,12 +247,14 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=f"[Reminder: {data['name']}] {prompt}")
             await context.bot.send_message(chat_id=chat_id, text=prompt)
         except Forbidden:
-            log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
+            log.warning("job.chat_gone", job_id=job_id, chat_id=chat_id)
             await sessions.deactivate_job(job_id)
             job.schedule_removal()
+            audit_job_event(job_id, user_id, "failed", error="chat_gone")
             return
         except Exception:
-            log.exception("Failed to send reminder for job %d", job_id)
+            log.exception("job.reminder_failed", job_id=job_id)
+        audit_job_event(job_id, user_id, "completed")
         # One-shot reminders auto-deactivate after firing.
         # No schedule_removal() needed here - APScheduler's run_once already
         # removes the job from the queue after it fires (unlike the Forbidden
@@ -261,7 +266,8 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
     # ── Claude jobs: send prompt through the Claude process ──
     manager = context.bot_data.get("claude_manager")
     if not manager:
-        log.error("No Claude manager available for job %d", job_id)
+        log.error("job.no_claude_manager", job_id=job_id)
+        audit_job_event(job_id, user_id, "failed", error="no_claude_manager")
         return
     claude = manager.get_or_create(user_id)
 
@@ -280,16 +286,16 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                     final_response = event.response
                     break
         except Exception:
-            log.exception("Job %d crashed during Claude interaction", job_id)
+            log.exception("job.claude_crash", job_id=job_id)
+            audit_job_event(job_id, user_id, "failed", error="claude_crash")
             return
 
         if final_response is None or not final_response.success:
             if final_response is None:
-                # Stream ended without a done event; helps distinguish from
-                # a done event with an error (which sets final_response.success=False)
-                log.warning("Job %d '%s': Claude stream ended without a done event", job_id, data["name"])
+                log.warning("job.no_done_event", job_id=job_id, name=data["name"])
             error = final_response.error if final_response else "No response"
-            log.error("Job %d Claude error: %s", job_id, error)
+            log.error("job.claude_error", job_id=job_id, error=error)
+            audit_job_event(job_id, user_id, "failed", error=error)
             return
 
         response_text = final_response.text
@@ -308,12 +314,13 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=msg)
                 await context.bot.send_message(chat_id=chat_id, text=msg)
             except Forbidden:
-                log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
+                log.warning("job.chat_gone", job_id=job_id, chat_id=chat_id)
             except Exception:
-                log.exception("Failed to send job %d result", job_id)
+                log.exception("job.send_failed", job_id=job_id)
             await sessions.deactivate_job(job_id)
             job.schedule_removal()
-            log.info("Job %d condition met, deactivated", job_id)
+            log.info("job.condition_met", job_id=job_id)
+            audit_job_event(job_id, user_id, "completed", condition="met")
 
         elif auto_remove and first_line.startswith(_CONDITION_NOT_MET_PREFIX.upper()):
             # Condition not met — notify user if notify_on_check is enabled, otherwise silent
@@ -333,12 +340,15 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                     await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=msg)
                     await context.bot.send_message(chat_id=chat_id, text=msg)
                 except Forbidden:
-                    log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
+                    log.warning("job.chat_gone", job_id=job_id, chat_id=chat_id)
                     await sessions.deactivate_job(job_id)
                     job.schedule_removal()
+                    audit_job_event(job_id, user_id, "failed", error="chat_gone")
+                    return
                 except Exception:
-                    log.exception("Failed to send job %d progress update", job_id)
-            log.info("Job %d condition not met, continuing (notified=%s)", job_id, notify_on_check)
+                    log.exception("job.progress_send_failed", job_id=job_id)
+            log.info("job.condition_not_met", job_id=job_id, notified=notify_on_check)
+            audit_job_event(job_id, user_id, "completed", condition="not_met")
 
         else:
             # Non-conditional or non-auto-remove: always deliver the response
@@ -347,8 +357,11 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=msg)
                 await context.bot.send_message(chat_id=chat_id, text=msg)
             except Forbidden:
-                log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
+                log.warning("job.chat_gone", job_id=job_id, chat_id=chat_id)
                 await sessions.deactivate_job(job_id)
                 job.schedule_removal()
+                audit_job_event(job_id, user_id, "failed", error="chat_gone")
+                return
             except Exception:
-                log.exception("Failed to send job %d result", job_id)
+                log.exception("job.send_failed", job_id=job_id)
+            audit_job_event(job_id, user_id, "completed")

@@ -42,18 +42,19 @@ import functools
 import hashlib
 import hmac
 import json
-import logging
 import re
 import time
 from pathlib import Path
 
+import structlog
 from aiohttp import web
 from telegram import Update
 
 from kai import cron, review, services, sessions, triage
 from kai.config import DATA_DIR, IMAGE_EXTENSIONS
+from kai.logging import audit_service_call, audit_webhook_event, log_route
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger("kai.webhook")
 
 # Module-level server state, managed by start() and stop()
 _app: web.Application | None = None
@@ -228,9 +229,7 @@ def _users_for_repo(repo_full_name: str, app: web.Application) -> list[int]:
     repo_name = repo_full_name.split("/")[-1]
     matched: list[int] = []
     for uid, ws_path in (app.get("user_workspaces") or {}).items():
-        if ws_path and Path(ws_path).name == repo_name:
-            matched.append(uid)
-        elif ws_path and Path(ws_path).parent.name == repo_name:
+        if (ws_path and Path(ws_path).name == repo_name) or (ws_path and Path(ws_path).parent.name == repo_name):
             matched.append(uid)
     # Fall back to all users if no workspace matches the repo
     if not matched:
@@ -268,7 +267,7 @@ def _require_secret(handler):
         secret = request.app["webhook_secret"]
         provided = request.headers.get("X-Webhook-Secret", "")
         if not hmac.compare_digest(provided, secret):
-            log.warning("Auth failure on %s from %s", request.path, request.remote)
+            log.warning("auth.failed", path=request.path, remote=request.remote)
             return web.Response(status=401, text="Invalid secret")
         return await handler(request)
 
@@ -403,11 +402,13 @@ def _verify_github_signature(secret: str, body: bytes, signature: str) -> bool:
 # ── Route handlers ───────────────────────────────────────────────────
 
 
+@log_route("health")
 async def _handle_health(request: web.Request) -> web.Response:
     """Health check endpoint. Returns {"status": "ok"} for uptime monitoring."""
     return web.json_response({"status": "ok"})
 
 
+@log_route("telegram_webhook")
 async def _handle_telegram_update(request: web.Request) -> web.Response:
     """
     Receive a Telegram update pushed via webhook.
@@ -458,6 +459,7 @@ async def _handle_telegram_update(request: web.Request) -> web.Response:
     return web.Response(status=200)
 
 
+@log_route("github_webhook")
 async def _handle_github(request: web.Request) -> web.Response:
     """
     Handle incoming GitHub webhook events.
@@ -491,51 +493,52 @@ async def _handle_github(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         return web.Response(status=400, text="Invalid JSON")
 
+    repo = payload.get("repository", {}).get("full_name", "")
+    action = payload.get("action", "")
+    audit_webhook_event("github", source=request.remote, webhook_event=event_type, repo=repo, action=action)
+
     # ── PR review routing ────────────────────────────────────────
     # When PR review is enabled, reviewable PR events (opened, reopened,
     # synchronize) are routed to the review pipeline instead of the
     # notification formatter. Non-reviewable actions (closed, merged)
     # still get the standard Telegram notification.
     pr_review_enabled = request.app.get("pr_review_enabled", False)
-    if pr_review_enabled and event_type == "pull_request":
-        action = payload.get("action", "")
-        if action in ("opened", "reopened", "synchronize"):
-            pr = payload.get("pull_request", {})
-            pr_number = pr.get("number", 0)
-            repo = payload.get("repository", {}).get("full_name", "")
-            cooldown = request.app.get("pr_review_cooldown", 300)
+    if pr_review_enabled and event_type == "pull_request" and action in ("opened", "reopened", "synchronize"):
+        pr = payload.get("pull_request", {})
+        pr_number = pr.get("number", 0)
+        cooldown = request.app.get("pr_review_cooldown", 300)
 
-            if _should_skip_review(repo, pr_number, cooldown):
-                log.info("Skipping review of %s PR #%d (cooldown)", repo, pr_number)
-                return web.json_response({"msg": "review_cooldown"})
+        if _should_skip_review(repo, pr_number, cooldown):
+            log.info("review.cooldown", repo=repo, pr_number=pr_number)
+            return web.json_response({"msg": "review_cooldown"})
 
-            _record_review(repo, pr_number)
+        _record_review(repo, pr_number)
 
-            # Resolve a local repo path for spec/convention loading.
-            # Checks home workspace, WORKSPACE_BASE, ALLOWED_WORKSPACES,
-            # and workspace history for a directory matching the repo name.
-            local_repo_path = await _resolve_local_repo(repo, request.app)
-            target_users = _users_for_repo(repo, request.app)
+        # Resolve a local repo path for spec/convention loading.
+        # Checks home workspace, WORKSPACE_BASE, ALLOWED_WORKSPACES,
+        # and workspace history for a directory matching the repo name.
+        local_repo_path = await _resolve_local_repo(repo, request.app)
+        target_users = _users_for_repo(repo, request.app)
 
-            # Launch the review as a fire-and-forget background task.
-            # Same pattern as Telegram update processing: create_task +
-            # _background_tasks set to prevent GC during execution.
-            task = asyncio.create_task(
-                review.review_pr(
-                    payload,
-                    webhook_port=request.app["webhook_port"],
-                    webhook_secret=request.app["webhook_secret"],
-                    claude_user=request.app.get("claude_user"),
-                    local_repo_path=local_repo_path,
-                    spec_dir=request.app.get("spec_dir", "specs"),
-                    user_ids=target_users,
-                )
+        # Launch the review as a fire-and-forget background task.
+        # Same pattern as Telegram update processing: create_task +
+        # _background_tasks set to prevent GC during execution.
+        task = asyncio.create_task(
+            review.review_pr(
+                payload,
+                webhook_port=request.app["webhook_port"],
+                webhook_secret=request.app["webhook_secret"],
+                claude_user=request.app.get("claude_user"),
+                local_repo_path=local_repo_path,
+                spec_dir=request.app.get("spec_dir", "specs"),
+                user_ids=target_users,
             )
-            _background_tasks.add(task)
-            task.add_done_callback(_background_tasks.discard)
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
-            log.info("PR review triggered for %s PR #%d (%s)", repo, pr_number, action)
-            return web.json_response({"status": "review_triggered"})
+        log.info("review.triggered", repo=repo, pr_number=pr_number, action=action)
+        return web.json_response({"status": "review_triggered"})
 
     # ── Issue triage routing ────────────────────────────────────
     # When issue triage is enabled, opened issues are routed to the
@@ -543,42 +546,31 @@ async def _handle_github(request: web.Request) -> web.Response:
     # _fmt_issues() notification (richer content). Non-triaged actions
     # (closed, reopened) still fall through to the standard formatter.
     issue_triage_enabled = request.app.get("issue_triage_enabled", False)
-    if issue_triage_enabled and event_type == "issues":
-        action = payload.get("action", "")
-        if action == "opened":
-            issue = payload.get("issue", {})
-            issue_number = issue.get("number", 0)
-            repo = payload.get("repository", {}).get("full_name", "")
+    if issue_triage_enabled and event_type == "issues" and action == "opened":
+        issue = payload.get("issue", {})
+        issue_number = issue.get("number", 0)
 
-            if _should_skip_triage(repo, issue_number):
-                log.info(
-                    "Skipping triage of %s issue #%d (cooldown)",
-                    repo,
-                    issue_number,
-                )
-                return web.json_response({"msg": "triage_cooldown"})
+        if _should_skip_triage(repo, issue_number):
+            log.info("triage.cooldown", repo=repo, issue_number=issue_number)
+            return web.json_response({"msg": "triage_cooldown"})
 
-            _record_triage(repo, issue_number)
-            target_users = _users_for_repo(repo, request.app)
+        _record_triage(repo, issue_number)
+        target_users = _users_for_repo(repo, request.app)
 
-            task = asyncio.create_task(
-                triage.triage_issue(
-                    payload,
-                    webhook_port=request.app["webhook_port"],
-                    webhook_secret=request.app["webhook_secret"],
-                    claude_user=request.app.get("claude_user"),
-                    user_ids=target_users,
-                )
+        task = asyncio.create_task(
+            triage.triage_issue(
+                payload,
+                webhook_port=request.app["webhook_port"],
+                webhook_secret=request.app["webhook_secret"],
+                claude_user=request.app.get("claude_user"),
+                user_ids=target_users,
             )
-            _background_tasks.add(task)
-            task.add_done_callback(_background_tasks.discard)
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
-            log.info(
-                "Issue triage triggered for %s issue #%d",
-                repo,
-                issue_number,
-            )
-            return web.json_response({"status": "triage_triggered"})
+        log.info("triage.triggered", repo=repo, issue_number=issue_number)
+        return web.json_response({"status": "triage_triggered"})
 
     # ── Standard notification path ───────────────────────────────
     # Look up the formatter for this event type
@@ -591,7 +583,6 @@ async def _handle_github(request: web.Request) -> web.Response:
         return web.json_response({"msg": "ignored", "event": event_type})
 
     # Send to repo-relevant users who have GitHub notifications enabled (default: on)
-    repo = payload.get("repository", {}).get("full_name", "")
     target_users = _users_for_repo(repo, request.app) if repo else list(request.app["allowed_user_ids"])
     sent_count = 0
     for uid in target_users:
@@ -606,12 +597,13 @@ async def _handle_github(request: web.Request) -> web.Response:
                 await bot.send_message(uid, _strip_markdown(message))
                 sent_count += 1
             except Exception:
-                log.exception("Failed to send GitHub notification to user %d", uid)
-    log.info("Sent GitHub %s notification to %d user(s)", event_type, sent_count)
+                log.exception("github.notify_failed", user_id=uid)
+    log.info("github.notified", event_type=event_type, sent_count=sent_count)
 
     return web.json_response({"status": "ok"})
 
 
+@log_route("generic_webhook")
 @_require_secret
 async def _handle_generic(request: web.Request) -> web.Response:
     """
@@ -627,6 +619,8 @@ async def _handle_generic(request: web.Request) -> web.Response:
         payload = await request.json()
     except json.JSONDecodeError:
         return web.Response(status=400, text="Invalid JSON")
+
+    audit_webhook_event("generic", source=request.remote)
 
     # Use the "message" field if present (including empty string),
     # otherwise dump the full JSON. `is not None` avoids treating "" as absent.
@@ -644,7 +638,7 @@ async def _handle_generic(request: web.Request) -> web.Response:
         try:
             await bot.send_message(uid, text)
         except Exception:
-            log.exception("Failed to send generic webhook notification to user %d", uid)
+            log.exception("generic_webhook.notify_failed", user_id=uid)
 
     return web.json_response({"status": "ok"})
 
@@ -693,6 +687,7 @@ _VALID_SCHEDULE_TYPES = ("once", "daily", "interval")
 _VALID_JOB_TYPES = ("reminder", "claude")
 
 
+@log_route("schedule_job")
 @_require_secret
 async def _handle_schedule(request: web.Request) -> web.Response:
     """
@@ -777,13 +772,14 @@ async def _handle_schedule(request: web.Request) -> web.Response:
     telegram_app = request.app["telegram_app"]
     await cron.register_job_by_id(telegram_app, job_id)
 
-    log.info("Scheduled job %d '%s' via API (%s)", job_id, name, schedule_type)
+    log.info("job.created", job_id=job_id, name=name, schedule_type=schedule_type)
     return web.json_response({"job_id": job_id, "name": name})
 
 
 # ── Jobs API ─────────────────────────────────────────────────────────
 
 
+@log_route("get_jobs")
 @_require_secret
 async def _handle_get_jobs(request: web.Request) -> web.Response:
     """
@@ -800,6 +796,7 @@ async def _handle_get_jobs(request: web.Request) -> web.Response:
     return web.json_response(jobs)
 
 
+@log_route("get_job")
 @_require_secret
 async def _handle_get_job(request: web.Request) -> web.Response:
     """
@@ -819,6 +816,7 @@ async def _handle_get_job(request: web.Request) -> web.Response:
     return web.json_response(job)
 
 
+@log_route("delete_job")
 @_require_secret
 async def _handle_delete_job(request: web.Request) -> web.Response:
     """
@@ -849,10 +847,11 @@ async def _handle_delete_job(request: web.Request) -> web.Response:
         if j.name == prefix or (j.name and j.name.startswith(f"{prefix}_")):
             j.schedule_removal()
 
-    log.info("Deleted job %d via API", job_id)
+    log.info("job.deleted", job_id=job_id)
     return web.json_response({"deleted": job_id})
 
 
+@log_route("update_job")
 @_require_secret
 async def _handle_update_job(request: web.Request) -> web.Response:
     """
@@ -917,13 +916,14 @@ async def _handle_update_job(request: web.Request) -> web.Response:
         # Re-register with new schedule
         await cron.register_job_by_id(telegram_app, job_id)
 
-    log.info("Updated job %d via API", job_id)
+    log.info("job.updated", job_id=job_id)
     return web.json_response({"updated": job_id})
 
 
 # ── Service proxy ────────────────────────────────────────────────────
 
 
+@log_route("service_proxy")
 @_require_secret
 async def _handle_service_call(request: web.Request) -> web.Response:
     """
@@ -960,12 +960,18 @@ async def _handle_service_call(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         pass  # No body is fine — all fields are optional
 
+    t0 = time.monotonic()
     result = await services.call_service(
         service_name,
         body=body,
         params=params,
         path_suffix=path_suffix,
     )
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+    raw_uid = request.headers.get("X-User-Id")
+    uid = int(raw_uid) if raw_uid and raw_uid.isdigit() else None
+    audit_service_call(service_name, user_id=uid, status=result.status, duration_ms=elapsed_ms)
 
     if result.success:
         return web.json_response({"status": result.status, "body": result.body})
@@ -976,6 +982,7 @@ async def _handle_service_call(request: web.Request) -> web.Response:
 # ── Messaging ────────────────────────────────────────────────────────
 
 
+@log_route("send_message")
 @_require_secret
 async def _handle_send_message(request: web.Request) -> web.Response:
     """
@@ -1028,16 +1035,17 @@ async def _handle_send_message(request: web.Request) -> web.Response:
                 await bot.send_message(chat_id, remaining[:cut])
                 remaining = remaining[cut:].lstrip("\n")
     except Exception:
-        log.exception("Failed to send message to chat %d via API", chat_id)
+        log.exception("send_message.failed", chat_id=chat_id)
         return web.json_response({"error": "Failed to send message"}, status=500)
 
-    log.info("Sent message to chat %d via API (%d chars)", chat_id, len(text))
+    log.info("send_message.sent", chat_id=chat_id, chars=len(text))
     return web.json_response({"status": "sent"})
 
 
 # ── File exchange ────────────────────────────────────────────────────
 
 
+@log_route("send_file")
 @_require_secret
 async def _handle_send_file(request: web.Request) -> web.Response:
     """
@@ -1113,10 +1121,10 @@ async def _handle_send_file(request: web.Request) -> web.Response:
             with open(path, "rb") as f:
                 await bot.send_document(chat_id, f, caption=caption or None, filename=path.name)
     except Exception:
-        log.exception("Failed to send file %s to chat %d", path, chat_id)
+        log.exception("send_file.failed", path=str(path), chat_id=chat_id)
         return web.json_response({"error": "Failed to send file"}, status=500)
 
-    log.info("Sent file %s to chat %d via API", path.name, chat_id)
+    log.info("send_file.sent", file=path.name, chat_id=chat_id)
     return web.json_response({"status": "sent", "file": path.name})
 
 
@@ -1180,7 +1188,7 @@ async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str) -> No
             prev_pending = current_pending
 
             if needs_reregister:
-                log.warning("Webhook health: %s - re-registering", reason)
+                log.warning("webhook.health_failed", reason=reason)
                 await bot.delete_webhook()
                 await bot.set_webhook(
                     url=webhook_url,
@@ -1278,7 +1286,7 @@ async def start(telegram_app, config) -> None:
     # so there's no reason to expose the server on the LAN.
     site = web.TCPSite(_runner, "127.0.0.1", config.webhook_port)
     await site.start()
-    log.info("Webhook server listening on port %d", config.webhook_port)
+    log.info("webhook.listening", port=config.webhook_port)
 
     # Register the webhook URL with Telegram's API if in webhook mode. This must
     # come after the server is listening so the endpoint is ready before Telegram
@@ -1299,11 +1307,11 @@ async def start(telegram_app, config) -> None:
                     allowed_updates=["message", "callback_query"],
                 )
                 _webhook_registered = True
-                log.info("Registered Telegram webhook: %s", config.telegram_webhook_url)
+                log.info("webhook.telegram_registered", url=config.telegram_webhook_url)
                 break
             except Exception:
                 if attempt == max_attempts:
-                    log.exception("Failed to register webhook after %d attempts", max_attempts)
+                    log.exception("webhook.telegram_register_failed", attempts=max_attempts)
                     raise
                 wait = 2**attempt  # 2, 4, 8, 16s
                 log.warning(

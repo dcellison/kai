@@ -229,20 +229,20 @@ class TestRegisterJob:
         job = _make_job(schedule_data='{"times": ["abc"]}')
         _register_job(mock_app, job)
         mock_app.job_queue.run_daily.assert_not_called()
-        assert "Invalid time" in caplog.text
+        assert "job.invalid_time" in caplog.text
 
     def test_daily_out_of_range_skipped(self, mock_app, caplog):
         """Out-of-range hour/minute values (e.g. 25:00) are skipped."""
         job = _make_job(schedule_data='{"times": ["25:00"]}')
         _register_job(mock_app, job)
         mock_app.job_queue.run_daily.assert_not_called()
-        assert "Invalid time" in caplog.text
+        assert "job.invalid_time" in caplog.text
 
     def test_unknown_schedule_type_logs_warning(self, mock_app, caplog):
         """Unknown schedule types are ignored with a warning."""
         job = _make_job(schedule_type="weekly", schedule_data="{}")
         _register_job(mock_app, job)
-        assert "Unknown schedule type" in caplog.text
+        assert "job.unknown_schedule" in caplog.text
         # Nothing was scheduled
         mock_app.job_queue.run_once.assert_not_called()
         mock_app.job_queue.run_daily.assert_not_called()
@@ -271,7 +271,7 @@ class TestRegisterJobById:
         with patch("kai.cron.sessions.get_job_by_id", new_callable=AsyncMock, return_value=None):
             result = await register_job_by_id(mock_app, 999)
         assert result is False
-        assert "not found" in caplog.text
+        assert "job.not_found" in caplog.text
 
 
 # ── _register_new_jobs ───────────────────────────────────────────────
@@ -336,7 +336,7 @@ class TestRegisterNewJobs:
         assert count == 0
         mock_deactivate.assert_called_once_with(3)
         mock_register.assert_not_called()
-        assert "expired" in caplog.text.lower()
+        assert "job.expired" in caplog.text
 
     @pytest.mark.asyncio()
     async def test_returns_correct_count(self, mock_app):
@@ -462,7 +462,7 @@ class TestJobCallbackClaude:
         """When claude_manager isn't in bot_data, logs error and returns without crashing."""
         self.ctx.bot_data = {}
         await _job_callback(self.ctx)
-        assert "No Claude" in caplog.text
+        assert "job.no_claude_manager" in caplog.text
         self.ctx.bot.send_message.assert_not_called()
 
     @pytest.mark.asyncio()
@@ -477,7 +477,7 @@ class TestJobCallbackClaude:
         mock_claude.send = exploding_send
         self.ctx.bot_data = {"claude_manager": _make_claude_manager_with_custom_claude(mock_claude)}
         await _job_callback(self.ctx)
-        assert "crashed" in caplog.text
+        assert "job.claude_crash" in caplog.text
         self.ctx.bot.send_message.assert_not_called()
 
     @pytest.mark.asyncio()
@@ -494,7 +494,7 @@ class TestJobCallbackClaude:
         mock_claude.send = empty_send
         self.ctx.bot_data = {"claude_manager": _make_claude_manager_with_custom_claude(mock_claude)}
         await _job_callback(self.ctx)
-        assert "without a done event" in caplog.text
+        assert "job.no_done_event" in caplog.text
         self.ctx.bot.send_message.assert_not_called()
 
     @pytest.mark.asyncio()
@@ -502,7 +502,7 @@ class TestJobCallbackClaude:
         """When Claude returns success=False, logs the error and returns."""
         self.ctx.bot_data = {"claude_manager": _make_claude_manager(success=False, error="rate limited")}
         await _job_callback(self.ctx)
-        assert "rate limited" in caplog.text
+        assert "rate limited" in caplog.text  # error text is passed as kwarg
         self.ctx.bot.send_message.assert_not_called()
 
     @pytest.mark.asyncio()

@@ -33,14 +33,13 @@ import asyncio
 import base64
 import functools
 import json
-import logging
 import math
 import shutil
 import time
-import uuid
 from datetime import datetime
 from pathlib import Path
 
+import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
@@ -58,6 +57,14 @@ from kai.claude import ClaudeManager, PersistentClaude
 from kai.config import DATA_DIR, Config, WorkspaceConfig
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
+from kai.logging import (
+    audit_assistant_response,
+    audit_auth_event,
+    audit_user_message,
+    get_session_id,
+    log_handler,
+    reset_session_id,
+)
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 
@@ -82,7 +89,7 @@ except ImportError:
         return 0
 
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger("kai.bot")
 
 # Minimum interval between Telegram message edits (seconds).
 # Telegram rate-limits message edits; 2 seconds keeps us safely below the limit
@@ -106,21 +113,10 @@ async def _clear_responding(user_id: int) -> None:
 
 
 # ── Per-user session tracking ──────────────────────────────────────
-
-# Per-user Kai session IDs (reset on /new, generated on first interaction)
-_user_sessions: dict[int, str] = {}
-
-
-def _get_session_id(user_id: int) -> str:
-    """Get or create a session ID for this user."""
-    if user_id not in _user_sessions:
-        _user_sessions[user_id] = uuid.uuid4().hex[:12]
-    return _user_sessions[user_id]
-
-
-def _reset_session_id(user_id: int) -> None:
-    """Reset session ID (called on /new, workspace switch)."""
-    _user_sessions.pop(user_id, None)
+# Session ID management is in kai.logging (get_session_id / reset_session_id).
+# Alias _get_session_id for internal use (e.g., _save_to_user_files).
+_get_session_id = get_session_id
+_reset_session_id = reset_session_id
 
 
 def _user_home(user_id: int) -> Path:
@@ -367,6 +363,7 @@ def _get_claude(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> PersistentC
 
 
 @_require_auth
+@log_handler("start")
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start — the initial greeting when a user first messages the bot."""
     assert update.message is not None
@@ -374,6 +371,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 @_require_auth
+@log_handler("new_session")
 async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle /new — kill the Claude process and start a fresh session.
@@ -412,6 +410,7 @@ def _models_keyboard(current: str) -> InlineKeyboardMarkup:
 
 
 @_require_auth
+@log_handler("list_models")
 async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /models — show an inline keyboard for model selection."""
     assert update.message is not None
@@ -434,6 +433,7 @@ async def _switch_model(context: ContextTypes.DEFAULT_TYPE, user_id: int, model:
     await sessions.clear_session(user_id)
 
 
+@log_handler("select_model")
 async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle inline keyboard model selection.
@@ -469,6 +469,7 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 @_require_auth
+@log_handler("switch_model")
 async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /model <name> — switch model directly via text command."""
     assert update.message is not None
@@ -501,6 +502,7 @@ _VOICE_MODE_LABELS = {"off": "OFF", "on": "ON (text + voice)", "only": "ONLY (vo
 
 
 @_require_auth
+@log_handler("voice_toggle")
 async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle /voice — toggle voice mode or set a specific voice.
@@ -555,6 +557,7 @@ async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 @_require_auth
+@log_handler("list_voices")
 async def handle_voices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /voices — show an inline keyboard of available TTS voices."""
     assert update.message is not None
@@ -571,6 +574,7 @@ async def handle_voices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+@log_handler("select_voice")
 async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle inline keyboard voice selection.
@@ -616,6 +620,7 @@ async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 @_require_auth
+@log_handler("stats")
 async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /stats — show session info, model, cost, and process status."""
     assert update.message is not None
@@ -637,6 +642,7 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 @_require_auth
+@log_handler("list_jobs")
 async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle /jobs — list all active scheduled jobs with their schedules.
@@ -677,6 +683,7 @@ async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 @_require_auth
+@log_handler("cancel_job")
 async def handle_canceljob(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle /canceljob <id> — permanently delete a scheduled job.
@@ -709,6 +716,7 @@ async def handle_canceljob(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 @_require_auth
+@log_handler("stop")
 async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle /stop — abort the current Claude response.
@@ -945,6 +953,7 @@ async def _workspaces_keyboard(
 
 
 @_require_auth
+@log_handler("list_workspaces")
 async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /workspaces — show an inline keyboard of recent workspaces."""
     assert update.message is not None
@@ -963,6 +972,7 @@ async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text("Workspaces:", reply_markup=keyboard)
 
 
+@log_handler("select_workspace")
 async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle inline keyboard workspace selection.
@@ -1065,6 +1075,7 @@ _NO_BASE_MSG = "WORKSPACE_BASE is not set. Add it to .env and restart."
 
 
 @_require_auth
+@log_handler("switch_workspace")
 async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle /workspace — show, switch, or create workspaces.
@@ -1168,6 +1179,7 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 @_require_auth
+@log_handler("webhooks")
 async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /webhooks — show webhook server status and endpoint info."""
     assert update.message is not None
@@ -1208,6 +1220,7 @@ async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 @_require_auth
+@log_handler("help")
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help — show all available commands."""
     assert update.message is not None
@@ -1236,6 +1249,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 @_require_auth
+@log_handler("notifications")
 async def handle_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /notifications — toggle GitHub/webhook notification preferences."""
     assert update.message is not None
@@ -1272,6 +1286,7 @@ async def handle_notifications(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 @_require_auth
+@log_handler("unknown_command")
 async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle unrecognized slash commands with a helpful redirect to /help."""
     assert update.message is not None
@@ -1311,6 +1326,7 @@ def _save_to_user_files(data: bytes, filename: str, user_id: int) -> Path:
 
 
 @_require_auth
+@log_handler("photo")
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle photo messages — download, base64-encode, and send to Claude.
@@ -1340,6 +1356,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     caption = update.message.caption or "What's in this image?"
     caption += f"\n[File saved to: {saved}]"
     await log_message(direction="user", user_id=user_id, chat_id=chat_id, text=caption, media={"type": "photo"})
+    audit_user_message(user_id, chat_id, caption, media={"type": "photo"})
     content = [
         {"type": "text", "text": caption},
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
@@ -1430,6 +1447,7 @@ _IMAGE_MEDIA_TYPES = {
 
 
 @_require_auth
+@log_handler("document")
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle document (file) uploads -- images, text files, and everything else.
@@ -1473,6 +1491,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text=caption or file_name,
             media={"type": "document", "filename": file_name},
         )
+        audit_user_message(user_id, chat_id, caption or file_name, media={"type": "document", "filename": file_name})
         content = [
             {"type": "text", "text": img_caption},
             {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
@@ -1499,6 +1518,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text=caption or f"[file: {file_name}]",
             media={"type": "document", "filename": file_name},
         )
+        audit_user_message(user_id, chat_id, caption or f"[file: {file_name}]", media={"type": "document", "filename": file_name})
         if caption:
             content = f"{caption}\n\n{header}"
         else:
@@ -1517,6 +1537,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text=caption or f"[file: {file_name}]",
             media={"type": "document", "filename": file_name},
         )
+        audit_user_message(user_id, chat_id, caption or f"[file: {file_name}]", media={"type": "document", "filename": file_name})
         content = (caption or f"File received: {file_name}") + f"\n[File saved to: {saved}]"
 
     was_queued = await _notify_if_queued(update, user_id)
@@ -1542,6 +1563,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 @_require_auth
+@log_handler("voice")
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle voice messages — transcribe via whisper-cpp and send to Claude.
@@ -1590,6 +1612,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         text=f"[voice message, {voice.duration}s]",
         media={"type": "voice", "duration": voice.duration},
     )
+    audit_user_message(user_id, chat_id, f"[voice message, {voice.duration}s]", media={"type": "voice", "duration": voice.duration})
 
     try:
         transcript = await transcribe_voice(audio_data, config.whisper_model_path)
@@ -1633,6 +1656,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 @_require_auth
+@log_handler("message")
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle plain text messages — the primary interaction path.
@@ -1674,6 +1698,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 context.user_data["totp_pending"] = {
                     "expires_at": time.time() + challenge_sec,
                 }
+                audit_auth_event(_user_id(update), "challenge_sent")
                 await update.message.reply_text("Session expired. Enter code from authenticator.")
                 return
 
@@ -1707,6 +1732,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if verify_code(code, lockout_attempts, lockout_minutes):
                 del context.user_data["totp_pending"]
                 context.user_data["totp_authenticated_at"] = time.time()
+                audit_auth_event(_user_id(update), "verified")
                 await update.effective_chat.send_message("Authenticated.")
                 # Return here - the code message has been deleted and its text
                 # is meaningless as a Claude prompt. The user sends their actual
@@ -1717,11 +1743,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             lockout_remaining = get_lockout_remaining()
             if lockout_remaining > 0:
                 del context.user_data["totp_pending"]
+                audit_auth_event(_user_id(update), "lockout", minutes=lockout_minutes)
                 await update.effective_chat.send_message(
                     f"Too many failed attempts. Locked out for {lockout_minutes} minutes."
                 )
             else:
                 remaining = lockout_attempts - get_failure_count()
+                audit_auth_event(_user_id(update), "failed", remaining=remaining)
                 await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
             return
 
@@ -1734,6 +1762,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = _chat_id(update)
     prompt = update.message.text
     await log_message(direction="user", user_id=user_id, chat_id=chat_id, text=prompt)
+    audit_user_message(user_id, chat_id, prompt)
     claude = _get_claude(context, user_id)
     model = claude.model
 
@@ -1908,6 +1937,15 @@ async def _handle_response(
 
     final_text = final_response.text
     await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=final_text)
+    audit_assistant_response(
+        user_id,
+        chat_id,
+        final_text,
+        cost_usd=final_response.cost_usd,
+        duration_ms=final_response.duration_ms,
+        model=model,
+        session_id=final_response.session_id,
+    )
 
     # Voice-only mode: synthesize and send voice, fall back to text on failure
     if voice_only and final_text:

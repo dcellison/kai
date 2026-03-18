@@ -1,5 +1,5 @@
 """
-Tests for main.py - setup_logging() configuration.
+Tests for setup_logging() configuration.
 
 The main() and _init_and_run() functions orchestrate the full application
 lifecycle and are impractical to unit test. setup_logging() is testable
@@ -8,11 +8,10 @@ in isolation since it just configures the root logger.
 
 import logging
 from logging.handlers import TimedRotatingFileHandler
-from unittest.mock import patch
 
 import pytest
 
-from kai.main import setup_logging
+from kai.logging import setup_logging
 
 # ── setup_logging() ──────────────────────────────────────────────────
 
@@ -39,23 +38,21 @@ class TestSetupLogging:
         root.level = original_level
 
     def test_creates_log_directory(self, tmp_path):
-        """Creates the logs/ directory under DATA_DIR."""
-        with patch("kai.main.DATA_DIR", tmp_path):
-            setup_logging()
-        assert (tmp_path / "logs").is_dir()
+        """Creates the log directory."""
+        log_dir = tmp_path / "logs"
+        setup_logging(log_dir)
+        assert log_dir.is_dir()
 
     def test_adds_file_handler(self, tmp_path):
-        """Adds a TimedRotatingFileHandler to the root logger."""
-        with patch("kai.main.DATA_DIR", tmp_path):
-            setup_logging()
+        """Adds TimedRotatingFileHandlers to the root logger (kai.log + audit.log)."""
+        setup_logging(tmp_path / "logs")
         root = logging.getLogger()
         file_handlers = [h for h in root.handlers if isinstance(h, TimedRotatingFileHandler)]
-        assert len(file_handlers) >= 1
+        assert len(file_handlers) >= 2  # kai.log + audit.log
 
     def test_adds_stream_handler(self, tmp_path):
         """Adds a StreamHandler to the root logger."""
-        with patch("kai.main.DATA_DIR", tmp_path):
-            setup_logging()
+        setup_logging(tmp_path / "logs")
         root = logging.getLogger()
         stream_handlers = [
             h
@@ -66,18 +63,15 @@ class TestSetupLogging:
 
     def test_root_level_info(self, tmp_path):
         """Sets root logger to INFO level."""
-        with patch("kai.main.DATA_DIR", tmp_path):
-            setup_logging()
+        setup_logging(tmp_path / "logs")
         assert logging.getLogger().level == logging.INFO
 
     def test_httpx_level_warning(self, tmp_path):
         """Sets httpx logger to WARNING to silence per-request HTTP logs."""
-        with patch("kai.main.DATA_DIR", tmp_path):
-            setup_logging()
+        setup_logging(tmp_path / "logs")
         assert logging.getLogger("httpx").level == logging.WARNING
 
     def test_apscheduler_level_warning(self, tmp_path):
         """Sets apscheduler logger to WARNING to silence tick logs."""
-        with patch("kai.main.DATA_DIR", tmp_path):
-            setup_logging()
+        setup_logging(tmp_path / "logs")
         assert logging.getLogger("apscheduler.executors.default").level == logging.WARNING

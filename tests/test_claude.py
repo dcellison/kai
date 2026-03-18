@@ -494,10 +494,18 @@ class TestDrainStderr:
         await claude._drain_stderr()
 
         # The log message should contain the truncated text (200 chars max)
+        found = False
         for record in caplog.records:
-            if "stderr" in record.message.lower():
-                # %s formatting inserts the truncated value
-                assert len(record.args[0]) <= 200
+            msg = record.getMessage() if callable(getattr(record, "getMessage", None)) else str(record.message)
+            if "stderr" in msg.lower():
+                # With structlog, args may be in positional_args. With stdlib, in record.args.
+                if record.args:
+                    assert len(record.args[0]) <= 200
+                else:
+                    # structlog stores the truncated text directly in the event
+                    assert "x" * 201 not in msg
+                found = True
+        assert found, "Expected a log record containing 'stderr'"
 
     @pytest.mark.asyncio
     async def test_stops_on_eof(self):

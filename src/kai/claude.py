@@ -27,7 +27,6 @@ Context injection on first message of each session:
 
 import asyncio
 import json
-import logging
 import os
 import shutil
 import signal
@@ -36,10 +35,12 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 
+import structlog
+
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file
 from kai.history import get_recent_history
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger("kai.claude")
 
 
 # ── Protocol types ───────────────────────────────────────────────────
@@ -224,11 +225,7 @@ class PersistentClaude:
         else:
             cmd = claude_cmd
 
-        log.info(
-            "Starting persistent Claude process (model=%s, user=%s)",
-            self.model,
-            self.claude_user or "(same as bot)",
-        )
+        log.info("process.started", model=self.model, workspace=str(self.workspace), claude_user=self.claude_user or "(same as bot)")
 
         # Build the subprocess environment. Merge order:
         # 1. Base environment (inherited from parent process)
@@ -292,7 +289,7 @@ class PersistentClaude:
                     break
                 text = line.decode().strip()
                 if text:
-                    log.debug("Claude stderr: %s", text[:200])
+                    log.debug("stderr.line", text=text[:200])
             except Exception:
                 log.warning("Unexpected error in stderr drain", exc_info=True)
                 break
@@ -375,11 +372,7 @@ class PersistentClaude:
         # machines. Only checked before starting a new interaction, never
         # during one, so in-flight responses complete normally.
         if self._should_recycle():
-            log.info(
-                "Session age %.1f hours exceeds limit of %.1f hours; recycling",
-                self._session_age_hours(),
-                self.max_session_hours,
-            )
+            log.info("session.recycled", reason="age", age_hours=round(self._session_age_hours(), 1), limit_hours=self.max_session_hours)
             await self._kill()
 
         try:
@@ -546,7 +539,7 @@ class PersistentClaude:
             self._proc.stdin.write(msg.encode())
             await self._proc.stdin.drain()
         except OSError as e:
-            log.error("Failed to write to Claude process: %s", e)
+            log.error("process.write_failed", error=str(e))
             await self._kill()
             yield StreamEvent(
                 text_so_far="",
@@ -571,11 +564,7 @@ class PersistentClaude:
                 # Check wall-clock limit before each readline
                 elapsed = time.monotonic() - interaction_start
                 if elapsed > max_interaction_seconds:
-                    log.error(
-                        "Interaction exceeded wall-clock limit (%.0fs > %ds)",
-                        elapsed,
-                        max_interaction_seconds,
-                    )
+                    log.error("process.wall_clock_timeout", elapsed_s=int(elapsed), limit_s=max_interaction_seconds)
                     await self._kill()
                     yield StreamEvent(
                         text_so_far=accumulated_text,
@@ -593,7 +582,7 @@ class PersistentClaude:
                     timeout = self.timeout_seconds * 3
                     line = await asyncio.wait_for(self._proc.stdout.readline(), timeout=timeout)
                 except TimeoutError:
-                    log.error("Claude response timed out")
+                    log.error("process.readline_timeout")
                     await self._kill()
                     yield StreamEvent(
                         text_so_far=accumulated_text,
@@ -604,7 +593,7 @@ class PersistentClaude:
 
                 if not line:
                     # Process died unexpectedly
-                    log.error("Claude process EOF")
+                    log.error("process.eof")
                     await self._kill()
                     yield StreamEvent(
                         text_so_far=accumulated_text,
@@ -620,7 +609,7 @@ class PersistentClaude:
                 try:
                     event = json.loads(line.decode())
                 except json.JSONDecodeError:
-                    log.debug("Skipping non-JSON stdout line: %s", line.decode().strip()[:200])
+                    log.debug("stdout.non_json", line=line.decode().strip()[:200])
                     continue
 
                 etype = event.get("type")
@@ -645,6 +634,13 @@ class PersistentClaude:
                         duration_ms=event.get("duration_ms", 0),
                         error=event.get("result") if event.get("is_error") else None,
                     )
+                    log.info(
+                        "response.received",
+                        success=response.success,
+                        cost_usd=response.cost_usd,
+                        duration_ms=response.duration_ms,
+                        session_id=response.session_id,
+                    )
                     yield StreamEvent(text_so_far=response.text, done=True, response=response)
                     return
 
@@ -660,7 +656,7 @@ class PersistentClaude:
                                 yield StreamEvent(text_so_far=accumulated_text)
 
         except Exception as e:
-            log.exception("Unexpected error reading Claude stream")
+            log.error("process.error", error=str(e), exc_info=True)
             await self._kill()
             yield StreamEvent(
                 text_so_far=accumulated_text,
@@ -699,7 +695,7 @@ class PersistentClaude:
             try:
                 return self.workspace_config.system_prompt_file.read_text()
             except OSError:
-                log.warning("Cannot read system_prompt_file: %s", self.workspace_config.system_prompt_file)
+                log.warning("system_prompt.read_failed", path=str(self.workspace_config.system_prompt_file))
                 return None
         return None
 

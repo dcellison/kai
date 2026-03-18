@@ -33,58 +33,16 @@ The shutdown sequence (in the finally block) reverses this order:
 """
 
 import asyncio
-import logging
-from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
+import structlog
 from telegram import BotCommand
 from telegram.error import NetworkError
 
 from kai import cron, services, sessions, webhook
 from kai.bot import _is_workspace_allowed, create_bot
 from kai.config import DATA_DIR, PROJECT_ROOT, _read_protected_file, load_config
-
-
-def setup_logging() -> None:
-    """
-    Configure root logger with file rotation and terminal output.
-
-    Sets up two handlers on the root logger:
-    - TimedRotatingFileHandler: writes to logs/kai.log, rotates at midnight,
-      keeps 14 days of dated backups (kai.log.2026-02-12, etc.)
-    - StreamHandler: writes to stderr for terminal visibility during `make run`
-      (harmless under launchd since there's no terminal attached)
-
-    Creates the logs/ directory if it doesn't already exist.
-    """
-    # Logs go under DATA_DIR so they're writable even when source is read-only
-    log_dir = DATA_DIR / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    formatter = logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
-
-    # Daily rotation at midnight, keep 2 weeks of history, use UTF-8 for
-    # emoji and non-ASCII content in Claude responses
-    file_handler = TimedRotatingFileHandler(
-        filename=log_dir / "kai.log",
-        when="midnight",
-        backupCount=14,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(formatter)
-
-    # Terminal output for interactive runs (make run, manual debugging)
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.addHandler(file_handler)
-    root.addHandler(stream_handler)
-
-    # Silence noisy per-request HTTP logs and APScheduler tick logs
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+from kai.logging import setup_logging
 
 
 def main() -> None:
@@ -96,10 +54,11 @@ def main() -> None:
     Catches KeyboardInterrupt for clean Ctrl+C shutdown and logs any
     unexpected crashes.
     """
-    setup_logging()
+    setup_logging(DATA_DIR / "logs")
 
+    log = structlog.get_logger("kai.main")
     config = load_config()
-    logging.info("Kai starting (model=%s, users=%s)", config.claude_model, config.allowed_user_ids)
+    log.info("startup", model=config.claude_model, users=list(config.allowed_user_ids))
 
     # Load external service definitions. In a protected installation, services.yaml
     # lives in /etc/kai/ (root-owned). Falls back to PROJECT_ROOT for development.
@@ -109,8 +68,7 @@ def main() -> None:
     else:
         loaded = services.load_services(PROJECT_ROOT / "services.yaml")
     if loaded:
-        names = ", ".join(loaded.keys())
-        logging.info("Loaded %d service(s): %s", len(loaded), names)
+        log.info("services.loaded", count=len(loaded), names=list(loaded.keys()))
 
     async def _init_and_run() -> None:
         """
@@ -133,20 +91,16 @@ def main() -> None:
             if saved_workspace:
                 ws_path = Path(saved_workspace)
                 if not _is_workspace_allowed(ws_path, config):
-                    logging.warning(
-                        "Saved workspace %s for user %d is not allowed, ignoring",
-                        saved_workspace,
-                        uid,
-                    )
+                    log.warning("workspace.disallowed", user_id=uid, workspace=saved_workspace)
                     await sessions.delete_setting(uid, "workspace")
                 elif ws_path.is_dir():
                     claude = manager.get_or_create(uid)
                     ws_config = config.get_workspace_config(ws_path)
                     await claude.change_workspace(ws_path, workspace_config=ws_config)
                     webhook.update_workspace(uid, str(ws_path))
-                    logging.info("Restored workspace for user %d: %s", uid, ws_path)
+                    log.info("workspace.restored", user_id=uid, workspace=str(ws_path))
                 else:
-                    logging.warning("Saved workspace no longer exists for user %d: %s", uid, saved_workspace)
+                    log.warning("workspace.missing", user_id=uid, workspace=saved_workspace)
                     await sessions.delete_setting(uid, "workspace")
 
         try:
@@ -160,11 +114,7 @@ def main() -> None:
                     if attempt == 12:
                         raise
                     wait = min(30, 2**attempt)
-                    logging.warning(
-                        "Network not ready (attempt %d/12), retrying in %ds…",
-                        attempt,
-                        wait,
-                    )
+                    log.warning("network.retry", attempt=attempt, wait_seconds=wait)
                     await asyncio.sleep(wait)
 
             await app.start()
@@ -215,7 +165,7 @@ def main() -> None:
                 await app.updater.start_polling(
                     allowed_updates=["message", "callback_query"],
                 )
-                logging.info("Polling started")
+                log.info("polling.started")
 
             # Check if any previous responses were interrupted by a crash/restart.
             # bot.py writes per-user flag files when it starts processing a message
@@ -231,10 +181,10 @@ def main() -> None:
                             await app.bot.send_message(
                                 chat_id, "Sorry, my previous response was interrupted. Please resend your last message."
                             )
-                            logging.info("Notified chat %d of interrupted response", chat_id)
+                            log.info("crash_recovery.notified", chat_id=chat_id)
                             flag.unlink(missing_ok=True)
                         except Exception:
-                            logging.exception("Failed to send interrupted-response notice")
+                            log.exception("crash_recovery.failed")
                             flag.unlink(missing_ok=True)
             # Start periodic idle Claude instance eviction
             async def _idle_eviction_loop():
@@ -242,11 +192,11 @@ def main() -> None:
                     await asyncio.sleep(1800)  # Every 30 minutes
                     count = await manager.evict_idle()
                     if count:
-                        logging.info("Evicted %d idle Claude instance(s)", count)
+                        log.info("eviction.completed", count=count)
 
             eviction_task = asyncio.create_task(_idle_eviction_loop())
 
-            logging.info("Kai is running. Press Ctrl+C to stop.")
+            log.info("ready", mode="webhook" if use_webhook else "polling")
             await asyncio.Event().wait()  # Block forever until shutdown signal
         finally:
             # Cancel the eviction task
@@ -268,9 +218,9 @@ def main() -> None:
     try:
         asyncio.run(_init_and_run())
     except KeyboardInterrupt:
-        logging.info("Kai stopped.")
+        log.info("shutdown")
     except Exception:
-        logging.exception("Kai crashed")
+        log.exception("crashed")
 
 
 if __name__ == "__main__":

@@ -26,13 +26,13 @@ hitting shell argument length limits. Output is captured as plain text.
 import asyncio
 import glob as glob_mod
 import json
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
+import structlog
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger("kai.review")
 
 
 # Maximum diff size in characters. Diffs exceeding this are truncated with
@@ -202,20 +202,20 @@ async def load_spec(
         try:
             full_path = Path(local_repo_path) / spec_path
             content = full_path.read_text()
-            log.info("Loaded spec from PR body marker: %s", spec_path)
+            log.info("spec.loaded", source="body_marker", path=spec_path)
             return content
         except OSError:
-            log.warning("Failed to read spec from body marker: %s", spec_path)
+            log.warning("spec.read_failed", source="body_marker", path=spec_path)
 
     # Strategy 2: branch name matching against configured spec directory
     local_spec = resolve_spec_from_branch(metadata.branch, local_repo_path, spec_dir)
     if local_spec:
         try:
             content = Path(local_spec).read_text()
-            log.info("Loaded spec from branch name match: %s", local_spec)
+            log.info("spec.loaded", source="branch_match", path=local_spec)
             return content
         except OSError:
-            log.warning("Failed to read local spec: %s", local_spec)
+            log.warning("spec.read_failed", source="branch_match", path=local_spec)
 
     return None
 
@@ -250,10 +250,10 @@ async def load_conventions(
         if candidate.is_file():
             try:
                 content = candidate.read_text()
-                log.info("Loaded conventions from local: %s", candidate)
+                log.info("conventions.loaded", path=str(candidate))
                 return content
             except OSError:
-                log.warning("Failed to read local CLAUDE.md: %s", candidate)
+                log.warning("conventions.read_failed", path=str(candidate))
 
     return None
 
@@ -300,12 +300,7 @@ async def fetch_prior_comments(repo: str, pr_number: int) -> str | None:
 
         if proc.returncode != 0:
             error = stderr.decode().strip()
-            log.warning(
-                "Failed to fetch prior comments for %s#%d: %s",
-                repo,
-                pr_number,
-                error,
-            )
+            log.warning("prior_comments.fetch_failed", repo=repo, pr_number=pr_number, error=error)
             return None
 
         # --jq '.[]' flattens paginated arrays into newline-delimited JSON
@@ -316,12 +311,7 @@ async def fetch_prior_comments(repo: str, pr_number: int) -> str | None:
             return None
         comments = [json.loads(line) for line in raw.splitlines() if line.strip()]
     except Exception:
-        log.warning(
-            "Failed to fetch prior comments for %s#%d",
-            repo,
-            pr_number,
-            exc_info=True,
-        )
+        log.warning("prior_comments.fetch_failed", repo=repo, pr_number=pr_number, exc_info=True)
         return None
 
     if not isinstance(comments, list) or not comments:
@@ -656,10 +646,10 @@ async def post_review_comment(repo: str, pr_number: int, review: str) -> bool:
 
     if proc.returncode != 0:
         error = stderr.decode().strip()
-        log.error("Failed to post review comment on %s#%d: %s", repo, pr_number, error)
+        log.error("review.post_failed", repo=repo, pr_number=pr_number, error=error)
         return False
 
-    log.info("Posted review comment on %s#%d", repo, pr_number)
+    log.info("review.posted", repo=repo, pr_number=pr_number)
     return True
 
 
@@ -706,9 +696,9 @@ async def send_review_summary(
                 session.post(url, json={"text": text}, headers=headers) as resp,
             ):
                 if resp.status != 200:
-                    log.warning("send-message API returned %d for review summary (user %d)", resp.status, uid)
+                    log.warning("review.notify_failed", status=resp.status, user_id=uid)
         except Exception:
-            log.exception("Failed to send review summary to Telegram (user %d)", uid)
+            log.exception("review.notify_error", user_id=uid)
 
 
 async def review_pr(
@@ -740,14 +730,17 @@ async def review_pr(
         spec_dir: Spec directory relative to repo root (default: "specs").
         user_ids: List of user IDs to notify with the review summary.
     """
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(operation="pr_review")
     metadata = extract_pr_metadata(payload)
+    structlog.contextvars.bind_contextvars(repo=metadata.repo, pr_number=metadata.number)
 
     try:
         # Step 1: Fetch the diff
         diff = await fetch_pr_diff(metadata.repo, metadata.number)
 
         if not diff.strip():
-            log.info("Empty diff for %s#%d, skipping review", metadata.repo, metadata.number)
+            log.info("review.skipped", repo=metadata.repo, pr_number=metadata.number, reason="empty_diff")
             return
 
         # Step 1.5: Load spec if referenced (agentic engineering layer)
@@ -761,12 +754,7 @@ async def review_pr(
         # and avoid repeating dismissed findings.
         prior_comments = await fetch_prior_comments(metadata.repo, metadata.number)
         if prior_comments:
-            log.info(
-                "Loaded %d chars of prior review comments for %s#%d",
-                len(prior_comments),
-                metadata.repo,
-                metadata.number,
-            )
+            log.info("prior_comments.loaded", chars=len(prior_comments), repo=metadata.repo, pr_number=metadata.number)
 
         # Step 2: Build the review prompt (with optional spec, conventions,
         # and prior review comments)
@@ -782,7 +770,7 @@ async def review_pr(
         review_text = await run_review(prompt, claude_user=claude_user)
 
         if not review_text.strip():
-            log.warning("Empty review output for %s#%d", metadata.repo, metadata.number)
+            log.warning("review.empty_output", repo=metadata.repo, pr_number=metadata.number)
             await send_review_summary(metadata, False, webhook_port, webhook_secret, user_ids=user_ids)
             return
 
@@ -793,13 +781,9 @@ async def review_pr(
         await send_review_summary(metadata, posted, webhook_port, webhook_secret, user_ids=user_ids)
 
     except Exception:
-        log.exception("Review failed for %s#%d", metadata.repo, metadata.number)
+        log.exception("review.failed", repo=metadata.repo, pr_number=metadata.number)
         # Best-effort failure notification so the user knows something broke
         try:
             await send_review_summary(metadata, False, webhook_port, webhook_secret, user_ids=user_ids)
         except Exception:
-            log.exception(
-                "Failed to send failure notification for %s#%d",
-                metadata.repo,
-                metadata.number,
-            )
+            log.exception("review.failure_notify_error", repo=metadata.repo, pr_number=metadata.number)

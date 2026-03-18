@@ -27,15 +27,15 @@ Auth injection by type:
     none    ->  no auth
 """
 
-import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import aiohttp
+import structlog
 import yaml
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger("kai.services")
 
 # Valid authentication types for service definitions
 _VALID_AUTH_TYPES = {"bearer", "header", "query", "none"}
@@ -136,13 +136,13 @@ def _load_and_register(raw: object) -> dict[str, ServiceDef]:
 
     # Handle empty file or non-dict top level
     if not isinstance(raw, dict):
-        log.warning("Services config is not a YAML mapping - ignoring")
+        log.warning("services.config_invalid", reason="not a YAML mapping")
         _services = {}
         return _services
 
     services_raw = raw.get("services", {})
     if not isinstance(services_raw, dict):
-        log.warning("'services' key is not a mapping - ignoring")
+        log.warning("services.config_invalid", reason="services key not a mapping")
         _services = {}
         return _services
 
@@ -150,24 +150,24 @@ def _load_and_register(raw: object) -> dict[str, ServiceDef]:
 
     for name, entry in services_raw.items():
         if not isinstance(entry, dict):
-            log.warning("Service '%s': entry is not a mapping - skipping", name)
+            log.warning("service.config_invalid", service=name, reason="not a mapping")
             continue
 
         # URL is required
         url = entry.get("url")
         if not url:
-            log.warning("Service '%s': missing 'url' - skipping", name)
+            log.warning("service.config_invalid", service=name, reason="missing url")
             continue
 
         # Parse and validate auth config
         auth_raw = entry.get("auth", {})
         if not isinstance(auth_raw, dict):
-            log.warning("Service '%s': 'auth' is not a mapping - skipping", name)
+            log.warning("service.config_invalid", service=name, reason="auth not a mapping")
             continue
 
         auth_type = auth_raw.get("type", "none")
         if auth_type not in _VALID_AUTH_TYPES:
-            log.warning("Service '%s': invalid auth type '%s' - skipping", name, auth_type)
+            log.warning("service.config_invalid", service=name, reason="invalid auth type", auth_type=auth_type)
             continue
 
         auth = AuthConfig(
@@ -180,9 +180,9 @@ def _load_and_register(raw: object) -> dict[str, ServiceDef]:
         # Check that the referenced env var is actually set
         if auth.type != "none" and auth.env and not os.environ.get(auth.env):
             if auth.optional:
-                log.info("Service '%s': env var %s not set (optional) - available without auth", name, auth.env)
+                log.info("service.no_auth", service=name, env_var=auth.env, reason="optional, env not set")
             else:
-                log.warning("Service '%s': env var %s not set - skipping", name, auth.env)
+                log.warning("service.skipped", service=name, env_var=auth.env, reason="env not set")
                 continue
 
         # Parse static headers and params
@@ -237,7 +237,7 @@ def load_services(config_path: Path) -> dict[str, ServiceDef]:
     global _services
 
     if not config_path.exists():
-        log.info("No services config at %s - external services disabled", config_path)
+        log.info("services.disabled", config_path=str(config_path))
         _services = {}
         return _services
 
@@ -377,7 +377,7 @@ async def call_service(
     # Construct the full URL (base + optional path suffix)
     url = svc.url + path_suffix
 
-    log.info("Calling service '%s': %s %s", name, svc.method, url)
+    log.info("service.calling", service=name, method=svc.method, url=url)
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -395,15 +395,15 @@ async def call_service(
                 timeout=timeout,
             ) as resp:
                 response_body = await resp.text()
-                log.info("Service '%s' responded: %d (%d bytes)", name, resp.status, len(response_body))
+                log.info("service.responded", service=name, status=resp.status, body_bytes=len(response_body))
                 return ServiceResponse(
                     success=True,
                     status=resp.status,
                     body=response_body,
                 )
     except TimeoutError:
-        log.warning("Service '%s' timed out", name)
+        log.warning("service.timeout", service=name)
         return ServiceResponse(success=False, error="Request timed out (30s)")
     except aiohttp.ClientError as e:
-        log.warning("Service '%s' connection error: %s", name, e)
+        log.warning("service.connection_error", service=name, error=str(e))
         return ServiceResponse(success=False, error=f"Connection error: {e}")
