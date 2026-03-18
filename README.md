@@ -17,6 +17,72 @@ This is what separates Kai from API-wrapper bots that send text to a model endpo
 
 Everything runs locally. Conversations never transit a relay server. Voice transcription and synthesis happen on-device. API keys are proxied through an internal service layer so they never appear in conversation context. There is no cloud component between you and your machine.
 
+```mermaid
+graph LR
+    TG[Telegram] -->|messages| Bot
+
+    subgraph "Outer process — Python"
+        Bot[bot.py<br>handlers & routing]
+        Bot --> Auth[Auth gate<br>+ TOTP]
+        Auth --> Lock[Per-user<br>asyncio lock]
+        Lock --> CM[ClaudeManager]
+
+        Webhook[webhook.py<br>GitHub · API · files] --> CM
+        Cron[cron.py<br>APScheduler] --> CM
+
+        DB[(SQLite<br>sessions · jobs<br>settings)]
+        Bot --- DB
+        Cron --- DB
+
+        Services[services.py<br>API proxy]
+    end
+
+    subgraph "Inner processes — Claude Code"
+        CM --> U1[Claude<br>user 1]
+        CM --> U2[Claude<br>user 2]
+        CM --> UN[Claude<br>user N]
+    end
+
+    U1 & U2 & UN -->|stream-json| Bot
+    U1 & U2 & UN -.->|curl| Services
+```
+
+Three entry points (Telegram, Webhooks, Cron) feed the outer process, which spawns per-user Claude subprocesses. Responses stream back via JSON. The services proxy is an optional internal endpoint.
+
+## Multi-user isolation
+
+Each authorized user gets an independent Claude Code subprocess and a fully siloed data directory. No state is shared between users.
+
+| Resource | Scope | Mechanism |
+|---|---|---|
+| Claude process | One per user | `ClaudeManager` spawns/tracks by `user_id` |
+| Home directory | `DATA_DIR/users/{user_id}/home/` | Created on first message |
+| Conversation history | `home/.claude/history/` | Per-user JSONL logs |
+| Memory | `home/.claude/MEMORY.md` | Isolated persistent context |
+| SQLite rows | Keyed by `user_id` | Sessions, settings, jobs partitioned per user |
+| Asyncio lock | One per user | Concurrent users never block each other |
+| Stop event | One per user | `/stop` only interrupts your own session |
+| Crash recovery | Per user | Restart notification targets the affected user |
+| TOTP session | Per user | Auth timeout tracked independently |
+| Scheduled jobs | Per user | Jobs execute in the owning user's subprocess |
+
+```mermaid
+graph TD
+    DATA[DATA_DIR/users/]
+    DATA --> U1[123456/]
+    DATA --> U2[789012/]
+    U1 --> H1[home/]
+    H1 --> C1[.claude/]
+    C1 --> M1[MEMORY.md]
+    C1 --> HI1[history/]
+    H1 --> F1[files/]
+    U2 --> H2[home/]
+    H2 --> C2[.claude/]
+    C2 --> M2[MEMORY.md]
+    C2 --> HI2[history/]
+    H2 --> F2[files/]
+```
+
 ## Security model
 
 Giving an AI agent shell access is a real trust decision. Kai's approach is layered defense - each layer independent, so no single failure is catastrophic:
