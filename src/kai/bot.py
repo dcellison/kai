@@ -1256,10 +1256,11 @@ async def handle_notifications(update: Update, context: ContextTypes.DEFAULT_TYP
     if not context.args:
         gh = await sessions.get_setting(user_id, "github_notifications") or "true"
         wh = await sessions.get_setting(user_id, "webhook_notifications") or "true"
+        on_off = {"true": "on", "false": "off"}
         await update.message.reply_text(
             f"Notification settings:\n"
-            f"  GitHub: {gh}\n"
-            f"  Webhooks: {wh}\n\n"
+            f"  GitHub: {on_off[gh]}\n"
+            f"  Webhooks: {on_off[wh]}\n\n"
             f"Usage:\n"
             f"  /notifications github off\n"
             f"  /notifications webhook on"

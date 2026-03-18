@@ -188,6 +188,7 @@ If interrupted mid-response, Kai notifies you on restart and asks you to resend 
 | `/jobs` | List active scheduled jobs |
 | `/canceljob <id>` | Cancel a scheduled job |
 | `/webhooks` | Show webhook server status |
+| `/notifications` | Toggle GitHub/webhook notification preferences |
 | `/help` | Show available commands |
 
 ## Requirements

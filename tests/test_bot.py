@@ -1280,6 +1280,24 @@ class TestHandleNotifications:
         reply = update.message.reply_text.call_args[0][0]
         assert reply == "Webhook notifications: off"
 
+    @pytest.mark.asyncio
+    async def test_no_args_shows_on_off_not_true_false(self):
+        """No-args branch must display 'on'/'off', not raw 'true'/'false'."""
+        update = _make_update()
+        ctx = _make_context()
+        ctx.args = []
+        with patch("kai.bot.sessions") as mock_sessions:
+            mock_sessions.get_setting = AsyncMock(
+                side_effect=lambda _uid, key: {
+                    "github_notifications": "false",
+                    "webhook_notifications": "true",
+                }[key]
+            )
+            await handle_notifications(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "off" in reply and "on" in reply
+        assert "true" not in reply and "false" not in reply
+
 
 # ── handle_workspace ─────────────────────────────────────────────────
 
