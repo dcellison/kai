@@ -38,3 +38,13 @@ workspace/.claude/*
 .idea/
 .vscode/
 *.swp
+
+# Claude
+.claude/
+
+# UV
+uv.lock
+
+# Users
+users/
+

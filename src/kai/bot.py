@@ -53,7 +53,7 @@ from telegram.ext import (
 )
 
 from kai import services, sessions, webhook
-from kai.claude import PersistentClaude
+from kai.claude import ClaudeManager, PersistentClaude
 from kai.config import DATA_DIR, Config, WorkspaceConfig
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
@@ -88,29 +88,26 @@ log = logging.getLogger(__name__)
 # while still giving the user a sense of streaming output.
 EDIT_INTERVAL = 2.0
 
-# Flag file written while processing a message. If the process crashes mid-response,
-# main.py detects this file at startup and notifies the user to resend. Lives under
-# DATA_DIR so it's writable even when source is in read-only /opt/kai/.
-_RESPONDING_FLAG = DATA_DIR / ".responding_to"
+# ── Crash recovery flag (per-user) ───────────────────────────────────
 
 
-# ── Crash recovery flag ──────────────────────────────────────────────
+def _set_responding(user_id: int, chat_id: int) -> None:
+    """Write the chat ID to a per-user flag file, marking a response as in-flight."""
+    flag = DATA_DIR / "users" / str(user_id) / ".responding_to"
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text(str(chat_id))
 
 
-def _set_responding(chat_id: int) -> None:
-    """Write the chat ID to the flag file, marking a response as in-flight."""
-    _RESPONDING_FLAG.write_text(str(chat_id))
+def _clear_responding(user_id: int) -> None:
+    """Remove the per-user flag file, indicating the response completed (or failed gracefully)."""
+    flag = DATA_DIR / "users" / str(user_id) / ".responding_to"
+    flag.unlink(missing_ok=True)
 
 
-def _clear_responding() -> None:
-    """Remove the flag file, indicating the response completed (or failed gracefully)."""
-    _RESPONDING_FLAG.unlink(missing_ok=True)
-
-
-async def _notify_if_queued(update: Update, chat_id: int) -> bool:
+async def _notify_if_queued(update: Update, user_id: int) -> bool:
     """Send a notification if the user's message will queue behind the lock.
 
-    Called immediately before acquiring the per-chat lock. If the lock is
+    Called immediately before acquiring the per-user lock. If the lock is
     already held (Kai is mid-response), sends a one-line Telegram message
     so the user knows their message was received. The notification goes
     directly to Telegram via _reply_safe - Claude never sees it. Do NOT
@@ -126,7 +123,7 @@ async def _notify_if_queued(update: Update, chat_id: int) -> bool:
     context-switch marker for a task that already finished. Both are
     harmless and not worth fixing.
     """
-    if get_lock(chat_id).locked():
+    if get_lock(user_id).locked():
         assert update.message is not None
         await _reply_safe(
             update.message,
@@ -155,11 +152,11 @@ _LOCK_ACQUIRE_TIMEOUT = 660  # 11 minutes
 
 
 async def _acquire_lock_or_kill(
-    chat_id: int,
+    user_id: int,
     claude: "PersistentClaude",
     update: Update,
 ) -> asyncio.Lock | None:
-    """Acquire the per-chat lock with a timeout, force-killing if stuck.
+    """Acquire the per-user lock with a timeout, force-killing if stuck.
 
     Returns the acquired lock on success (caller must call lock.release()
     in a finally block). Returns None if the lock timed out, in which case
@@ -170,14 +167,14 @@ async def _acquire_lock_or_kill(
     releases the same object that was acquired (avoids issues if get_lock
     is called again and returns a different instance).
     """
-    lock = get_lock(chat_id)
+    lock = get_lock(user_id)
     try:
         await asyncio.wait_for(lock.acquire(), timeout=_LOCK_ACQUIRE_TIMEOUT)
         return lock
     except TimeoutError:
         log.error(
-            "Lock acquisition timed out for chat %d after %ds; force-killing Claude",
-            chat_id,
+            "Lock acquisition timed out for user %d after %ds; force-killing Claude",
+            user_id,
             _LOCK_ACQUIRE_TIMEOUT,
         )
         claude.force_kill()
@@ -336,9 +333,10 @@ async def _send_response(update: Update, text: str) -> None:
         await _reply_safe(update.message, chunk)
 
 
-def _get_claude(context: ContextTypes.DEFAULT_TYPE) -> PersistentClaude:
-    """Retrieve the PersistentClaude instance from bot_data."""
-    return context.bot_data["claude"]
+def _get_claude(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> PersistentClaude:
+    """Retrieve the PersistentClaude instance for a user via ClaudeManager."""
+    manager: ClaudeManager = context.bot_data["claude_manager"]
+    return manager.get_or_create(user_id)
 
 
 # ── Basic command handlers ───────────────────────────────────────────
@@ -360,9 +358,10 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     kills the subprocess so the next message launches a new one.
     """
     assert update.message is not None
-    claude = _get_claude(context)
+    user_id = _user_id(update)
+    claude = _get_claude(context, user_id)
     await claude.restart()
-    await sessions.clear_session(_chat_id(update))
+    await sessions.clear_session(user_id)
     await update.message.reply_text("Session cleared. Starting fresh.")
 
 
@@ -391,23 +390,23 @@ def _models_keyboard(current: str) -> InlineKeyboardMarkup:
 async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /models — show an inline keyboard for model selection."""
     assert update.message is not None
-    claude = _get_claude(context)
+    claude = _get_claude(context, _user_id(update))
     await update.message.reply_text(
         "Choose a model:",
         reply_markup=_models_keyboard(claude.model),
     )
 
 
-async def _switch_model(context: ContextTypes.DEFAULT_TYPE, chat_id: int, model: str) -> None:
+async def _switch_model(context: ContextTypes.DEFAULT_TYPE, user_id: int, model: str) -> None:
     """
     Switch the Claude model, restart the process, and clear the session.
 
     Called by both the inline keyboard callback and the /model text command.
     """
-    claude = _get_claude(context)
+    claude = _get_claude(context, user_id)
     claude.model = model
     await claude.restart()
-    await sessions.clear_session(chat_id)
+    await sessions.clear_session(user_id)
 
 
 async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -430,14 +429,14 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("Invalid model.")
         return
 
-    claude = _get_claude(context)
+    claude = _get_claude(context, _user_id(update))
     if model == claude.model:
         await query.answer()
         await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
         return
 
     await query.answer()
-    await _switch_model(context, _chat_id(update), model)
+    await _switch_model(context, _user_id(update), model)
     await query.edit_message_text(
         f"Switched to {_AVAILABLE_MODELS[model]}. Session restarted.",
         reply_markup=InlineKeyboardMarkup([]),
@@ -455,7 +454,7 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if model not in _AVAILABLE_MODELS:
         await update.message.reply_text("Choose: opus, sonnet, or haiku")
         return
-    await _switch_model(context, _chat_id(update), model)
+    await _switch_model(context, _user_id(update), model)
     await update.message.reply_text(f"Model set to {_AVAILABLE_MODELS[model]}. Session restarted.")
 
 
@@ -494,21 +493,21 @@ async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("TTS is not enabled. Set TTS_ENABLED=true in .env")
         return
 
-    chat_id = _chat_id(update)
-    current_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
-    current_voice = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+    user_id = _user_id(update)
+    current_mode = await sessions.get_setting(user_id, "voice_mode") or "off"
+    current_voice = await sessions.get_setting(user_id, "voice_name") or DEFAULT_VOICE
 
     if context.args:
         arg = context.args[0].lower()
         if arg in _VOICE_MODES:
             # /voice on|only|off — set mode directly
-            await sessions.set_setting(f"voice_mode:{chat_id}", arg)
+            await sessions.set_setting(user_id, "voice_mode", arg)
             await update.message.reply_text(f"Voice mode: {_VOICE_MODE_LABELS[arg]} (voice: {VOICES[current_voice]})")
         elif arg in VOICES:
             # /voice <name> — set voice (enable in current mode, or default to "only")
-            await sessions.set_setting(f"voice_name:{chat_id}", arg)
+            await sessions.set_setting(user_id, "voice_name", arg)
             if current_mode == "off":
-                await sessions.set_setting(f"voice_mode:{chat_id}", "only")
+                await sessions.set_setting(user_id, "voice_mode", "only")
                 current_mode = "only"
             await update.message.reply_text(
                 f"Voice set to {VOICES[arg]}. Voice mode: {_VOICE_MODE_LABELS[current_mode]}"
@@ -526,7 +525,7 @@ async def handle_voice_command(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         # /voice — toggle: off → only → off
         new_mode = "off" if current_mode != "off" else "only"
-        await sessions.set_setting(f"voice_mode:{chat_id}", new_mode)
+        await sessions.set_setting(user_id, "voice_mode", new_mode)
         await update.message.reply_text(f"Voice mode: {_VOICE_MODE_LABELS[new_mode]} (voice: {VOICES[current_voice]})")
 
 
@@ -539,8 +538,8 @@ async def handle_voices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("TTS is not enabled. Set TTS_ENABLED=true in .env")
         return
 
-    chat_id = _chat_id(update)
-    current_voice = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+    user_id = _user_id(update)
+    current_voice = await sessions.get_setting(user_id, "voice_name") or DEFAULT_VOICE
     await update.message.reply_text(
         "Choose a voice:",
         reply_markup=_voices_keyboard(current_voice),
@@ -567,19 +566,19 @@ async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("Invalid voice.")
         return
 
-    chat_id = _chat_id(update)
-    current_voice = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+    user_id = _user_id(update)
+    current_voice = await sessions.get_setting(user_id, "voice_name") or DEFAULT_VOICE
 
     if voice == current_voice:
         await query.answer()
         await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
         return
 
-    current_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
-    await sessions.set_setting(f"voice_name:{chat_id}", voice)
+    current_mode = await sessions.get_setting(user_id, "voice_mode") or "off"
+    await sessions.set_setting(user_id, "voice_name", voice)
     # Auto-enable voice if it was off
     if current_mode == "off":
-        await sessions.set_setting(f"voice_mode:{chat_id}", "only")
+        await sessions.set_setting(user_id, "voice_mode", "only")
         current_mode = "only"
     await query.answer()
     await query.edit_message_text(
@@ -595,8 +594,9 @@ async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /stats — show session info, model, cost, and process status."""
     assert update.message is not None
-    claude = _get_claude(context)
-    stats = await sessions.get_stats(_chat_id(update))
+    user_id = _user_id(update)
+    claude = _get_claude(context, user_id)
+    stats = await sessions.get_stats(user_id)
     alive = claude.is_alive
     if not stats:
         await update.message.reply_text(f"No active session.\nProcess alive: {alive}")
@@ -620,7 +620,7 @@ async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     jobs), the job ID, name, and a human-readable schedule description.
     """
     assert update.message is not None
-    jobs = await sessions.get_jobs(_chat_id(update))
+    jobs = await sessions.get_jobs(_user_id(update))
     if not jobs:
         await update.message.reply_text("No active scheduled jobs.")
         return
@@ -693,9 +693,9 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     sees the stop event and appends "(stopped)" to the live message.
     """
     assert update.message is not None
-    chat_id = _chat_id(update)
-    claude = _get_claude(context)
-    stop_event = get_stop_event(chat_id)
+    user_id = _user_id(update)
+    claude = _get_claude(context, user_id)
+    stop_event = get_stop_event(user_id)
     stop_event.set()
     claude.force_kill()
     await update.message.reply_text("Stopping...")
@@ -783,7 +783,7 @@ def _workspace_config_suffix(ws_config: WorkspaceConfig | None) -> str:
     return f" ({', '.join(extras)})" if extras else ""
 
 
-async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path: Path) -> WorkspaceConfig | None:
+async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, user_id: int, path: Path) -> WorkspaceConfig | None:
     """
     Core workspace switch logic shared by command and callback handlers.
 
@@ -795,7 +795,7 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     Returns the WorkspaceConfig for the target workspace (or None) so
     callers can display config details without a redundant lookup.
     """
-    claude = _get_claude(context)
+    claude = _get_claude(context, user_id)
     config: Config = context.bot_data["config"]
     home = config.claude_workspace
 
@@ -804,14 +804,14 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     await claude.change_workspace(path, workspace_config=ws_config)
     # Keep the webhook server's confinement path in sync so send-file accepts
     # files from the new workspace rather than rejecting them with 403.
-    webhook.update_workspace(str(path))
-    await sessions.clear_session(chat_id)
+    webhook.update_workspace(user_id, str(path))
+    await sessions.clear_session(user_id)
 
     if path == home:
-        await sessions.delete_setting("workspace")
+        await sessions.delete_setting(user_id, "workspace")
     else:
-        await sessions.set_setting("workspace", str(path))
-        await sessions.upsert_workspace_history(str(path))
+        await sessions.set_setting(user_id, "workspace", str(path))
+        await sessions.upsert_workspace_history(user_id, str(path))
 
     return ws_config
 
@@ -824,7 +824,8 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     metadata (git repo detection, CLAUDE.md presence).
     """
     assert update.message is not None
-    claude = _get_claude(context)
+    user_id = _user_id(update)
+    claude = _get_claude(context, user_id)
     config: Config = context.bot_data["config"]
     home = config.claude_workspace
 
@@ -837,7 +838,7 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text("That workspace no longer exists.")
         return
 
-    ws_config = await _do_switch_workspace(context, _chat_id(update), path)
+    ws_config = await _do_switch_workspace(context, user_id, path)
 
     config_suffix = _workspace_config_suffix(ws_config)
 
@@ -922,8 +923,9 @@ async def _workspaces_keyboard(
 async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /workspaces — show an inline keyboard of recent workspaces."""
     assert update.message is not None
-    history = await sessions.get_workspace_history()
-    claude = _get_claude(context)
+    user_id = _user_id(update)
+    history = await sessions.get_workspace_history(user_id)
+    claude = _get_claude(context, user_id)
     config: Config = context.bot_data["config"]
     current = str(claude.workspace)
     home = str(config.claude_workspace)
@@ -953,7 +955,8 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
 
     assert query.data is not None
     data = query.data.removeprefix("ws:")
-    claude = _get_claude(context)
+    user_id = _user_id(update)
+    claude = _get_claude(context, user_id)
     home = config.claude_workspace
     base = config.workspace_base
 
@@ -987,7 +990,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             await query.answer("Invalid selection.")
             await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
             return
-        history = await sessions.get_workspace_history()
+        history = await sessions.get_workspace_history(user_id)
         if idx < 0 or idx >= len(history):
             await query.answer("Workspace no longer in history.")
             await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
@@ -997,9 +1000,9 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
         # This handles the case where a path was removed from ALLOWED_WORKSPACES
         # after the user visited it — the history entry persists but access is revoked.
         if not _is_workspace_allowed(path, config):
-            await sessions.delete_workspace_history(str(path))
+            await sessions.delete_workspace_history(user_id, str(path))
             await query.answer("That workspace is no longer allowed.")
-            history = await sessions.get_workspace_history()
+            history = await sessions.get_workspace_history(user_id)
             keyboard = await _workspaces_keyboard(
                 history, str(claude.workspace), str(home), base, config.allowed_workspaces
             )
@@ -1007,9 +1010,9 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             return
         # Remove stale entries where the directory no longer exists
         if not path.is_dir():
-            await sessions.delete_workspace_history(str(path))
+            await sessions.delete_workspace_history(user_id, str(path))
             await query.answer("That workspace no longer exists.")
-            history = await sessions.get_workspace_history()
+            history = await sessions.get_workspace_history(user_id)
             keyboard = await _workspaces_keyboard(
                 history, str(claude.workspace), str(home), base, config.allowed_workspaces
             )
@@ -1025,7 +1028,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
 
     # Switch and confirm, showing any per-workspace config details
     await query.answer()
-    ws_config = await _do_switch_workspace(context, _chat_id(update), path)
+    ws_config = await _do_switch_workspace(context, user_id, path)
     suffix = _workspace_config_suffix(ws_config)
     await query.edit_message_text(
         f"Switched to {label}{suffix}. Session cleared.",
@@ -1051,7 +1054,7 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     checks WORKSPACE_BASE first, then ALLOWED_WORKSPACES (by directory name).
     """
     assert update.message is not None
-    claude = _get_claude(context)
+    claude = _get_claude(context, _user_id(update))
     config: Config = context.bot_data["config"]
     home = config.claude_workspace
     base = config.workspace_base
@@ -1257,8 +1260,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message or not update.message.photo:
         return
 
+    user_id = _user_id(update)
     chat_id = _chat_id(update)
-    claude = _get_claude(context)
+    claude = _get_claude(context, user_id)
     model = claude.model
 
     # Download the largest available resolution (last in the list)
@@ -1273,29 +1277,30 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     caption = update.message.caption or "What's in this image?"
     caption += f"\n[File saved to: {saved}]"
-    log_message(direction="user", chat_id=chat_id, text=caption, media={"type": "photo"})
+    log_message(direction="user", user_id=user_id, chat_id=chat_id, text=caption, media={"type": "photo"})
     content = [
         {"type": "text", "text": caption},
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
     ]
 
-    was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    was_queued = await _notify_if_queued(update, user_id)
+    lock = await _acquire_lock_or_kill(user_id, claude, update)
     if lock is None:
         return
     try:
-        _set_responding(chat_id)
+        _set_responding(user_id, chat_id)
         try:
             await _handle_response(
                 update,
                 context,
+                user_id,
                 chat_id,
                 _prepend_queue_marker(content) if was_queued else content,
                 claude,
                 model,
             )
         finally:
-            _clear_responding()
+            _clear_responding(user_id)
     finally:
         lock.release()
 
@@ -1381,8 +1386,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     suffix = Path(file_name).suffix.lower()
     caption = update.message.caption or ""
 
+    user_id = _user_id(update)
     chat_id = _chat_id(update)
-    claude = _get_claude(context)
+    claude = _get_claude(context, user_id)
     model = claude.model
 
     if suffix in _IMAGE_MEDIA_TYPES:
@@ -1400,6 +1406,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         log_message(
             direction="user",
+            user_id=user_id,
             chat_id=chat_id,
             text=caption or file_name,
             media={"type": "document", "filename": file_name},
@@ -1425,6 +1432,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         log_message(
             direction="user",
+            user_id=user_id,
             chat_id=chat_id,
             text=caption or f"[file: {file_name}]",
             media={"type": "document", "filename": file_name},
@@ -1442,29 +1450,31 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         log_message(
             direction="user",
+            user_id=user_id,
             chat_id=chat_id,
             text=caption or f"[file: {file_name}]",
             media={"type": "document", "filename": file_name},
         )
         content = (caption or f"File received: {file_name}") + f"\n[File saved to: {saved}]"
 
-    was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    was_queued = await _notify_if_queued(update, user_id)
+    lock = await _acquire_lock_or_kill(user_id, claude, update)
     if lock is None:
         return
     try:
-        _set_responding(chat_id)
+        _set_responding(user_id, chat_id)
         try:
             await _handle_response(
                 update,
                 context,
+                user_id,
                 chat_id,
                 _prepend_queue_marker(content) if was_queued else content,
                 claude,
                 model,
             )
         finally:
-            _clear_responding()
+            _clear_responding(user_id)
     finally:
         lock.release()
 
@@ -1483,8 +1493,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message or not update.message.voice:
         return
 
+    user_id = _user_id(update)
     chat_id = _chat_id(update)
-    claude = _get_claude(context)
+    claude = _get_claude(context, user_id)
     config: Config = context.bot_data["config"]
 
     if not config.voice_enabled:
@@ -1512,6 +1523,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     log_message(
         direction="user",
+        user_id=user_id,
         chat_id=chat_id,
         text=f"[voice message, {voice.duration}s]",
         media={"type": "voice", "duration": voice.duration},
@@ -1533,23 +1545,24 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     prompt = f"[Voice message transcription]: {transcript}"
     model = claude.model
 
-    was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    was_queued = await _notify_if_queued(update, user_id)
+    lock = await _acquire_lock_or_kill(user_id, claude, update)
     if lock is None:
         return
     try:
-        _set_responding(chat_id)
+        _set_responding(user_id, chat_id)
         try:
             await _handle_response(
                 update,
                 context,
+                user_id,
                 chat_id,
                 _prepend_queue_marker(prompt) if was_queued else prompt,
                 claude,
                 model,
             )
         finally:
-            _clear_responding()
+            _clear_responding(user_id)
     finally:
         lock.release()
 
@@ -1655,29 +1668,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["totp_authenticated_at"] = time.time()
     # ── End TOTP gate ─────────────────────────────────────────────────────
 
+    user_id = _user_id(update)
     chat_id = _chat_id(update)
     prompt = update.message.text
-    log_message(direction="user", chat_id=chat_id, text=prompt)
-    claude = _get_claude(context)
+    log_message(direction="user", user_id=user_id, chat_id=chat_id, text=prompt)
+    claude = _get_claude(context, user_id)
     model = claude.model
 
-    was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    was_queued = await _notify_if_queued(update, user_id)
+    lock = await _acquire_lock_or_kill(user_id, claude, update)
     if lock is None:
         return
     try:
-        _set_responding(chat_id)
+        _set_responding(user_id, chat_id)
         try:
             await _handle_response(
                 update,
                 context,
+                user_id,
                 chat_id,
                 _prepend_queue_marker(prompt) if was_queued else prompt,
                 claude,
                 model,
             )
         finally:
-            _clear_responding()
+            _clear_responding(user_id)
     finally:
         lock.release()
 
@@ -1688,6 +1703,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def _handle_response(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
     chat_id: int,
     prompt: str | list,
     claude: PersistentClaude,
@@ -1702,7 +1718,7 @@ async def _handle_response(
     1. Check voice mode to determine output format
     2. Start a background typing indicator task
     3. Stream events from Claude, creating/editing a live Telegram message
-    4. Handle /stop interruptions via the per-chat stop event
+    4. Handle /stop interruptions via the per-user stop event
     5. On completion: save session, log response, deliver final text/voice
     6. Handle errors gracefully with user-visible error messages
 
@@ -1715,6 +1731,7 @@ async def _handle_response(
     Args:
         update: The Telegram Update that triggered this response.
         context: Telegram callback context.
+        user_id: The Telegram user ID.
         chat_id: The Telegram chat ID.
         prompt: Text string or list of content blocks to send to Claude.
         claude: The PersistentClaude instance.
@@ -1725,7 +1742,7 @@ async def _handle_response(
     config: Config = context.bot_data["config"]
     voice_mode = "off"
     if config.tts_enabled:
-        voice_mode = await sessions.get_setting(f"voice_mode:{chat_id}") or "off"
+        voice_mode = await sessions.get_setting(user_id, "voice_mode") or "off"
     voice_only = voice_mode == "only"
 
     # Keep activity indicator visible until the response completes.
@@ -1754,7 +1771,7 @@ async def _handle_response(
 
     try:
         # Reset the stop event (in case /stop was sent between messages)
-        stop_event = get_stop_event(chat_id)
+        stop_event = get_stop_event(user_id)
         stop_event.clear()
 
         # Stream events from Claude
@@ -1808,15 +1825,15 @@ async def _handle_response(
     # try to address it instead of the current message.
     if final_response is None:
         if stopped_by_user:
-            log_message(direction="assistant", chat_id=chat_id, text="[stopped by user]")
+            log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text="[stopped by user]")
         else:
-            log_message(direction="assistant", chat_id=chat_id, text="[no response]")
+            log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text="[no response]")
             await update.message.reply_text("Error: No response from Claude")
         return
 
     if not final_response.success:
         error_text = f"Error: {final_response.error}"
-        log_message(direction="assistant", chat_id=chat_id, text=f"[error: {final_response.error}]")
+        log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=f"[error: {final_response.error}]")
         if live_msg:
             await _edit_message_safe(live_msg, error_text)
         else:
@@ -1825,14 +1842,14 @@ async def _handle_response(
 
     # Persist session info for /stats (cost accumulates across interactions)
     if final_response.session_id:
-        await sessions.save_session(chat_id, final_response.session_id, model, final_response.cost_usd)
+        await sessions.save_session(user_id, chat_id, final_response.session_id, model, final_response.cost_usd)
 
     final_text = final_response.text
-    log_message(direction="assistant", chat_id=chat_id, text=final_text)
+    log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=final_text)
 
     # Voice-only mode: synthesize and send voice, fall back to text on failure
     if voice_only and final_text:
-        voice_name = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+        voice_name = await sessions.get_setting(user_id, "voice_name") or DEFAULT_VOICE
         try:
             audio = await synthesize_speech(final_text, config.piper_model_dir, voice_name)
             await context.bot.send_voice(chat_id=chat_id, voice=audio)
@@ -1857,7 +1874,7 @@ async def _handle_response(
 
     # Text+voice mode: send voice note after text
     if voice_mode == "on" and final_text:
-        voice_name = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE
+        voice_name = await sessions.get_setting(user_id, "voice_name") or DEFAULT_VOICE
         try:
             audio = await synthesize_speech(final_text, config.piper_model_dir, voice_name)
             await context.bot.send_voice(chat_id=chat_id, voice=audio)
@@ -1900,21 +1917,9 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
 
     app = builder.build()
     app.bot_data["config"] = config
-    # Apply per-workspace config for the startup workspace (if any).
-    initial_ws_config = config.get_workspace_config(config.claude_workspace)
-
-    app.bot_data["claude"] = PersistentClaude(
-        model=config.claude_model,
-        workspace=config.claude_workspace,
-        home_workspace=config.claude_workspace,
-        webhook_port=config.webhook_port,
-        webhook_secret=config.webhook_secret,
-        max_budget_usd=config.claude_max_budget_usd,
-        timeout_seconds=config.claude_timeout_seconds,
+    app.bot_data["claude_manager"] = ClaudeManager(
+        config=config,
         services_info=services.get_available_services(),
-        claude_user=config.claude_user,
-        max_session_hours=config.claude_max_session_hours,
-        workspace_config=initial_ws_config,
     )
 
     # Command handlers (alphabetical registration, but order doesn't matter for commands)

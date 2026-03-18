@@ -8,33 +8,42 @@ import pytest
 from kai import history
 from kai.history import get_recent_history, log_message
 
+_TEST_USER_ID = 12345
+_TEST_CHAT_ID = 12345
+
 
 @pytest.fixture(autouse=True)
 def _log_dir(monkeypatch, tmp_path):
     """Redirect history log dir to a temp directory."""
-    monkeypatch.setattr(history, "_LOG_DIR", tmp_path)
+    monkeypatch.setattr(history, "_log_dir_for_user", lambda uid: tmp_path)
     return tmp_path
 
 
-# ── log_message ──────────────────────────────────────────────────────
+# -- log_message --------------------------------------------------------------
 
 
 class TestLogMessage:
     def test_creates_jsonl_file(self, _log_dir):
-        log_message(direction="user", chat_id=1, text="hello")
+        log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="hello")
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         path = _log_dir / f"{today}.jsonl"
         assert path.exists()
 
     def test_appends_multiple_records(self, _log_dir):
-        log_message(direction="user", chat_id=1, text="first")
-        log_message(direction="assistant", chat_id=1, text="second")
+        log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="first")
+        log_message(direction="assistant", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="second")
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         lines = (_log_dir / f"{today}.jsonl").read_text().strip().splitlines()
         assert len(lines) == 2
 
     def test_record_fields(self, _log_dir):
-        log_message(direction="user", chat_id=42, text="hi", media={"type": "photo"})
+        log_message(
+            direction="user",
+            user_id=_TEST_USER_ID,
+            chat_id=42,
+            text="hi",
+            media={"type": "photo"},
+        )
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         line = (_log_dir / f"{today}.jsonl").read_text().strip()
         record = json.loads(line)
@@ -45,31 +54,31 @@ class TestLogMessage:
         assert "ts" in record
 
     def test_media_defaults_to_none(self, _log_dir):
-        log_message(direction="user", chat_id=1, text="text only")
+        log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="text only")
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         line = (_log_dir / f"{today}.jsonl").read_text().strip()
         record = json.loads(line)
         assert record["media"] is None
 
 
-# ── get_recent_history ───────────────────────────────────────────────
+# -- get_recent_history --------------------------------------------------------
 
 
 class TestGetRecentHistory:
     def test_empty_when_no_files(self):
-        assert get_recent_history() == ""
+        assert get_recent_history(user_id=_TEST_USER_ID) == ""
 
     def test_formats_messages(self, _log_dir):
-        log_message(direction="user", chat_id=1, text="hello")
-        log_message(direction="assistant", chat_id=1, text="hi there")
-        result = get_recent_history()
+        log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="hello")
+        log_message(direction="assistant", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="hi there")
+        result = get_recent_history(user_id=_TEST_USER_ID)
         assert "You: hello" in result
         assert "Kai: hi there" in result
 
     def test_truncates_long_messages(self, _log_dir):
         long_text = "x" * 600
-        log_message(direction="user", chat_id=1, text=long_text)
-        result = get_recent_history()
+        log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text=long_text)
+        result = get_recent_history(user_id=_TEST_USER_ID)
         # _MAX_CHARS_PER_MESSAGE = 500, truncated with "..."
         assert "x" * 500 + "..." in result
         assert "x" * 501 not in result
@@ -77,8 +86,8 @@ class TestGetRecentHistory:
     def test_limits_to_max_recent(self, _log_dir, monkeypatch):
         monkeypatch.setattr(history, "_MAX_RECENT_MESSAGES", 3)
         for i in range(5):
-            log_message(direction="user", chat_id=1, text=f"msg{i}")
-        result = get_recent_history()
+            log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text=f"msg{i}")
+        result = get_recent_history(user_id=_TEST_USER_ID)
         # Only last 3 messages
         assert "msg2" in result
         assert "msg3" in result
@@ -92,30 +101,30 @@ class TestGetRecentHistory:
         record = {
             "ts": f"{yesterday}T23:00:00+00:00",
             "dir": "user",
-            "chat_id": 1,
+            "chat_id": _TEST_CHAT_ID,
             "text": "yesterday msg",
             "media": None,
         }
         (_log_dir / f"{yesterday}.jsonl").write_text(json.dumps(record) + "\n")
         # Also add a today message
-        log_message(direction="assistant", chat_id=1, text="today msg")
-        result = get_recent_history()
+        log_message(direction="assistant", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="today msg")
+        result = get_recent_history(user_id=_TEST_USER_ID)
         assert "yesterday msg" in result
         assert "today msg" in result
 
     def test_scans_back_multiple_days(self, _log_dir):
         """Messages from several days ago should still be found."""
-        # Write a message from 5 days ago — old code would miss this entirely
+        # Write a message from 5 days ago -- old code would miss this entirely
         old_date = (datetime.now(UTC) - timedelta(days=5)).strftime("%Y-%m-%d")
         record = {
             "ts": f"{old_date}T10:00:00+00:00",
             "dir": "user",
-            "chat_id": 1,
+            "chat_id": _TEST_CHAT_ID,
             "text": "five days ago",
             "media": None,
         }
         (_log_dir / f"{old_date}.jsonl").write_text(json.dumps(record) + "\n")
-        result = get_recent_history()
+        result = get_recent_history(user_id=_TEST_USER_ID)
         assert "five days ago" in result
 
     def test_chronological_order_across_days(self, _log_dir):
@@ -126,12 +135,12 @@ class TestGetRecentHistory:
             record = {
                 "ts": f"{date}T12:00:00+00:00",
                 "dir": "user",
-                "chat_id": 1,
+                "chat_id": _TEST_CHAT_ID,
                 "text": msg,
                 "media": None,
             }
             (_log_dir / f"{date}.jsonl").write_text(json.dumps(record) + "\n")
-        result = get_recent_history()
+        result = get_recent_history(user_id=_TEST_USER_ID)
         # All three should be present, in chronological order
         assert "three days" in result
         assert "one day" in result
@@ -143,19 +152,19 @@ class TestGetRecentHistory:
         monkeypatch.setattr(history, "_MAX_RECENT_MESSAGES", 3)
         # Write 2 messages today and 2 messages from 5 days ago
         for msg in ["today1", "today2"]:
-            log_message(direction="user", chat_id=1, text=msg)
+            log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text=msg)
         old_date = (datetime.now(UTC) - timedelta(days=5)).strftime("%Y-%m-%d")
         for msg in ["old1", "old2"]:
             record = {
                 "ts": f"{old_date}T12:00:00+00:00",
                 "dir": "user",
-                "chat_id": 1,
+                "chat_id": _TEST_CHAT_ID,
                 "text": msg,
                 "media": None,
             }
             with open(_log_dir / f"{old_date}.jsonl", "a") as f:
                 f.write(json.dumps(record) + "\n")
-        result = get_recent_history()
+        result = get_recent_history(user_id=_TEST_USER_ID)
         # With max=3, should get the last 3: old2, today1, today2
         assert "today1" in result
         assert "today2" in result

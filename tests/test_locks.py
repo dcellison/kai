@@ -11,10 +11,10 @@ from kai.locks import get_lock, get_stop_event
 @pytest.fixture(autouse=True)
 def _clean_locks():
     """Reset internal dicts before and after each test."""
-    locks._chat_locks.clear()
+    locks._user_locks.clear()
     locks._stop_events.clear()
     yield
-    locks._chat_locks.clear()
+    locks._user_locks.clear()
     locks._stop_events.clear()
 
 
@@ -39,12 +39,12 @@ class TestGetLock:
         get_lock(1)
         get_lock(2)
         get_lock(3)
-        assert 1 in locks._chat_locks
-        # Adding a 4th should evict chat_id=1 (oldest)
+        assert 1 in locks._user_locks
+        # Adding a 4th should evict user_id=1 (oldest)
         get_lock(4)
-        assert 1 not in locks._chat_locks
-        assert 4 in locks._chat_locks
-        assert len(locks._chat_locks) == 3
+        assert 1 not in locks._user_locks
+        assert 4 in locks._user_locks
+        assert len(locks._user_locks) == 3
 
 
 # ── get_stop_event ───────────────────────────────────────────────────
@@ -68,7 +68,7 @@ class TestGetStopEvent:
         get_stop_event(10)
         get_stop_event(20)
         get_stop_event(30)
-        # Adding a 4th should evict chat_id=10
+        # Adding a 4th should evict user_id=10
         get_stop_event(40)
         assert 10 not in locks._stop_events
         assert 40 in locks._stop_events

@@ -4,6 +4,9 @@ import pytest
 
 from kai import sessions
 
+_TEST_USER_ID = 12345
+_TEST_CHAT_ID = 12345
+
 
 @pytest.fixture
 async def db(tmp_path):
@@ -21,24 +24,24 @@ class TestSessions:
         assert await sessions.get_session(999) is None
 
     async def test_save_then_get(self, db):
-        await sessions.save_session(1, "sess-abc", "sonnet", 0.5)
-        result = await sessions.get_session(1)
+        await sessions.save_session(_TEST_USER_ID, _TEST_CHAT_ID, "sess-abc", "sonnet", 0.5)
+        result = await sessions.get_session(_TEST_USER_ID)
         assert result == "sess-abc"
 
     async def test_save_twice_accumulates_cost(self, db):
-        await sessions.save_session(1, "sess-1", "sonnet", 0.5)
-        await sessions.save_session(1, "sess-1", "sonnet", 0.3)
-        stats = await sessions.get_stats(1)
+        await sessions.save_session(_TEST_USER_ID, _TEST_CHAT_ID, "sess-1", "sonnet", 0.5)
+        await sessions.save_session(_TEST_USER_ID, _TEST_CHAT_ID, "sess-1", "sonnet", 0.3)
+        stats = await sessions.get_stats(_TEST_USER_ID)
         assert stats["total_cost_usd"] == pytest.approx(0.8)
 
     async def test_clear_session(self, db):
-        await sessions.save_session(1, "sess-1", "sonnet", 0.0)
-        await sessions.clear_session(1)
-        assert await sessions.get_session(1) is None
+        await sessions.save_session(_TEST_USER_ID, _TEST_CHAT_ID, "sess-1", "sonnet", 0.0)
+        await sessions.clear_session(_TEST_USER_ID)
+        assert await sessions.get_session(_TEST_USER_ID) is None
 
     async def test_get_stats(self, db):
-        await sessions.save_session(1, "sess-1", "opus", 1.23)
-        stats = await sessions.get_stats(1)
+        await sessions.save_session(_TEST_USER_ID, _TEST_CHAT_ID, "sess-1", "opus", 1.23)
+        stats = await sessions.get_stats(_TEST_USER_ID)
         assert stats["session_id"] == "sess-1"
         assert stats["model"] == "opus"
         assert stats["total_cost_usd"] == pytest.approx(1.23)
@@ -55,7 +58,8 @@ class TestSessions:
 class TestJobs:
     async def test_create_returns_int_id(self, db):
         job_id = await sessions.create_job(
-            chat_id=1,
+            user_id=_TEST_USER_ID,
+            chat_id=_TEST_CHAT_ID,
             name="test",
             job_type="reminder",
             prompt="hello",
@@ -66,20 +70,22 @@ class TestJobs:
 
     async def test_get_jobs_returns_active(self, db):
         await sessions.create_job(
-            chat_id=1,
+            user_id=_TEST_USER_ID,
+            chat_id=_TEST_CHAT_ID,
             name="j1",
             job_type="reminder",
             prompt="p1",
             schedule_type="once",
             schedule_data="{}",
         )
-        jobs = await sessions.get_jobs(1)
+        jobs = await sessions.get_jobs(_TEST_USER_ID)
         assert len(jobs) == 1
         assert jobs[0]["name"] == "j1"
 
-    async def test_get_jobs_filters_by_chat(self, db):
+    async def test_get_jobs_filters_by_user(self, db):
         await sessions.create_job(
-            chat_id=1,
+            user_id=_TEST_USER_ID,
+            chat_id=_TEST_CHAT_ID,
             name="j1",
             job_type="reminder",
             prompt="p",
@@ -87,19 +93,21 @@ class TestJobs:
             schedule_data="{}",
         )
         await sessions.create_job(
-            chat_id=2,
+            user_id=99999,
+            chat_id=99999,
             name="j2",
             job_type="reminder",
             prompt="p",
             schedule_type="once",
             schedule_data="{}",
         )
-        assert len(await sessions.get_jobs(1)) == 1
-        assert len(await sessions.get_jobs(2)) == 1
+        assert len(await sessions.get_jobs(_TEST_USER_ID)) == 1
+        assert len(await sessions.get_jobs(99999)) == 1
 
     async def test_get_job_by_id(self, db):
         job_id = await sessions.create_job(
-            chat_id=1,
+            user_id=_TEST_USER_ID,
+            chat_id=_TEST_CHAT_ID,
             name="j1",
             job_type="claude",
             prompt="analyze",
@@ -116,7 +124,8 @@ class TestJobs:
 
     async def test_get_all_active_jobs(self, db):
         await sessions.create_job(
-            chat_id=1,
+            user_id=_TEST_USER_ID,
+            chat_id=_TEST_CHAT_ID,
             name="j1",
             job_type="reminder",
             prompt="p",
@@ -124,7 +133,8 @@ class TestJobs:
             schedule_data="{}",
         )
         await sessions.create_job(
-            chat_id=2,
+            user_id=99999,
+            chat_id=99999,
             name="j2",
             job_type="reminder",
             prompt="p",
@@ -136,7 +146,8 @@ class TestJobs:
 
     async def test_deactivate_job(self, db):
         job_id = await sessions.create_job(
-            chat_id=1,
+            user_id=_TEST_USER_ID,
+            chat_id=_TEST_CHAT_ID,
             name="j1",
             job_type="reminder",
             prompt="p",
@@ -144,12 +155,13 @@ class TestJobs:
             schedule_data="{}",
         )
         await sessions.deactivate_job(job_id)
-        assert len(await sessions.get_jobs(1)) == 0
+        assert len(await sessions.get_jobs(_TEST_USER_ID)) == 0
         assert len(await sessions.get_all_active_jobs()) == 0
 
     async def test_delete_job(self, db):
         job_id = await sessions.create_job(
-            chat_id=1,
+            user_id=_TEST_USER_ID,
+            chat_id=_TEST_CHAT_ID,
             name="j1",
             job_type="reminder",
             prompt="p",
@@ -164,7 +176,8 @@ class TestJobs:
 
     async def test_update_job_single_field(self, db):
         job_id = await sessions.create_job(
-            chat_id=1,
+            user_id=_TEST_USER_ID,
+            chat_id=_TEST_CHAT_ID,
             name="original",
             job_type="reminder",
             prompt="original prompt",
@@ -180,7 +193,8 @@ class TestJobs:
 
     async def test_update_job_multiple_fields(self, db):
         job_id = await sessions.create_job(
-            chat_id=1,
+            user_id=_TEST_USER_ID,
+            chat_id=_TEST_CHAT_ID,
             name="j1",
             job_type="claude",
             prompt="old prompt",
@@ -203,7 +217,8 @@ class TestJobs:
 
     async def test_update_job_inactive_returns_false(self, db):
         job_id = await sessions.create_job(
-            chat_id=1,
+            user_id=_TEST_USER_ID,
+            chat_id=_TEST_CHAT_ID,
             name="j1",
             job_type="reminder",
             prompt="p",
@@ -220,7 +235,8 @@ class TestJobs:
 
     async def test_update_job_no_fields_returns_false(self, db):
         job_id = await sessions.create_job(
-            chat_id=1,
+            user_id=_TEST_USER_ID,
+            chat_id=_TEST_CHAT_ID,
             name="j1",
             job_type="reminder",
             prompt="p",
@@ -232,7 +248,8 @@ class TestJobs:
 
     async def test_auto_remove_stored_as_bool(self, db):
         job_id = await sessions.create_job(
-            chat_id=1,
+            user_id=_TEST_USER_ID,
+            chat_id=_TEST_CHAT_ID,
             name="j1",
             job_type="claude",
             prompt="check",
@@ -244,7 +261,8 @@ class TestJobs:
         assert job["auto_remove"] is True
 
         job_id2 = await sessions.create_job(
-            chat_id=1,
+            user_id=_TEST_USER_ID,
+            chat_id=_TEST_CHAT_ID,
             name="j2",
             job_type="reminder",
             prompt="hi",
@@ -261,21 +279,21 @@ class TestJobs:
 
 class TestSettings:
     async def test_get_unknown_returns_none(self, db):
-        assert await sessions.get_setting("nonexistent") is None
+        assert await sessions.get_setting(_TEST_USER_ID, "nonexistent") is None
 
     async def test_set_then_get(self, db):
-        await sessions.set_setting("theme", "dark")
-        assert await sessions.get_setting("theme") == "dark"
+        await sessions.set_setting(_TEST_USER_ID, "theme", "dark")
+        assert await sessions.get_setting(_TEST_USER_ID, "theme") == "dark"
 
     async def test_set_overwrites(self, db):
-        await sessions.set_setting("theme", "dark")
-        await sessions.set_setting("theme", "light")
-        assert await sessions.get_setting("theme") == "light"
+        await sessions.set_setting(_TEST_USER_ID, "theme", "dark")
+        await sessions.set_setting(_TEST_USER_ID, "theme", "light")
+        assert await sessions.get_setting(_TEST_USER_ID, "theme") == "light"
 
     async def test_delete_setting(self, db):
-        await sessions.set_setting("key", "val")
-        await sessions.delete_setting("key")
-        assert await sessions.get_setting("key") is None
+        await sessions.set_setting(_TEST_USER_ID, "key", "val")
+        await sessions.delete_setting(_TEST_USER_ID, "key")
+        assert await sessions.get_setting(_TEST_USER_ID, "key") is None
 
 
 # ── Workspace history ────────────────────────────────────────────────
@@ -283,27 +301,27 @@ class TestSettings:
 
 class TestWorkspaceHistory:
     async def test_upsert_and_get(self, db):
-        await sessions.upsert_workspace_history("/path/a")
-        await sessions.upsert_workspace_history("/path/b")
-        history = await sessions.get_workspace_history()
+        await sessions.upsert_workspace_history(_TEST_USER_ID, "/path/a")
+        await sessions.upsert_workspace_history(_TEST_USER_ID, "/path/b")
+        history = await sessions.get_workspace_history(_TEST_USER_ID)
         paths = [h["path"] for h in history]
         assert "/path/a" in paths
         assert "/path/b" in paths
 
     async def test_upsert_twice_no_duplicates(self, db):
-        await sessions.upsert_workspace_history("/path/a")
-        await sessions.upsert_workspace_history("/path/a")
-        history = await sessions.get_workspace_history()
+        await sessions.upsert_workspace_history(_TEST_USER_ID, "/path/a")
+        await sessions.upsert_workspace_history(_TEST_USER_ID, "/path/a")
+        history = await sessions.get_workspace_history(_TEST_USER_ID)
         assert len(history) == 1
 
     async def test_delete_workspace_history(self, db):
-        await sessions.upsert_workspace_history("/path/a")
-        await sessions.delete_workspace_history("/path/a")
-        history = await sessions.get_workspace_history()
+        await sessions.upsert_workspace_history(_TEST_USER_ID, "/path/a")
+        await sessions.delete_workspace_history(_TEST_USER_ID, "/path/a")
+        history = await sessions.get_workspace_history(_TEST_USER_ID)
         assert len(history) == 0
 
     async def test_respects_limit(self, db):
         for i in range(5):
-            await sessions.upsert_workspace_history(f"/path/{i}")
-        history = await sessions.get_workspace_history(limit=3)
+            await sessions.upsert_workspace_history(_TEST_USER_ID, f"/path/{i}")
+        history = await sessions.get_workspace_history(_TEST_USER_ID, limit=3)
         assert len(history) == 3

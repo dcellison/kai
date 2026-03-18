@@ -447,12 +447,20 @@ def _make_mock_claude(model="sonnet", workspace=None, is_alive=True):
     return claude
 
 
+def _make_mock_manager(claude=None):
+    """Create a mock ClaudeManager."""
+    c = claude or _make_mock_claude()
+    manager = MagicMock()
+    manager.get_or_create = MagicMock(return_value=c)
+    return manager
+
+
 def _make_context(config=None, claude=None, args=None, user_data=None, job_queue=None):
     """Create a mock PTB context with bot_data, args, and user_data."""
     ctx = MagicMock()
     ctx.bot_data = {
         "config": config or _make_config(),
-        "claude": claude or _make_mock_claude(),
+        "claude_manager": _make_mock_manager(claude),
     }
     ctx.args = args or []
     ctx.user_data = user_data if user_data is not None else {}
@@ -507,24 +515,24 @@ async def _fake_stream(*events):
 class TestCrashRecoveryFlag:
     def test_set_responding_writes_chat_id(self, tmp_path):
         """Flag file contains the chat ID as text."""
-        flag = tmp_path / ".responding_to"
-        with patch("kai.bot._RESPONDING_FLAG", flag):
-            _set_responding(12345)
+        with patch("kai.bot.DATA_DIR", tmp_path):
+            _set_responding(42, 12345)
+        flag = tmp_path / "users" / "42" / ".responding_to"
         assert flag.read_text() == "12345"
 
     def test_clear_responding_removes_flag(self, tmp_path):
         """Flag file is deleted after clearing."""
-        flag = tmp_path / ".responding_to"
+        flag = tmp_path / "users" / "42" / ".responding_to"
+        flag.parent.mkdir(parents=True)
         flag.write_text("12345")
-        with patch("kai.bot._RESPONDING_FLAG", flag):
-            _clear_responding()
+        with patch("kai.bot.DATA_DIR", tmp_path):
+            _clear_responding(42)
         assert not flag.exists()
 
     def test_clear_responding_noop_if_missing(self, tmp_path):
         """No error when flag file doesn't exist."""
-        flag = tmp_path / ".responding_to"
-        with patch("kai.bot._RESPONDING_FLAG", flag):
-            _clear_responding()  # should not raise
+        with patch("kai.bot.DATA_DIR", tmp_path):
+            _clear_responding(42)  # should not raise
 
 
 # ── Authorization ────────────────────────────────────────────────────
@@ -694,7 +702,7 @@ class TestHandleNew:
         with patch("kai.bot.sessions.clear_session", new_callable=AsyncMock) as mock_clear:
             await handle_new(update, ctx)
         claude.restart.assert_called_once()
-        mock_clear.assert_called_once_with(12345)
+        mock_clear.assert_called_once_with(1)
         reply = update.message.reply_text.call_args[0][0]
         assert "cleared" in reply.lower()
 
@@ -997,7 +1005,7 @@ class TestHandleVoiceCommand:
         ):
             await handle_voice_command(update, ctx)
         # Should set to "only" (toggling from default "off")
-        mock_set.assert_called_once_with("voice_mode:12345", "only")
+        mock_set.assert_called_once_with(1, "voice_mode", "only")
 
     @pytest.mark.asyncio
     async def test_toggle_only_to_off(self):
@@ -1005,7 +1013,7 @@ class TestHandleVoiceCommand:
         update = _make_update()
         ctx = _make_context(config=_make_config(tts_enabled=True))
 
-        async def _get(key):
+        async def _get(user_id, key):
             if "voice_mode" in key:
                 return "only"
             return None
@@ -1015,7 +1023,7 @@ class TestHandleVoiceCommand:
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock) as mock_set,
         ):
             await handle_voice_command(update, ctx)
-        mock_set.assert_called_once_with("voice_mode:12345", "off")
+        mock_set.assert_called_once_with(1, "voice_mode", "off")
 
     @pytest.mark.asyncio
     async def test_set_mode_on(self):
@@ -1026,7 +1034,7 @@ class TestHandleVoiceCommand:
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock) as mock_set,
         ):
             await handle_voice_command(update, ctx)
-        mock_set.assert_called_once_with("voice_mode:12345", "on")
+        mock_set.assert_called_once_with(1, "voice_mode", "on")
 
     @pytest.mark.asyncio
     async def test_set_voice_name_enables_if_off(self):
@@ -1036,7 +1044,7 @@ class TestHandleVoiceCommand:
         voice_key = next(iter(VOICES.keys()))
         ctx = _make_context(config=_make_config(tts_enabled=True), args=[voice_key])
 
-        async def _get(key):
+        async def _get(user_id, key):
             if "voice_mode" in key:
                 return "off"
             return DEFAULT_VOICE
@@ -1048,8 +1056,8 @@ class TestHandleVoiceCommand:
             await handle_voice_command(update, ctx)
         # Should set both voice name and mode
         calls = {c[0] for c in mock_set.call_args_list}
-        assert ("voice_name:12345", voice_key) in calls
-        assert ("voice_mode:12345", "only") in calls
+        assert (1, "voice_name", voice_key) in calls
+        assert (1, "voice_mode", "only") in calls
 
     @pytest.mark.asyncio
     async def test_invalid_voice_name(self):
@@ -1131,7 +1139,7 @@ class TestHandleVoiceCallback:
         update = _make_callback_update(data=f"voice:{new_voice}")
         ctx = _make_context()
 
-        async def _get(key):
+        async def _get(user_id, key):
             if "voice_mode" in key:
                 return "off"
             return None  # default voice
@@ -1142,7 +1150,7 @@ class TestHandleVoiceCallback:
         ):
             await handle_voice_callback(update, ctx)
         calls = {c[0] for c in mock_set.call_args_list}
-        assert ("voice_mode:12345", "only") in calls
+        assert (1, "voice_mode", "only") in calls
 
 
 # ── handle_webhooks ──────────────────────────────────────────────────
@@ -1490,7 +1498,7 @@ class TestHandleWorkspaceCallback:
             patch("kai.bot.sessions.delete_workspace_history", new_callable=AsyncMock) as mock_del,
         ):
             await handle_workspace_callback(update, ctx)
-        mock_del.assert_called_once_with(str(project))
+        mock_del.assert_called_once_with(1, str(project))
         update.callback_query.answer.assert_called_once_with("That workspace is no longer allowed.")
 
     @pytest.mark.asyncio
@@ -1507,7 +1515,7 @@ class TestHandleWorkspaceCallback:
             patch("kai.bot.sessions.delete_workspace_history", new_callable=AsyncMock) as mock_del,
         ):
             await handle_workspace_callback(update, ctx)
-        mock_del.assert_called_once_with(str(gone))
+        mock_del.assert_called_once_with(1, str(gone))
 
     @pytest.mark.asyncio
     async def test_already_in_workspace(self, tmp_path):
@@ -1572,7 +1580,7 @@ class TestSwitchWorkspaceConfig:
             patch("kai.bot.sessions", new_callable=AsyncMock),
             patch("kai.bot.webhook"),
         ):
-            result = await _do_switch_workspace(ctx, 12345, ws_path.resolve())
+            result = await _do_switch_workspace(ctx, 1, ws_path.resolve())
 
         # Config was returned and passed to change_workspace
         assert result is ws_config
@@ -1591,7 +1599,7 @@ class TestSwitchWorkspaceConfig:
             patch("kai.bot.sessions", new_callable=AsyncMock),
             patch("kai.bot.webhook"),
         ):
-            result = await _do_switch_workspace(ctx, 12345, ws_path.resolve())
+            result = await _do_switch_workspace(ctx, 1, ws_path.resolve())
 
         assert result is None
         claude.change_workspace.assert_called_once_with(ws_path.resolve(), workspace_config=None)
@@ -1722,7 +1730,7 @@ class TestHandlePhoto:
         ):
             await handle_photo(update, ctx)
         # The content arg should be a list (multi-modal)
-        content = mock_resp.call_args[0][3]
+        content = mock_resp.call_args[0][4]
         assert isinstance(content, list)
         assert content[1]["type"] == "image"
 
@@ -1750,7 +1758,7 @@ class TestHandlePhoto:
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_photo(update, ctx)
-        content = mock_resp.call_args[0][3]
+        content = mock_resp.call_args[0][4]
         assert "Describe this logo" in content[0]["text"]
 
 
@@ -1785,7 +1793,7 @@ class TestHandleDocument:
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_document(update, ctx)
-        content = mock_resp.call_args[0][3]
+        content = mock_resp.call_args[0][4]
         assert isinstance(content, list)
         assert content[1]["type"] == "image"
 
@@ -1808,7 +1816,7 @@ class TestHandleDocument:
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_document(update, ctx)
-        content = mock_resp.call_args[0][3]
+        content = mock_resp.call_args[0][4]
         assert isinstance(content, str)
         assert "```" in content
 
@@ -1855,7 +1863,7 @@ class TestHandleDocument:
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_document(update, ctx)
-        content = mock_resp.call_args[0][3]
+        content = mock_resp.call_args[0][4]
         assert isinstance(content, str)
         assert "archive.zip" in content
 
@@ -1967,7 +1975,7 @@ class TestHandleVoice:
         echo_call = update.message.reply_text.call_args
         assert "Hello there" in echo_call[0][0]
         # Then send to Claude
-        prompt = mock_resp.call_args[0][3]
+        prompt = mock_resp.call_args[0][4]
         assert "Hello there" in prompt
 
 
@@ -2003,7 +2011,7 @@ class TestHandleResponse:
         ctx = _make_context(claude=claude)
 
         with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
+            await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
 
         # Live message should have been created via reply_text
         assert update.message.reply_text.called
@@ -2024,7 +2032,7 @@ class TestHandleResponse:
         ctx = _make_context(claude=claude)
 
         with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
+            await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
 
         # The important thing is no exception was raised and
         # the response completed successfully
@@ -2056,7 +2064,7 @@ class TestHandleResponse:
             patch.multiple("kai.bot", **self._base_patches()),
             patch("kai.bot.get_stop_event", return_value=stop_event),
         ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
+            await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
 
         # Should NOT send the "No response" error
         replies = [c[0][0] for c in update.message.reply_text.call_args_list]
@@ -2074,7 +2082,7 @@ class TestHandleResponse:
         ctx = _make_context(claude=claude)
 
         with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
+            await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
 
         replies = [c[0][0] for c in update.message.reply_text.call_args_list]
         assert any("No response from Claude" in r for r in replies)
@@ -2099,7 +2107,7 @@ class TestHandleResponse:
         ctx = _make_context(claude=claude)
 
         with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
+            await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
 
         # Error should be edited into the live message
         last_edit = live_msg.edit_text.call_args_list[-1]
@@ -2121,7 +2129,7 @@ class TestHandleResponse:
         ctx = _make_context(claude=claude)
 
         with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
+            await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
 
         replies = [c[0][0] for c in update.message.reply_text.call_args_list]
         assert any("Error" in r for r in replies)
@@ -2142,7 +2150,7 @@ class TestHandleResponse:
         ctx = _make_context(claude=claude)
 
         with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
+            await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
 
         # Multiple messages should have been sent (chunked)
         assert update.message.reply_text.call_count >= 2
@@ -2162,12 +2170,13 @@ class TestHandleResponse:
         )
 
         with patch("kai.bot.sessions", mock_sessions), patch("kai.bot.log_message"):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
+            await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
 
         mock_sessions.save_session.assert_called_once()
         args = mock_sessions.save_session.call_args[0]
-        assert args[0] == 12345
-        assert args[1] == "sess-abc"
+        assert args[0] == 1
+        assert args[1] == 12345
+        assert args[2] == "sess-abc"
 
     @pytest.mark.asyncio
     async def test_session_not_saved_without_id(self):
@@ -2184,7 +2193,7 @@ class TestHandleResponse:
         )
 
         with patch("kai.bot.sessions", mock_sessions), patch("kai.bot.log_message"):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
+            await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
 
         mock_sessions.save_session.assert_not_called()
 
@@ -2208,7 +2217,7 @@ class TestHandleResponse:
             patch("kai.bot.log_message"),
             patch("kai.bot.synthesize_speech", new_callable=AsyncMock, return_value=b"audio-bytes"),
         ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
+            await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
 
         ctx.bot.send_voice.assert_called_once()
 
@@ -2233,7 +2242,7 @@ class TestHandleResponse:
             patch("kai.bot.log_message"),
             patch("kai.bot.synthesize_speech", new_callable=AsyncMock, side_effect=TTSError("fail")),
         ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
+            await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
 
         # Should fall back to text
         assert update.message.reply_text.called
@@ -2253,7 +2262,7 @@ class TestHandleResponse:
         config = _make_config(tts_enabled=True, piper_model_dir=Path("/models"))
         ctx = _make_context(config=config, claude=claude)
 
-        async def _get_setting(key):
+        async def _get_setting(user_id, key):
             if "voice_mode" in key:
                 return "on"
             return DEFAULT_VOICE
@@ -2268,7 +2277,7 @@ class TestHandleResponse:
             patch("kai.bot.log_message"),
             patch("kai.bot.synthesize_speech", new_callable=AsyncMock, return_value=b"audio"),
         ):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
+            await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
 
         # Both text (reply_text) and voice (send_voice) should be sent
         assert update.message.reply_text.called
@@ -2285,7 +2294,7 @@ class TestHandleResponse:
         ctx = _make_context(claude=claude)
 
         with patch.multiple("kai.bot", **self._base_patches()):
-            await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
+            await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
 
         # If we got here without hanging, the typing task was properly cancelled
 

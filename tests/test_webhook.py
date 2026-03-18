@@ -340,7 +340,8 @@ def _build_test_app(
     # Mock bot that records sent messages
     mock_bot = AsyncMock()
     app["telegram_bot"] = mock_bot
-    app["chat_id"] = 12345
+    app["allowed_user_ids"] = {12345}
+    app["user_workspaces"] = {}
     app.router.add_post("/webhook/github", _handle_github)
     return app
 

@@ -455,7 +455,6 @@ async def _handle_github(request: web.Request) -> web.Response:
     """
     secret = request.app["webhook_secret"]
     bot = request.app["telegram_bot"]
-    chat_id = request.app["chat_id"]
 
     body = await request.read()
 
@@ -571,16 +570,16 @@ async def _handle_github(request: web.Request) -> web.Response:
     if not message:
         return web.json_response({"msg": "ignored", "event": event_type})
 
-    # Send to Telegram with Markdown, falling back to plain text on parse failure
-    try:
-        await bot.send_message(chat_id, message, parse_mode="Markdown")
-    except Exception:
+    # Send to all allowed users
+    for uid in request.app["allowed_user_ids"]:
         try:
-            await bot.send_message(chat_id, _strip_markdown(message))
+            await bot.send_message(uid, message, parse_mode="Markdown")
         except Exception:
-            log.exception("Failed to send GitHub notification")
-            return web.json_response({"msg": "error"})
-    log.info("Sent GitHub %s notification to chat %d", event_type, chat_id)
+            try:
+                await bot.send_message(uid, _strip_markdown(message))
+            except Exception:
+                log.exception("Failed to send GitHub notification to user %d", uid)
+    log.info("Sent GitHub %s notification to %d user(s)", event_type, len(request.app["allowed_user_ids"]))
 
     return web.json_response({"status": "ok"})
 
@@ -595,7 +594,6 @@ async def _handle_generic(request: web.Request) -> web.Response:
     4096-char limit.
     """
     bot = request.app["telegram_bot"]
-    chat_id = request.app["chat_id"]
 
     try:
         payload = await request.json()
@@ -609,12 +607,48 @@ async def _handle_generic(request: web.Request) -> web.Response:
     if len(text) > 4096:
         text = text[:4093] + "..."
 
-    try:
-        await bot.send_message(chat_id, text)
-    except Exception:
-        log.exception("Failed to send generic webhook notification")
+    # Broadcast to all allowed users
+    for uid in request.app["allowed_user_ids"]:
+        try:
+            await bot.send_message(uid, text)
+        except Exception:
+            log.exception("Failed to send generic webhook notification to user %d", uid)
 
     return web.json_response({"status": "ok"})
+
+
+# ── User identification for internal APIs ────────────────────────────
+
+
+def _extract_user_id(request: web.Request, body: dict | None = None) -> int | None:
+    """Extract user_id from X-User-Id header or request body chat_id.
+
+    Returns None if the user_id is not in the allowed set.
+    Falls back to the first allowed user for single-user compatibility.
+    """
+    allowed: set[int] = request.app["allowed_user_ids"]
+
+    # Try X-User-Id header first
+    raw = request.headers.get("X-User-Id")
+    if raw:
+        try:
+            uid = int(raw)
+            if uid in allowed:
+                return uid
+        except ValueError:
+            pass
+
+    # Try chat_id in body (for backwards compatibility)
+    if body and "chat_id" in body:
+        try:
+            cid = int(body["chat_id"])
+            if cid in allowed:
+                return cid
+        except (ValueError, TypeError):
+            pass
+
+    # Fall back to first allowed user (single-user compatibility)
+    return next(iter(allowed), None)
 
 
 # ── Scheduling API ───────────────────────────────────────────────────
@@ -678,7 +712,10 @@ async def _handle_schedule(request: web.Request) -> web.Response:
         )
     auto_remove = payload.get("auto_remove", False)
     notify_on_check = payload.get("notify_on_check", False)
-    chat_id = request.app["chat_id"]
+    user_id = _extract_user_id(request, payload)
+    if user_id is None:
+        return web.json_response({"error": "Cannot determine user"}, status=403)
+    chat_id = payload.get("chat_id", user_id)
 
     # schedule_data can arrive as a JSON object or a pre-serialized string
     if isinstance(schedule_data, dict):
@@ -689,6 +726,7 @@ async def _handle_schedule(request: web.Request) -> web.Response:
     # Persist to database
     try:
         job_id = await sessions.create_job(
+            user_id=user_id,
             chat_id=chat_id,
             name=name,
             job_type=job_type,
@@ -722,8 +760,10 @@ async def _handle_get_jobs(request: web.Request) -> web.Response:
     without needing to parse Telegram bot command output.
     """
 
-    chat_id = request.app["chat_id"]
-    jobs = await sessions.get_jobs(chat_id)
+    user_id = _extract_user_id(request)
+    if user_id is None:
+        return web.json_response({"error": "Cannot determine user"}, status=403)
+    jobs = await sessions.get_jobs(user_id)
     return web.json_response(jobs)
 
 
@@ -928,7 +968,10 @@ async def _handle_send_message(request: web.Request) -> web.Response:
         return web.json_response({"error": "Missing required field: text"}, status=400)
 
     bot = request.app["telegram_bot"]
-    chat_id = request.app["chat_id"]
+    user_id = _extract_user_id(request, payload)
+    if user_id is None:
+        return web.json_response({"error": "Cannot determine user"}, status=403)
+    chat_id = payload.get("chat_id", user_id)
 
     try:
         # Telegram limits messages to 4096 characters. Split long messages
@@ -995,7 +1038,12 @@ async def _handle_send_file(request: web.Request) -> web.Response:
     # prefix matching which is bypassable via symlinks.
     # Fail closed: if workspace is somehow unset, deny all file access
     # rather than allowing reads from anywhere on the filesystem.
-    workspace = request.app.get("workspace")
+    user_id = _extract_user_id(request, payload)
+    if user_id is None:
+        return web.json_response({"error": "Cannot determine user"}, status=403)
+    # Look up the user's workspace from the per-user workspace mapping
+    user_workspaces = request.app.get("user_workspaces", {})
+    workspace = user_workspaces.get(user_id) or request.app.get("workspace")
     if not workspace:
         return web.json_response({"error": "No workspace configured"}, status=403)
     workspace_resolved = Path(workspace).resolve()
@@ -1008,7 +1056,7 @@ async def _handle_send_file(request: web.Request) -> web.Response:
         return web.json_response({"error": f"File not found: {file_path}"}, status=404)
 
     bot = request.app["telegram_bot"]
-    chat_id = request.app["chat_id"]
+    chat_id = payload.get("chat_id", user_id)
     caption = payload.get("caption", "")
 
     # Send images as photos (Telegram renders them inline) and everything
@@ -1135,16 +1183,13 @@ async def start(telegram_app, config) -> None:
     _app["telegram_bot"] = telegram_app.bot
     _app["webhook_secret"] = config.webhook_secret
 
-    # Use first allowed user ID as the notification target.
-    # Config validation ensures allowed_user_ids is non-empty, but guard
-    # against edge cases to avoid a StopIteration crash at startup.
-    chat_id = next(iter(config.allowed_user_ids), None)
-    if chat_id is None:
-        raise SystemExit("No allowed user IDs configured; cannot start webhook server")
-    _app["chat_id"] = chat_id
+    # Store all allowed user IDs for multi-user routing
+    _app["allowed_user_ids"] = config.allowed_user_ids
 
-    # Store workspace path for send-file path confinement
+    # Store default workspace path for send-file path confinement
     _app["workspace"] = str(config.claude_workspace)
+    # Per-user workspace mapping (populated as users switch workspaces)
+    _app["user_workspaces"] = {}
 
     # PR review agent config - stored in app for access by _handle_github()
     _app["pr_review_enabled"] = config.pr_review_enabled
@@ -1285,11 +1330,11 @@ def is_running() -> bool:
     return _runner is not None
 
 
-def update_workspace(workspace: str) -> None:
+def update_workspace(user_id: int, workspace: str) -> None:
     """
     Update the workspace path used by the send-file endpoint's confinement check.
 
-    Called by _do_switch_workspace in bot.py whenever the user switches workspaces,
+    Called by _do_switch_workspace in bot.py whenever a user switches workspaces,
     and by main.py after startup if a non-default workspace was restored from the
     settings table. Without this, the confinement check keeps using the initial
     home workspace path set at startup, causing send-file to return 403 for any
@@ -1300,7 +1345,9 @@ def update_workspace(workspace: str) -> None:
     path from config and would overwrite an earlier call.
 
     Args:
+        user_id: Telegram user ID whose workspace is changing.
         workspace: Absolute path string of the new current workspace.
     """
     if _app is not None:
-        _app["workspace"] = workspace
+        workspaces = _app.setdefault("user_workspaces", {})
+        workspaces[user_id] = workspace

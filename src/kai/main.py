@@ -126,22 +126,28 @@ def main() -> None:
         await sessions.init_db(config.session_db_path)
         app = create_bot(config, use_webhook=use_webhook)
 
-        # Restore workspace from previous session (persisted in settings table)
-        saved_workspace = await sessions.get_setting("workspace")
-        if saved_workspace:
-            ws_path = Path(saved_workspace)
-            if not _is_workspace_allowed(ws_path, config):
-                logging.warning(
-                    "Saved workspace %s is not under WORKSPACE_BASE or ALLOWED_WORKSPACES, ignoring",
-                    saved_workspace,
-                )
-                await sessions.delete_setting("workspace")
-            elif ws_path.is_dir():
-                await app.bot_data["claude"].change_workspace(ws_path)
-                logging.info("Restored workspace: %s", ws_path)
-            else:
-                logging.warning("Saved workspace no longer exists: %s", saved_workspace)
-                await sessions.delete_setting("workspace")
+        # Restore per-user workspaces from previous session
+        manager = app.bot_data["claude_manager"]
+        for uid in config.allowed_user_ids:
+            saved_workspace = await sessions.get_setting(uid, "workspace")
+            if saved_workspace:
+                ws_path = Path(saved_workspace)
+                if not _is_workspace_allowed(ws_path, config):
+                    logging.warning(
+                        "Saved workspace %s for user %d is not allowed, ignoring",
+                        saved_workspace,
+                        uid,
+                    )
+                    await sessions.delete_setting(uid, "workspace")
+                elif ws_path.is_dir():
+                    claude = manager.get_or_create(uid)
+                    ws_config = config.get_workspace_config(ws_path)
+                    await claude.change_workspace(ws_path, workspace_config=ws_config)
+                    webhook.update_workspace(uid, str(ws_path))
+                    logging.info("Restored workspace for user %d: %s", uid, ws_path)
+                else:
+                    logging.warning("Saved workspace no longer exists for user %d: %s", uid, saved_workspace)
+                    await sessions.delete_setting(uid, "workspace")
 
         try:
             # Retry initialization if the network isn't ready yet (e.g. after a
@@ -190,11 +196,13 @@ def main() -> None:
             # In webhook mode, this also registers the Telegram webhook with the API.
             await webhook.start(app, config)
             # webhook.start() initializes the confinement path from config (home workspace).
-            # If a non-default workspace was restored above, sync it now so send-file
-            # accepts files from the restored workspace. Must come after start() because
+            # If non-default workspaces were restored above, sync them now so send-file
+            # accepts files from the restored workspaces. Must come after start() because
             # start() would overwrite any earlier update_workspace() call.
-            if app.bot_data["claude"].workspace != config.claude_workspace:
-                webhook.update_workspace(str(app.bot_data["claude"].workspace))
+            for uid in config.allowed_user_ids:
+                saved = await sessions.get_setting(uid, "workspace")
+                if saved:
+                    webhook.update_workspace(uid, saved)
 
             # In polling mode, start the Updater's long-polling loop. PTB's
             # start_polling() automatically calls delete_webhook() first, which
@@ -206,25 +214,36 @@ def main() -> None:
                 )
                 logging.info("Polling started")
 
-            # Check if a previous response was interrupted by a crash/restart.
-            # bot.py writes this flag file when it starts processing a message
-            # and deletes it when done. If it exists at startup, the process
-            # crashed mid-response and the user should be notified.
-            # Flag file is under DATA_DIR (writable) not PROJECT_ROOT (may be read-only)
-            flag = DATA_DIR / ".responding_to"
-            try:
-                chat_id = int(flag.read_text().strip())
-                await app.bot.send_message(
-                    chat_id, "Sorry, my previous response was interrupted. Please resend your last message."
-                )
-                logging.info("Notified chat %d of interrupted response", chat_id)
-                flag.unlink(missing_ok=True)
-            except FileNotFoundError:
-                pass
-            except Exception:
-                # Full traceback helps diagnose issues like corrupt flag file content
-                logging.exception("Failed to send interrupted-response notice")
-                flag.unlink(missing_ok=True)
+            # Check if any previous responses were interrupted by a crash/restart.
+            # bot.py writes per-user flag files when it starts processing a message
+            # and deletes them when done. If they exist at startup, the process
+            # crashed mid-response and the affected users should be notified.
+            users_dir = DATA_DIR / "users"
+            if users_dir.exists():
+                for user_dir in users_dir.iterdir():
+                    flag = user_dir / ".responding_to"
+                    if flag.exists():
+                        try:
+                            chat_id = int(flag.read_text().strip())
+                            await app.bot.send_message(
+                                chat_id, "Sorry, my previous response was interrupted. Please resend your last message."
+                            )
+                            logging.info("Notified chat %d of interrupted response", chat_id)
+                            flag.unlink(missing_ok=True)
+                        except Exception:
+                            logging.exception("Failed to send interrupted-response notice")
+                            flag.unlink(missing_ok=True)
+            # Also check the legacy single-user flag location
+            legacy_flag = DATA_DIR / ".responding_to"
+            if legacy_flag.exists():
+                try:
+                    chat_id = int(legacy_flag.read_text().strip())
+                    await app.bot.send_message(
+                        chat_id, "Sorry, my previous response was interrupted. Please resend your last message."
+                    )
+                    legacy_flag.unlink(missing_ok=True)
+                except Exception:
+                    legacy_flag.unlink(missing_ok=True)
 
             logging.info("Kai is running. Press Ctrl+C to stop.")
             await asyncio.Event().wait()  # Block forever until shutdown signal
@@ -236,7 +255,7 @@ def main() -> None:
             if not use_webhook and app.updater:
                 await app.updater.stop()
             await app.stop()
-            await app.bot_data["claude"].shutdown()
+            await app.bot_data["claude_manager"].shutdown_all()
             await app.shutdown()
             await sessions.close_db()
 

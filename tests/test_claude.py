@@ -960,6 +960,7 @@ class TestContextInjection:
             workspace=home_workspace,
             home_workspace=home_workspace,
             webhook_secret="secret",
+            user_id=12345,
         )
         claude._proc = proc
         claude._fresh_session = True

@@ -71,6 +71,11 @@ def _downstream_patches() -> dict:
     Applied when a test expects the gate to pass and execution to continue
     into normal Claude handling. Prevents actual subprocess spawning.
     """
+    manager = MagicMock()
+    manager.get_or_create = MagicMock(return_value=MagicMock(model="opus"))
+    ctx_mock = MagicMock()
+    ctx_mock.bot_data = {"claude_manager": manager}
+
     return {
         "_is_authorized": MagicMock(return_value=True),
         "_handle_response": AsyncMock(),

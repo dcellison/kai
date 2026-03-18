@@ -29,13 +29,14 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import signal
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from kai.config import WorkspaceConfig, parse_env_file
+from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file
 from kai.history import get_recent_history
 
 log = logging.getLogger(__name__)
@@ -114,10 +115,12 @@ class PersistentClaude:
         claude_user: str | None = None,
         max_session_hours: float = 0,
         workspace_config: WorkspaceConfig | None = None,
+        user_id: int | None = None,
     ):
         self.model = model
         self.workspace = workspace
         self.home_workspace = home_workspace or workspace
+        self.user_id = user_id
         self.webhook_port = webhook_port
         self.webhook_secret = webhook_secret
         self.max_budget_usd = max_budget_usd
@@ -235,6 +238,9 @@ class PersistentClaude:
         # Webhook secret last - ensures workspace env can't override it.
         if self.webhook_secret:
             env["KAI_WEBHOOK_SECRET"] = self.webhook_secret
+        # Inject user ID so inner Claude can include it in API calls
+        if self.user_id is not None:
+            env["KAI_USER_ID"] = str(self.user_id)
 
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -411,7 +417,7 @@ class PersistentClaude:
                 parts.append(f"## Workspace Instructions\n\n{ws_prompt}")
 
             # Inject recent conversation history for continuity
-            recent = get_recent_history()
+            recent = get_recent_history(user_id=self.user_id) if self.user_id is not None else ""
             if recent:
                 parts.append(f"[Recent conversations (search .claude/history/ for full logs):]\n{recent}")
 
@@ -422,7 +428,7 @@ class PersistentClaude:
                 api_note = (
                     f"[Scheduling API: To create jobs, POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/schedule "
-                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
+                    f"with headers 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' and 'X-User-Id: $KAI_USER_ID' (environment variables). "
                     f"Required fields: name, prompt, schedule_type, schedule_data. "
                     f"Optional: job_type (reminder|claude), auto_remove (bool). "
                     f"To list jobs: GET /api/jobs. To update: PATCH /api/jobs/{{id}}. "
@@ -443,14 +449,14 @@ class PersistentClaude:
                     f"[Messaging API: To send a text message to the user proactively "
                     f"(e.g., background task results), POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/send-message "
-                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
+                    f"with headers 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' and 'X-User-Id: $KAI_USER_ID' (environment variables). "
                     f'Required: "text" (the message content). '
                     f"Long messages are automatically split at Telegram's 4096-char limit.]"
                 )
                 parts.append(
                     f"[File API: To send a file to the user, POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/send-file "
-                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
+                    f"with headers 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' and 'X-User-Id: $KAI_USER_ID' (environment variables). "
                     f'Required: "path" (absolute file path within the current workspace {self.workspace}). '
                     f'Optional: "caption". Images are sent as photos, '
                     f"everything else as documents.\n"
@@ -464,7 +470,7 @@ class PersistentClaude:
                 svc_lines = [
                     "[External Services: To call external APIs, POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/services/{{name}} "
-                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
+                    f"with headers 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' and 'X-User-Id: $KAI_USER_ID' (environment variables). "
                     "Request JSON fields (all optional): "
                     '"body" (dict - forwarded as JSON), '
                     '"params" (dict - query parameters), '
@@ -824,3 +830,63 @@ class PersistentClaude:
                 os.killpg(saved_pgid, signal.SIGKILL)
             except OSError:
                 pass
+
+
+# ── Per-user process pool ──────────────────────────────────────────
+
+
+class ClaudeManager:
+    """Manages per-user PersistentClaude instances with lazy creation."""
+
+    def __init__(self, *, config, services_info: list[dict] | None = None):
+        self._instances: dict[int, PersistentClaude] = {}
+        self._config = config
+        self._services_info = services_info or []
+
+    def get_or_create(self, user_id: int) -> PersistentClaude:
+        """Get existing instance or create new one for this user."""
+        if user_id not in self._instances:
+            self._ensure_user_dirs(user_id)
+            home = self._user_home(user_id)
+            ws_config = self._config.get_workspace_config(home)
+            self._instances[user_id] = PersistentClaude(
+                model=self._config.claude_model,
+                workspace=home,
+                home_workspace=home,
+                webhook_port=self._config.webhook_port,
+                webhook_secret=self._config.webhook_secret,
+                max_budget_usd=self._config.claude_max_budget_usd,
+                timeout_seconds=self._config.claude_timeout_seconds,
+                services_info=self._services_info,
+                claude_user=self._config.claude_user,
+                max_session_hours=self._config.claude_max_session_hours,
+                workspace_config=ws_config,
+                user_id=user_id,
+            )
+        return self._instances[user_id]
+
+    def _ensure_user_dirs(self, user_id: int) -> None:
+        """Create per-user directory structure on first access."""
+        home = self._user_home(user_id)
+        for d in [home, home / ".claude" / "history", home / "files"]:
+            d.mkdir(parents=True, exist_ok=True)
+        # Copy template CLAUDE.md if not present
+        template = self._config.claude_workspace / ".claude" / "CLAUDE.md"
+        target = home / ".claude" / "CLAUDE.md"
+        if template.exists() and not target.exists():
+            shutil.copy2(template, target)
+
+    def _user_home(self, user_id: int) -> Path:
+        return DATA_DIR / "users" / str(user_id) / "home"
+
+    async def shutdown_all(self) -> None:
+        """Shut down all Claude instances."""
+        for instance in self._instances.values():
+            await instance.shutdown()
+        self._instances.clear()
+
+    async def shutdown_user(self, user_id: int) -> None:
+        """Shut down a specific user's Claude instance."""
+        if user_id in self._instances:
+            await self._instances[user_id].shutdown()
+            del self._instances[user_id]
