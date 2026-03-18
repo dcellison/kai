@@ -777,11 +777,26 @@ class TestHandleStop:
         claude = _make_mock_claude()
         update = _make_update()
         ctx = _make_context(claude=claude)
+        ctx.bot_data["claude_manager"].get = MagicMock(return_value=claude)
         stop_event = asyncio.Event()
         with patch("kai.bot.get_stop_event", return_value=stop_event):
             await handle_stop(update, ctx)
         assert stop_event.is_set()
         claude.force_kill.assert_called_once()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "stopping" in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_no_instance_skips_kill(self):
+        """When no instance exists, stop event is set but force_kill is not called."""
+        update = _make_update()
+        ctx = _make_context()
+        ctx.bot_data["claude_manager"].get = MagicMock(return_value=None)
+        stop_event = asyncio.Event()
+        with patch("kai.bot.get_stop_event", return_value=stop_event):
+            await handle_stop(update, ctx)
+        assert stop_event.is_set()
+        ctx.bot_data["claude_manager"].get_or_create.assert_not_called()
         reply = update.message.reply_text.call_args[0][0]
         assert "stopping" in reply.lower()
 
@@ -935,6 +950,17 @@ class TestHandleCancelJob:
         mock_job.schedule_removal.assert_called_once()
         reply = update.message.reply_text.call_args[0][0]
         assert "cancelled" in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_passes_user_id(self):
+        """delete_job is called with the requesting user's ID for authorization."""
+        update = _make_update(user_id=1)
+        jq = MagicMock()
+        jq.jobs.return_value = []
+        ctx = _make_context(args=["7"], job_queue=jq)
+        with patch("kai.bot.sessions.delete_job", new_callable=AsyncMock, return_value=True) as mock_del:
+            await handle_canceljob(update, ctx)
+        mock_del.assert_called_once_with(7, user_id=1)
 
 
 # ── handle_models ────────────────────────────────────────────────────

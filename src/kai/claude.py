@@ -857,6 +857,10 @@ class ClaudeManager:
         self._config = config
         self._services_info = services_info or []
 
+    def get(self, user_id: int) -> PersistentClaude | None:
+        """Get existing instance without creating. Returns None if not found."""
+        return self._instances.get(user_id)
+
     async def get_or_create(self, user_id: int) -> PersistentClaude:
         """Get existing instance or create new one for this user."""
         if user_id not in self._instances:

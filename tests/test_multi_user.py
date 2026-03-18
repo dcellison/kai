@@ -114,6 +114,13 @@ class TestClaudeManagerIsolation:
         assert USER_A not in manager._instances
         assert USER_B in manager._instances
 
+    async def test_get_returns_existing_instance(self, manager):
+        created = await manager.get_or_create(USER_A)
+        assert manager.get(USER_A) is created
+
+    def test_get_returns_none_for_missing(self, manager):
+        assert manager.get(999) is None
+
     async def test_shutdown_all_clears_everything(self, manager):
         await manager.get_or_create(USER_A)
         await manager.get_or_create(USER_B)
@@ -166,6 +173,17 @@ class TestSessionIsolation:
         jobs_b = await sessions.get_jobs(USER_B)
         assert len(jobs_a) == 1 and jobs_a[0]["name"] == "job-a"
         assert len(jobs_b) == 1 and jobs_b[0]["name"] == "job-b"
+
+    async def test_canceljob_cannot_delete_other_users_job(self, db):
+        """User B cannot cancel User A's job via /canceljob."""
+        await sessions.create_job(USER_A, USER_A, "secret", "reminder", "hi", "interval", '{"seconds":60}')
+        jobs_a = await sessions.get_jobs(USER_A)
+        job_id = jobs_a[0]["id"]
+        # User B tries to delete User A's job
+        deleted = await sessions.delete_job(job_id, user_id=USER_B)
+        assert not deleted
+        # Job still exists for User A
+        assert len(await sessions.get_jobs(USER_A)) == 1
 
 
 # ── 3. Settings isolation ────────────────────────────────────────────
@@ -333,6 +351,8 @@ class TestHandlerUserRouting:
 
     async def test_handle_stop_routes_to_user(self):
         claude_a, claude_b, manager, config = _two_user_setup()
+        instances = {USER_A: claude_a, USER_B: claude_b}
+        manager.get = MagicMock(side_effect=lambda uid: instances.get(uid))
         update = _make_update(user_id=USER_B)
         ctx = _make_two_user_context(manager, config)
         stop_event = asyncio.Event()

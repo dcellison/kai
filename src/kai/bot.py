@@ -695,7 +695,7 @@ async def handle_canceljob(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except ValueError:
         await update.message.reply_text("Job ID must be a number.")
         return
-    deleted = await sessions.delete_job(job_id)
+    deleted = await sessions.delete_job(job_id, user_id=_user_id(update))
     if not deleted:
         await update.message.reply_text(f"Job #{job_id} not found.")
         return
@@ -723,10 +723,12 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """
     assert update.message is not None
     user_id = _user_id(update)
-    claude = await _get_claude(context, user_id)
+    manager: ClaudeManager = context.bot_data["claude_manager"]
     stop_event = get_stop_event(user_id)
     stop_event.set()
-    claude.force_kill()
+    claude = manager.get(user_id)
+    if claude:
+        claude.force_kill()
     await update.message.reply_text("Stopping...")
 
 
