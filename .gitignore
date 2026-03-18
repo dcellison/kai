@@ -42,9 +42,6 @@ workspace/.claude/*
 # Claude
 .claude/
 
-# UV
-uv.lock
-
 # Users
 users/
 

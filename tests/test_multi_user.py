@@ -16,7 +16,6 @@ import pytest
 from kai import history, locks, sessions
 from kai.bot import (
     _clear_responding,
-    _reset_session_id,
     _set_responding,
     handle_document,
     handle_jobs,
@@ -29,6 +28,7 @@ from kai.bot import (
     handle_stop,
 )
 from kai.claude import ClaudeManager
+from kai.logging import reset_session_id
 from kai.webhook import _extract_user_id, update_workspace
 
 # Re-use test helpers from test_bot
@@ -373,7 +373,7 @@ class TestHandlerUserRouting:
         ctx = _make_two_user_context(manager, config)
         ctx.bot.get_file = AsyncMock(return_value=mock_file)
 
-        _reset_session_id(USER_A)
+        reset_session_id(USER_A)
         with (
             patch("kai.bot.DATA_DIR", tmp_path),
             patch("kai.bot._handle_response", new_callable=AsyncMock),
@@ -383,12 +383,13 @@ class TestHandlerUserRouting:
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_photo(update, ctx)
-        # Photo should be saved under user A's session dir
-        user_a_sessions = tmp_path / "users" / str(USER_A) / "sessions"
-        assert user_a_sessions.is_dir()
-        # User B should have no session files
-        user_b_sessions = tmp_path / "users" / str(USER_B) / "sessions"
-        assert not user_b_sessions.exists()
+        # Photo should be saved under user A's home/files/ dir
+        user_a_files = tmp_path / "users" / str(USER_A) / "home" / "files"
+        assert user_a_files.is_dir()
+        assert len(list(user_a_files.iterdir())) == 1
+        # User B should have no files
+        user_b_files = tmp_path / "users" / str(USER_B) / "home" / "files"
+        assert not user_b_files.exists()
 
     async def test_models_shows_correct_user_model(self):
         claude_a, claude_b, manager, config = _two_user_setup()
@@ -408,7 +409,7 @@ class TestHandlerUserRouting:
         assert has_sonnet_marker
         assert not has_opus_marker
 
-    async def test_handle_document_saves_to_user_session_dir(self, tmp_path):
+    async def test_handle_document_saves_to_user_files_dir(self, tmp_path):
         _claude_a, _claude_b, manager, config = _two_user_setup()
 
         update = _make_update(user_id=USER_A)
@@ -423,7 +424,7 @@ class TestHandlerUserRouting:
         ctx = _make_two_user_context(manager, config)
         ctx.bot.get_file = AsyncMock(return_value=mock_file)
 
-        _reset_session_id(USER_A)
+        reset_session_id(USER_A)
         with (
             patch("kai.bot.DATA_DIR", tmp_path),
             patch("kai.bot._handle_response", new_callable=AsyncMock),
@@ -433,11 +434,13 @@ class TestHandlerUserRouting:
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_document(update, ctx)
-        # Document should be saved under user A's session dir
-        user_a_sessions = tmp_path / "users" / str(USER_A) / "sessions"
-        assert user_a_sessions.is_dir()
-        user_b_sessions = tmp_path / "users" / str(USER_B) / "sessions"
-        assert not user_b_sessions.exists()
+        # Document should be saved under user A's home/files/ dir
+        user_a_files = tmp_path / "users" / str(USER_A) / "home" / "files"
+        assert user_a_files.is_dir()
+        assert len(list(user_a_files.iterdir())) == 1
+        # User B should have no files
+        user_b_files = tmp_path / "users" / str(USER_B) / "home" / "files"
+        assert not user_b_files.exists()
 
     async def test_handle_model_callback_isolated(self):
         claude_a, claude_b, manager, config = _two_user_setup()
@@ -470,8 +473,20 @@ class TestHandlerUserRouting:
     async def test_stats_shows_correct_user(self):
         _claude_a, _claude_b, manager, config = _two_user_setup()
         stats_data = {
-            USER_A: {"session_id": "a1", "model": "opus", "created_at": "2026-01-01", "last_used_at": "2026-01-02", "total_cost_usd": 5.0},
-            USER_B: {"session_id": "b1", "model": "sonnet", "created_at": "2026-01-01", "last_used_at": "2026-01-02", "total_cost_usd": 1.0},
+            USER_A: {
+                "session_id": "a1",
+                "model": "opus",
+                "created_at": "2026-01-01",
+                "last_used_at": "2026-01-02",
+                "total_cost_usd": 5.0,
+            },
+            USER_B: {
+                "session_id": "b1",
+                "model": "sonnet",
+                "created_at": "2026-01-01",
+                "last_used_at": "2026-01-02",
+                "total_cost_usd": 1.0,
+            },
         }
 
         async def mock_get_stats(uid):
@@ -490,9 +505,15 @@ class TestHandlerUserRouting:
         jobs_data = {
             USER_A: [
                 {
-                    "id": 1, "name": "job-A", "job_type": "reminder", "prompt": "hi",
-                    "schedule_type": "interval", "schedule_data": '{"seconds": 3600}',
-                    "auto_remove": False, "notify_on_check": False, "created_at": "2026-01-01",
+                    "id": 1,
+                    "name": "job-A",
+                    "job_type": "reminder",
+                    "prompt": "hi",
+                    "schedule_type": "interval",
+                    "schedule_data": '{"seconds": 3600}',
+                    "auto_remove": False,
+                    "notify_on_check": False,
+                    "created_at": "2026-01-01",
                 }
             ],
             USER_B: [],
@@ -592,3 +613,63 @@ class TestCronJobUserRouting:
         manager.get_or_create.assert_called_with(USER_A)
         claude_a.send.assert_called_once()
         claude_b.send.assert_not_called()
+
+
+# ── File cleanup ──────────────────────────────────────────────────
+
+
+class TestCleanupOldFiles:
+    """Tests for ClaudeManager.cleanup_old_files."""
+
+    @pytest.fixture
+    def manager_with_files(self, tmp_path):
+        """Create a ClaudeManager with tmp DATA_DIR and sample files."""
+        config = MagicMock()
+        config.claude_workspace = tmp_path / "workspace"
+        config.claude_workspace.mkdir()
+        mgr = ClaudeManager(config=config)
+        return mgr, tmp_path
+
+    @pytest.mark.asyncio
+    async def test_removes_old_files(self, manager_with_files):
+        """Files older than max_age_days are removed."""
+        mgr, tmp_path = manager_with_files
+        import os
+        import time
+
+        files_dir = tmp_path / "users" / "42" / "home" / "files"
+        files_dir.mkdir(parents=True)
+        old_file = files_dir / "old_photo.jpg"
+        old_file.write_bytes(b"old")
+        # Set mtime to 10 days ago
+        old_time = time.time() - (10 * 86400)
+        os.utime(old_file, (old_time, old_time))
+
+        with patch("kai.claude.DATA_DIR", tmp_path):
+            removed = await mgr.cleanup_old_files(max_age_days=7)
+
+        assert removed == 1
+        assert not old_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_keeps_recent_files(self, manager_with_files):
+        """Files newer than max_age_days are kept."""
+        mgr, tmp_path = manager_with_files
+        files_dir = tmp_path / "users" / "42" / "home" / "files"
+        files_dir.mkdir(parents=True)
+        new_file = files_dir / "new_photo.jpg"
+        new_file.write_bytes(b"new")
+
+        with patch("kai.claude.DATA_DIR", tmp_path):
+            removed = await mgr.cleanup_old_files(max_age_days=7)
+
+        assert removed == 0
+        assert new_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_handles_missing_users_dir(self, manager_with_files):
+        """Returns 0 when users/ directory doesn't exist."""
+        mgr, tmp_path = manager_with_files
+        with patch("kai.claude.DATA_DIR", tmp_path):
+            removed = await mgr.cleanup_old_files()
+        assert removed == 0

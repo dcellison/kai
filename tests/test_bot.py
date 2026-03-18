@@ -23,7 +23,6 @@ from kai.bot import (
     _clear_responding,
     _do_switch_workspace,
     _edit_message_safe,
-    _get_session_id,
     _is_authorized,
     _is_workspace_allowed,
     _models_keyboard,
@@ -31,7 +30,6 @@ from kai.bot import (
     _prepend_queue_marker,
     _reply_safe,
     _require_auth,
-    _reset_session_id,
     _resolve_workspace_path,
     _save_to_user_files,
     _set_responding,
@@ -67,6 +65,7 @@ from kai.bot import (
 )
 from kai.claude import ClaudeResponse, StreamEvent
 from kai.config import Config
+from kai.logging import get_session_id, reset_session_id
 from kai.tts import DEFAULT_VOICE, VOICES
 
 # ── _resolve_workspace_path ──────────────────────────────────────────
@@ -158,16 +157,13 @@ class TestTruncateForTelegram:
 
 
 class TestSaveToUserFiles:
-    def test_creates_session_files_directory(self, tmp_path):
-        """Automatically creates the session files/ directory."""
+    def test_creates_user_files_directory(self, tmp_path):
+        """Automatically creates the user home/files/ directory."""
         with patch("kai.bot.DATA_DIR", tmp_path):
             _save_to_user_files(b"hello", "test.txt", 12345)
-        # Check that files are in users/{uid}/sessions/{sid}/files/
-        users_dir = tmp_path / "users" / "12345" / "sessions"
-        assert users_dir.is_dir()
-        session_dirs = list(users_dir.iterdir())
-        assert len(session_dirs) == 1
-        assert (session_dirs[0] / "files").is_dir()
+        files_dir = tmp_path / "users" / "12345" / "home" / "files"
+        assert files_dir.is_dir()
+        assert len(list(files_dir.iterdir())) == 1
 
     def test_saves_content_correctly(self, tmp_path):
         """Written bytes match the input exactly."""
@@ -208,20 +204,31 @@ class TestSaveToUserFiles:
 
     def test_same_session_for_same_user(self):
         """Same user gets consistent session ID."""
-        _reset_session_id(99999)  # ensure clean state
-        sid1 = _get_session_id(99999)
-        sid2 = _get_session_id(99999)
+        reset_session_id(99999)  # ensure clean state
+        sid1 = get_session_id(99999)
+        sid2 = get_session_id(99999)
         assert sid1 == sid2
-        _reset_session_id(99999)
+        reset_session_id(99999)
 
     def test_reset_generates_new_session(self):
         """After reset, a new session ID is generated."""
-        _reset_session_id(99998)
-        sid1 = _get_session_id(99998)
-        _reset_session_id(99998)
-        sid2 = _get_session_id(99998)
+        reset_session_id(99998)
+        sid1 = get_session_id(99998)
+        reset_session_id(99998)
+        sid2 = get_session_id(99998)
         assert sid1 != sid2
-        _reset_session_id(99998)
+        reset_session_id(99998)
+
+    def test_file_path_persists_across_session_reset(self, tmp_path):
+        """File path remains valid after session reset (files are user-level, not session-level)."""
+        with patch("kai.bot.DATA_DIR", tmp_path):
+            path1 = _save_to_user_files(b"data1", "photo.jpg", 77777)
+            reset_session_id(77777)
+            path2 = _save_to_user_files(b"data2", "photo2.jpg", 77777)
+        # Both files in the same directory (not separated by session)
+        assert path1.parent == path2.parent
+        assert path1.is_file()
+        assert path2.is_file()
 
 
 # ── _workspaces_keyboard ────────────────────────────────────────────

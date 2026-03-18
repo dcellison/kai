@@ -186,6 +186,7 @@ def main() -> None:
                         except Exception:
                             log.exception("crash_recovery.failed")
                             flag.unlink(missing_ok=True)
+
             # Start periodic idle Claude instance eviction
             async def _idle_eviction_loop():
                 while True:
@@ -193,6 +194,9 @@ def main() -> None:
                     count = await manager.evict_idle()
                     if count:
                         log.info("eviction.completed", count=count)
+                    removed = await manager.cleanup_old_files()
+                    if removed:
+                        log.info("files.cleanup_completed", removed=removed)
 
             eviction_task = asyncio.create_task(_idle_eviction_loop())
 

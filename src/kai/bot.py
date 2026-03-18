@@ -61,7 +61,6 @@ from kai.logging import (
     audit_assistant_response,
     audit_auth_event,
     audit_user_message,
-    get_session_id,
     log_handler,
     reset_session_id,
 )
@@ -102,21 +101,18 @@ EDIT_INTERVAL = 2.0
 async def _set_responding(user_id: int, chat_id: int) -> None:
     """Write the chat ID to a per-user flag file, marking a response as in-flight."""
     flag = DATA_DIR / "users" / str(user_id) / ".responding_to"
-    flag.parent.mkdir(parents=True, exist_ok=True)
-    await asyncio.to_thread(flag.write_text, str(chat_id))
+
+    def _write() -> None:
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.write_text(str(chat_id))
+
+    await asyncio.to_thread(_write)
 
 
 async def _clear_responding(user_id: int) -> None:
     """Remove the per-user flag file, indicating the response completed (or failed gracefully)."""
     flag = DATA_DIR / "users" / str(user_id) / ".responding_to"
     await asyncio.to_thread(flag.unlink, True)
-
-
-# ── Per-user session tracking ──────────────────────────────────────
-# Session ID management is in kai.logging (get_session_id / reset_session_id).
-# Alias _get_session_id for internal use (e.g., _save_to_user_files).
-_get_session_id = get_session_id
-_reset_session_id = reset_session_id
 
 
 def _user_home(user_id: int) -> Path:
@@ -380,7 +376,7 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     claude = _get_claude(context, user_id)
     await claude.restart()
     await sessions.clear_session(user_id)
-    _reset_session_id(user_id)
+    reset_session_id(user_id)
     await update.message.reply_text("Session cleared. Starting fresh.")
 
 
@@ -835,7 +831,7 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, user_id: int,
     # files from the new workspace rather than rejecting them with 403.
     webhook.update_workspace(user_id, str(path))
     await sessions.clear_session(user_id)
-    _reset_session_id(user_id)
+    reset_session_id(user_id)
 
     if path == home:
         await sessions.delete_setting(user_id, "workspace")
@@ -1296,10 +1292,11 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
 
 def _save_to_user_files(data: bytes, filename: str, user_id: int) -> Path:
     """
-    Save file bytes to the user's session directory with a timestamped name.
+    Save file bytes to the user's home/files/ directory with a timestamped name.
 
-    Files are stored in DATA_DIR/users/{user_id}/sessions/{session_id}/files/
-    to ensure complete per-user isolation regardless of workspace.
+    Files are stored in DATA_DIR/users/{user_id}/home/files/ — a user-level
+    directory that persists across sessions, ensuring Claude always has access
+    to uploaded files regardless of session resets or workspace switches.
 
     Args:
         data: Raw file bytes to write.
@@ -1309,8 +1306,7 @@ def _save_to_user_files(data: bytes, filename: str, user_id: int) -> Path:
     Returns:
         Absolute path to the saved file.
     """
-    session_id = _get_session_id(user_id)
-    files_dir = DATA_DIR / "users" / str(user_id) / "sessions" / session_id / "files"
+    files_dir = DATA_DIR / "users" / str(user_id) / "home" / "files"
     files_dir.mkdir(parents=True, exist_ok=True)
 
     # Timestamp prefix ensures unique names even if the same file is sent twice
@@ -1346,11 +1342,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     raw = bytes(data)
     b64 = base64.b64encode(raw).decode()
 
-    # Save to per-user session directory so Claude can access the file
     saved = _save_to_user_files(raw, f"photo_{photo.file_unique_id}.jpg", user_id)
 
     caption = update.message.caption or "What's in this image?"
     caption += f"\n[File saved to: {saved}]"
+    # log_message → JSONL conversation history; audit_* → structured audit log (separate stores)
     await log_message(direction="user", user_id=user_id, chat_id=chat_id, text=caption, media={"type": "photo"})
     audit_user_message(user_id, chat_id, caption, media={"type": "photo"})
     content = [
@@ -1475,7 +1471,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         b64 = base64.b64encode(raw).decode()
         media_type = _IMAGE_MEDIA_TYPES[suffix]
 
-        # Save to per-user session directory so Claude can access the file
+        # Save to per-user files directory so Claude can access the file
         saved = _save_to_user_files(raw, file_name, user_id)
         img_caption = caption or f"What's in this image ({file_name})?"
         img_caption += f"\n[File saved to: {saved}]"
@@ -1503,7 +1499,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text(f"Couldn't decode {file_name} as text.")
             return
 
-        # Save to per-user session directory so Claude can access the file
+        # Save to per-user files directory so Claude can access the file
         saved = _save_to_user_files(raw, file_name, user_id)
         header = f"File: {file_name}\n```\n{text_content}\n```\n[File saved to: {saved}]"
 
@@ -1514,7 +1510,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text=caption or f"[file: {file_name}]",
             media={"type": "document", "filename": file_name},
         )
-        audit_user_message(user_id, chat_id, caption or f"[file: {file_name}]", media={"type": "document", "filename": file_name})
+        audit_user_message(
+            user_id, chat_id, caption or f"[file: {file_name}]", media={"type": "document", "filename": file_name}
+        )
         if caption:
             content = f"{caption}\n\n{header}"
         else:
@@ -1533,7 +1531,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text=caption or f"[file: {file_name}]",
             media={"type": "document", "filename": file_name},
         )
-        audit_user_message(user_id, chat_id, caption or f"[file: {file_name}]", media={"type": "document", "filename": file_name})
+        audit_user_message(
+            user_id, chat_id, caption or f"[file: {file_name}]", media={"type": "document", "filename": file_name}
+        )
         content = (caption or f"File received: {file_name}") + f"\n[File saved to: {saved}]"
 
     was_queued = await _notify_if_queued(update, user_id)
@@ -1608,7 +1608,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         text=f"[voice message, {voice.duration}s]",
         media={"type": "voice", "duration": voice.duration},
     )
-    audit_user_message(user_id, chat_id, f"[voice message, {voice.duration}s]", media={"type": "voice", "duration": voice.duration})
+    audit_user_message(
+        user_id, chat_id, f"[voice message, {voice.duration}s]", media={"type": "voice", "duration": voice.duration}
+    )
 
     try:
         transcript = await transcribe_voice(audio_data, config.whisper_model_path)
@@ -1920,7 +1922,9 @@ async def _handle_response(
 
     if not final_response.success:
         error_text = f"Error: {final_response.error}"
-        await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=f"[error: {final_response.error}]")
+        await log_message(
+            direction="assistant", user_id=user_id, chat_id=chat_id, text=f"[error: {final_response.error}]"
+        )
         if live_msg:
             await _edit_message_safe(live_msg, error_text)
         else:

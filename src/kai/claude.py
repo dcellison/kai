@@ -225,7 +225,12 @@ class PersistentClaude:
         else:
             cmd = claude_cmd
 
-        log.info("process.started", model=self.model, workspace=str(self.workspace), claude_user=self.claude_user or "(same as bot)")
+        log.info(
+            "process.started",
+            model=self.model,
+            workspace=str(self.workspace),
+            claude_user=self.claude_user or "(same as bot)",
+        )
 
         # Build the subprocess environment. Merge order:
         # 1. Base environment (inherited from parent process)
@@ -372,7 +377,12 @@ class PersistentClaude:
         # machines. Only checked before starting a new interaction, never
         # during one, so in-flight responses complete normally.
         if self._should_recycle():
-            log.info("session.recycled", reason="age", age_hours=round(self._session_age_hours(), 1), limit_hours=self.max_session_hours)
+            log.info(
+                "session.recycled",
+                reason="age",
+                age_hours=round(self._session_age_hours(), 1),
+                limit_hours=self.max_session_hours,
+            )
             await self._kill()
 
         try:
@@ -896,13 +906,38 @@ class ClaudeManager:
     async def evict_idle(self, max_idle_hours: float = 4.0) -> int:
         """Shut down idle instances. Returns count evicted."""
         to_evict = [
-            uid for uid, inst in self._instances.items()
+            uid
+            for uid, inst in self._instances.items()
             if inst.idle_hours >= max_idle_hours and not inst._lock.locked()
         ]
         for uid in to_evict:
             await self._instances[uid].shutdown()
             del self._instances[uid]
         return len(to_evict)
+
+    async def cleanup_old_files(self, max_age_days: int = 7) -> int:
+        """Remove uploaded files older than max_age_days. Returns count removed."""
+        cutoff = time.time() - (max_age_days * 86400)
+        users_dir = DATA_DIR / "users"
+        if not users_dir.exists():
+            return 0
+
+        def _cleanup() -> int:
+            count = 0
+            for user_dir in users_dir.iterdir():
+                files_dir = user_dir / "home" / "files"
+                if not files_dir.is_dir():
+                    continue
+                for f in files_dir.iterdir():
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        count += 1
+            return count
+
+        removed = await asyncio.to_thread(_cleanup)
+        if removed:
+            log.info("files.cleanup", removed=removed, max_age_days=max_age_days)
+        return removed
 
     async def shutdown_all(self) -> None:
         """Shut down all Claude instances."""
