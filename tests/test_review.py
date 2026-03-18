@@ -606,7 +606,7 @@ class TestSendReviewSummary:
         with patch("kai.review.aiohttp.ClientSession") as mock_cs:
             mock_cs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_cs.return_value.__aexit__ = AsyncMock(return_value=False)
-            await send_review_summary(meta, True, 8080, "secret")
+            await send_review_summary(meta, True, 8080, "secret", user_ids=[1])
 
         # Verify the POST was made with correct URL and content
         call_args = mock_session.post.call_args
@@ -615,6 +615,8 @@ class TestSendReviewSummary:
         assert "Reviewed PR #42" in body["text"]
         assert "owner/repo" in body["text"]
         assert "https://github.com/owner/repo/pull/42" in body["text"]
+        headers = call_args[1]["headers"]
+        assert headers["X-User-Id"] == "1"
 
     @pytest.mark.asyncio
     async def test_failure_message(self):
@@ -630,7 +632,7 @@ class TestSendReviewSummary:
         with patch("kai.review.aiohttp.ClientSession") as mock_cs:
             mock_cs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_cs.return_value.__aexit__ = AsyncMock(return_value=False)
-            await send_review_summary(meta, False, 8080, "secret")
+            await send_review_summary(meta, False, 8080, "secret", user_ids=[1])
 
         body = mock_session.post.call_args[1]["json"]
         assert "Failed to review" in body["text"]
@@ -642,7 +644,7 @@ class TestSendReviewSummary:
 
         with patch("kai.review.aiohttp.ClientSession", side_effect=Exception("network error")):
             # Should not raise
-            await send_review_summary(meta, True, 8080, "secret")
+            await send_review_summary(meta, True, 8080, "secret", user_ids=[1])
 
 
 # ── review_pr (orchestrator) ────────────────────────────────────────
@@ -661,7 +663,7 @@ class TestReviewPR:
             patch("kai.review.post_review_comment", return_value=True) as mock_post,
             patch("kai.review.send_review_summary") as mock_summary,
         ):
-            await review_pr(payload, 8080, "secret", claude_user="kai")
+            await review_pr(payload, 8080, "secret", claude_user="kai", user_ids=[1])
 
         mock_diff.assert_called_once_with("owner/repo", 42)
         mock_run.assert_called_once()
@@ -678,7 +680,7 @@ class TestReviewPR:
             author="alice",
             branch="feature/x",
         )
-        mock_summary.assert_called_once_with(expected_meta, True, 8080, "secret")
+        mock_summary.assert_called_once_with(expected_meta, True, 8080, "secret", user_ids=[1])
 
     @pytest.mark.asyncio
     async def test_empty_diff_skips_review(self):
@@ -704,7 +706,7 @@ class TestReviewPR:
             patch("kai.review.fetch_pr_diff", side_effect=RuntimeError("gh failed")),
             patch("kai.review.send_review_summary") as mock_summary,
         ):
-            await review_pr(payload, 8080, "secret")
+            await review_pr(payload, 8080, "secret", user_ids=[1])
 
         # Failure notification should have been sent
         mock_summary.assert_called_once()
@@ -721,7 +723,7 @@ class TestReviewPR:
             patch("kai.review.run_review", side_effect=RuntimeError("Claude crashed")),
             patch("kai.review.send_review_summary") as mock_summary,
         ):
-            await review_pr(payload, 8080, "secret")
+            await review_pr(payload, 8080, "secret", user_ids=[1])
 
         mock_summary.assert_called_once()
         assert mock_summary.call_args[0][1] is False
@@ -738,7 +740,7 @@ class TestReviewPR:
             patch("kai.review.post_review_comment") as mock_post,
             patch("kai.review.send_review_summary") as mock_summary,
         ):
-            await review_pr(payload, 8080, "secret")
+            await review_pr(payload, 8080, "secret", user_ids=[1])
 
         # Should not attempt to post an empty review
         mock_post.assert_not_called()

@@ -23,21 +23,21 @@ def _log_dir(monkeypatch, tmp_path):
 
 
 class TestLogMessage:
-    def test_creates_jsonl_file(self, _log_dir):
-        log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="hello")
+    async def test_creates_jsonl_file(self, _log_dir):
+        await log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="hello")
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         path = _log_dir / f"{today}.jsonl"
         assert path.exists()
 
-    def test_appends_multiple_records(self, _log_dir):
-        log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="first")
-        log_message(direction="assistant", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="second")
+    async def test_appends_multiple_records(self, _log_dir):
+        await log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="first")
+        await log_message(direction="assistant", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="second")
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         lines = (_log_dir / f"{today}.jsonl").read_text().strip().splitlines()
         assert len(lines) == 2
 
-    def test_record_fields(self, _log_dir):
-        log_message(
+    async def test_record_fields(self, _log_dir):
+        await log_message(
             direction="user",
             user_id=_TEST_USER_ID,
             chat_id=42,
@@ -53,8 +53,8 @@ class TestLogMessage:
         assert record["media"] == {"type": "photo"}
         assert "ts" in record
 
-    def test_media_defaults_to_none(self, _log_dir):
-        log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="text only")
+    async def test_media_defaults_to_none(self, _log_dir):
+        await log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="text only")
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         line = (_log_dir / f"{today}.jsonl").read_text().strip()
         record = json.loads(line)
@@ -68,25 +68,25 @@ class TestGetRecentHistory:
     def test_empty_when_no_files(self):
         assert get_recent_history(user_id=_TEST_USER_ID) == ""
 
-    def test_formats_messages(self, _log_dir):
-        log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="hello")
-        log_message(direction="assistant", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="hi there")
+    async def test_formats_messages(self, _log_dir):
+        await log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="hello")
+        await log_message(direction="assistant", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="hi there")
         result = get_recent_history(user_id=_TEST_USER_ID)
         assert "You: hello" in result
         assert "Kai: hi there" in result
 
-    def test_truncates_long_messages(self, _log_dir):
+    async def test_truncates_long_messages(self, _log_dir):
         long_text = "x" * 600
-        log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text=long_text)
+        await log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text=long_text)
         result = get_recent_history(user_id=_TEST_USER_ID)
         # _MAX_CHARS_PER_MESSAGE = 500, truncated with "..."
         assert "x" * 500 + "..." in result
         assert "x" * 501 not in result
 
-    def test_limits_to_max_recent(self, _log_dir, monkeypatch):
+    async def test_limits_to_max_recent(self, _log_dir, monkeypatch):
         monkeypatch.setattr(history, "_MAX_RECENT_MESSAGES", 3)
         for i in range(5):
-            log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text=f"msg{i}")
+            await log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text=f"msg{i}")
         result = get_recent_history(user_id=_TEST_USER_ID)
         # Only last 3 messages
         assert "msg2" in result
@@ -95,7 +95,7 @@ class TestGetRecentHistory:
         assert "msg0" not in result
         assert "msg1" not in result
 
-    def test_reads_older_files(self, _log_dir):
+    async def test_reads_older_files(self, _log_dir):
         """History should scan back beyond yesterday to find messages."""
         yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
         record = {
@@ -107,7 +107,7 @@ class TestGetRecentHistory:
         }
         (_log_dir / f"{yesterday}.jsonl").write_text(json.dumps(record) + "\n")
         # Also add a today message
-        log_message(direction="assistant", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="today msg")
+        await log_message(direction="assistant", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text="today msg")
         result = get_recent_history(user_id=_TEST_USER_ID)
         assert "yesterday msg" in result
         assert "today msg" in result
@@ -147,12 +147,12 @@ class TestGetRecentHistory:
         assert "today" in result
         assert result.index("three days") < result.index("one day") < result.index("today")
 
-    def test_stops_scanning_when_enough_messages(self, _log_dir, monkeypatch):
+    async def test_stops_scanning_when_enough_messages(self, _log_dir, monkeypatch):
         """Should stop reading older files once enough messages are collected."""
         monkeypatch.setattr(history, "_MAX_RECENT_MESSAGES", 3)
         # Write 2 messages today and 2 messages from 5 days ago
         for msg in ["today1", "today2"]:
-            log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text=msg)
+            await log_message(direction="user", user_id=_TEST_USER_ID, chat_id=_TEST_CHAT_ID, text=msg)
         old_date = (datetime.now(UTC) - timedelta(days=5)).strftime("%Y-%m-%d")
         for msg in ["old1", "old2"]:
             record = {

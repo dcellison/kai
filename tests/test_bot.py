@@ -545,26 +545,29 @@ async def _fake_stream(*events):
 
 
 class TestCrashRecoveryFlag:
-    def test_set_responding_writes_chat_id(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_set_responding_writes_chat_id(self, tmp_path):
         """Flag file contains the chat ID as text."""
         with patch("kai.bot.DATA_DIR", tmp_path):
-            _set_responding(42, 12345)
+            await _set_responding(42, 12345)
         flag = tmp_path / "users" / "42" / ".responding_to"
         assert flag.read_text() == "12345"
 
-    def test_clear_responding_removes_flag(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_clear_responding_removes_flag(self, tmp_path):
         """Flag file is deleted after clearing."""
         flag = tmp_path / "users" / "42" / ".responding_to"
         flag.parent.mkdir(parents=True)
         flag.write_text("12345")
         with patch("kai.bot.DATA_DIR", tmp_path):
-            _clear_responding(42)
+            await _clear_responding(42)
         assert not flag.exists()
 
-    def test_clear_responding_noop_if_missing(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_clear_responding_noop_if_missing(self, tmp_path):
         """No error when flag file doesn't exist."""
         with patch("kai.bot.DATA_DIR", tmp_path):
-            _clear_responding(42)  # should not raise
+            await _clear_responding(42)  # should not raise
 
 
 # ── Authorization ────────────────────────────────────────────────────
@@ -1699,9 +1702,9 @@ class TestHandleMessage:
         with (
             patch("kai.bot.is_totp_configured", return_value=False),
             patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot.log_message") as mock_log,
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
+            patch("kai.bot.log_message", new_callable=AsyncMock) as mock_log,
+            patch("kai.bot._set_responding", new_callable=AsyncMock),
+            patch("kai.bot._clear_responding", new_callable=AsyncMock),
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_message(update, ctx)
@@ -1729,9 +1732,9 @@ class TestHandleMessage:
         with (
             patch("kai.bot.is_totp_configured", return_value=False),
             patch("kai.bot._handle_response", new_callable=AsyncMock, side_effect=RuntimeError("boom")),
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding") as mock_set,
-            patch("kai.bot._clear_responding") as mock_clear,
+            patch("kai.bot.log_message", new_callable=AsyncMock),
+            patch("kai.bot._set_responding", new_callable=AsyncMock) as mock_set,
+            patch("kai.bot._clear_responding", new_callable=AsyncMock) as mock_clear,
             patch("kai.bot.get_lock", return_value=_fake_lock()),
             pytest.raises(RuntimeError),
         ):
@@ -1761,9 +1764,9 @@ class TestHandlePhoto:
 
         with (
             patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
+            patch("kai.bot._set_responding", new_callable=AsyncMock),
+            patch("kai.bot._clear_responding", new_callable=AsyncMock),
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_photo(update, ctx)
@@ -1790,9 +1793,9 @@ class TestHandlePhoto:
 
         with (
             patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
+            patch("kai.bot._set_responding", new_callable=AsyncMock),
+            patch("kai.bot._clear_responding", new_callable=AsyncMock),
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_photo(update, ctx)
@@ -1825,9 +1828,9 @@ class TestHandleDocument:
 
         with (
             patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
+            patch("kai.bot._set_responding", new_callable=AsyncMock),
+            patch("kai.bot._clear_responding", new_callable=AsyncMock),
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_document(update, ctx)
@@ -1848,9 +1851,9 @@ class TestHandleDocument:
 
         with (
             patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
+            patch("kai.bot._set_responding", new_callable=AsyncMock),
+            patch("kai.bot._clear_responding", new_callable=AsyncMock),
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_document(update, ctx)
@@ -1872,9 +1875,9 @@ class TestHandleDocument:
 
         with (
             patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
+            patch("kai.bot._set_responding", new_callable=AsyncMock),
+            patch("kai.bot._clear_responding", new_callable=AsyncMock),
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_document(update, ctx)
@@ -1895,9 +1898,9 @@ class TestHandleDocument:
 
         with (
             patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
+            patch("kai.bot._set_responding", new_callable=AsyncMock),
+            patch("kai.bot._clear_responding", new_callable=AsyncMock),
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_document(update, ctx)
@@ -1952,7 +1955,7 @@ class TestHandleVoice:
         with (
             patch("shutil.which", return_value="/usr/bin/ffmpeg"),
             patch("kai.bot.transcribe_voice", new_callable=AsyncMock, side_effect=TranscriptionError("fail")),
-            patch("kai.bot.log_message"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
         ):
             await handle_voice(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
@@ -1976,7 +1979,7 @@ class TestHandleVoice:
         with (
             patch("shutil.which", return_value="/usr/bin/ffmpeg"),
             patch("kai.bot.transcribe_voice", new_callable=AsyncMock, return_value=""),
-            patch("kai.bot.log_message"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
         ):
             await handle_voice(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
@@ -2002,10 +2005,10 @@ class TestHandleVoice:
         with (
             patch("shutil.which", return_value="/usr/bin/ffmpeg"),
             patch("kai.bot.transcribe_voice", new_callable=AsyncMock, return_value="Hello there"),
-            patch("kai.bot.log_message"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
             patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
+            patch("kai.bot._set_responding", new_callable=AsyncMock),
+            patch("kai.bot._clear_responding", new_callable=AsyncMock),
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_voice(update, ctx)
@@ -2035,7 +2038,7 @@ class TestHandleResponse:
                 get_setting=AsyncMock(return_value="off"),
                 save_session=AsyncMock(),
             ),
-            "log_message": MagicMock(),
+            "log_message": AsyncMock(),
         }
 
     @pytest.mark.asyncio
@@ -2207,7 +2210,7 @@ class TestHandleResponse:
             save_session=AsyncMock(),
         )
 
-        with patch("kai.bot.sessions", mock_sessions), patch("kai.bot.log_message"):
+        with patch("kai.bot.sessions", mock_sessions), patch("kai.bot.log_message", new_callable=AsyncMock):
             await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
 
         mock_sessions.save_session.assert_called_once()
@@ -2230,7 +2233,7 @@ class TestHandleResponse:
             save_session=AsyncMock(),
         )
 
-        with patch("kai.bot.sessions", mock_sessions), patch("kai.bot.log_message"):
+        with patch("kai.bot.sessions", mock_sessions), patch("kai.bot.log_message", new_callable=AsyncMock):
             await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
 
         mock_sessions.save_session.assert_not_called()
@@ -2252,7 +2255,7 @@ class TestHandleResponse:
 
         with (
             patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.log_message"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
             patch("kai.bot.synthesize_speech", new_callable=AsyncMock, return_value=b"audio-bytes"),
         ):
             await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
@@ -2277,7 +2280,7 @@ class TestHandleResponse:
 
         with (
             patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.log_message"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
             patch("kai.bot.synthesize_speech", new_callable=AsyncMock, side_effect=TTSError("fail")),
         ):
             await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
@@ -2312,7 +2315,7 @@ class TestHandleResponse:
 
         with (
             patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.log_message"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
             patch("kai.bot.synthesize_speech", new_callable=AsyncMock, return_value=b"audio"),
         ):
             await _handle_response(update, ctx, 1, 12345, "test", claude, "sonnet")
@@ -2566,9 +2569,9 @@ class TestAcquireLockOrKill:
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("boom"),
             ),
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
+            patch("kai.bot._set_responding", new_callable=AsyncMock),
+            patch("kai.bot._clear_responding", new_callable=AsyncMock),
             # Use real get_lock so we can verify the lock state after
             pytest.raises(RuntimeError),
         ):

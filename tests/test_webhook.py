@@ -617,23 +617,15 @@ class TestResolveLocalRepo:
         assert result == str(myrepo)
 
     @pytest.mark.asyncio
-    async def test_workspace_history(self, tmp_path):
-        """Resolves via workspace_history entries from the database."""
-        history_repo = tmp_path / "historic"
-        history_repo.mkdir()
-
+    async def test_workspace_history_removed(self, tmp_path):
+        """workspace_history fallback was removed; returns None."""
         app = web.Application()
         app["user_workspaces"] = {}
         app["workspace_base"] = None
         app["allowed_workspaces"] = []
 
-        with patch(
-            "kai.webhook.sessions.get_workspace_history",
-            new_callable=AsyncMock,
-            return_value=[{"path": str(history_repo)}],
-        ):
-            result = await _resolve_local_repo("owner/historic", app)
-        assert result == str(history_repo)
+        result = await _resolve_local_repo("owner/historic", app)
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_priority_order(self, tmp_path):
@@ -665,28 +657,18 @@ class TestResolveLocalRepo:
         app["workspace_base"] = str(tmp_path)
         app["allowed_workspaces"] = []
 
-        with patch(
-            "kai.webhook.sessions.get_workspace_history",
-            new_callable=AsyncMock,
-            return_value=[],
-        ):
-            result = await _resolve_local_repo("owner/nonexistent", app)
+        result = await _resolve_local_repo("owner/nonexistent", app)
         assert result is None
 
     @pytest.mark.asyncio
     async def test_nonexistent_dir_skipped(self, tmp_path):
-        """History entries pointing to deleted directories are skipped."""
+        """Non-existent directories in allowed_workspaces are skipped."""
         app = web.Application()
         app["user_workspaces"] = {}
         app["workspace_base"] = None
-        app["allowed_workspaces"] = []
+        app["allowed_workspaces"] = ["/gone/deleted-repo"]
 
-        with patch(
-            "kai.webhook.sessions.get_workspace_history",
-            new_callable=AsyncMock,
-            return_value=[{"path": "/gone/deleted-repo"}],
-        ):
-            result = await _resolve_local_repo("owner/deleted-repo", app)
+        result = await _resolve_local_repo("owner/deleted-repo", app)
         assert result is None
 
     @pytest.mark.asyncio

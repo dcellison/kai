@@ -487,6 +487,7 @@ async def apply_triage(
     webhook_port: int,
     webhook_secret: str,
     projects_json: str = "[]",
+    user_ids: list[int] | None = None,
 ) -> None:
     """
     Apply triage results: labels, project assignment, comment, and notification.
@@ -502,6 +503,8 @@ async def apply_triage(
         webhook_secret: Secret for authenticating with the send-message API.
         projects_json: Raw JSON from list_projects(), reused to avoid a
             redundant gh project list call when looking up project numbers.
+        user_ids: List of user IDs to notify. Each gets a separate request
+            with X-User-Id header for proper multi-user routing.
     """
     # Type-guard Claude's response fields. Claude may return wrong types
     # (e.g., "labels": "bug" instead of ["bug"], or ["bug", 42, null]).
@@ -681,20 +684,22 @@ async def apply_triage(
 
     text = "\n".join(telegram_parts)
     url = f"http://localhost:{webhook_port}/api/send-message"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Webhook-Secret": webhook_secret,
-    }
 
-    try:
-        async with (
-            aiohttp.ClientSession() as session,
-            session.post(url, json={"text": text}, headers=headers) as resp,
-        ):
-            if resp.status != 200:
-                log.warning("send-message API returned %d for triage summary", resp.status)
-    except Exception:
-        log.exception("Failed to send triage summary to Telegram")
+    for uid in (user_ids or []):
+        headers = {
+            "Content-Type": "application/json",
+            "X-Webhook-Secret": webhook_secret,
+            "X-User-Id": str(uid),
+        }
+        try:
+            async with (
+                aiohttp.ClientSession() as session,
+                session.post(url, json={"text": text}, headers=headers) as resp,
+            ):
+                if resp.status != 200:
+                    log.warning("send-message API returned %d for triage summary (user %d)", resp.status, uid)
+        except Exception:
+            log.exception("Failed to send triage summary to Telegram (user %d)", uid)
 
 
 async def triage_issue(
@@ -702,6 +707,7 @@ async def triage_issue(
     webhook_port: int,
     webhook_secret: str,
     claude_user: str | None = None,
+    user_ids: list[int] | None = None,
 ) -> None:
     """
     Full triage pipeline: analyze issue, apply labels, post results.
@@ -719,6 +725,7 @@ async def triage_issue(
         webhook_port: Local webhook server port.
         webhook_secret: Webhook secret for API auth.
         claude_user: Optional OS user for the Claude subprocess.
+        user_ids: List of user IDs to notify with the triage summary.
     """
     # Metadata extraction is inside try/except so a malformed payload
     # doesn't produce an unhandled exception in the background task.
@@ -742,7 +749,7 @@ async def triage_issue(
 
         if not raw_response.strip():
             log.warning("Empty triage output for %s#%d", metadata.repo, metadata.number)
-            await _send_error_notification(metadata, "Empty response from Claude", webhook_port, webhook_secret)
+            await _send_error_notification(metadata, "Empty response from Claude", webhook_port, webhook_secret, user_ids=user_ids)
             return
 
         # Step 5: Parse the JSON response
@@ -750,7 +757,7 @@ async def triage_issue(
 
         # Step 6: Apply triage (labels, project, comment, telegram).
         # Pass projects JSON to avoid a redundant gh project list call.
-        await apply_triage(metadata, triage_result, webhook_port, webhook_secret, projects_json=projects)
+        await apply_triage(metadata, triage_result, webhook_port, webhook_secret, projects_json=projects, user_ids=user_ids)
 
     except Exception as exc:
         log.exception(
@@ -769,6 +776,7 @@ async def triage_issue(
                 str(exc),
                 webhook_port,
                 webhook_secret,
+                user_ids=user_ids,
             )
         except Exception:
             log.exception(
@@ -783,6 +791,7 @@ async def _send_error_notification(
     error_detail: str,
     webhook_port: int,
     webhook_secret: str,
+    user_ids: list[int] | None = None,
 ) -> None:
     """
     Send a triage failure notification to Telegram.
@@ -795,20 +804,24 @@ async def _send_error_notification(
         error_detail: Brief description of what went wrong.
         webhook_port: Local webhook server port.
         webhook_secret: Secret for authenticating with the send-message API.
+        user_ids: List of user IDs to notify.
     """
     text = f"Issue triage failed for {metadata.repo}#{metadata.number}: {error_detail}"
     url = f"http://localhost:{webhook_port}/api/send-message"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Webhook-Secret": webhook_secret,
-    }
 
-    async with (
-        aiohttp.ClientSession() as session,
-        session.post(url, json={"text": text}, headers=headers) as resp,
-    ):
-        if resp.status != 200:
-            log.warning(
-                "send-message API returned %d for triage error notification",
-                resp.status,
-            )
+    for uid in (user_ids or []):
+        headers = {
+            "Content-Type": "application/json",
+            "X-Webhook-Secret": webhook_secret,
+            "X-User-Id": str(uid),
+        }
+        async with (
+            aiohttp.ClientSession() as session,
+            session.post(url, json={"text": text}, headers=headers) as resp,
+        ):
+            if resp.status != 200:
+                log.warning(
+                    "send-message API returned %d for triage error notification (user %d)",
+                    resp.status,
+                    uid,
+                )

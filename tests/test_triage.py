@@ -542,7 +542,7 @@ class TestApplyTriage:
             mock_resp.status = 200
             mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
             mock_session_cls.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            await apply_triage(meta, result, 8080, "secret")
+            await apply_triage(meta, result, 8080, "secret", user_ids=[1])
 
         # Verify the send-message call
         mock_session.post.assert_called_once()
@@ -656,7 +656,7 @@ class TestTriageIssue:
             mock_resp.status = 200
             mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
             mock_session_cls.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            await triage_issue(payload, 8080, "secret")
+            await triage_issue(payload, 8080, "secret", user_ids=[1])
 
         # Pipeline ran (multiple subprocess calls)
         assert call_count > 0
@@ -683,7 +683,7 @@ class TestTriageIssue:
             mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
             mock_session_cls.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             # Should not raise
-            await triage_issue(payload, 8080, "secret")
+            await triage_issue(payload, 8080, "secret", user_ids=[1])
 
         # Error notification was sent
         mock_session.post.assert_called_once()
@@ -709,7 +709,7 @@ class TestTriageIssue:
             mock_resp.status = 200
             mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
             mock_session_cls.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            await triage_issue(payload, 8080, "secret")
+            await triage_issue(payload, 8080, "secret", user_ids=[1])
 
         # Error notification was sent
         mock_session.post.assert_called_once()

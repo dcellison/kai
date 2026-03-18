@@ -179,7 +179,6 @@ async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str 
     1. User workspaces (derived from per-user workspace paths)
     2. WORKSPACE_BASE children
     3. ALLOWED_WORKSPACES entries
-    4. workspace_history entries from the database
 
     Args:
         repo_full_name: Full GitHub repo name (e.g., "dcellison/kai").
@@ -190,6 +189,10 @@ async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str 
     """
     # Extract just the repo name from "owner/repo"
     repo_name = repo_full_name.split("/")[-1]
+
+    # NOTE: Step 1 iterates ALL users' workspaces. This is intentional --
+    # repo resolution finds a local checkout for spec/convention loading,
+    # and any user's workspace pointing to the repo is equally valid.
 
     # 1. User workspaces - check all active per-user workspace paths.
     # Each workspace may be a subdirectory of the repo root (e.g., /opt/kai/workspace),
@@ -212,14 +215,27 @@ async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str 
         if Path(allowed).name == repo_name and Path(allowed).is_dir():
             return str(allowed)
 
-    # 4. workspace_history - check each entry's directory name
-    history = await sessions.get_workspace_history(limit=50)
-    for entry in history:
-        path = Path(entry["path"])
-        if path.name == repo_name and path.is_dir():
-            return str(path)
-
     return None
+
+
+def _users_for_repo(repo_full_name: str, app: web.Application) -> list[int]:
+    """Determine which users should receive notifications for a GitHub repo.
+
+    Matches the repo name against active per-user workspace paths. Falls back
+    to all allowed users if no workspace matches, so notifications are never
+    silently dropped.
+    """
+    repo_name = repo_full_name.split("/")[-1]
+    matched: list[int] = []
+    for uid, ws_path in (app.get("user_workspaces") or {}).items():
+        if ws_path and Path(ws_path).name == repo_name:
+            matched.append(uid)
+        elif ws_path and Path(ws_path).parent.name == repo_name:
+            matched.append(uid)
+    # Fall back to all users if no workspace matches the repo
+    if not matched:
+        matched = list(app["allowed_user_ids"])
+    return matched
 
 
 def _strip_markdown(text: str) -> str:
@@ -499,6 +515,7 @@ async def _handle_github(request: web.Request) -> web.Response:
             # Checks home workspace, WORKSPACE_BASE, ALLOWED_WORKSPACES,
             # and workspace history for a directory matching the repo name.
             local_repo_path = await _resolve_local_repo(repo, request.app)
+            target_users = _users_for_repo(repo, request.app)
 
             # Launch the review as a fire-and-forget background task.
             # Same pattern as Telegram update processing: create_task +
@@ -511,6 +528,7 @@ async def _handle_github(request: web.Request) -> web.Response:
                     claude_user=request.app.get("claude_user"),
                     local_repo_path=local_repo_path,
                     spec_dir=request.app.get("spec_dir", "specs"),
+                    user_ids=target_users,
                 )
             )
             _background_tasks.add(task)
@@ -541,6 +559,7 @@ async def _handle_github(request: web.Request) -> web.Response:
                 return web.json_response({"msg": "triage_cooldown"})
 
             _record_triage(repo, issue_number)
+            target_users = _users_for_repo(repo, request.app)
 
             task = asyncio.create_task(
                 triage.triage_issue(
@@ -548,6 +567,7 @@ async def _handle_github(request: web.Request) -> web.Response:
                     webhook_port=request.app["webhook_port"],
                     webhook_secret=request.app["webhook_secret"],
                     claude_user=request.app.get("claude_user"),
+                    user_ids=target_users,
                 )
             )
             _background_tasks.add(task)
@@ -570,9 +590,11 @@ async def _handle_github(request: web.Request) -> web.Response:
     if not message:
         return web.json_response({"msg": "ignored", "event": event_type})
 
-    # Send to users who have GitHub notifications enabled (default: on)
+    # Send to repo-relevant users who have GitHub notifications enabled (default: on)
+    repo = payload.get("repository", {}).get("full_name", "")
+    target_users = _users_for_repo(repo, request.app) if repo else list(request.app["allowed_user_ids"])
     sent_count = 0
-    for uid in request.app["allowed_user_ids"]:
+    for uid in target_users:
         pref = await sessions.get_setting(uid, "github_notifications")
         if pref == "false":
             continue
@@ -613,7 +635,8 @@ async def _handle_generic(request: web.Request) -> web.Response:
     if len(text) > 4096:
         text = text[:4093] + "..."
 
-    # Broadcast to users who have webhook notifications enabled (default: on)
+    # Generic webhooks are broadcast to all users with preference check.
+    # Unlike GitHub webhooks, generic sources have no repo context for routing.
     for uid in request.app["allowed_user_ids"]:
         pref = await sessions.get_setting(uid, "webhook_notifications")
         if pref == "false":

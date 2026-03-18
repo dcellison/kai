@@ -80,9 +80,9 @@ def _downstream_patches() -> dict:
         "_is_authorized": MagicMock(return_value=True),
         "_handle_response": AsyncMock(),
         "_get_claude": MagicMock(return_value=MagicMock(model="opus")),
-        "log_message": MagicMock(),
-        "_set_responding": MagicMock(),
-        "_clear_responding": MagicMock(),
+        "log_message": AsyncMock(),
+        "_set_responding": AsyncMock(),
+        "_clear_responding": AsyncMock(),
         "get_lock": MagicMock(return_value=_fake_lock()),
     }
 

@@ -668,6 +668,7 @@ async def send_review_summary(
     success: bool,
     webhook_port: int,
     webhook_secret: str,
+    user_ids: list[int] | None = None,
 ) -> None:
     """
     Send a brief review summary to Telegram via the send-message API.
@@ -681,6 +682,8 @@ async def send_review_summary(
         success: Whether the review was posted successfully.
         webhook_port: Local webhook server port (for the send-message API).
         webhook_secret: Secret for authenticating with the send-message API.
+        user_ids: List of user IDs to notify. Each gets a separate request
+            with X-User-Id header for proper multi-user routing.
     """
     pr_url = f"https://github.com/{metadata.repo}/pull/{metadata.number}"
 
@@ -690,20 +693,22 @@ async def send_review_summary(
         text = f"Failed to review PR #{metadata.number} in {metadata.repo}\n{metadata.title}\n{pr_url}"
 
     url = f"http://localhost:{webhook_port}/api/send-message"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Webhook-Secret": webhook_secret,
-    }
 
-    try:
-        async with (
-            aiohttp.ClientSession() as session,
-            session.post(url, json={"text": text}, headers=headers) as resp,
-        ):
-            if resp.status != 200:
-                log.warning("send-message API returned %d for review summary", resp.status)
-    except Exception:
-        log.exception("Failed to send review summary to Telegram")
+    for uid in (user_ids or []):
+        headers = {
+            "Content-Type": "application/json",
+            "X-Webhook-Secret": webhook_secret,
+            "X-User-Id": str(uid),
+        }
+        try:
+            async with (
+                aiohttp.ClientSession() as session,
+                session.post(url, json={"text": text}, headers=headers) as resp,
+            ):
+                if resp.status != 200:
+                    log.warning("send-message API returned %d for review summary (user %d)", resp.status, uid)
+        except Exception:
+            log.exception("Failed to send review summary to Telegram (user %d)", uid)
 
 
 async def review_pr(
@@ -713,6 +718,7 @@ async def review_pr(
     claude_user: str | None = None,
     local_repo_path: str | None = None,
     spec_dir: str = "specs",
+    user_ids: list[int] | None = None,
 ) -> None:
     """
     Full review pipeline: fetch diff, build prompt, run review, post results.
@@ -732,6 +738,7 @@ async def review_pr(
         claude_user: Optional OS user for the Claude subprocess.
         local_repo_path: Optional path to local repo checkout for spec resolution.
         spec_dir: Spec directory relative to repo root (default: "specs").
+        user_ids: List of user IDs to notify with the review summary.
     """
     metadata = extract_pr_metadata(payload)
 
@@ -776,20 +783,20 @@ async def review_pr(
 
         if not review_text.strip():
             log.warning("Empty review output for %s#%d", metadata.repo, metadata.number)
-            await send_review_summary(metadata, False, webhook_port, webhook_secret)
+            await send_review_summary(metadata, False, webhook_port, webhook_secret, user_ids=user_ids)
             return
 
         # Step 4: Post the review as a GitHub PR comment
         posted = await post_review_comment(metadata.repo, metadata.number, review_text)
 
         # Step 5: Send Telegram summary
-        await send_review_summary(metadata, posted, webhook_port, webhook_secret)
+        await send_review_summary(metadata, posted, webhook_port, webhook_secret, user_ids=user_ids)
 
     except Exception:
         log.exception("Review failed for %s#%d", metadata.repo, metadata.number)
         # Best-effort failure notification so the user knows something broke
         try:
-            await send_review_summary(metadata, False, webhook_port, webhook_secret)
+            await send_review_summary(metadata, False, webhook_port, webhook_secret, user_ids=user_ids)
         except Exception:
             log.exception(
                 "Failed to send failure notification for %s#%d",

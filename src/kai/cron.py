@@ -241,7 +241,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
         # Strip stray backslash escapes (e.g. \! from bash double-quoting in curl)
         prompt = prompt.replace("\\!", "!").replace("\\.", ".").replace("\\?", "?")
         try:
-            log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=f"[Reminder: {data['name']}] {prompt}")
+            await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=f"[Reminder: {data['name']}] {prompt}")
             await context.bot.send_message(chat_id=chat_id, text=prompt)
         except Forbidden:
             log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
@@ -305,7 +305,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             clean_text = f"{after_marker}\n{rest}".strip() if after_marker else rest
             msg = f"[Job: {data['name']}]\n{clean_text}" if clean_text else f"[Job: {data['name']}] Condition met."
             try:
-                log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=msg)
+                await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=msg)
                 await context.bot.send_message(chat_id=chat_id, text=msg)
             except Forbidden:
                 log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
@@ -330,7 +330,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                     f"[Job: {data['name']}]\n{clean_text}" if clean_text else f"[Job: {data['name']}] Still checking..."
                 )
                 try:
-                    log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=msg)
+                    await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=msg)
                     await context.bot.send_message(chat_id=chat_id, text=msg)
                 except Forbidden:
                     log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
@@ -344,7 +344,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             # Non-conditional or non-auto-remove: always deliver the response
             msg = f"[Job: {data['name']}]\n{response_text}"
             try:
-                log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=msg)
+                await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=msg)
                 await context.bot.send_message(chat_id=chat_id, text=msg)
             except Forbidden:
                 log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)

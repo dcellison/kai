@@ -20,6 +20,7 @@ when asked about past conversations. get_recent_history() provides a formatted
 summary of the last few messages for ambient recall at session start.
 """
 
+import asyncio
 import json
 import logging
 from datetime import UTC, datetime
@@ -39,7 +40,13 @@ def _log_dir_for_user(user_id: int) -> Path:
     return DATA_DIR / "users" / str(user_id) / "home" / ".claude" / "history"
 
 
-def log_message(
+def _write_log_line(filepath: Path, record: dict) -> None:
+    """Synchronous helper — runs in a thread via asyncio.to_thread()."""
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+async def log_message(
     *,
     direction: str,
     user_id: int,
@@ -53,6 +60,9 @@ def log_message(
     Called from bot.py for every inbound user message and outbound assistant
     response. Each message is written immediately (not batched) so the log
     stays current even if the process crashes mid-conversation.
+
+    Uses asyncio.to_thread() so file I/O does not block the event loop
+    during concurrent multi-user operation.
 
     Args:
         direction: "user" for inbound messages, "assistant" for Kai's responses.
@@ -73,8 +83,7 @@ def log_message(
     }
     filepath = log_dir / f"{now.strftime('%Y-%m-%d')}.jsonl"
     try:
-        with open(filepath, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        await asyncio.to_thread(_write_log_line, filepath, record)
     except OSError:
         log.exception("Failed to write chat log")
 

@@ -92,17 +92,17 @@ EDIT_INTERVAL = 2.0
 # ── Crash recovery flag (per-user) ───────────────────────────────────
 
 
-def _set_responding(user_id: int, chat_id: int) -> None:
+async def _set_responding(user_id: int, chat_id: int) -> None:
     """Write the chat ID to a per-user flag file, marking a response as in-flight."""
     flag = DATA_DIR / "users" / str(user_id) / ".responding_to"
     flag.parent.mkdir(parents=True, exist_ok=True)
-    flag.write_text(str(chat_id))
+    await asyncio.to_thread(flag.write_text, str(chat_id))
 
 
-def _clear_responding(user_id: int) -> None:
+async def _clear_responding(user_id: int) -> None:
     """Remove the per-user flag file, indicating the response completed (or failed gracefully)."""
     flag = DATA_DIR / "users" / str(user_id) / ".responding_to"
-    flag.unlink(missing_ok=True)
+    await asyncio.to_thread(flag.unlink, True)
 
 
 # ── Per-user session tracking ──────────────────────────────────────
@@ -1339,7 +1339,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     caption = update.message.caption or "What's in this image?"
     caption += f"\n[File saved to: {saved}]"
-    log_message(direction="user", user_id=user_id, chat_id=chat_id, text=caption, media={"type": "photo"})
+    await log_message(direction="user", user_id=user_id, chat_id=chat_id, text=caption, media={"type": "photo"})
     content = [
         {"type": "text", "text": caption},
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
@@ -1350,7 +1350,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if lock is None:
         return
     try:
-        _set_responding(user_id, chat_id)
+        await _set_responding(user_id, chat_id)
         try:
             await _handle_response(
                 update,
@@ -1362,7 +1362,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 model,
             )
         finally:
-            _clear_responding(user_id)
+            await _clear_responding(user_id)
     finally:
         lock.release()
 
@@ -1466,7 +1466,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         img_caption = caption or f"What's in this image ({file_name})?"
         img_caption += f"\n[File saved to: {saved}]"
 
-        log_message(
+        await log_message(
             direction="user",
             user_id=user_id,
             chat_id=chat_id,
@@ -1492,7 +1492,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         saved = _save_to_user_files(raw, file_name, user_id)
         header = f"File: {file_name}\n```\n{text_content}\n```\n[File saved to: {saved}]"
 
-        log_message(
+        await log_message(
             direction="user",
             user_id=user_id,
             chat_id=chat_id,
@@ -1510,7 +1510,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         data = await file.download_as_bytearray()
         saved = _save_to_user_files(bytes(data), file_name, user_id)
 
-        log_message(
+        await log_message(
             direction="user",
             user_id=user_id,
             chat_id=chat_id,
@@ -1524,7 +1524,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if lock is None:
         return
     try:
-        _set_responding(user_id, chat_id)
+        await _set_responding(user_id, chat_id)
         try:
             await _handle_response(
                 update,
@@ -1536,7 +1536,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 model,
             )
         finally:
-            _clear_responding(user_id)
+            await _clear_responding(user_id)
     finally:
         lock.release()
 
@@ -1583,7 +1583,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     file = await context.bot.get_file(voice.file_id)
     audio_data = bytes(await file.download_as_bytearray())
 
-    log_message(
+    await log_message(
         direction="user",
         user_id=user_id,
         chat_id=chat_id,
@@ -1612,7 +1612,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if lock is None:
         return
     try:
-        _set_responding(user_id, chat_id)
+        await _set_responding(user_id, chat_id)
         try:
             await _handle_response(
                 update,
@@ -1624,7 +1624,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 model,
             )
         finally:
-            _clear_responding(user_id)
+            await _clear_responding(user_id)
     finally:
         lock.release()
 
@@ -1733,7 +1733,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = _user_id(update)
     chat_id = _chat_id(update)
     prompt = update.message.text
-    log_message(direction="user", user_id=user_id, chat_id=chat_id, text=prompt)
+    await log_message(direction="user", user_id=user_id, chat_id=chat_id, text=prompt)
     claude = _get_claude(context, user_id)
     model = claude.model
 
@@ -1742,7 +1742,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if lock is None:
         return
     try:
-        _set_responding(user_id, chat_id)
+        await _set_responding(user_id, chat_id)
         try:
             await _handle_response(
                 update,
@@ -1754,7 +1754,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 model,
             )
         finally:
-            _clear_responding(user_id)
+            await _clear_responding(user_id)
     finally:
         lock.release()
 
@@ -1887,15 +1887,15 @@ async def _handle_response(
     # try to address it instead of the current message.
     if final_response is None:
         if stopped_by_user:
-            log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text="[stopped by user]")
+            await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text="[stopped by user]")
         else:
-            log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text="[no response]")
+            await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text="[no response]")
             await update.message.reply_text("Error: No response from Claude")
         return
 
     if not final_response.success:
         error_text = f"Error: {final_response.error}"
-        log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=f"[error: {final_response.error}]")
+        await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=f"[error: {final_response.error}]")
         if live_msg:
             await _edit_message_safe(live_msg, error_text)
         else:
@@ -1907,7 +1907,7 @@ async def _handle_response(
         await sessions.save_session(user_id, chat_id, final_response.session_id, model, final_response.cost_usd)
 
     final_text = final_response.text
-    log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=final_text)
+    await log_message(direction="assistant", user_id=user_id, chat_id=chat_id, text=final_text)
 
     # Voice-only mode: synthesize and send voice, fall back to text on failure
     if voice_only and final_text:

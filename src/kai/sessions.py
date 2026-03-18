@@ -58,6 +58,13 @@ async def init_db(db_path: Path) -> None:
     _db = await aiosqlite.connect(str(db_path))
     _get_db().row_factory = aiosqlite.Row
 
+    # WAL mode allows concurrent readers during writes — essential for
+    # multi-user operation where parallel users may write simultaneously.
+    # busy_timeout makes SQLite retry for 5s on lock contention instead
+    # of immediately failing with "database is locked".
+    await _get_db().execute("PRAGMA journal_mode=WAL")
+    await _get_db().execute("PRAGMA busy_timeout=5000")
+
     # Create tables with multi-user schema (user_id as primary identity)
     await _get_db().execute("""
         CREATE TABLE IF NOT EXISTS sessions (

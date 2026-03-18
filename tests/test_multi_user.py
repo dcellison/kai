@@ -243,20 +243,20 @@ class TestLockIsolation:
 
 
 class TestCrashFlagIsolation:
-    def test_flags_per_user(self, tmp_path):
+    async def test_flags_per_user(self, tmp_path):
         with patch("kai.bot.DATA_DIR", tmp_path):
-            _set_responding(USER_A, 111)
-            _set_responding(USER_B, 222)
+            await _set_responding(USER_A, 111)
+            await _set_responding(USER_B, 222)
         flag_a = tmp_path / "users" / "100" / ".responding_to"
         flag_b = tmp_path / "users" / "200" / ".responding_to"
         assert flag_a.read_text() == "111"
         assert flag_b.read_text() == "222"
 
-    def test_clear_only_affects_target(self, tmp_path):
+    async def test_clear_only_affects_target(self, tmp_path):
         with patch("kai.bot.DATA_DIR", tmp_path):
-            _set_responding(USER_A, 111)
-            _set_responding(USER_B, 222)
-            _clear_responding(USER_A)
+            await _set_responding(USER_A, 111)
+            await _set_responding(USER_B, 222)
+            await _clear_responding(USER_A)
         flag_a = tmp_path / "users" / "100" / ".responding_to"
         flag_b = tmp_path / "users" / "200" / ".responding_to"
         assert not flag_a.exists()
@@ -267,10 +267,10 @@ class TestCrashFlagIsolation:
 
 
 class TestHistoryIsolation:
-    def test_messages_in_separate_dirs(self, tmp_path):
+    async def test_messages_in_separate_dirs(self, tmp_path):
         with patch("kai.history.DATA_DIR", tmp_path):
-            history.log_message(direction="user", user_id=USER_A, chat_id=USER_A, text="hello from A")
-            history.log_message(direction="user", user_id=USER_B, chat_id=USER_B, text="hello from B")
+            await history.log_message(direction="user", user_id=USER_A, chat_id=USER_A, text="hello from A")
+            await history.log_message(direction="user", user_id=USER_B, chat_id=USER_B, text="hello from B")
 
         dir_a = tmp_path / "users" / "100" / "home" / ".claude" / "history"
         dir_b = tmp_path / "users" / "200" / "home" / ".claude" / "history"
@@ -289,10 +289,10 @@ class TestHistoryIsolation:
         assert "hello from B" in content_b
         assert "hello from A" not in content_b
 
-    def test_get_recent_history_isolated(self, tmp_path):
+    async def test_get_recent_history_isolated(self, tmp_path):
         with patch("kai.history.DATA_DIR", tmp_path):
-            history.log_message(direction="user", user_id=USER_A, chat_id=USER_A, text="hello from A")
-            history.log_message(direction="user", user_id=USER_B, chat_id=USER_B, text="hello from B")
+            await history.log_message(direction="user", user_id=USER_A, chat_id=USER_A, text="hello from A")
+            await history.log_message(direction="user", user_id=USER_B, chat_id=USER_B, text="hello from B")
             recent_a = history.get_recent_history(USER_A)
             recent_b = history.get_recent_history(USER_B)
 
@@ -350,9 +350,9 @@ class TestHandlerUserRouting:
         with (
             patch("kai.bot.is_totp_configured", return_value=False),
             patch("kai.bot._handle_response", new_callable=AsyncMock) as mock_resp,
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
+            patch("kai.bot._set_responding", new_callable=AsyncMock),
+            patch("kai.bot._clear_responding", new_callable=AsyncMock),
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_message(update, ctx)
@@ -379,9 +379,9 @@ class TestHandlerUserRouting:
         with (
             patch("kai.bot.DATA_DIR", tmp_path),
             patch("kai.bot._handle_response", new_callable=AsyncMock),
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
+            patch("kai.bot._set_responding", new_callable=AsyncMock),
+            patch("kai.bot._clear_responding", new_callable=AsyncMock),
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_photo(update, ctx)
@@ -429,9 +429,9 @@ class TestHandlerUserRouting:
         with (
             patch("kai.bot.DATA_DIR", tmp_path),
             patch("kai.bot._handle_response", new_callable=AsyncMock),
-            patch("kai.bot.log_message"),
-            patch("kai.bot._set_responding"),
-            patch("kai.bot._clear_responding"),
+            patch("kai.bot.log_message", new_callable=AsyncMock),
+            patch("kai.bot._set_responding", new_callable=AsyncMock),
+            patch("kai.bot._clear_responding", new_callable=AsyncMock),
             patch("kai.bot.get_lock", return_value=_fake_lock()),
         ):
             await handle_document(update, ctx)
@@ -585,7 +585,7 @@ class TestCronJobUserRouting:
         context.bot.send_message = AsyncMock()
 
         with (
-            patch("kai.cron.log_message"),
+            patch("kai.cron.log_message", new_callable=AsyncMock),
             patch("kai.cron.get_lock", return_value=_fake_lock()),
             patch("kai.cron.sessions.save_session", new_callable=AsyncMock),
         ):

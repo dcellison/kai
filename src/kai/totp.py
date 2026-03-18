@@ -23,6 +23,10 @@ import time
 
 import pyotp
 
+# NOTE: TOTP lockout is intentionally global across all users. If someone is
+# brute-forcing the code, ALL access should be locked regardless of user_id.
+# Per-user auth sessions are handled in bot.py via context.user_data.
+
 # Root-owned files, mode 0600. Only accessible via sudo.
 # The sudoers rule in /etc/sudoers.d/kai authorizes the bot process
 # to run exactly these two commands on exactly these paths, NOPASSWD.
