@@ -878,11 +878,21 @@ class ClaudeManager:
         home = self._user_home(user_id)
         for d in [home, home / ".claude" / "history", home / "files"]:
             d.mkdir(parents=True, exist_ok=True)
-        # Copy template CLAUDE.md if not present
+        # Always overwrite CLAUDE.md from template (deployment-managed, not user-editable)
         template = self._config.claude_workspace / ".claude" / "CLAUDE.md"
         target = home / ".claude" / "CLAUDE.md"
-        if template.exists() and not target.exists():
+        if template.exists():
             shutil.copy2(template, target)
+        # Always overwrite .mcp.json from template (deployment-managed)
+        mcp_template = self._config.claude_workspace / ".mcp.json"
+        mcp_target = home / ".mcp.json"
+        if mcp_template.exists():
+            shutil.copy2(mcp_template, mcp_target)
+        # Copy schema_cache.md if not present
+        schema_template = self._config.claude_workspace / "schema_cache.md"
+        schema_target = home / "schema_cache.md"
+        if schema_template.exists() and not schema_target.exists():
+            shutil.copy2(schema_template, schema_target)
 
     def _user_home(self, user_id: int) -> Path:
         return DATA_DIR / "users" / str(user_id) / "home"
