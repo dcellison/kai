@@ -114,8 +114,10 @@ def extract_pr_metadata(payload: dict) -> PRMetadata:
 # Pattern matching GitHub issue-closing keywords followed by #N.
 # Supports: fixes, fixed, fix, closes, closed, close, resolves, resolved, resolve.
 # Case-insensitive. Only matches same-repo references (#N), not cross-repo (owner/repo#N).
+# Use [^\S\n]+ (non-newline whitespace) instead of \s+ to avoid matching
+# across line breaks, which GitHub does not recognize as valid syntax.
 _ISSUE_REF_PATTERN = re.compile(
-    r"\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s+#(\d+)\b",
+    r"\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)[^\S\n]+#(\d+)\b",
     re.IGNORECASE,
 )
 
@@ -164,11 +166,19 @@ async def load_spec_from_issue(repo: str, description: str) -> str | None:
                 "api",
                 f"repos/{repo}/issues/{issue_num}",
                 "--jq",
-                ".body",
+                '.body // ""',
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            # Timeout prevents a hung gh invocation from blocking the
+            # review indefinitely, especially with multiple issue refs.
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+                log.warning("Timed out fetching issue #%d from %s", issue_num, repo)
+                continue
 
             if proc.returncode != 0:
                 error = stderr.decode().strip()

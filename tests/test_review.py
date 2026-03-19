@@ -903,6 +903,10 @@ class TestIssueRefPattern:
         """Cross-repo refs (owner/repo#N) are not matched in v1."""
         assert _ISSUE_REF_PATTERN.findall("fixes dcellison/kai#42") == []
 
+    def test_newline_between_keyword_and_ref(self):
+        """Keyword and #N on separate lines should not match."""
+        assert _ISSUE_REF_PATTERN.findall("fix\n#42") == []
+
 
 # ── load_spec_from_issue ──────────────────────────────────────────
 
@@ -1031,6 +1035,38 @@ class TestLoadSpecFromIssue:
             result = await load_spec_from_issue("owner/repo", "fixes #42")
 
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_null_issue_body_skipped(self):
+        """Issues with null bodies (no description) are skipped.
+
+        gh --jq '.body' outputs the empty string when piped through
+        '.body // ""' coercion, but without coercion it outputs 'null'.
+        Either way, the result should not appear in the spec.
+        """
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        # With '.body // ""' coercion, null becomes empty string
+        mock_proc.communicate.return_value = (b"", b"")
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await load_spec_from_issue("owner/repo", "fixes #42")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_timeout_handling(self):
+        """Timed-out gh invocations are handled gracefully."""
+        mock_proc = AsyncMock()
+        mock_proc.communicate.side_effect = TimeoutError()
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock()
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await load_spec_from_issue("owner/repo", "fixes #42")
+
+        assert result is None
+        mock_proc.kill.assert_called_once()
 
 
 # ── load_conventions ───────────────────────────────────────────────
