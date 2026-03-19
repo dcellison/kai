@@ -12,10 +12,10 @@ project stabilizes - check back or watch the repo for updates.
 
 **The best way to contribute right now is through issues.** Bug reports,
 feature ideas, and design feedback are all welcome. For non-trivial
-proposals, include a spec: describe the problem, the proposed solution,
-what changes are needed, and what's explicitly out of scope. A
-well-written spec is more valuable than a surprise PR - it lets us
-discuss the approach before anyone writes code.
+proposals, describe the problem, your proposed solution, what changes
+you think are needed, and what's explicitly out of scope. A clear
+write-up is more valuable than a surprise PR - it lets us discuss the
+approach before anyone writes code.
 
 **Open an issue first.** Even if you're a collaborator, open an issue
 before starting work on anything non-trivial. This keeps the "why"
@@ -48,7 +48,7 @@ wiki page for full setup instructions including `.env` configuration.
 
 This section is for project collaborators with push access. If you're
 contributing through issues, you can skip this - but the standards below
-are useful context for writing specs.
+are useful context for writing proposals.
 
 Direct pushes to `main` are blocked. All changes go through pull
 requests with required CI checks.

@@ -112,18 +112,10 @@ def extract_pr_metadata(payload: dict) -> PRMetadata:
 
 # ── Spec resolution ─────────────────────────────────────────────────
 #
-# Specs are loaded from the LOCAL FILESYSTEM only. Issue-body fetching
-# (load_spec_from_issue, PR #88) was removed because it piped untrusted
-# external content directly into a Claude session, creating a prompt
-# injection surface. Random boundary tokens (PR #90) prevent structural
-# injection (delimiter escape) but not semantic injection (content
-# inside the boundary influencing Claude's behavior).
-#
-# The security principle: don't build pipelines from external content
-# to LLM sessions. A human reads the issue, copies relevant content to
-# a local spec file, and references it in the PR. The human is the
-# firewall. This also avoids establishing a pattern that future agents
-# (which may have tools) could inherit.
+# Specs are loaded from the local filesystem only. External content
+# (GitHub issue bodies, third-party input) is never fed into the
+# review agent's Claude session. A human reviews external input and
+# creates local spec files manually.
 
 
 def resolve_spec_from_body(description: str | None) -> str | None:
