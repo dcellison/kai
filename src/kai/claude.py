@@ -296,7 +296,7 @@ class PersistentClaude:
                 if text:
                     log.debug("stderr.line", text=text[:200])
             except Exception:
-                log.warning("Unexpected error in stderr drain", exc_info=True)
+                log.warning("stderr.drain_error", exc_info=True)
                 break
 
     def _send_signal(self, sig: int) -> None:
@@ -825,7 +825,7 @@ class PersistentClaude:
                 try:
                     await asyncio.wait_for(self._proc.wait(), timeout=5)
                 except TimeoutError:
-                    log.warning("Process did not exit after SIGKILL; abandoning")
+                    log.warning("process.kill_timeout")
         else:
             saved_pgid = None
 

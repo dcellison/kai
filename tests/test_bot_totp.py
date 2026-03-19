@@ -54,7 +54,7 @@ def _make_context(user_data: dict | None = None) -> MagicMock:
 
 
 def _fake_lock(*_args, **_kwargs):
-    """Return a real asyncio.Lock to stand in for the per-chat lock.
+    """Return a real asyncio.Lock to stand in for the per-user lock.
 
     Uses a real Lock instead of a bare async context manager so that both
     async-with and .locked() work (the latter is needed by _notify_if_queued).

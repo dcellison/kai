@@ -1504,7 +1504,7 @@ class TestShutdown:
         with patch("asyncio.wait_for", side_effect=always_timeout):
             await claude.shutdown()
 
-        assert "did not exit" in caplog.text.lower()
+        assert "process.kill_timeout" in caplog.text
         assert claude._proc is None
 
     @pytest.mark.asyncio

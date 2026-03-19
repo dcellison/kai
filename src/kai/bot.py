@@ -16,7 +16,7 @@ message length limits, Markdown fallback, inline keyboards, and typing indicator
 The response flow for a text message:
     1. User message arrives → handle_message()
     2. Message logged to JSONL history
-    3. Per-chat lock acquired (prevents concurrent Claude interactions)
+    3. Per-user lock acquired (prevents concurrent Claude interactions)
     4. Flag file written (for crash recovery)
     5. Prompt sent to PersistentClaude.send() → streaming begins
     6. Live message created and progressively edited (2-second intervals)
@@ -156,7 +156,7 @@ _QUEUED_MESSAGE_MARKER = (
     "Their previous task is done. Focus on this new message.]\n\n"
 )
 
-# Safety-net timeout for acquiring the per-chat lock (seconds). If the
+# Safety-net timeout for acquiring the per-user lock (seconds). If the
 # wall-clock timeout in claude.py doesn't fire for some reason, this
 # prevents a stuck interaction from blocking all future messages. Set
 # longer than claude.py's wall-clock limit (timeout_seconds * 5) so the
@@ -718,7 +718,7 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """
     Handle /stop — abort the current Claude response.
 
-    Sets the per-chat stop event (checked by the streaming loop) and kills
+    Sets the per-user stop event (checked by the streaming loop) and kills
     the Claude process immediately. The streaming loop in _handle_response()
     sees the stop event and appends "(stopped)" to the live message.
     """
@@ -1668,7 +1668,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """
     Handle plain text messages — the primary interaction path.
 
-    Logs the message, acquires the per-chat lock, sets the crash recovery
+    Logs the message, acquires the per-user lock, sets the crash recovery
     flag, sends the prompt to Claude, and delegates to _handle_response()
     for streaming and delivery.
     """

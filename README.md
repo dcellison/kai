@@ -349,7 +349,7 @@ kai/
 │   ├── cron.py               # Scheduled job execution (APScheduler)
 │   ├── webhook.py            # HTTP server: GitHub/generic webhooks, scheduling API
 │   ├── history.py            # Conversation history (read/write JSONL logs)
-│   ├── locks.py              # Per-chat async locks and stop events
+│   ├── locks.py              # Per-user async locks and stop events
 │   ├── install.py            # Protected installation tooling
 │   ├── totp.py               # TOTP verification, rate limiting, and CLI
 │   ├── review.py             # PR review agent (one-shot Claude subprocess)

@@ -424,7 +424,7 @@ async def _handle_telegram_update(request: web.Request) -> web.Response:
     out after ~30-35s. If we awaited process_update(), Telegram would assume
     delivery failed and retry the same message, causing duplicate responses.
     By returning 200 immediately and processing in the background, we acknowledge
-    receipt before Telegram's timeout. The per-chat lock in bot.py serializes
+    receipt before Telegram's timeout. The per-user lock in bot.py serializes
     concurrent messages, so ordering is preserved.
 
     Always returns 200 on valid-secret requests, even on errors. Telegram retries
