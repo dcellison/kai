@@ -154,6 +154,24 @@ class TestLoadUserConfigs:
         assert configs is not None
         assert len(configs) == 0
 
+    def test_whitespace_only_name(self, tmp_path):
+        """Whitespace-only name is treated as missing."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: "   "
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert len(configs) == 0
+
     def test_missing_name(self, tmp_path):
         """Entry without name is skipped."""
         self._write_yaml(

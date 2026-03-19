@@ -553,11 +553,13 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
             log.warning("%s: expected a YAML dict, got %s", local_path, type(data).__name__)
             return None
 
-    # After the _YAML_MALFORMED and None checks, data must be a dict
+    # After the _YAML_MALFORMED and None checks, data should be a dict
     # (protected path returns _YAML_MALFORMED for non-dicts, local path
-    # checks isinstance explicitly). This assert narrows the type for
-    # static analysis and guards against future refactoring.
-    assert isinstance(data, dict)
+    # checks isinstance explicitly). Guard defensively rather than assert
+    # since assertions are stripped under Python -O.
+    if not isinstance(data, dict):
+        log.warning("users.yaml: expected a YAML dict, got %s", type(data).__name__)
+        return None
 
     entries = data.get("users")
     if not isinstance(entries, list):
