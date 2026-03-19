@@ -630,13 +630,13 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
                 home_workspace = None
             else:
                 home_workspace = Path(home_workspace_str).expanduser().resolve()
-            if not home_workspace.is_dir():
-                log.warning(
-                    "users.yaml: home_workspace not found for %s: %s; using global default",
-                    name,
-                    home_workspace,
-                )
-                home_workspace = None
+                if not home_workspace.is_dir():
+                    log.warning(
+                        "users.yaml: home_workspace not found for %s: %s; using global default",
+                        name,
+                        home_workspace,
+                    )
+                    home_workspace = None
 
         # Validate max_budget (same bool guard as workspace budget)
         max_budget = entry.get("max_budget")

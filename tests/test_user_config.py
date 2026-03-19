@@ -268,6 +268,26 @@ class TestLoadUserConfigs:
         assert len(configs) == 1
         assert configs[111].name == "alice"
 
+    def test_home_workspace_empty_string(self, tmp_path):
+        """Empty home_workspace string is treated as None, not CWD."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                home_workspace: ""
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert len(configs) == 1
+        assert configs[111].home_workspace is None
+
     def test_home_workspace_nonexistent_warns_but_keeps_user(self, tmp_path):
         """Non-existent home_workspace warns and falls back to None, not skip."""
         self._write_yaml(
