@@ -126,7 +126,7 @@ def extract_pr_metadata(payload: dict) -> PRMetadata:
 # (which may have tools) could inherit.
 
 
-def resolve_spec_from_body(description: str) -> str | None:
+def resolve_spec_from_body(description: str | None) -> str | None:
     """
     Extract a spec file path from a 'spec: <path>' marker in the PR body.
 
@@ -134,11 +134,14 @@ def resolve_spec_from_body(description: str) -> str | None:
     (case-insensitive). Returns the path portion, stripped of whitespace.
 
     Args:
-        description: The PR body/description text.
+        description: The PR body/description text (may be None for PRs
+            with no body - GitHub sends null).
 
     Returns:
         The spec file path string, or None if no marker is found.
     """
+    if not description:
+        return None
     for line in description.splitlines():
         stripped = line.strip()
         if stripped.lower().startswith("spec:"):
@@ -235,13 +238,19 @@ async def load_spec(
         except OSError:
             log.warning("Failed to read spec from body marker: %s", spec_path)
 
-    # Strategy 2: branch name matching against configured spec directory
+    # Strategy 2: branch name matching against configured spec directory.
+    # Same containment check as strategy 1 - a misconfigured spec_dir
+    # pointing outside the repo should not leak files.
     local_spec = resolve_spec_from_branch(metadata.branch, local_repo_path, spec_dir)
     if local_spec:
         try:
-            content = Path(local_spec).read_text()
+            resolved = Path(local_spec).resolve()
+            resolved.relative_to(repo_root)  # raises ValueError if outside
+            content = resolved.read_text()
             log.info("Loaded spec from branch name match: %s", local_spec)
             return content
+        except ValueError:
+            log.warning("Branch spec path traversal blocked: %s", local_spec)
         except OSError:
             log.warning("Failed to read local spec: %s", local_spec)
 

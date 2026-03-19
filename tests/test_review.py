@@ -929,6 +929,10 @@ class TestResolveSpecFromBody:
         """Returns None for an empty description string."""
         assert resolve_spec_from_body("") is None
 
+    def test_none_description(self):
+        """Returns None for None description (GitHub sends null for PRs with no body)."""
+        assert resolve_spec_from_body(None) is None
+
     def test_whitespace_around_marker(self):
         """Handles leading/trailing whitespace on the spec line."""
         body = "  spec:   workspace/specs/my-spec.md  "
