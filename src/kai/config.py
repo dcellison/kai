@@ -555,8 +555,13 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
 
     entries = data.get("users")
     if not isinstance(entries, list):
+        # Warn for any non-list value, including None (missing key).
+        # A users.yaml file without a 'users' key is almost certainly
+        # a typo (e.g., 'user:' instead of 'users:').
         if entries is not None:
             log.warning("users.yaml: 'users' must be a list, got %s", type(entries).__name__)
+        else:
+            log.warning("users.yaml: no 'users' key found; check for typos")
         return None
 
     configs: dict[int, UserConfig] = {}
@@ -612,17 +617,20 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
         if os_user is not None:
             os_user = str(os_user).strip() or None
 
-        # Validate home_workspace
+        # Validate home_workspace. Warn but don't skip the user if
+        # the directory doesn't exist - it may be on an unmounted drive
+        # or not yet created. The user keeps access; the workspace
+        # falls back to the global default at runtime.
         home_workspace = entry.get("home_workspace")
         if home_workspace is not None:
             home_workspace = Path(str(home_workspace)).expanduser().resolve()
             if not home_workspace.is_dir():
                 log.warning(
-                    "users.yaml: home_workspace not found for %s: %s; skipping entry",
+                    "users.yaml: home_workspace not found for %s: %s; using global default",
                     name,
                     home_workspace,
                 )
-                continue
+                home_workspace = None
 
         # Validate max_budget (same bool guard as workspace budget)
         max_budget = entry.get("max_budget")

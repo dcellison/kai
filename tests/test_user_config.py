@@ -268,8 +268,8 @@ class TestLoadUserConfigs:
         assert len(configs) == 1
         assert configs[111].name == "alice"
 
-    def test_home_workspace_nonexistent(self, tmp_path):
-        """Non-existent home_workspace causes the entry to be skipped."""
+    def test_home_workspace_nonexistent_warns_but_keeps_user(self, tmp_path):
+        """Non-existent home_workspace warns and falls back to None, not skip."""
         self._write_yaml(
             tmp_path,
             """\
@@ -285,7 +285,9 @@ class TestLoadUserConfigs:
         ):
             configs = _load_user_configs()
         assert configs is not None
-        assert len(configs) == 0
+        assert len(configs) == 1
+        # home_workspace falls back to None (global default)
+        assert configs[111].home_workspace is None
 
     def test_protected_installation_tried_first(self, tmp_path):
         """Protected file (/etc/kai/users.yaml) is tried before local."""

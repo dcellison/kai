@@ -267,10 +267,19 @@ def _resolve_chat_id(request: web.Request, payload: dict) -> int:
     This allows the inner Claude process to specify which user a
     message/file/job belongs to, while remaining backward-compatible
     with callers that don't pass chat_id.
+
+    Raises:
+        ValueError: If chat_id is present but not a valid integer.
     """
     explicit = payload.get("chat_id")
     if explicit is not None:
-        return int(explicit)
+        # Reject floats (int(12345.6) silently truncates) and non-numeric values
+        if isinstance(explicit, float) and not float(explicit).is_integer():
+            raise ValueError(f"chat_id must be an integer, got {explicit!r}")
+        try:
+            return int(explicit)
+        except (TypeError, ValueError):
+            raise ValueError(f"chat_id must be an integer, got {explicit!r}") from None
     return request.app["chat_id"]
 
 
@@ -693,7 +702,10 @@ async def _handle_schedule(request: web.Request) -> web.Response:
         )
     auto_remove = payload.get("auto_remove", False)
     notify_on_check = payload.get("notify_on_check", False)
-    chat_id = _resolve_chat_id(request, payload)
+    try:
+        chat_id = _resolve_chat_id(request, payload)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
 
     # schedule_data can arrive as a JSON object or a pre-serialized string
     if isinstance(schedule_data, dict):
@@ -741,7 +753,10 @@ async def _handle_get_jobs(request: web.Request) -> web.Response:
     # instead of a JSON body (more conventional for GET endpoints).
     raw_chat_id = request.query.get("chat_id")
     if raw_chat_id is not None:
-        chat_id = int(raw_chat_id)
+        try:
+            chat_id = int(raw_chat_id)
+        except (ValueError, TypeError):
+            return web.json_response({"error": f"chat_id must be an integer, got {raw_chat_id!r}"}, status=400)
     else:
         chat_id = request.app["chat_id"]
     jobs = await sessions.get_jobs(chat_id)
@@ -949,7 +964,10 @@ async def _handle_send_message(request: web.Request) -> web.Response:
         return web.json_response({"error": "Missing required field: text"}, status=400)
 
     bot = request.app["telegram_bot"]
-    chat_id = _resolve_chat_id(request, payload)
+    try:
+        chat_id = _resolve_chat_id(request, payload)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
 
     try:
         # Telegram limits messages to 4096 characters. Split long messages
@@ -1029,7 +1047,10 @@ async def _handle_send_file(request: web.Request) -> web.Response:
         return web.json_response({"error": f"File not found: {file_path}"}, status=404)
 
     bot = request.app["telegram_bot"]
-    chat_id = _resolve_chat_id(request, payload)
+    try:
+        chat_id = _resolve_chat_id(request, payload)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
     caption = payload.get("caption", "")
 
     # Send images as photos (Telegram renders them inline) and everything
