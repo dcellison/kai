@@ -116,6 +116,11 @@ def extract_pr_metadata(payload: dict) -> PRMetadata:
 # (GitHub issue bodies, third-party input) is never fed into the
 # review agent's Claude session. A human reviews external input and
 # creates local spec files manually.
+#
+# Note: random boundary tokens prevent structural injection (delimiter
+# escape) but not semantic injection - content inside the boundary can
+# still influence model behavior. This restriction should not be
+# relaxed for future agents, which may have tools.
 
 
 def resolve_spec_from_body(description: str | None) -> str | None:
