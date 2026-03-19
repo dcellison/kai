@@ -91,20 +91,25 @@ EDIT_INTERVAL = 2.0
 # Flag file written while processing a message. If the process crashes mid-response,
 # main.py detects this file at startup and notifies the user to resend. Lives under
 # DATA_DIR so it's writable even when source is in read-only /opt/kai/.
-_RESPONDING_FLAG = DATA_DIR / ".responding_to"
+# Directory for per-user crash recovery flags. Each file is named by
+# chat_id and exists only while that user's response is in-flight.
+# Using a directory of files (not a single JSON file) avoids locking
+# and allows atomic per-user create/delete.
+_RESPONDING_DIR = DATA_DIR / ".responding"
 
 
 # ── Crash recovery flag ──────────────────────────────────────────────
 
 
 def _set_responding(chat_id: int) -> None:
-    """Write the chat ID to the flag file, marking a response as in-flight."""
-    _RESPONDING_FLAG.write_text(str(chat_id))
+    """Mark a response as in-flight for crash recovery."""
+    _RESPONDING_DIR.mkdir(exist_ok=True)
+    (_RESPONDING_DIR / str(chat_id)).touch()
 
 
-def _clear_responding() -> None:
-    """Remove the flag file, indicating the response completed (or failed gracefully)."""
-    _RESPONDING_FLAG.unlink(missing_ok=True)
+def _clear_responding(chat_id: int) -> None:
+    """Mark a response as complete for a specific user."""
+    (_RESPONDING_DIR / str(chat_id)).unlink(missing_ok=True)
 
 
 async def _notify_if_queued(update: Update, chat_id: int) -> bool:
@@ -808,10 +813,10 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     await sessions.clear_session(chat_id)
 
     if path == home:
-        await sessions.delete_setting("workspace")
+        await sessions.delete_setting(f"workspace:{chat_id}")
     else:
-        await sessions.set_setting("workspace", str(path))
-        await sessions.upsert_workspace_history(str(path))
+        await sessions.set_setting(f"workspace:{chat_id}", str(path))
+        await sessions.upsert_workspace_history(str(path), chat_id)
 
     return ws_config
 
@@ -922,7 +927,8 @@ async def _workspaces_keyboard(
 async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /workspaces — show an inline keyboard of recent workspaces."""
     assert update.message is not None
-    history = await sessions.get_workspace_history()
+    chat_id = _chat_id(update)
+    history = await sessions.get_workspace_history(chat_id)
     claude = _get_claude(context)
     config: Config = context.bot_data["config"]
     current = str(claude.workspace)
@@ -946,6 +952,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     """
     assert update.callback_query is not None
     query = update.callback_query
+    chat_id = _chat_id(update)
     config: Config = context.bot_data["config"]
     if not _is_authorized(config, _user_id(update)):
         await query.answer("Not authorized.")
@@ -987,7 +994,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             await query.answer("Invalid selection.")
             await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
             return
-        history = await sessions.get_workspace_history()
+        history = await sessions.get_workspace_history(chat_id)
         if idx < 0 or idx >= len(history):
             await query.answer("Workspace no longer in history.")
             await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
@@ -995,11 +1002,11 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
         path = Path(history[idx]["path"])
         # Reject history entries that are no longer in an allowed workspace source.
         # This handles the case where a path was removed from ALLOWED_WORKSPACES
-        # after the user visited it — the history entry persists but access is revoked.
+        # after the user visited it - the history entry persists but access is revoked.
         if not _is_workspace_allowed(path, config):
-            await sessions.delete_workspace_history(str(path))
+            await sessions.delete_workspace_history(str(path), chat_id)
             await query.answer("That workspace is no longer allowed.")
-            history = await sessions.get_workspace_history()
+            history = await sessions.get_workspace_history(chat_id)
             keyboard = await _workspaces_keyboard(
                 history, str(claude.workspace), str(home), base, config.allowed_workspaces
             )
@@ -1007,9 +1014,9 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             return
         # Remove stale entries where the directory no longer exists
         if not path.is_dir():
-            await sessions.delete_workspace_history(str(path))
+            await sessions.delete_workspace_history(str(path), chat_id)
             await query.answer("That workspace no longer exists.")
-            history = await sessions.get_workspace_history()
+            history = await sessions.get_workspace_history(chat_id)
             keyboard = await _workspaces_keyboard(
                 history, str(claude.workspace), str(home), base, config.allowed_workspaces
             )
@@ -1217,7 +1224,7 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
 # ── Media message handlers ──────────────────────────────────────────
 
 
-def _save_to_workspace(data: bytes, filename: str, workspace: Path) -> Path:
+def _save_to_workspace(data: bytes, filename: str, workspace: Path, user_id: int | None = None) -> Path:
     """
     Save file bytes to the workspace/files/ directory with a timestamped name.
 
@@ -1226,16 +1233,25 @@ def _save_to_workspace(data: bytes, filename: str, workspace: Path) -> Path:
     spaces. Returns the absolute path to the saved file so Claude can
     reference it in subsequent commands.
 
+    When user_id is provided, files are saved to a per-user subdirectory
+    (workspace/files/{user_id}/) to prevent cross-user file access.
+    When None, uses the shared workspace/files/ directory (backward-
+    compatible for single-user deployments).
+
     Args:
         data: Raw file bytes to write.
         filename: Original filename from Telegram (sanitized before use).
         workspace: The current workspace root directory.
+        user_id: Optional Telegram user ID for per-user file isolation.
 
     Returns:
         Absolute path to the saved file.
     """
-    files_dir = workspace / "files"
-    files_dir.mkdir(exist_ok=True)
+    if user_id is not None:
+        files_dir = workspace / "files" / str(user_id)
+    else:
+        files_dir = workspace / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
 
     # Timestamp prefix ensures unique names even if the same file is sent twice
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1269,7 +1285,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     b64 = base64.b64encode(raw).decode()
 
     # Save to workspace so Claude can access the file via shell tools
-    saved = _save_to_workspace(raw, f"photo_{photo.file_unique_id}.jpg", claude.workspace)
+    saved = _save_to_workspace(raw, f"photo_{photo.file_unique_id}.jpg", claude.workspace, user_id=chat_id)
 
     caption = update.message.caption or "What's in this image?"
     caption += f"\n[File saved to: {saved}]"
@@ -1295,7 +1311,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 model,
             )
         finally:
-            _clear_responding()
+            _clear_responding(chat_id)
     finally:
         lock.release()
 
@@ -1394,7 +1410,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         media_type = _IMAGE_MEDIA_TYPES[suffix]
 
         # Save to workspace so Claude can access the file via shell tools
-        saved = _save_to_workspace(raw, file_name, claude.workspace)
+        saved = _save_to_workspace(raw, file_name, claude.workspace, user_id=chat_id)
         img_caption = caption or f"What's in this image ({file_name})?"
         img_caption += f"\n[File saved to: {saved}]"
 
@@ -1420,7 +1436,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         # Save to workspace so Claude can access the file via shell tools
-        saved = _save_to_workspace(raw, file_name, claude.workspace)
+        saved = _save_to_workspace(raw, file_name, claude.workspace, user_id=chat_id)
         header = f"File: {file_name}\n```\n{text_content}\n```\n[File saved to: {saved}]"
 
         log_message(
@@ -1438,7 +1454,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # can work with the file via shell tools (e.g., unzip, pdftotext, etc.)
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
-        saved = _save_to_workspace(bytes(data), file_name, claude.workspace)
+        saved = _save_to_workspace(bytes(data), file_name, claude.workspace, user_id=chat_id)
 
         log_message(
             direction="user",
@@ -1464,7 +1480,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 model,
             )
         finally:
-            _clear_responding()
+            _clear_responding(chat_id)
     finally:
         lock.release()
 
@@ -1549,7 +1565,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 model,
             )
         finally:
-            _clear_responding()
+            _clear_responding(chat_id)
     finally:
         lock.release()
 
@@ -1677,7 +1693,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 model,
             )
         finally:
-            _clear_responding()
+            _clear_responding(chat_id)
     finally:
         lock.release()
 

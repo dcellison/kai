@@ -24,9 +24,12 @@ All functions use a module-level aiosqlite connection initialized by init_db()
 at startup. The database file is kai.db at the project root.
 """
 
+import logging
 from pathlib import Path
 
 import aiosqlite
+
+log = logging.getLogger(__name__)
 
 # Module-level database connection, initialized by init_db() at startup
 _db: aiosqlite.Connection | None = None
@@ -95,10 +98,19 @@ async def init_db(db_path: Path) -> None:
     """)
     await _get_db().execute("""
         CREATE TABLE IF NOT EXISTS workspace_history (
-            path TEXT PRIMARY KEY,
-            last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            path TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (path, chat_id)
         )
     """)
+    # Schema evolution: add chat_id column to existing workspace_history tables.
+    # Existing rows get chat_id=0 as a placeholder; the caller (main.py) must
+    # call backfill_workspace_history() to assign them to the admin user.
+    cursor = await _get_db().execute("PRAGMA table_info(workspace_history)")
+    ws_columns = [row[1] for row in await cursor.fetchall()]
+    if "chat_id" not in ws_columns:
+        await _get_db().execute("ALTER TABLE workspace_history ADD COLUMN chat_id INTEGER NOT NULL DEFAULT 0")
     await _get_db().commit()
 
 
@@ -353,38 +365,65 @@ async def delete_setting(key: str) -> None:
 # ── Workspace history ────────────────────────────────────────────────
 
 
-async def upsert_workspace_history(path: str) -> None:
-    """Record or refresh a workspace path in the history. Used for /workspaces keyboard."""
+async def upsert_workspace_history(path: str, chat_id: int) -> None:
+    """Record or refresh a workspace path in the user's history."""
+    # INSERT OR REPLACE works with both old schema (path-only PK) and
+    # new schema (path+chat_id composite PK). See Phase 2 spec section 4.
     await _get_db().execute(
-        "INSERT INTO workspace_history (path, last_used_at) VALUES (?, CURRENT_TIMESTAMP) "
-        "ON CONFLICT(path) DO UPDATE SET last_used_at = CURRENT_TIMESTAMP",
-        (path,),
+        "INSERT OR REPLACE INTO workspace_history (path, chat_id, last_used_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+        (path, chat_id),
     )
     await _get_db().commit()
 
 
-async def get_workspace_history(limit: int = 10) -> list[dict]:
+async def get_workspace_history(chat_id: int, limit: int = 10) -> list[dict]:
     """
-    Get recent workspace paths, ordered by most recently used first.
+    Get recent workspace paths for a specific user.
 
     Args:
+        chat_id: Telegram chat ID of the user.
         limit: Maximum number of entries to return (default 10).
 
     Returns:
         List of dicts with "path" and "last_used_at" keys.
     """
     async with _get_db().execute(
-        "SELECT path, last_used_at FROM workspace_history ORDER BY last_used_at DESC LIMIT ?",
-        (limit,),
+        "SELECT path, last_used_at FROM workspace_history WHERE chat_id = ? ORDER BY last_used_at DESC LIMIT ?",
+        (chat_id, limit),
     ) as cursor:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
 
-async def delete_workspace_history(path: str) -> None:
-    """Remove a workspace path from history. Used when a workspace directory no longer exists."""
-    await _get_db().execute("DELETE FROM workspace_history WHERE path = ?", (path,))
+async def delete_workspace_history(path: str, chat_id: int) -> None:
+    """Remove a workspace path from a user's history."""
+    await _get_db().execute(
+        "DELETE FROM workspace_history WHERE path = ? AND chat_id = ?",
+        (path, chat_id),
+    )
     await _get_db().commit()
+
+
+async def backfill_workspace_history(default_chat_id: int) -> None:
+    """
+    Assign unowned workspace history rows to the default user.
+
+    Phase 2 migration: rows created before per-user workspace history
+    have chat_id=0 (the ALTER TABLE default). This assigns them to the
+    admin user so they appear in the right user's /workspaces list.
+    Idempotent - no-op after the first run.
+    """
+    cursor = await _get_db().execute(
+        "UPDATE workspace_history SET chat_id = ? WHERE chat_id = 0",
+        (default_chat_id,),
+    )
+    await _get_db().commit()
+    if cursor.rowcount > 0:
+        log.info(
+            "Migrated %d workspace history rows to user %d",
+            cursor.rowcount,
+            default_chat_id,
+        )
 
 
 # ── Lifecycle ────────────────────────────────────────────────────────

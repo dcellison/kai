@@ -506,25 +506,26 @@ async def _fake_stream(*events):
 
 class TestCrashRecoveryFlag:
     def test_set_responding_writes_chat_id(self, tmp_path):
-        """Flag file contains the chat ID as text."""
-        flag = tmp_path / ".responding_to"
-        with patch("kai.bot._RESPONDING_FLAG", flag):
+        """Per-user flag file is created under the .responding directory."""
+        responding_dir = tmp_path / ".responding"
+        with patch("kai.bot._RESPONDING_DIR", responding_dir):
             _set_responding(12345)
-        assert flag.read_text() == "12345"
+        assert (responding_dir / "12345").exists()
 
     def test_clear_responding_removes_flag(self, tmp_path):
-        """Flag file is deleted after clearing."""
-        flag = tmp_path / ".responding_to"
-        flag.write_text("12345")
-        with patch("kai.bot._RESPONDING_FLAG", flag):
-            _clear_responding()
-        assert not flag.exists()
+        """Per-user flag file is deleted after clearing."""
+        responding_dir = tmp_path / ".responding"
+        responding_dir.mkdir()
+        (responding_dir / "12345").touch()
+        with patch("kai.bot._RESPONDING_DIR", responding_dir):
+            _clear_responding(12345)
+        assert not (responding_dir / "12345").exists()
 
     def test_clear_responding_noop_if_missing(self, tmp_path):
         """No error when flag file doesn't exist."""
-        flag = tmp_path / ".responding_to"
-        with patch("kai.bot._RESPONDING_FLAG", flag):
-            _clear_responding()  # should not raise
+        responding_dir = tmp_path / ".responding"
+        with patch("kai.bot._RESPONDING_DIR", responding_dir):
+            _clear_responding(12345)  # should not raise
 
 
 # ── Authorization ────────────────────────────────────────────────────
@@ -1490,7 +1491,7 @@ class TestHandleWorkspaceCallback:
             patch("kai.bot.sessions.delete_workspace_history", new_callable=AsyncMock) as mock_del,
         ):
             await handle_workspace_callback(update, ctx)
-        mock_del.assert_called_once_with(str(project))
+        mock_del.assert_called_once_with(str(project), 12345)
         update.callback_query.answer.assert_called_once_with("That workspace is no longer allowed.")
 
     @pytest.mark.asyncio
@@ -1507,7 +1508,7 @@ class TestHandleWorkspaceCallback:
             patch("kai.bot.sessions.delete_workspace_history", new_callable=AsyncMock) as mock_del,
         ):
             await handle_workspace_callback(update, ctx)
-        mock_del.assert_called_once_with(str(gone))
+        mock_del.assert_called_once_with(str(gone), 12345)
 
     @pytest.mark.asyncio
     async def test_already_in_workspace(self, tmp_path):

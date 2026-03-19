@@ -283,27 +283,27 @@ class TestSettings:
 
 class TestWorkspaceHistory:
     async def test_upsert_and_get(self, db):
-        await sessions.upsert_workspace_history("/path/a")
-        await sessions.upsert_workspace_history("/path/b")
-        history = await sessions.get_workspace_history()
+        await sessions.upsert_workspace_history("/path/a", 12345)
+        await sessions.upsert_workspace_history("/path/b", 12345)
+        history = await sessions.get_workspace_history(12345)
         paths = [h["path"] for h in history]
         assert "/path/a" in paths
         assert "/path/b" in paths
 
     async def test_upsert_twice_no_duplicates(self, db):
-        await sessions.upsert_workspace_history("/path/a")
-        await sessions.upsert_workspace_history("/path/a")
-        history = await sessions.get_workspace_history()
+        await sessions.upsert_workspace_history("/path/a", 12345)
+        await sessions.upsert_workspace_history("/path/a", 12345)
+        history = await sessions.get_workspace_history(12345)
         assert len(history) == 1
 
     async def test_delete_workspace_history(self, db):
-        await sessions.upsert_workspace_history("/path/a")
-        await sessions.delete_workspace_history("/path/a")
-        history = await sessions.get_workspace_history()
+        await sessions.upsert_workspace_history("/path/a", 12345)
+        await sessions.delete_workspace_history("/path/a", 12345)
+        history = await sessions.get_workspace_history(12345)
         assert len(history) == 0
 
     async def test_respects_limit(self, db):
         for i in range(5):
-            await sessions.upsert_workspace_history(f"/path/{i}")
-        history = await sessions.get_workspace_history(limit=3)
+            await sessions.upsert_workspace_history(f"/path/{i}", 12345)
+        history = await sessions.get_workspace_history(12345, limit=3)
         assert len(history) == 3

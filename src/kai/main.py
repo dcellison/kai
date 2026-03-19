@@ -126,8 +126,30 @@ def main() -> None:
         await sessions.init_db(config.session_db_path)
         app = create_bot(config, use_webhook=use_webhook)
 
-        # Restore workspace from previous session (persisted in settings table)
-        saved_workspace = await sessions.get_setting("workspace")
+        # Determine the default user (admin or first allowed user) for
+        # per-user data migrations and workspace restoration.
+        if config.user_configs:
+            admins = config.get_admins()
+            if admins:
+                default_chat_id = admins[0].telegram_id
+            else:
+                default_chat_id = next(iter(config.user_configs))
+        else:
+            default_chat_id = next(iter(config.allowed_user_ids))
+
+        # One-time migration: rename global "workspace" setting to
+        # "workspace:{chat_id}" for per-user namespacing (Phase 2).
+        old_workspace = await sessions.get_setting("workspace")
+        if old_workspace:
+            await sessions.set_setting(f"workspace:{default_chat_id}", old_workspace)
+            await sessions.delete_setting("workspace")
+            logging.info("Migrated workspace setting to workspace:%d", default_chat_id)
+
+        # Backfill workspace history rows from pre-Phase-2 (chat_id=0)
+        await sessions.backfill_workspace_history(default_chat_id)
+
+        # Restore workspace for the default user from previous session
+        saved_workspace = await sessions.get_setting(f"workspace:{default_chat_id}")
         if saved_workspace:
             ws_path = Path(saved_workspace)
             if not _is_workspace_allowed(ws_path, config):
@@ -135,13 +157,14 @@ def main() -> None:
                     "Saved workspace %s is not under WORKSPACE_BASE or ALLOWED_WORKSPACES, ignoring",
                     saved_workspace,
                 )
-                await sessions.delete_setting("workspace")
+                await sessions.delete_setting(f"workspace:{default_chat_id}")
             elif ws_path.is_dir():
-                await app.bot_data["claude"].change_workspace(ws_path)
+                ws_config = config.get_workspace_config(ws_path)
+                await app.bot_data["claude"].change_workspace(ws_path, workspace_config=ws_config)
                 logging.info("Restored workspace: %s", ws_path)
             else:
                 logging.warning("Saved workspace no longer exists: %s", saved_workspace)
-                await sessions.delete_setting("workspace")
+                await sessions.delete_setting(f"workspace:{default_chat_id}")
 
         try:
             # Retry initialization if the network isn't ready yet (e.g. after a
@@ -206,25 +229,37 @@ def main() -> None:
                 )
                 logging.info("Polling started")
 
-            # Check if a previous response was interrupted by a crash/restart.
-            # bot.py writes this flag file when it starts processing a message
-            # and deletes it when done. If it exists at startup, the process
-            # crashed mid-response and the user should be notified.
-            # Flag file is under DATA_DIR (writable) not PROJECT_ROOT (may be read-only)
-            flag = DATA_DIR / ".responding_to"
-            try:
-                chat_id = int(flag.read_text().strip())
-                await app.bot.send_message(
-                    chat_id, "Sorry, my previous response was interrupted. Please resend your last message."
-                )
-                logging.info("Notified chat %d of interrupted response", chat_id)
-                flag.unlink(missing_ok=True)
-            except FileNotFoundError:
-                pass
-            except Exception:
-                # Full traceback helps diagnose issues like corrupt flag file content
-                logging.exception("Failed to send interrupted-response notice")
-                flag.unlink(missing_ok=True)
+            # Check for interrupted responses from a crash/restart.
+            # Phase 2: check all files in the .responding directory (per-user
+            # flags) instead of the old single .responding_to file.
+            responding_dir = DATA_DIR / ".responding"
+            if responding_dir.is_dir():
+                for flag in responding_dir.iterdir():
+                    try:
+                        interrupted_chat_id = int(flag.name)
+                        await app.bot.send_message(
+                            interrupted_chat_id,
+                            "Sorry, my previous response was interrupted. Please resend your last message.",
+                        )
+                        logging.info("Notified chat %d of interrupted response", interrupted_chat_id)
+                        flag.unlink(missing_ok=True)
+                    except (ValueError, Exception):
+                        logging.exception("Failed to process interrupted-response flag: %s", flag.name)
+                        flag.unlink(missing_ok=True)
+
+            # Clean up old single-file flag if it exists (one-time migration)
+            old_flag = DATA_DIR / ".responding_to"
+            if old_flag.exists():
+                try:
+                    old_chat_id = int(old_flag.read_text().strip())
+                    await app.bot.send_message(
+                        old_chat_id,
+                        "Sorry, my previous response was interrupted. Please resend your last message.",
+                    )
+                    logging.info("Notified chat %d of interrupted response (old flag)", old_chat_id)
+                except Exception:
+                    logging.exception("Failed to process old .responding_to flag")
+                old_flag.unlink(missing_ok=True)
 
             logging.info("Kai is running. Press Ctrl+C to stop.")
             await asyncio.Event().wait()  # Block forever until shutdown signal
