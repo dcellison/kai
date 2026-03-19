@@ -1757,8 +1757,9 @@ async def _handle_response(
         stop_event = get_stop_event(chat_id)
         stop_event.clear()
 
-        # Stream events from Claude
-        async for event in claude.send(prompt):
+        # Stream events from Claude. Pass chat_id so the inner Claude
+        # can include it in API calls for correct multi-user routing.
+        async for event in claude.send(prompt, chat_id=chat_id):
             # Check for /stop between stream chunks
             if stop_event.is_set():
                 stop_event.clear()

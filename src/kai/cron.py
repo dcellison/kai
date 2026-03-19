@@ -269,10 +269,11 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
 
-        # Send prompt to Claude and collect the final response (no streaming to Telegram)
+        # Send prompt to Claude and collect the final response (no streaming
+        # to Telegram). Pass chat_id for correct multi-user API routing.
         try:
             final_response = None
-            async for event in claude.send(prompt):
+            async for event in claude.send(prompt, chat_id=chat_id):
                 if event.done:
                     final_response = event.response
                     break

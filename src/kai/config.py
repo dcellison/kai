@@ -80,6 +80,37 @@ class WorkspaceConfig:
     system_prompt_file: Path | None = None
 
 
+# ── Per-user configuration ──────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class UserConfig:
+    """
+    Per-user configuration loaded from users.yaml.
+
+    Defines a user's identity, authorization, and resource limits.
+    Preferences that the user controls (active model, working budget)
+    live in the settings table, not here.
+
+    Attributes:
+        telegram_id: Telegram user ID (authorization key).
+        name: Display name for logs and notifications.
+        role: "admin" or "user". Admins receive unattributed webhooks.
+        github: GitHub username for webhook actor routing.
+        os_user: OS username for subprocess isolation (Phase 3).
+        home_workspace: Per-user home workspace directory.
+        max_budget: Budget ceiling in USD (user cannot exceed via /budget).
+    """
+
+    telegram_id: int
+    name: str
+    role: str = "user"
+    github: str | None = None
+    os_user: str | None = None
+    home_workspace: Path | None = None
+    max_budget: float | None = None
+
+
 # ── Config dataclass ─────────────────────────────────────────────────
 
 
@@ -188,6 +219,11 @@ class Config:
     # Disabled by default so existing users are not surprised by automatic triage.
     issue_triage_enabled: bool = False
 
+    # Per-user configuration from users.yaml. Keyed by telegram_id.
+    # None means users.yaml does not exist (fall back to allowed_user_ids).
+    # Empty dict means users.yaml exists but has no valid entries.
+    user_configs: dict[int, UserConfig] | None = None
+
     # TOTP two-factor authentication timing (only relevant when TOTP is enabled)
     totp_session_minutes: int = 30
     totp_challenge_seconds: int = 120
@@ -202,6 +238,27 @@ class Config:
         paths consistently.
         """
         return self.workspace_configs.get(workspace.resolve())
+
+    def get_user_config(self, user_id: int) -> UserConfig | None:
+        """Get per-user config by Telegram user ID, or None if not configured."""
+        if self.user_configs is None:
+            return None
+        return self.user_configs.get(user_id)
+
+    def get_user_by_github(self, github_login: str) -> UserConfig | None:
+        """Look up a user by GitHub username. Used for webhook actor routing."""
+        if self.user_configs is None:
+            return None
+        for uc in self.user_configs.values():
+            if uc.github and uc.github.lower() == github_login.lower():
+                return uc
+        return None
+
+    def get_admins(self) -> list[UserConfig]:
+        """Get all admin users. Used for unattributed webhook fallback routing."""
+        if self.user_configs is None:
+            return []
+        return [uc for uc in self.user_configs.values() if uc.role == "admin"]
 
 
 # ── Config loading ───────────────────────────────────────────────────
@@ -463,6 +520,144 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
     return configs
 
 
+# Valid user roles for users.yaml
+_VALID_ROLES = {"admin", "user"}
+
+
+def _load_user_configs() -> dict[int, UserConfig] | None:
+    """
+    Load per-user configs from users.yaml.
+
+    Tries /etc/kai/users.yaml first (protected), falls back to
+    PROJECT_ROOT/users.yaml (dev). Returns None if neither exists
+    (signals the caller to fall back to ALLOWED_USER_IDS).
+
+    Returns a dict keyed by telegram_id for O(1) lookup.
+    """
+    # Same dual-mode loading pattern as _load_workspace_configs.
+    data = _read_protected_yaml("users.yaml")
+    if data is _YAML_MALFORMED:
+        log.warning("Skipping user config: /etc/kai/users.yaml is malformed or empty")
+        return None
+    if data is None:
+        local_path = PROJECT_ROOT / "users.yaml"
+        if not local_path.exists():
+            return None
+        try:
+            with open(local_path) as f:
+                data = yaml.safe_load(f)
+        except (yaml.YAMLError, OSError) as e:
+            log.error("Cannot load %s: %s", local_path, e)
+            return None
+        if not isinstance(data, dict):
+            log.warning("%s: expected a YAML dict, got %s", local_path, type(data).__name__)
+            return None
+
+    entries = data.get("users")
+    if not isinstance(entries, list):
+        if entries is not None:
+            log.warning("users.yaml: 'users' must be a list, got %s", type(entries).__name__)
+        return None
+
+    configs: dict[int, UserConfig] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            log.warning("users.yaml: skipping non-dict entry: %s", entry)
+            continue
+
+        # Validate required telegram_id (must be a positive integer, not a bool)
+        raw_id = entry.get("telegram_id")
+        if raw_id is None:
+            log.warning("users.yaml: skipping entry without telegram_id")
+            continue
+        try:
+            if isinstance(raw_id, bool):
+                raise ValueError("must be an integer, not a boolean")
+            telegram_id = int(raw_id)
+            if telegram_id <= 0:
+                raise ValueError("must be positive")
+        except (TypeError, ValueError) as e:
+            log.warning("users.yaml: invalid telegram_id %s: %s; skipping entry", raw_id, e)
+            continue
+
+        # Validate required name
+        name = entry.get("name")
+        if not name or not isinstance(name, str):
+            log.warning("users.yaml: skipping entry for telegram_id %d without name", telegram_id)
+            continue
+        name = str(name).strip()
+
+        # Duplicate check: first wins
+        if telegram_id in configs:
+            log.warning("users.yaml: duplicate telegram_id %d; using first entry", telegram_id)
+            continue
+
+        # Validate role
+        role = str(entry.get("role", "user")).strip().lower()
+        if role not in _VALID_ROLES:
+            log.warning(
+                "users.yaml: invalid role '%s' for %s (must be one of %s); skipping entry",
+                role,
+                name,
+                _VALID_ROLES,
+            )
+            continue
+
+        # Optional fields
+        github = entry.get("github")
+        if github is not None:
+            github = str(github).strip() or None
+
+        os_user = entry.get("os_user")
+        if os_user is not None:
+            os_user = str(os_user).strip() or None
+
+        # Validate home_workspace
+        home_workspace = entry.get("home_workspace")
+        if home_workspace is not None:
+            home_workspace = Path(str(home_workspace)).expanduser().resolve()
+            if not home_workspace.is_dir():
+                log.warning(
+                    "users.yaml: home_workspace not found for %s: %s; skipping entry",
+                    name,
+                    home_workspace,
+                )
+                continue
+
+        # Validate max_budget (same bool guard as workspace budget)
+        max_budget = entry.get("max_budget")
+        if max_budget is not None:
+            try:
+                if isinstance(max_budget, bool):
+                    raise ValueError("must be a number, not a boolean")
+                max_budget = float(max_budget)
+                if max_budget <= 0:
+                    raise ValueError("must be positive")
+            except (TypeError, ValueError) as e:
+                log.warning("users.yaml: invalid max_budget for %s: %s; skipping entry", name, e)
+                continue
+
+        configs[telegram_id] = UserConfig(
+            telegram_id=telegram_id,
+            name=name,
+            role=role,
+            github=github,
+            os_user=os_user,
+            home_workspace=home_workspace,
+            max_budget=max_budget,
+        )
+
+    # Warn if no admin is defined - external webhooks will route to
+    # an arbitrary user, which may be surprising.
+    if configs and not any(uc.role == "admin" for uc in configs.values()):
+        log.warning(
+            "users.yaml: no admin users defined. External webhook notifications "
+            "(GitHub, generic) will route to an arbitrary user."
+        )
+
+    return configs
+
+
 def load_config() -> Config:
     """
     Load application configuration from environment variables.
@@ -526,10 +721,11 @@ def load_config() -> Config:
     else:
         log.info("Telegram transport: polling (TELEGRAM_WEBHOOK_URL not set)")
 
-    # Validate required: allowed user IDs (comma-separated numeric Telegram user IDs)
+    # Validate allowed user IDs. ALLOWED_USER_IDS is required unless
+    # users.yaml exists (which provides its own authorization source).
+    # Parse the env var first; we check later whether users.yaml overrides it.
     raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
-    if not raw_ids:
-        raise SystemExit("ALLOWED_USER_IDS is required in .env")
+    allowed_ids: set[int] = set()
     try:
         allowed_ids = {int(uid.strip()) for uid in raw_ids.split(",") if uid.strip()}
     except ValueError as e:
@@ -621,6 +817,21 @@ def load_config() -> Config:
             seen_allowed.add(p)
             allowed_workspaces.append(p)
 
+    # Per-user configuration. If users.yaml exists, it is authoritative;
+    # ALLOWED_USER_IDS is ignored. If users.yaml does not exist,
+    # ALLOWED_USER_IDS works as before (backward-compatible).
+    user_configs = _load_user_configs()
+    if user_configs is not None:
+        if raw_ids:
+            log.warning("ALLOWED_USER_IDS is set but users.yaml exists; using users.yaml")
+        # Users in the YAML replace the ALLOWED_USER_IDS set.
+        allowed_ids = set(user_configs.keys())
+        if not allowed_ids:
+            raise SystemExit("users.yaml exists but contains no valid user entries")
+    elif not allowed_ids:
+        # No users.yaml and no ALLOWED_USER_IDS - can't start
+        raise SystemExit("ALLOWED_USER_IDS is required in .env (or create users.yaml)")
+
     return Config(
         telegram_bot_token=token,
         telegram_webhook_url=telegram_webhook_url,
@@ -643,6 +854,7 @@ def load_config() -> Config:
         github_repo=os.getenv("GITHUB_REPO", ""),
         spec_dir=os.getenv("SPEC_DIR", "specs"),
         issue_triage_enabled=issue_triage_enabled,
+        user_configs=user_configs,
         totp_session_minutes=totp_session_minutes,
         totp_challenge_seconds=totp_challenge_seconds,
         totp_lockout_attempts=totp_lockout_attempts,

@@ -314,7 +314,7 @@ class PersistentClaude:
             except OSError:
                 pass
 
-    async def send(self, prompt: str | list) -> AsyncIterator[StreamEvent]:
+    async def send(self, prompt: str | list, chat_id: int | None = None) -> AsyncIterator[StreamEvent]:
         """
         Send a message to Claude and yield streaming events.
 
@@ -325,16 +325,20 @@ class PersistentClaude:
         Args:
             prompt: Either a text string or a list of content blocks (for
                 multi-modal messages like images).
+            chat_id: Optional Telegram chat ID of the user. When provided
+                on the first message of a session, it's included in the
+                context so inner Claude can route API calls to the correct
+                user. Forward-compatible with Phase 3 per-user subprocesses.
 
         Yields:
             StreamEvent objects with accumulated text. The final event has
             done=True and includes the complete ClaudeResponse.
         """
         async with self._lock:
-            async for event in self._send_locked(prompt):
+            async for event in self._send_locked(prompt, chat_id=chat_id):
                 yield event
 
-    async def _send_locked(self, prompt: str | list) -> AsyncIterator[StreamEvent]:
+    async def _send_locked(self, prompt: str | list, chat_id: int | None = None) -> AsyncIterator[StreamEvent]:
         """
         Core message-sending logic (must be called while holding self._lock).
 
@@ -489,6 +493,18 @@ class PersistentClaude:
                     "— they provide better results.]"
                 )
                 parts.append("\n".join(svc_lines))
+
+            # Include chat_id so inner Claude can pass it back in API
+            # calls for correct multi-user routing. Without this, all
+            # API calls route to the default admin user.
+            if chat_id is not None:
+                parts.append(
+                    f"[Your chat_id for API calls: {chat_id}. Include "
+                    f'"chat_id": {chat_id} in the JSON body of all '
+                    f"POST requests to /api/schedule, /api/send-message, "
+                    f"and /api/send-file so responses route to the "
+                    f"correct user.]"
+                )
 
             if parts:
                 prefix = "\n\n".join(parts) + "\n\n"

@@ -108,7 +108,7 @@ def _make_claude_mock(text="The response", success=True, error=None):
     """
     mock_claude = MagicMock()
 
-    async def fake_send(prompt):
+    async def fake_send(prompt, chat_id=None):
         event = MagicMock()
         event.done = True
         event.response = MagicMock()
@@ -445,7 +445,7 @@ class TestJobCallbackClaude:
         """When the stream ends without a done event, logs warning and returns."""
         mock_claude = MagicMock()
 
-        async def empty_send(prompt):
+        async def empty_send(prompt, chat_id=None):
             # Yield a non-done event, then end
             event = MagicMock()
             event.done = False

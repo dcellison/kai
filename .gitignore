@@ -5,6 +5,10 @@
 # Service config (user-specific, contains service selections)
 services.yaml
 
+# User and workspace config (contains user IDs and local paths)
+users.yaml
+workspaces.yaml
+
 # Python
 __pycache__/
 *.pyc

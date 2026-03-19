@@ -259,6 +259,21 @@ def _require_secret(handler):
     return wrapper
 
 
+def _resolve_chat_id(request: web.Request, payload: dict) -> int:
+    """
+    Extract chat_id from the request payload if present, otherwise
+    fall back to the app-level default.
+
+    This allows the inner Claude process to specify which user a
+    message/file/job belongs to, while remaining backward-compatible
+    with callers that don't pass chat_id.
+    """
+    explicit = payload.get("chat_id")
+    if explicit is not None:
+        return int(explicit)
+    return request.app["chat_id"]
+
+
 # ── GitHub event formatters ───────────────────────────────────────────
 # Each formatter takes a GitHub webhook payload dict and returns a formatted
 # Markdown string for Telegram, or None if the event should be silently ignored.
@@ -678,7 +693,7 @@ async def _handle_schedule(request: web.Request) -> web.Response:
         )
     auto_remove = payload.get("auto_remove", False)
     notify_on_check = payload.get("notify_on_check", False)
-    chat_id = request.app["chat_id"]
+    chat_id = _resolve_chat_id(request, payload)
 
     # schedule_data can arrive as a JSON object or a pre-serialized string
     if isinstance(schedule_data, dict):
@@ -722,7 +737,13 @@ async def _handle_get_jobs(request: web.Request) -> web.Response:
     without needing to parse Telegram bot command output.
     """
 
-    chat_id = request.app["chat_id"]
+    # GET requests use a query parameter for chat_id routing
+    # instead of a JSON body (more conventional for GET endpoints).
+    raw_chat_id = request.query.get("chat_id")
+    if raw_chat_id is not None:
+        chat_id = int(raw_chat_id)
+    else:
+        chat_id = request.app["chat_id"]
     jobs = await sessions.get_jobs(chat_id)
     return web.json_response(jobs)
 
@@ -928,7 +949,7 @@ async def _handle_send_message(request: web.Request) -> web.Response:
         return web.json_response({"error": "Missing required field: text"}, status=400)
 
     bot = request.app["telegram_bot"]
-    chat_id = request.app["chat_id"]
+    chat_id = _resolve_chat_id(request, payload)
 
     try:
         # Telegram limits messages to 4096 characters. Split long messages
@@ -1008,7 +1029,7 @@ async def _handle_send_file(request: web.Request) -> web.Response:
         return web.json_response({"error": f"File not found: {file_path}"}, status=404)
 
     bot = request.app["telegram_bot"]
-    chat_id = request.app["chat_id"]
+    chat_id = _resolve_chat_id(request, payload)
     caption = payload.get("caption", "")
 
     # Send images as photos (Telegram renders them inline) and everything
@@ -1135,13 +1156,31 @@ async def start(telegram_app, config) -> None:
     _app["telegram_bot"] = telegram_app.bot
     _app["webhook_secret"] = config.webhook_secret
 
-    # Use first allowed user ID as the notification target.
-    # Config validation ensures allowed_user_ids is non-empty, but guard
-    # against edge cases to avoid a StopIteration crash at startup.
-    chat_id = next(iter(config.allowed_user_ids), None)
-    if chat_id is None:
-        raise SystemExit("No allowed user IDs configured; cannot start webhook server")
-    _app["chat_id"] = chat_id
+    # Set the default chat_id for API calls that don't specify a target.
+    # When users.yaml exists, the first admin is the default. When no
+    # admin is defined, fall back to the first user with a warning.
+    # Without users.yaml, use the first ALLOWED_USER_IDS entry.
+    if config.user_configs:
+        admins = config.get_admins()
+        if admins:
+            _app["chat_id"] = admins[0].telegram_id
+        else:
+            # No admin defined - fall back to arbitrary first user.
+            fallback = next(iter(config.user_configs.values()))
+            log.warning(
+                "No admin users defined in users.yaml; using %s "
+                "(telegram_id: %d) as default webhook target. "
+                "External notifications may route unexpectedly.",
+                fallback.name,
+                fallback.telegram_id,
+            )
+            _app["chat_id"] = fallback.telegram_id
+    else:
+        # Legacy: ALLOWED_USER_IDS only
+        chat_id = next(iter(config.allowed_user_ids), None)
+        if chat_id is None:
+            raise SystemExit("No allowed user IDs configured; cannot start webhook server")
+        _app["chat_id"] = chat_id
 
     # Store workspace path for send-file path confinement
     _app["workspace"] = str(config.claude_workspace)

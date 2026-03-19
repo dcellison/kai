@@ -50,6 +50,8 @@ def mock_request():
     request.app["telegram_app"].job_queue = job_queue
     request.headers = {}
     request.match_info = {}
+    # Multidict-like query object for GET parameter access
+    request.query = {}
     return request
 
 
