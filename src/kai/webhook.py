@@ -273,7 +273,9 @@ def _resolve_chat_id(request: web.Request, payload: dict) -> int:
     """
     explicit = payload.get("chat_id")
     if explicit is not None:
-        # Reject floats (int(12345.6) silently truncates) and non-numeric values
+        # Reject bools (int(True) == 1) and non-integer floats
+        if isinstance(explicit, bool):
+            raise ValueError(f"chat_id must be an integer, got {explicit!r}")
         if isinstance(explicit, float) and not float(explicit).is_integer():
             raise ValueError(f"chat_id must be an integer, got {explicit!r}")
         try:

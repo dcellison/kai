@@ -24,6 +24,7 @@ from kai.webhook import (
     _handle_service_call,
     _handle_telegram_update,
     _handle_update_job,
+    _resolve_chat_id,
     update_workspace,
 )
 
@@ -1174,3 +1175,118 @@ class TestServiceCall:
         resp = await _handle_service_call(service_request)
 
         assert resp.status == 401
+
+
+# ── _resolve_chat_id ────────────────────────────────────────────────
+
+
+class TestResolveChatId:
+    def _make_request(self, app_chat_id=12345):
+        """Create a minimal mock request with an app-level chat_id."""
+        request = MagicMock()
+        request.app = {"chat_id": app_chat_id}
+        return request
+
+    def test_explicit_chat_id(self):
+        """Uses chat_id from payload when present."""
+        request = self._make_request(app_chat_id=99999)
+        assert _resolve_chat_id(request, {"chat_id": 42}) == 42
+
+    def test_fallback_to_app_default(self):
+        """Falls back to app-level chat_id when payload has no chat_id."""
+        request = self._make_request(app_chat_id=12345)
+        assert _resolve_chat_id(request, {}) == 12345
+
+    def test_invalid_non_numeric(self):
+        """Raises ValueError for non-numeric chat_id."""
+        request = self._make_request()
+        with pytest.raises(ValueError, match="must be an integer"):
+            _resolve_chat_id(request, {"chat_id": "abc"})
+
+    def test_invalid_float(self):
+        """Raises ValueError for non-integer float chat_id."""
+        request = self._make_request()
+        with pytest.raises(ValueError, match="must be an integer"):
+            _resolve_chat_id(request, {"chat_id": 12345.6})
+
+    def test_invalid_bool(self):
+        """Raises ValueError for boolean chat_id."""
+        request = self._make_request()
+        with pytest.raises(ValueError, match="must be an integer"):
+            _resolve_chat_id(request, {"chat_id": True})
+
+    def test_integer_like_float_accepted(self):
+        """Integer-like float (e.g. 42.0) is accepted."""
+        request = self._make_request()
+        assert _resolve_chat_id(request, {"chat_id": 42.0}) == 42
+
+    def test_string_integer_accepted(self):
+        """String-encoded integer (e.g. from JSON) is accepted."""
+        request = self._make_request()
+        assert _resolve_chat_id(request, {"chat_id": "42"}) == 42
+
+
+class TestGetJobsChatIdRouting:
+    @pytest.mark.asyncio
+    async def test_query_param_routes_to_user(self, db, mock_request):
+        """GET /api/jobs?chat_id=456 returns jobs for that user."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.query = {"chat_id": "456"}
+
+        # Create a job for user 456
+        await sessions.create_job(
+            chat_id=456,
+            name="User 456 Job",
+            job_type="reminder",
+            prompt="hello",
+            schedule_type="daily",
+            schedule_data='{"times": ["09:00"]}',
+        )
+
+        resp = await _handle_get_jobs(mock_request)
+        body = json.loads(resp.body.decode())
+        assert len(body) == 1
+        assert body[0]["name"] == "User 456 Job"
+
+    @pytest.mark.asyncio
+    async def test_invalid_query_param_returns_400(self, db, mock_request):
+        """GET /api/jobs?chat_id=abc returns 400."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.query = {"chat_id": "abc"}
+
+        resp = await _handle_get_jobs(mock_request)
+        assert resp.status == 400
+
+
+class TestScheduleChatIdRouting:
+    @pytest.mark.asyncio
+    async def test_explicit_chat_id_in_body(self, db, mock_request):
+        """POST /api/schedule with chat_id routes job to that user."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.app["telegram_app"].job_queue = MagicMock()
+        mock_request.app["telegram_app"].job_queue.jobs.return_value = []
+
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "Routed Job",
+                "prompt": "test",
+                "schedule_type": "daily",
+                "schedule_data": {"times": ["09:00"]},
+                "chat_id": 456,
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+        assert resp.status == 200
+
+        # Verify the job was created for user 456, not 123
+        jobs = await sessions.get_jobs(456)
+        assert len(jobs) == 1
+        assert jobs[0]["name"] == "Routed Job"
+
+        # User 123 should have no jobs
+        jobs_123 = await sessions.get_jobs(123)
+        assert len(jobs_123) == 0
