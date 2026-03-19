@@ -1,7 +1,7 @@
 # Contributing to Kai
 
 Thanks for your interest in contributing to Kai. This document covers
-what you need to know before opening a pull request.
+how the project accepts contributions and what to expect.
 
 ## How to Contribute
 
