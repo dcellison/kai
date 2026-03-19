@@ -4,7 +4,7 @@ PR review agent - one-shot Claude subprocess for automated code review.
 Provides functionality to:
 1. Fetch PR diffs and metadata via the GitHub CLI
 2. Construct boundary-delimited review prompts (prompt injection prevention)
-3. Resolve spec content from linked GitHub issues for compliance checking
+3. Resolve and load spec files from the local filesystem for compliance checking
 4. Spawn a one-shot Claude subprocess in --print mode for review
 5. Post review output as a GitHub PR comment via gh CLI
 6. Send review summaries to Telegram via the send-message API
@@ -24,9 +24,9 @@ hitting shell argument length limits. Output is captured as plain text.
 """
 
 import asyncio
+import glob as glob_mod
 import json
 import logging
-import re
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
@@ -111,100 +111,141 @@ def extract_pr_metadata(payload: dict) -> PRMetadata:
 
 
 # ── Spec resolution ─────────────────────────────────────────────────
+#
+# Specs are loaded from the LOCAL FILESYSTEM only. Issue-body fetching
+# (load_spec_from_issue, PR #88) was removed because it piped untrusted
+# external content directly into a Claude session, creating a prompt
+# injection surface. Random boundary tokens (PR #90) prevent structural
+# injection (delimiter escape) but not semantic injection (content
+# inside the boundary influencing Claude's behavior).
+#
+# The security principle: don't build pipelines from external content
+# to LLM sessions. A human reads the issue, copies relevant content to
+# a local spec file, and references it in the PR. The human is the
+# firewall. This also avoids establishing a pattern that future agents
+# (which may have tools) could inherit.
 
-# Pattern matching GitHub issue-closing keywords followed by #N.
-# Supports: fixes, fixed, fix, closes, closed, close, resolves, resolved, resolve.
-# Case-insensitive. Only matches same-repo references (#N), not cross-repo (owner/repo#N).
-# Use [^\S\n]+ (non-newline whitespace) instead of \s+ to avoid matching
-# across line breaks, which GitHub does not recognize as valid syntax.
-_ISSUE_REF_PATTERN = re.compile(
-    r"\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)[^\S\n]+#(\d+)\b",
-    re.IGNORECASE,
-)
 
-
-async def load_spec_from_issue(repo: str, description: str) -> str | None:
+def resolve_spec_from_body(description: str) -> str | None:
     """
-    Load spec content from GitHub issues linked in the PR description.
+    Extract a spec file path from a 'spec: <path>' marker in the PR body.
 
-    Scans the PR body for GitHub issue-closing keywords (fixes #N,
-    closes #N, resolves #N, etc.) and fetches the linked issue bodies
-    via the GitHub API. Multiple issue references are concatenated.
-
-    This replaces the old filesystem-based spec loading (resolve_spec_from_body,
-    resolve_spec_from_branch, load_spec) which had a path traversal vulnerability
-    and exposed local directory structure.
+    Scans the PR description line by line for a line starting with 'spec:'
+    (case-insensitive). Returns the path portion, stripped of whitespace.
 
     Args:
-        repo: Full repository name (e.g., "dcellison/kai").
         description: The PR body/description text.
 
     Returns:
-        Concatenated issue body content, or None if no issue links found
-        or all API calls fail.
+        The spec file path string, or None if no marker is found.
     """
-    if not description:
+    for line in description.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("spec:"):
+            path = stripped[5:].strip()
+            if path:
+                return path
+    return None
+
+
+def resolve_spec_from_branch(branch: str, repo_path: str, spec_dir: str = "specs") -> str | None:
+    """
+    Find a spec file matching the branch name by glob pattern.
+
+    Strips the branch prefix (everything before the first '/') and
+    searches the configured spec directory for a matching markdown file.
+    Returns the first match (sorted alphabetically), or None if no
+    match is found.
+
+    Only works for repos that exist locally on the machine. Remote-only
+    repos will not have a local specs directory to search.
+
+    Args:
+        branch: The source branch name (e.g., "feature/pr-review-routing").
+        repo_path: Absolute path to the local repo checkout.
+        spec_dir: Spec directory relative to repo root (default: "specs").
+
+    Returns:
+        Absolute path to the matching spec file, or None if not found.
+    """
+    # Strip branch prefix (e.g., "feature/", "fix/") to get the
+    # descriptive part. Split on first "/" handles any prefix convention
+    # without maintaining a hardcoded list.
+    name = branch.split("/", 1)[-1] if "/" in branch else branch
+
+    specs_dir = Path(repo_path) / spec_dir
+    if not specs_dir.is_dir():
         return None
 
-    # Find all issue references (deduplicate, preserve order)
-    seen: set[int] = set()
-    issue_numbers: list[int] = []
-    for match in _ISSUE_REF_PATTERN.finditer(description):
-        num = int(match.group(1))
-        if num not in seen:
-            seen.add(num)
-            issue_numbers.append(num)
+    # Glob for spec files containing the branch name fragment
+    pattern = str(specs_dir / f"*{name}*.md")
+    matches = sorted(glob_mod.glob(pattern))
+    return matches[0] if matches else None
 
-    if not issue_numbers:
+
+async def load_spec(
+    metadata: PRMetadata,
+    local_repo_path: str | None = None,
+    spec_dir: str = "specs",
+) -> str | None:
+    """
+    Attempt to load a spec file for the PR being reviewed.
+
+    Specs are loaded from the local filesystem only - never from external
+    sources like GitHub issue bodies. This is a deliberate security choice:
+    external content piped into an LLM session is a prompt injection
+    surface (see module-level comment above).
+
+    Tries two resolution strategies in order:
+    1. Explicit 'spec: <path>' marker in the PR body
+    2. Branch name matching against the configured spec directory
+
+    The body marker path is resolved relative to local_repo_path and
+    contained within it (path traversal prevention). Branch-name matching
+    searches the spec_dir subdirectory.
+
+    Args:
+        metadata: PR metadata with description and branch name.
+        local_repo_path: Optional absolute path to a local repo checkout.
+        spec_dir: Spec directory relative to repo root (default: "specs").
+
+    Returns:
+        The spec file content as a string, or None if no spec is found.
+    """
+    if not local_repo_path:
         return None
 
-    # Fetch each issue body via gh API
-    specs: list[str] = []
-    for issue_num in issue_numbers:
+    repo_root = Path(local_repo_path).resolve()
+
+    # Strategy 1: explicit marker in PR body
+    spec_path = resolve_spec_from_body(metadata.description)
+    if spec_path:
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "gh",
-                "api",
-                f"repos/{repo}/issues/{issue_num}",
-                "--jq",
-                '.body // ""',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            # Timeout prevents a hung gh invocation from blocking the
-            # review indefinitely, especially with multiple issue refs.
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-            except TimeoutError:
-                proc.kill()
-                await proc.wait()
-                log.warning("Timed out fetching issue #%d from %s", issue_num, repo)
-                continue
+            # Resolve and contain the path within the repo root to
+            # prevent path traversal attacks. A malicious PR body
+            # with "spec: ../../etc/kai/env" would resolve outside
+            # the repo; relative_to() raises ValueError in that case.
+            full_path = (repo_root / spec_path).resolve()
+            full_path.relative_to(repo_root)  # raises ValueError if outside
+            content = full_path.read_text()
+            log.info("Loaded spec from PR body marker: %s", spec_path)
+            return content
+        except ValueError:
+            log.warning("Spec path traversal blocked: %s", spec_path)
+        except OSError:
+            log.warning("Failed to read spec from body marker: %s", spec_path)
 
-            if proc.returncode != 0:
-                error = stderr.decode().strip()
-                log.warning(
-                    "Failed to fetch issue #%d from %s: %s",
-                    issue_num,
-                    repo,
-                    error,
-                )
-                continue
+    # Strategy 2: branch name matching against configured spec directory
+    local_spec = resolve_spec_from_branch(metadata.branch, local_repo_path, spec_dir)
+    if local_spec:
+        try:
+            content = Path(local_spec).read_text()
+            log.info("Loaded spec from branch name match: %s", local_spec)
+            return content
+        except OSError:
+            log.warning("Failed to read local spec: %s", local_spec)
 
-            body = stdout.decode().strip()
-            if body:
-                specs.append(f"## Issue #{issue_num}\n\n{body}")
-                log.info("Loaded spec from issue #%d in %s", issue_num, repo)
-
-        except Exception:
-            log.warning(
-                "Failed to fetch issue #%d from %s",
-                issue_num,
-                repo,
-                exc_info=True,
-            )
-
-    return "\n\n---\n\n".join(specs) if specs else None
+    return None
 
 
 async def load_conventions(
@@ -716,6 +757,7 @@ async def review_pr(
     webhook_secret: str,
     claude_user: str | None = None,
     local_repo_path: str | None = None,
+    spec_dir: str = "specs",
 ) -> None:
     """
     Full review pipeline: fetch diff, build prompt, run review, post results.
@@ -733,7 +775,8 @@ async def review_pr(
         webhook_port: Local webhook server port.
         webhook_secret: Webhook secret for API auth.
         claude_user: Optional OS user for the Claude subprocess.
-        local_repo_path: Optional path to local repo checkout for conventions.
+        local_repo_path: Optional path to local repo checkout for spec/convention loading.
+        spec_dir: Spec directory relative to repo root (default: "specs").
     """
     metadata = extract_pr_metadata(payload)
 
@@ -745,8 +788,9 @@ async def review_pr(
             log.info("Empty diff for %s#%d, skipping review", metadata.repo, metadata.number)
             return
 
-        # Step 1.5: Load spec from linked GitHub issues (fixes #N, closes #N)
-        spec = await load_spec_from_issue(metadata.repo, metadata.description)
+        # Step 1.5: Load spec from local filesystem (body marker or branch match).
+        # Specs are local-only to prevent prompt injection from external content.
+        spec = await load_spec(metadata, local_repo_path, spec_dir)
 
         # Step 1.6: Load project conventions from CLAUDE.md (issue #58)
         conventions = await load_conventions(metadata, local_repo_path)

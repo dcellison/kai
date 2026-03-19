@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kai.review import (
-    _ISSUE_REF_PATTERN,
     _MAX_DIFF_CHARS,
     _MAX_PRIOR_COMMENTS_CHARS,
     _REVIEW_HEADER,
@@ -17,8 +16,10 @@ from kai.review import (
     fetch_pr_diff,
     fetch_prior_comments,
     load_conventions,
-    load_spec_from_issue,
+    load_spec,
     post_review_comment,
+    resolve_spec_from_body,
+    resolve_spec_from_branch,
     review_pr,
     run_review,
     send_review_summary,
@@ -778,13 +779,13 @@ class TestReviewPR:
         assert mock_summary.call_args[0][1] is False
 
     @pytest.mark.asyncio
-    async def test_spec_injected_from_issue(self):
-        """When load_spec_from_issue returns content, it is passed to build_review_prompt."""
+    async def test_spec_injected_into_prompt(self):
+        """When load_spec returns content, it is passed to build_review_prompt."""
         payload = _webhook_payload()
 
         with (
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
-            patch("kai.review.load_spec_from_issue", return_value="Must implement feature Y.") as mock_load,
+            patch("kai.review.load_spec", return_value="Must implement feature Y.") as mock_load,
             patch("kai.review.load_conventions", return_value=None),
             patch("kai.review.fetch_prior_comments", return_value=None),
             patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
@@ -799,13 +800,33 @@ class TestReviewPR:
         assert mock_build.call_args[1].get("spec") == "Must implement feature Y."
 
     @pytest.mark.asyncio
+    async def test_passes_spec_dir_to_load_spec(self):
+        """spec_dir is forwarded from review_pr to load_spec."""
+        payload = _webhook_payload()
+
+        with (
+            patch("kai.review.fetch_pr_diff", return_value="diff content"),
+            patch("kai.review.load_spec", return_value=None) as mock_load,
+            patch("kai.review.load_conventions", return_value=None),
+            patch("kai.review.fetch_prior_comments", return_value=None),
+            patch("kai.review.build_review_prompt", return_value="prompt"),
+            patch("kai.review.run_review", return_value="review output"),
+            patch("kai.review.post_review_comment", return_value=True),
+            patch("kai.review.send_review_summary"),
+        ):
+            await review_pr(payload, 8080, "secret", local_repo_path="/repo", spec_dir="my/specs")
+
+        # Verify spec_dir was passed through to load_spec
+        assert mock_load.call_args[0][2] == "my/specs"
+
+    @pytest.mark.asyncio
     async def test_conventions_injected_into_prompt(self):
         """When load_conventions returns content, it is passed to build_review_prompt."""
         payload = _webhook_payload()
 
         with (
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
-            patch("kai.review.load_spec_from_issue", return_value=None),
+            patch("kai.review.load_spec", return_value=None),
             patch("kai.review.load_conventions", return_value="Use snake_case.") as mock_conv,
             patch("kai.review.fetch_prior_comments", return_value=None),
             patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
@@ -825,7 +846,7 @@ class TestReviewPR:
 
         with (
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
-            patch("kai.review.load_spec_from_issue", return_value=None),
+            patch("kai.review.load_spec", return_value=None),
             patch("kai.review.load_conventions", return_value=None) as mock_conv,
             patch("kai.review.fetch_prior_comments", return_value=None),
             patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
@@ -846,7 +867,7 @@ class TestReviewPR:
 
         with (
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
-            patch("kai.review.load_spec_from_issue", return_value=None),
+            patch("kai.review.load_spec", return_value=None),
             patch("kai.review.load_conventions", return_value=None),
             patch("kai.review.fetch_prior_comments", return_value=prior_thread) as mock_prior,
             patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
@@ -866,7 +887,7 @@ class TestReviewPR:
 
         with (
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
-            patch("kai.review.load_spec_from_issue", return_value=None),
+            patch("kai.review.load_spec", return_value=None),
             patch("kai.review.load_conventions", return_value=None),
             patch("kai.review.fetch_prior_comments", return_value=None),
             patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
@@ -880,226 +901,217 @@ class TestReviewPR:
         assert mock_build.call_args[1].get("prior_comments") is None
 
 
-# ── Issue ref pattern ─────────────────────────────────────────────
+# ── resolve_spec_from_body ─────────────────────────────────────────
 
 
-class TestIssueRefPattern:
-    """Tests for the regex that extracts issue references from PR bodies."""
-
-    def test_fixes(self):
-        assert _ISSUE_REF_PATTERN.findall("fixes #42") == ["42"]
-
-    def test_fixed(self):
-        assert _ISSUE_REF_PATTERN.findall("fixed #42") == ["42"]
-
-    def test_fix(self):
-        assert _ISSUE_REF_PATTERN.findall("fix #42") == ["42"]
-
-    def test_closes(self):
-        assert _ISSUE_REF_PATTERN.findall("closes #99") == ["99"]
-
-    def test_closed(self):
-        assert _ISSUE_REF_PATTERN.findall("closed #99") == ["99"]
-
-    def test_close(self):
-        assert _ISSUE_REF_PATTERN.findall("close #99") == ["99"]
-
-    def test_resolves(self):
-        assert _ISSUE_REF_PATTERN.findall("resolves #7") == ["7"]
-
-    def test_resolved(self):
-        assert _ISSUE_REF_PATTERN.findall("resolved #7") == ["7"]
-
-    def test_resolve(self):
-        assert _ISSUE_REF_PATTERN.findall("resolve #7") == ["7"]
+class TestResolveSpecFromBody:
+    def test_found(self):
+        """Extracts path from a 'spec: <path>' line in the PR body."""
+        body = "This PR implements the new feature.\nspec: workspace/specs/my-spec.md\n"
+        assert resolve_spec_from_body(body) == "workspace/specs/my-spec.md"
 
     def test_case_insensitive(self):
-        assert _ISSUE_REF_PATTERN.findall("Fixes #42") == ["42"]
-        assert _ISSUE_REF_PATTERN.findall("CLOSES #42") == ["42"]
+        """Spec marker is matched case-insensitively."""
+        body = "Spec: path/to/spec.md"
+        assert resolve_spec_from_body(body) == "path/to/spec.md"
 
-    def test_multiple_refs(self):
-        body = "This PR fixes #42 and closes #87."
-        assert _ISSUE_REF_PATTERN.findall(body) == ["42", "87"]
+    def test_not_found(self):
+        """Returns None when no spec marker is present."""
+        body = "Just a normal PR description.\nNo spec here."
+        assert resolve_spec_from_body(body) is None
 
-    def test_no_match(self):
-        assert _ISSUE_REF_PATTERN.findall("Just a normal PR.") == []
+    def test_empty_path(self):
+        """Returns None when 'spec:' has no path after the colon."""
+        body = "spec:  \nMore text."
+        assert resolve_spec_from_body(body) is None
 
-    def test_spec_marker_ignored(self):
-        """The old 'spec: path' marker is not matched."""
-        assert _ISSUE_REF_PATTERN.findall("spec: workspace/specs/foo.md") == []
+    def test_empty_description(self):
+        """Returns None for an empty description string."""
+        assert resolve_spec_from_body("") is None
 
-    def test_embedded_in_sentence(self):
-        body = "This change fixes #42 by adding a guard clause."
-        assert _ISSUE_REF_PATTERN.findall(body) == ["42"]
-
-    def test_cross_repo_not_matched(self):
-        """Cross-repo refs (owner/repo#N) are not matched in v1."""
-        assert _ISSUE_REF_PATTERN.findall("fixes dcellison/kai#42") == []
-
-    def test_newline_between_keyword_and_ref(self):
-        """Keyword and #N on separate lines should not match."""
-        assert _ISSUE_REF_PATTERN.findall("fix\n#42") == []
+    def test_whitespace_around_marker(self):
+        """Handles leading/trailing whitespace on the spec line."""
+        body = "  spec:   workspace/specs/my-spec.md  "
+        assert resolve_spec_from_body(body) == "workspace/specs/my-spec.md"
 
 
-# ── load_spec_from_issue ──────────────────────────────────────────
+# ── resolve_spec_from_branch ───────────────────────────────────────
 
 
-class TestLoadSpecFromIssue:
+class TestResolveSpecFromBranch:
+    def test_found(self, tmp_path):
+        """Finds a spec file matching the branch name fragment."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        spec_file = specs_dir / "issue-54-pr-review-routing.md"
+        spec_file.write_text("spec content")
+
+        result = resolve_spec_from_branch("feature/pr-review-routing", str(tmp_path), spec_dir="workspace/specs")
+        assert result == str(spec_file)
+
+    def test_no_match(self, tmp_path):
+        """Returns None when no spec files match the branch name."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        (specs_dir / "unrelated-spec.md").write_text("content")
+
+        result = resolve_spec_from_branch("feature/something-else", str(tmp_path), spec_dir="workspace/specs")
+        assert result is None
+
+    def test_no_specs_dir(self, tmp_path):
+        """Returns None when the spec directory does not exist."""
+        result = resolve_spec_from_branch("feature/anything", str(tmp_path), spec_dir="workspace/specs")
+        assert result is None
+
+    def test_strips_prefix(self, tmp_path):
+        """Strips everything before the first '/' before matching."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        spec_file = specs_dir / "some-bug-fix.md"
+        spec_file.write_text("content")
+
+        for prefix in ("fix", "docs", "custom"):
+            assert resolve_spec_from_branch(f"{prefix}/some-bug-fix", str(tmp_path), spec_dir="workspace/specs") == str(
+                spec_file
+            )
+
+    def test_no_prefix_branch(self, tmp_path):
+        """Branches without a '/' are used as-is for matching."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        spec_file = specs_dir / "my-branch-spec.md"
+        spec_file.write_text("content")
+
+        result = resolve_spec_from_branch("my-branch", str(tmp_path), spec_dir="workspace/specs")
+        assert result == str(spec_file)
+
+    def test_first_match_sorted(self, tmp_path):
+        """When multiple specs match, returns the first alphabetically."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        (specs_dir / "a-routing.md").write_text("a")
+        (specs_dir / "b-routing.md").write_text("b")
+
+        result = resolve_spec_from_branch("feature/routing", str(tmp_path), spec_dir="workspace/specs")
+        assert result == str(specs_dir / "a-routing.md")
+
+    def test_default_dir(self, tmp_path):
+        """Default spec_dir uses 'specs' at repo root."""
+        specs_dir = tmp_path / "specs"
+        specs_dir.mkdir()
+        spec_file = specs_dir / "my-spec.md"
+        spec_file.write_text("default dir spec")
+
+        result = resolve_spec_from_branch("feature/my-spec", str(tmp_path))
+        assert result == str(spec_file)
+
+
+# ── load_spec ──────────────────────────────────────────────────────
+
+
+class TestLoadSpec:
     @pytest.mark.asyncio
-    async def test_happy_path(self):
-        """Fetches issue body when PR description has fixes #N."""
-        mock_proc = AsyncMock()
-        mock_proc.returncode = 0
-        mock_proc.communicate.return_value = (b"## Problem\n\nThe spec content.", b"")
+    async def test_body_marker_priority(self, tmp_path):
+        """Body marker takes priority over branch name matching."""
+        spec_from_body = tmp_path / "workspace" / "specs" / "explicit.md"
+        spec_from_body.parent.mkdir(parents=True)
+        spec_from_body.write_text("body spec content")
 
-        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-            result = await load_spec_from_issue("owner/repo", "This PR fixes #42")
+        spec_from_branch = tmp_path / "workspace" / "specs" / "branch-match.md"
+        spec_from_branch.write_text("branch spec content")
 
-        assert result is not None
-        assert "## Issue #42" in result
-        assert "The spec content." in result
+        meta = _metadata(
+            description="spec: workspace/specs/explicit.md",
+            branch="feature/branch-match",
+        )
+
+        result = await load_spec(meta, local_repo_path=str(tmp_path), spec_dir="workspace/specs")
+        assert result == "body spec content"
 
     @pytest.mark.asyncio
-    async def test_no_issue_link(self):
-        """Returns None when no issue-closing keywords are in the description."""
-        result = await load_spec_from_issue("owner/repo", "Just a normal PR description.")
+    async def test_falls_back_to_branch(self, tmp_path):
+        """Uses branch name matching when no body marker is present."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        (specs_dir / "issue-99-my-feature.md").write_text("branch spec")
+
+        meta = _metadata(description="No spec marker here.", branch="feature/my-feature")
+
+        result = await load_spec(meta, local_repo_path=str(tmp_path), spec_dir="workspace/specs")
+        assert result == "branch spec"
+
+    @pytest.mark.asyncio
+    async def test_no_spec_found(self, tmp_path):
+        """Returns None when neither strategy finds a spec."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+
+        meta = _metadata(description="No spec.", branch="feature/no-match")
+
+        result = await load_spec(meta, local_repo_path=str(tmp_path), spec_dir="workspace/specs")
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_empty_description(self):
-        """Returns None for an empty description."""
-        result = await load_spec_from_issue("owner/repo", "")
+    async def test_no_local_repo_path(self):
+        """Returns None immediately when local_repo_path is not provided."""
+        meta = _metadata(description="spec: workspace/specs/something.md")
+        result = await load_spec(meta, local_repo_path=None)
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_none_description(self):
-        """Returns None for a None description."""
-        result = await load_spec_from_issue("owner/repo", None)
+    async def test_body_marker_file_missing(self, tmp_path):
+        """Falls back to branch matching when body-referenced file does not exist."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        (specs_dir / "fallback-spec.md").write_text("fallback content")
+
+        meta = _metadata(
+            description="spec: workspace/specs/nonexistent.md",
+            branch="feature/fallback",
+        )
+
+        result = await load_spec(meta, local_repo_path=str(tmp_path), spec_dir="workspace/specs")
+        assert result == "fallback content"
+
+    @pytest.mark.asyncio
+    async def test_path_traversal_blocked(self, tmp_path):
+        """Spec paths that escape the repo root are blocked."""
+        # Create a file outside the repo root that the attacker wants to read
+        secret = tmp_path / "secret.txt"
+        secret.write_text("sensitive data")
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        meta = _metadata(description="spec: ../secret.txt")
+
+        result = await load_spec(meta, local_repo_path=str(repo))
+        # Should NOT have read the file
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_api_failure(self):
-        """Logs warning and continues when gh API call fails."""
-        mock_proc = AsyncMock()
-        mock_proc.returncode = 1
-        mock_proc.communicate.return_value = (b"", b"Not Found")
+    async def test_absolute_path_traversal_blocked(self, tmp_path):
+        """Absolute spec paths are blocked (they escape the repo root)."""
+        secret = tmp_path / "secret.txt"
+        secret.write_text("sensitive data")
 
-        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-            result = await load_spec_from_issue("owner/repo", "fixes #999")
+        repo = tmp_path / "repo"
+        repo.mkdir()
 
+        meta = _metadata(description=f"spec: {secret}")
+
+        result = await load_spec(meta, local_repo_path=str(repo))
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_multiple_issues_concatenated(self):
-        """Multiple issue refs are fetched and concatenated."""
-        call_count = 0
+    async def test_passes_spec_dir_to_branch_resolver(self):
+        """spec_dir is forwarded to resolve_spec_from_branch."""
+        meta = _metadata(description="No marker.", branch="feature/thing")
 
-        async def mock_exec(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            proc = AsyncMock()
-            proc.returncode = 0
-            # Return different content for each issue
-            issue_num = args[2].split("/")[-1]  # repos/owner/repo/issues/N
-            proc.communicate.return_value = (f"Content for issue {issue_num}".encode(), b"")
-            return proc
+        with patch("kai.review.resolve_spec_from_branch", return_value=None) as mock_resolve:
+            await load_spec(meta, local_repo_path="/repo", spec_dir="custom/path")
 
-        with patch("asyncio.create_subprocess_exec", side_effect=mock_exec):
-            result = await load_spec_from_issue("owner/repo", "fixes #42, closes #87")
-
-        assert result is not None
-        assert "## Issue #42" in result
-        assert "## Issue #87" in result
-        assert "---" in result  # separator between issues
-        assert call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_duplicate_refs_deduplicated(self):
-        """Same issue number referenced twice is only fetched once."""
-        call_count = 0
-
-        async def mock_exec(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            proc = AsyncMock()
-            proc.returncode = 0
-            proc.communicate.return_value = (b"Issue content", b"")
-            return proc
-
-        with patch("asyncio.create_subprocess_exec", side_effect=mock_exec):
-            result = await load_spec_from_issue("owner/repo", "fixes #42 and also closes #42")
-
-        assert result is not None
-        assert call_count == 1  # only fetched once
-
-    @pytest.mark.asyncio
-    async def test_partial_failure(self):
-        """If one issue fails but another succeeds, returns the successful one."""
-        call_count = 0
-
-        async def mock_exec(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            proc = AsyncMock()
-            issue_num = args[2].split("/")[-1]
-            if issue_num == "42":
-                proc.returncode = 0
-                proc.communicate.return_value = (b"Good content", b"")
-            else:
-                proc.returncode = 1
-                proc.communicate.return_value = (b"", b"Not Found")
-            return proc
-
-        with patch("asyncio.create_subprocess_exec", side_effect=mock_exec):
-            result = await load_spec_from_issue("owner/repo", "fixes #42, fixes #999")
-
-        assert result is not None
-        assert "## Issue #42" in result
-        assert "#999" not in result
-
-    @pytest.mark.asyncio
-    async def test_empty_issue_body_skipped(self):
-        """Issues with empty bodies are skipped."""
-        mock_proc = AsyncMock()
-        mock_proc.returncode = 0
-        mock_proc.communicate.return_value = (b"", b"")
-
-        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-            result = await load_spec_from_issue("owner/repo", "fixes #42")
-
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_null_issue_body_skipped(self):
-        """Issues with null bodies (no description) are skipped.
-
-        gh --jq '.body' outputs the empty string when piped through
-        '.body // ""' coercion, but without coercion it outputs 'null'.
-        Either way, the result should not appear in the spec.
-        """
-        mock_proc = AsyncMock()
-        mock_proc.returncode = 0
-        # With '.body // ""' coercion, null becomes empty string
-        mock_proc.communicate.return_value = (b"", b"")
-
-        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-            result = await load_spec_from_issue("owner/repo", "fixes #42")
-
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_timeout_handling(self):
-        """Timed-out gh invocations are handled gracefully."""
-        mock_proc = AsyncMock()
-        mock_proc.communicate.side_effect = TimeoutError()
-        mock_proc.kill = MagicMock()
-        mock_proc.wait = AsyncMock()
-
-        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-            result = await load_spec_from_issue("owner/repo", "fixes #42")
-
-        assert result is None
-        mock_proc.kill.assert_called_once()
+        mock_resolve.assert_called_once_with("feature/thing", "/repo", "custom/path")
 
 
 # ── load_conventions ───────────────────────────────────────────────

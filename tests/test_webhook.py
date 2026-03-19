@@ -336,6 +336,7 @@ def _build_test_app(
     app["workspace"] = "/home/user/repo/workspace"
     app["workspace_base"] = None
     app["allowed_workspaces"] = []
+    app["spec_dir"] = "specs"
     # Mock bot that records sent messages
     mock_bot = AsyncMock()
     app["telegram_bot"] = mock_bot

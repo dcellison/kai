@@ -80,10 +80,10 @@ requests with required CI checks.
 5. **Expect an automated review.** Kai runs a PR Review Agent that
    posts a code review comment on every push. It checks for bugs,
    security issues, missing error handling, and style violations. If
-   the PR links an issue (via `fixes #N` or `closes #N`), the agent
-   also checks the implementation against the issue body as a spec.
-   Treat its feedback like any other review - address what's valid,
-   explain what's intentional.
+   you reference a spec file (add `spec: path/to/spec.md` in the PR
+   body), it also checks your implementation against the spec. Treat
+   its feedback like any other review - address what's valid, explain
+   what's intentional.
 
 ## Project Standards
 
