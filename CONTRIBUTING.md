@@ -3,16 +3,13 @@
 Thanks for your interest in contributing to Kai. This document covers
 what you need to know before opening a pull request.
 
-## Before You Start
+## How to Contribute
 
-**Open an issue first.** Before writing code, open a GitHub issue describing
-what you want to change and why. This lets us discuss the approach before
-you invest time in implementation. Small bug fixes (typos, off-by-one errors)
-can skip this step.
+**Pull requests are currently restricted to collaborators.** Kai's architecture is evolving quickly and all implementation is handled internally to keep the codebase coherent. This isn't permanent, but it's the right call for where the project is right now.
 
-**Kai is a personal assistant.** It runs locally on one machine for one user.
-Contributions should respect that scope -- multi-user features, cloud
-deployment support, and similar changes are out of scope.
+**The best way to contribute is through issues.** Bug reports, feature ideas, and design feedback are all welcome. For non-trivial proposals, include a spec: describe the problem, the proposed solution, what changes are needed, and what's explicitly out of scope. A well-written spec is more valuable than a surprise PR - it lets us discuss the approach before anyone writes code.
+
+**Open an issue first.** Even if you're a collaborator, open an issue before starting work on anything non-trivial. This keeps the "why" (issue) separate from the "how" (PR) and gives the triage agent something to work with.
 
 ## Development Setup
 
@@ -38,10 +35,9 @@ dependencies for local development. For a protected deployment to `/opt/kai/`,
 use `python -m kai install config` followed by `sudo python -m kai install apply`
 instead. See the README for details.
 
-## Branch and PR Workflow
+## Branch and PR Workflow (Collaborators)
 
-Direct pushes to `main` are blocked. All changes go through pull requests
-with required CI checks.
+Direct pushes to `main` are blocked. All changes go through pull requests with required CI checks.
 
 1. **Create a branch** from `main` with a descriptive prefix:
    - `feature/` -- new functionality
@@ -66,6 +62,8 @@ with required CI checks.
    ```bash
    make check && make test
    ```
+
+5. **Expect an automated review.** Kai runs a PR Review Agent that posts a code review comment on every push. It checks for bugs, security issues, missing error handling, and style violations. If you reference a spec file (add `spec: path/to/spec.md` in the PR body), it also checks your implementation against the spec. Treat its feedback like any other review - address what's valid, explain what's intentional.
 
 ## Code Style
 
