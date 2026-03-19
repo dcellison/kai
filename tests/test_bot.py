@@ -1048,6 +1048,18 @@ class TestHandleModelCallback:
         edit_text = update.callback_query.edit_message_text.call_args[0][0]
         assert "Switched" in edit_text
 
+    @pytest.mark.asyncio
+    async def test_switch_model_resets_session_id(self):
+        """Model switch must rotate the audit-log session ID."""
+        update = _make_callback_update(data="model:opus")
+        ctx = _make_context(claude=_make_mock_claude(model="sonnet"))
+        with (
+            patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
+            patch("kai.bot.reset_session_id") as mock_reset,
+        ):
+            await handle_model_callback(update, ctx)
+        mock_reset.assert_called_once_with(1)
+
 
 # ── handle_voice_command ─────────────────────────────────────────────
 

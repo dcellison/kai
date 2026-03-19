@@ -427,6 +427,7 @@ async def _switch_model(context: ContextTypes.DEFAULT_TYPE, user_id: int, model:
     claude.model = model
     await claude.restart()
     await sessions.clear_session(user_id)
+    reset_session_id(user_id)
 
 
 @log_handler("select_model")

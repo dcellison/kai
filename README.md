@@ -115,8 +115,8 @@ Per-workspace configuration is supported via `workspaces.yaml` (or `/etc/kai/wor
 Three layers of persistent context give the agent continuity across sessions:
 
 1. **Auto-memory** - managed by Claude Code per-workspace. Project architecture and patterns.
-2. **Home memory** (`workspace/.claude/MEMORY.md`) - personal memory, always injected regardless of current workspace. Proactively updated by Kai.
-3. **Conversation history** (`workspace/.claude/history/`) - JSONL logs, one file per day. Searchable for past conversations.
+2. **Home memory** (`home/.claude/MEMORY.md`) - personal memory, always injected regardless of current workspace. Proactively updated by Kai.
+3. **Conversation history** (`home/.claude/history/`) - JSONL logs, one file per day. Searchable for past conversations.
 
 Foreign workspaces also get their own `.claude/MEMORY.md` injected alongside home memory. See [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture).
 

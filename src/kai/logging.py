@@ -57,7 +57,7 @@ def get_session_id(user_id: int) -> str:
 
 
 def reset_session_id(user_id: int) -> None:
-    """Reset session ID (called on /new, workspace switch)."""
+    """Reset session ID (called on /new, model switch, workspace switch)."""
     _user_sessions.pop(user_id, None)
 
 
