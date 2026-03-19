@@ -127,29 +127,35 @@ def main() -> None:
         app = create_bot(config, use_webhook=use_webhook)
 
         # Determine the default user (admin or first allowed user) for
-        # per-user data migrations and workspace restoration.
+        # per-user data migrations and workspace restoration. Config
+        # validation ensures at least one user exists, but guard against
+        # edge cases to avoid a StopIteration crash at startup.
+        default_chat_id: int | None = None
         if config.user_configs:
             admins = config.get_admins()
             if admins:
                 default_chat_id = admins[0].telegram_id
-            else:
+            elif config.user_configs:
                 default_chat_id = next(iter(config.user_configs))
-        else:
+        elif config.allowed_user_ids:
             default_chat_id = next(iter(config.allowed_user_ids))
 
         # One-time migration: rename global "workspace" setting to
         # "workspace:{chat_id}" for per-user namespacing (Phase 2).
         old_workspace = await sessions.get_setting("workspace")
-        if old_workspace:
+        if old_workspace and default_chat_id is not None:
             await sessions.set_setting(f"workspace:{default_chat_id}", old_workspace)
             await sessions.delete_setting("workspace")
             logging.info("Migrated workspace setting to workspace:%d", default_chat_id)
 
         # Backfill workspace history rows from pre-Phase-2 (chat_id=0)
-        await sessions.backfill_workspace_history(default_chat_id)
+        if default_chat_id is not None:
+            await sessions.backfill_workspace_history(default_chat_id)
 
         # Restore workspace for the default user from previous session
-        saved_workspace = await sessions.get_setting(f"workspace:{default_chat_id}")
+        saved_workspace = (
+            await sessions.get_setting(f"workspace:{default_chat_id}") if default_chat_id is not None else None
+        )
         if saved_workspace:
             ws_path = Path(saved_workspace)
             if not _is_workspace_allowed(ws_path, config):

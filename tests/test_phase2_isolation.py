@@ -114,6 +114,26 @@ class TestHistoryFiltering:
         assert "Alice msg" in result
         assert "Bob msg" in result
 
+    def test_pre_migration_records_included(self, tmp_path):
+        """Pre-Phase-2 records (no chat_id) are included for all users."""
+        records = [
+            {"ts": "2026-03-19T10:00:00", "dir": "user", "text": "Old message"},
+            {"ts": "2026-03-19T10:01:00", "dir": "user", "chat_id": 111, "text": "Alice msg"},
+        ]
+        history_dir = self._write_history(tmp_path, records)
+
+        # User 111 sees their own message AND the pre-migration record
+        with patch("kai.history._LOG_DIR", history_dir):
+            result = get_recent_history(chat_id=111)
+        assert "Old message" in result
+        assert "Alice msg" in result
+
+        # User 999 also sees the pre-migration record (no way to attribute it)
+        with patch("kai.history._LOG_DIR", history_dir):
+            result = get_recent_history(chat_id=999)
+        assert "Old message" in result
+        assert "Alice msg" not in result
+
     def test_no_messages_for_user(self, tmp_path):
         """User with no history gets empty string."""
         records = [
