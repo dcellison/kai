@@ -243,7 +243,7 @@ def main() -> None:
                         )
                         logging.info("Notified chat %d of interrupted response", interrupted_chat_id)
                         flag.unlink(missing_ok=True)
-                    except (ValueError, Exception):
+                    except Exception:
                         logging.exception("Failed to process interrupted-response flag: %s", flag.name)
                         flag.unlink(missing_ok=True)
 

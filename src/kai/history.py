@@ -119,8 +119,12 @@ def get_recent_history(chat_id: int | None = None) -> str:
             if line.strip():
                 try:
                     record = json.loads(line)
-                    # Skip messages from other users when filtering
-                    if chat_id is not None and record.get("chat_id") != chat_id:
+                    # Skip messages from other users when filtering.
+                    # Records without a chat_id field predate multi-user
+                    # (Phase 2) and are included for all users since they
+                    # belong to the single-user era.
+                    record_chat_id = record.get("chat_id")
+                    if chat_id is not None and record_chat_id is not None and record_chat_id != chat_id:
                         continue
                     file_messages.append(record)
                 except json.JSONDecodeError:

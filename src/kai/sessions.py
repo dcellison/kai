@@ -104,13 +104,30 @@ async def init_db(db_path: Path) -> None:
             PRIMARY KEY (path, chat_id)
         )
     """)
-    # Schema evolution: add chat_id column to existing workspace_history tables.
-    # Existing rows get chat_id=0 as a placeholder; the caller (main.py) must
-    # call backfill_workspace_history() to assign them to the admin user.
+    # Schema evolution: migrate old workspace_history tables (path-only PK)
+    # to the new composite PK (path, chat_id). SQLite does not support
+    # ALTER TABLE to change primary keys, so we recreate the table.
+    # Existing rows get chat_id=0; main.py calls backfill_workspace_history()
+    # to assign them to the admin user.
     cursor = await _get_db().execute("PRAGMA table_info(workspace_history)")
     ws_columns = [row[1] for row in await cursor.fetchall()]
     if "chat_id" not in ws_columns:
-        await _get_db().execute("ALTER TABLE workspace_history ADD COLUMN chat_id INTEGER NOT NULL DEFAULT 0")
+        # Recreate with composite PK: copy data, drop old, rename new.
+        # This is the standard SQLite pattern for PK changes.
+        await _get_db().execute("""
+            CREATE TABLE workspace_history_new (
+                path TEXT NOT NULL,
+                chat_id INTEGER NOT NULL DEFAULT 0,
+                last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (path, chat_id)
+            )
+        """)
+        await _get_db().execute("""
+            INSERT INTO workspace_history_new (path, last_used_at)
+            SELECT path, last_used_at FROM workspace_history
+        """)
+        await _get_db().execute("DROP TABLE workspace_history")
+        await _get_db().execute("ALTER TABLE workspace_history_new RENAME TO workspace_history")
     await _get_db().commit()
 
 
