@@ -384,8 +384,6 @@ async def delete_setting(key: str) -> None:
 
 async def upsert_workspace_history(path: str, chat_id: int) -> None:
     """Record or refresh a workspace path in the user's history."""
-    # INSERT OR REPLACE works with both old schema (path-only PK) and
-    # new schema (path+chat_id composite PK). See Phase 2 spec section 4.
     await _get_db().execute(
         "INSERT OR REPLACE INTO workspace_history (path, chat_id, last_used_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
         (path, chat_id),

@@ -74,7 +74,7 @@ def log_message(
         log.exception("Failed to write chat log")
 
 
-def get_recent_history(chat_id: int | None = None) -> str:
+def get_recent_history(chat_id: int | None = None, default_chat_id: int | None = None) -> str:
     """
     Return a formatted summary of recent messages, scanning back as needed.
 
@@ -90,6 +90,12 @@ def get_recent_history(chat_id: int | None = None) -> str:
         chat_id: When provided, only include messages from this chat.
             When None, include all messages (backward-compatible for
             single-user deployments).
+        default_chat_id: The admin/default user's chat_id. Pre-Phase-2
+            records (no chat_id field) are treated as belonging to this
+            user, matching the workspace history backfill approach.
+            When None, pre-migration records are included for all users
+            (acceptable until Phase 3 per-user subprocess isolation
+            eliminates shared history entirely).
 
     Returns:
         A newline-separated string of formatted messages like
@@ -120,12 +126,15 @@ def get_recent_history(chat_id: int | None = None) -> str:
                 try:
                     record = json.loads(line)
                     # Skip messages from other users when filtering.
-                    # Records without a chat_id field predate multi-user
-                    # (Phase 2) and are included for all users since they
-                    # belong to the single-user era.
-                    record_chat_id = record.get("chat_id")
-                    if chat_id is not None and record_chat_id is not None and record_chat_id != chat_id:
-                        continue
+                    # Records without a chat_id field predate Phase 2
+                    # and are treated as belonging to default_chat_id
+                    # (the admin), matching the workspace history backfill.
+                    if chat_id is not None:
+                        record_chat_id = record.get("chat_id")
+                        if record_chat_id is None:
+                            record_chat_id = default_chat_id
+                        if record_chat_id is not None and record_chat_id != chat_id:
+                            continue
                     file_messages.append(record)
                 except json.JSONDecodeError:
                     # Skip individual bad lines rather than discarding the whole file

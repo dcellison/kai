@@ -233,19 +233,22 @@ def main() -> None:
             # Phase 2: check all files in the .responding directory (per-user
             # flags) instead of the old single .responding_to file.
             responding_dir = DATA_DIR / ".responding"
-            if responding_dir.is_dir():
-                for flag in responding_dir.iterdir():
-                    try:
-                        interrupted_chat_id = int(flag.name)
-                        await app.bot.send_message(
-                            interrupted_chat_id,
-                            "Sorry, my previous response was interrupted. Please resend your last message.",
-                        )
-                        logging.info("Notified chat %d of interrupted response", interrupted_chat_id)
-                        flag.unlink(missing_ok=True)
-                    except Exception:
-                        logging.exception("Failed to process interrupted-response flag: %s", flag.name)
-                        flag.unlink(missing_ok=True)
+            try:
+                flags = list(responding_dir.iterdir()) if responding_dir.is_dir() else []
+            except OSError:
+                flags = []
+            for flag in flags:
+                try:
+                    interrupted_chat_id = int(flag.name)
+                    await app.bot.send_message(
+                        interrupted_chat_id,
+                        "Sorry, my previous response was interrupted. Please resend your last message.",
+                    )
+                    logging.info("Notified chat %d of interrupted response", interrupted_chat_id)
+                    flag.unlink(missing_ok=True)
+                except Exception:
+                    logging.exception("Failed to process interrupted-response flag: %s", flag.name)
+                    flag.unlink(missing_ok=True)
 
             # Clean up old single-file flag if it exists (one-time migration)
             old_flag = DATA_DIR / ".responding_to"
