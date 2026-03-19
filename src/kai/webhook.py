@@ -746,6 +746,8 @@ async def _handle_schedule(request: web.Request) -> web.Response:
     if user_id is None:
         return web.json_response({"error": "Cannot determine user"}, status=403)
     chat_id = payload.get("chat_id", user_id)
+    if chat_id != user_id:
+        return web.json_response({"error": "Cannot schedule for other users"}, status=403)
 
     # schedule_data can arrive as a JSON object or a pre-serialized string
     if isinstance(schedule_data, dict):
@@ -1029,6 +1031,8 @@ async def _handle_send_message(request: web.Request) -> web.Response:
     if user_id is None:
         return web.json_response({"error": "Cannot determine user"}, status=403)
     chat_id = payload.get("chat_id", user_id)
+    if chat_id != user_id:
+        return web.json_response({"error": "Cannot send to other users"}, status=403)
 
     try:
         # Telegram limits messages to 4096 characters. Split long messages
@@ -1099,6 +1103,8 @@ async def _handle_send_file(request: web.Request) -> web.Response:
     user_id = _extract_user_id(request, payload)
     if user_id is None:
         return web.json_response({"error": "Cannot determine user"}, status=403)
+    if payload.get("chat_id", user_id) != user_id:
+        return web.json_response({"error": "Cannot send to other users"}, status=403)
     # Look up the user's workspace from the per-user workspace mapping
     user_workspaces = request.app.get("user_workspaces", {})
     workspace = user_workspaces.get(user_id)
@@ -1124,7 +1130,6 @@ async def _handle_send_file(request: web.Request) -> web.Response:
         return web.json_response({"error": f"File not found: {file_path}"}, status=404)
 
     bot = request.app["telegram_bot"]
-    chat_id = payload.get("chat_id", user_id)
     caption = payload.get("caption", "")
 
     # Send images as photos (Telegram renders them inline) and everything
@@ -1133,15 +1138,15 @@ async def _handle_send_file(request: web.Request) -> web.Response:
         suffix = path.suffix.lower()
         if suffix in IMAGE_EXTENSIONS:
             with open(path, "rb") as f:
-                await bot.send_photo(chat_id, f, caption=caption or None)
+                await bot.send_photo(user_id, f, caption=caption or None)
         else:
             with open(path, "rb") as f:
-                await bot.send_document(chat_id, f, caption=caption or None, filename=path.name)
+                await bot.send_document(user_id, f, caption=caption or None, filename=path.name)
     except Exception:
-        log.exception("send_file.failed", path=str(path), chat_id=chat_id)
+        log.exception("send_file.failed", path=str(path), chat_id=user_id)
         return web.json_response({"error": "Failed to send file"}, status=500)
 
-    log.info("send_file.sent", file=path.name, chat_id=chat_id)
+    log.info("send_file.sent", file=path.name, chat_id=user_id)
     return web.json_response({"status": "sent", "file": path.name})
 
 

@@ -158,6 +158,23 @@ class TestJobs:
         assert len(await sessions.get_jobs(_TEST_USER_ID)) == 0
         assert len(await sessions.get_all_active_jobs()) == 0
 
+    async def test_deactivate_job_wrong_user_no_op(self, db):
+        """deactivate_job with wrong user_id does not deactivate another user's job."""
+        job_id = await sessions.create_job(
+            user_id=_TEST_USER_ID,
+            chat_id=_TEST_CHAT_ID,
+            name="j1",
+            job_type="reminder",
+            prompt="p",
+            schedule_type="once",
+            schedule_data="{}",
+        )
+        await sessions.deactivate_job(job_id, user_id=99999)
+        # Job should still be active — wrong user cannot deactivate it
+        jobs = await sessions.get_jobs(_TEST_USER_ID)
+        assert len(jobs) == 1
+        assert jobs[0]["id"] == job_id
+
     async def test_delete_job(self, db):
         job_id = await sessions.create_job(
             user_id=_TEST_USER_ID,

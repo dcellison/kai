@@ -109,7 +109,7 @@ async def _register_new_jobs(app: Application) -> int:
         if job["schedule_type"] == "once":
             run_at = _ensure_utc(datetime.fromisoformat(schedule["run_at"]))
             if run_at <= now:
-                await sessions.deactivate_job(job["id"])
+                await sessions.deactivate_job(job["id"], user_id=job["user_id"])
                 log.info("job.expired", job_id=job["id"], name=job["name"])
                 continue
         _register_job(app, job)
@@ -250,7 +250,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             await context.bot.send_message(chat_id=chat_id, text=prompt)
         except Forbidden:
             log.warning("job.chat_gone", job_id=job_id, chat_id=chat_id)
-            await sessions.deactivate_job(job_id)
+            await sessions.deactivate_job(job_id, user_id=user_id)
             job.schedule_removal()
             audit_job_event(job_id, user_id, "failed", error="chat_gone")
             return
@@ -262,7 +262,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
         # removes the job from the queue after it fires (unlike the Forbidden
         # handler above, which must remove recurring jobs explicitly).
         if data["schedule_type"] == "once":
-            await sessions.deactivate_job(job_id)
+            await sessions.deactivate_job(job_id, user_id=user_id)
         return
 
     # ── Claude jobs: send prompt through the Claude process ──
@@ -319,7 +319,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                 log.warning("job.chat_gone", job_id=job_id, chat_id=chat_id)
             except Exception:
                 log.exception("job.send_failed", job_id=job_id)
-            await sessions.deactivate_job(job_id)
+            await sessions.deactivate_job(job_id, user_id=user_id)
             job.schedule_removal()
             log.info("job.condition_met", job_id=job_id)
             audit_job_event(job_id, user_id, "completed", condition="met")
@@ -343,7 +343,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                     await context.bot.send_message(chat_id=chat_id, text=msg)
                 except Forbidden:
                     log.warning("job.chat_gone", job_id=job_id, chat_id=chat_id)
-                    await sessions.deactivate_job(job_id)
+                    await sessions.deactivate_job(job_id, user_id=user_id)
                     job.schedule_removal()
                     audit_job_event(job_id, user_id, "failed", error="chat_gone")
                     return
@@ -360,7 +360,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(chat_id=chat_id, text=msg)
             except Forbidden:
                 log.warning("job.chat_gone", job_id=job_id, chat_id=chat_id)
-                await sessions.deactivate_job(job_id)
+                await sessions.deactivate_job(job_id, user_id=user_id)
                 job.schedule_removal()
                 audit_job_event(job_id, user_id, "failed", error="chat_gone")
                 return

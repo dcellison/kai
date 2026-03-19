@@ -178,11 +178,11 @@ def main() -> None:
                     if flag.exists():
                         try:
                             chat_id = int(flag.read_text().strip())
+                            flag.unlink(missing_ok=True)
                             await app.bot.send_message(
                                 chat_id, "Sorry, my previous response was interrupted. Please resend your last message."
                             )
                             log.info("crash_recovery.notified", chat_id=chat_id)
-                            flag.unlink(missing_ok=True)
                         except Exception:
                             log.exception("crash_recovery.failed")
                             flag.unlink(missing_ok=True)

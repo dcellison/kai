@@ -18,7 +18,7 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from kai.bot import handle_message
+from kai.bot import handle_document, handle_message, handle_photo, handle_voice
 
 # ── Test helpers ──────────────────────────────────────────────────────────
 
@@ -227,3 +227,111 @@ async def test_invalid_code_shows_remaining_attempts():
     sent = update.effective_chat.send_message.call_args[0][0]
     assert "Invalid code" in sent
     assert "2" in sent  # lockout_attempts(3) - failures(1) = 2 remaining
+
+
+# ── Media handler TOTP gate tests ────────────────────────────────────────
+
+
+def _make_photo_update() -> MagicMock:
+    """Create a mock Update for handle_photo with TOTP-relevant fields."""
+    update = MagicMock()
+    update.message.photo = [MagicMock()]
+    update.message.text = None
+    update.message.caption = "test photo"
+    update.message.reply_text = AsyncMock()
+    update.message.delete = AsyncMock()
+    update.effective_chat.id = 12345
+    update.effective_chat.send_message = AsyncMock()
+    return update
+
+
+def _make_document_update() -> MagicMock:
+    """Create a mock Update for handle_document with TOTP-relevant fields."""
+    update = MagicMock()
+    update.message.document = MagicMock()
+    update.message.document.file_name = "test.txt"
+    update.message.document.mime_type = "text/plain"
+    update.message.photo = None
+    update.message.text = None
+    update.message.caption = None
+    update.message.reply_text = AsyncMock()
+    update.message.delete = AsyncMock()
+    update.effective_chat.id = 12345
+    update.effective_chat.send_message = AsyncMock()
+    return update
+
+
+def _make_voice_update() -> MagicMock:
+    """Create a mock Update for handle_voice with TOTP-relevant fields."""
+    update = MagicMock()
+    update.message.voice = MagicMock()
+    update.message.voice.duration = 5
+    update.message.text = None
+    update.message.reply_text = AsyncMock()
+    update.message.delete = AsyncMock()
+    update.effective_chat.id = 12345
+    update.effective_chat.send_message = AsyncMock()
+    return update
+
+
+async def test_photo_blocked_when_totp_expired():
+    """handle_photo blocks when TOTP is configured and auth has expired."""
+    update = _make_photo_update()
+    ctx = _make_context()  # no totp_authenticated_at -> expired
+
+    with (
+        patch("kai.bot._is_authorized", return_value=True),
+        patch("kai.bot.is_totp_configured", return_value=True),
+    ):
+        await handle_photo(update, ctx)
+
+    update.message.reply_text.assert_called_once_with("Session expired. Enter code from authenticator.")
+    assert "totp_pending" in ctx.user_data
+
+
+async def test_document_blocked_when_totp_expired():
+    """handle_document blocks when TOTP is configured and auth has expired."""
+    update = _make_document_update()
+    ctx = _make_context()
+
+    with (
+        patch("kai.bot._is_authorized", return_value=True),
+        patch("kai.bot.is_totp_configured", return_value=True),
+    ):
+        await handle_document(update, ctx)
+
+    update.message.reply_text.assert_called_once_with("Session expired. Enter code from authenticator.")
+    assert "totp_pending" in ctx.user_data
+
+
+async def test_voice_blocked_when_totp_expired():
+    """handle_voice blocks when TOTP is configured and auth has expired."""
+    update = _make_voice_update()
+    ctx = _make_context()
+
+    with (
+        patch("kai.bot._is_authorized", return_value=True),
+        patch("kai.bot.is_totp_configured", return_value=True),
+    ):
+        await handle_voice(update, ctx)
+
+    update.message.reply_text.assert_called_once_with("Session expired. Enter code from authenticator.")
+    assert "totp_pending" in ctx.user_data
+
+
+async def test_photo_passes_when_totp_not_configured():
+    """handle_photo proceeds normally when TOTP is not configured."""
+    update = _make_photo_update()
+    ctx = _make_context()
+
+    with patch.multiple("kai.bot", is_totp_configured=MagicMock(return_value=False), **_downstream_patches()):
+        # Need to also mock the photo-specific download path
+        ctx.bot = MagicMock()
+        mock_file = AsyncMock()
+        mock_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"fake-image"))
+        ctx.bot.get_file = AsyncMock(return_value=mock_file)
+        await handle_photo(update, ctx)
+
+    # The challenge prompt must NOT have been sent
+    for call in update.message.reply_text.call_args_list:
+        assert "Session expired" not in str(call)

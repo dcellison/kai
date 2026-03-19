@@ -258,24 +258,21 @@ class PersistentClaude:
             cwd=str(self.workspace),
             env=env,
             limit=1024 * 1024,  # 1 MiB; default 64 KiB too small for large tool results
-            # When spawned via sudo, start in a new process group so we can
-            # kill the entire tree (sudo + claude) via os.killpg(). Without
-            # this, killing sudo may orphan the claude process.
-            start_new_session=bool(self.claude_user),
+            # Start in a new process group so we can kill the entire tree
+            # via os.killpg(). Without this, child processes spawned by
+            # Claude's bash tool can outlive the subprocess.
+            start_new_session=True,
         )
         self._session_id = None
         self._fresh_session = True
         self._session_started_at = time.monotonic()
 
         # Save the process group ID for reliable signal delivery.
-        # When claude_user is set, start_new_session=True creates a new group
-        # with PGID == PID (session leader). Save it now because os.getpgid()
-        # fails after the process exits, but os.killpg() works as long as any
-        # group member is still alive (i.e., the actual claude process).
-        if self.claude_user:
-            self._pgid = self._proc.pid  # PGID == PID for session leaders
-        else:
-            self._pgid = None
+        # start_new_session=True creates a new group with PGID == PID
+        # (session leader). Save it now because os.getpgid() fails after
+        # the process exits, but os.killpg() works as long as any group
+        # member is still alive.
+        self._pgid = self._proc.pid  # PGID == PID for session leaders
 
         # Drain stderr in background to prevent pipe buffer deadlock
         self._stderr_task = asyncio.create_task(self._drain_stderr())
@@ -301,23 +298,18 @@ class PersistentClaude:
 
     def _send_signal(self, sig: int) -> None:
         """
-        Send a signal to the Claude process (or process group if claude_user).
+        Send a signal to the Claude process group.
 
-        Deliberately does NOT check self._proc.returncode. When claude_user
-        is set, self._proc tracks the sudo wrapper, not the actual claude
-        process. If sudo exits before claude (e.g., from SIGTERM), checking
-        returncode would skip sending further signals - leaving claude
-        orphaned. Instead, we always attempt delivery and let OSError handle
-        the already-dead case cleanly:
-        - claude_user path: os.killpg() raises OSError if the group is gone
-        - direct path: send_signal() calls os.kill() which raises OSError
+        Always uses os.killpg() to signal the entire process group (including
+        any child processes spawned by Claude's bash tool). Deliberately does
+        NOT check self._proc.returncode — when claude_user is set, self._proc
+        tracks sudo, not claude, and sudo may exit before claude does. We
+        always attempt delivery and let OSError handle the already-dead case.
 
         Args:
             sig: Signal to send (e.g., signal.SIGTERM, signal.SIGKILL).
         """
         if self._pgid is not None:
-            # claude_user mode: signal the entire process group (sudo + claude)
-            # using the PGID saved at spawn time
             try:
                 os.killpg(self._pgid, sig)
             except OSError:
@@ -789,8 +781,7 @@ class PersistentClaude:
             # Final cleanup: signal the saved process group one more time.
             # If claude was reparented to init during the wait, this catches
             # it. If everything is already dead, killpg raises OSError which
-            # we ignore. Only applies to claude_user mode (pgid is None
-            # otherwise).
+            # we ignore.
             if saved_pgid is not None:
                 try:
                     os.killpg(saved_pgid, signal.SIGKILL)
@@ -856,6 +847,7 @@ class ClaudeManager:
         self._instances: dict[int, PersistentClaude] = {}
         self._config = config
         self._services_info = services_info or []
+        self._creation_lock = asyncio.Lock()
 
     def get(self, user_id: int) -> PersistentClaude | None:
         """Get existing instance without creating. Returns None if not found."""
@@ -863,24 +855,28 @@ class ClaudeManager:
 
     async def get_or_create(self, user_id: int) -> PersistentClaude:
         """Get existing instance or create new one for this user."""
-        if user_id not in self._instances:
-            await asyncio.to_thread(self._ensure_user_dirs, user_id)
-            home = self._user_home(user_id)
-            ws_config = self._config.get_workspace_config(home)
-            self._instances[user_id] = PersistentClaude(
-                model=self._config.claude_model,
-                workspace=home,
-                home_workspace=home,
-                webhook_port=self._config.webhook_port,
-                webhook_secret=self._config.webhook_secret,
-                max_budget_usd=self._config.claude_max_budget_usd,
-                timeout_seconds=self._config.claude_timeout_seconds,
-                services_info=self._services_info,
-                claude_user=self._config.claude_user,
-                max_session_hours=self._config.claude_max_session_hours,
-                workspace_config=ws_config,
-                user_id=user_id,
-            )
+        if user_id in self._instances:
+            return self._instances[user_id]
+        async with self._creation_lock:
+            # Re-check after acquiring lock (another coroutine may have created it)
+            if user_id not in self._instances:
+                await asyncio.to_thread(self._ensure_user_dirs, user_id)
+                home = self._user_home(user_id)
+                ws_config = self._config.get_workspace_config(home)
+                self._instances[user_id] = PersistentClaude(
+                    model=self._config.claude_model,
+                    workspace=home,
+                    home_workspace=home,
+                    webhook_port=self._config.webhook_port,
+                    webhook_secret=self._config.webhook_secret,
+                    max_budget_usd=self._config.claude_max_budget_usd,
+                    timeout_seconds=self._config.claude_timeout_seconds,
+                    services_info=self._services_info,
+                    claude_user=self._config.claude_user,
+                    max_session_hours=self._config.claude_max_session_hours,
+                    workspace_config=ws_config,
+                    user_id=user_id,
+                )
         return self._instances[user_id]
 
     def _ensure_user_dirs(self, user_id: int) -> None:
@@ -914,10 +910,16 @@ class ClaudeManager:
             for uid, inst in self._instances.items()
             if inst.idle_hours >= max_idle_hours and not inst._lock.locked()
         ]
+        evicted = 0
         for uid in to_evict:
-            await self._instances[uid].shutdown()
+            inst = self._instances.get(uid)
+            if inst is None or inst._lock.locked():
+                # Instance was removed or became active between check and here
+                continue
+            await inst.shutdown()
             del self._instances[uid]
-        return len(to_evict)
+            evicted += 1
+        return evicted
 
     async def cleanup_old_files(self, max_age_days: int = 7) -> int:
         """Remove uploaded files older than max_age_days. Returns count removed."""

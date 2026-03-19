@@ -638,6 +638,40 @@ class TestCronJobUserRouting:
 # ── File cleanup ──────────────────────────────────────────────────
 
 
+class TestEvictIdleTOCTOU:
+    """Verify evict_idle re-checks lock before shutdown."""
+
+    @pytest.fixture()
+    def manager(self, tmp_path):
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        config = _make_config(
+            allowed_user_ids={USER_A},
+            claude_workspace=ws,
+        )
+        with patch("kai.claude.DATA_DIR", tmp_path):
+            mgr = ClaudeManager(config=config)
+            yield mgr
+
+    async def test_lock_acquired_between_check_and_shutdown(self, manager):
+        """Instance whose lock becomes acquired between candidate collection
+        and the per-item re-check must NOT be evicted."""
+        inst = MagicMock()
+        inst.idle_hours = 10.0
+        # False during list-comp (candidate collection), True during re-check
+        inst._lock = MagicMock()
+        inst._lock.locked = MagicMock(side_effect=[False, True])
+        inst.shutdown = AsyncMock()
+
+        manager._instances[USER_A] = inst
+
+        evicted = await manager.evict_idle(max_idle_hours=1.0)
+
+        assert evicted == 0
+        inst.shutdown.assert_not_called()
+        assert USER_A in manager._instances
+
+
 class TestCleanupOldFiles:
     """Tests for ClaudeManager.cleanup_old_files."""
 

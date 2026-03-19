@@ -131,8 +131,8 @@ class TestCommandConstruction:
             cmd = args[0]
             assert cmd[0] == "claude"
             assert "sudo" not in cmd
-            # Should NOT use start_new_session when running as same user
-            assert args[1].get("start_new_session") is False
+            # Always uses start_new_session=True for reliable process group cleanup
+            assert args[1].get("start_new_session") is True
 
     @pytest.mark.asyncio
     async def test_cmd_with_claude_user(self):

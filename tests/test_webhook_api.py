@@ -404,6 +404,16 @@ class TestSendFile:
         resp = await _handle_send_file(send_file_request)
         assert resp.status == 401
 
+    async def test_chat_id_different_from_user_returns_403(self, tmp_path, send_file_request):
+        """Returns 403 when chat_id differs from the authenticated user_id."""
+        img = tmp_path / "photo.jpg"
+        img.write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
+        send_file_request.json = AsyncMock(return_value={"path": str(img), "chat_id": 999})
+        resp = await _handle_send_file(send_file_request)
+        assert resp.status == 403
+        body = json.loads(resp.body)
+        assert "other users" in body["error"].lower()
+
 
 # ── POST /api/send-message ────────────────────────────────────────────
 
@@ -475,6 +485,22 @@ class TestSendMessage:
         send_message_request.app["telegram_bot"].send_message = AsyncMock(side_effect=RuntimeError("Boom"))
         resp = await _handle_send_message(send_message_request)
         assert resp.status == 500
+
+    async def test_chat_id_different_from_user_returns_403(self, send_message_request):
+        """Returns 403 when chat_id differs from the authenticated user_id."""
+        send_message_request.json = AsyncMock(return_value={"text": "Hello", "chat_id": 999})
+        resp = await _handle_send_message(send_message_request)
+        assert resp.status == 403
+        body = json.loads(resp.body)
+        assert "other users" in body["error"].lower()
+        send_message_request.app["telegram_bot"].send_message.assert_not_called()
+
+    async def test_chat_id_same_as_user_succeeds(self, send_message_request):
+        """Explicit chat_id matching user_id is allowed."""
+        send_message_request.json = AsyncMock(return_value={"text": "Hello", "chat_id": 123})
+        resp = await _handle_send_message(send_message_request)
+        assert resp.status == 200
+        send_message_request.app["telegram_bot"].send_message.assert_called_once()
 
 
 # ── update_workspace() ──────────────────────────────────────────────
@@ -1192,6 +1218,29 @@ class TestScheduleValidation:
         resp = await _handle_schedule(mock_request)
 
         assert resp.status == 400
+
+    async def test_chat_id_different_from_user_returns_403(self, db, mock_request):
+        """Scheduling for a chat_id that differs from user_id is rejected."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret", "X-User-Id": "123"}
+
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "xss test",
+                "prompt": "test",
+                "schedule_type": "once",
+                "schedule_data": {"run_at": "2026-06-01T12:00:00+00:00"},
+                "chat_id": 999,
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 403
+        body = json.loads(resp.body.decode())
+        assert "other users" in body["error"].lower()
+        # Verify no job was persisted
+        jobs = await sessions.get_jobs(123)
+        assert len(jobs) == 0
 
 
 # ── POST /api/services/{name} ─────────────────────────────────────

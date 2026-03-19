@@ -291,9 +291,21 @@ async def delete_job(job_id: int, *, user_id: int | None = None) -> bool:
     return cursor.rowcount > 0
 
 
-async def deactivate_job(job_id: int) -> None:
-    """Soft-delete a job by setting active=0. Preserves the row for history."""
-    await _get_db().execute("UPDATE jobs SET active = 0 WHERE id = ?", (job_id,))
+async def deactivate_job(job_id: int, *, user_id: int | None = None) -> None:
+    """Soft-delete a job by setting active=0. Preserves the row for history.
+
+    Args:
+        job_id: Database ID of the job.
+        user_id: If provided, only deactivate if the job belongs to this user.
+            Internal callers (cron) should pass user_id to prevent cross-user
+            deactivation.
+    """
+    sql = "UPDATE jobs SET active = 0 WHERE id = ?"
+    params: list = [job_id]
+    if user_id is not None:
+        sql += " AND user_id = ?"
+        params.append(user_id)
+    await _get_db().execute(sql, params)
     await _get_db().commit()
 
 

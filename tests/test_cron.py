@@ -334,7 +334,7 @@ class TestRegisterNewJobs:
         ):
             count = await _register_new_jobs(mock_app)
         assert count == 0
-        mock_deactivate.assert_called_once_with(3)
+        mock_deactivate.assert_called_once_with(3, user_id=_TEST_USER_ID)
         mock_register.assert_not_called()
         assert "job.expired" in caplog.text
 
@@ -400,7 +400,7 @@ class TestJobCallbackReminder:
         mock_context.bot.send_message.side_effect = Forbidden("bot was blocked")
         with patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate:
             await _job_callback(mock_context)
-        mock_deactivate.assert_called_once_with(1)
+        mock_deactivate.assert_called_once_with(1, user_id=_TEST_USER_ID)
         mock_context.job.schedule_removal.assert_called_once()
 
     @pytest.mark.asyncio()
@@ -417,7 +417,7 @@ class TestJobCallbackReminder:
         mock_context.job.data["schedule_type"] = "once"
         with patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate:
             await _job_callback(mock_context)
-        mock_deactivate.assert_called_once_with(1)
+        mock_deactivate.assert_called_once_with(1, user_id=_TEST_USER_ID)
         # schedule_removal is NOT called - APScheduler handles that for run_once
         mock_context.job.schedule_removal.assert_not_called()
 
@@ -515,7 +515,7 @@ class TestJobCallbackClaude:
             patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate,
         ):
             await _job_callback(self.ctx)
-        mock_deactivate.assert_called_once_with(1)
+        mock_deactivate.assert_called_once_with(1, user_id=_TEST_USER_ID)
         self.ctx.job.schedule_removal.assert_called_once()
 
     @pytest.mark.asyncio()
@@ -552,7 +552,7 @@ class TestJobCallbackConditionMet:
         ):
             await _job_callback(self.ctx)
         # Job was deactivated and removed
-        mock_deactivate.assert_called_once_with(1)
+        mock_deactivate.assert_called_once_with(1, user_id=_TEST_USER_ID)
         self.ctx.job.schedule_removal.assert_called_once()
 
     @pytest.mark.asyncio()
@@ -602,7 +602,7 @@ class TestJobCallbackConditionMet:
             patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate,
         ):
             await _job_callback(self.ctx)
-        mock_deactivate.assert_called_once_with(1)
+        mock_deactivate.assert_called_once_with(1, user_id=_TEST_USER_ID)
         self.ctx.job.schedule_removal.assert_called_once()
 
 
@@ -679,5 +679,5 @@ class TestJobCallbackConditionNotMet:
             patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate,
         ):
             await _job_callback(self.ctx)
-        mock_deactivate.assert_called_once_with(1)
+        mock_deactivate.assert_called_once_with(1, user_id=_TEST_USER_ID)
         self.ctx.job.schedule_removal.assert_called_once()

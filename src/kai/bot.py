@@ -1296,6 +1296,95 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
+# ── TOTP gate (shared by all message handlers) ──────────────────────
+
+
+async def _check_totp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check TOTP authentication status before allowing a message through.
+
+    Returns True if the message should be processed (TOTP not configured,
+    or auth is still valid). Returns False if the message was consumed by
+    the TOTP gate (challenge sent, code verified/rejected, etc.) — caller
+    should return immediately.
+
+    This is extracted from handle_message() so all message handlers (text,
+    photo, document, voice) share the same TOTP enforcement. Without this,
+    media handlers would bypass TOTP entirely.
+    """
+    if not is_totp_configured():
+        return True
+
+    assert context.user_data is not None
+    assert update.effective_chat is not None
+    assert update.message is not None
+
+    totp_cfg: Config = context.bot_data["config"]
+    session_min = totp_cfg.totp_session_minutes
+    challenge_sec = totp_cfg.totp_challenge_seconds
+
+    auth_time = context.user_data.get("totp_authenticated_at", 0)
+    totp_expired = time.time() - auth_time > session_min * 60
+
+    if totp_expired:
+        pending = context.user_data.get("totp_pending")
+
+        if not pending:
+            context.user_data["totp_pending"] = {
+                "expires_at": time.time() + challenge_sec,
+            }
+            audit_auth_event(_user_id(update), "challenge_sent")
+            await update.message.reply_text("Session expired. Enter code from authenticator.")
+            return False
+
+        if time.time() > pending["expires_at"]:
+            del context.user_data["totp_pending"]
+            await update.message.reply_text("TOTP challenge expired. Send another message to try again.")
+            return False
+
+        code = update.message.text.strip() if update.message.text else ""
+
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        lockout_remaining = get_lockout_remaining()
+        if lockout_remaining > 0:
+            minutes = math.ceil(lockout_remaining / 60)
+            await update.effective_chat.send_message(
+                f"Too many failed attempts. Locked out for {minutes} more minute{'s' if minutes != 1 else ''}."
+            )
+            return False
+
+        lockout_attempts = totp_cfg.totp_lockout_attempts
+        lockout_minutes = totp_cfg.totp_lockout_minutes
+
+        if verify_code(code, lockout_attempts, lockout_minutes):
+            del context.user_data["totp_pending"]
+            context.user_data["totp_authenticated_at"] = time.time()
+            audit_auth_event(_user_id(update), "verified")
+            await update.effective_chat.send_message("Authenticated.")
+            return False
+
+        lockout_remaining = get_lockout_remaining()
+        if lockout_remaining > 0:
+            del context.user_data["totp_pending"]
+            audit_auth_event(_user_id(update), "lockout", minutes=lockout_minutes)
+            await update.effective_chat.send_message(
+                f"Too many failed attempts. Locked out for {lockout_minutes} minutes."
+            )
+        else:
+            remaining = lockout_attempts - get_failure_count()
+            audit_auth_event(_user_id(update), "failed", remaining=remaining)
+            await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
+        return False
+
+    # Auth is still valid - refresh the timestamp so the session
+    # timeout measures inactivity, not time since login.
+    context.user_data["totp_authenticated_at"] = time.time()
+    return True
+
+
 # ── Media message handlers ──────────────────────────────────────────
 
 
@@ -1320,7 +1409,7 @@ def _save_to_user_files(data: bytes, filename: str, user_id: int) -> Path:
 
     # Timestamp prefix ensures unique names even if the same file is sent twice
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    safe_name = filename.replace("/", "_").replace(" ", "_")
+    safe_name = Path(filename).name.replace(" ", "_")
     dest = files_dir / f"{ts}_{safe_name}"
     dest.write_bytes(data)
     return dest
@@ -1337,6 +1426,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     the caption (or "What's in this image?" if no caption).
     """
     if not update.message or not update.message.photo:
+        return
+
+    if not await _check_totp(update, context):
         return
 
     user_id = _user_id(update)
@@ -1462,6 +1554,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not update.message or not update.message.document:
         return
 
+    if not await _check_totp(update, context):
+        return
+
     doc = update.message.document
     file_name = doc.file_name or "unknown"
     suffix = Path(file_name).suffix.lower()
@@ -1582,6 +1677,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message or not update.message.voice:
         return
 
+    if not await _check_totp(update, context):
+        return
+
     user_id = _user_id(update)
     chat_id = _chat_id(update)
     claude = await _get_claude(context, user_id)
@@ -1675,95 +1773,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not update.message or not update.message.text:
         return
 
-    # ── TOTP gate ────────────────────────────────────────────────────────
-    # When TOTP is configured, require a valid authenticator code before
-    # allowing any Claude invocation. Auth state lives in context.user_data
-    # (in-memory, bot-process-owned) so Claude cannot read or manipulate it.
-    if is_totp_configured():
-        # Assert non-None to narrow types for Pyright. user_data is always
-        # populated by PTB when a user_id is present (which it is here - the
-        # @_require_auth decorator already confirmed that). effective_chat is
-        # always set for user messages.
-        assert context.user_data is not None
-        assert update.effective_chat is not None
-
-        # Read TOTP timing from the centralized Config object rather than
-        # raw os.environ, so defaults and validation happen in one place.
-        totp_cfg: Config = context.bot_data["config"]
-        session_min = totp_cfg.totp_session_minutes
-        challenge_sec = totp_cfg.totp_challenge_seconds
-
-        auth_time = context.user_data.get("totp_authenticated_at", 0)
-        totp_expired = time.time() - auth_time > session_min * 60
-
-        if totp_expired:
-            pending = context.user_data.get("totp_pending")
-
-            if not pending:
-                # First message after auth expired - send the challenge and
-                # store a pending state so the next message is treated as a code.
-                context.user_data["totp_pending"] = {
-                    "expires_at": time.time() + challenge_sec,
-                }
-                audit_auth_event(_user_id(update), "challenge_sent")
-                await update.message.reply_text("Session expired. Enter code from authenticator.")
-                return
-
-            # A challenge is already in flight - this message should be the code.
-            if time.time() > pending["expires_at"]:
-                del context.user_data["totp_pending"]
-                await update.message.reply_text("TOTP challenge expired. Send another message to try again.")
-                return
-
-            code = update.message.text.strip() if update.message.text else ""
-
-            # Delete the code message immediately so it doesn't linger in chat.
-            try:
-                await update.message.delete()
-            except Exception:
-                pass
-
-            # Check global lockout before calling verify_code().
-            lockout_remaining = get_lockout_remaining()
-            if lockout_remaining > 0:
-                # ceil() so the user never sees "0 more minutes" when <60s remain
-                minutes = math.ceil(lockout_remaining / 60)
-                await update.effective_chat.send_message(
-                    f"Too many failed attempts. Locked out for {minutes} more minute{'s' if minutes != 1 else ''}."
-                )
-                return
-
-            lockout_attempts = totp_cfg.totp_lockout_attempts
-            lockout_minutes = totp_cfg.totp_lockout_minutes
-
-            if verify_code(code, lockout_attempts, lockout_minutes):
-                del context.user_data["totp_pending"]
-                context.user_data["totp_authenticated_at"] = time.time()
-                audit_auth_event(_user_id(update), "verified")
-                await update.effective_chat.send_message("Authenticated.")
-                # Return here - the code message has been deleted and its text
-                # is meaningless as a Claude prompt. The user sends their actual
-                # query in the next message, which will pass the gate cleanly.
-                return
-
-            # Verification failed. Show lockout message if triggered, or remaining attempts.
-            lockout_remaining = get_lockout_remaining()
-            if lockout_remaining > 0:
-                del context.user_data["totp_pending"]
-                audit_auth_event(_user_id(update), "lockout", minutes=lockout_minutes)
-                await update.effective_chat.send_message(
-                    f"Too many failed attempts. Locked out for {lockout_minutes} minutes."
-                )
-            else:
-                remaining = lockout_attempts - get_failure_count()
-                audit_auth_event(_user_id(update), "failed", remaining=remaining)
-                await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
-            return
-
-        # Auth is still valid - refresh the timestamp so the session
-        # timeout measures inactivity, not time since login.
-        context.user_data["totp_authenticated_at"] = time.time()
-    # ── End TOTP gate ─────────────────────────────────────────────────────
+    if not await _check_totp(update, context):
+        return
 
     user_id = _user_id(update)
     chat_id = _chat_id(update)
