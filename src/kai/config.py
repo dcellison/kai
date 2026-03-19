@@ -623,7 +623,13 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
         # falls back to the global default at runtime.
         home_workspace = entry.get("home_workspace")
         if home_workspace is not None:
-            home_workspace = Path(str(home_workspace)).expanduser().resolve()
+            # Guard against empty strings: Path("").resolve() silently
+            # returns CWD, which would give the user unintended access.
+            home_workspace_str = str(home_workspace).strip()
+            if not home_workspace_str:
+                home_workspace = None
+            else:
+                home_workspace = Path(home_workspace_str).expanduser().resolve()
             if not home_workspace.is_dir():
                 log.warning(
                     "users.yaml: home_workspace not found for %s: %s; using global default",
@@ -729,18 +735,22 @@ def load_config() -> Config:
     else:
         log.info("Telegram transport: polling (TELEGRAM_WEBHOOK_URL not set)")
 
-    # Validate allowed user IDs. ALLOWED_USER_IDS is required unless
+    # Parse allowed user IDs. ALLOWED_USER_IDS is required unless
     # users.yaml exists (which provides its own authorization source).
-    # Parse the env var first; we check later whether users.yaml overrides it.
+    # Defer the ValueError until after users.yaml is checked so that
+    # a malformed env var doesn't block startup when users.yaml is
+    # authoritative and would make the env var irrelevant.
     raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
     allowed_ids: set[int] = set()
+    allowed_ids_error: str | None = None
     try:
         allowed_ids = {int(uid.strip()) for uid in raw_ids.split(",") if uid.strip()}
-    except ValueError as e:
-        raise SystemExit(
+    except ValueError:
+        allowed_ids_error = (
             "ALLOWED_USER_IDS must be numeric Telegram user IDs (not usernames). "
-            "Message @userinfobot on Telegram to find yours."
-        ) from e
+            "Message @userinfobot on Telegram to find yours. "
+            "(Or create users.yaml as the authorization source.)"
+        )
 
     # Validate optional: workspace base directory (must exist if provided)
     workspace_base = None
@@ -833,9 +843,13 @@ def load_config() -> Config:
         if raw_ids:
             log.warning("ALLOWED_USER_IDS is set but users.yaml exists; using users.yaml")
         # Users in the YAML replace the ALLOWED_USER_IDS set.
+        # Any ALLOWED_USER_IDS parse error is irrelevant since users.yaml is authoritative.
         allowed_ids = set(user_configs.keys())
         if not allowed_ids:
             raise SystemExit("users.yaml exists but contains no valid user entries")
+    elif allowed_ids_error:
+        # No users.yaml and ALLOWED_USER_IDS had a parse error
+        raise SystemExit(allowed_ids_error)
     elif not allowed_ids:
         # No users.yaml and no ALLOWED_USER_IDS - can't start
         raise SystemExit("ALLOWED_USER_IDS is required in .env (or create users.yaml)")
