@@ -341,13 +341,8 @@ def _cmd_config() -> None:
         "Enable PR review agent",
         existing_env.get("PR_REVIEW_ENABLED", "false").lower() in ("1", "true", "yes"),
     )
-    spec_dir = "specs"
     pr_review_cooldown = "300"
     if pr_review_enabled:
-        spec_dir = _prompt(
-            "Spec directory relative to repo root",
-            existing_env.get("SPEC_DIR", "specs"),
-        )
         while True:
             pr_review_cooldown = _prompt(
                 "Review cooldown in seconds (prevents spam from rapid pushes)",
@@ -424,8 +419,6 @@ def _cmd_config() -> None:
         env["PR_REVIEW_ENABLED"] = "true"
         if pr_review_cooldown != "300":
             env["PR_REVIEW_COOLDOWN"] = pr_review_cooldown
-        if spec_dir != "specs":
-            env["SPEC_DIR"] = spec_dir
     if issue_triage_enabled:
         env["ISSUE_TRIAGE_ENABLED"] = "true"
 

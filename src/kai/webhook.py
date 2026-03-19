@@ -511,7 +511,6 @@ async def _handle_github(request: web.Request) -> web.Response:
                     webhook_secret=request.app["webhook_secret"],
                     claude_user=request.app.get("claude_user"),
                     local_repo_path=local_repo_path,
-                    spec_dir=request.app.get("spec_dir", "specs"),
                 )
             )
             _background_tasks.add(task)
@@ -1159,8 +1158,6 @@ async def start(telegram_app, config) -> None:
     # local checkouts without a hardcoded GITHUB_REPO setting.
     _app["workspace_base"] = str(config.workspace_base) if config.workspace_base else None
     _app["allowed_workspaces"] = [str(p) for p in config.allowed_workspaces]
-    _app["spec_dir"] = config.spec_dir
-
     # Issue triage agent config
     _app["issue_triage_enabled"] = config.issue_triage_enabled
 

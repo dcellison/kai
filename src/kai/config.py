@@ -179,10 +179,6 @@ class Config:
     # Kept for backwards compatibility with existing .env files; the value
     # is parsed but no longer used by webhook.py.
     github_repo: str = ""
-    # Directory (relative to repo root) where spec files live for
-    # branch-name matching. Does not affect body marker resolution,
-    # which accepts any path relative to the repo root.
-    spec_dir: str = "specs"
 
     # Issue triage agent: automatically triage new issues when webhooks fire.
     # Disabled by default so existing users are not surprised by automatic triage.
@@ -641,7 +637,6 @@ def load_config() -> Config:
         pr_review_enabled=pr_review_enabled,
         pr_review_cooldown=pr_review_cooldown,
         github_repo=os.getenv("GITHUB_REPO", ""),
-        spec_dir=os.getenv("SPEC_DIR", "specs"),
         issue_triage_enabled=issue_triage_enabled,
         totp_session_minutes=totp_session_minutes,
         totp_challenge_seconds=totp_challenge_seconds,
