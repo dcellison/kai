@@ -135,7 +135,7 @@ def main() -> None:
             admins = config.get_admins()
             if admins:
                 default_chat_id = admins[0].telegram_id
-            elif config.user_configs:
+            else:
                 default_chat_id = next(iter(config.user_configs))
         elif config.allowed_user_ids:
             default_chat_id = next(iter(config.allowed_user_ids))
