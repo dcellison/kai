@@ -553,6 +553,12 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
             log.warning("%s: expected a YAML dict, got %s", local_path, type(data).__name__)
             return None
 
+    # After the _YAML_MALFORMED and None checks, data must be a dict
+    # (protected path returns _YAML_MALFORMED for non-dicts, local path
+    # checks isinstance explicitly). This assert narrows the type for
+    # static analysis and guards against future refactoring.
+    assert isinstance(data, dict)
+
     entries = data.get("users")
     if not isinstance(entries, list):
         # Warn for any non-list value, including None (missing key).
@@ -585,12 +591,11 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
             log.warning("users.yaml: invalid telegram_id %s: %s; skipping entry", raw_id, e)
             continue
 
-        # Validate required name
-        name = entry.get("name")
-        if not name or not isinstance(name, str):
+        # Validate required name (strip first so whitespace-only is rejected)
+        name = str(entry.get("name") or "").strip()
+        if not name:
             log.warning("users.yaml: skipping entry for telegram_id %d without name", telegram_id)
             continue
-        name = str(name).strip()
 
         # Duplicate check: first wins
         if telegram_id in configs:
