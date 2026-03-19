@@ -1,6 +1,7 @@
 """Tests for review.py PR review agent - metadata, prompts, subprocess, and output."""
 
 import json
+import re
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -261,8 +262,6 @@ class TestBuildReviewPrompt:
             prior_comments="prior content",
         )
         # Extract all tokens (8 hex chars after block name in BEGIN lines)
-        import re
-
         tokens = re.findall(r"--- BEGIN \w+ ([0-9a-f]{8}) ---", prompt)
         # Should have 6 blocks: metadata, description, spec, conventions, prior, diff
         assert len(tokens) == 6
@@ -275,8 +274,6 @@ class TestBuildReviewPrompt:
         prompt1 = build_review_prompt(meta, "diff")
         prompt2 = build_review_prompt(meta, "diff")
         # Extract tokens from both prompts
-        import re
-
         tokens1 = re.findall(r"--- BEGIN \w+ ([0-9a-f]{8}) ---", prompt1)
         tokens2 = re.findall(r"--- BEGIN \w+ ([0-9a-f]{8}) ---", prompt2)
         # At least one token should differ (statistically near-certain)
