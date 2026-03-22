@@ -5,13 +5,13 @@
 [![License](https://img.shields.io/github/license/dcellison/kai)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dcellison/kai?label=version)](https://github.com/dcellison/kai/releases)
 
-An AI agent, not a chatbot. Kai wraps a persistent [Claude Code](https://docs.anthropic.com/en/docs/claude-code) process running on your hardware and connects it to Telegram as a control surface. Shell, filesystem, git, web search, scheduling - the agent has real access to your system and can take real action on it. It reviews PRs when code is pushed, triages issues when they're opened, monitors conditions on a schedule, and operates across any project on your machine.
+An AI agent, not a chatbot. Kai wraps persistent [Claude Code](https://docs.anthropic.com/en/docs/claude-code) processes running on your hardware and connects them to Telegram as a control surface. Shell, filesystem, git, web search, scheduling - the agent has real access to your system and can take real action on it. It reviews PRs when code is pushed, triages issues when they're opened, monitors conditions on a schedule, and operates across any project on your machine. Multiple users can share a single Kai instance, each with their own isolated subprocess, workspace, conversation history, and optional OS-level process separation.
 
 For detailed guides on setup, architecture, and optional features, see the **[Wiki](https://github.com/dcellison/kai/wiki)**.
 
 ## Architecture
 
-Kai is two processes: an outer Python application that handles Telegram, HTTP, and scheduling, and an inner Claude Code subprocess that does the thinking and acting. The outer process manages lifecycle, authentication, and transport. The inner process has persistent state, tool access, and a working directory on your filesystem.
+Kai is two layers: an outer Python application that handles Telegram, HTTP, and scheduling, and one or more inner Claude Code subprocesses that do the thinking and acting. The outer process manages lifecycle, authentication, and transport. Each user gets their own inner subprocess with persistent state, tool access, and a working directory on your filesystem. A subprocess pool manages lazy creation and idle eviction so resource usage scales with active users, not registered ones.
 
 This is what separates Kai from API-wrapper bots that send text to a model endpoint and relay the response. Claude Code is a full agentic runtime - it reads files, runs shell commands, searches the web, writes and commits code, and maintains context across a session. Kai gives that runtime a durable home, a scheduling system, event-driven inputs, persistent memory, and a security model designed around the fact that it has all of this power.
 
@@ -26,6 +26,7 @@ Giving an AI agent shell access is a real trust decision. Kai's approach is laye
 - **Process isolation** - authentication state lives in the bot's in-memory context, not in the filesystem or conversation history. The inner Claude process cannot read, manipulate, or bypass the auth gate.
 - **Path confinement** - file exchange operations are restricted to the active workspace via `Path.relative_to()`. Traversal attempts are rejected.
 - **Service proxy** - external API keys live in server-side config (`services.yaml`) and are injected at request time. Claude calls APIs through a local proxy endpoint; the keys never enter the conversation.
+- **Multi-user isolation** - each user's data is namespaced by chat ID: separate conversation history, workspace state, scheduled jobs, and file storage. When `os_user` is configured in `users.yaml`, the inner Claude subprocess runs as a dedicated OS account via `sudo -u`, creating a hard process-level boundary between users and between the bot and the AI.
 
 Setup for TOTP requires the optional dependency group and root access:
 
@@ -43,6 +44,31 @@ For the full architecture, see [System Architecture](https://github.com/dcelliso
 Switch the agent between projects on your system with `/workspace <name>`. Names resolve relative to `WORKSPACE_BASE` (set in `.env`). Identity and memory carry over from the home workspace, so Kai retains full context regardless of what it's working on. Create new workspaces with `/workspace new <name>`. Absolute paths are not accepted - all workspaces must live under the configured base directory.
 
 Per-workspace configuration is supported via `workspaces.yaml` (or `/etc/kai/workspaces.yaml` for protected installations). Each workspace can override the Claude model, budget, timeout, environment variables, and system prompt. See `workspaces.example.yaml` for the full format.
+
+### Multi-user
+
+A single Kai instance can serve multiple Telegram users, each fully isolated. Define users in `users.yaml` (or `/etc/kai/users.yaml` for protected installations):
+
+```yaml
+users:
+  - telegram_id: 123456789
+    name: alice
+    role: admin           # receives webhook notifications (GitHub, generic)
+    github: alice-dev     # routes GitHub events to this user
+    os_user: alice        # subprocess runs as this OS account
+    home_workspace: /home/alice/workspace
+    max_budget: 15.0      # per-session spending ceiling
+```
+
+Each user gets:
+
+- **Own Claude subprocess** - created lazily on first message, evicted after idle timeout (`CLAUDE_IDLE_TIMEOUT`, default 30 minutes). No shared conversation state.
+- **Isolated data** - conversation history, workspace settings, scheduled jobs, and file uploads are all namespaced by user. One user cannot see or affect another's state.
+- **Optional OS-level separation** - set `os_user` to run that user's Claude process as a dedicated system account via `sudo -u`. Requires a sudoers rule (the install script generates one automatically).
+- **Per-user home workspace** - each user can have their own default workspace directory.
+- **Role-based routing** - admins receive unattributed webhook events (GitHub pushes, generic webhooks). Regular users interact only through Telegram messages.
+
+When `users.yaml` is absent, Kai falls back to `ALLOWED_USER_IDS` for single-user or simple multi-user setups where per-user configuration is not needed. See `users.yaml.example` for the full format.
 
 ### Memory
 
@@ -147,7 +173,7 @@ cp .env.example .env
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | Yes | | Bot token from BotFather |
-| `ALLOWED_USER_IDS` | Yes | | Comma-separated Telegram user IDs |
+| `ALLOWED_USER_IDS` | Yes* | | Comma-separated Telegram user IDs (*not required when `users.yaml` exists) |
 | `CLAUDE_MODEL` | No | `sonnet` | Default model (`opus`, `sonnet`, or `haiku`) |
 | `CLAUDE_TIMEOUT_SECONDS` | No | `120` | Per-message timeout |
 | `CLAUDE_MAX_BUDGET_USD` | No | `10.0` | Session budget cap |
@@ -166,6 +192,7 @@ cp .env.example .env
 | `TOTP_LOCKOUT_ATTEMPTS` | No | `3` | Failed TOTP attempts before temporary lockout |
 | `TOTP_LOCKOUT_MINUTES` | No | `15` | TOTP lockout duration in minutes |
 | `CLAUDE_USER` | No | | OS user for the inner Claude process (enables process isolation via `sudo -u`) |
+| `CLAUDE_IDLE_TIMEOUT` | No | `1800` | Seconds before idle subprocesses are evicted (0 to disable) |
 
 `CLAUDE_MAX_BUDGET_USD` limits how much work Claude can do in a single session via Claude Code's `--max-budget-usd` flag. On Pro/Max plans this is purely a runaway prevention mechanism (no per-token charges). The session resets on `/new`, model switch, or workspace switch.
 
@@ -282,6 +309,7 @@ kai/
 │   ├── cron.py               # Scheduled job execution (APScheduler)
 │   ├── webhook.py            # HTTP server: GitHub/generic webhooks, scheduling API
 │   ├── history.py            # Conversation history (read/write JSONL logs)
+│   ├── pool.py               # Per-user Claude subprocess pool (lazy creation, idle eviction)
 │   ├── locks.py              # Per-chat async locks and stop events
 │   ├── install.py            # Protected installation tooling
 │   ├── totp.py               # TOTP verification, rate limiting, and CLI
@@ -298,6 +326,7 @@ kai/
 ├── logs/                     # Daily-rotated log files (gitignored)
 ├── models/                   # Whisper and Piper model files (gitignored)
 ├── services.yaml             # External service configs (gitignored)
+├── users.yaml.example        # Per-user config template (multi-user)
 ├── workspaces.example.yaml   # Per-workspace config template
 ├── pyproject.toml            # Package metadata and dependencies
 ├── Makefile                  # Common dev commands
