@@ -570,6 +570,8 @@ def _generate_sudoers(service_user: str, claude_user: str | None = None) -> str:
         # Managed by 'python -m kai install apply'. Do not edit manually.
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/env
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/services.yaml
+        {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/users.yaml
+        {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/workspaces.yaml
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/totp.secret
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/totp.attempts
         {service_user} ALL=(root) NOPASSWD: {tee_path} /etc/kai/totp.attempts
@@ -1278,6 +1280,9 @@ def _apply_secrets(env: dict[str, str], dry_run: bool) -> None:
 
     if dry_run:
         print(f"[DRY RUN] Would write: {env_path} (mode 0600)")
+        for yaml_name in ("services.yaml", "users.yaml", "workspaces.yaml"):
+            if (PROJECT_ROOT / yaml_name).exists():
+                print(f"[DRY RUN] Would copy: /etc/kai/{yaml_name} (mode 0600)")
         return
 
     env_path.write_text(env_content)
@@ -1285,14 +1290,18 @@ def _apply_secrets(env: dict[str, str], dry_run: bool) -> None:
     os.chown(env_path, 0, 0)
     print(f"  Wrote {env_path}")
 
-    # Copy services.yaml if it exists in the source directory
-    services_src = PROJECT_ROOT / "services.yaml"
-    services_dst = etc_kai / "services.yaml"
-    if services_src.exists():
-        shutil.copy2(services_src, services_dst)
-        os.chmod(services_dst, 0o600)
-        os.chown(services_dst, 0, 0)
-        print(f"  Copied {services_dst}")
+    # Copy optional YAML config files to /etc/kai/ if they exist in the
+    # source directory. All get root-only permissions (mode 0600) since
+    # they may contain sensitive configuration (API keys in services.yaml,
+    # user IDs in users.yaml).
+    for yaml_name in ("services.yaml", "users.yaml", "workspaces.yaml"):
+        yaml_src = PROJECT_ROOT / yaml_name
+        yaml_dst = etc_kai / yaml_name
+        if yaml_src.exists():
+            shutil.copy2(yaml_src, yaml_dst)
+            os.chmod(yaml_dst, 0o600)
+            os.chown(yaml_dst, 0, 0)
+            print(f"  Copied {yaml_dst}")
 
 
 def _apply_sudoers(service_user: str, dry_run: bool, claude_user: str | None = None) -> None:
