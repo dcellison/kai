@@ -68,7 +68,7 @@ Each user gets:
 - **Per-user home workspace** - each user can have their own default workspace directory.
 - **Role-based routing** - admins receive unattributed webhook events (GitHub pushes, generic webhooks). Regular users interact only through Telegram messages.
 
-When `users.yaml` is absent, Kai falls back to `ALLOWED_USER_IDS` for single-user or simple multi-user setups where per-user configuration is not needed. See `users.yaml.example` for the full format.
+When `users.yaml` is absent, Kai falls back to `ALLOWED_USER_IDS` for single-user or simple multi-user setups where per-user configuration is not needed. If neither is set, Kai refuses to start (fail-closed). The `CLAUDE_USER` env var acts as a global fallback for subprocess isolation; per-user `os_user` in `users.yaml` takes precedence when set. See `users.yaml.example` for the full format.
 
 ### Memory
 
