@@ -381,3 +381,63 @@ class TestWorkspaceHistoryMigration:
             assert rows[0][1] == 0
         finally:
             await sessions.close_db()
+
+
+# ── get_all_workspace_paths ─────────────────────────────────────────
+
+
+class TestGetAllWorkspacePaths:
+    @pytest.fixture(autouse=True)
+    async def db(self, tmp_path):
+        await sessions.init_db(tmp_path / "test.db")
+        yield
+        await sessions.close_db()
+
+    @pytest.mark.asyncio
+    async def test_returns_paths_from_multiple_users(self):
+        """Paths from different users are all returned."""
+        await sessions.upsert_workspace_history("/projects/alice", 111)
+        await sessions.upsert_workspace_history("/projects/bob", 222)
+        paths = await sessions.get_all_workspace_paths()
+        assert "/projects/alice" in paths
+        assert "/projects/bob" in paths
+
+    @pytest.mark.asyncio
+    async def test_deduplicates_paths(self):
+        """Same path visited by two users appears once."""
+        await sessions.upsert_workspace_history("/shared/project", 111)
+        await sessions.upsert_workspace_history("/shared/project", 222)
+        paths = await sessions.get_all_workspace_paths()
+        assert paths.count("/shared/project") == 1
+
+    @pytest.mark.asyncio
+    async def test_respects_limit(self):
+        """Returns at most 'limit' paths."""
+        for i in range(10):
+            await sessions.upsert_workspace_history(f"/projects/{i}", 111)
+        paths = await sessions.get_all_workspace_paths(limit=3)
+        assert len(paths) == 3
+
+    @pytest.mark.asyncio
+    async def test_empty_when_no_history(self):
+        """Returns empty list when no workspace history exists."""
+        paths = await sessions.get_all_workspace_paths()
+        assert paths == []
+
+    @pytest.mark.asyncio
+    async def test_most_recent_first(self):
+        """Paths are ordered by most recently used."""
+        # Use explicit timestamps to guarantee ordering (CURRENT_TIMESTAMP
+        # can be identical for rapid inserts within the same second).
+        db = sessions._get_db()
+        await db.execute(
+            "INSERT OR REPLACE INTO workspace_history (path, chat_id, last_used_at) VALUES (?, ?, ?)",
+            ("/old", 111, "2026-01-01 00:00:00"),
+        )
+        await db.execute(
+            "INSERT OR REPLACE INTO workspace_history (path, chat_id, last_used_at) VALUES (?, ?, ?)",
+            ("/new", 111, "2026-01-02 00:00:00"),
+        )
+        await db.commit()
+        paths = await sessions.get_all_workspace_paths()
+        assert paths.index("/new") < paths.index("/old")

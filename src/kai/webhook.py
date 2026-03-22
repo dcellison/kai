@@ -217,10 +217,11 @@ async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str 
         if Path(allowed).name == repo_name and Path(allowed).is_dir():
             return str(allowed)
 
-    # 4. workspace_history - check each entry's directory name
-    history = await sessions.get_workspace_history(limit=50)
-    for entry in history:
-        path = Path(entry["path"])
+    # 4. workspace_history - search all users' history since webhook
+    # routing has no user context (server-to-server GitHub payload)
+    history_paths = await sessions.get_all_workspace_paths(limit=50)
+    for path_str in history_paths:
+        path = Path(path_str)
         if path.name == repo_name and path.is_dir():
             return str(path)
 

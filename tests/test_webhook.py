@@ -624,9 +624,9 @@ class TestResolveLocalRepo:
         app["allowed_workspaces"] = []
 
         with patch(
-            "kai.webhook.sessions.get_workspace_history",
+            "kai.webhook.sessions.get_all_workspace_paths",
             new_callable=AsyncMock,
-            return_value=[{"path": str(history_repo)}],
+            return_value=[str(history_repo)],
         ):
             result = await _resolve_local_repo("owner/historic", app)
         assert result == str(history_repo)
@@ -662,7 +662,7 @@ class TestResolveLocalRepo:
         app["allowed_workspaces"] = []
 
         with patch(
-            "kai.webhook.sessions.get_workspace_history",
+            "kai.webhook.sessions.get_all_workspace_paths",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -678,12 +678,31 @@ class TestResolveLocalRepo:
         app["allowed_workspaces"] = []
 
         with patch(
-            "kai.webhook.sessions.get_workspace_history",
+            "kai.webhook.sessions.get_all_workspace_paths",
             new_callable=AsyncMock,
-            return_value=[{"path": "/gone/deleted-repo"}],
+            return_value=["/gone/deleted-repo"],
         ):
             result = await _resolve_local_repo("owner/deleted-repo", app)
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_history_searches_all_users(self, tmp_path):
+        """Workspace history resolution finds repos from any user, not just one."""
+        other_user_repo = tmp_path / "other_user_project"
+        other_user_repo.mkdir()
+
+        app = web.Application()
+        app["workspace"] = "/nonexistent/workspace"
+        app["workspace_base"] = None
+        app["allowed_workspaces"] = []
+
+        with patch(
+            "kai.webhook.sessions.get_all_workspace_paths",
+            new_callable=AsyncMock,
+            return_value=[str(other_user_repo)],
+        ):
+            result = await _resolve_local_repo("owner/other_user_project", app)
+        assert result == str(other_user_repo)
 
     @pytest.mark.asyncio
     async def test_handler_uses_resolve(self, _clear_cooldowns):
