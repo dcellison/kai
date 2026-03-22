@@ -246,9 +246,9 @@ def main() -> None:
             # so malformed content doesn't persist across restarts.
             old_flag = DATA_DIR / ".responding_to"
             if old_flag.exists():
-                old_content = old_flag.read_text().strip()
-                old_flag.unlink(missing_ok=True)
                 try:
+                    old_content = old_flag.read_text().strip()
+                    old_flag.unlink(missing_ok=True)
                     old_chat_id = int(old_content)
                     await app.bot.send_message(
                         old_chat_id,
@@ -257,6 +257,7 @@ def main() -> None:
                     logging.info("Notified chat %d of interrupted response (old flag)", old_chat_id)
                 except Exception:
                     logging.exception("Failed to process old .responding_to flag")
+                    old_flag.unlink(missing_ok=True)
 
             logging.info("Kai is running. Press Ctrl+C to stop.")
             await asyncio.Event().wait()  # Block forever until shutdown signal
