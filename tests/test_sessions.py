@@ -366,9 +366,8 @@ class TestWorkspaceHistoryMigration:
 
         # Run init_db which should detect the missing chat_id column
         # and perform the atomic migration
-        await sessions.init_db(db_path)
-
         try:
+            await sessions.init_db(db_path)
             # Verify schema: chat_id column exists
             async with sessions._get_db().execute("PRAGMA table_info(workspace_history)") as cursor:
                 columns = [row[1] for row in await cursor.fetchall()]
