@@ -293,16 +293,27 @@ class TestGetIfExists:
 
 class TestEvictionTOCTOU:
     def test_eviction_skips_recently_active(self):
-        """User becomes active during eviction sweep window. Subprocess survives."""
+        """User becomes active during eviction sweep. TOCTOU guard protects them."""
         config = _make_config(claude_idle_timeout=1)
         pool = SubprocessPool(config=config, services_info=[])
         pool.get(111)
 
-        # Simulate: list was built when user was idle, but user became
-        # active before the per-user eviction check runs.
-        now = time.monotonic() - 10  # "now" when the list was built
+        # Simulate the eviction sweep's perspective: "now" was 10 seconds
+        # ago when the candidate list was built. But the user became
+        # active after that (their timestamp is newer than "now").
+        sweep_now = time.monotonic() - 10
         pool._last_activity[111] = time.monotonic()  # user just became active
 
-        # The re-check should skip this user since their activity
-        # timestamp is newer than the eviction sweep's "now"
-        assert pool._last_activity[111] > now
+        # Build the candidate list as the eviction loop would
+        to_evict = [
+            cid
+            for cid, last in pool._last_activity.items()
+            if sweep_now - last > config.claude_idle_timeout and cid in pool._pool and cid not in pool._in_flight
+        ]
+
+        # User should NOT be in the evict list (they were active recently)
+        assert 111 not in to_evict
+
+        # Even if they somehow ended up in the list, the TOCTOU re-check
+        # would skip them since their activity is newer than sweep_now
+        assert pool._last_activity[111] > sweep_now

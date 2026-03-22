@@ -227,12 +227,12 @@ def main() -> None:
             except OSError:
                 flags = []
             for flag in flags:
+                # Always unlink the flag first: prevents double-notify on
+                # restart if send fails, and cleans up malformed files
+                # (e.g., OS temp files) that would otherwise persist forever.
+                flag.unlink(missing_ok=True)
                 try:
                     interrupted_chat_id = int(flag.name)
-                    # Delete flag FIRST to prevent double-notify on restart.
-                    # If the notification fails, the user just doesn't get it -
-                    # better than getting it on every subsequent restart.
-                    flag.unlink(missing_ok=True)
                     await app.bot.send_message(
                         interrupted_chat_id,
                         "Sorry, my previous response was interrupted. Please resend your last message.",

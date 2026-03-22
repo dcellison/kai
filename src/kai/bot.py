@@ -1593,7 +1593,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ── Main message handler ─────────────────────────────────────────────
 
 
-@_require_auth
 async def _check_totp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Check TOTP authentication if configured. Returns True if the request

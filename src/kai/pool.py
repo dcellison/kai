@@ -192,15 +192,16 @@ class SubprocessPool:
 
         Use this for operations that should be no-ops when no subprocess
         exists (e.g., /stop on an idle user). Contrast with get(), which
-        creates on first access.
+        creates on first access. Does NOT update last_activity to avoid
+        side effects (e.g., force_kill refreshing the timestamp of a
+        process it's about to kill).
         """
-        if chat_id in self._pool:
-            self._last_activity[chat_id] = time.monotonic()
         return self._pool.get(chat_id)
 
     def force_kill(self, chat_id: int) -> None:
-        """Kill a specific user's subprocess immediately."""
-        instance = self.get_if_exists(chat_id)
+        """Kill a specific user's subprocess and remove it from the pool."""
+        instance = self._pool.pop(chat_id, None)
+        self._last_activity.pop(chat_id, None)
         if instance:
             instance.force_kill()
 
