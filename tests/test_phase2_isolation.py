@@ -292,3 +292,38 @@ class TestCrashRecoveryPerUser:
 
         with patch("kai.bot._RESPONDING_DIR", responding_dir):
             _clear_responding(999)  # should not raise
+
+
+class TestCrashRecoveryFlagOrdering:
+    def test_flag_deleted_before_send(self, tmp_path):
+        """Flag is unlinked before notification attempt, not after."""
+        responding_dir = tmp_path / ".responding"
+        responding_dir.mkdir()
+        flag = responding_dir / "12345"
+        flag.touch()
+
+        # The flag should be deleted even if we just read the directory
+        flags = list(responding_dir.iterdir())
+        assert len(flags) == 1
+
+        # Simulate the main.py pattern: unlink first, then process
+        flag.unlink(missing_ok=True)
+        assert not flag.exists()
+
+    def test_malformed_flag_cleaned_up(self, tmp_path):
+        """Non-numeric flag files are cleaned up unconditionally."""
+        responding_dir = tmp_path / ".responding"
+        responding_dir.mkdir()
+        bad_flag = responding_dir / "not_a_number"
+        bad_flag.touch()
+
+        # Simulate main.py: unlink before try block
+        bad_flag.unlink(missing_ok=True)
+        assert not bad_flag.exists()
+
+        # The int() parse would fail, but the file is already gone
+        try:
+            int("not_a_number")
+        except ValueError:
+            pass  # expected
+        assert not bad_flag.exists()

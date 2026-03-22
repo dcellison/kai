@@ -1649,74 +1649,66 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     # ── TOTP gate ────────────────────────────────────────────────────────
-    # _check_totp handles the common case (session valid → proceed, or
-    # session expired → send challenge). The code-verification path below
-    # only applies to text messages (the user types the TOTP code as text).
-    if is_totp_configured():
+    # _check_totp handles the common path: session valid (refresh + proceed)
+    # or session expired with no pending challenge (send challenge + return
+    # False). If it returns False, either the challenge was just sent OR a
+    # challenge is already pending - in the latter case, this text message
+    # is the TOTP code, so we fall through to the verification logic below.
+    if is_totp_configured() and not await _check_totp(update, context):
+        # _check_totp returned False. If a pending challenge exists,
+        # this message is the code - verify it. Otherwise _check_totp
+        # already sent the challenge and we're done.
         assert context.user_data is not None
         assert update.effective_chat is not None
-
-        totp_cfg: Config = context.bot_data["config"]
-        auth_time = context.user_data.get("totp_authenticated_at", 0)
-        totp_expired = time.time() - auth_time > totp_cfg.totp_session_minutes * 60
-
-        if totp_expired:
-            pending = context.user_data.get("totp_pending")
-
-            if not pending:
-                # Send the challenge and set totp_pending. Don't check
-                # the return value - the session is known expired, so
-                # always return after sending the challenge.
-                await _check_totp(update, context)
-                return
-
-            # A challenge is in flight (guaranteed truthy after the
-            # if-not-pending return above). This text is the TOTP code.
-            if time.time() > pending["expires_at"]:
-                del context.user_data["totp_pending"]
-                await update.message.reply_text("TOTP challenge expired. Send another message to try again.")
-                return
-
-            code = update.message.text.strip() if update.message.text else ""
-
-            # Delete the code message immediately so it doesn't linger in chat.
-            try:
-                await update.message.delete()
-            except Exception:
-                pass
-
-            # Check global lockout before calling verify_code().
-            lockout_remaining = get_lockout_remaining()
-            if lockout_remaining > 0:
-                minutes = math.ceil(lockout_remaining / 60)
-                await update.effective_chat.send_message(
-                    f"Too many failed attempts. Locked out for {minutes} more minute{'s' if minutes != 1 else ''}."
-                )
-                return
-
-            lockout_attempts = totp_cfg.totp_lockout_attempts
-            lockout_minutes = totp_cfg.totp_lockout_minutes
-
-            if verify_code(code, lockout_attempts, lockout_minutes):
-                del context.user_data["totp_pending"]
-                context.user_data["totp_authenticated_at"] = time.time()
-                await update.effective_chat.send_message("Authenticated.")
-                return
-
-            # Verification failed
-            lockout_remaining = get_lockout_remaining()
-            if lockout_remaining > 0:
-                del context.user_data["totp_pending"]
-                await update.effective_chat.send_message(
-                    f"Too many failed attempts. Locked out for {lockout_minutes} minutes."
-                )
-            else:
-                remaining = lockout_attempts - get_failure_count()
-                await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
+        pending = context.user_data.get("totp_pending")
+        if not pending:
             return
 
-        # Auth is still valid - refresh the timestamp
-        context.user_data["totp_authenticated_at"] = time.time()
+        # A challenge is in flight. This text is the TOTP code.
+        if time.time() > pending["expires_at"]:
+            del context.user_data["totp_pending"]
+            await update.message.reply_text("TOTP challenge expired. Send another message to try again.")
+            return
+
+        code = update.message.text.strip() if update.message.text else ""
+
+        # Delete the code message immediately so it doesn't linger
+        # in chat history where others could see it.
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        # Check global lockout before calling verify_code().
+        totp_cfg: Config = context.bot_data["config"]
+        lockout_remaining = get_lockout_remaining()
+        if lockout_remaining > 0:
+            minutes = math.ceil(lockout_remaining / 60)
+            await update.effective_chat.send_message(
+                f"Too many failed attempts. Locked out for {minutes} more minute{'s' if minutes != 1 else ''}."
+            )
+            return
+
+        lockout_attempts = totp_cfg.totp_lockout_attempts
+        lockout_minutes = totp_cfg.totp_lockout_minutes
+
+        if verify_code(code, lockout_attempts, lockout_minutes):
+            del context.user_data["totp_pending"]
+            context.user_data["totp_authenticated_at"] = time.time()
+            await update.effective_chat.send_message("Authenticated.")
+            return
+
+        # Verification failed
+        lockout_remaining = get_lockout_remaining()
+        if lockout_remaining > 0:
+            del context.user_data["totp_pending"]
+            await update.effective_chat.send_message(
+                f"Too many failed attempts. Locked out for {lockout_minutes} minutes."
+            )
+        else:
+            remaining = lockout_attempts - get_failure_count()
+            await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
+        return
     # ── End TOTP gate ─────────────────────────────────────────────────────
 
     chat_id = _chat_id(update)

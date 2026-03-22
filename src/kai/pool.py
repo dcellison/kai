@@ -229,7 +229,7 @@ class SubprocessPool:
 
     def get_model(self, chat_id: int) -> str:
         """Get the active model for a user (or global default if no instance)."""
-        instance = self._pool.get(chat_id)
+        instance = self.get_if_exists(chat_id)
         return instance.model if instance else self._config.claude_model
 
     def set_model(self, chat_id: int, model: str) -> None:
@@ -239,17 +239,17 @@ class SubprocessPool:
 
     def get_workspace(self, chat_id: int) -> Path:
         """Get the active workspace for a user."""
-        instance = self._pool.get(chat_id)
+        instance = self.get_if_exists(chat_id)
         return instance.workspace if instance else self._config.claude_workspace
 
     def is_alive(self, chat_id: int) -> bool:
         """True if this user's subprocess is running."""
-        instance = self._pool.get(chat_id)
+        instance = self.get_if_exists(chat_id)
         return instance.is_alive if instance else False
 
     def get_session_id(self, chat_id: int) -> str | None:
         """Get the session ID for a user's subprocess."""
-        instance = self._pool.get(chat_id)
+        instance = self.get_if_exists(chat_id)
         return instance.session_id if instance else None
 
     # ── Idle eviction ───────────────────────────────────────────────
