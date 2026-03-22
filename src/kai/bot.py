@@ -1663,10 +1663,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if totp_expired:
             pending = context.user_data.get("totp_pending")
 
-            # _check_totp always returns False here (session is expired),
-            # but we call it for the side effect of sending the challenge
-            # and setting totp_pending. Only needed when no pending challenge.
-            if not pending and not await _check_totp(update, context):
+            if not pending:
+                # Send the challenge and set totp_pending. Don't check
+                # the return value - the session is known expired, so
+                # always return after sending the challenge.
+                await _check_totp(update, context)
                 return
 
             # A challenge is already in flight - this text is the code.
