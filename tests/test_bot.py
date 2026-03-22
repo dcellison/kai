@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from telegram.error import BadRequest
@@ -936,8 +936,6 @@ class TestHandleModel:
 
     @pytest.mark.asyncio
     async def test_valid_model(self):
-        from unittest.mock import ANY
-
         pool = _make_mock_claude(model="sonnet")
         update = _make_update()
         ctx = _make_context(claude=pool, args=["opus"])
@@ -977,8 +975,6 @@ class TestHandleModelCallback:
 
     @pytest.mark.asyncio
     async def test_switch_model(self):
-        from unittest.mock import ANY
-
         pool = _make_mock_claude(model="sonnet")
         update = _make_callback_update(data="model:opus")
         ctx = _make_context(claude=pool)

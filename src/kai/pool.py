@@ -271,7 +271,10 @@ class SubprocessPool:
                 pass
             self._eviction_task = None
         for chat_id, instance in self._pool.items():
-            log.info("Shutting down subprocess for user %d", chat_id)
-            await instance.shutdown()
+            try:
+                log.info("Shutting down subprocess for user %d", chat_id)
+                await instance.shutdown()
+            except Exception:
+                log.exception("Error shutting down subprocess for user %d", chat_id)
         self._pool.clear()
         self._last_activity.clear()
