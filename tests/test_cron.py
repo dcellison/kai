@@ -404,7 +404,7 @@ class TestJobCallbackClaude:
     @pytest.mark.asyncio()
     async def test_sends_claude_response_to_telegram(self):
         """Claude response is delivered with a [Job: name] prefix."""
-        self.ctx.bot_data = {"claude": _make_claude_mock("Hello world")}
+        self.ctx.bot_data = {"pool": _make_claude_mock("Hello world")}
         with patch("kai.cron.log_message"):
             await _job_callback(self.ctx)
         self.ctx.bot.send_message.assert_called_once_with(chat_id=12345, text="[Job: Test Job]\nHello world")
@@ -412,7 +412,7 @@ class TestJobCallbackClaude:
     @pytest.mark.asyncio()
     async def test_shows_typing_indicator(self):
         """A typing indicator is sent before the Claude request."""
-        self.ctx.bot_data = {"claude": _make_claude_mock()}
+        self.ctx.bot_data = {"pool": _make_claude_mock()}
         with patch("kai.cron.log_message"):
             await _job_callback(self.ctx)
         self.ctx.bot.send_chat_action.assert_called_once()
@@ -422,7 +422,7 @@ class TestJobCallbackClaude:
         """When claude isn't in bot_data, logs error and returns without crashing."""
         self.ctx.bot_data = {}
         await _job_callback(self.ctx)
-        assert "No Claude process" in caplog.text
+        assert "No subprocess pool" in caplog.text
         self.ctx.bot.send_message.assert_not_called()
 
     @pytest.mark.asyncio()
@@ -435,7 +435,7 @@ class TestJobCallbackClaude:
             yield
 
         mock_claude.send = exploding_send
-        self.ctx.bot_data = {"claude": mock_claude}
+        self.ctx.bot_data = {"pool": mock_claude}
         await _job_callback(self.ctx)
         assert "crashed" in caplog.text
         self.ctx.bot.send_message.assert_not_called()
@@ -452,7 +452,7 @@ class TestJobCallbackClaude:
             yield event
 
         mock_claude.send = empty_send
-        self.ctx.bot_data = {"claude": mock_claude}
+        self.ctx.bot_data = {"pool": mock_claude}
         await _job_callback(self.ctx)
         assert "without a done event" in caplog.text
         self.ctx.bot.send_message.assert_not_called()
@@ -460,7 +460,7 @@ class TestJobCallbackClaude:
     @pytest.mark.asyncio()
     async def test_claude_error_response_returns_early(self, caplog):
         """When Claude returns success=False, logs the error and returns."""
-        self.ctx.bot_data = {"claude": _make_claude_mock(success=False, error="rate limited")}
+        self.ctx.bot_data = {"pool": _make_claude_mock(success=False, error="rate limited")}
         await _job_callback(self.ctx)
         assert "rate limited" in caplog.text
         self.ctx.bot.send_message.assert_not_called()
@@ -468,7 +468,7 @@ class TestJobCallbackClaude:
     @pytest.mark.asyncio()
     async def test_forbidden_on_send_deactivates(self):
         """Forbidden when sending the result deactivates and removes the job."""
-        self.ctx.bot_data = {"claude": _make_claude_mock()}
+        self.ctx.bot_data = {"pool": _make_claude_mock()}
         self.ctx.bot.send_message.side_effect = Forbidden("blocked")
         with (
             patch("kai.cron.log_message"),
@@ -481,7 +481,7 @@ class TestJobCallbackClaude:
     @pytest.mark.asyncio()
     async def test_other_send_exception_does_not_deactivate(self):
         """Non-Forbidden send exceptions log the error but keep the job active."""
-        self.ctx.bot_data = {"claude": _make_claude_mock()}
+        self.ctx.bot_data = {"pool": _make_claude_mock()}
         self.ctx.bot.send_message.side_effect = RuntimeError("timeout")
         with (
             patch("kai.cron.log_message"),
@@ -505,7 +505,7 @@ class TestJobCallbackConditionMet:
     @pytest.mark.asyncio()
     async def test_detects_condition_met_prefix(self):
         """Case-insensitive CONDITION_MET: prefix triggers the met branch."""
-        self.ctx.bot_data = {"claude": _make_claude_mock("condition_met: Package arrived!")}
+        self.ctx.bot_data = {"pool": _make_claude_mock("condition_met: Package arrived!")}
         with (
             patch("kai.cron.log_message"),
             patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate,
@@ -518,7 +518,7 @@ class TestJobCallbackConditionMet:
     @pytest.mark.asyncio()
     async def test_extracts_message_after_marker(self):
         """The message text after CONDITION_MET: is delivered to the user."""
-        self.ctx.bot_data = {"claude": _make_claude_mock("CONDITION_MET: Package arrived!")}
+        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_MET: Package arrived!")}
         with (
             patch("kai.cron.log_message"),
             patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock),
@@ -530,7 +530,7 @@ class TestJobCallbackConditionMet:
     @pytest.mark.asyncio()
     async def test_multi_line_response(self):
         """Text on lines after the marker line is included in the message."""
-        self.ctx.bot_data = {"claude": _make_claude_mock("CONDITION_MET: Done\nHere are details.")}
+        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_MET: Done\nHere are details.")}
         with (
             patch("kai.cron.log_message"),
             patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock),
@@ -543,7 +543,7 @@ class TestJobCallbackConditionMet:
     @pytest.mark.asyncio()
     async def test_no_message_after_marker(self):
         """When nothing follows CONDITION_MET:, a default message is sent."""
-        self.ctx.bot_data = {"claude": _make_claude_mock("CONDITION_MET:")}
+        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_MET:")}
         with (
             patch("kai.cron.log_message"),
             patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock),
@@ -555,7 +555,7 @@ class TestJobCallbackConditionMet:
     @pytest.mark.asyncio()
     async def test_forbidden_still_deactivates(self):
         """Even if the chat is gone (Forbidden), the job is still deactivated."""
-        self.ctx.bot_data = {"claude": _make_claude_mock("CONDITION_MET: done")}
+        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_MET: done")}
         self.ctx.bot.send_message.side_effect = Forbidden("blocked")
         with (
             patch("kai.cron.log_message"),
@@ -581,7 +581,7 @@ class TestJobCallbackConditionNotMet:
     @pytest.mark.asyncio()
     async def test_detects_condition_not_met(self):
         """CONDITION_NOT_MET is recognized (case-insensitive, no colon required)."""
-        self.ctx.bot_data = {"claude": _make_claude_mock("CONDITION_NOT_MET")}
+        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_NOT_MET")}
         with patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate:
             await _job_callback(self.ctx)
         # Job stays active - not deactivated
@@ -591,7 +591,7 @@ class TestJobCallbackConditionNotMet:
     @pytest.mark.asyncio()
     async def test_silent_when_notify_disabled(self):
         """With notify_on_check=False, no message is sent to the user."""
-        self.ctx.bot_data = {"claude": _make_claude_mock("CONDITION_NOT_MET: still waiting")}
+        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_NOT_MET: still waiting")}
         await _job_callback(self.ctx)
         self.ctx.bot.send_message.assert_not_called()
 
@@ -599,7 +599,7 @@ class TestJobCallbackConditionNotMet:
     async def test_sends_message_when_notify_enabled(self):
         """With notify_on_check=True, the status message is sent to the user."""
         self.ctx.job.data["notify_on_check"] = True
-        self.ctx.bot_data = {"claude": _make_claude_mock("CONDITION_NOT_MET: Package in transit")}
+        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_NOT_MET: Package in transit")}
         with patch("kai.cron.log_message"):
             await _job_callback(self.ctx)
         sent_text = self.ctx.bot.send_message.call_args.kwargs["text"]
@@ -610,7 +610,7 @@ class TestJobCallbackConditionNotMet:
         """Both 'CONDITION_NOT_MET: msg' and 'CONDITION_NOT_MET msg' work."""
         self.ctx.job.data["notify_on_check"] = True
         # Without colon
-        self.ctx.bot_data = {"claude": _make_claude_mock("CONDITION_NOT_MET Still checking")}
+        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_NOT_MET Still checking")}
         with patch("kai.cron.log_message"):
             await _job_callback(self.ctx)
         # The lstrip(":") handles the optional colon; without it, the space
@@ -622,7 +622,7 @@ class TestJobCallbackConditionNotMet:
     async def test_no_message_after_marker_with_notify(self):
         """When nothing follows CONDITION_NOT_MET with notify=True, sends default text."""
         self.ctx.job.data["notify_on_check"] = True
-        self.ctx.bot_data = {"claude": _make_claude_mock("CONDITION_NOT_MET")}
+        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_NOT_MET")}
         with patch("kai.cron.log_message"):
             await _job_callback(self.ctx)
         sent_text = self.ctx.bot.send_message.call_args.kwargs["text"]
@@ -632,7 +632,7 @@ class TestJobCallbackConditionNotMet:
     async def test_forbidden_with_notify_deactivates(self):
         """Forbidden when sending a notify update deactivates and removes the job."""
         self.ctx.job.data["notify_on_check"] = True
-        self.ctx.bot_data = {"claude": _make_claude_mock("CONDITION_NOT_MET: status")}
+        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_NOT_MET: status")}
         self.ctx.bot.send_message.side_effect = Forbidden("blocked")
         with (
             patch("kai.cron.log_message"),

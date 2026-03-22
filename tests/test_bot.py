@@ -435,24 +435,34 @@ def _make_callback_update(data="model:opus", chat_id=12345, user_id=1):
 
 
 def _make_mock_claude(model="sonnet", workspace=None, is_alive=True):
-    """Create a mock PersistentClaude."""
-    claude = MagicMock()
-    claude.model = model
-    claude.is_alive = is_alive
-    claude.workspace = workspace or Path("/home/workspace")
-    claude.restart = AsyncMock()
-    claude.change_workspace = AsyncMock()
-    claude.force_kill = MagicMock()
-    claude.send = MagicMock()  # configured per test
-    return claude
+    """Create a mock SubprocessPool with pool-compatible methods.
+
+    Despite the name (kept for backward compatibility with existing test
+    call sites), this returns a pool-like mock, not a PersistentClaude.
+    """
+    pool = MagicMock()
+    ws = workspace or Path("/home/workspace")
+    pool.get_model = MagicMock(return_value=model)
+    pool.set_model = MagicMock()
+    pool.get_workspace = MagicMock(return_value=ws)
+    pool.is_alive = MagicMock(return_value=is_alive)
+    pool.get_session_id = MagicMock(return_value=None)
+    pool.restart = AsyncMock()
+    pool.change_workspace = AsyncMock()
+    pool.force_kill = MagicMock()
+    pool.send = MagicMock()  # configured per test
+    return pool
 
 
-def _make_context(config=None, claude=None, args=None, user_data=None, job_queue=None):
+def _make_context(config=None, claude=None, pool=None, args=None, user_data=None, job_queue=None):
     """Create a mock PTB context with bot_data, args, and user_data."""
     ctx = MagicMock()
+    # Accept either pool (Phase 3) or claude (legacy test compat) as the
+    # mock subprocess manager. Pool is preferred for new tests.
+    mock_pool = pool or claude or _make_mock_claude()
     ctx.bot_data = {
         "config": config or _make_config(),
-        "claude": claude or _make_mock_claude(),
+        "pool": mock_pool,
     }
     ctx.args = args or []
     ctx.user_data = user_data if user_data is not None else {}
@@ -926,13 +936,13 @@ class TestHandleModel:
 
     @pytest.mark.asyncio
     async def test_valid_model(self):
-        claude = _make_mock_claude(model="sonnet")
+        pool = _make_mock_claude(model="sonnet")
         update = _make_update()
-        ctx = _make_context(claude=claude, args=["opus"])
+        ctx = _make_context(claude=pool, args=["opus"])
         with patch("kai.bot.sessions.clear_session", new_callable=AsyncMock):
             await handle_model(update, ctx)
-        assert claude.model == "opus"
-        claude.restart.assert_called_once()
+        pool.set_model.assert_called_once()
+        pool.restart.assert_called_once()
 
 
 # ── handle_model_callback ────────────────────────────────────────────
@@ -965,12 +975,12 @@ class TestHandleModelCallback:
 
     @pytest.mark.asyncio
     async def test_switch_model(self):
-        claude = _make_mock_claude(model="sonnet")
+        pool = _make_mock_claude(model="sonnet")
         update = _make_callback_update(data="model:opus")
-        ctx = _make_context(claude=claude)
+        ctx = _make_context(claude=pool)
         with patch("kai.bot.sessions.clear_session", new_callable=AsyncMock):
             await handle_model_callback(update, ctx)
-        assert claude.model == "opus"
+        pool.set_model.assert_called_once()
         edit_text = update.callback_query.edit_message_text.call_args[0][0]
         assert "Switched" in edit_text
 
@@ -1577,7 +1587,7 @@ class TestSwitchWorkspaceConfig:
 
         # Config was returned and passed to change_workspace
         assert result is ws_config
-        claude.change_workspace.assert_called_once_with(ws_path.resolve(), workspace_config=ws_config)
+        claude.change_workspace.assert_called_once_with(12345, ws_path.resolve(), workspace_config=ws_config)
 
     @pytest.mark.asyncio
     async def test_switch_unconfigured_passes_none(self, tmp_path):
@@ -1595,7 +1605,7 @@ class TestSwitchWorkspaceConfig:
             result = await _do_switch_workspace(ctx, 12345, ws_path.resolve())
 
         assert result is None
-        claude.change_workspace.assert_called_once_with(ws_path.resolve(), workspace_config=None)
+        claude.change_workspace.assert_called_once_with(12345, ws_path.resolve(), workspace_config=None)
 
     @pytest.mark.asyncio
     async def test_switch_shows_config_info(self, tmp_path):

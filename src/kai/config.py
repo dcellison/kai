@@ -169,6 +169,7 @@ class Config:
     claude_timeout_seconds: int = 120
     claude_max_budget_usd: float = 10.0
     claude_max_session_hours: float = 0  # 0 = no limit
+    claude_idle_timeout: int = 1800  # seconds before idle subprocess eviction; 0 = no eviction
     claude_workspace: Path = field(default_factory=lambda: PROJECT_ROOT / "workspace")
 
     # Database - uses DATA_DIR so the db lands in the writable data directory
@@ -800,6 +801,10 @@ def load_config() -> Config:
     except ValueError:
         raise SystemExit("CLAUDE_MAX_SESSION_HOURS must be a number") from None
     try:
+        claude_idle_timeout = int(os.environ.get("CLAUDE_IDLE_TIMEOUT", "1800"))
+    except ValueError:
+        raise SystemExit("CLAUDE_IDLE_TIMEOUT must be an integer") from None
+    try:
         webhook_port = int(os.environ.get("WEBHOOK_PORT", "8080"))
     except ValueError:
         raise SystemExit("WEBHOOK_PORT must be an integer") from None
@@ -870,6 +875,7 @@ def load_config() -> Config:
         claude_timeout_seconds=claude_timeout_seconds,
         claude_max_budget_usd=claude_max_budget_usd,
         claude_max_session_hours=claude_max_session_hours,
+        claude_idle_timeout=claude_idle_timeout,
         webhook_port=webhook_port,
         webhook_secret=os.environ.get("WEBHOOK_SECRET", ""),
         voice_enabled=os.environ.get("VOICE_ENABLED", "").lower() in ("1", "true", "yes"),

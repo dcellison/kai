@@ -53,10 +53,10 @@ from telegram.ext import (
 )
 
 from kai import services, sessions, webhook
-from kai.claude import PersistentClaude
 from kai.config import DATA_DIR, Config, WorkspaceConfig
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
+from kai.pool import SubprocessPool
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 
@@ -161,7 +161,7 @@ _LOCK_ACQUIRE_TIMEOUT = 660  # 11 minutes
 
 async def _acquire_lock_or_kill(
     chat_id: int,
-    claude: "PersistentClaude",
+    pool: "SubprocessPool",
     update: Update,
 ) -> asyncio.Lock | None:
     """Acquire the per-chat lock with a timeout, force-killing if stuck.
@@ -185,7 +185,7 @@ async def _acquire_lock_or_kill(
             chat_id,
             _LOCK_ACQUIRE_TIMEOUT,
         )
-        claude.force_kill()
+        pool.force_kill(chat_id)
         # update.message can be None for edited messages or callback
         # queries, so guard rather than assert.
         if update.message is not None:
@@ -341,9 +341,9 @@ async def _send_response(update: Update, text: str) -> None:
         await _reply_safe(update.message, chunk)
 
 
-def _get_claude(context: ContextTypes.DEFAULT_TYPE) -> PersistentClaude:
-    """Retrieve the PersistentClaude instance from bot_data."""
-    return context.bot_data["claude"]
+def _get_pool(context: ContextTypes.DEFAULT_TYPE) -> "SubprocessPool":
+    """Retrieve the SubprocessPool from bot_data."""
+    return context.bot_data["pool"]
 
 
 # ── Basic command handlers ───────────────────────────────────────────
@@ -365,9 +365,10 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     kills the subprocess so the next message launches a new one.
     """
     assert update.message is not None
-    claude = _get_claude(context)
-    await claude.restart()
-    await sessions.clear_session(_chat_id(update))
+    chat_id = _chat_id(update)
+    pool = _get_pool(context)
+    await pool.restart(chat_id)
+    await sessions.clear_session(chat_id)
     await update.message.reply_text("Session cleared. Starting fresh.")
 
 
@@ -396,10 +397,10 @@ def _models_keyboard(current: str) -> InlineKeyboardMarkup:
 async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /models — show an inline keyboard for model selection."""
     assert update.message is not None
-    claude = _get_claude(context)
+    pool = _get_pool(context)
     await update.message.reply_text(
         "Choose a model:",
-        reply_markup=_models_keyboard(claude.model),
+        reply_markup=_models_keyboard(pool.get_model(_chat_id(update))),
     )
 
 
@@ -409,9 +410,9 @@ async def _switch_model(context: ContextTypes.DEFAULT_TYPE, chat_id: int, model:
 
     Called by both the inline keyboard callback and the /model text command.
     """
-    claude = _get_claude(context)
-    claude.model = model
-    await claude.restart()
+    pool = _get_pool(context)
+    pool.set_model(chat_id, model)
+    await pool.restart(chat_id)
     await sessions.clear_session(chat_id)
 
 
@@ -435,8 +436,8 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("Invalid model.")
         return
 
-    claude = _get_claude(context)
-    if model == claude.model:
+    pool = _get_pool(context)
+    if model == pool.get_model(_chat_id(update)):
         await query.answer()
         await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
         return
@@ -600,9 +601,10 @@ async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /stats — show session info, model, cost, and process status."""
     assert update.message is not None
-    claude = _get_claude(context)
-    stats = await sessions.get_stats(_chat_id(update))
-    alive = claude.is_alive
+    chat_id = _chat_id(update)
+    pool = _get_pool(context)
+    stats = await sessions.get_stats(chat_id)
+    alive = pool.is_alive(chat_id)
     if not stats:
         await update.message.reply_text(f"No active session.\nProcess alive: {alive}")
         return
@@ -701,10 +703,10 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """
     assert update.message is not None
     chat_id = _chat_id(update)
-    claude = _get_claude(context)
+    pool = _get_pool(context)
     stop_event = get_stop_event(chat_id)
     stop_event.set()
-    claude.force_kill()
+    pool.force_kill(chat_id)
     await update.message.reply_text("Stopping...")
 
 
@@ -802,16 +804,15 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     Returns the WorkspaceConfig for the target workspace (or None) so
     callers can display config details without a redundant lookup.
     """
-    claude = _get_claude(context)
+    pool = _get_pool(context)
     config: Config = context.bot_data["config"]
     home = config.claude_workspace
 
     # Look up per-workspace config for the target workspace.
     ws_config = config.get_workspace_config(path)
-    await claude.change_workspace(path, workspace_config=ws_config)
-    # Keep the webhook server's confinement path in sync so send-file accepts
-    # files from the new workspace rather than rejecting them with 403.
-    webhook.update_workspace(str(path))
+    await pool.change_workspace(chat_id, path, workspace_config=ws_config)
+    # Per-user file confinement is handled at request time in webhook.py
+    # via pool.get_workspace(chat_id), so no global update needed here.
     await sessions.clear_session(chat_id)
 
     if path == home:
@@ -831,11 +832,11 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     metadata (git repo detection, CLAUDE.md presence).
     """
     assert update.message is not None
-    claude = _get_claude(context)
+    pool = _get_pool(context)
     config: Config = context.bot_data["config"]
     home = config.claude_workspace
 
-    if path == claude.workspace:
+    if path == pool.get_workspace(_chat_id(update)):
         await update.message.reply_text("Already in that workspace.")
         return
 
@@ -931,9 +932,9 @@ async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     assert update.message is not None
     chat_id = _chat_id(update)
     history = await sessions.get_workspace_history(chat_id)
-    claude = _get_claude(context)
+    pool = _get_pool(context)
     config: Config = context.bot_data["config"]
-    current = str(claude.workspace)
+    current = str(pool.get_workspace(chat_id))
     home = str(config.claude_workspace)
 
     if not history and not config.allowed_workspaces and current == home:
@@ -962,7 +963,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
 
     assert query.data is not None
     data = query.data.removeprefix("ws:")
-    claude = _get_claude(context)
+    pool = _get_pool(context)
     home = config.claude_workspace
     base = config.workspace_base
 
@@ -1010,7 +1011,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             await query.answer("That workspace is no longer allowed.")
             history = await sessions.get_workspace_history(chat_id)
             keyboard = await _workspaces_keyboard(
-                history, str(claude.workspace), str(home), base, config.allowed_workspaces
+                history, str(pool.get_workspace(chat_id)), str(home), base, config.allowed_workspaces
             )
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return
@@ -1020,14 +1021,14 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             await query.answer("That workspace no longer exists.")
             history = await sessions.get_workspace_history(chat_id)
             keyboard = await _workspaces_keyboard(
-                history, str(claude.workspace), str(home), base, config.allowed_workspaces
+                history, str(pool.get_workspace(chat_id)), str(home), base, config.allowed_workspaces
             )
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return
         label = _short_workspace_name(str(path), base)
 
     # Already there — dismiss the keyboard
-    if path == claude.workspace:
+    if path == pool.get_workspace(chat_id):
         await query.answer()
         await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
         return
@@ -1060,14 +1061,15 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     checks WORKSPACE_BASE first, then ALLOWED_WORKSPACES (by directory name).
     """
     assert update.message is not None
-    claude = _get_claude(context)
+    chat_id = _chat_id(update)
+    pool = _get_pool(context)
     config: Config = context.bot_data["config"]
     home = config.claude_workspace
     base = config.workspace_base
 
     # No args: show current workspace
     if not context.args:
-        current = claude.workspace
+        current = pool.get_workspace(chat_id)
         short = _short_workspace_name(str(current), base)
         if current == home:
             short = "Home"
@@ -1280,8 +1282,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     chat_id = _chat_id(update)
-    claude = _get_claude(context)
-    model = claude.model
+    pool = _get_pool(context)
+    model = pool.get_model(chat_id)
 
     # Download the largest available resolution (last in the list)
     photo = update.message.photo[-1]
@@ -1291,7 +1293,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     b64 = base64.b64encode(raw).decode()
 
     # Save to workspace so Claude can access the file via shell tools
-    saved = _save_to_workspace(raw, f"photo_{photo.file_unique_id}.jpg", claude.workspace, user_id=chat_id)
+    saved = _save_to_workspace(raw, f"photo_{photo.file_unique_id}.jpg", pool.get_workspace(chat_id), user_id=chat_id)
 
     caption = update.message.caption or "What's in this image?"
     caption += f"\n[File saved to: {saved}]"
@@ -1302,7 +1304,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ]
 
     was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    lock = await _acquire_lock_or_kill(chat_id, pool, update)
     if lock is None:
         return
     try:
@@ -1313,7 +1315,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 context,
                 chat_id,
                 _prepend_queue_marker(content) if was_queued else content,
-                claude,
+                pool,
                 model,
             )
         finally:
@@ -1404,8 +1406,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     caption = update.message.caption or ""
 
     chat_id = _chat_id(update)
-    claude = _get_claude(context)
-    model = claude.model
+    pool = _get_pool(context)
+    model = pool.get_model(chat_id)
 
     if suffix in _IMAGE_MEDIA_TYPES:
         # Handle images sent as documents (uncompressed upload)
@@ -1416,7 +1418,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         media_type = _IMAGE_MEDIA_TYPES[suffix]
 
         # Save to workspace so Claude can access the file via shell tools
-        saved = _save_to_workspace(raw, file_name, claude.workspace, user_id=chat_id)
+        saved = _save_to_workspace(raw, file_name, pool.get_workspace(chat_id), user_id=chat_id)
         img_caption = caption or f"What's in this image ({file_name})?"
         img_caption += f"\n[File saved to: {saved}]"
 
@@ -1442,7 +1444,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         # Save to workspace so Claude can access the file via shell tools
-        saved = _save_to_workspace(raw, file_name, claude.workspace, user_id=chat_id)
+        saved = _save_to_workspace(raw, file_name, pool.get_workspace(chat_id), user_id=chat_id)
         header = f"File: {file_name}\n```\n{text_content}\n```\n[File saved to: {saved}]"
 
         log_message(
@@ -1460,7 +1462,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # can work with the file via shell tools (e.g., unzip, pdftotext, etc.)
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
-        saved = _save_to_workspace(bytes(data), file_name, claude.workspace, user_id=chat_id)
+        saved = _save_to_workspace(bytes(data), file_name, pool.get_workspace(chat_id), user_id=chat_id)
 
         log_message(
             direction="user",
@@ -1471,7 +1473,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         content = (caption or f"File received: {file_name}") + f"\n[File saved to: {saved}]"
 
     was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    lock = await _acquire_lock_or_kill(chat_id, pool, update)
     if lock is None:
         return
     try:
@@ -1482,7 +1484,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 context,
                 chat_id,
                 _prepend_queue_marker(content) if was_queued else content,
-                claude,
+                pool,
                 model,
             )
         finally:
@@ -1506,7 +1508,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     chat_id = _chat_id(update)
-    claude = _get_claude(context)
+    pool = _get_pool(context)
     config: Config = context.bot_data["config"]
 
     if not config.voice_enabled:
@@ -1553,10 +1555,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _reply_safe(update.message, f"_Heard:_ {transcript}")
 
     prompt = f"[Voice message transcription]: {transcript}"
-    model = claude.model
+    model = pool.get_model(chat_id)
 
     was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    lock = await _acquire_lock_or_kill(chat_id, pool, update)
     if lock is None:
         return
     try:
@@ -1567,7 +1569,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 context,
                 chat_id,
                 _prepend_queue_marker(prompt) if was_queued else prompt,
-                claude,
+                pool,
                 model,
             )
         finally:
@@ -1680,11 +1682,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = _chat_id(update)
     prompt = update.message.text
     log_message(direction="user", chat_id=chat_id, text=prompt)
-    claude = _get_claude(context)
-    model = claude.model
+    pool = _get_pool(context)
+    model = pool.get_model(chat_id)
 
     was_queued = await _notify_if_queued(update, chat_id)
-    lock = await _acquire_lock_or_kill(chat_id, claude, update)
+    lock = await _acquire_lock_or_kill(chat_id, pool, update)
     if lock is None:
         return
     try:
@@ -1695,7 +1697,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 context,
                 chat_id,
                 _prepend_queue_marker(prompt) if was_queued else prompt,
-                claude,
+                pool,
                 model,
             )
         finally:
@@ -1712,7 +1714,7 @@ async def _handle_response(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     prompt: str | list,
-    claude: PersistentClaude,
+    pool: SubprocessPool,
     model: str,
 ) -> None:
     """
@@ -1781,7 +1783,7 @@ async def _handle_response(
 
         # Stream events from Claude. Pass chat_id so the inner Claude
         # can include it in API calls for correct multi-user routing.
-        async for event in claude.send(prompt, chat_id=chat_id):
+        async for event in pool.send(prompt, chat_id=chat_id):
             # Check for /stop between stream chunks
             if stop_event.is_set():
                 stop_event.clear()
@@ -1923,21 +1925,9 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
 
     app = builder.build()
     app.bot_data["config"] = config
-    # Apply per-workspace config for the startup workspace (if any).
-    initial_ws_config = config.get_workspace_config(config.claude_workspace)
-
-    app.bot_data["claude"] = PersistentClaude(
-        model=config.claude_model,
-        workspace=config.claude_workspace,
-        home_workspace=config.claude_workspace,
-        webhook_port=config.webhook_port,
-        webhook_secret=config.webhook_secret,
-        max_budget_usd=config.claude_max_budget_usd,
-        timeout_seconds=config.claude_timeout_seconds,
+    app.bot_data["pool"] = SubprocessPool(
+        config=config,
         services_info=services.get_available_services(),
-        claude_user=config.claude_user,
-        max_session_hours=config.claude_max_session_hours,
-        workspace_config=initial_ws_config,
     )
 
     # Command handlers (alphabetical registration, but order doesn't matter for commands)

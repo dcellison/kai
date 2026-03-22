@@ -494,7 +494,6 @@ async def _handle_github(request: web.Request) -> web.Response:
     """
     secret = request.app["webhook_secret"]
     bot = request.app["telegram_bot"]
-    chat_id = request.app["chat_id"]
 
     body = await request.read()
 
@@ -514,6 +513,21 @@ async def _handle_github(request: web.Request) -> web.Response:
         payload = json.loads(body)
     except json.JSONDecodeError:
         return web.Response(status=400, text="Invalid JSON")
+
+    # Route to the user whose GitHub handle matches the event actor.
+    # For PR events, use the PR author (who should see review feedback).
+    # For all other events, use the sender (who performed the action).
+    # Falls back to the default admin for unknown actors.
+    config = request.app.get("config")
+    if config and event_type == "pull_request":
+        pr_author = payload.get("pull_request", {}).get("user", {}).get("login", "")
+        target_user = config.get_user_by_github(pr_author) if pr_author else None
+    elif config:
+        sender_login = payload.get("sender", {}).get("login", "")
+        target_user = config.get_user_by_github(sender_login) if sender_login else None
+    else:
+        target_user = None
+    chat_id = target_user.telegram_id if target_user else request.app["chat_id"]
 
     # ── PR review routing ────────────────────────────────────────
     # When PR review is enabled, reviewable PR events (opened, reopened,
@@ -1053,14 +1067,26 @@ async def _handle_send_file(request: web.Request) -> web.Response:
     if not file_path:
         return web.json_response({"error": "Missing required field: path"}, status=400)
 
+    # Resolve chat_id first - needed for per-user workspace confinement
+    try:
+        chat_id = _resolve_chat_id(request, payload)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    except UnauthorizedChatIdError as e:
+        return web.json_response({"error": str(e)}, status=403)
+
     path = Path(file_path).resolve()
 
-    # Confine to the current workspace to prevent path traversal. Uses
-    # Path.relative_to() which raises ValueError on escape, unlike string
-    # prefix matching which is bypassable via symlinks.
-    # Fail closed: if workspace is somehow unset, deny all file access
-    # rather than allowing reads from anywhere on the filesystem.
-    workspace = request.app.get("workspace")
+    # Confine to the requesting user's workspace to prevent path traversal.
+    # Uses Path.relative_to() which raises ValueError on escape. With
+    # per-user subprocesses (Phase 3), each user has their own workspace
+    # resolved from the pool. Falls back to the global workspace setting
+    # for backward compatibility.
+    pool = request.app.get("pool")
+    if pool:
+        workspace = str(pool.get_workspace(chat_id))
+    else:
+        workspace = request.app.get("workspace")
     if not workspace:
         return web.json_response({"error": "No workspace configured"}, status=403)
     workspace_resolved = Path(workspace).resolve()
@@ -1073,12 +1099,6 @@ async def _handle_send_file(request: web.Request) -> web.Response:
         return web.json_response({"error": f"File not found: {file_path}"}, status=404)
 
     bot = request.app["telegram_bot"]
-    try:
-        chat_id = _resolve_chat_id(request, payload)
-    except ValueError as e:
-        return web.json_response({"error": str(e)}, status=400)
-    except UnauthorizedChatIdError as e:
-        return web.json_response({"error": str(e)}, status=403)
     caption = payload.get("caption", "")
 
     # Send images as photos (Telegram renders them inline) and everything
@@ -1235,8 +1255,17 @@ async def start(telegram_app, config) -> None:
     # Prevents prompt injection from routing messages to arbitrary users.
     _app["allowed_user_ids"] = config.allowed_user_ids
 
-    # Store workspace path for send-file path confinement
+    # Store workspace path for send-file path confinement (fallback when
+    # pool is not available). Phase 3 uses pool.get_workspace(chat_id)
+    # for per-user confinement at request time.
     _app["workspace"] = str(config.claude_workspace)
+
+    # Store config for GitHub actor routing in _handle_github()
+    _app["config"] = config
+
+    # Store the subprocess pool for per-user workspace lookup in send-file.
+    # Set by main.py after pool creation; may be None during init.
+    _app["pool"] = telegram_app.bot_data.get("pool")
 
     # PR review agent config - stored in app for access by _handle_github()
     _app["pr_review_enabled"] = config.pr_review_enabled

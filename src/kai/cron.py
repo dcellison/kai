@@ -256,10 +256,10 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             await sessions.deactivate_job(job_id)
         return
 
-    # ── Claude jobs: send prompt through the Claude process ──
-    claude = context.bot_data.get("claude")
-    if not claude:
-        log.error("No Claude process available for job %d", job_id)
+    # ── Claude jobs: send prompt through the subprocess pool ──
+    pool = context.bot_data.get("pool")
+    if not pool:
+        log.error("No subprocess pool available for job %d", job_id)
         return
 
     async with get_lock(chat_id):
@@ -269,11 +269,12 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
 
-        # Send prompt to Claude and collect the final response (no streaming
-        # to Telegram). Pass chat_id for correct multi-user API routing.
+        # Send prompt to the user's subprocess and collect the final response
+        # (no streaming to Telegram). The pool routes to the correct user's
+        # subprocess and lazily recreates it if it was evicted.
         try:
             final_response = None
-            async for event in claude.send(prompt, chat_id=chat_id):
+            async for event in pool.send(prompt, chat_id=chat_id):
                 if event.done:
                     final_response = event.response
                     break

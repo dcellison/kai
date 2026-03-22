@@ -35,13 +35,12 @@ The shutdown sequence (in the finally block) reverses this order:
 import asyncio
 import logging
 from logging.handlers import TimedRotatingFileHandler
-from pathlib import Path
 
 from telegram import BotCommand
 from telegram.error import NetworkError
 
 from kai import cron, services, sessions, webhook
-from kai.bot import _is_workspace_allowed, create_bot
+from kai.bot import create_bot
 from kai.config import DATA_DIR, PROJECT_ROOT, _read_protected_file, load_config
 
 
@@ -152,25 +151,9 @@ def main() -> None:
         if default_chat_id is not None:
             await sessions.backfill_workspace_history(default_chat_id)
 
-        # Restore workspace for the default user from previous session
-        saved_workspace = (
-            await sessions.get_setting(f"workspace:{default_chat_id}") if default_chat_id is not None else None
-        )
-        if saved_workspace:
-            ws_path = Path(saved_workspace)
-            if not _is_workspace_allowed(ws_path, config):
-                logging.warning(
-                    "Saved workspace %s is not under WORKSPACE_BASE or ALLOWED_WORKSPACES, ignoring",
-                    saved_workspace,
-                )
-                await sessions.delete_setting(f"workspace:{default_chat_id}")
-            elif ws_path.is_dir():
-                ws_config = config.get_workspace_config(ws_path)
-                await app.bot_data["claude"].change_workspace(ws_path, workspace_config=ws_config)
-                logging.info("Restored workspace: %s", ws_path)
-            else:
-                logging.warning("Saved workspace no longer exists: %s", saved_workspace)
-                await sessions.delete_setting(f"workspace:{default_chat_id}")
+        # Phase 3: per-user workspace restoration is deferred to the
+        # SubprocessPool. Each user's workspace is restored lazily on
+        # their first message (in pool.send()). No startup restore needed.
 
         try:
             # Retry initialization if the network isn't ready yet (e.g. after a
@@ -218,12 +201,12 @@ def main() -> None:
             # webhooks, file exchange, and health check regardless of transport mode).
             # In webhook mode, this also registers the Telegram webhook with the API.
             await webhook.start(app, config)
-            # webhook.start() initializes the confinement path from config (home workspace).
-            # If a non-default workspace was restored above, sync it now so send-file
-            # accepts files from the restored workspace. Must come after start() because
-            # start() would overwrite any earlier update_workspace() call.
-            if app.bot_data["claude"].workspace != config.claude_workspace:
-                webhook.update_workspace(str(app.bot_data["claude"].workspace))
+            # Phase 3: per-user file confinement is handled at request
+            # time via pool.get_workspace(chat_id) in webhook.py. No
+            # global workspace sync needed at startup.
+
+            # Start the subprocess pool's idle eviction task.
+            app.bot_data["pool"].start()
 
             # In polling mode, start the Updater's long-polling loop. PTB's
             # start_polling() automatically calls delete_webhook() first, which
@@ -280,7 +263,7 @@ def main() -> None:
             if not use_webhook and app.updater:
                 await app.updater.stop()
             await app.stop()
-            await app.bot_data["claude"].shutdown()
+            await app.bot_data["pool"].shutdown()
             await app.shutdown()
             await sessions.close_db()
 
