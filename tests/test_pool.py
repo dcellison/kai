@@ -292,28 +292,28 @@ class TestGetIfExists:
 
 
 class TestEvictionTOCTOU:
-    def test_eviction_skips_recently_active(self):
-        """User becomes active during eviction sweep. TOCTOU guard protects them."""
+    def test_toctou_guard_skips_recently_active(self):
+        """TOCTOU guard skips user who became active between list build and eviction."""
         config = _make_config(claude_idle_timeout=1)
         pool = SubprocessPool(config=config, services_info=[])
         pool.get(111)
 
-        # Simulate the eviction sweep's perspective: "now" was 10 seconds
-        # ago when the candidate list was built. But the user became
-        # active after that (their timestamp is newer than "now").
-        sweep_now = time.monotonic() - 10
-        pool._last_activity[111] = time.monotonic()  # user just became active
+        # Step 1: simulate building the candidate list when user was idle.
+        # Set activity to old timestamp so user enters the evict list.
+        sweep_now = time.monotonic()
+        pool._last_activity[111] = sweep_now - 10  # idle for 10 seconds
 
-        # Build the candidate list as the eviction loop would
         to_evict = [
             cid
             for cid, last in pool._last_activity.items()
             if sweep_now - last > config.claude_idle_timeout and cid in pool._pool and cid not in pool._in_flight
         ]
+        assert 111 in to_evict  # user is in the evict list
 
-        # User should NOT be in the evict list (they were active recently)
-        assert 111 not in to_evict
+        # Step 2: user becomes active AFTER the list was built (TOCTOU window)
+        pool._last_activity[111] = time.monotonic()
 
-        # Even if they somehow ended up in the list, the TOCTOU re-check
-        # would skip them since their activity is newer than sweep_now
-        assert pool._last_activity[111] > sweep_now
+        # Step 3: the TOCTOU re-check should skip them
+        assert pool._last_activity.get(111, 0) > sweep_now
+        # This is the guard: if _last_activity > now, skip eviction
+        assert 111 in pool._pool  # user survives

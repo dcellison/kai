@@ -1670,51 +1670,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await _check_totp(update, context)
                 return
 
-            # A challenge is already in flight - this text is the code.
-            pending = context.user_data.get("totp_pending")
-            if pending:
-                if time.time() > pending["expires_at"]:
-                    del context.user_data["totp_pending"]
-                    await update.message.reply_text("TOTP challenge expired. Send another message to try again.")
-                    return
-
-                code = update.message.text.strip() if update.message.text else ""
-
-                # Delete the code message immediately so it doesn't linger in chat.
-                try:
-                    await update.message.delete()
-                except Exception:
-                    pass
-
-                # Check global lockout before calling verify_code().
-                lockout_remaining = get_lockout_remaining()
-                if lockout_remaining > 0:
-                    minutes = math.ceil(lockout_remaining / 60)
-                    await update.effective_chat.send_message(
-                        f"Too many failed attempts. Locked out for {minutes} more minute{'s' if minutes != 1 else ''}."
-                    )
-                    return
-
-                lockout_attempts = totp_cfg.totp_lockout_attempts
-                lockout_minutes = totp_cfg.totp_lockout_minutes
-
-                if verify_code(code, lockout_attempts, lockout_minutes):
-                    del context.user_data["totp_pending"]
-                    context.user_data["totp_authenticated_at"] = time.time()
-                    await update.effective_chat.send_message("Authenticated.")
-                    return
-
-                # Verification failed
-                lockout_remaining = get_lockout_remaining()
-                if lockout_remaining > 0:
-                    del context.user_data["totp_pending"]
-                    await update.effective_chat.send_message(
-                        f"Too many failed attempts. Locked out for {lockout_minutes} minutes."
-                    )
-                else:
-                    remaining = lockout_attempts - get_failure_count()
-                    await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
+            # A challenge is in flight (guaranteed truthy after the
+            # if-not-pending return above). This text is the TOTP code.
+            if time.time() > pending["expires_at"]:
+                del context.user_data["totp_pending"]
+                await update.message.reply_text("TOTP challenge expired. Send another message to try again.")
                 return
+
+            code = update.message.text.strip() if update.message.text else ""
+
+            # Delete the code message immediately so it doesn't linger in chat.
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+
+            # Check global lockout before calling verify_code().
+            lockout_remaining = get_lockout_remaining()
+            if lockout_remaining > 0:
+                minutes = math.ceil(lockout_remaining / 60)
+                await update.effective_chat.send_message(
+                    f"Too many failed attempts. Locked out for {minutes} more minute{'s' if minutes != 1 else ''}."
+                )
+                return
+
+            lockout_attempts = totp_cfg.totp_lockout_attempts
+            lockout_minutes = totp_cfg.totp_lockout_minutes
+
+            if verify_code(code, lockout_attempts, lockout_minutes):
+                del context.user_data["totp_pending"]
+                context.user_data["totp_authenticated_at"] = time.time()
+                await update.effective_chat.send_message("Authenticated.")
+                return
+
+            # Verification failed
+            lockout_remaining = get_lockout_remaining()
+            if lockout_remaining > 0:
+                del context.user_data["totp_pending"]
+                await update.effective_chat.send_message(
+                    f"Too many failed attempts. Locked out for {lockout_minutes} minutes."
+                )
+            else:
+                remaining = lockout_attempts - get_failure_count()
+                await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
+            return
 
         # Auth is still valid - refresh the timestamp
         context.user_data["totp_authenticated_at"] = time.time()
