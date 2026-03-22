@@ -122,31 +122,23 @@ async def init_db(db_path: Path) -> None:
     ws_columns = [row[1] for row in await cursor.fetchall()]
     if "chat_id" not in ws_columns:
         # Recreate with composite PK: copy data, drop old, rename new.
-        # Wrapped in explicit transaction so the migration is atomic -
-        # a crash mid-migration rolls back instead of leaving the DB
-        # in a half-migrated state (original table dropped, new table
-        # not yet renamed). BEGIN IMMEDIATE acquires a write lock
-        # immediately to prevent conflicts from concurrent connections.
-        await _get_db().execute("BEGIN IMMEDIATE")
-        try:
-            await _get_db().execute("""
-                CREATE TABLE workspace_history_new (
-                    path TEXT NOT NULL,
-                    chat_id INTEGER NOT NULL DEFAULT 0,
-                    last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (path, chat_id)
-                )
-            """)
-            await _get_db().execute("""
-                INSERT INTO workspace_history_new (path, last_used_at)
-                SELECT path, last_used_at FROM workspace_history
-            """)
-            await _get_db().execute("DROP TABLE workspace_history")
-            await _get_db().execute("ALTER TABLE workspace_history_new RENAME TO workspace_history")
-            await _get_db().execute("COMMIT")
-        except Exception:
-            await _get_db().execute("ROLLBACK")
-            raise
+        # Use executescript() which runs all statements atomically in a
+        # single call, bypassing Python's sqlite3 auto-commit-before-DDL
+        # behavior that would break explicit transactions via execute().
+        await _get_db().executescript("""
+            BEGIN IMMEDIATE;
+            CREATE TABLE workspace_history_new (
+                path TEXT NOT NULL,
+                chat_id INTEGER NOT NULL DEFAULT 0,
+                last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (path, chat_id)
+            );
+            INSERT INTO workspace_history_new (path, last_used_at)
+                SELECT path, last_used_at FROM workspace_history;
+            DROP TABLE workspace_history;
+            ALTER TABLE workspace_history_new RENAME TO workspace_history;
+            COMMIT;
+        """)
     await _get_db().commit()
 
 
