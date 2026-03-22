@@ -1502,8 +1502,8 @@ class TestWALMode:
         """init_db enables WAL journal mode."""
         await sessions.init_db(tmp_path / "test.db")
         try:
-            cursor = await sessions._get_db().execute("PRAGMA journal_mode")
-            row = await cursor.fetchone()
+            async with sessions._get_db().execute("PRAGMA journal_mode") as cursor:
+                row = await cursor.fetchone()
             assert row[0] == "wal"
         finally:
             await sessions.close_db()
