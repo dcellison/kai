@@ -123,8 +123,8 @@ async def init_db(db_path: Path) -> None:
     if "chat_id" not in ws_columns:
         # Recreate with composite PK: copy data, drop old, rename new.
         # Use executescript() which runs all statements atomically in a
-        # single call, bypassing Python's sqlite3 auto-commit-before-DDL
-        # behavior that would break explicit transactions via execute().
+        # single call, avoiding reliance on Python's sqlite3 transaction
+        # suppression rules and aiosqlite's internal locking for DDL.
         try:
             await _get_db().executescript("""
                 BEGIN IMMEDIATE;
