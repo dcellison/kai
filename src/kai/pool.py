@@ -26,12 +26,26 @@ from kai.config import Config, WorkspaceConfig
 
 log = logging.getLogger(__name__)
 
+
+def _is_workspace_allowed(path: Path, config: Config) -> bool:
+    """Return True if path is covered by a configured workspace source.
+
+    Accepts paths under WORKSPACE_BASE or in ALLOWED_WORKSPACES. If
+    neither is configured, all paths are accepted (permissive mode).
+    Duplicated from bot.py to avoid circular import (bot imports pool).
+    """
+    base = config.workspace_base
+    if not base and not config.allowed_workspaces:
+        return True
+    resolved = path.resolve()
+    resolved_base = base.resolve() if base else None
+    in_base = resolved_base and (str(resolved).startswith(str(resolved_base) + "/") or resolved == resolved_base)
+    in_allowed = resolved in config.allowed_workspaces
+    return bool(in_base or in_allowed)
+
+
 # How often the eviction loop checks for idle subprocesses (seconds).
 _EVICTION_CHECK_INTERVAL = 60
-
-# Default idle timeout if not configured via CLAUDE_IDLE_TIMEOUT (seconds).
-# 30 minutes balances memory reclamation with avoiding unnecessary restarts.
-_DEFAULT_IDLE_TIMEOUT = 1800
 
 
 class SubprocessPool:
@@ -129,21 +143,34 @@ class SubprocessPool:
         self._last_activity[chat_id] = time.monotonic()
 
     async def _restore_workspace(self, chat_id: int, instance: PersistentClaude) -> None:
-        """Restore a user's saved workspace from the database."""
+        """Restore a user's saved workspace from the database.
+
+        Validates that the saved workspace is still an allowed path
+        (under WORKSPACE_BASE or in ALLOWED_WORKSPACES). An admin who
+        removes a path from the allowed set should not have users
+        silently bypass the restriction on their next message.
+        """
         saved = await sessions.get_setting(f"workspace:{chat_id}")
         if saved:
             ws_path = Path(saved)
-            if ws_path.is_dir():
-                ws_config = self._config.get_workspace_config(ws_path)
-                await instance.change_workspace(ws_path, workspace_config=ws_config)
-                log.info("Restored workspace for user %d: %s", chat_id, ws_path)
-            else:
+            if not ws_path.is_dir():
                 log.warning(
                     "Saved workspace for user %d no longer exists: %s",
                     chat_id,
                     saved,
                 )
                 await sessions.delete_setting(f"workspace:{chat_id}")
+            elif not _is_workspace_allowed(ws_path, self._config):
+                log.warning(
+                    "Saved workspace for user %d is no longer allowed: %s",
+                    chat_id,
+                    saved,
+                )
+                await sessions.delete_setting(f"workspace:{chat_id}")
+            else:
+                ws_config = self._config.get_workspace_config(ws_path)
+                await instance.change_workspace(ws_path, workspace_config=ws_config)
+                log.info("Restored workspace for user %d: %s", chat_id, ws_path)
 
     # ── Per-user actions ────────────────────────────────────────────
 
@@ -161,6 +188,10 @@ class SubprocessPool:
     ) -> None:
         """Switch a specific user's workspace."""
         instance = self.get(chat_id)
+        # Explicit workspace change supersedes any pending restore.
+        # Without this, the next send() would restore the old saved
+        # workspace over the one just set.
+        self._needs_workspace_restore.discard(chat_id)
         await instance.change_workspace(new_workspace, workspace_config=workspace_config)
 
     async def restart(self, chat_id: int) -> None:
@@ -199,15 +230,16 @@ class SubprocessPool:
     # ── Idle eviction ───────────────────────────────────────────────
 
     def start(self) -> None:
-        """Start the eviction background task."""
-        self._eviction_task = asyncio.create_task(self._eviction_loop())
+        """Start the eviction background task (if eviction is enabled)."""
+        if self._config.claude_idle_timeout > 0:
+            self._eviction_task = asyncio.create_task(self._eviction_loop())
 
     async def _eviction_loop(self) -> None:
         """Periodically kill idle subprocesses to free memory."""
+        idle_timeout = self._config.claude_idle_timeout
         while True:
             await asyncio.sleep(_EVICTION_CHECK_INTERVAL)
             now = time.monotonic()
-            idle_timeout = self._config.claude_idle_timeout or _DEFAULT_IDLE_TIMEOUT
             to_evict = [
                 chat_id
                 for chat_id, last in self._last_activity.items()
@@ -215,15 +247,22 @@ class SubprocessPool:
             ]
             for chat_id in to_evict:
                 instance = self._pool.pop(chat_id, None)
-                if instance and instance.is_alive:
-                    log.info("Evicting idle subprocess for user %d", chat_id)
-                    await instance.shutdown()
                 self._last_activity.pop(chat_id, None)
+                if instance and instance.is_alive:
+                    try:
+                        log.info("Evicting idle subprocess for user %d", chat_id)
+                        await instance.shutdown()
+                    except Exception:
+                        log.exception("Error evicting subprocess for user %d", chat_id)
 
     async def shutdown(self) -> None:
         """Shut down all subprocesses and stop the eviction task."""
         if self._eviction_task:
             self._eviction_task.cancel()
+            try:
+                await self._eviction_task
+            except asyncio.CancelledError:
+                pass
             self._eviction_task = None
         for chat_id, instance in self._pool.items():
             log.info("Shutting down subprocess for user %d", chat_id)
