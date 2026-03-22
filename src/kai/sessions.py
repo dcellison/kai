@@ -122,21 +122,31 @@ async def init_db(db_path: Path) -> None:
     ws_columns = [row[1] for row in await cursor.fetchall()]
     if "chat_id" not in ws_columns:
         # Recreate with composite PK: copy data, drop old, rename new.
-        # This is the standard SQLite pattern for PK changes.
-        await _get_db().execute("""
-            CREATE TABLE workspace_history_new (
-                path TEXT NOT NULL,
-                chat_id INTEGER NOT NULL DEFAULT 0,
-                last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (path, chat_id)
-            )
-        """)
-        await _get_db().execute("""
-            INSERT INTO workspace_history_new (path, last_used_at)
-            SELECT path, last_used_at FROM workspace_history
-        """)
-        await _get_db().execute("DROP TABLE workspace_history")
-        await _get_db().execute("ALTER TABLE workspace_history_new RENAME TO workspace_history")
+        # Wrapped in explicit transaction so the migration is atomic -
+        # a crash mid-migration rolls back instead of leaving the DB
+        # in a half-migrated state (original table dropped, new table
+        # not yet renamed). BEGIN IMMEDIATE acquires a write lock
+        # immediately to prevent conflicts from concurrent connections.
+        await _get_db().execute("BEGIN IMMEDIATE")
+        try:
+            await _get_db().execute("""
+                CREATE TABLE workspace_history_new (
+                    path TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL DEFAULT 0,
+                    last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (path, chat_id)
+                )
+            """)
+            await _get_db().execute("""
+                INSERT INTO workspace_history_new (path, last_used_at)
+                SELECT path, last_used_at FROM workspace_history
+            """)
+            await _get_db().execute("DROP TABLE workspace_history")
+            await _get_db().execute("ALTER TABLE workspace_history_new RENAME TO workspace_history")
+            await _get_db().execute("COMMIT")
+        except Exception:
+            await _get_db().execute("ROLLBACK")
+            raise
     await _get_db().commit()
 
 

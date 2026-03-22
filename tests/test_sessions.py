@@ -1,5 +1,6 @@
 """Tests for sessions.py async database CRUD."""
 
+import aiosqlite
 import pytest
 
 from kai import sessions
@@ -307,3 +308,77 @@ class TestWorkspaceHistory:
             await sessions.upsert_workspace_history(f"/path/{i}", 12345)
         history = await sessions.get_workspace_history(12345, limit=3)
         assert len(history) == 3
+
+
+# ── Workspace history migration ─────────────────────────────────────
+
+
+class TestWorkspaceHistoryMigration:
+    """Verify the workspace_history DDL migration runs atomically."""
+
+    @pytest.mark.asyncio
+    async def test_migration_adds_chat_id_column(self, tmp_path):
+        """Old schema (path-only PK) migrates to composite PK with chat_id."""
+        db_path = tmp_path / "test_migration.db"
+
+        # Create old-schema table directly (path as sole PK, no chat_id)
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await conn.execute("""
+                CREATE TABLE workspace_history (
+                    path TEXT PRIMARY KEY,
+                    last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await conn.execute(
+                "INSERT INTO workspace_history (path) VALUES (?)",
+                ("/old/workspace",),
+            )
+            # Also create the other tables init_db expects to CREATE IF NOT EXISTS
+            await conn.execute("""
+                CREATE TABLE sessions (
+                    chat_id INTEGER PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    model TEXT DEFAULT 'sonnet',
+                    total_cost REAL DEFAULT 0.0
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    job_type TEXT NOT NULL DEFAULT 'reminder',
+                    prompt TEXT NOT NULL,
+                    schedule_type TEXT NOT NULL,
+                    schedule_data TEXT NOT NULL,
+                    active INTEGER DEFAULT 1,
+                    auto_remove INTEGER DEFAULT 0,
+                    notify_on_check INTEGER DEFAULT 0
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            await conn.commit()
+
+        # Run init_db which should detect the missing chat_id column
+        # and perform the atomic migration
+        await sessions.init_db(db_path)
+
+        try:
+            # Verify schema: chat_id column exists
+            async with sessions._get_db().execute("PRAGMA table_info(workspace_history)") as cursor:
+                columns = [row[1] for row in await cursor.fetchall()]
+            assert "chat_id" in columns
+
+            # Verify data preserved with default chat_id=0
+            async with sessions._get_db().execute("SELECT path, chat_id FROM workspace_history") as cursor:
+                rows = await cursor.fetchall()
+            assert len(rows) == 1
+            assert rows[0][0] == "/old/workspace"
+            assert rows[0][1] == 0
+        finally:
+            await sessions.close_db()
