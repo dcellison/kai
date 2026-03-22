@@ -55,6 +55,12 @@ class SubprocessPool:
     Each user gets an independent PersistentClaude instance running as their
     OS user. Instances are created on first message and evicted after idle
     timeout to manage memory on resource-constrained machines.
+
+    Thread safety: send() for a given chat_id is serialized by the
+    per-chat lock in bot.py/cron.py. The pool does not add its own
+    locking because the callers already guarantee single-writer-per-user.
+    If a future caller bypasses the per-chat lock, add an asyncio.Lock
+    per chat_id here.
     """
 
     def __init__(
@@ -180,9 +186,21 @@ class SubprocessPool:
 
     # ── Per-user actions ────────────────────────────────────────────
 
+    def get_if_exists(self, chat_id: int) -> PersistentClaude | None:
+        """
+        Look up a user's subprocess without creating one.
+
+        Use this for operations that should be no-ops when no subprocess
+        exists (e.g., /stop on an idle user). Contrast with get(), which
+        creates on first access.
+        """
+        if chat_id in self._pool:
+            self._last_activity[chat_id] = time.monotonic()
+        return self._pool.get(chat_id)
+
     def force_kill(self, chat_id: int) -> None:
         """Kill a specific user's subprocess immediately."""
-        instance = self._pool.get(chat_id)
+        instance = self.get_if_exists(chat_id)
         if instance:
             instance.force_kill()
 
@@ -202,7 +220,7 @@ class SubprocessPool:
 
     async def restart(self, chat_id: int) -> None:
         """Restart a specific user's subprocess."""
-        instance = self._pool.get(chat_id)
+        instance = self.get_if_exists(chat_id)
         if instance:
             await instance.restart()
 
@@ -252,6 +270,10 @@ class SubprocessPool:
                 if now - last > idle_timeout and chat_id in self._pool and chat_id not in self._in_flight
             ]
             for chat_id in to_evict:
+                # Re-check: activity may have occurred between list
+                # construction and this iteration (TOCTOU window).
+                if self._last_activity.get(chat_id, 0) > now:
+                    continue
                 instance = self._pool.pop(chat_id, None)
                 self._last_activity.pop(chat_id, None)
                 if instance and instance.is_alive:

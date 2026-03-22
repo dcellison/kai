@@ -229,21 +229,24 @@ def main() -> None:
             for flag in flags:
                 try:
                     interrupted_chat_id = int(flag.name)
+                    # Delete flag FIRST to prevent double-notify on restart.
+                    # If the notification fails, the user just doesn't get it -
+                    # better than getting it on every subsequent restart.
+                    flag.unlink(missing_ok=True)
                     await app.bot.send_message(
                         interrupted_chat_id,
                         "Sorry, my previous response was interrupted. Please resend your last message.",
                     )
                     logging.info("Notified chat %d of interrupted response", interrupted_chat_id)
-                    flag.unlink(missing_ok=True)
                 except Exception:
                     logging.exception("Failed to process interrupted-response flag: %s", flag.name)
-                    flag.unlink(missing_ok=True)
 
             # Clean up old single-file flag if it exists (one-time migration)
             old_flag = DATA_DIR / ".responding_to"
             if old_flag.exists():
                 try:
                     old_chat_id = int(old_flag.read_text().strip())
+                    old_flag.unlink(missing_ok=True)
                     await app.bot.send_message(
                         old_chat_id,
                         "Sorry, my previous response was interrupted. Please resend your last message.",

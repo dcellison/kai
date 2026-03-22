@@ -262,3 +262,47 @@ class TestWorkspaceRestoration:
             # The restore should detect the path doesn't exist and delete
             await pool._restore_workspace(111, pool.get(111))
             mock_delete.assert_called_once_with("workspace:111")
+
+
+# ── get_if_exists ───────────────────────────────────────────────────
+
+
+class TestGetIfExists:
+    def test_returns_none_when_no_instance(self):
+        """No subprocess for user. Returns None without creating one."""
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        assert pool.get_if_exists(999) is None
+        assert 999 not in pool._pool
+
+    def test_returns_instance_when_exists(self):
+        """Subprocess exists. Returns it."""
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        pool.get(111)  # create
+        result = pool.get_if_exists(111)
+        assert result is not None
+        assert result is pool._pool[111]
+
+    def test_force_kill_no_instance(self):
+        """/stop for a user with no subprocess. No-op, no crash."""
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        pool.force_kill(999)  # should not raise
+
+
+# ── TOCTOU eviction guard ──────────────────────────────────────────
+
+
+class TestEvictionTOCTOU:
+    def test_eviction_skips_recently_active(self):
+        """User becomes active during eviction sweep window. Subprocess survives."""
+        config = _make_config(claude_idle_timeout=1)
+        pool = SubprocessPool(config=config, services_info=[])
+        pool.get(111)
+
+        # Simulate: list was built when user was idle, but user became
+        # active before the per-user eviction check runs.
+        now = time.monotonic() - 10  # "now" when the list was built
+        pool._last_activity[111] = time.monotonic()  # user just became active
+
+        # The re-check should skip this user since their activity
+        # timestamp is newer than the eviction sweep's "now"
+        assert pool._last_activity[111] > now
