@@ -57,7 +57,7 @@ users:
     github: alice-dev     # routes GitHub events to this user
     os_user: alice        # subprocess runs as this OS account
     home_workspace: /home/alice/workspace
-    max_budget: 15.0      # per-session spending ceiling
+    max_budget: 15.0      # ceiling for /budget command (CLAUDE_MAX_BUDGET_USD is the default)
 ```
 
 Each user gets:
