@@ -17,7 +17,7 @@ configured in users.yaml.
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from kai import sessions
@@ -68,6 +68,7 @@ class SubprocessPool:
         self._pool: dict[int, PersistentClaude] = {}
         self._last_activity: dict[int, float] = {}
         self._needs_workspace_restore: set[int] = set()
+        self._in_flight: set[int] = set()  # chat_ids with active send()
         self._eviction_task: asyncio.Task | None = None
 
     # ── Instance management ─────────────────────────────────────────
@@ -126,21 +127,26 @@ class SubprocessPool:
 
     # ── Prompt routing ──────────────────────────────────────────────
 
-    async def send(self, prompt: str | list, *, chat_id: int) -> AsyncIterator[StreamEvent]:
+    async def send(self, prompt: str | list, *, chat_id: int) -> AsyncGenerator[StreamEvent]:
         """
         Route a prompt to the user's subprocess.
 
         On the first call for a newly created instance, restores the
         user's saved workspace from the database before sending.
+        Marks the user as in-flight to prevent eviction mid-stream.
         """
         instance = self.get(chat_id)
         if chat_id in self._needs_workspace_restore:
             await self._restore_workspace(chat_id, instance)
             self._needs_workspace_restore.discard(chat_id)
         self._last_activity[chat_id] = time.monotonic()
-        async for event in instance.send(prompt, chat_id=chat_id):
-            yield event
-        self._last_activity[chat_id] = time.monotonic()
+        self._in_flight.add(chat_id)
+        try:
+            async for event in instance.send(prompt, chat_id=chat_id):
+                yield event
+        finally:
+            self._in_flight.discard(chat_id)
+            self._last_activity[chat_id] = time.monotonic()
 
     async def _restore_workspace(self, chat_id: int, instance: PersistentClaude) -> None:
         """Restore a user's saved workspace from the database.
@@ -243,7 +249,7 @@ class SubprocessPool:
             to_evict = [
                 chat_id
                 for chat_id, last in self._last_activity.items()
-                if now - last > idle_timeout and chat_id in self._pool
+                if now - last > idle_timeout and chat_id in self._pool and chat_id not in self._in_flight
             ]
             for chat_id in to_evict:
                 instance = self._pool.pop(chat_id, None)

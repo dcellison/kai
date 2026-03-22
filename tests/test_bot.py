@@ -936,12 +936,14 @@ class TestHandleModel:
 
     @pytest.mark.asyncio
     async def test_valid_model(self):
+        from unittest.mock import ANY
+
         pool = _make_mock_claude(model="sonnet")
         update = _make_update()
         ctx = _make_context(claude=pool, args=["opus"])
         with patch("kai.bot.sessions.clear_session", new_callable=AsyncMock):
             await handle_model(update, ctx)
-        pool.set_model.assert_called_once()
+        pool.set_model.assert_called_once_with(ANY, "opus")
         pool.restart.assert_called_once()
 
 
@@ -975,12 +977,14 @@ class TestHandleModelCallback:
 
     @pytest.mark.asyncio
     async def test_switch_model(self):
+        from unittest.mock import ANY
+
         pool = _make_mock_claude(model="sonnet")
         update = _make_callback_update(data="model:opus")
         ctx = _make_context(claude=pool)
         with patch("kai.bot.sessions.clear_session", new_callable=AsyncMock):
             await handle_model_callback(update, ctx)
-        pool.set_model.assert_called_once()
+        pool.set_model.assert_called_once_with(ANY, "opus")
         edit_text = update.callback_query.edit_message_text.call_args[0][0]
         assert "Switched" in edit_text
 
