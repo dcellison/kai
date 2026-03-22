@@ -458,8 +458,11 @@ async def get_all_workspace_paths(limit: int = 100) -> list[str]:
     Returns:
         List of workspace path strings (deduplicated across users).
     """
+    # GROUP BY + MAX(last_used_at) instead of DISTINCT to get
+    # deterministic ordering when the same path appears for multiple
+    # users with different timestamps.
     async with _get_db().execute(
-        "SELECT DISTINCT path FROM workspace_history ORDER BY last_used_at DESC LIMIT ?",
+        "SELECT path FROM workspace_history GROUP BY path ORDER BY MAX(last_used_at) DESC LIMIT ?",
         (limit,),
     ) as cursor:
         rows = await cursor.fetchall()

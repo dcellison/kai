@@ -427,9 +427,10 @@ class TestGetAllWorkspacePaths:
     @pytest.mark.asyncio
     async def test_most_recent_first(self):
         """Paths are ordered by most recently used."""
-        # Use explicit timestamps to guarantee ordering (CURRENT_TIMESTAMP
-        # can be identical for rapid inserts within the same second).
-        db = sessions._get_db()
+        # Use explicit timestamps via raw SQL to guarantee ordering.
+        # CURRENT_TIMESTAMP can be identical for rapid inserts within
+        # the same second, making the ordering test non-deterministic.
+        db = sessions._get_db()  # test-only access for timestamp control
         await db.execute(
             "INSERT OR REPLACE INTO workspace_history (path, chat_id, last_used_at) VALUES (?, ?, ?)",
             ("/old", 111, "2026-01-01 00:00:00"),
