@@ -1338,8 +1338,7 @@ class TestChatIdAuthorization:
         resp = await _handle_schedule(mock_request)
         assert resp.status == 200
 
-    @pytest.mark.asyncio
-    async def test_resolve_chat_id_unauthorized(self):
+    def test_resolve_chat_id_unauthorized(self):
         """_resolve_chat_id raises UnauthorizedChatIdError for unknown users."""
         from kai.webhook import UnauthorizedChatIdError
 
@@ -1349,8 +1348,7 @@ class TestChatIdAuthorization:
         with pytest.raises(UnauthorizedChatIdError):
             _resolve_chat_id(request, {"chat_id": 999999})
 
-    @pytest.mark.asyncio
-    async def test_resolve_chat_id_no_allowed_list(self):
+    def test_resolve_chat_id_no_allowed_list(self):
         """_resolve_chat_id skips validation when allowed_user_ids is not set."""
         request = MagicMock()
         request.app = {"chat_id": 123}

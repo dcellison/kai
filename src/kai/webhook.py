@@ -292,7 +292,7 @@ def _resolve_chat_id(request: web.Request, payload: dict) -> int:
         # Without this, a prompt injection attack could make inner Claude
         # send messages to arbitrary Telegram users.
         allowed = request.app.get("allowed_user_ids")
-        if allowed and resolved not in allowed:
+        if allowed is not None and resolved not in allowed:
             raise UnauthorizedChatIdError(f"chat_id {resolved} is not an authorized user")
         return resolved
     return request.app["chat_id"]

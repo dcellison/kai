@@ -1258,7 +1258,7 @@ def _save_to_workspace(data: bytes, filename: str, workspace: Path, user_id: int
     # Timestamp prefix ensures unique names even if the same file is sent twice
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     # Strip directory components entirely rather than replacing slashes.
-    # Path.name handles all separators (/, \) and edge cases like "../../".
+    # Path.name returns only the final component, handling "/" and "..".
     safe_name = Path(filename).name.replace(" ", "_")
     if not safe_name:
         safe_name = "unnamed_file"
