@@ -1282,7 +1282,7 @@ def _apply_secrets(env: dict[str, str], dry_run: bool) -> None:
         print(f"[DRY RUN] Would write: {env_path} (mode 0600)")
         for yaml_name in ("services.yaml", "users.yaml", "workspaces.yaml"):
             if (PROJECT_ROOT / yaml_name).exists():
-                print(f"[DRY RUN] Would copy: /etc/kai/{yaml_name} (mode 0600)")
+                print(f"[DRY RUN] Would copy: {etc_kai / yaml_name} (mode 0600)")
         return
 
     env_path.write_text(env_content)
