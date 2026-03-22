@@ -44,6 +44,7 @@ def mock_request():
     request.app = {
         "webhook_secret": "test-secret",
         "telegram_app": MagicMock(),
+        "telegram_bot": AsyncMock(),
         "chat_id": 123,
         "allowed_user_ids": {123, 456},
     }
@@ -1338,6 +1339,24 @@ class TestChatIdAuthorization:
         resp = await _handle_schedule(mock_request)
         assert resp.status == 200
 
+    @pytest.mark.asyncio
+    async def test_send_message_unauthorized_returns_403(self, db, mock_request):
+        """POST /api/send-message with unauthorized chat_id returns 403."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"text": "hello", "chat_id": 999999})
+
+        resp = await _handle_send_message(mock_request)
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_send_file_unauthorized_returns_403(self, db, mock_request):
+        """POST /api/send-file with unauthorized chat_id returns 403."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"path": "/tmp/test.txt", "chat_id": 999999})
+
+        resp = await _handle_send_file(mock_request)
+        assert resp.status == 403
+
     def test_resolve_chat_id_unauthorized(self):
         """_resolve_chat_id raises UnauthorizedChatIdError for unknown users."""
         from kai.webhook import UnauthorizedChatIdError
@@ -1422,7 +1441,8 @@ class TestJobOwnership:
             schedule_type="daily",
             schedule_data='{"times":["09:00"]}',
         )
-        await sessions.deactivate_job(job_id, chat_id=222)
+        result = await sessions.deactivate_job(job_id, chat_id=222)
+        assert result is False
         # Job should still be active
         jobs = await sessions.get_jobs(111)
         assert len(jobs) == 1

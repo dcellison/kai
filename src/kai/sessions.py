@@ -63,10 +63,10 @@ async def init_db(db_path: Path) -> None:
     # multi-user requests from blocking each other on the database.
     # busy_timeout retries for 5 seconds on lock contention instead of
     # failing immediately with SQLITE_BUSY.
-    cursor = await _get_db().execute("PRAGMA journal_mode=WAL")
-    row = await cursor.fetchone()
-    if row and row[0] != "wal":
-        log.warning("Failed to enable WAL mode; journal_mode is %s", row[0])
+    async with _get_db().execute("PRAGMA journal_mode=WAL") as cursor:
+        row = await cursor.fetchone()
+        if row and row[0] != "wal":
+            log.warning("Failed to enable WAL mode; journal_mode is %s", row[0])
     await _get_db().execute("PRAGMA busy_timeout=5000")
     await _get_db().execute("""
         CREATE TABLE IF NOT EXISTS sessions (
