@@ -44,6 +44,8 @@ def mock_request():
     request.app = {
         "webhook_secret": "test-secret",
         "telegram_app": MagicMock(),
+        "chat_id": 123,
+        "allowed_user_ids": {123, 456},
     }
     # Mock the job_queue on the telegram app
     job_queue = MagicMock()
@@ -1290,3 +1292,200 @@ class TestScheduleChatIdRouting:
         # User 123 should have no jobs
         jobs_123 = await sessions.get_jobs(123)
         assert len(jobs_123) == 0
+
+
+# ── chat_id authorization ──────────────────────────────────────────
+
+
+class TestChatIdAuthorization:
+    @pytest.mark.asyncio
+    async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
+        """POST /api/schedule with chat_id not in allowed_user_ids returns 403."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["telegram_app"].job_queue = MagicMock()
+        mock_request.app["telegram_app"].job_queue.jobs.return_value = []
+
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "Evil Job",
+                "prompt": "test",
+                "schedule_type": "daily",
+                "schedule_data": {"times": ["09:00"]},
+                "chat_id": 999999,  # not in allowed_user_ids
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_authorized_chat_id_accepted(self, db, mock_request):
+        """POST /api/schedule with chat_id in allowed_user_ids succeeds."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["telegram_app"].job_queue = MagicMock()
+        mock_request.app["telegram_app"].job_queue.jobs.return_value = []
+
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "Good Job",
+                "prompt": "test",
+                "schedule_type": "daily",
+                "schedule_data": {"times": ["09:00"]},
+                "chat_id": 456,  # in allowed_user_ids
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_resolve_chat_id_unauthorized(self):
+        """_resolve_chat_id raises UnauthorizedChatIdError for unknown users."""
+        from kai.webhook import UnauthorizedChatIdError
+
+        request = MagicMock()
+        request.app = {"chat_id": 123, "allowed_user_ids": {123, 456}}
+
+        with pytest.raises(UnauthorizedChatIdError):
+            _resolve_chat_id(request, {"chat_id": 999999})
+
+    @pytest.mark.asyncio
+    async def test_resolve_chat_id_no_allowed_list(self):
+        """_resolve_chat_id skips validation when allowed_user_ids is not set."""
+        request = MagicMock()
+        request.app = {"chat_id": 123}
+
+        # Should not raise even though 999 isn't in any allowed list
+        result = _resolve_chat_id(request, {"chat_id": 999})
+        assert result == 999
+
+
+# ── Job ownership ──────────────────────────────────────────────────
+
+
+class TestJobOwnership:
+    @pytest.fixture(autouse=True)
+    async def db(self, tmp_path):
+        await sessions.init_db(tmp_path / "test.db")
+        yield
+        await sessions.close_db()
+
+    @pytest.mark.asyncio
+    async def test_delete_wrong_owner_returns_false(self):
+        """delete_job with wrong chat_id returns False."""
+        job_id = await sessions.create_job(
+            chat_id=111,
+            name="A",
+            job_type="reminder",
+            prompt="x",
+            schedule_type="daily",
+            schedule_data='{"times":["09:00"]}',
+        )
+        # User 222 tries to delete user 111's job
+        assert await sessions.delete_job(job_id, chat_id=222) is False
+        # Job still exists
+        jobs = await sessions.get_jobs(111)
+        assert len(jobs) == 1
+
+    @pytest.mark.asyncio
+    async def test_delete_correct_owner(self):
+        """delete_job with correct chat_id succeeds."""
+        job_id = await sessions.create_job(
+            chat_id=111,
+            name="A",
+            job_type="reminder",
+            prompt="x",
+            schedule_type="daily",
+            schedule_data='{"times":["09:00"]}',
+        )
+        assert await sessions.delete_job(job_id, chat_id=111) is True
+
+    @pytest.mark.asyncio
+    async def test_delete_no_chat_id_backward_compatible(self):
+        """delete_job without chat_id deletes unconditionally."""
+        job_id = await sessions.create_job(
+            chat_id=111,
+            name="A",
+            job_type="reminder",
+            prompt="x",
+            schedule_type="daily",
+            schedule_data='{"times":["09:00"]}',
+        )
+        assert await sessions.delete_job(job_id) is True
+
+    @pytest.mark.asyncio
+    async def test_deactivate_wrong_owner(self):
+        """deactivate_job with wrong chat_id does not deactivate."""
+        job_id = await sessions.create_job(
+            chat_id=111,
+            name="A",
+            job_type="reminder",
+            prompt="x",
+            schedule_type="daily",
+            schedule_data='{"times":["09:00"]}',
+        )
+        await sessions.deactivate_job(job_id, chat_id=222)
+        # Job should still be active
+        jobs = await sessions.get_jobs(111)
+        assert len(jobs) == 1
+
+    @pytest.mark.asyncio
+    async def test_update_wrong_owner(self):
+        """update_job with wrong chat_id does not update."""
+        job_id = await sessions.create_job(
+            chat_id=111,
+            name="Original",
+            job_type="reminder",
+            prompt="x",
+            schedule_type="daily",
+            schedule_data='{"times":["09:00"]}',
+        )
+        result = await sessions.update_job(job_id, chat_id=222, name="Hacked")
+        assert result is False
+        # Name should be unchanged
+        jobs = await sessions.get_jobs(111)
+        assert jobs[0]["name"] == "Original"
+
+
+# ── Filename sanitization ──────────────────────────────────────────
+
+
+class TestFilenameSanitization:
+    def test_path_traversal(self, tmp_path):
+        """../../etc/passwd becomes 'passwd' inside the files directory."""
+        from kai.bot import _save_to_workspace
+
+        saved = _save_to_workspace(b"test", "../../etc/passwd", tmp_path)
+        assert saved.parent == tmp_path / "files"
+        assert "passwd" in saved.name
+        assert ".." not in str(saved)
+
+    def test_empty_filename(self, tmp_path):
+        """Empty filename produces unnamed_file."""
+        from kai.bot import _save_to_workspace
+
+        saved = _save_to_workspace(b"test", "", tmp_path)
+        assert "unnamed_file" in saved.name
+
+    def test_slash_only(self, tmp_path):
+        """Slash-only filename produces unnamed_file."""
+        from kai.bot import _save_to_workspace
+
+        saved = _save_to_workspace(b"test", "/", tmp_path)
+        assert "unnamed_file" in saved.name
+
+
+# ── WAL mode ────────────────────────────────────────────────────────
+
+
+class TestWALMode:
+    @pytest.mark.asyncio
+    async def test_wal_mode_enabled(self, tmp_path):
+        """init_db enables WAL journal mode."""
+        await sessions.init_db(tmp_path / "test.db")
+        try:
+            cursor = await sessions._get_db().execute("PRAGMA journal_mode")
+            row = await cursor.fetchone()
+            assert row[0] == "wal"
+        finally:
+            await sessions.close_db()

@@ -55,6 +55,11 @@ from kai.config import IMAGE_EXTENSIONS
 
 log = logging.getLogger(__name__)
 
+
+class UnauthorizedChatIdError(Exception):
+    """Raised when a request specifies a chat_id not in allowed_user_ids."""
+
+
 # Module-level server state, managed by start() and stop()
 _app: web.Application | None = None
 _runner: web.AppRunner | None = None
@@ -270,6 +275,7 @@ def _resolve_chat_id(request: web.Request, payload: dict) -> int:
 
     Raises:
         ValueError: If chat_id is present but not a valid integer.
+        UnauthorizedChatIdError: If chat_id is not in allowed_user_ids.
     """
     explicit = payload.get("chat_id")
     if explicit is not None:
@@ -279,9 +285,16 @@ def _resolve_chat_id(request: web.Request, payload: dict) -> int:
         if isinstance(explicit, float) and not float(explicit).is_integer():
             raise ValueError(f"chat_id must be an integer, got {explicit!r}")
         try:
-            return int(explicit)
+            resolved = int(explicit)
         except (TypeError, ValueError):
             raise ValueError(f"chat_id must be an integer, got {explicit!r}") from None
+        # Validate the resolved chat_id is an authorized user.
+        # Without this, a prompt injection attack could make inner Claude
+        # send messages to arbitrary Telegram users.
+        allowed = request.app.get("allowed_user_ids")
+        if allowed and resolved not in allowed:
+            raise UnauthorizedChatIdError(f"chat_id {resolved} is not an authorized user")
+        return resolved
     return request.app["chat_id"]
 
 
@@ -708,6 +721,8 @@ async def _handle_schedule(request: web.Request) -> web.Response:
         chat_id = _resolve_chat_id(request, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
+    except UnauthorizedChatIdError as e:
+        return web.json_response({"error": str(e)}, status=403)
 
     # schedule_data can arrive as a JSON object or a pre-serialized string
     if isinstance(schedule_data, dict):
@@ -799,7 +814,11 @@ async def _handle_delete_job(request: web.Request) -> web.Response:
     except ValueError:
         return web.json_response({"error": "Invalid job ID"}, status=400)
 
-    deleted = await sessions.delete_job(job_id)
+    # Use the default chat_id for ownership check. The API endpoints
+    # are localhost-only behind webhook secret, but validating ownership
+    # prevents cross-user job manipulation via prompt injection.
+    chat_id = request.app["chat_id"]
+    deleted = await sessions.delete_job(job_id, chat_id=chat_id)
     if not deleted:
         return web.json_response({"error": "Job not found"}, status=404)
 
@@ -854,8 +873,11 @@ async def _handle_update_job(request: web.Request) -> web.Response:
     if isinstance(schedule_data, dict):
         schedule_data = json.dumps(schedule_data)
 
+    # Use default chat_id for ownership check (same pattern as delete)
+    chat_id = request.app["chat_id"]
     updated = await sessions.update_job(
         job_id,
+        chat_id=chat_id,
         name=payload.get("name"),
         prompt=payload.get("prompt"),
         schedule_type=new_schedule_type,
@@ -970,6 +992,8 @@ async def _handle_send_message(request: web.Request) -> web.Response:
         chat_id = _resolve_chat_id(request, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
+    except UnauthorizedChatIdError as e:
+        return web.json_response({"error": str(e)}, status=403)
 
     try:
         # Telegram limits messages to 4096 characters. Split long messages
@@ -1053,6 +1077,8 @@ async def _handle_send_file(request: web.Request) -> web.Response:
         chat_id = _resolve_chat_id(request, payload)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
+    except UnauthorizedChatIdError as e:
+        return web.json_response({"error": str(e)}, status=403)
     caption = payload.get("caption", "")
 
     # Send images as photos (Telegram renders them inline) and everything
@@ -1204,6 +1230,10 @@ async def start(telegram_app, config) -> None:
         if chat_id is None:
             raise SystemExit("No allowed user IDs configured; cannot start webhook server")
         _app["chat_id"] = chat_id
+
+    # Store allowed user IDs for chat_id validation in _resolve_chat_id.
+    # Prevents prompt injection from routing messages to arbitrary users.
+    _app["allowed_user_ids"] = config.allowed_user_ids
 
     # Store workspace path for send-file path confinement
     _app["workspace"] = str(config.claude_workspace)

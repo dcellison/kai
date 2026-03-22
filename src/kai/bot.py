@@ -672,7 +672,9 @@ async def handle_canceljob(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except ValueError:
         await update.message.reply_text("Job ID must be a number.")
         return
-    deleted = await sessions.delete_job(job_id)
+    # Pass user's chat_id for ownership check - users can only cancel
+    # their own jobs (prevents cross-user job manipulation).
+    deleted = await sessions.delete_job(job_id, chat_id=_chat_id(update))
     if not deleted:
         await update.message.reply_text(f"Job #{job_id} not found.")
         return
@@ -1255,7 +1257,11 @@ def _save_to_workspace(data: bytes, filename: str, workspace: Path, user_id: int
 
     # Timestamp prefix ensures unique names even if the same file is sent twice
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    safe_name = filename.replace("/", "_").replace(" ", "_")
+    # Strip directory components entirely rather than replacing slashes.
+    # Path.name handles all separators (/, \) and edge cases like "../../".
+    safe_name = Path(filename).name.replace(" ", "_")
+    if not safe_name:
+        safe_name = "unnamed_file"
     dest = files_dir / f"{ts}_{safe_name}"
     dest.write_bytes(data)
     return dest

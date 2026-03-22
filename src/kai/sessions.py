@@ -59,6 +59,12 @@ async def init_db(db_path: Path) -> None:
     global _db
     _db = await aiosqlite.connect(str(db_path))
     _get_db().row_factory = aiosqlite.Row
+    # WAL mode allows concurrent readers during writes, which prevents
+    # multi-user requests from blocking each other on the database.
+    # busy_timeout retries for 5 seconds on lock contention instead of
+    # failing immediately with SQLITE_BUSY.
+    await _get_db().execute("PRAGMA journal_mode=WAL")
+    await _get_db().execute("PRAGMA busy_timeout=5000")
     await _get_db().execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             chat_id INTEGER PRIMARY KEY,
@@ -271,22 +277,45 @@ async def get_all_active_jobs() -> list[dict]:
         ]
 
 
-async def delete_job(job_id: int) -> bool:
-    """Permanently delete a job. Returns True if a row was deleted, False if not found."""
-    cursor = await _get_db().execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+async def delete_job(job_id: int, chat_id: int | None = None) -> bool:
+    """
+    Permanently delete a job. Returns True if a row was deleted, False if
+    not found (or not owned by chat_id when provided).
+    """
+    if chat_id is not None:
+        cursor = await _get_db().execute(
+            "DELETE FROM jobs WHERE id = ? AND chat_id = ?",
+            (job_id, chat_id),
+        )
+    else:
+        cursor = await _get_db().execute("DELETE FROM jobs WHERE id = ?", (job_id,))
     await _get_db().commit()
     return cursor.rowcount > 0
 
 
-async def deactivate_job(job_id: int) -> None:
-    """Soft-delete a job by setting active=0. Preserves the row for history."""
-    await _get_db().execute("UPDATE jobs SET active = 0 WHERE id = ?", (job_id,))
+async def deactivate_job(job_id: int, chat_id: int | None = None) -> None:
+    """
+    Soft-delete a job by setting active=0. Preserves the row for history.
+
+    When chat_id is provided, the job is only deactivated if it belongs to
+    that user. This prevents cross-user job manipulation. When None, the
+    job is deactivated unconditionally (backward-compatible for internal
+    callers like cron.py that have already verified ownership).
+    """
+    if chat_id is not None:
+        await _get_db().execute(
+            "UPDATE jobs SET active = 0 WHERE id = ? AND chat_id = ?",
+            (job_id, chat_id),
+        )
+    else:
+        await _get_db().execute("UPDATE jobs SET active = 0 WHERE id = ?", (job_id,))
     await _get_db().commit()
 
 
 async def update_job(
     job_id: int,
     *,
+    chat_id: int | None = None,
     name: str | None = None,
     prompt: str | None = None,
     schedule_type: str | None = None,
@@ -344,7 +373,11 @@ async def update_job(
         return False
 
     values.append(job_id)
-    sql = f"UPDATE jobs SET {', '.join(updates)} WHERE id = ? AND active = 1"
+    where = "WHERE id = ? AND active = 1"
+    if chat_id is not None:
+        where += " AND chat_id = ?"
+        values.append(chat_id)
+    sql = f"UPDATE jobs SET {', '.join(updates)} {where}"
     cursor = await _get_db().execute(sql, values)
     await _get_db().commit()
     return cursor.rowcount > 0
