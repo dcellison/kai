@@ -667,7 +667,7 @@ async def run_review(
         if claude_user:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
-            except OSError:
+            except ProcessLookupError:
                 pass  # Already dead
         else:
             proc.kill()

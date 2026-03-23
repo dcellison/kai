@@ -315,6 +315,17 @@ class TestRunTriage:
         assert kwargs.get("start_new_session") is True
 
     @pytest.mark.asyncio
+    async def test_no_claude_user_no_new_session(self):
+        """Without claude_user, start_new_session is False."""
+        mock_proc = _mock_subprocess(returncode=0, stdout='{"labels": []}')
+
+        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_triage("prompt")
+
+        kwargs = mock_exec.call_args[1]
+        assert kwargs.get("start_new_session") is False
+
+    @pytest.mark.asyncio
     async def test_nonzero_exit(self):
         """Non-zero exit code raises RuntimeError."""
         mock_proc = _mock_subprocess(returncode=1, stderr="model error")

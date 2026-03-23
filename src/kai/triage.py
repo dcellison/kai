@@ -382,7 +382,7 @@ async def run_triage(
         if claude_user:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
-            except OSError:
+            except ProcessLookupError:
                 pass  # Already dead
         else:
             proc.kill()
