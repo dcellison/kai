@@ -301,6 +301,7 @@ class TestGetIfExists:
             await asyncio.sleep(999)
 
         with (
+            patch("kai.pool._FORCE_KILL_TIMEOUT", 0.01),
             patch.object(instance, "shutdown", side_effect=hang_forever),
             patch.object(instance, "force_kill") as mock_raw_kill,
         ):

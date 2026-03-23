@@ -47,6 +47,10 @@ def _is_workspace_allowed(path: Path, config: Config) -> bool:
 # How often the eviction loop checks for idle subprocesses (seconds).
 _EVICTION_CHECK_INTERVAL = 60
 
+# Maximum time to wait for shutdown() in force_kill before falling
+# back to raw SIGKILL (seconds).
+_FORCE_KILL_TIMEOUT = 5
+
 
 class SubprocessPool:
     """
@@ -210,7 +214,7 @@ class SubprocessPool:
         self._last_activity.pop(chat_id, None)
         if instance:
             try:
-                await asyncio.wait_for(instance.shutdown(), timeout=5)
+                await asyncio.wait_for(instance.shutdown(), timeout=_FORCE_KILL_TIMEOUT)
             except TimeoutError:
                 # shutdown() already escalates to SIGKILL internally, but
                 # if even that hangs (zombie), force-kill and move on.
