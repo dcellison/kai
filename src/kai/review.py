@@ -27,6 +27,8 @@ import asyncio
 import glob as glob_mod
 import json
 import logging
+import os
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -641,11 +643,15 @@ async def run_review(
     if claude_user:
         cmd = ["sudo", "-u", claude_user, "--"] + cmd
 
+    # When claude_user is set, start in a new process group so the
+    # entire tree (sudo + claude) can be killed via os.killpg().
+    # Without this, killing sudo orphans the claude Node.js process.
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=bool(claude_user),
     )
 
     try:
@@ -654,8 +660,17 @@ async def run_review(
             timeout=_REVIEW_TIMEOUT,
         )
     except TimeoutError:
-        # Kill the subprocess tree if it exceeds the timeout
-        proc.kill()
+        # Kill the subprocess tree if it exceeds the timeout.
+        # When claude_user is set, start_new_session=True puts the
+        # process in a new group (PGID == PID). Kill the group so
+        # both sudo and its claude child die, preventing orphans.
+        if claude_user:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass  # Already dead
+        else:
+            proc.kill()
         await proc.wait()
         raise RuntimeError(f"Review subprocess timed out after {_REVIEW_TIMEOUT}s") from None
 

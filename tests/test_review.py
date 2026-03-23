@@ -2,6 +2,7 @@
 
 import json
 import re
+import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -527,6 +528,7 @@ class TestRunReview:
     async def test_timeout_raises(self):
         """Hanging subprocess is killed and raises RuntimeError."""
         mock_proc = AsyncMock()
+        mock_proc.pid = 12345
         # communicate's return value doesn't matter here - wait_for is
         # patched to raise TimeoutError before communicate is ever called.
         mock_proc.kill = MagicMock()
@@ -539,9 +541,50 @@ class TestRunReview:
         ):
             await run_review("review this code")
 
-        # Verify the process was killed
+        # Without claude_user, kills the process directly
         mock_proc.kill.assert_called_once()
         mock_proc.wait.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_timeout_with_claude_user_kills_group(self):
+        """Timeout with claude_user kills the process group, not just sudo."""
+        mock_proc = AsyncMock()
+        mock_proc.pid = 12345
+        mock_proc.wait = AsyncMock()
+
+        with (
+            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
+            patch("kai.review.asyncio.wait_for", side_effect=TimeoutError()),
+            patch("kai.review.os.killpg") as mock_killpg,
+            pytest.raises(RuntimeError, match="timed out"),
+        ):
+            await run_review("review this code", claude_user="kai")
+
+        # With claude_user, kills the entire process group
+        mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
+        mock_proc.wait.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_claude_user_starts_new_session(self):
+        """claude_user spawns with start_new_session=True for group kill."""
+        mock_proc = _mock_process(stdout=b"review output")
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review("prompt", claude_user="kai")
+
+        kwargs = mock_exec.call_args[1]
+        assert kwargs.get("start_new_session") is True
+
+    @pytest.mark.asyncio
+    async def test_no_claude_user_no_new_session(self):
+        """Without claude_user, start_new_session is False."""
+        mock_proc = _mock_process(stdout=b"review output")
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review("prompt")
+
+        kwargs = mock_exec.call_args[1]
+        assert kwargs.get("start_new_session") is False
 
     @pytest.mark.asyncio
     async def test_with_claude_user(self):

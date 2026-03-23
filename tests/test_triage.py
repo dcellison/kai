@@ -2,6 +2,7 @@
 
 import json
 import re
+import signal
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -273,6 +274,7 @@ class TestRunTriage:
     async def test_timeout(self):
         """Timed-out subprocess raises RuntimeError and kills the process."""
         mock_proc = AsyncMock()
+        mock_proc.pid = 12345
         mock_proc.communicate = AsyncMock(side_effect=TimeoutError)
         mock_proc.kill = AsyncMock()
         mock_proc.wait = AsyncMock()
@@ -283,6 +285,34 @@ class TestRunTriage:
         ):
             await run_triage("test prompt")
         mock_proc.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_timeout_with_claude_user_kills_group(self):
+        """Timeout with claude_user kills the process group."""
+        mock_proc = AsyncMock()
+        mock_proc.pid = 12345
+        mock_proc.communicate = AsyncMock(side_effect=TimeoutError)
+        mock_proc.wait = AsyncMock()
+
+        with (
+            patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc),
+            patch("kai.triage.os.killpg") as mock_killpg,
+            pytest.raises(RuntimeError, match="timed out"),
+        ):
+            await run_triage("test prompt", claude_user="kai")
+
+        mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
+
+    @pytest.mark.asyncio
+    async def test_claude_user_starts_new_session(self):
+        """claude_user spawns with start_new_session=True."""
+        mock_proc = _mock_subprocess(returncode=0, stdout='{"labels": []}')
+
+        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_triage("prompt", claude_user="kai")
+
+        kwargs = mock_exec.call_args[1]
+        assert kwargs.get("start_new_session") is True
 
     @pytest.mark.asyncio
     async def test_nonzero_exit(self):
