@@ -1092,6 +1092,19 @@ class TestResolveSpecFromBranch:
         result = resolve_spec_from_branch("feature/add-user-auth", str(tmp_path), spec_dir="workspace/specs")
         assert result == str(spec_file)
 
+    def test_literal_bracket_in_filename_still_matches(self, tmp_path):
+        """A spec file with literal [ in its name matches an escaped branch."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        # [ is a glob metachar AND a valid filename on all platforms
+        spec_file = specs_dir / "fix-[wip]-auth.md"
+        spec_file.write_text("content")
+
+        # Without escaping, [wip] would be a character class matching w/i/p.
+        # With escaping, it matches the literal [ and ].
+        result = resolve_spec_from_branch("feature/fix-[wip]-auth", str(tmp_path), spec_dir="workspace/specs")
+        assert result == str(spec_file)
+
 
 # ── load_spec ──────────────────────────────────────────────────────
 
