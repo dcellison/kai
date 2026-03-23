@@ -357,6 +357,11 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                     log.exception("Failed to send job %d progress update", job_id)
             log.info("Job %d condition not met, continuing (notified=%s)", job_id, notify_on_check)
 
+            # One-shot jobs will never fire again; deactivate the DB row.
+            # APScheduler's run_once already removed it from the queue.
+            if data["schedule_type"] == "once":
+                await sessions.deactivate_job(job_id)
+
         else:
             # Non-conditional or non-auto-remove: always deliver the response
             msg = f"[Job: {data['name']}]\n{response_text}"
@@ -369,3 +374,8 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                 job.schedule_removal()
             except Exception:
                 log.exception("Failed to send job %d result", job_id)
+
+            # One-shot jobs will never fire again; deactivate the DB row.
+            # APScheduler's run_once already removed it from the queue.
+            if data["schedule_type"] == "once":
+                await sessions.deactivate_job(job_id)

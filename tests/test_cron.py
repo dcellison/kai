@@ -501,6 +501,32 @@ class TestJobCallbackClaude:
             await _job_callback(self.ctx)
         mock_deactivate.assert_not_called()
 
+    @pytest.mark.asyncio()
+    async def test_one_shot_claude_deactivates_after_sending(self):
+        """One-shot Claude jobs (schedule_type=once) deactivate after delivery."""
+        self.ctx.job.data["schedule_type"] = "once"
+        self.ctx.bot_data = {"pool": _make_claude_mock("The answer is 42")}
+        with (
+            patch("kai.cron.log_message"),
+            patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate,
+        ):
+            await _job_callback(self.ctx)
+        mock_deactivate.assert_called_once_with(1)
+        # APScheduler handles queue removal for run_once; no schedule_removal needed
+        self.ctx.job.schedule_removal.assert_not_called()
+
+    @pytest.mark.asyncio()
+    async def test_recurring_claude_does_not_deactivate(self):
+        """Recurring Claude jobs (daily/interval) are not deactivated after delivery."""
+        self.ctx.job.data["schedule_type"] = "daily"
+        self.ctx.bot_data = {"pool": _make_claude_mock("Daily report")}
+        with (
+            patch("kai.cron.log_message"),
+            patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate,
+        ):
+            await _job_callback(self.ctx)
+        mock_deactivate.assert_not_called()
+
 
 # ── _job_callback: CONDITION_MET ─────────────────────────────────────
 
@@ -652,3 +678,12 @@ class TestJobCallbackConditionNotMet:
             await _job_callback(self.ctx)
         mock_deactivate.assert_called_once_with(1)
         self.ctx.job.schedule_removal.assert_called_once()
+
+    @pytest.mark.asyncio()
+    async def test_one_shot_condition_not_met_deactivates(self):
+        """One-shot auto-remove jobs deactivate even when condition is not met."""
+        self.ctx.job.data["schedule_type"] = "once"
+        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_NOT_MET")}
+        with patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate:
+            await _job_callback(self.ctx)
+        mock_deactivate.assert_called_once_with(1)
