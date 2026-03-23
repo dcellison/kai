@@ -40,9 +40,9 @@ class TestChunkText:
         """Text starting with \\n\\n doesn't produce an empty first chunk."""
         text = "\n\n" + "a" * 5000
         chunks = chunk_text(text)
-        for chunk in chunks:
-            assert chunk != ""
-            assert len(chunk) > 0
+        assert all(c and len(c) <= 4096 for c in chunks)
+        # Content preserved (leading newlines stripped, nothing lost)
+        assert "".join(chunks) == "a" * 5000
 
     def test_4097_triggers_split(self):
         """A string of 4097 characters with a newline is split into two chunks."""
