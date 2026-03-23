@@ -512,7 +512,9 @@ class TestJobCallbackClaude:
         ):
             await _job_callback(self.ctx)
         mock_deactivate.assert_called_once_with(1)
-        # APScheduler handles queue removal for run_once; no schedule_removal needed
+        # APScheduler handles queue removal for run_once jobs automatically.
+        # schedule_removal() is only needed for recurring jobs being manually
+        # removed (e.g., in the Forbidden handler). One-shot jobs never need it.
         self.ctx.job.schedule_removal.assert_not_called()
 
     @pytest.mark.asyncio()

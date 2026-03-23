@@ -359,6 +359,8 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             # One-shot jobs will never fire again; deactivate the DB row.
             # APScheduler's run_once already removed it from the queue.
+            # Runs even if delivery failed above - the job can't retry
+            # regardless, so deactivating prevents a stale active=1 row.
             if data["schedule_type"] == "once":
                 await sessions.deactivate_job(job_id)
 
@@ -377,5 +379,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             # One-shot jobs will never fire again; deactivate the DB row.
             # APScheduler's run_once already removed it from the queue.
+            # Runs even if delivery failed above - the job can't retry
+            # regardless, so deactivating prevents a stale active=1 row.
             if data["schedule_type"] == "once":
                 await sessions.deactivate_job(job_id)
