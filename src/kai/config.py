@@ -318,6 +318,19 @@ def _read_protected_yaml(filename: str) -> dict | object | None:
         return _YAML_MALFORMED
 
 
+def _strip_quotes(value: str) -> str:
+    """
+    Remove matched surrounding quotes from a value string.
+
+    Only strips when the first and last characters are the same quote
+    type (' or "). This avoids corrupting values that contain the
+    opposite quote type internally (e.g., 'he said "hello"').
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
+
+
 def parse_env_file(path: Path) -> dict[str, str]:
     """
     Parse a KEY=VALUE file into a dict.
@@ -326,8 +339,8 @@ def parse_env_file(path: Path) -> dict[str, str]:
     - Lines with KEY=VALUE or KEY="VALUE" or KEY='VALUE'
     - Lines starting with 'export ' (stripped)
     - Comments (lines starting with #) and blank lines (skipped)
-    - Surrounding quotes on values (stripped via str.strip, not matched
-      pairs - same limitation as the main .env parser in load_config)
+    - Surrounding quotes on values (stripped as matched pairs only -
+      inner quotes of the opposite type are preserved)
 
     Same parsing logic as _read_protected_file() uses for /etc/kai/env.
     Re-reads the file each time to pick up changes without restart.
@@ -348,7 +361,7 @@ def parse_env_file(path: Path) -> dict[str, str]:
         # Handle `export KEY=VALUE` lines (common in shell-sourced env files)
         line = line.removeprefix("export ")
         key, _, value = line.partition("=")
-        env[key.strip()] = value.strip().strip("\"'")
+        env[key.strip()] = _strip_quotes(value.strip())
     return env
 
 
@@ -707,7 +720,7 @@ def load_config() -> Config:
                 # Handle `export KEY=VALUE` lines (common in shell-sourced env files)
                 line = line.removeprefix("export ")
                 key, _, value = line.partition("=")
-                os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+                os.environ.setdefault(key.strip(), _strip_quotes(value.strip()))
     else:
         load_dotenv(PROJECT_ROOT / ".env")
 

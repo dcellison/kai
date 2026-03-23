@@ -20,6 +20,7 @@ from kai.config import (
     WorkspaceConfig,
     _load_workspace_configs,
     _read_protected_yaml,
+    _strip_quotes,
     parse_env_file,
 )
 
@@ -113,6 +114,70 @@ class TestParseEnvFile:
         env_file.write_text("URL=postgres://host/db?opt=1\n")
         result = parse_env_file(env_file)
         assert result == {"URL": "postgres://host/db?opt=1"}
+
+    def test_single_quotes_containing_double(self, tmp_path):
+        """Single-quoted values preserve internal double quotes."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("""KEY='he said "hello"'\n""")
+        result = parse_env_file(env_file)
+        assert result == {"KEY": 'he said "hello"'}
+
+    def test_double_quotes_containing_single(self, tmp_path):
+        """Double-quoted values preserve internal single quotes."""
+        env_file = tmp_path / ".env"
+        env_file.write_text('KEY="it\'s fine"\n')
+        result = parse_env_file(env_file)
+        assert result == {"KEY": "it's fine"}
+
+    def test_mismatched_quotes_not_stripped(self, tmp_path):
+        """Mismatched outer quotes are left as-is."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("""KEY='value"\n""")
+        result = parse_env_file(env_file)
+        assert result == {"KEY": "'value\""}
+
+    def test_unquoted_value_unchanged(self, tmp_path):
+        """Values without surrounding quotes pass through unchanged."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("KEY=no_quotes_here\n")
+        result = parse_env_file(env_file)
+        assert result == {"KEY": "no_quotes_here"}
+
+    def test_single_quote_char_unchanged(self, tmp_path):
+        """A value that is just a single quote character is not corrupted."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("KEY='\n")
+        result = parse_env_file(env_file)
+        assert result == {"KEY": "'"}
+
+
+# ── _strip_quotes ──────────────────────────────────────────────────
+
+
+class TestStripQuotes:
+    def test_double_quoted(self):
+        assert _strip_quotes('"hello"') == "hello"
+
+    def test_single_quoted(self):
+        assert _strip_quotes("'hello'") == "hello"
+
+    def test_mismatched(self):
+        assert _strip_quotes("'hello\"") == "'hello\""
+
+    def test_no_quotes(self):
+        assert _strip_quotes("hello") == "hello"
+
+    def test_empty_string(self):
+        assert _strip_quotes("") == ""
+
+    def test_single_char_quote(self):
+        assert _strip_quotes("'") == "'"
+
+    def test_empty_quoted_string(self):
+        assert _strip_quotes('""') == ""
+
+    def test_inner_quotes_preserved(self):
+        assert _strip_quotes("""'he said "hello"'""") == 'he said "hello"'
 
 
 # ── _read_protected_yaml ────────────────────────────────────────────
