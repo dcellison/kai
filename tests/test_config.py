@@ -119,11 +119,24 @@ class TestLoadConfigErrors:
         config = load_config()
         assert config.claude_max_session_hours == 4.5
 
+    def test_invalid_claude_model(self, monkeypatch):
+        """CLAUDE_MODEL with an unrecognized value raises SystemExit."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_MODEL", "sonet")
+        with pytest.raises(SystemExit, match="CLAUDE_MODEL"):
+            load_config()
+
 
 # ── Optional fields ──────────────────────────────────────────────────
 
 
 class TestLoadConfigOptional:
+    def test_claude_model_from_env(self, monkeypatch):
+        """CLAUDE_MODEL is read from environment when set."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_MODEL", "opus")
+        assert load_config().claude_model == "opus"
+
     def test_voice_enabled_true(self, monkeypatch):
         _set_required(monkeypatch)
         monkeypatch.setenv("VOICE_ENABLED", "true")

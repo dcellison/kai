@@ -866,12 +866,21 @@ def load_config() -> Config:
         # No users.yaml and no ALLOWED_USER_IDS - can't start
         raise SystemExit("ALLOWED_USER_IDS is required in .env (or create users.yaml)")
 
+    # Validate CLAUDE_MODEL against the same VALID_MODELS set used
+    # for workspace config. Catches typos at startup instead of
+    # letting them propagate to a confusing runtime failure.
+    claude_model = os.environ.get("CLAUDE_MODEL", "sonnet")
+    if claude_model not in VALID_MODELS:
+        raise SystemExit(
+            f"CLAUDE_MODEL '{claude_model}' is not valid (must be one of: {', '.join(sorted(VALID_MODELS))})"
+        )
+
     return Config(
         telegram_bot_token=token,
         telegram_webhook_url=telegram_webhook_url,
         telegram_webhook_secret=telegram_webhook_secret,
         allowed_user_ids=allowed_ids,
-        claude_model=os.environ.get("CLAUDE_MODEL", "sonnet"),
+        claude_model=claude_model,
         claude_timeout_seconds=claude_timeout_seconds,
         claude_max_budget_usd=claude_max_budget_usd,
         claude_max_session_hours=claude_max_session_hours,
