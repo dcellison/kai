@@ -1533,6 +1533,26 @@ class TestGetJobAuth:
     """Authorization and ownership tests for GET /api/jobs/{id}."""
 
     @pytest.mark.asyncio
+    async def test_omitted_chat_id_defaults_to_admin(self, db, mock_request):
+        """GET /api/jobs/{id} without chat_id falls back to admin, preserving backward compat."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        # No query param set; should fall back to app["chat_id"] = 123
+        job_id = await sessions.create_job(
+            chat_id=123,
+            name="Admin Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_get_job(mock_request)
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        assert body["name"] == "Admin Job"
+
+    @pytest.mark.asyncio
     async def test_wrong_owner_returns_404(self, db, mock_request):
         """GET /api/jobs/{id} returns 404 when job belongs to another user."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
