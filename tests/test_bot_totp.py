@@ -318,8 +318,11 @@ async def test_photo_passes_with_valid_totp():
     with (
         patch("kai.bot._is_authorized", return_value=True),
         patch("kai.bot.is_totp_configured", return_value=True),
-        # Patch downstream to prevent actual processing past the gate
+        # Patch downstream to prevent actual processing past the gate.
+        # log_message MUST be patched to avoid writing test data (chat_id
+        # 12345, MagicMock paths) to the real production history files.
         patch("kai.bot._get_pool"),
+        patch("kai.bot.log_message"),
         patch("kai.bot._notify_if_queued", new_callable=AsyncMock, return_value=False),
         patch("kai.bot._acquire_lock_or_kill", new_callable=AsyncMock, return_value=None),
     ):
