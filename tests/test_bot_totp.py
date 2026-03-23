@@ -331,3 +331,83 @@ async def test_photo_passes_with_valid_totp():
     # Challenge NOT sent (gate passed, processing continued)
     for call in update.message.reply_text.call_args_list:
         assert "Session expired" not in call[0][0]
+
+
+# ── Non-code message filtering during TOTP challenge ─────────────────
+
+
+async def test_non_code_message_not_deleted():
+    """Non-code messages during a pending challenge are not deleted or verified."""
+    pending = {"expires_at": time.time() + 120}
+    update = _make_update("What's the weather?")
+    ctx = _make_context({"totp_pending": pending})
+
+    with (
+        patch("kai.bot._is_authorized", return_value=True),
+        patch("kai.bot.is_totp_configured", return_value=True),
+        patch("kai.bot.verify_code") as mock_verify,
+    ):
+        await handle_message(update, ctx)
+
+    # Message should NOT be deleted (it's not a code)
+    update.message.delete.assert_not_called()
+    # verify_code should NOT be called
+    mock_verify.assert_not_called()
+    # User should see a reminder
+    sent = update.effective_chat.send_message.call_args[0][0]
+    assert "6-digit" in sent.lower() or "code" in sent.lower()
+
+
+async def test_six_digit_code_still_verified():
+    """Six-digit messages pass the format filter and reach verify_code."""
+    pending = {"expires_at": time.time() + 120}
+    update = _make_update("123456")
+    ctx = _make_context({"totp_pending": pending})
+
+    with (
+        patch("kai.bot._is_authorized", return_value=True),
+        patch("kai.bot.is_totp_configured", return_value=True),
+        patch("kai.bot.get_lockout_remaining", return_value=0),
+        patch("kai.bot.verify_code", return_value=True),
+    ):
+        await handle_message(update, ctx)
+
+    # Message should be deleted (it's a code attempt)
+    update.message.delete.assert_called_once()
+
+
+async def test_non_code_no_sudo_calls():
+    """Non-code messages skip all sudo-backed functions."""
+    pending = {"expires_at": time.time() + 120}
+    update = _make_update("check my calendar")
+    ctx = _make_context({"totp_pending": pending})
+
+    with (
+        patch("kai.bot._is_authorized", return_value=True),
+        patch("kai.bot.is_totp_configured", return_value=True),
+        patch("kai.bot.get_lockout_remaining") as mock_lockout,
+        patch("kai.bot.verify_code") as mock_verify,
+        patch("kai.bot.get_failure_count") as mock_failures,
+    ):
+        await handle_message(update, ctx)
+
+    mock_lockout.assert_not_called()
+    mock_verify.assert_not_called()
+    mock_failures.assert_not_called()
+
+
+async def test_partial_digit_string_not_treated_as_code():
+    """Strings like '12345' or '1234567' are not treated as TOTP codes."""
+    for text in ["12345", "1234567", "12ab56", "code: 123456"]:
+        pending = {"expires_at": time.time() + 120}
+        update = _make_update(text)
+        ctx = _make_context({"totp_pending": pending})
+
+        with (
+            patch("kai.bot._is_authorized", return_value=True),
+            patch("kai.bot.is_totp_configured", return_value=True),
+            patch("kai.bot.verify_code") as mock_verify,
+        ):
+            await handle_message(update, ctx)
+
+        mock_verify.assert_not_called()

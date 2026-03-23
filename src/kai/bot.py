@@ -1648,6 +1648,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             code = update.message.text.strip() if update.message.text else ""
 
+            # Only treat 6-digit strings as code attempts. Other messages
+            # (e.g., normal chat that arrived concurrently with the challenge)
+            # are dropped with a brief reminder instead of being fed to
+            # verify_code(). This prevents message deletion, spurious
+            # "Invalid code" responses, and unnecessary sudo calls.
+            if not code.isdigit() or len(code) != 6:
+                await update.effective_chat.send_message("Authentication required. Enter your 6-digit code.")
+                return
+
             # Delete the code message so it doesn't linger in chat
             try:
                 await update.message.delete()
