@@ -1013,6 +1013,25 @@ class TestScheduleValidation:
         assert job is not None
         assert job["schedule_data"] == '{"seconds": 900}'
 
+    async def test_invalid_string_schedule_data_returns_400(self, db, mock_request):
+        """schedule_data as a non-JSON string is rejected with 400."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "bad data",
+                "prompt": "test",
+                "schedule_type": "interval",
+                "schedule_data": "not json at all",
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "not valid JSON" in body["error"]
+
     async def test_defaults_for_optional_fields(self, db, mock_request):
         """auto_remove defaults to False when omitted. job_type defaults to 'reminder'."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
@@ -1086,6 +1105,152 @@ class TestScheduleValidation:
         resp = await _handle_schedule(mock_request)
 
         assert resp.status == 400
+
+    async def test_once_missing_run_at_returns_400(self, db, mock_request):
+        """schedule_data for 'once' without 'run_at' is rejected."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "bad once",
+                "prompt": "test",
+                "schedule_type": "once",
+                "schedule_data": {"times": ["08:00"]},
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "run_at" in body["error"]
+
+    async def test_daily_missing_times_returns_400(self, db, mock_request):
+        """schedule_data for 'daily' without 'times' is rejected."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "bad daily",
+                "prompt": "test",
+                "schedule_type": "daily",
+                "schedule_data": {"seconds": 60},
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "times" in body["error"]
+
+    async def test_interval_missing_seconds_returns_400(self, db, mock_request):
+        """schedule_data for 'interval' without 'seconds' is rejected."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "bad interval",
+                "prompt": "test",
+                "schedule_type": "interval",
+                "schedule_data": {"run_at": "2026-01-01T00:00:00Z"},
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "seconds" in body["error"]
+
+    async def test_interval_negative_seconds_returns_400(self, db, mock_request):
+        """schedule_data with non-positive seconds is rejected."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "bad interval",
+                "prompt": "test",
+                "schedule_type": "interval",
+                "schedule_data": {"seconds": -10},
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "positive" in body["error"]
+
+    async def test_daily_invalid_time_format_returns_400(self, db, mock_request):
+        """schedule_data with a malformed time string is rejected."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "bad time",
+                "prompt": "test",
+                "schedule_type": "daily",
+                "schedule_data": {"times": ["25:00"]},
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "HH:MM" in body["error"]
+
+    async def test_once_invalid_datetime_returns_400(self, db, mock_request):
+        """schedule_data with an unparseable run_at is rejected."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "bad datetime",
+                "prompt": "test",
+                "schedule_type": "once",
+                "schedule_data": {"run_at": "not-a-date"},
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "ISO datetime" in body["error"]
+
+
+# ── PATCH schedule_data validation ───────────────────────────────
+
+
+class TestUpdateJobScheduleDataValidation:
+    async def test_update_invalid_schedule_data_returns_400(self, db, mock_request):
+        """PATCH with malformed schedule_data is rejected."""
+        # Create a valid job first
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "to update",
+                "prompt": "test",
+                "schedule_type": "interval",
+                "schedule_data": {"seconds": 600},
+            }
+        )
+        with patch("kai.cron.register_job_by_id", new_callable=AsyncMock):
+            resp = await _handle_schedule(mock_request)
+        job_id = json.loads(resp.body.decode())["job_id"]
+
+        # Now PATCH with invalid schedule_data
+        mock_request.match_info = {"id": str(job_id)}
+        mock_request.json = AsyncMock(return_value={"schedule_data": "not json"})
+
+        resp = await _handle_update_job(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "not valid JSON" in body["error"]
 
 
 # ── POST /api/services/{name} ─────────────────────────────────────

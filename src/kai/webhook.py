@@ -45,6 +45,7 @@ import json
 import logging
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 
 from aiohttp import web
@@ -681,6 +682,72 @@ _VALID_SCHEDULE_TYPES = ("once", "daily", "interval")
 _VALID_JOB_TYPES = ("reminder", "claude")
 
 
+def _validate_schedule_data(
+    schedule_data: dict | str,
+    schedule_type: str,
+) -> tuple[str | None, str | None]:
+    """
+    Validate schedule_data and return the serialized JSON string.
+
+    Handles both dict and pre-serialized string inputs. Validates
+    that the JSON structure matches what the given schedule_type
+    requires so cron.py never encounters malformed data at fire time.
+
+    Args:
+        schedule_data: Either a dict or a JSON string.
+        schedule_type: One of "once", "daily", "interval".
+
+    Returns:
+        (json_string, None) on success, or (None, error_message) on failure.
+    """
+    # Parse string input into a dict for structural validation
+    if isinstance(schedule_data, str):
+        try:
+            parsed = json.loads(schedule_data)
+        except json.JSONDecodeError:
+            return None, "schedule_data is not valid JSON"
+        if not isinstance(parsed, dict):
+            return None, "schedule_data must be a JSON object"
+    else:
+        parsed = schedule_data
+
+    # Structural validation per schedule_type
+    if schedule_type == "once":
+        if "run_at" not in parsed:
+            return None, "schedule_data for 'once' requires 'run_at'"
+        # Validate it parses as an ISO datetime
+        try:
+            datetime.fromisoformat(str(parsed["run_at"]))
+        except ValueError:
+            return None, "schedule_data 'run_at' is not a valid ISO datetime"
+
+    elif schedule_type == "daily":
+        if "times" not in parsed:
+            return None, "schedule_data for 'daily' requires 'times'"
+        times = parsed["times"]
+        if not isinstance(times, list) or len(times) == 0:
+            return None, "schedule_data 'times' must be a non-empty list"
+        for t in times:
+            if not isinstance(t, str) or ":" not in t:
+                return None, f"schedule_data 'times' entry '{t}' is not a valid HH:MM string"
+            try:
+                parts = t.split(":")
+                h, m = int(parts[0]), int(parts[1])
+                if not (0 <= h <= 23 and 0 <= m <= 59):
+                    raise ValueError
+            except (ValueError, IndexError):
+                return None, f"schedule_data 'times' entry '{t}' is not a valid HH:MM string"
+
+    elif schedule_type == "interval":
+        if "seconds" not in parsed:
+            return None, "schedule_data for 'interval' requires 'seconds'"
+        seconds = parsed["seconds"]
+        if not isinstance(seconds, (int, float)) or seconds <= 0:
+            return None, "schedule_data 'seconds' must be a positive number"
+
+    return json.dumps(parsed), None
+
+
 @_require_secret
 async def _handle_schedule(request: web.Request) -> web.Response:
     """
@@ -740,11 +807,12 @@ async def _handle_schedule(request: web.Request) -> web.Response:
     except UnauthorizedChatIdError as e:
         return web.json_response({"error": str(e)}, status=403)
 
-    # schedule_data can arrive as a JSON object or a pre-serialized string
-    if isinstance(schedule_data, dict):
-        schedule_data_str = json.dumps(schedule_data)
-    else:
-        schedule_data_str = schedule_data
+    # Validate schedule_data structure before persisting. Catches malformed
+    # JSON strings and wrong-shape payloads (e.g., interval keys on a daily
+    # job) that would otherwise crash cron.py on every fire attempt.
+    schedule_data_str, error = _validate_schedule_data(schedule_data, schedule_type)
+    if error:
+        return web.json_response({"error": error}, status=400)
 
     # Persist to database
     try:
@@ -900,10 +968,23 @@ async def _handle_update_job(request: web.Request) -> web.Response:
             status=400,
         )
 
-    # Serialize schedule_data if provided as a dict (allow either string or dict)
+    # Validate schedule_data if provided. For PATCH, schedule_type might come
+    # from the payload (changing the schedule) or from the existing job (keeping
+    # the same type but updating the data). We need the effective schedule_type
+    # to validate the shape.
     schedule_data = payload.get("schedule_data")
-    if isinstance(schedule_data, dict):
-        schedule_data = json.dumps(schedule_data)
+    if schedule_data is not None:
+        # If schedule_type is also being changed, validate against the new one.
+        # Otherwise, fetch the current job to get its existing schedule_type.
+        effective_type = new_schedule_type
+        if effective_type is None:
+            existing_job = await sessions.get_job_by_id(job_id)
+            if existing_job is None:
+                return web.json_response({"error": "Job not found or inactive"}, status=404)
+            effective_type = existing_job["schedule_type"]
+        schedule_data, error = _validate_schedule_data(schedule_data, effective_type)
+        if error:
+            return web.json_response({"error": error}, status=400)
 
     # Resolve caller identity from the JSON body (e.g., {"chat_id": 456, ...}).
     # Falls back to admin chat_id when omitted. The chat_id field is used
