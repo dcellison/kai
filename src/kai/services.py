@@ -414,8 +414,14 @@ async def call_service(
                 # Decode using the charset from the Content-Type header,
                 # falling back to UTF-8. errors="replace" avoids crashes
                 # on malformed byte sequences in truncated responses.
+                # LookupError catch handles unknown codec names (e.g.,
+                # "x-weird-encoding") that resp.text() would have caught
+                # internally.
                 encoding = resp.get_encoding() or "utf-8"
-                response_body = raw.decode(encoding, errors="replace")
+                try:
+                    response_body = raw.decode(encoding, errors="replace")
+                except LookupError:
+                    response_body = raw.decode("utf-8", errors="replace")
                 log.info(
                     "Service '%s' responded: %d (%d bytes%s)",
                     name,
