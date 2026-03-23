@@ -57,6 +57,7 @@ from kai.config import DATA_DIR, Config, WorkspaceConfig
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
 from kai.pool import SubprocessPool
+from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 
@@ -303,41 +304,10 @@ async def _edit_message_safe(msg: Message, text: str) -> None:
         log.debug("Failed to edit message", exc_info=True)
 
 
-def _chunk_text(text: str, max_len: int = 4096) -> list[str]:
-    """
-    Split text into Telegram-safe chunks at natural break points.
-
-    Prefers splitting at double newlines (paragraph breaks), then single
-    newlines, and only falls back to hard-cutting at max_len if no break
-    point is found. This keeps code blocks and paragraphs intact.
-
-    Args:
-        text: The text to split.
-        max_len: Maximum length per chunk (Telegram's limit is 4096).
-
-    Returns:
-        A list of text chunks, each within max_len.
-    """
-    chunks = []
-    while text:
-        if len(text) <= max_len:
-            chunks.append(text)
-            break
-        # Try paragraph break, then line break, then hard cut
-        split_at = text.rfind("\n\n", 0, max_len)
-        if split_at == -1:
-            split_at = text.rfind("\n", 0, max_len)
-        if split_at == -1:
-            split_at = max_len
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip("\n")
-    return chunks
-
-
 async def _send_response(update: Update, text: str) -> None:
     """Send a potentially long response as multiple chunked messages."""
     assert update.message is not None
-    for chunk in _chunk_text(text):
+    for chunk in chunk_text(text):
         await _reply_safe(update.message, chunk)
 
 
@@ -1913,7 +1883,7 @@ async def _handle_response(
                 await _edit_message_safe(live_msg, final_text)
         else:
             # Response exceeds Telegram's limit — edit first chunk, send the rest
-            chunks = _chunk_text(final_text)
+            chunks = chunk_text(final_text)
             await _edit_message_safe(live_msg, chunks[0])
             for chunk in chunks[1:]:
                 await _reply_safe(update.message, chunk)

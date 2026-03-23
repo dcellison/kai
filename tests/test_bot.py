@@ -19,7 +19,6 @@ from telegram.error import BadRequest
 from kai.bot import (
     _QUEUED_MESSAGE_MARKER,
     _acquire_lock_or_kill,
-    _chunk_text,
     _clear_responding,
     _do_switch_workspace,
     _edit_message_safe,
@@ -102,36 +101,6 @@ class TestShortWorkspaceName:
 
     def test_base_is_none(self):
         assert _short_workspace_name("/some/path/project", None) == "project"
-
-
-# ── _chunk_text ──────────────────────────────────────────────────────
-
-
-class TestChunkText:
-    def test_short_text_single_chunk(self):
-        assert _chunk_text("hello", 100) == ["hello"]
-
-    def test_splits_at_double_newline(self):
-        text = "a" * 50 + "\n\n" + "b" * 50
-        chunks = _chunk_text(text, 60)
-        assert len(chunks) == 2
-        assert chunks[0] == "a" * 50
-        assert chunks[1] == "b" * 50
-
-    def test_splits_at_single_newline_if_no_double(self):
-        text = "a" * 50 + "\n" + "b" * 50
-        chunks = _chunk_text(text, 60)
-        assert len(chunks) == 2
-        assert chunks[0] == "a" * 50
-        assert chunks[1] == "b" * 50
-
-    def test_splits_at_max_len_if_no_newlines(self):
-        text = "a" * 100
-        chunks = _chunk_text(text, 50)
-        assert chunks == ["a" * 50, "a" * 50]
-
-    def test_empty_string(self):
-        assert _chunk_text("") == []
 
 
 # ── _truncate_for_telegram ───────────────────────────────────────────

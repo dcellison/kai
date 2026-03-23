@@ -34,6 +34,7 @@ from telegram.ext import Application, ContextTypes
 from kai import sessions
 from kai.history import log_message
 from kai.locks import get_lock
+from kai.telegram_utils import chunk_text
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +45,23 @@ _CONDITION_MET_PREFIX = "CONDITION_MET:"
 _CONDITION_NOT_MET_PREFIX = (
     "CONDITION_NOT_MET"  # No trailing colon (unlike MET) because bare "CONDITION_NOT_MET" is valid
 )
+
+
+async def _send_chunked(bot: object, chat_id: int, text: str) -> None:
+    """
+    Send a potentially long message as multiple Telegram-safe chunks.
+
+    Splits text at natural break points (paragraph > line > hard cut)
+    to stay within Telegram's 4096-character limit. Re-raises all
+    exceptions so callers can handle Forbidden/other errors.
+
+    Args:
+        bot: The Telegram Bot instance.
+        chat_id: Target chat ID.
+        text: The full message text to send.
+    """
+    for part in chunk_text(text):
+        await bot.send_message(chat_id=chat_id, text=part)
 
 
 # ── Job registration ─────────────────────────────────────────────────
@@ -305,7 +323,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             msg = f"[Job: {data['name']}]\n{clean_text}" if clean_text else f"[Job: {data['name']}] Condition met."
             try:
                 log_message(direction="assistant", chat_id=chat_id, text=msg)
-                await context.bot.send_message(chat_id=chat_id, text=msg)
+                await _send_chunked(context.bot, chat_id, msg)
             except Forbidden:
                 log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
             except Exception:
@@ -330,7 +348,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 try:
                     log_message(direction="assistant", chat_id=chat_id, text=msg)
-                    await context.bot.send_message(chat_id=chat_id, text=msg)
+                    await _send_chunked(context.bot, chat_id, msg)
                 except Forbidden:
                     log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
                     await sessions.deactivate_job(job_id)
@@ -344,7 +362,7 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             msg = f"[Job: {data['name']}]\n{response_text}"
             try:
                 log_message(direction="assistant", chat_id=chat_id, text=msg)
-                await context.bot.send_message(chat_id=chat_id, text=msg)
+                await _send_chunked(context.bot, chat_id, msg)
             except Forbidden:
                 log.warning("Job %d: chat %d is gone, deactivating", job_id, chat_id)
                 await sessions.deactivate_job(job_id)

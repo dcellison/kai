@@ -52,6 +52,7 @@ from telegram import Update
 
 from kai import cron, review, services, sessions, triage
 from kai.config import IMAGE_EXTENSIONS
+from kai.telegram_utils import chunk_text
 
 log = logging.getLogger(__name__)
 
@@ -1011,26 +1012,8 @@ async def _handle_send_message(request: web.Request) -> web.Response:
         return web.json_response({"error": str(e)}, status=403)
 
     try:
-        # Telegram limits messages to 4096 characters. Split long messages
-        # at newline boundaries to avoid cutting mid-word.
-        if len(text) <= 4096:
-            await bot.send_message(chat_id, text)
-        else:
-            # Simple chunking: split on double-newline first, then single
-            # newline, then hard-cut at 4096.
-            remaining = text
-            while remaining:
-                if len(remaining) <= 4096:
-                    await bot.send_message(chat_id, remaining)
-                    break
-                # Find the last newline before the limit
-                cut = remaining[:4096].rfind("\n\n")
-                if cut < 100:
-                    cut = remaining[:4096].rfind("\n")
-                if cut < 100:
-                    cut = 4096
-                await bot.send_message(chat_id, remaining[:cut])
-                remaining = remaining[cut:].lstrip("\n")
+        for part in chunk_text(text):
+            await bot.send_message(chat_id, part)
     except Exception:
         log.exception("Failed to send message to chat %d via API", chat_id)
         return web.json_response({"error": "Failed to send message"}, status=500)
