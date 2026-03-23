@@ -198,12 +198,26 @@ class SubprocessPool:
         """
         return self._pool.get(chat_id)
 
-    def force_kill(self, chat_id: int) -> None:
-        """Kill a specific user's subprocess and remove it from the pool."""
+    async def force_kill(self, chat_id: int) -> None:
+        """
+        Kill a specific user's subprocess and remove it from the pool.
+
+        Uses shutdown() with a short timeout for clean process reaping
+        and stderr task cancellation. Falls back to raw SIGKILL if
+        shutdown hangs, so this never blocks callers for long.
+        """
         instance = self._pool.pop(chat_id, None)
         self._last_activity.pop(chat_id, None)
         if instance:
-            instance.force_kill()
+            try:
+                await asyncio.wait_for(instance.shutdown(), timeout=5)
+            except TimeoutError:
+                # shutdown() already escalates to SIGKILL internally, but
+                # if even that hangs (zombie), force-kill and move on.
+                # At this point the instance is already out of the pool,
+                # so we won't try to use it again.
+                instance.force_kill()
+                log.warning("force_kill: shutdown timed out for user %d, sent SIGKILL", chat_id)
 
     async def change_workspace(
         self,

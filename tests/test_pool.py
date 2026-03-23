@@ -11,6 +11,7 @@ Covers:
 7. Shutdown
 """
 
+import asyncio
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -86,16 +87,17 @@ class TestInstanceCreation:
 
 
 class TestPerUserActions:
-    def test_force_kill_specific_user(self):
-        """force_kill(A) kills A's process, B's is unaffected."""
+    @pytest.mark.asyncio
+    async def test_force_kill_specific_user(self):
+        """force_kill(A) shuts down A's process, B's is unaffected."""
         pool = SubprocessPool(config=_make_config(), services_info=[])
         a = pool.get(111)
         b = pool.get(222)
         with (
-            patch.object(a, "force_kill") as mock_a,
-            patch.object(b, "force_kill") as mock_b,
+            patch.object(a, "shutdown", new_callable=AsyncMock) as mock_a,
+            patch.object(b, "shutdown", new_callable=AsyncMock) as mock_b,
         ):
-            pool.force_kill(111)
+            await pool.force_kill(111)
             mock_a.assert_called_once()
             mock_b.assert_not_called()
 
@@ -282,10 +284,28 @@ class TestGetIfExists:
         assert result is not None
         assert result is pool._pool[111]
 
-    def test_force_kill_no_instance(self):
+    @pytest.mark.asyncio
+    async def test_force_kill_no_instance(self):
         """/stop for a user with no subprocess. No-op, no crash."""
         pool = SubprocessPool(config=_make_config(), services_info=[])
-        pool.force_kill(999)  # should not raise
+        await pool.force_kill(999)  # should not raise
+
+    @pytest.mark.asyncio
+    async def test_force_kill_shutdown_timeout_falls_back(self):
+        """When shutdown() hangs, falls back to raw force_kill."""
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        instance = pool.get(111)
+
+        # Make shutdown hang forever
+        async def hang_forever():
+            await asyncio.sleep(999)
+
+        with (
+            patch.object(instance, "shutdown", side_effect=hang_forever),
+            patch.object(instance, "force_kill") as mock_raw_kill,
+        ):
+            await pool.force_kill(111)
+            mock_raw_kill.assert_called_once()
 
 
 # ── TOCTOU eviction guard ──────────────────────────────────────────

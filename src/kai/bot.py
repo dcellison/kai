@@ -186,7 +186,7 @@ async def _acquire_lock_or_kill(
             chat_id,
             _LOCK_ACQUIRE_TIMEOUT,
         )
-        pool.force_kill(chat_id)
+        await pool.force_kill(chat_id)
         # update.message can be None for edited messages or callback
         # queries, so guard rather than assert.
         if update.message is not None:
@@ -676,7 +676,7 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     pool = _get_pool(context)
     stop_event = get_stop_event(chat_id)
     stop_event.set()
-    pool.force_kill(chat_id)
+    await pool.force_kill(chat_id)
     await update.message.reply_text("Stopping...")
 
 

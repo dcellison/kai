@@ -418,7 +418,7 @@ def _make_mock_claude(model="sonnet", workspace=None, is_alive=True):
     pool.get_session_id = MagicMock(return_value=None)
     pool.restart = AsyncMock()
     pool.change_workspace = AsyncMock()
-    pool.force_kill = MagicMock()
+    pool.force_kill = AsyncMock()
     pool.send = MagicMock()  # configured per test
     return pool
 
