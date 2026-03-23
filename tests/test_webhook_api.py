@@ -1472,6 +1472,26 @@ class TestGetJobsAuth:
     """Authorization tests for GET /api/jobs."""
 
     @pytest.mark.asyncio
+    async def test_omitted_chat_id_defaults_to_admin(self, db, mock_request):
+        """GET /api/jobs without chat_id falls back to admin, preserving backward compat."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        # No query param set; should fall back to app["chat_id"] = 123
+        await sessions.create_job(
+            chat_id=123,
+            name="Admin Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="daily",
+            schedule_data='{"times": ["09:00"]}',
+        )
+
+        resp = await _handle_get_jobs(mock_request)
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        assert len(body) == 1
+        assert body[0]["name"] == "Admin Job"
+
+    @pytest.mark.asyncio
     async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
         """GET /api/jobs?chat_id=999 returns 403 for unauthorized users."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
