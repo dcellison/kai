@@ -26,12 +26,13 @@ import asyncio
 import json
 import logging
 import re
-import secrets
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
+
+from kai.prompt_utils import make_boundary
 
 log = logging.getLogger(__name__)
 
@@ -62,24 +63,6 @@ _DEFAULT_LABEL_COLOR = "ededed"
 # Header prepended to every triage comment on GitHub. Distinguishes
 # automated triage from human comments.
 _TRIAGE_HEADER = "## Triage by Kai\n\n"
-
-
-def _boundary(label: str) -> tuple[str, str]:
-    """
-    Generate a pair of randomized boundary delimiters for prompt injection prevention.
-
-    Each call produces a unique 8-character hex token, making it computationally
-    infeasible for injected content to guess and forge a closing delimiter.
-    Same pattern as review.py's boundary generation.
-
-    Args:
-        label: Human-readable label for the boundary (e.g., "ISSUE_BODY").
-
-    Returns:
-        A (begin, end) tuple of delimiter strings.
-    """
-    token = secrets.token_hex(4)
-    return (f"--- BEGIN {label} {token} ---", f"--- END {label} {token} ---")
 
 
 @dataclass(frozen=True)
@@ -277,10 +260,10 @@ def build_triage_prompt(
     # Generate unique random boundary tokens per block. Each block gets
     # its own token so even if an attacker guesses the format, they
     # cannot forge another block's delimiter.
-    meta_begin, meta_end = _boundary("ISSUE_METADATA")
-    body_begin, body_end = _boundary("ISSUE_BODY")
-    related_begin, related_end = _boundary("RELATED_ISSUES")
-    projects_begin, projects_end = _boundary("AVAILABLE_PROJECTS")
+    meta_begin, meta_end = make_boundary("ISSUE_METADATA")
+    body_begin, body_end = make_boundary("ISSUE_BODY")
+    related_begin, related_end = make_boundary("RELATED_ISSUES")
+    projects_begin, projects_end = make_boundary("AVAILABLE_PROJECTS")
 
     parts = [
         "You are triaging a new GitHub issue. Content between BEGIN/END "

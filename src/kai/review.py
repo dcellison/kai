@@ -27,11 +27,12 @@ import asyncio
 import glob as glob_mod
 import json
 import logging
-import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
+
+from kai.prompt_utils import make_boundary
 
 log = logging.getLogger(__name__)
 
@@ -453,13 +454,9 @@ def build_review_prompt(
     # Generate unique random boundary tokens per block. Each block gets
     # its own token so even if an attacker guesses the format, they
     # cannot forge another block's delimiter.
-    def _boundary(label: str) -> tuple[str, str]:
-        token = secrets.token_hex(4)
-        return (f"--- BEGIN {label} {token} ---", f"--- END {label} {token} ---")
-
-    meta_begin, meta_end = _boundary("PR_METADATA")
-    desc_begin, desc_end = _boundary("PR_DESCRIPTION")
-    diff_begin, diff_end = _boundary("DIFF")
+    meta_begin, meta_end = make_boundary("PR_METADATA")
+    desc_begin, desc_end = make_boundary("PR_DESCRIPTION")
+    diff_begin, diff_end = make_boundary("DIFF")
 
     # Truncate oversized diffs with a note so Claude knows the review
     # is partial. Better to review what we can than to fail entirely.
@@ -490,7 +487,7 @@ def build_review_prompt(
 
     # Optional: spec compliance context (from linked GitHub issues)
     if spec:
-        spec_begin, spec_end = _boundary("SPEC")
+        spec_begin, spec_end = make_boundary("SPEC")
         parts.extend(
             [
                 spec_begin,
@@ -505,7 +502,7 @@ def build_review_prompt(
 
     # Optional: project conventions from CLAUDE.md
     if conventions:
-        conv_begin, conv_end = _boundary("CONVENTIONS")
+        conv_begin, conv_end = make_boundary("CONVENTIONS")
         parts.extend(
             [
                 conv_begin,
@@ -521,7 +518,7 @@ def build_review_prompt(
     # the agent from re-flagging issues that were already raised and
     # dismissed in prior review rounds on this same PR.
     if prior_comments:
-        prior_begin, prior_end = _boundary("PRIOR_REVIEW_THREAD")
+        prior_begin, prior_end = make_boundary("PRIOR_REVIEW_THREAD")
         parts.extend(
             [
                 prior_begin,
