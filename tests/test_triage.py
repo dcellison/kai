@@ -302,6 +302,7 @@ class TestRunTriage:
             await run_triage("test prompt", claude_user="kai")
 
         mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
+        mock_proc.wait.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_claude_user_starts_new_session(self):
