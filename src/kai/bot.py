@@ -1576,7 +1576,7 @@ async def _check_totp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     Informational commands (/stats, /help, /jobs, etc.) do NOT need
     this gate since they don't invoke Claude with user content.
     """
-    if not is_totp_configured():
+    if not await asyncio.to_thread(is_totp_configured):
         return True
 
     assert context.user_data is not None
@@ -1624,7 +1624,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # which only handles the first two steps. We keep the expiry check
     # inline here because _check_totp sets totp_pending as a side effect,
     # and we need to read the pending state before that happens.
-    if is_totp_configured():
+    if await asyncio.to_thread(is_totp_configured):
         assert context.user_data is not None
         assert update.effective_chat is not None
 
@@ -1666,7 +1666,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 pass
 
             # Check global lockout before calling verify_code()
-            lockout_remaining = get_lockout_remaining()
+            lockout_remaining = await asyncio.to_thread(get_lockout_remaining)
             if lockout_remaining > 0:
                 minutes = math.ceil(lockout_remaining / 60)
                 await update.effective_chat.send_message(
@@ -1677,21 +1677,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             lockout_attempts = totp_cfg.totp_lockout_attempts
             lockout_minutes = totp_cfg.totp_lockout_minutes
 
-            if verify_code(code, lockout_attempts, lockout_minutes):
+            if await asyncio.to_thread(verify_code, code, lockout_attempts, lockout_minutes):
                 del context.user_data["totp_pending"]
                 context.user_data["totp_authenticated_at"] = time.time()
                 await update.effective_chat.send_message("Authenticated.")
                 return
 
             # Verification failed
-            lockout_remaining = get_lockout_remaining()
+            lockout_remaining = await asyncio.to_thread(get_lockout_remaining)
             if lockout_remaining > 0:
                 del context.user_data["totp_pending"]
                 await update.effective_chat.send_message(
                     f"Too many failed attempts. Locked out for {lockout_minutes} minutes."
                 )
             else:
-                remaining = lockout_attempts - get_failure_count()
+                remaining = lockout_attempts - await asyncio.to_thread(get_failure_count)
                 await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
             return
 
