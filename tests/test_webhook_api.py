@@ -1554,6 +1554,22 @@ class TestDeleteJobAuth:
     """Authorization tests for DELETE /api/jobs/{id}."""
 
     @pytest.mark.asyncio
+    async def test_omitted_chat_id_defaults_to_admin(self, db, mock_request):
+        """DELETE without chat_id falls back to admin, preserving backward compat."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        # No query param set; should fall back to app["chat_id"] = 123
+        job_id = await sessions.create_job(
+            chat_id=123, name="Admin Job", job_type="reminder",
+            prompt="test", schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_delete_job(mock_request)
+        assert resp.status == 200
+        assert await sessions.get_job_by_id(job_id) is None
+
+    @pytest.mark.asyncio
     async def test_user_can_delete_own_job(self, db, mock_request):
         """DELETE /api/jobs/{id}?chat_id=456 deletes user 456's job."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
@@ -1599,6 +1615,25 @@ class TestDeleteJobAuth:
 
 class TestUpdateJobAuth:
     """Authorization tests for PATCH /api/jobs/{id}."""
+
+    @pytest.mark.asyncio
+    async def test_omitted_chat_id_defaults_to_admin(self, db, mock_request):
+        """PATCH without chat_id in body falls back to admin, preserving backward compat."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        job_id = await sessions.create_job(
+            chat_id=123, name="Original", job_type="reminder",
+            prompt="test", schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+        # No chat_id in body; falls back to app["chat_id"] = 123
+        mock_request.json = AsyncMock(return_value={"name": "Updated"})
+
+        resp = await _handle_update_job(mock_request)
+        assert resp.status == 200
+        job = await sessions.get_job_by_id(job_id)
+        assert job is not None
+        assert job["name"] == "Updated"
 
     @pytest.mark.asyncio
     async def test_user_can_update_own_job(self, db, mock_request):

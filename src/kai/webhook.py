@@ -817,7 +817,9 @@ async def _handle_get_job(request: web.Request) -> web.Response:
         return web.json_response({"error": str(e)}, status=403)
 
     job = await sessions.get_job_by_id(job_id)
-    # Return 404 for missing OR wrong-owner jobs (don't leak existence)
+    # Return 404 for missing OR wrong-owner jobs (don't leak existence).
+    # Both sides are ints: _resolve_chat_id always returns int, and
+    # chat_id is stored as INTEGER in the jobs table.
     if not job or job["chat_id"] != chat_id:
         return web.json_response({"error": "Job not found"}, status=404)
     return web.json_response(job)
@@ -904,8 +906,10 @@ async def _handle_update_job(request: web.Request) -> web.Response:
         schedule_data = json.dumps(schedule_data)
 
     # Resolve caller identity from the JSON body (e.g., {"chat_id": 456, ...}).
-    # Falls back to admin chat_id when omitted. The chat_id field here is
-    # for authorization, not an updatable field.
+    # Falls back to admin chat_id when omitted. The chat_id field is used
+    # solely for authorization (WHERE clause filter in update_job), not as
+    # an updatable column - update_job only writes explicitly named fields
+    # (name, prompt, schedule_type, etc.) to the SET clause.
     try:
         chat_id = _resolve_chat_id(request, payload)
     except ValueError as e:
