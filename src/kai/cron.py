@@ -29,7 +29,7 @@ from datetime import time as dt_time
 
 from telegram.constants import ChatAction
 from telegram.error import Forbidden
-from telegram.ext import Application, ContextTypes
+from telegram.ext import Application, ContextTypes, ExtBot
 
 from kai import sessions
 from kai.history import log_message
@@ -47,7 +47,7 @@ _CONDITION_NOT_MET_PREFIX = (
 )
 
 
-async def _send_chunked(bot: object, chat_id: int, text: str) -> None:
+async def _send_chunked(bot: ExtBot, chat_id: int, text: str) -> None:
     """
     Send a potentially long message as multiple Telegram-safe chunks.
 

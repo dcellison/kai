@@ -36,6 +36,14 @@ class TestChunkText:
         assert len(chunks) == 1
         assert chunks[0] == text
 
+    def test_leading_double_newline_no_empty_chunk(self):
+        """Text starting with \\n\\n doesn't produce an empty first chunk."""
+        text = "\n\n" + "a" * 5000
+        chunks = chunk_text(text)
+        for chunk in chunks:
+            assert chunk != ""
+            assert len(chunk) > 0
+
     def test_4097_triggers_split(self):
         """A string of 4097 characters with a newline is split into two chunks."""
         text = "a" * 2000 + "\n" + "b" * 2096

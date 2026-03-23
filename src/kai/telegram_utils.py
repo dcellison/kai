@@ -32,6 +32,8 @@ def chunk_text(text: str, max_len: int = 4096) -> list[str]:
             split_at = text.rfind("\n", 0, max_len)
         if split_at == -1:
             split_at = max_len
-        chunks.append(text[:split_at])
+        chunk = text[:split_at]
+        if chunk:  # skip empty chunks (e.g., text starts with "\n\n")
+            chunks.append(chunk)
         text = text[split_at:].lstrip("\n")
     return chunks
