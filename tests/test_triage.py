@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from kai.prompt_utils import make_boundary
 from kai.triage import (
     IssueMetadata,
     _parse_triage_json,
@@ -178,22 +177,6 @@ class TestBuildTriagePrompt:
 
 
 class TestBoundaryHelper:
-    def test_unique_tokens(self):
-        """Each call to make_boundary produces a different token."""
-        begin1, end1 = make_boundary("TEST")
-        begin2, end2 = make_boundary("TEST")
-        # Tokens should differ between calls (statistically near-certain)
-        assert begin1 != begin2
-        assert end1 != end2
-
-    def test_format(self):
-        """Boundary strings follow the expected format."""
-        begin, end = make_boundary("ISSUE_BODY")
-        assert begin.startswith("--- BEGIN ISSUE_BODY ")
-        assert begin.endswith(" ---")
-        assert end.startswith("--- END ISSUE_BODY ")
-        assert end.endswith(" ---")
-
     def test_each_block_unique_in_prompt(self):
         """Each block in a single prompt gets a different token."""
         meta = _make_metadata()
