@@ -53,8 +53,17 @@ def clean_history_dir(history_dir: Path) -> None:
                 clean.append(line)  # keep malformed lines
 
         if removed > 0:
-            with open(path, "w") as f:
-                f.writelines(clean)
+            # Atomic write: write to temp file, then rename. If the
+            # process is killed mid-write, the original file is intact.
+            tmp = path.with_suffix(".tmp")
+            try:
+                with open(tmp, "w") as f:
+                    f.writelines(clean)
+                tmp.replace(path)
+            except OSError as e:
+                print(f"  Cannot write {path.name}: {e}")
+                tmp.unlink(missing_ok=True)
+                continue
             print(f"  {path.name}: removed {removed} test entries, kept {len(clean)}")
             total_removed += removed
             files_cleaned += 1
