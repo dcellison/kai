@@ -1487,13 +1487,19 @@ class TestGetJobsAuth:
         mock_request.query = {"chat_id": "456"}
 
         await sessions.create_job(
-            chat_id=123, name="Admin Job", job_type="reminder",
-            prompt="admin", schedule_type="daily",
+            chat_id=123,
+            name="Admin Job",
+            job_type="reminder",
+            prompt="admin",
+            schedule_type="daily",
             schedule_data='{"times": ["09:00"]}',
         )
         await sessions.create_job(
-            chat_id=456, name="User Job", job_type="reminder",
-            prompt="user", schedule_type="daily",
+            chat_id=456,
+            name="User Job",
+            job_type="reminder",
+            prompt="user",
+            schedule_type="daily",
             schedule_data='{"times": ["10:00"]}',
         )
 
@@ -1513,8 +1519,11 @@ class TestGetJobAuth:
         # Caller is user 456, job belongs to user 123
         mock_request.query = {"chat_id": "456"}
         job_id = await sessions.create_job(
-            chat_id=123, name="Admin Job", job_type="reminder",
-            prompt="test", schedule_type="once",
+            chat_id=123,
+            name="Admin Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
             schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
         )
         mock_request.match_info = {"id": str(job_id)}
@@ -1528,8 +1537,11 @@ class TestGetJobAuth:
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.query = {"chat_id": "456"}
         job_id = await sessions.create_job(
-            chat_id=456, name="User Job", job_type="reminder",
-            prompt="test", schedule_type="once",
+            chat_id=456,
+            name="User Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
             schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
         )
         mock_request.match_info = {"id": str(job_id)}
@@ -1559,8 +1571,11 @@ class TestDeleteJobAuth:
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         # No query param set; should fall back to app["chat_id"] = 123
         job_id = await sessions.create_job(
-            chat_id=123, name="Admin Job", job_type="reminder",
-            prompt="test", schedule_type="once",
+            chat_id=123,
+            name="Admin Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
             schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
         )
         mock_request.match_info = {"id": str(job_id)}
@@ -1575,8 +1590,11 @@ class TestDeleteJobAuth:
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.query = {"chat_id": "456"}
         job_id = await sessions.create_job(
-            chat_id=456, name="User Job", job_type="reminder",
-            prompt="test", schedule_type="once",
+            chat_id=456,
+            name="User Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
             schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
         )
         mock_request.match_info = {"id": str(job_id)}
@@ -1591,8 +1609,11 @@ class TestDeleteJobAuth:
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.query = {"chat_id": "456"}
         job_id = await sessions.create_job(
-            chat_id=123, name="Admin Job", job_type="reminder",
-            prompt="test", schedule_type="once",
+            chat_id=123,
+            name="Admin Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
             schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
         )
         mock_request.match_info = {"id": str(job_id)}
@@ -1621,8 +1642,11 @@ class TestUpdateJobAuth:
         """PATCH without chat_id in body falls back to admin, preserving backward compat."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         job_id = await sessions.create_job(
-            chat_id=123, name="Original", job_type="reminder",
-            prompt="test", schedule_type="once",
+            chat_id=123,
+            name="Original",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
             schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
         )
         mock_request.match_info = {"id": str(job_id)}
@@ -1640,14 +1664,15 @@ class TestUpdateJobAuth:
         """PATCH with chat_id in body updates the user's own job."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         job_id = await sessions.create_job(
-            chat_id=456, name="Original", job_type="reminder",
-            prompt="test", schedule_type="once",
+            chat_id=456,
+            name="Original",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
             schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
         )
         mock_request.match_info = {"id": str(job_id)}
-        mock_request.json = AsyncMock(
-            return_value={"chat_id": 456, "name": "Updated"}
-        )
+        mock_request.json = AsyncMock(return_value={"chat_id": 456, "name": "Updated"})
 
         resp = await _handle_update_job(mock_request)
         assert resp.status == 200
@@ -1660,14 +1685,15 @@ class TestUpdateJobAuth:
         """PATCH with chat_id=456 returns 404 for admin's job."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         job_id = await sessions.create_job(
-            chat_id=123, name="Admin Job", job_type="reminder",
-            prompt="test", schedule_type="once",
+            chat_id=123,
+            name="Admin Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
             schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
         )
         mock_request.match_info = {"id": str(job_id)}
-        mock_request.json = AsyncMock(
-            return_value={"chat_id": 456, "name": "Hacked"}
-        )
+        mock_request.json = AsyncMock(return_value={"chat_id": 456, "name": "Hacked"})
 
         resp = await _handle_update_job(mock_request)
         assert resp.status == 404
@@ -1681,9 +1707,7 @@ class TestUpdateJobAuth:
         """PATCH with unauthorized chat_id returns 403."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.match_info = {"id": "1"}
-        mock_request.json = AsyncMock(
-            return_value={"chat_id": 999, "name": "Nope"}
-        )
+        mock_request.json = AsyncMock(return_value={"chat_id": 999, "name": "Nope"})
 
         resp = await _handle_update_job(mock_request)
         assert resp.status == 403
