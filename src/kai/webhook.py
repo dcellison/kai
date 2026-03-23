@@ -709,15 +709,20 @@ def _validate_schedule_data(
         if not isinstance(parsed, dict):
             return None, "schedule_data must be a JSON object"
     else:
+        if not isinstance(schedule_data, dict):
+            return None, "schedule_data must be a JSON object"
         parsed = schedule_data
 
     # Structural validation per schedule_type
     if schedule_type == "once":
         if "run_at" not in parsed:
             return None, "schedule_data for 'once' requires 'run_at'"
-        # Validate it parses as an ISO datetime
+        # Validate it parses as an ISO datetime string
+        run_at = parsed["run_at"]
+        if not isinstance(run_at, str):
+            return None, "schedule_data 'run_at' must be a string"
         try:
-            datetime.fromisoformat(str(parsed["run_at"]))
+            datetime.fromisoformat(run_at)
         except ValueError:
             return None, "schedule_data 'run_at' is not a valid ISO datetime"
 
@@ -732,6 +737,8 @@ def _validate_schedule_data(
                 return None, f"schedule_data 'times' entry '{t}' is not a valid HH:MM string"
             try:
                 parts = t.split(":")
+                if len(parts) != 2:
+                    raise ValueError
                 h, m = int(parts[0]), int(parts[1])
                 if not (0 <= h <= 23 and 0 <= m <= 59):
                     raise ValueError
@@ -742,8 +749,12 @@ def _validate_schedule_data(
         if "seconds" not in parsed:
             return None, "schedule_data for 'interval' requires 'seconds'"
         seconds = parsed["seconds"]
-        if not isinstance(seconds, (int, float)) or seconds <= 0:
+        # bool is a subclass of int in Python, so reject it explicitly
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
             return None, "schedule_data 'seconds' must be a positive number"
+
+    else:
+        return None, f"unknown schedule_type '{schedule_type}'"
 
     return json.dumps(parsed), None
 
