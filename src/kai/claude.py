@@ -782,6 +782,17 @@ class PersistentClaude:
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except TimeoutError:
                 pass
+
+            # Cancel the stderr drain BEFORE clearing self._proc.
+            # _drain_stderr's while-loop checks self._proc on each iteration;
+            # if we clear proc first, the drain task could observe None in a
+            # state that was never intended to be visible to it. Cancelling
+            # the task first ensures it stops reading before its dependencies
+            # are destroyed.
+            if self._stderr_task:
+                self._stderr_task.cancel()
+                self._stderr_task = None
+
             self._proc = None
             self._pgid = None
             self._session_id = None
@@ -797,9 +808,6 @@ class PersistentClaude:
                     os.killpg(saved_pgid, signal.SIGKILL)
                 except OSError:
                     pass
-        if self._stderr_task:
-            self._stderr_task.cancel()
-            self._stderr_task = None
 
     async def shutdown(self) -> None:
         """
@@ -830,13 +838,16 @@ class PersistentClaude:
         else:
             saved_pgid = None
 
+        # Cancel stderr drain before clearing proc (same invariant as _kill:
+        # the drain task checks self._proc, so cancel it first).
+        if self._stderr_task:
+            self._stderr_task.cancel()
+            self._stderr_task = None
+
         # Clean up state regardless of how (or whether) the process exited
         self._proc = None
         self._pgid = None
         self._session_started_at = None
-        if self._stderr_task:
-            self._stderr_task.cancel()
-            self._stderr_task = None
 
         # Final cleanup: signal the saved process group one more time
         # to catch any orphaned children that survived the initial signals.

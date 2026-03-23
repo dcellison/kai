@@ -1224,16 +1224,49 @@ class TestKill:
 
     @pytest.mark.asyncio
     async def test_cancels_stderr_task(self):
-        """_kill cancels the stderr drain task."""
+        """_kill cancels the stderr drain task before clearing proc."""
         claude = _make_claude()
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.send_signal = MagicMock()
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+
         mock_task = MagicMock()
         claude._stderr_task = mock_task
-        claude._proc = None  # No process to kill
 
         await claude._kill()
 
         mock_task.cancel.assert_called_once()
         assert claude._stderr_task is None
+
+    @pytest.mark.asyncio
+    async def test_stderr_cancelled_before_proc_cleared(self):
+        """_kill cancels stderr task while self._proc is still set."""
+        claude = _make_claude()
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.send_signal = MagicMock()
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+
+        proc_at_cancel_time: list[object] = []
+
+        def tracking_cancel():
+            # Record whether self._proc is still set when cancel is called
+            proc_at_cancel_time.append(claude._proc)
+
+        mock_task = MagicMock()
+        mock_task.cancel = MagicMock(side_effect=tracking_cancel)
+        claude._stderr_task = mock_task
+
+        await claude._kill()
+
+        # stderr task was cancelled while proc was still set (not None)
+        assert len(proc_at_cancel_time) == 1
+        assert proc_at_cancel_time[0] is mock_proc
+        # After _kill completes, proc is cleared
+        assert claude._proc is None
 
     @pytest.mark.asyncio
     async def test_idempotent_no_process(self):
