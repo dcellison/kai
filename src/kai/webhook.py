@@ -824,6 +824,7 @@ async def _handle_schedule(request: web.Request) -> web.Response:
     schedule_data_str, error = _validate_schedule_data(schedule_data, schedule_type)
     if error:
         return web.json_response({"error": error}, status=400)
+    assert schedule_data_str is not None  # guaranteed when error is None
 
     # Persist to database
     try:
