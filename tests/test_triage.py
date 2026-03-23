@@ -176,7 +176,7 @@ class TestBuildTriagePrompt:
         assert "Sprint 1" in prompt
 
 
-class TestBoundaryHelper:
+class TestBuildTriagePromptBoundaries:
     def test_each_block_unique_in_prompt(self):
         """Each block in a single prompt gets a different token."""
         meta = _make_metadata()
