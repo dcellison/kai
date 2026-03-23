@@ -355,7 +355,7 @@ async def test_non_code_message_not_deleted():
     mock_verify.assert_not_called()
     # User should see a reminder
     sent = update.effective_chat.send_message.call_args[0][0]
-    assert "6-digit" in sent.lower() or "code" in sent.lower()
+    assert "6-digit" in sent
 
 
 async def test_six_digit_code_still_verified():
