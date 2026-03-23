@@ -40,6 +40,11 @@ log = logging.getLogger(__name__)
 # Valid authentication types for service definitions
 _VALID_AUTH_TYPES = {"bearer", "header", "query", "none"}
 
+# Maximum response body size from external services (bytes).
+# 10MB is generous; typical API responses (Perplexity, etc.) are well
+# under 1MB. Prevents a misbehaving upstream from OOM-ing the process.
+_MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10MB
+
 # Module-level service registry, populated by load_services() at startup
 _services: dict[str, "ServiceDef"] | None = None
 
@@ -394,8 +399,30 @@ async def call_service(
                 json=body if body is not None else None,
                 timeout=timeout,
             ) as resp:
-                response_body = await resp.text()
-                log.info("Service '%s' responded: %d (%d bytes)", name, resp.status, len(response_body))
+                # Read with a size cap to prevent OOM from oversized
+                # responses. Read one extra byte to detect truncation
+                # without a second read call.
+                raw = await resp.content.read(_MAX_RESPONSE_BYTES + 1)
+                truncated = len(raw) > _MAX_RESPONSE_BYTES
+                if truncated:
+                    raw = raw[:_MAX_RESPONSE_BYTES]
+                    log.warning(
+                        "Service '%s' response truncated at %d bytes",
+                        name,
+                        _MAX_RESPONSE_BYTES,
+                    )
+                # Decode using the charset from the Content-Type header,
+                # falling back to UTF-8. errors="replace" avoids crashes
+                # on malformed byte sequences in truncated responses.
+                encoding = resp.get_encoding() or "utf-8"
+                response_body = raw.decode(encoding, errors="replace")
+                log.info(
+                    "Service '%s' responded: %d (%d bytes%s)",
+                    name,
+                    resp.status,
+                    len(raw),
+                    ", truncated" if truncated else "",
+                )
                 return ServiceResponse(
                     success=True,
                     status=resp.status,
