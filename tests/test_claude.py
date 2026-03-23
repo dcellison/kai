@@ -1540,6 +1540,25 @@ class TestChangeWorkspace:
         assert claude.workspace == new_path
         mock_kill.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_kill_before_state_mutation(self):
+        """_kill() runs before attributes are mutated, not after."""
+        claude = _make_claude()
+        original_workspace = claude.workspace
+        kill_order: list[tuple[str, Path]] = []
+
+        async def tracking_kill():
+            # Record what workspace was set when _kill was called
+            kill_order.append(("kill", claude.workspace))
+
+        with patch.object(claude, "_kill", side_effect=tracking_kill):
+            await claude.change_workspace(Path("/tmp/new-workspace"))
+
+        # _kill should have seen the ORIGINAL workspace, not the new one
+        assert kill_order == [("kill", original_workspace)]
+        # Final state should still be the new workspace
+        assert claude.workspace == Path("/tmp/new-workspace")
+
 
 # ── restart ──────────────────────────────────────────────────────────
 

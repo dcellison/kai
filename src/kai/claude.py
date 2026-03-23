@@ -723,9 +723,14 @@ class PersistentClaude:
             workspace_config: Per-workspace config for the target, or
                 None to use global defaults.
         """
-        # No lock needed: _kill() terminates the process, and the next send()
-        # call will start fresh in the new workspace via _ensure_started().
-        # Any in-flight send() will see EOF on stdout and clean up.
+        # Kill first, then mutate. An in-flight _send_locked() reads
+        # self.workspace, self.timeout_seconds, and self.workspace_config
+        # at various await points during streaming. If we mutate before
+        # killing, the stream sees new config values while still running
+        # the old workspace's process. Killing first ensures the stream
+        # hits EOF and exits before any state changes.
+        await self._kill()
+
         self.workspace = new_workspace
         self.workspace_config = workspace_config
 
@@ -745,8 +750,6 @@ class PersistentClaude:
                 self.max_budget_usd = workspace_config.budget
             if workspace_config.timeout is not None:
                 self.timeout_seconds = workspace_config.timeout
-
-        await self._kill()
 
     async def restart(self) -> None:
         """
