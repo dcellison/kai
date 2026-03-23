@@ -179,7 +179,7 @@ class TestBuildTriagePrompt:
 
 class TestBoundaryHelper:
     def test_unique_tokens(self):
-        """Each call to _boundary produces a different token."""
+        """Each call to make_boundary produces a different token."""
         begin1, end1 = make_boundary("TEST")
         begin2, end2 = make_boundary("TEST")
         # Tokens should differ between calls (statistically near-certain)
