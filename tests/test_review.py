@@ -1052,6 +1052,47 @@ class TestResolveSpecFromBranch:
         result = resolve_spec_from_branch("feature/my-spec", str(tmp_path))
         assert result == str(spec_file)
 
+    def test_glob_metachar_star_escaped(self, tmp_path):
+        """Glob * in branch name is escaped, doesn't match everything."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        (specs_dir / "unrelated-spec.md").write_text("should not match")
+
+        # Branch name contains *, which unescaped would match all .md files
+        result = resolve_spec_from_branch("feature/*", str(tmp_path), spec_dir="workspace/specs")
+        assert result is None
+
+    def test_glob_metachar_question_escaped(self, tmp_path):
+        """Glob ? in branch name is escaped, doesn't match single chars."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        (specs_dir / "test-spec.md").write_text("content")
+
+        # "t?st" unescaped would match "test", but escaped it's literal
+        result = resolve_spec_from_branch("feature/t?st", str(tmp_path), spec_dir="workspace/specs")
+        assert result is None
+
+    def test_glob_metachar_bracket_escaped(self, tmp_path):
+        """Glob [] in branch name is escaped, doesn't match char classes."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        (specs_dir / "spec1.md").write_text("content")
+
+        # "spec[0-9]" unescaped would match "spec1", but escaped it's literal
+        result = resolve_spec_from_branch("feature/spec[0-9]", str(tmp_path), spec_dir="workspace/specs")
+        assert result is None
+
+    def test_literal_branch_with_special_chars_still_matches(self, tmp_path):
+        """A spec file whose name literally contains escaped chars can still match."""
+        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir.mkdir(parents=True)
+        # Edge case: a spec file that literally has a ? in its name
+        spec_file = specs_dir / "what-is-this?.md"
+        spec_file.write_text("content")
+
+        result = resolve_spec_from_branch("feature/what-is-this?", str(tmp_path), spec_dir="workspace/specs")
+        assert result == str(spec_file)
+
 
 # ── load_spec ──────────────────────────────────────────────────────
 

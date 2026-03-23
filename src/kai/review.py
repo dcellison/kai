@@ -180,8 +180,10 @@ def resolve_spec_from_branch(branch: str, repo_path: str, spec_dir: str = "specs
     if not specs_dir.is_dir():
         return None
 
-    # Glob for spec files containing the branch name fragment
-    pattern = str(specs_dir / f"*{name}*.md")
+    # Escape glob metacharacters (*, ?, [) in the branch name so
+    # attacker-controlled branch names can't match unintended files.
+    safe_name = glob_mod.escape(name)
+    pattern = str(specs_dir / f"*{safe_name}*.md")
     matches = sorted(glob_mod.glob(pattern))
     return matches[0] if matches else None
 
