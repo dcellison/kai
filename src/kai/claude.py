@@ -768,6 +768,10 @@ class PersistentClaude:
         the initial signal (e.g., claude reparented to init after sudo
         died). The timeout prevents hanging on zombie processes.
         Idempotent - safe to call even if the process has already exited.
+
+        Note: _stderr_task cancellation is inside the `if self._proc` guard
+        because _stderr_task is only created alongside _proc in _ensure_started().
+        If _proc is None, there is no stderr task to cancel.
         """
         if self._proc:
             # Save pgid before clearing - the EOF handler in _send_locked()
