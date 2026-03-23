@@ -1465,6 +1465,195 @@ class TestJobOwnership:
         assert jobs[0]["name"] == "Original"
 
 
+# ── Jobs API multi-user authorization ─────────────────────────────
+
+
+class TestGetJobsAuth:
+    """Authorization tests for GET /api/jobs."""
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
+        """GET /api/jobs?chat_id=999 returns 403 for unauthorized users."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {"chat_id": "999"}
+
+        resp = await _handle_get_jobs(mock_request)
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_authorized_chat_id_returns_only_their_jobs(self, db, mock_request):
+        """GET /api/jobs?chat_id=456 returns only user 456's jobs."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {"chat_id": "456"}
+
+        await sessions.create_job(
+            chat_id=123, name="Admin Job", job_type="reminder",
+            prompt="admin", schedule_type="daily",
+            schedule_data='{"times": ["09:00"]}',
+        )
+        await sessions.create_job(
+            chat_id=456, name="User Job", job_type="reminder",
+            prompt="user", schedule_type="daily",
+            schedule_data='{"times": ["10:00"]}',
+        )
+
+        resp = await _handle_get_jobs(mock_request)
+        body = json.loads(resp.body.decode())
+        assert len(body) == 1
+        assert body[0]["name"] == "User Job"
+
+
+class TestGetJobAuth:
+    """Authorization and ownership tests for GET /api/jobs/{id}."""
+
+    @pytest.mark.asyncio
+    async def test_wrong_owner_returns_404(self, db, mock_request):
+        """GET /api/jobs/{id} returns 404 when job belongs to another user."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        # Caller is user 456, job belongs to user 123
+        mock_request.query = {"chat_id": "456"}
+        job_id = await sessions.create_job(
+            chat_id=123, name="Admin Job", job_type="reminder",
+            prompt="test", schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_get_job(mock_request)
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_owner_can_view_own_job(self, db, mock_request):
+        """GET /api/jobs/{id}?chat_id=456 returns the job when owned by 456."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {"chat_id": "456"}
+        job_id = await sessions.create_job(
+            chat_id=456, name="User Job", job_type="reminder",
+            prompt="test", schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_get_job(mock_request)
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        assert body["name"] == "User Job"
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
+        """GET /api/jobs/{id}?chat_id=999 returns 403 for unauthorized user."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {"chat_id": "999"}
+        mock_request.match_info = {"id": "1"}
+
+        resp = await _handle_get_job(mock_request)
+        assert resp.status == 403
+
+
+class TestDeleteJobAuth:
+    """Authorization tests for DELETE /api/jobs/{id}."""
+
+    @pytest.mark.asyncio
+    async def test_user_can_delete_own_job(self, db, mock_request):
+        """DELETE /api/jobs/{id}?chat_id=456 deletes user 456's job."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {"chat_id": "456"}
+        job_id = await sessions.create_job(
+            chat_id=456, name="User Job", job_type="reminder",
+            prompt="test", schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_delete_job(mock_request)
+        assert resp.status == 200
+        assert await sessions.get_job_by_id(job_id) is None
+
+    @pytest.mark.asyncio
+    async def test_cannot_delete_other_users_job(self, db, mock_request):
+        """DELETE /api/jobs/{id}?chat_id=456 returns 404 for admin's job."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {"chat_id": "456"}
+        job_id = await sessions.create_job(
+            chat_id=123, name="Admin Job", job_type="reminder",
+            prompt="test", schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_delete_job(mock_request)
+        assert resp.status == 404
+        # Job should still exist
+        assert await sessions.get_job_by_id(job_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
+        """DELETE /api/jobs/{id}?chat_id=999 returns 403."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {"chat_id": "999"}
+        mock_request.match_info = {"id": "1"}
+
+        resp = await _handle_delete_job(mock_request)
+        assert resp.status == 403
+
+
+class TestUpdateJobAuth:
+    """Authorization tests for PATCH /api/jobs/{id}."""
+
+    @pytest.mark.asyncio
+    async def test_user_can_update_own_job(self, db, mock_request):
+        """PATCH with chat_id in body updates the user's own job."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        job_id = await sessions.create_job(
+            chat_id=456, name="Original", job_type="reminder",
+            prompt="test", schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+        mock_request.json = AsyncMock(
+            return_value={"chat_id": 456, "name": "Updated"}
+        )
+
+        resp = await _handle_update_job(mock_request)
+        assert resp.status == 200
+        job = await sessions.get_job_by_id(job_id)
+        assert job is not None
+        assert job["name"] == "Updated"
+
+    @pytest.mark.asyncio
+    async def test_cannot_update_other_users_job(self, db, mock_request):
+        """PATCH with chat_id=456 returns 404 for admin's job."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        job_id = await sessions.create_job(
+            chat_id=123, name="Admin Job", job_type="reminder",
+            prompt="test", schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+        mock_request.json = AsyncMock(
+            return_value={"chat_id": 456, "name": "Hacked"}
+        )
+
+        resp = await _handle_update_job(mock_request)
+        assert resp.status == 404
+        # Job should be unchanged
+        job = await sessions.get_job_by_id(job_id)
+        assert job is not None
+        assert job["name"] == "Admin Job"
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
+        """PATCH with unauthorized chat_id returns 403."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.match_info = {"id": "1"}
+        mock_request.json = AsyncMock(
+            return_value={"chat_id": 999, "name": "Nope"}
+        )
+
+        resp = await _handle_update_job(mock_request)
+        assert resp.status == 403
+
+
 # ── Filename sanitization ──────────────────────────────────────────
 
 

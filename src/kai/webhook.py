@@ -782,16 +782,15 @@ async def _handle_get_jobs(request: web.Request) -> web.Response:
     without needing to parse Telegram bot command output.
     """
 
-    # GET requests use a query parameter for chat_id routing
-    # instead of a JSON body (more conventional for GET endpoints).
-    raw_chat_id = request.query.get("chat_id")
-    if raw_chat_id is not None:
-        try:
-            chat_id = int(raw_chat_id)
-        except (ValueError, TypeError):
-            return web.json_response({"error": f"chat_id must be an integer, got {raw_chat_id!r}"}, status=400)
-    else:
-        chat_id = request.app["chat_id"]
+    # Resolve the caller's identity. Query params are passed as the payload
+    # dict so _resolve_chat_id can extract and validate chat_id the same
+    # way it does for POST endpoints with JSON bodies.
+    try:
+        chat_id = _resolve_chat_id(request, dict(request.query))
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    except UnauthorizedChatIdError as e:
+        return web.json_response({"error": str(e)}, status=403)
     jobs = await sessions.get_jobs(chat_id)
     return web.json_response(jobs)
 
@@ -809,8 +808,17 @@ async def _handle_get_job(request: web.Request) -> web.Response:
     except ValueError:
         return web.json_response({"error": "Invalid job ID"}, status=400)
 
+    # Resolve caller identity for ownership check
+    try:
+        chat_id = _resolve_chat_id(request, dict(request.query))
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    except UnauthorizedChatIdError as e:
+        return web.json_response({"error": str(e)}, status=403)
+
     job = await sessions.get_job_by_id(job_id)
-    if not job:
+    # Return 404 for missing OR wrong-owner jobs (don't leak existence)
+    if not job or job["chat_id"] != chat_id:
         return web.json_response({"error": "Job not found"}, status=404)
     return web.json_response(job)
 
@@ -830,10 +838,16 @@ async def _handle_delete_job(request: web.Request) -> web.Response:
     except ValueError:
         return web.json_response({"error": "Invalid job ID"}, status=400)
 
-    # Use the default chat_id for ownership check. The API endpoints
-    # are localhost-only behind webhook secret, but validating ownership
-    # prevents cross-user job manipulation via prompt injection.
-    chat_id = request.app["chat_id"]
+    # Resolve caller identity from query params (e.g., ?chat_id=456).
+    # Falls back to admin chat_id when omitted, preserving backward
+    # compatibility. _resolve_chat_id validates against allowed_user_ids
+    # to prevent cross-user job manipulation via prompt injection.
+    try:
+        chat_id = _resolve_chat_id(request, dict(request.query))
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    except UnauthorizedChatIdError as e:
+        return web.json_response({"error": str(e)}, status=403)
     deleted = await sessions.delete_job(job_id, chat_id=chat_id)
     if not deleted:
         return web.json_response({"error": "Job not found"}, status=404)
@@ -889,8 +903,15 @@ async def _handle_update_job(request: web.Request) -> web.Response:
     if isinstance(schedule_data, dict):
         schedule_data = json.dumps(schedule_data)
 
-    # Use default chat_id for ownership check (same pattern as delete)
-    chat_id = request.app["chat_id"]
+    # Resolve caller identity from the JSON body (e.g., {"chat_id": 456, ...}).
+    # Falls back to admin chat_id when omitted. The chat_id field here is
+    # for authorization, not an updatable field.
+    try:
+        chat_id = _resolve_chat_id(request, payload)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    except UnauthorizedChatIdError as e:
+        return web.json_response({"error": str(e)}, status=403)
     updated = await sessions.update_job(
         job_id,
         chat_id=chat_id,
