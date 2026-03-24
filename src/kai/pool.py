@@ -207,21 +207,30 @@ class SubprocessPool:
         Kill a specific user's subprocess and remove it from the pool.
 
         Uses shutdown() with a short timeout for clean process reaping
-        and stderr task cancellation. Falls back to raw SIGKILL if
-        shutdown hangs, so this never blocks callers for long.
+        and stderr task cancellation. Falls back to raw SIGKILL on any
+        failure (timeout, cancellation, or other exception), so this
+        never blocks callers for long and never propagates exceptions.
+
+        The instance is kept in the pool during shutdown so it remains
+        tracked. It is only removed after the subprocess is confirmed
+        dead (either via clean shutdown or SIGKILL fallback).
         """
-        instance = self._pool.pop(chat_id, None)
+        instance = self._pool.get(chat_id)
+        if not instance:
+            # No instance to kill; clean up any orphaned tracking entry
+            self._last_activity.pop(chat_id, None)
+            return
+        try:
+            await asyncio.wait_for(instance.shutdown(), timeout=_FORCE_KILL_TIMEOUT)
+        except Exception:
+            # Any failure (timeout, CancelledError, OSError, etc.) -
+            # fall back to raw SIGKILL. instance.force_kill() is
+            # effectively infallible (catches its own OSError).
+            instance.force_kill()
+            log.warning("force_kill: shutdown failed for user %d, sent SIGKILL", chat_id)
+        # Remove from tracking only after the subprocess is confirmed dead
+        self._pool.pop(chat_id, None)
         self._last_activity.pop(chat_id, None)
-        if instance:
-            try:
-                await asyncio.wait_for(instance.shutdown(), timeout=_FORCE_KILL_TIMEOUT)
-            except TimeoutError:
-                # shutdown() already escalates to SIGKILL internally, but
-                # if even that hangs (zombie), force-kill and move on.
-                # At this point the instance is already out of the pool,
-                # so we won't try to use it again.
-                instance.force_kill()
-                log.warning("force_kill: shutdown timed out for user %d, sent SIGKILL", chat_id)
 
     async def change_workspace(
         self,
@@ -307,14 +316,21 @@ class SubprocessPool:
                     continue
                 if chat_id in self._in_flight:
                     continue
-                instance = self._pool.pop(chat_id, None)
-                self._last_activity.pop(chat_id, None)
+                instance = self._pool.get(chat_id)
                 if instance and instance.is_alive:
                     try:
                         log.info("Evicting idle subprocess for user %d", chat_id)
                         await instance.shutdown()
                     except Exception:
-                        log.exception("Error evicting subprocess for user %d", chat_id)
+                        # Graceful shutdown failed. Fall back to raw SIGKILL
+                        # so the process doesn't become an orphan. force_kill()
+                        # is effectively infallible (catches its own OSError).
+                        log.exception("Error evicting subprocess for user %d, sending SIGKILL", chat_id)
+                        instance.force_kill()
+                    # Remove from tracking only after the subprocess is
+                    # confirmed dead (clean shutdown or SIGKILL fallback)
+                    self._pool.pop(chat_id, None)
+                    self._last_activity.pop(chat_id, None)
 
     async def shutdown(self) -> None:
         """Shut down all subprocesses and stop the eviction task."""
