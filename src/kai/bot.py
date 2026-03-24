@@ -1265,7 +1265,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     raw = bytes(data)
     b64 = base64.b64encode(raw).decode()
 
-    # Save to workspace so Claude can access the file via shell tools
+    # Save to DATA_DIR/files/ so Claude can access the file via shell tools
     saved = _save_upload(raw, f"photo_{photo.file_unique_id}.jpg", user_id=chat_id)
 
     caption = update.message.caption or "What's in this image?"
@@ -1394,7 +1394,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         b64 = base64.b64encode(raw).decode()
         media_type = _IMAGE_MEDIA_TYPES[suffix]
 
-        # Save to workspace so Claude can access the file via shell tools
+        # Save to DATA_DIR/files/ so Claude can access the file via shell tools
         saved = _save_upload(raw, file_name, user_id=chat_id)
         img_caption = caption or f"What's in this image ({file_name})?"
         img_caption += f"\n[File saved to: {saved}]"
@@ -1420,7 +1420,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text(f"Couldn't decode {file_name} as text.")
             return
 
-        # Save to workspace so Claude can access the file via shell tools
+        # Save to DATA_DIR/files/ so Claude can access the file via shell tools
         saved = _save_upload(raw, file_name, user_id=chat_id)
         header = f"File: {file_name}\n```\n{text_content}\n```\n[File saved to: {saved}]"
 

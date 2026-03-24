@@ -998,33 +998,31 @@ def _apply_migrate(data_path: Path, install_path: Path, svc_uid: int, svc_gid: i
     files_dst = data_path / "files"
 
     if files_src.exists() and any(files_src.iterdir()):
-        if dry_run:
-            for item in files_src.rglob("*"):
-                if item.is_file():
-                    rel = item.relative_to(files_src)
-                    dst = files_dst / rel
-                    if not dst.exists():
-                        print(f"[DRY RUN] Would copy file: {item} -> {dst}")
-            print(f"[DRY RUN] Would set ownership: {files_dst} ({svc_uid}:{svc_gid})")
-        else:
-            copied = 0
-            for item in files_src.rglob("*"):
-                if item.is_file():
-                    rel = item.relative_to(files_src)
-                    dst = files_dst / rel
-                    if not dst.exists():
-                        dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(item, dst)
-                        copied += 1
-            if copied:
-                # Recursively set ownership on the entire files tree
-                for root, _dirs, fnames in os.walk(files_dst):
-                    os.chown(root, svc_uid, svc_gid)
-                    for fname in fnames:
-                        os.chown(os.path.join(root, fname), svc_uid, svc_gid)
-                print(f"  Migrated {copied} uploaded file(s) to {files_dst}")
-            else:
-                print("  Uploaded files already migrated or no files to copy")
+        # Use os.walk with followlinks=False (the default) so symlinks
+        # pointing outside the directory are not followed during migration.
+        copied = 0
+        for root, _dirs, fnames in os.walk(files_src):
+            for fname in fnames:
+                src_file = Path(root) / fname
+                rel = src_file.relative_to(files_src)
+                dst_file = files_dst / rel
+                if dst_file.exists():
+                    continue
+                if dry_run:
+                    print(f"[DRY RUN] Would copy file: {src_file} -> {dst_file}")
+                else:
+                    dst_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_file, dst_file)
+                copied += 1
+        if copied and not dry_run:
+            # Recursively set ownership on the entire files tree
+            for root, _subdirs, fnames in os.walk(files_dst):
+                os.chown(root, svc_uid, svc_gid)
+                for fname in fnames:
+                    os.chown(os.path.join(root, fname), svc_uid, svc_gid)
+            print(f"  Migrated {copied} uploaded file(s) to {files_dst}")
+        elif not copied and not dry_run:
+            print("  Uploaded files already migrated or no files to copy")
 
 
 def _cmd_apply() -> None:

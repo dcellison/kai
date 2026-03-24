@@ -1118,6 +1118,54 @@ class TestApplyMigrate:
 
         assert (memory_dir / "MEMORY.md").read_text() == "existing personalized content"
 
+    def test_copies_uploaded_files(self, tmp_path, monkeypatch):
+        """Copies uploaded files from home/files/ to data_path/files/."""
+        install_path = tmp_path / "install"
+        files_src = install_path / "home" / "files" / "123"
+        files_src.mkdir(parents=True)
+        (files_src / "photo.jpg").write_bytes(b"image data")
+        (files_src / "doc.pdf").write_bytes(b"pdf data")
+
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "files").mkdir()
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, install_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        assert (data_path / "files" / "123" / "photo.jpg").read_bytes() == b"image data"
+        assert (data_path / "files" / "123" / "doc.pdf").read_bytes() == b"pdf data"
+        # Source files preserved
+        assert (files_src / "photo.jpg").exists()
+
+    def test_uploaded_files_skip_existing(self, tmp_path, monkeypatch):
+        """Does not overwrite uploaded files that already exist at the destination."""
+        install_path = tmp_path / "install"
+        files_src = install_path / "home" / "files"
+        files_src.mkdir(parents=True)
+        (files_src / "photo.jpg").write_bytes(b"source")
+
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        files_dst = data_path / "files"
+        files_dst.mkdir()
+        (files_dst / "photo.jpg").write_bytes(b"existing")
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, install_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        assert (files_dst / "photo.jpg").read_bytes() == b"existing"
+
 
 # ── Service lifecycle ────────────────────────────────────────────────
 
