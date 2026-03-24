@@ -1033,6 +1033,50 @@ class TestApplyMigrate:
         assert not (data_path / "kai.db").exists()
         assert not (data_path / "logs" / "kai.log").exists()
 
+    def test_copies_history(self, tmp_path, monkeypatch):
+        """Copies JSONL history files from workspace/.claude/history/ to data_path/history/."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        history_src = tmp_path / "src" / "workspace" / ".claude" / "history"
+        history_src.mkdir(parents=True)
+        (history_src / "2026-03-20.jsonl").write_text('{"ts":"2026-03-20","text":"hello"}')
+        (history_src / "2026-03-21.jsonl").write_text('{"ts":"2026-03-21","text":"world"}')
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        history_dst = data_path / "history"
+        history_dst.mkdir()
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        assert (history_dst / "2026-03-20.jsonl").exists()
+        assert (history_dst / "2026-03-21.jsonl").exists()
+        # Source files preserved
+        assert (history_src / "2026-03-20.jsonl").exists()
+
+    def test_history_skips_existing(self, tmp_path, monkeypatch, capsys):
+        """Does not overwrite history files that already exist at the destination."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        history_src = tmp_path / "src" / "workspace" / ".claude" / "history"
+        history_src.mkdir(parents=True)
+        (history_src / "2026-03-20.jsonl").write_text("source content")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        history_dst = data_path / "history"
+        history_dst.mkdir()
+        (history_dst / "2026-03-20.jsonl").write_text("existing content")
+
+        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        # Destination unchanged
+        assert (history_dst / "2026-03-20.jsonl").read_text() == "existing content"
+        output = capsys.readouterr().out
+        assert "already migrated" in output
+
 
 # ── Service lifecycle ────────────────────────────────────────────────
 

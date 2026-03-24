@@ -501,8 +501,8 @@ def _copy_tree(src: Path, dst: Path, excludes: set[str] | None = None) -> None:
     Uses a merge-based approach: walks the source tree and copies each file
     individually, creating destination directories as needed. Files at the
     destination that don't exist in the source are left untouched. This is
-    critical for workspace/.claude/ where runtime-created files (history,
-    MEMORY.md, skills) must survive installs.
+    critical for workspace/.claude/ where runtime-created content (skills,
+    Claude Code state files) must survive installs.
 
     The previous implementation used shutil.rmtree(dst) before copytree(),
     which destroyed ALL destination contents including runtime data that the
