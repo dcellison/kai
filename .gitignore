@@ -32,12 +32,12 @@ install.conf
 # Claude Code local config
 CLAUDE.md
 
-# Workspace runtime data (Kai's state, not source code)
-workspace/*
-!workspace/.claude
-workspace/.claude/*
-!workspace/.claude/CLAUDE.md
-!workspace/.claude/MEMORY.md.example
+# Home workspace runtime data (Kai's state, not source code)
+home/*
+!home/.claude
+home/.claude/*
+!home/.claude/CLAUDE.md
+!home/.claude/MEMORY.md.example
 
 # OS / IDE
 .DS_Store

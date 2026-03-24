@@ -56,7 +56,7 @@ _LAUNCHD_LABEL = "com.syrinx.kai"
 # Excludes __pycache__, .pyc, and other build artifacts.
 _SOURCE_EXCLUDES = {"__pycache__", "*.pyc", "*.egg-info", ".git", ".venv", ".env"}
 
-# Excludes for workspace/.claude/ copy. These are runtime-generated or
+# Excludes for home/.claude/ copy. These are runtime-generated or
 # personal data that should not be part of a clean install:
 #   history/    - conversation logs written by history.py at runtime
 #   MEMORY.md   - personal data (gitignored), user creates from .example
@@ -943,11 +943,11 @@ def _apply_migrate(data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -
                 _set_ownership(logs_dst, svc_uid, svc_gid, recursive=True)
 
     # -- History migration --
-    # One-time: copy JSONL conversation logs from the old workspace location
+    # One-time: copy JSONL conversation logs from the old home location
     # to DATA_DIR/history/. Safe on repeated runs: only copies files that
     # don't already exist at the destination. Source files are preserved
     # as backups (same pattern as the database and log migrations above).
-    history_src = PROJECT_ROOT / "workspace" / ".claude" / "history"
+    history_src = PROJECT_ROOT / "home" / ".claude" / "history"
     history_dst = data_path / "history"
 
     if history_src.is_dir():
@@ -969,11 +969,11 @@ def _apply_migrate(data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -
             print("  History already migrated or no files to copy")
 
     # -- MEMORY.md migration --
-    # One-time: copy personal memory from the old workspace location to
+    # One-time: copy personal memory from the old home location to
     # DATA_DIR/memory/. If the file doesn't exist at the old location
     # (common - it was never created on most installs), _bootstrap_memory()
     # in main.py handles creation from the example template at startup.
-    memory_src = PROJECT_ROOT / "workspace" / ".claude" / "MEMORY.md"
+    memory_src = PROJECT_ROOT / "home" / ".claude" / "MEMORY.md"
     memory_dst = data_path / "memory" / "MEMORY.md"
     if memory_src.is_file() and not memory_dst.exists():
         if dry_run:
@@ -1135,13 +1135,13 @@ def _apply_directories(
         dry_run: If True, print what would be created without doing it.
         workspace_base: Optional base directory for workspace name resolution.
     """
-    # The workspace dir under the install path must be writable by the service
+    # The home dir under the install path must be writable by the service
     # user so skills/ and other runtime dirs can be created inside it. The rest
     # of the install tree stays root-owned and read-only.
-    workspace_path = install_path / "workspace"
+    home_path = install_path / "home"
     dirs: list[tuple[Path, int, int, int]] = [
         (install_path, 0, 0, 0o755),  # root-owned install dir
-        (workspace_path, svc_uid, svc_gid, 0o755),  # user-writable workspace
+        (home_path, svc_uid, svc_gid, 0o755),  # user-writable home workspace
         (data_path, svc_uid, svc_gid, 0o755),  # user-owned data dir
         (data_path / "logs", svc_uid, svc_gid, 0o755),
         (data_path / "files", svc_uid, svc_gid, 0o755),
@@ -1169,13 +1169,26 @@ def _apply_directories(
 
 
 def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
-    """Copy source tree and workspace config from PROJECT_ROOT to the install location."""
+    """Copy source tree and home config from PROJECT_ROOT to the install location."""
     src_src = PROJECT_ROOT / "src"
     src_dst = install_path / "src"
     pyproject_src = PROJECT_ROOT / "pyproject.toml"
     pyproject_dst = install_path / "pyproject.toml"
-    ws_claude_src = PROJECT_ROOT / "workspace" / ".claude"
-    ws_claude_dst = install_path / "workspace" / ".claude"
+    ws_claude_src = PROJECT_ROOT / "home" / ".claude"
+    ws_claude_dst = install_path / "home" / ".claude"
+
+    # One-time: rename workspace/ to home/ at the install location.
+    # The directory was renamed in the source tree; this migrates the
+    # production install so runtime content (skills, files, notes) is
+    # preserved rather than orphaned.
+    old_ws = install_path / "workspace"
+    new_ws = install_path / "home"
+    if old_ws.is_dir() and not new_ws.exists():
+        if dry_run:
+            print(f"[DRY RUN] Would rename: {old_ws} -> {new_ws}")
+        else:
+            old_ws.rename(new_ws)
+            print(f"  Renamed {old_ws} -> {new_ws}")
 
     if dry_run:
         print(f"[DRY RUN] Would copy: {src_src} -> {src_dst}")
@@ -1192,18 +1205,18 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     os.chown(pyproject_dst, 0, 0)
     print(f"  Copied {pyproject_dst}")
 
-    # Copy workspace/.claude/ (bot identity, memory template) excluding
-    # runtime data. Without CLAUDE.md, the bot has no identity in the home
-    # workspace and nothing to inject into foreign workspace sessions.
+    # Copy home/.claude/ (bot identity, memory template) excluding
+    # runtime data. Without CLAUDE.md, the bot has no identity in the
+    # home workspace and nothing to inject into foreign workspace sessions.
     # Files inside are root-owned (read-only config), but the directory
-    # itself is service-user-owned so history.py can create history/ at
-    # runtime.
+    # itself is service-user-owned so skills/ and other runtime dirs can
+    # be created inside it.
     if ws_claude_src.is_dir():
         ws_claude_dst.parent.mkdir(parents=True, exist_ok=True)
         _copy_tree(ws_claude_src, ws_claude_dst, _WORKSPACE_CLAUDE_EXCLUDES)
         _set_ownership(ws_claude_dst, 0, 0, recursive=True)
         os.chown(ws_claude_dst, svc_uid, svc_gid)
-        print(f"  Copied workspace config to {ws_claude_dst}")
+        print(f"  Copied home config to {ws_claude_dst}")
 
 
 def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:

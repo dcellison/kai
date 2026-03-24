@@ -10,7 +10,7 @@
 #   4. Restart Kai
 #
 # Kai injects authentication from .env at call time — API keys never
-# enter Claude's context. See workspace/.claude/CLAUDE.md for usage docs.
+# enter Claude's context. See home/.claude/CLAUDE.md for usage docs.
 #
 # Auth types:
 #   bearer  — Authorization: Bearer $KEY

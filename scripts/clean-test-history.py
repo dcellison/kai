@@ -9,7 +9,7 @@ removes those entries.
 Usage:
     python scripts/clean-test-history.py [history_dir]
 
-If no directory is specified, defaults to workspace/.claude/history/
+If no directory is specified, defaults to history/
 relative to the script's location.
 
 Safe to run multiple times - idempotent.
@@ -78,9 +78,9 @@ def main() -> None:
     if len(sys.argv) > 1:
         history_dir = Path(sys.argv[1])
     else:
-        # Default: workspace/.claude/history/ relative to repo root
+        # Default: history/ relative to repo root
         script_dir = Path(__file__).resolve().parent
-        history_dir = script_dir.parent / "workspace" / ".claude" / "history"
+        history_dir = script_dir.parent / "history"
 
     print(f"Scanning: {history_dir}")
     clean_history_dir(history_dir)

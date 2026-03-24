@@ -507,9 +507,9 @@ class TestPRReviewConfig:
         config = load_config()
         assert config.spec_dir == "specs"
 
-        monkeypatch.setenv("SPEC_DIR", "workspace/specs")
+        monkeypatch.setenv("SPEC_DIR", "home/specs")
         config = load_config()
-        assert config.spec_dir == "workspace/specs"
+        assert config.spec_dir == "home/specs"
 
 
 # ── Issue triage config ─────────────────────────────────────────────

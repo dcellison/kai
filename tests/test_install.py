@@ -1034,9 +1034,9 @@ class TestApplyMigrate:
         assert not (data_path / "logs" / "kai.log").exists()
 
     def test_copies_history(self, tmp_path, monkeypatch):
-        """Copies JSONL history files from workspace/.claude/history/ to data_path/history/."""
+        """Copies JSONL history files from home/.claude/history/ to data_path/history/."""
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
-        history_src = tmp_path / "src" / "workspace" / ".claude" / "history"
+        history_src = tmp_path / "src" / "home" / ".claude" / "history"
         history_src.mkdir(parents=True)
         (history_src / "2026-03-20.jsonl").write_text('{"ts":"2026-03-20","text":"hello"}')
         (history_src / "2026-03-21.jsonl").write_text('{"ts":"2026-03-21","text":"world"}')
@@ -1059,7 +1059,7 @@ class TestApplyMigrate:
     def test_history_skips_existing(self, tmp_path, monkeypatch, capsys):
         """Does not overwrite history files that already exist at the destination."""
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
-        history_src = tmp_path / "src" / "workspace" / ".claude" / "history"
+        history_src = tmp_path / "src" / "home" / ".claude" / "history"
         history_src.mkdir(parents=True)
         (history_src / "2026-03-20.jsonl").write_text("source content")
 
@@ -1078,9 +1078,9 @@ class TestApplyMigrate:
         assert "already migrated" in output
 
     def test_copies_memory(self, tmp_path, monkeypatch, capsys):
-        """Copies MEMORY.md from workspace/.claude/ to data_path/memory/."""
+        """Copies MEMORY.md from home/.claude/ to data_path/memory/."""
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
-        claude_dir = tmp_path / "src" / "workspace" / ".claude"
+        claude_dir = tmp_path / "src" / "home" / ".claude"
         claude_dir.mkdir(parents=True)
         (claude_dir / "MEMORY.md").write_text("User prefers dry humor.")
 
@@ -1103,7 +1103,7 @@ class TestApplyMigrate:
     def test_memory_skips_existing(self, tmp_path, monkeypatch):
         """Does not overwrite MEMORY.md that already exists at the destination."""
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
-        claude_dir = tmp_path / "src" / "workspace" / ".claude"
+        claude_dir = tmp_path / "src" / "home" / ".claude"
         claude_dir.mkdir(parents=True)
         (claude_dir / "MEMORY.md").write_text("old content")
 
@@ -1416,8 +1416,8 @@ class TestGenerateLauncherScript:
 class TestApplySource:
     def test_dry_run(self, tmp_path, capsys):
         """Dry run: prints messages, doesn't copy."""
-        # Create workspace/.claude/ so the dry-run message appears
-        ws_claude = tmp_path / "workspace" / ".claude"
+        # Create home/.claude/ so the dry-run message appears
+        ws_claude = tmp_path / "home" / ".claude"
         ws_claude.mkdir(parents=True)
         (ws_claude / "CLAUDE.md").write_text("identity")
         with patch("kai.install.PROJECT_ROOT", tmp_path):
@@ -1425,25 +1425,25 @@ class TestApplySource:
         output = capsys.readouterr().out
         assert "DRY RUN" in output
         assert "Would copy" in output
-        # Dry run should NOT create workspace/.claude/ at the destination
-        assert not (tmp_path / "install" / "workspace" / ".claude").exists()
+        # Dry run should NOT create home/.claude/ at the destination
+        assert not (tmp_path / "install" / "home" / ".claude").exists()
 
-    def test_dry_run_no_workspace_claude(self, tmp_path, capsys):
-        """Dry run without workspace/.claude/: no workspace copy message."""
+    def test_dry_run_no_home_claude(self, tmp_path, capsys):
+        """Dry run without home/.claude/: no home config copy message."""
         with patch("kai.install.PROJECT_ROOT", tmp_path):
             _apply_source(tmp_path / "install", svc_uid=1000, svc_gid=1000, dry_run=True)
         output = capsys.readouterr().out
         assert "DRY RUN" in output
-        assert "workspace" not in output.lower() or "workspace config" not in output
+        assert "home config" not in output
 
     def test_actual(self, tmp_path):
-        """Actual: copies source, pyproject.toml, and workspace/.claude/."""
+        """Actual: copies source, pyproject.toml, and home/.claude/."""
         # Set up source structure
         src = tmp_path / "source"
         (src / "src").mkdir(parents=True)
         (src / "src" / "module.py").write_text("code")
         (src / "pyproject.toml").write_text("[project]")
-        ws_claude = src / "workspace" / ".claude"
+        ws_claude = src / "home" / ".claude"
         ws_claude.mkdir(parents=True)
         (ws_claude / "CLAUDE.md").write_text("identity")
         install = tmp_path / "install"
@@ -1457,21 +1457,21 @@ class TestApplySource:
             patch("os.chown") as mock_chown,
         ):
             _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
-        # Should call _copy_tree twice: once for src/, once for workspace/.claude/
+        # Should call _copy_tree twice: once for src/, once for home/.claude/
         assert mock_copy.call_count == 2
-        # Should call _set_ownership twice: once for src/, once for workspace/.claude/
+        # Should call _set_ownership twice: once for src/, once for home/.claude/
         assert mock_own.call_count == 2
         mock_cp.assert_called_once()
         # os.chown called twice: once for pyproject.toml (root), once for
         # the .claude/ directory itself (service user)
-        ws_claude_dst = install / "workspace" / ".claude"
+        ws_claude_dst = install / "home" / ".claude"
         chown_calls = mock_chown.call_args_list
         assert any(c.args == (ws_claude_dst, 1000, 1000) for c in chown_calls), (
             f"Expected os.chown({ws_claude_dst}, 1000, 1000) in {chown_calls}"
         )
 
-    def test_actual_no_workspace_claude(self, tmp_path):
-        """Actual without workspace/.claude/: copies source only, no error."""
+    def test_actual_no_home_claude(self, tmp_path):
+        """Actual without home/.claude/: copies source only, no error."""
         src = tmp_path / "source"
         (src / "src").mkdir(parents=True)
         (src / "src" / "module.py").write_text("code")
@@ -1487,20 +1487,20 @@ class TestApplySource:
             patch("os.chown"),
         ):
             _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
-        # Only one _copy_tree call (src/), no workspace/.claude/ copy
+        # Only one _copy_tree call (src/), no home/.claude/ copy
         mock_copy.assert_called_once()
         mock_own.assert_called_once()
         mock_cp.assert_called_once()
 
-    def test_workspace_claude_excludes(self, tmp_path):
-        """Workspace copy excludes history/, MEMORY.md, skills/, __pycache__."""
+    def test_home_claude_excludes(self, tmp_path):
+        """Home config copy excludes history/, MEMORY.md, skills/, __pycache__."""
         from kai.install import _WORKSPACE_CLAUDE_EXCLUDES
 
         src = tmp_path / "source"
         (src / "src").mkdir(parents=True)
         (src / "src" / "module.py").write_text("code")
         (src / "pyproject.toml").write_text("[project]")
-        ws_claude = src / "workspace" / ".claude"
+        ws_claude = src / "home" / ".claude"
         ws_claude.mkdir(parents=True)
         (ws_claude / "CLAUDE.md").write_text("identity")
         install = tmp_path / "install"
@@ -1515,7 +1515,7 @@ class TestApplySource:
         ):
             _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
 
-        # Second _copy_tree call is for workspace/.claude/
+        # Second _copy_tree call is for home/.claude/
         ws_call = mock_copy.call_args_list[1]
         assert ws_call[0][2] == _WORKSPACE_CLAUDE_EXCLUDES
 

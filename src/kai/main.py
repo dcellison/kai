@@ -101,7 +101,7 @@ def _bootstrap_memory() -> None:
         return
 
     memory_dir.mkdir(parents=True, exist_ok=True)
-    example = PROJECT_ROOT / "workspace" / ".claude" / "MEMORY.md.example"
+    example = PROJECT_ROOT / "home" / ".claude" / "MEMORY.md.example"
     if example.exists():
         shutil.copy2(example, memory_file)
         logging.info("Bootstrapped MEMORY.md from example template")

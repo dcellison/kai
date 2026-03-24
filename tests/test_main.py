@@ -91,7 +91,7 @@ class TestBootstrapMemory:
         """Creates MEMORY.md from example template when missing."""
         data_dir = tmp_path / "data"
         project_root = tmp_path / "project"
-        example_dir = project_root / "workspace" / ".claude"
+        example_dir = project_root / "home" / ".claude"
         example_dir.mkdir(parents=True)
         (example_dir / "MEMORY.md.example").write_text("# Memory\n\n## About the User\n")
 
@@ -108,7 +108,7 @@ class TestBootstrapMemory:
         """Creates a minimal MEMORY.md when no example template exists."""
         data_dir = tmp_path / "data"
         project_root = tmp_path / "project"
-        (project_root / "workspace" / ".claude").mkdir(parents=True)
+        (project_root / "home" / ".claude").mkdir(parents=True)
 
         monkeypatch.setattr("kai.main.DATA_DIR", data_dir)
         monkeypatch.setattr("kai.main.PROJECT_ROOT", project_root)

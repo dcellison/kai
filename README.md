@@ -75,8 +75,8 @@ When `users.yaml` is absent, Kai falls back to `ALLOWED_USER_IDS` for single-use
 Three layers of persistent context give the agent continuity across sessions:
 
 1. **Auto-memory** - managed by Claude Code per-workspace. Project architecture and patterns.
-2. **Home memory** (`workspace/.claude/MEMORY.md`) - personal memory, always injected regardless of current workspace. Proactively updated by Kai.
-3. **Conversation history** (`workspace/.claude/history/`) - JSONL logs, one file per day. Searchable for past conversations.
+2. **Home memory** (`memory/MEMORY.md`) - personal memory, always injected regardless of current workspace. Proactively updated by Kai.
+3. **Conversation history** (`history/`) - JSONL logs, one file per day. Searchable for past conversations.
 
 Foreign workspaces also get their own `.claude/MEMORY.md` injected alongside home memory. See [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture).
 
@@ -319,8 +319,8 @@ kai/
 │   ├── transcribe.py         # Voice message transcription (ffmpeg + whisper-cpp)
 │   └── tts.py                # Text-to-speech synthesis (Piper TTS + ffmpeg)
 ├── tests/                    # Test suite
-├── workspace/                # Claude Code working directory
-│   ├── .claude/              # Identity, memory, and chat history
+├── home/                     # Claude Code home workspace
+│   ├── .claude/              # Identity and memory template
 │   └── files/                # File exchange directory (created at runtime)
 ├── kai.db                    # SQLite database (gitignored, created at runtime)
 ├── logs/                     # Daily-rotated log files (gitignored)

@@ -104,7 +104,7 @@ class PersistentClaude:
         self,
         *,
         model: str = "sonnet",
-        workspace: Path = Path("workspace"),
+        workspace: Path = Path("home"),
         home_workspace: Path | None = None,
         webhook_port: int = 8080,
         webhook_secret: str = "",

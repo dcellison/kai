@@ -170,7 +170,7 @@ class Config:
     claude_max_budget_usd: float = 10.0
     claude_max_session_hours: float = 0  # 0 = no limit
     claude_idle_timeout: int = 1800  # seconds before idle subprocess eviction; 0 = no eviction
-    claude_workspace: Path = field(default_factory=lambda: PROJECT_ROOT / "workspace")
+    claude_workspace: Path = field(default_factory=lambda: PROJECT_ROOT / "home")
 
     # Database - uses DATA_DIR so the db lands in the writable data directory
     session_db_path: Path = field(default_factory=lambda: DATA_DIR / "kai.db")
