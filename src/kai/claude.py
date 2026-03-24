@@ -404,6 +404,10 @@ class PersistentClaude:
                 memory = memory_path.read_text().strip()
                 if memory:
                     parts.append(f"[Your persistent memory (file: {memory_path}):]\n{memory}")
+                else:
+                    parts.append(f"[Your persistent memory file is at {memory_path} (currently empty).]")
+            else:
+                parts.append(f"[Your persistent memory file is at {memory_path} (not yet created).]")
 
             # Per-workspace system prompt from workspaces.yaml. Injected
             # between the identity/memory block and conversation history,
