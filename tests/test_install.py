@@ -1166,6 +1166,29 @@ class TestApplyMigrate:
 
         assert (files_dst / "photo.jpg").read_bytes() == b"existing"
 
+    def test_uploaded_files_dry_run(self, tmp_path, monkeypatch, capsys):
+        """Dry run prints file migration actions without copying."""
+        install_path = tmp_path / "install"
+        files_src = install_path / "home" / "files"
+        files_src.mkdir(parents=True)
+        (files_src / "photo.jpg").write_bytes(b"image data")
+
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "files").mkdir()
+
+        _apply_migrate(data_path, install_path, svc_uid=501, svc_gid=20, dry_run=True)
+
+        output = capsys.readouterr().out
+        assert "[DRY RUN] Would copy file:" in output
+        assert "Would migrate 1 uploaded file(s)" in output
+        # Nothing should have been copied
+        assert not (data_path / "files" / "photo.jpg").exists()
+
 
 # ── Service lifecycle ────────────────────────────────────────────────
 

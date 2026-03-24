@@ -1015,12 +1015,16 @@ def _apply_migrate(data_path: Path, install_path: Path, svc_uid: int, svc_gid: i
                     shutil.copy2(src_file, dst_file)
                 copied += 1
         if copied and not dry_run:
-            # Recursively set ownership on the entire files tree
+            # Set ownership on the entire files tree, not just newly copied
+            # files. This ensures uniform ownership after a partial migration
+            # (e.g., some files copied on a previous run, new ones added now).
             for root, _subdirs, fnames in os.walk(files_dst):
                 os.chown(root, svc_uid, svc_gid)
                 for fname in fnames:
                     os.chown(os.path.join(root, fname), svc_uid, svc_gid)
             print(f"  Migrated {copied} uploaded file(s) to {files_dst}")
+        elif copied and dry_run:
+            print(f"[DRY RUN] Would migrate {copied} uploaded file(s) to {files_dst}")
         elif not copied and not dry_run:
             print("  Uploaded files already migrated or no files to copy")
 
