@@ -412,13 +412,21 @@ class PersistentClaude:
             if ws_prompt:
                 parts.append(f"## Workspace Instructions\n\n{ws_prompt}")
 
+            # Always inject the history directory path so the inner Claude
+            # can grep past conversations regardless of whether there are
+            # recent messages to show.
+            history_dir = str(DATA_DIR / "history")
+
             # Inject recent conversation history for continuity.
             # Filter by chat_id so each user's session only sees their
             # own messages (Phase 2 per-user data isolation).
             recent = get_recent_history(chat_id=chat_id)
             if recent:
-                history_dir = str(DATA_DIR / "history")
                 parts.append(f"[Recent conversations (search {history_dir}/ for full logs):]\n{recent}")
+            else:
+                parts.append(
+                    f"[Chat history is stored in {history_dir}/ as daily JSONL files. Search with grep or jq when asked about past conversations.]"
+                )
 
             # Inject scheduling API info (always, so cron works from any workspace).
             # The secret is passed via $KAI_WEBHOOK_SECRET env var (not embedded
