@@ -926,13 +926,20 @@ class TestContextInjection:
         monkeypatch.setattr(PersistentClaude, "_kill", AsyncMock())
 
     @pytest.fixture()
-    def home_workspace(self, tmp_path):
-        """Create a home workspace with identity and memory files."""
+    def home_workspace(self, tmp_path, monkeypatch):
+        """Create a home workspace with identity file and DATA_DIR memory."""
         home = tmp_path / "home"
         claude_dir = home / ".claude"
         claude_dir.mkdir(parents=True)
         (claude_dir / "CLAUDE.md").write_text("You are Kai.")
-        (claude_dir / "MEMORY.md").write_text("User likes concise responses.")
+
+        # Personal memory now lives under DATA_DIR, not the workspace
+        data_dir = tmp_path / "data"
+        memory_dir = data_dir / "memory"
+        memory_dir.mkdir(parents=True)
+        (memory_dir / "MEMORY.md").write_text("User likes concise responses.")
+        monkeypatch.setattr("kai.claude.DATA_DIR", data_dir)
+
         return home
 
     @pytest.fixture()
@@ -1112,12 +1119,18 @@ class TestMultiModalPrompt:
         monkeypatch.setattr(PersistentClaude, "_kill", AsyncMock())
 
     @pytest.mark.asyncio
-    async def test_list_prompt_with_context_injection(self, tmp_path):
+    async def test_list_prompt_with_context_injection(self, tmp_path, monkeypatch):
         """List prompts get context prepended as text blocks, content sent as-is."""
         home = tmp_path / "home"
         claude_dir = home / ".claude"
         claude_dir.mkdir(parents=True)
-        (claude_dir / "MEMORY.md").write_text("Some memory")
+
+        # Personal memory lives under DATA_DIR, not the workspace
+        data_dir = tmp_path / "data"
+        memory_dir = data_dir / "memory"
+        memory_dir.mkdir(parents=True)
+        (memory_dir / "MEMORY.md").write_text("Some memory")
+        monkeypatch.setattr("kai.claude.DATA_DIR", data_dir)
 
         proc = _make_mock_proc([_system_event(), _result_event(), b""])
         claude = _make_claude(

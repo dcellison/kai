@@ -34,6 +34,7 @@ The shutdown sequence (in the finally block) reverses this order:
 
 import asyncio
 import logging
+import shutil
 from logging.handlers import TimedRotatingFileHandler
 
 from telegram import BotCommand
@@ -84,6 +85,30 @@ def setup_logging() -> None:
     # Silence noisy per-request HTTP logs and APScheduler tick logs
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+
+
+def _bootstrap_memory() -> None:
+    """
+    Create MEMORY.md from the example template if it doesn't exist yet.
+
+    Called once at startup. Creates the DATA_DIR/memory/ directory and
+    copies MEMORY.md.example from the home workspace as a starting point.
+    After this one-time setup, the inner Claude maintains the file.
+    """
+    memory_dir = DATA_DIR / "memory"
+    memory_file = memory_dir / "MEMORY.md"
+    if memory_file.exists():
+        return
+
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    example = PROJECT_ROOT / "workspace" / ".claude" / "MEMORY.md.example"
+    if example.exists():
+        shutil.copy2(example, memory_file)
+        logging.info("Bootstrapped MEMORY.md from example template")
+    else:
+        # Create a minimal file so the inner Claude has something to write to
+        memory_file.write_text("# Memory\n")
+        logging.info("Created empty MEMORY.md (no example template found)")
 
 
 def main() -> None:
@@ -154,6 +179,9 @@ def main() -> None:
         # Phase 3: per-user workspace restoration is deferred to the
         # SubprocessPool. Each user's workspace is restored lazily on
         # their first message (in pool.send()). No startup restore needed.
+
+        # Bootstrap personal memory if it doesn't exist yet
+        _bootstrap_memory()
 
         try:
             # Retry initialization if the network isn't ready yet (e.g. after a

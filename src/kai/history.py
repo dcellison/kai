@@ -6,7 +6,7 @@ Provides functionality to:
 2. Retrieve recent messages for injection into new Claude sessions
 3. Serve as the "episodic memory" layer of Kai's three-layer memory system
 
-Log files are stored in workspace/.claude/history/ as date-stamped JSONL files
+Log files are stored in DATA_DIR/history/ as date-stamped JSONL files
 (e.g., 2026-02-11.jsonl). Each line is a JSON object with fields:
     ts       — ISO 8601 timestamp
     dir      — "user" or "assistant"
@@ -23,14 +23,15 @@ import json
 import logging
 from datetime import UTC, datetime
 
-from kai.config import PROJECT_ROOT
+from kai.config import DATA_DIR
 
 log = logging.getLogger(__name__)
 
-# History files live inside the home workspace so the inner Claude can access them.
-# Intentionally NOT updated when workspace switches - all conversation history
-# stays in the canonical home workspace location regardless of active workspace.
-_LOG_DIR = PROJECT_ROOT / "workspace" / ".claude" / "history"
+# History files live under DATA_DIR (alongside the database and logs) so they
+# survive installs. In production this is /var/lib/kai/history/, in dev it's
+# PROJECT_ROOT/history/. Intentionally NOT updated when workspace switches -
+# all conversation history stays in one canonical location.
+_LOG_DIR = DATA_DIR / "history"
 
 # Limits for the recent-history summary injected at session start
 _MAX_RECENT_MESSAGES = 20

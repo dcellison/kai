@@ -163,3 +163,22 @@ class TestGetRecentHistory:
         assert "old2" in result
         # old1 should be excluded (it's the 4th oldest, beyond the cap)
         assert "old1" not in result
+
+
+def test_log_dir_uses_data_dir():
+    """Verify _LOG_DIR derives from DATA_DIR, not PROJECT_ROOT."""
+    # Import the module to check its source-level default, not the
+    # patched value from the autouse _log_dir fixture. The fixture
+    # patches the instance attribute, but we can re-derive the expected
+    # value from the config to verify the import is correct.
+    # Temporarily read the unpatched default by reimporting
+    import importlib
+
+    # The module-level _LOG_DIR is patched by the autouse fixture above,
+    # so instead verify that the source code uses DATA_DIR by checking
+    # the expected path matches what DATA_DIR / "history" would produce.
+    import kai.history as hist_mod
+    from kai.config import DATA_DIR
+
+    importlib.reload(hist_mod)
+    assert hist_mod._LOG_DIR == DATA_DIR / "history"

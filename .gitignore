@@ -23,6 +23,8 @@ build/
 # Runtime artifacts
 kai.db
 logs/
+history/
+memory/
 .responding_to
 models/
 install.conf

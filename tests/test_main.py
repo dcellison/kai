@@ -1,9 +1,9 @@
 """
-Tests for main.py - setup_logging() configuration.
+Tests for main.py - setup_logging() and _bootstrap_memory().
 
 The main() and _init_and_run() functions orchestrate the full application
-lifecycle and are impractical to unit test. setup_logging() is testable
-in isolation since it just configures the root logger.
+lifecycle and are impractical to unit test. setup_logging() and
+_bootstrap_memory() are testable in isolation.
 """
 
 import logging
@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from kai.main import setup_logging
+from kai.main import _bootstrap_memory, setup_logging
 
 # ── setup_logging() ──────────────────────────────────────────────────
 
@@ -81,3 +81,55 @@ class TestSetupLogging:
         with patch("kai.main.DATA_DIR", tmp_path):
             setup_logging()
         assert logging.getLogger("apscheduler.executors.default").level == logging.WARNING
+
+
+# ── _bootstrap_memory() ──────────────────────────────────────────────
+
+
+class TestBootstrapMemory:
+    def test_from_example_template(self, tmp_path, monkeypatch):
+        """Creates MEMORY.md from example template when missing."""
+        data_dir = tmp_path / "data"
+        project_root = tmp_path / "project"
+        example_dir = project_root / "workspace" / ".claude"
+        example_dir.mkdir(parents=True)
+        (example_dir / "MEMORY.md.example").write_text("# Memory\n\n## About the User\n")
+
+        monkeypatch.setattr("kai.main.DATA_DIR", data_dir)
+        monkeypatch.setattr("kai.main.PROJECT_ROOT", project_root)
+
+        _bootstrap_memory()
+
+        memory_file = data_dir / "memory" / "MEMORY.md"
+        assert memory_file.exists()
+        assert "About the User" in memory_file.read_text()
+
+    def test_no_example_creates_minimal(self, tmp_path, monkeypatch):
+        """Creates a minimal MEMORY.md when no example template exists."""
+        data_dir = tmp_path / "data"
+        project_root = tmp_path / "project"
+        (project_root / "workspace" / ".claude").mkdir(parents=True)
+
+        monkeypatch.setattr("kai.main.DATA_DIR", data_dir)
+        monkeypatch.setattr("kai.main.PROJECT_ROOT", project_root)
+
+        _bootstrap_memory()
+
+        memory_file = data_dir / "memory" / "MEMORY.md"
+        assert memory_file.exists()
+        assert memory_file.read_text() == "# Memory\n"
+
+    def test_skips_existing(self, tmp_path, monkeypatch):
+        """Does not overwrite an existing MEMORY.md."""
+        data_dir = tmp_path / "data"
+        memory_dir = data_dir / "memory"
+        memory_dir.mkdir(parents=True)
+        memory_file = memory_dir / "MEMORY.md"
+        memory_file.write_text("User prefers dry humor.")
+
+        monkeypatch.setattr("kai.main.DATA_DIR", data_dir)
+        monkeypatch.setattr("kai.main.PROJECT_ROOT", tmp_path / "project")
+
+        _bootstrap_memory()
+
+        assert memory_file.read_text() == "User prefers dry humor."

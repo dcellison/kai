@@ -35,7 +35,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from kai.config import WorkspaceConfig, parse_env_file
+from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file
 from kai.history import get_recent_history
 
 log = logging.getLogger(__name__)
@@ -395,17 +395,15 @@ class PersistentClaude:
                     if identity:
                         parts.append(f"[Your core identity and instructions:]\n{identity}")
 
-            # Always inject Kai's personal memory from home workspace
-            memory_path = self.home_workspace / ".claude" / "MEMORY.md"
+            # Always inject Kai's personal memory from DATA_DIR. This file
+            # lives outside the install tree (/var/lib/kai/memory/ in production)
+            # so it survives make install. Available regardless of which
+            # workspace the inner Claude is operating in.
+            memory_path = DATA_DIR / "memory" / "MEMORY.md"
             if memory_path.exists():
                 memory = memory_path.read_text().strip()
                 if memory:
-                    parts.append(f"[Your persistent memory from home workspace:]\n{memory}")
-
-            # NOTE: Foreign workspace memory (.claude/MEMORY.md) is NOT injected
-            # here. Claude Code reads it natively from its cwd (built-in auto-memory).
-            # Bot-side reads are redundant and can cause PermissionError on Linux
-            # when the workspace is owned by a different user (CLAUDE_USER).
+                    parts.append(f"[Your persistent memory:]\n{memory}")
 
             # Per-workspace system prompt from workspaces.yaml. Injected
             # between the identity/memory block and conversation history,
@@ -419,7 +417,8 @@ class PersistentClaude:
             # own messages (Phase 2 per-user data isolation).
             recent = get_recent_history(chat_id=chat_id)
             if recent:
-                parts.append(f"[Recent conversations (search .claude/history/ for full logs):]\n{recent}")
+                history_dir = str(DATA_DIR / "history")
+                parts.append(f"[Recent conversations (search {history_dir}/ for full logs):]\n{recent}")
 
             # Inject scheduling API info (always, so cron works from any workspace).
             # The secret is passed via $KAI_WEBHOOK_SECRET env var (not embedded
