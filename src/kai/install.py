@@ -62,8 +62,9 @@ _SOURCE_EXCLUDES = {"__pycache__", "*.pyc", "*.egg-info", ".git", ".venv", ".env
 #   MEMORY.md   - personal data (gitignored), user creates from .example
 #   skills/     - downloaded skills, environment-specific
 # History and MEMORY.md now live in DATA_DIR, outside the install tree.
-# Only exclude skills (environment-specific) and __pycache__ (build artifact).
-_WORKSPACE_CLAUDE_EXCLUDES = {"skills", "__pycache__"}
+# "history" is still excluded because stale files may remain at the source
+# after migration (source files are preserved as backups, not deleted).
+_WORKSPACE_CLAUDE_EXCLUDES = {"history", "skills", "__pycache__"}
 
 
 # ── Input helpers ────────────────────────────────────────────────────
@@ -942,29 +943,30 @@ def _apply_migrate(data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -
                 _set_ownership(logs_dst, svc_uid, svc_gid, recursive=True)
 
     # -- History migration --
-    # One-time: move JSONL conversation logs from the old workspace location
-    # to DATA_DIR/history/. Safe on repeated runs: only moves files that
-    # don't already exist at the destination.
+    # One-time: copy JSONL conversation logs from the old workspace location
+    # to DATA_DIR/history/. Safe on repeated runs: only copies files that
+    # don't already exist at the destination. Source files are preserved
+    # as backups (same pattern as the database and log migrations above).
     history_src = PROJECT_ROOT / "workspace" / ".claude" / "history"
     history_dst = data_path / "history"
 
     if history_src.is_dir():
-        moved = 0
+        copied = 0
         for f in sorted(history_src.glob("*.jsonl")):
             dest = history_dst / f.name
             if dest.exists():
                 continue
             if dry_run:
-                print(f"[DRY RUN] Would move history: {f} -> {dest}")
+                print(f"[DRY RUN] Would copy history: {f} -> {dest}")
             else:
                 history_dst.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(f, dest)
                 os.chown(dest, svc_uid, svc_gid)
-                moved += 1
-        if moved and not dry_run:
-            print(f"  Migrated {moved} history file(s) to {history_dst}")
-        elif not moved:
-            print("  History already migrated or no files to move")
+                copied += 1
+        if copied and not dry_run:
+            print(f"  Migrated {copied} history file(s) to {history_dst}")
+        elif not copied and not dry_run:
+            print("  History already migrated or no files to copy")
 
 
 def _cmd_apply() -> None:

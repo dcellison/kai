@@ -180,8 +180,13 @@ def main() -> None:
         # SubprocessPool. Each user's workspace is restored lazily on
         # their first message (in pool.send()). No startup restore needed.
 
-        # Bootstrap personal memory if it doesn't exist yet
-        _bootstrap_memory()
+        # Bootstrap personal memory if it doesn't exist yet.
+        # Non-fatal: a permission or disk error here should not prevent
+        # the bot from starting. The memory layer is a nice-to-have.
+        try:
+            _bootstrap_memory()
+        except OSError:
+            logging.warning("Could not bootstrap MEMORY.md", exc_info=True)
 
         try:
             # Retry initialization if the network isn't ready yet (e.g. after a
