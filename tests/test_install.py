@@ -1077,6 +1077,47 @@ class TestApplyMigrate:
         output = capsys.readouterr().out
         assert "already migrated" in output
 
+    def test_copies_memory(self, tmp_path, monkeypatch, capsys):
+        """Copies MEMORY.md from workspace/.claude/ to data_path/memory/."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        claude_dir = tmp_path / "src" / "workspace" / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "MEMORY.md").write_text("User prefers dry humor.")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "memory").mkdir()
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        memory_dst = data_path / "memory" / "MEMORY.md"
+        assert memory_dst.exists()
+        assert memory_dst.read_text() == "User prefers dry humor."
+        # Source preserved
+        assert (claude_dir / "MEMORY.md").exists()
+        assert "Migrated MEMORY.md" in capsys.readouterr().out
+
+    def test_memory_skips_existing(self, tmp_path, monkeypatch):
+        """Does not overwrite MEMORY.md that already exists at the destination."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        claude_dir = tmp_path / "src" / "workspace" / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "MEMORY.md").write_text("old content")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        memory_dir = data_path / "memory"
+        memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("existing personalized content")
+
+        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        assert (memory_dir / "MEMORY.md").read_text() == "existing personalized content"
+
 
 # ── Service lifecycle ────────────────────────────────────────────────
 
