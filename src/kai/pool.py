@@ -301,6 +301,7 @@ class SubprocessPool:
                 if chat_id in self._in_flight:
                     continue
                 if chat_id not in self._pool:
+                    self._last_activity.pop(chat_id, None)
                     continue
                 instance = self._pool.pop(chat_id, None)
                 self._last_activity.pop(chat_id, None)

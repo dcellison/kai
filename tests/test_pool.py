@@ -339,67 +339,120 @@ class TestEvictionTOCTOU:
         # This is the guard: if _last_activity > now, skip eviction
         assert 111 in pool._pool  # user survives
 
-    def test_toctou_guard_skips_in_flight(self):
+    @pytest.mark.asyncio
+    async def test_toctou_guard_skips_in_flight(self):
         """TOCTOU guard skips user who entered send() between snapshot and eviction."""
         config = _make_config(claude_idle_timeout=1)
         pool = SubprocessPool(config=config, services_info=[])
-        pool.get(111)
 
-        # Step 1: build candidate list when user was idle
-        sweep_now = time.monotonic()
-        pool._last_activity[111] = sweep_now - 10
+        # Two idle users: A's shutdown is the yield point, B gets the TOCTOU change
+        a = pool.get(111)
+        pool.get(222)
+        pool._last_activity[111] = time.monotonic() - 10
+        pool._last_activity[222] = time.monotonic() - 10
 
-        to_evict = [
-            cid
-            for cid, last in pool._last_activity.items()
-            if sweep_now - last > config.claude_idle_timeout and cid in pool._pool and cid not in pool._in_flight
-        ]
-        assert 111 in to_evict
+        async def a_shutdown_adds_b_in_flight():
+            # Simulate user 222 entering send() during A's shutdown
+            pool._in_flight.add(222)
 
-        # Step 2: user enters send() after snapshot (TOCTOU window)
-        pool._in_flight.add(111)
+        sleep_count = 0
 
-        # Step 3: the in-flight re-check should skip them
-        assert 111 in pool._in_flight
-        assert 111 in pool._pool  # user survives
+        async def mock_sleep(_duration):
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
 
-    def test_toctou_guard_skips_removed_from_pool(self):
+        # Set _proc so is_alive returns True (it checks _proc.returncode)
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        a._proc = mock_proc
+
+        with (
+            patch.object(a, "shutdown", side_effect=a_shutdown_adds_b_in_flight),
+            patch("kai.pool.asyncio.sleep", side_effect=mock_sleep),
+        ):
+            try:
+                await pool._eviction_loop()
+            except asyncio.CancelledError:
+                pass
+
+        # A was evicted (first in the loop, before the TOCTOU change)
+        assert 111 not in pool._pool
+        # B survived (in-flight re-check caught the change)
+        assert 222 in pool._pool
+
+    @pytest.mark.asyncio
+    async def test_toctou_guard_skips_removed_from_pool(self):
         """TOCTOU guard skips user removed from pool between snapshot and eviction."""
         config = _make_config(claude_idle_timeout=1)
         pool = SubprocessPool(config=config, services_info=[])
-        pool.get(111)
 
-        # Step 1: build candidate list when user was in pool
-        sweep_now = time.monotonic()
-        pool._last_activity[111] = sweep_now - 10
+        a = pool.get(111)
+        pool.get(222)
+        pool._last_activity[111] = time.monotonic() - 10
+        pool._last_activity[222] = time.monotonic() - 10
 
-        to_evict = [
-            cid
-            for cid, last in pool._last_activity.items()
-            if sweep_now - last > config.claude_idle_timeout and cid in pool._pool and cid not in pool._in_flight
-        ]
-        assert 111 in to_evict
+        async def a_shutdown_removes_b():
+            # Simulate force_kill removing user 222 during A's shutdown
+            pool._pool.pop(222, None)
 
-        # Step 2: force_kill removes user from pool (TOCTOU window)
-        pool._pool.pop(111, None)
+        sleep_count = 0
 
-        # Step 3: the pool-membership re-check should skip them
+        async def mock_sleep(_duration):
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        a._proc = mock_proc
+
+        with (
+            patch.object(a, "shutdown", side_effect=a_shutdown_removes_b),
+            patch("kai.pool.asyncio.sleep", side_effect=mock_sleep),
+        ):
+            try:
+                await pool._eviction_loop()
+            except asyncio.CancelledError:
+                pass
+
+        # A was evicted
         assert 111 not in pool._pool
+        # B's _last_activity was cleaned up by the pool-membership guard
+        assert 222 not in pool._last_activity
 
-    def test_eviction_proceeds_when_all_checks_pass(self):
+    @pytest.mark.asyncio
+    async def test_eviction_proceeds_when_all_checks_pass(self):
         """User passing all three re-checks is evicted normally."""
         config = _make_config(claude_idle_timeout=1)
         pool = SubprocessPool(config=config, services_info=[])
-        pool.get(111)
 
-        sweep_now = time.monotonic()
-        pool._last_activity[111] = sweep_now - 10
+        instance = pool.get(111)
+        pool._last_activity[111] = time.monotonic() - 10
 
-        # All three conditions hold: old timestamp, not in-flight, in pool
-        assert pool._last_activity.get(111, 0) <= sweep_now
-        assert 111 not in pool._in_flight
-        assert 111 in pool._pool
+        sleep_count = 0
 
-        # Pop should succeed (simulating what the eviction loop does)
-        instance = pool._pool.pop(111, None)
-        assert instance is not None
+        async def mock_sleep(_duration):
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        instance._proc = mock_proc
+
+        with (
+            patch.object(instance, "shutdown", new_callable=AsyncMock),
+            patch("kai.pool.asyncio.sleep", side_effect=mock_sleep),
+        ):
+            try:
+                await pool._eviction_loop()
+            except asyncio.CancelledError:
+                pass
+
+        # User was evicted: removed from pool and last_activity
+        assert 111 not in pool._pool
+        assert 111 not in pool._last_activity
