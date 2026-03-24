@@ -208,8 +208,8 @@ class SubprocessPool:
 
         Uses shutdown() with a short timeout for clean process reaping
         and stderr task cancellation. Falls back to raw SIGKILL on any
-        failure (timeout, cancellation, or other exception), so this
-        never blocks callers for long and never propagates exceptions.
+        non-cancellation failure (timeout, OSError, etc.). Cleanup
+        (pool removal) runs unconditionally via finally.
 
         The instance is kept in the pool during shutdown so it remains
         tracked. It is only removed after the subprocess is confirmed
