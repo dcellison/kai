@@ -320,21 +320,23 @@ class SubprocessPool:
                 if chat_id in self._in_flight:
                     continue
                 instance = self._pool.get(chat_id)
-                if instance and instance.is_alive:
-                    try:
-                        log.info("Evicting idle subprocess for user %d", chat_id)
-                        await instance.shutdown()
-                    except Exception:
-                        # Graceful shutdown failed. Fall back to raw SIGKILL
-                        # so the process doesn't become an orphan. force_kill()
-                        # is effectively infallible (catches its own OSError).
-                        log.exception("Error evicting subprocess for user %d, sending SIGKILL", chat_id)
-                        instance.force_kill()
-                # Remove from tracking after shutdown (alive instances) or
-                # unconditionally (dead instances). Without this, a dead
-                # instance would stay in the pool indefinitely.
-                self._pool.pop(chat_id, None)
-                self._last_activity.pop(chat_id, None)
+                try:
+                    if instance and instance.is_alive:
+                        try:
+                            log.info("Evicting idle subprocess for user %d", chat_id)
+                            await instance.shutdown()
+                        except Exception:
+                            # Graceful shutdown failed. Fall back to raw SIGKILL
+                            # so the process doesn't become an orphan. force_kill()
+                            # is effectively infallible (catches its own OSError).
+                            log.exception("Error evicting subprocess for user %d, sending SIGKILL", chat_id)
+                            instance.force_kill()
+                finally:
+                    # Remove from tracking after shutdown (alive instances) or
+                    # unconditionally (dead instances). The finally block ensures
+                    # cleanup even if CancelledError propagates from shutdown().
+                    self._pool.pop(chat_id, None)
+                    self._last_activity.pop(chat_id, None)
 
     async def shutdown(self) -> None:
         """Shut down all subprocesses and stop the eviction task."""
