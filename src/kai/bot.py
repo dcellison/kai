@@ -1198,9 +1198,9 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
 # ── Media message handlers ──────────────────────────────────────────
 
 
-def _save_to_workspace(data: bytes, filename: str, workspace: Path, user_id: int | None = None) -> Path:
+def _save_upload(data: bytes, filename: str, user_id: int | None = None) -> Path:
     """
-    Save file bytes to the workspace/files/ directory with a timestamped name.
+    Save file bytes to DATA_DIR/files/ with a timestamped name.
 
     Creates the files/ directory if it doesn't exist. Filenames are prefixed
     with a timestamp to avoid collisions and sanitized to remove slashes and
@@ -1208,23 +1208,22 @@ def _save_to_workspace(data: bytes, filename: str, workspace: Path, user_id: int
     reference it in subsequent commands.
 
     When user_id is provided, files are saved to a per-user subdirectory
-    (workspace/files/{user_id}/) to prevent cross-user file access.
-    When None, uses the shared workspace/files/ directory (backward-
+    (DATA_DIR/files/{user_id}/) to prevent cross-user file access.
+    When None, uses the shared DATA_DIR/files/ directory (backward-
     compatible for single-user deployments).
 
     Args:
         data: Raw file bytes to write.
         filename: Original filename from Telegram (sanitized before use).
-        workspace: The current workspace root directory.
         user_id: Optional Telegram user ID for per-user file isolation.
 
     Returns:
         Absolute path to the saved file.
     """
     if user_id is not None:
-        files_dir = workspace / "files" / str(user_id)
+        files_dir = DATA_DIR / "files" / str(user_id)
     else:
-        files_dir = workspace / "files"
+        files_dir = DATA_DIR / "files"
     files_dir.mkdir(parents=True, exist_ok=True)
 
     # Timestamp prefix ensures unique names even if the same file is sent twice
@@ -1267,7 +1266,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     b64 = base64.b64encode(raw).decode()
 
     # Save to workspace so Claude can access the file via shell tools
-    saved = _save_to_workspace(raw, f"photo_{photo.file_unique_id}.jpg", pool.get_workspace(chat_id), user_id=chat_id)
+    saved = _save_upload(raw, f"photo_{photo.file_unique_id}.jpg", user_id=chat_id)
 
     caption = update.message.caption or "What's in this image?"
     caption += f"\n[File saved to: {saved}]"
@@ -1396,7 +1395,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         media_type = _IMAGE_MEDIA_TYPES[suffix]
 
         # Save to workspace so Claude can access the file via shell tools
-        saved = _save_to_workspace(raw, file_name, pool.get_workspace(chat_id), user_id=chat_id)
+        saved = _save_upload(raw, file_name, user_id=chat_id)
         img_caption = caption or f"What's in this image ({file_name})?"
         img_caption += f"\n[File saved to: {saved}]"
 
@@ -1422,7 +1421,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         # Save to workspace so Claude can access the file via shell tools
-        saved = _save_to_workspace(raw, file_name, pool.get_workspace(chat_id), user_id=chat_id)
+        saved = _save_upload(raw, file_name, user_id=chat_id)
         header = f"File: {file_name}\n```\n{text_content}\n```\n[File saved to: {saved}]"
 
         log_message(
@@ -1440,7 +1439,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # can work with the file via shell tools (e.g., unzip, pdftotext, etc.)
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
-        saved = _save_to_workspace(bytes(data), file_name, pool.get_workspace(chat_id), user_id=chat_id)
+        saved = _save_upload(bytes(data), file_name, user_id=chat_id)
 
         log_message(
             direction="user",

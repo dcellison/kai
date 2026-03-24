@@ -915,7 +915,7 @@ class TestApplyMigrate:
         )
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         assert (data_path / "kai.db").exists()
         assert (data_path / "kai.db").read_text() == "fake-db-content"
@@ -941,7 +941,7 @@ class TestApplyMigrate:
         monkeypatch.setattr("kai.install.subprocess.run", mock_run)
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         # Find the sqlite3 call
         sqlite_calls = [c for c in calls if "sqlite3" in c[0]]
@@ -959,7 +959,7 @@ class TestApplyMigrate:
         (data_path / "logs").mkdir()
         (data_path / "kai.db").write_text("existing-content")
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         # Destination should be unchanged
         assert (data_path / "kai.db").read_text() == "existing-content"
@@ -982,7 +982,7 @@ class TestApplyMigrate:
         # Mock os.chown for ownership setting
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         assert (logs_dst / "kai.log").read_text() == "log1"
         assert (logs_dst / "kai.log.1").read_text() == "log2"
@@ -1006,7 +1006,7 @@ class TestApplyMigrate:
         )
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         # Source files must still exist
         assert (tmp_path / "src" / "kai.db").exists()
@@ -1025,7 +1025,7 @@ class TestApplyMigrate:
         data_path.mkdir()
         (data_path / "logs").mkdir()
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=True)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=True)
 
         output = capsys.readouterr().out
         assert "[DRY RUN]" in output
@@ -1049,7 +1049,7 @@ class TestApplyMigrate:
 
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         assert (history_dst / "2026-03-20.jsonl").exists()
         assert (history_dst / "2026-03-21.jsonl").exists()
@@ -1070,7 +1070,7 @@ class TestApplyMigrate:
         history_dst.mkdir()
         (history_dst / "2026-03-20.jsonl").write_text("existing content")
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         # Destination unchanged
         assert (history_dst / "2026-03-20.jsonl").read_text() == "existing content"
@@ -1091,7 +1091,7 @@ class TestApplyMigrate:
 
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         memory_dst = data_path / "memory" / "MEMORY.md"
         assert memory_dst.exists()
@@ -1114,7 +1114,7 @@ class TestApplyMigrate:
         memory_dir.mkdir()
         (memory_dir / "MEMORY.md").write_text("existing personalized content")
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         assert (memory_dir / "MEMORY.md").read_text() == "existing personalized content"
 

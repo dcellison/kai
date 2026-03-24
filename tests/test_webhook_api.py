@@ -1922,27 +1922,30 @@ class TestUpdateJobAuth:
 
 
 class TestFilenameSanitization:
-    def test_path_traversal(self, tmp_path):
+    def test_path_traversal(self, tmp_path, monkeypatch):
         """../../etc/passwd becomes 'passwd' inside the files directory."""
-        from kai.bot import _save_to_workspace
+        from kai.bot import _save_upload
 
-        saved = _save_to_workspace(b"test", "../../etc/passwd", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        saved = _save_upload(b"test", "../../etc/passwd")
         assert saved.parent == tmp_path / "files"
         assert "passwd" in saved.name
         assert ".." not in str(saved)
 
-    def test_empty_filename(self, tmp_path):
+    def test_empty_filename(self, tmp_path, monkeypatch):
         """Empty filename produces unnamed_file."""
-        from kai.bot import _save_to_workspace
+        from kai.bot import _save_upload
 
-        saved = _save_to_workspace(b"test", "", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        saved = _save_upload(b"test", "")
         assert "unnamed_file" in saved.name
 
-    def test_slash_only(self, tmp_path):
+    def test_slash_only(self, tmp_path, monkeypatch):
         """Slash-only filename produces unnamed_file."""
-        from kai.bot import _save_to_workspace
+        from kai.bot import _save_upload
 
-        saved = _save_to_workspace(b"test", "/", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        saved = _save_upload(b"test", "/")
         assert "unnamed_file" in saved.name
 
 

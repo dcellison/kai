@@ -25,6 +25,7 @@ kai.db
 logs/
 history/
 memory/
+files/
 .responding_to
 models/
 install.conf

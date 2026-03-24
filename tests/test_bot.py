@@ -30,7 +30,7 @@ from kai.bot import (
     _reply_safe,
     _require_auth,
     _resolve_workspace_path,
-    _save_to_workspace,
+    _save_upload,
     _set_responding,
     _short_workspace_name,
     _switch_workspace,
@@ -121,44 +121,50 @@ class TestTruncateForTelegram:
         assert _truncate_for_telegram(text, 50) == text
 
 
-# ── _save_to_workspace ──────────────────────────────────────────────
+# ── _save_upload ────────────────────────────────────────────────────
 
 
-class TestSaveToWorkspace:
-    def test_creates_files_directory(self, tmp_path):
+class TestSaveUpload:
+    def test_creates_files_directory(self, tmp_path, monkeypatch):
         """Automatically creates the files/ subdirectory if missing."""
-        _save_to_workspace(b"hello", "test.txt", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        _save_upload(b"hello", "test.txt")
         assert (tmp_path / "files").is_dir()
 
-    def test_saves_content_correctly(self, tmp_path):
+    def test_saves_content_correctly(self, tmp_path, monkeypatch):
         """Written bytes match the input exactly."""
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         data = b"binary content here"
-        result = _save_to_workspace(data, "doc.pdf", tmp_path)
+        result = _save_upload(data, "doc.pdf")
         assert result.read_bytes() == data
 
-    def test_filename_contains_original_name(self, tmp_path):
+    def test_filename_contains_original_name(self, tmp_path, monkeypatch):
         """Saved filename preserves the original name after the timestamp."""
-        result = _save_to_workspace(b"x", "report.pdf", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        result = _save_upload(b"x", "report.pdf")
         assert "report.pdf" in result.name
 
-    def test_timestamp_prefix_format(self, tmp_path):
+    def test_timestamp_prefix_format(self, tmp_path, monkeypatch):
         """Filename starts with YYYYMMDD_HHMMSS_ffffff timestamp."""
-        result = _save_to_workspace(b"x", "file.txt", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        result = _save_upload(b"x", "file.txt")
         # Format: YYYYMMDD_HHMMSS_ffffff_file.txt
         parts = result.name.split("_", 3)
         assert len(parts[0]) == 8  # date
         assert len(parts[1]) == 6  # time
         assert len(parts[2]) == 6  # microseconds
 
-    def test_sanitizes_slashes_and_spaces(self, tmp_path):
+    def test_sanitizes_slashes_and_spaces(self, tmp_path, monkeypatch):
         """Slashes and spaces in filenames are replaced with underscores."""
-        result = _save_to_workspace(b"x", "my file/name.txt", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        result = _save_upload(b"x", "my file/name.txt")
         assert "/" not in result.name
         assert " " not in result.name
 
-    def test_returns_absolute_path(self, tmp_path):
+    def test_returns_absolute_path(self, tmp_path, monkeypatch):
         """Returned path is absolute and points to an existing file."""
-        result = _save_to_workspace(b"x", "test.txt", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        result = _save_upload(b"x", "test.txt")
         assert result.is_absolute()
         assert result.is_file()
 

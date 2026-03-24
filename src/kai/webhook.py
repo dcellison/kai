@@ -52,7 +52,7 @@ from aiohttp import web
 from telegram import Update
 
 from kai import cron, review, services, sessions, triage
-from kai.config import IMAGE_EXTENSIONS
+from kai.config import DATA_DIR, IMAGE_EXTENSIONS
 from kai.telegram_utils import chunk_text
 
 log = logging.getLogger(__name__)
@@ -1191,11 +1191,20 @@ async def _handle_send_file(request: web.Request) -> web.Response:
         workspace = request.app.get("workspace")
     if not workspace:
         return web.json_response({"error": "No workspace configured"}, status=403)
+    # Allow files from either the workspace or DATA_DIR/files/.
+    # DATA_DIR/files/ is where uploaded files now live (PR #145).
+    # Confinement to DATA_DIR/"files" (not all of DATA_DIR) is deliberate;
+    # inner Claude should not be able to send the database, logs, or
+    # history files via this endpoint.
     workspace_resolved = Path(workspace).resolve()
+    files_resolved = (DATA_DIR / "files").resolve()
     try:
         path.relative_to(workspace_resolved)
     except ValueError:
-        return web.json_response({"error": "Path outside workspace"}, status=403)
+        try:
+            path.relative_to(files_resolved)
+        except ValueError:
+            return web.json_response({"error": "Path outside allowed directories"}, status=403)
 
     if not path.is_file():
         return web.json_response({"error": f"File not found: {file_path}"}, status=404)

@@ -15,7 +15,7 @@ from unittest.mock import patch
 import pytest
 
 from kai import sessions
-from kai.bot import _clear_responding, _save_to_workspace, _set_responding
+from kai.bot import _clear_responding, _save_upload, _set_responding
 from kai.history import get_recent_history
 
 # ── Settings namespacing ────────────────────────────────────────────
@@ -151,23 +151,26 @@ class TestHistoryFiltering:
 
 
 class TestFileStorage:
-    def test_save_per_user(self, tmp_path):
+    def test_save_per_user(self, tmp_path, monkeypatch):
         """File saved with user_id goes to per-user subdirectory."""
-        saved = _save_to_workspace(b"hello", "test.txt", tmp_path, user_id=123)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        saved = _save_upload(b"hello", "test.txt", user_id=123)
         assert "/files/123/" in str(saved)
         assert saved.exists()
         assert saved.read_bytes() == b"hello"
 
-    def test_save_no_user(self, tmp_path):
+    def test_save_no_user(self, tmp_path, monkeypatch):
         """File saved without user_id goes to shared files/ directory."""
-        saved = _save_to_workspace(b"hello", "test.txt", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        saved = _save_upload(b"hello", "test.txt")
         assert "/files/" in str(saved)
         assert "/files/123/" not in str(saved)
 
-    def test_per_user_files_isolated(self, tmp_path):
+    def test_per_user_files_isolated(self, tmp_path, monkeypatch):
         """User A's files are not in User B's directory."""
-        _save_to_workspace(b"alice data", "a.txt", tmp_path, user_id=111)
-        _save_to_workspace(b"bob data", "b.txt", tmp_path, user_id=222)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        _save_upload(b"alice data", "a.txt", user_id=111)
+        _save_upload(b"bob data", "b.txt", user_id=222)
 
         alice_files = list((tmp_path / "files" / "111").iterdir())
         bob_files = list((tmp_path / "files" / "222").iterdir())

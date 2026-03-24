@@ -876,16 +876,18 @@ def _start_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
     print(f"  Warning: service start failed ({' '.join(cmd[:2])}){hint}")
 
 
-def _apply_migrate(data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
+def _apply_migrate(data_path: Path, install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
     """
     Migrate runtime data from the development directory to the data directory.
 
-    One-time migration of database and log files. Safe to run multiple times:
-    existing files at the destination are never overwritten, and source files
-    are never deleted (they serve as backups).
+    One-time migration of database, log, history, memory, and uploaded files.
+    Safe to run multiple times: existing files at the destination are never
+    overwritten, and source files are never deleted (they serve as backups).
 
     Args:
         data_path: Writable data directory (e.g., /var/lib/kai).
+        install_path: Installation directory (e.g., /opt/kai) for locating
+            uploaded files at the old home/files/ location.
         svc_uid: Numeric UID for file ownership.
         svc_gid: Numeric GID for file ownership.
         dry_run: If True, print actions without executing.
@@ -985,6 +987,44 @@ def _apply_migrate(data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -
             shutil.copy2(memory_src, memory_dst)
             os.chown(memory_dst, svc_uid, svc_gid)
             print(f"  Migrated MEMORY.md to {memory_dst}")
+
+    # -- Uploaded files migration --
+    # One-time: copy user-uploaded files from the install tree
+    # (home/files/, pre-DATA_DIR location) to DATA_DIR/files/.
+    # Walks the full directory tree to handle per-user subdirectories
+    # (files/{user_id}/). Existing files at the destination are not
+    # overwritten. Source files are preserved as backups.
+    files_src = install_path / "home" / "files"
+    files_dst = data_path / "files"
+
+    if files_src.exists() and any(files_src.iterdir()):
+        if dry_run:
+            for item in files_src.rglob("*"):
+                if item.is_file():
+                    rel = item.relative_to(files_src)
+                    dst = files_dst / rel
+                    if not dst.exists():
+                        print(f"[DRY RUN] Would copy file: {item} -> {dst}")
+            print(f"[DRY RUN] Would set ownership: {files_dst} ({svc_uid}:{svc_gid})")
+        else:
+            copied = 0
+            for item in files_src.rglob("*"):
+                if item.is_file():
+                    rel = item.relative_to(files_src)
+                    dst = files_dst / rel
+                    if not dst.exists():
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(item, dst)
+                        copied += 1
+            if copied:
+                # Recursively set ownership on the entire files tree
+                for root, _dirs, fnames in os.walk(files_dst):
+                    os.chown(root, svc_uid, svc_gid)
+                    for fname in fnames:
+                        os.chown(os.path.join(root, fname), svc_uid, svc_gid)
+                print(f"  Migrated {copied} uploaded file(s) to {files_dst}")
+            else:
+                print("  Uploaded files already migrated or no files to copy")
 
 
 def _cmd_apply() -> None:
@@ -1091,7 +1131,7 @@ def _cmd_apply() -> None:
     _apply_sudoers(service_user, dry_run, claude_user)
 
     # -- Step 7: Migrate runtime data --
-    _apply_migrate(data_path, svc_uid, svc_gid, dry_run)
+    _apply_migrate(data_path, install_path, svc_uid, svc_gid, dry_run)
 
     # -- Step 8: Generate service definition --
     webhook_port = int(env.get("WEBHOOK_PORT", "8080"))

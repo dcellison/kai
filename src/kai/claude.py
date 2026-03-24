@@ -464,7 +464,7 @@ class PersistentClaude:
                     f'Required: "text" (the message content). '
                     f"Long messages are automatically split at Telegram's 4096-char limit.]"
                 )
-                files_path = f"{self.workspace}/files/{chat_id}/" if chat_id else f"{self.workspace}/files/"
+                files_path = f"{DATA_DIR}/files/{chat_id}/" if chat_id else f"{DATA_DIR}/files/"
                 parts.append(
                     f"[File API: To send a file to the user, POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/send-file "
