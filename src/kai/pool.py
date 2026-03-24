@@ -223,14 +223,17 @@ class SubprocessPool:
         try:
             await asyncio.wait_for(instance.shutdown(), timeout=_FORCE_KILL_TIMEOUT)
         except Exception:
-            # Any failure (timeout, CancelledError, OSError, etc.) -
-            # fall back to raw SIGKILL. instance.force_kill() is
-            # effectively infallible (catches its own OSError).
+            # Any failure (timeout, OSError, etc.) - fall back to raw
+            # SIGKILL. instance.force_kill() is effectively infallible
+            # (catches its own OSError).
             instance.force_kill()
             log.warning("force_kill: shutdown failed for user %d, sent SIGKILL", chat_id)
-        # Remove from tracking only after the subprocess is confirmed dead
-        self._pool.pop(chat_id, None)
-        self._last_activity.pop(chat_id, None)
+        finally:
+            # Remove from tracking regardless of how shutdown ended.
+            # The finally block ensures cleanup even if CancelledError
+            # (a BaseException, not caught by except Exception) propagates.
+            self._pool.pop(chat_id, None)
+            self._last_activity.pop(chat_id, None)
 
     async def change_workspace(
         self,
@@ -327,10 +330,11 @@ class SubprocessPool:
                         # is effectively infallible (catches its own OSError).
                         log.exception("Error evicting subprocess for user %d, sending SIGKILL", chat_id)
                         instance.force_kill()
-                    # Remove from tracking only after the subprocess is
-                    # confirmed dead (clean shutdown or SIGKILL fallback)
-                    self._pool.pop(chat_id, None)
-                    self._last_activity.pop(chat_id, None)
+                # Remove from tracking after shutdown (alive instances) or
+                # unconditionally (dead instances). Without this, a dead
+                # instance would stay in the pool indefinitely.
+                self._pool.pop(chat_id, None)
+                self._last_activity.pop(chat_id, None)
 
     async def shutdown(self) -> None:
         """Shut down all subprocesses and stop the eviction task."""
