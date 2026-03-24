@@ -64,7 +64,7 @@ _SOURCE_EXCLUDES = {"__pycache__", "*.pyc", "*.egg-info", ".git", ".venv", ".env
 # History and MEMORY.md now live in DATA_DIR, outside the install tree.
 # Both are still excluded because stale files may remain at the source
 # after migration (source files are preserved as backups, not deleted).
-_WORKSPACE_CLAUDE_EXCLUDES = {"history", "MEMORY.md", "skills", "__pycache__"}
+_HOME_CLAUDE_EXCLUDES = {"history", "MEMORY.md", "skills", "__pycache__"}
 
 
 # ── Input helpers ────────────────────────────────────────────────────
@@ -943,8 +943,9 @@ def _apply_migrate(data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -
                 _set_ownership(logs_dst, svc_uid, svc_gid, recursive=True)
 
     # -- History migration --
-    # One-time: copy JSONL conversation logs from the old home location
-    # to DATA_DIR/history/. Safe on repeated runs: only copies files that
+    # One-time: copy JSONL conversation logs from the source tree
+    # (home/.claude/history/, pre-DATA_DIR location) to DATA_DIR/history/.
+    # Safe on repeated runs: only copies files that
     # don't already exist at the destination. Source files are preserved
     # as backups (same pattern as the database and log migrations above).
     history_src = PROJECT_ROOT / "home" / ".claude" / "history"
@@ -969,8 +970,9 @@ def _apply_migrate(data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -
             print("  History already migrated or no files to copy")
 
     # -- MEMORY.md migration --
-    # One-time: copy personal memory from the old home location to
-    # DATA_DIR/memory/. If the file doesn't exist at the old location
+    # One-time: copy personal memory from the source tree
+    # (home/.claude/MEMORY.md, pre-DATA_DIR location) to DATA_DIR/memory/.
+    # If the file doesn't exist at the source location
     # (common - it was never created on most installs), _bootstrap_memory()
     # in main.py handles creation from the example template at startup.
     memory_src = PROJECT_ROOT / "home" / ".claude" / "MEMORY.md"
@@ -1213,7 +1215,7 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     # be created inside it.
     if ws_claude_src.is_dir():
         ws_claude_dst.parent.mkdir(parents=True, exist_ok=True)
-        _copy_tree(ws_claude_src, ws_claude_dst, _WORKSPACE_CLAUDE_EXCLUDES)
+        _copy_tree(ws_claude_src, ws_claude_dst, _HOME_CLAUDE_EXCLUDES)
         _set_ownership(ws_claude_dst, 0, 0, recursive=True)
         os.chown(ws_claude_dst, svc_uid, svc_gid)
         print(f"  Copied home config to {ws_claude_dst}")

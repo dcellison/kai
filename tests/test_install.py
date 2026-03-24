@@ -1494,7 +1494,7 @@ class TestApplySource:
 
     def test_home_claude_excludes(self, tmp_path):
         """Home config copy excludes history/, MEMORY.md, skills/, __pycache__."""
-        from kai.install import _WORKSPACE_CLAUDE_EXCLUDES
+        from kai.install import _HOME_CLAUDE_EXCLUDES
 
         src = tmp_path / "source"
         (src / "src").mkdir(parents=True)
@@ -1517,7 +1517,7 @@ class TestApplySource:
 
         # Second _copy_tree call is for home/.claude/
         ws_call = mock_copy.call_args_list[1]
-        assert ws_call[0][2] == _WORKSPACE_CLAUDE_EXCLUDES
+        assert ws_call[0][2] == _HOME_CLAUDE_EXCLUDES
 
 
 # ── _apply_models ────────────────────────────────────────────────────
