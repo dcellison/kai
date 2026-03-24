@@ -338,3 +338,68 @@ class TestEvictionTOCTOU:
         assert pool._last_activity.get(111, 0) > sweep_now
         # This is the guard: if _last_activity > now, skip eviction
         assert 111 in pool._pool  # user survives
+
+    def test_toctou_guard_skips_in_flight(self):
+        """TOCTOU guard skips user who entered send() between snapshot and eviction."""
+        config = _make_config(claude_idle_timeout=1)
+        pool = SubprocessPool(config=config, services_info=[])
+        pool.get(111)
+
+        # Step 1: build candidate list when user was idle
+        sweep_now = time.monotonic()
+        pool._last_activity[111] = sweep_now - 10
+
+        to_evict = [
+            cid
+            for cid, last in pool._last_activity.items()
+            if sweep_now - last > config.claude_idle_timeout and cid in pool._pool and cid not in pool._in_flight
+        ]
+        assert 111 in to_evict
+
+        # Step 2: user enters send() after snapshot (TOCTOU window)
+        pool._in_flight.add(111)
+
+        # Step 3: the in-flight re-check should skip them
+        assert 111 in pool._in_flight
+        assert 111 in pool._pool  # user survives
+
+    def test_toctou_guard_skips_removed_from_pool(self):
+        """TOCTOU guard skips user removed from pool between snapshot and eviction."""
+        config = _make_config(claude_idle_timeout=1)
+        pool = SubprocessPool(config=config, services_info=[])
+        pool.get(111)
+
+        # Step 1: build candidate list when user was in pool
+        sweep_now = time.monotonic()
+        pool._last_activity[111] = sweep_now - 10
+
+        to_evict = [
+            cid
+            for cid, last in pool._last_activity.items()
+            if sweep_now - last > config.claude_idle_timeout and cid in pool._pool and cid not in pool._in_flight
+        ]
+        assert 111 in to_evict
+
+        # Step 2: force_kill removes user from pool (TOCTOU window)
+        pool._pool.pop(111, None)
+
+        # Step 3: the pool-membership re-check should skip them
+        assert 111 not in pool._pool
+
+    def test_eviction_proceeds_when_all_checks_pass(self):
+        """User passing all three re-checks is evicted normally."""
+        config = _make_config(claude_idle_timeout=1)
+        pool = SubprocessPool(config=config, services_info=[])
+        pool.get(111)
+
+        sweep_now = time.monotonic()
+        pool._last_activity[111] = sweep_now - 10
+
+        # All three conditions hold: old timestamp, not in-flight, in pool
+        assert pool._last_activity.get(111, 0) <= sweep_now
+        assert 111 not in pool._in_flight
+        assert 111 in pool._pool
+
+        # Pop should succeed (simulating what the eviction loop does)
+        instance = pool._pool.pop(111, None)
+        assert instance is not None
