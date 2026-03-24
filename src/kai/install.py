@@ -968,6 +968,22 @@ def _apply_migrate(data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -
         elif not copied and not dry_run:
             print("  History already migrated or no files to copy")
 
+    # -- MEMORY.md migration --
+    # One-time: copy personal memory from the old workspace location to
+    # DATA_DIR/memory/. If the file doesn't exist at the old location
+    # (common - it was never created on most installs), _bootstrap_memory()
+    # in main.py handles creation from the example template at startup.
+    memory_src = PROJECT_ROOT / "workspace" / ".claude" / "MEMORY.md"
+    memory_dst = data_path / "memory" / "MEMORY.md"
+    if memory_src.is_file() and not memory_dst.exists():
+        if dry_run:
+            print(f"[DRY RUN] Would copy MEMORY.md: {memory_src} -> {memory_dst}")
+        else:
+            (data_path / "memory").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(memory_src, memory_dst)
+            os.chown(memory_dst, svc_uid, svc_gid)
+            print(f"  Migrated MEMORY.md to {memory_dst}")
+
 
 def _cmd_apply() -> None:
     """
