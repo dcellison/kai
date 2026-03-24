@@ -62,9 +62,9 @@ _SOURCE_EXCLUDES = {"__pycache__", "*.pyc", "*.egg-info", ".git", ".venv", ".env
 #   MEMORY.md   - personal data (gitignored), user creates from .example
 #   skills/     - downloaded skills, environment-specific
 # History and MEMORY.md now live in DATA_DIR, outside the install tree.
-# "history" is still excluded because stale files may remain at the source
+# Both are still excluded because stale files may remain at the source
 # after migration (source files are preserved as backups, not deleted).
-_WORKSPACE_CLAUDE_EXCLUDES = {"history", "skills", "__pycache__"}
+_WORKSPACE_CLAUDE_EXCLUDES = {"history", "MEMORY.md", "skills", "__pycache__"}
 
 
 # ── Input helpers ────────────────────────────────────────────────────
