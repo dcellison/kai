@@ -390,6 +390,8 @@ class TestEvictionTOCTOU:
         config = _make_config(claude_idle_timeout=1)
         pool = SubprocessPool(config=config, services_info=[])
 
+        # get() order determines to_evict order (dict insertion order); 111 must
+        # be processed first so its shutdown side effect modifies 222's state.
         a = pool.get(111)
         pool.get(222)
         pool._last_activity[111] = time.monotonic() - 10
