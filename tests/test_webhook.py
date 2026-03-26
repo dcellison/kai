@@ -925,3 +925,74 @@ class TestIssueTriageRouting:
             assert resp.status == 200
             # Closed events fall through to standard formatter
             app["telegram_bot"].send_message.assert_called_once()
+
+
+# ── _handle_github exception handling ──────────────────────────────
+
+
+class TestGitHubExceptionHandler:
+    """Verify the top-level exception handler in _handle_github."""
+
+    @pytest.mark.asyncio
+    async def test_exception_returns_500(self, _clear_cooldowns):
+        """An unhandled exception in event processing returns 500."""
+        app = _build_test_app(pr_review_enabled=False)
+        # Remove telegram_bot to trigger KeyError in _process_github_event
+        del app["telegram_bot"]
+        payload = {"action": "opened", "repository": {"full_name": "owner/repo"}}
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/webhook/github",
+                data=body,
+                headers={
+                    "X-GitHub-Event": "push",
+                    "X-Hub-Signature-256": sig,
+                },
+            )
+            result = await resp.json()
+            assert resp.status == 500
+            assert result["msg"] == "internal_error"
+
+    @pytest.mark.asyncio
+    async def test_signature_validation_unaffected(self, _clear_cooldowns):
+        """Signature validation still returns 401, not caught by the handler."""
+        app = _build_test_app()
+        body = json.dumps({"action": "opened"}).encode()
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/webhook/github",
+                data=body,
+                headers={
+                    "X-GitHub-Event": "push",
+                    "X-Hub-Signature-256": "sha256=invalid",
+                },
+            )
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_happy_path_unaffected(self, _clear_cooldowns):
+        """Normal event processing still returns 200."""
+        app = _build_test_app(pr_review_enabled=False)
+        payload = {
+            "ref": "refs/heads/main",
+            "commits": [{"message": "test commit", "author": {"name": "dev"}}],
+            "repository": {"full_name": "owner/repo"},
+            "compare": "https://github.com/owner/repo/compare/abc...def",
+        }
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/webhook/github",
+                data=body,
+                headers={
+                    "X-GitHub-Event": "push",
+                    "X-Hub-Signature-256": sig,
+                },
+            )
+            assert resp.status == 200

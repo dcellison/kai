@@ -519,7 +519,6 @@ async def _handle_github(request: web.Request) -> web.Response:
     Unsupported events are silently acknowledged with {"msg": "ignored"}.
     """
     secret = request.app["webhook_secret"]
-    bot = request.app["telegram_bot"]
 
     body = await request.read()
 
@@ -539,6 +538,28 @@ async def _handle_github(request: web.Request) -> web.Response:
         payload = json.loads(body)
     except json.JSONDecodeError:
         return web.Response(status=400, text="Invalid JSON")
+
+    # Top-level exception handler for all post-validation logic.
+    # Returns 500 on any unexpected error so GitHub sees a clean response
+    # rather than aiohttp's default error handler. GitHub retries 5xx
+    # responses, but a deterministic error (e.g., KeyError from an unusual
+    # payload shape) would fail the same way each time regardless.
+    try:
+        return await _process_github_event(request, payload, event_type)
+    except Exception:
+        log.exception("Unhandled error processing GitHub %s event", event_type)
+        return web.json_response({"msg": "internal_error"}, status=500)
+
+
+async def _process_github_event(request: web.Request, payload: dict, event_type: str) -> web.Response:
+    """
+    Process a validated GitHub webhook event.
+
+    Handles user routing, PR review dispatch, issue triage dispatch,
+    event formatting, and Telegram delivery. Extracted from _handle_github
+    so the caller can wrap it in a top-level exception handler.
+    """
+    bot = request.app["telegram_bot"]
 
     # Route to the user whose GitHub handle matches the event actor.
     # For PR events, use the PR author (who should see review feedback).
