@@ -834,7 +834,7 @@ async def triage_issue(
             return
         await _send_error_notification(
             metadata,
-            str(exc),
+            type(exc).__name__,
             webhook_port,
             webhook_secret,
             notify_chat_id,

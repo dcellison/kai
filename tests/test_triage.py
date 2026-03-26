@@ -1007,3 +1007,42 @@ class TestApplyTriageNotifyChatId:
         assert len(summary_call) >= 1
         body = summary_call[0][1]["json"]
         assert body["chat_id"] == -100999
+
+
+# ── Triage error notification content ────────────────────────────────
+
+
+class TestTriageErrorContent:
+    @pytest.mark.asyncio
+    async def test_error_sends_exception_type_not_message(self):
+        """Triage failure notification contains only the exception type name,
+        not the full message (which may leak internal paths)."""
+        metadata = IssueMetadata(
+            repo="owner/repo",
+            number=42,
+            title="Test issue",
+            body="body",
+            author="user",
+            url="https://github.com/owner/repo/issues/42",
+            labels=[],
+        )
+
+        sensitive_path = "/opt/kai/home/.claude/CLAUDE.md"
+        error = FileNotFoundError(f"[Errno 2] No such file or directory: '{sensitive_path}'")
+
+        with (
+            patch("kai.triage.extract_issue_metadata", return_value=metadata),
+            patch("kai.triage.search_related_issues", side_effect=error),
+            patch("kai.triage._send_error_notification", new_callable=AsyncMock) as mock_notify,
+        ):
+            await triage_issue(
+                {"issue": {}, "repository": {}},
+                webhook_port=8080,
+                webhook_secret="secret",
+            )
+
+        # The error_detail argument should be just the type name
+        mock_notify.assert_called_once()
+        error_detail = mock_notify.call_args[0][1]
+        assert error_detail == "FileNotFoundError"
+        assert sensitive_path not in error_detail
