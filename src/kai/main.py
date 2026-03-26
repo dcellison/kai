@@ -34,8 +34,11 @@ The shutdown sequence (in the finally block) reverses this order:
 
 import asyncio
 import logging
+import re
 import shutil
+from datetime import UTC, datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
 
 from telegram import BotCommand
 from telegram.error import NetworkError
@@ -109,6 +112,97 @@ def _bootstrap_memory() -> None:
         # Create a minimal file so the inner Claude has something to write to
         memory_file.write_text("# Memory\n")
         logging.info("Created empty MEMORY.md (no example template found)")
+
+
+# ── File cleanup ─────────────────────────────────────────────────────
+
+# Regex to extract the upload timestamp from filenames created by
+# _save_upload(): YYYYMMDD_HHMMSS_ffffff_originalname.ext
+_UPLOAD_TS_RE = re.compile(r"^(\d{8}_\d{6})_")
+
+# How often the cleanup loop runs (seconds)
+_CLEANUP_INTERVAL = 86400  # 24 hours
+
+# Initial delay before the first cleanup run (seconds)
+_CLEANUP_STARTUP_DELAY = 120
+
+
+def _file_age(path: Path) -> datetime | None:
+    """
+    Extract upload timestamp from a file's name.
+
+    Parses the YYYYMMDD_HHMMSS prefix that _save_upload() prepends to every
+    file. Returns None if the filename doesn't match the expected format
+    (e.g., files placed manually or by older code paths).
+    """
+    match = _UPLOAD_TS_RE.match(path.name)
+    if match:
+        try:
+            return datetime.strptime(match.group(1), "%Y%m%d_%H%M%S").replace(tzinfo=UTC)
+        except ValueError:
+            return None
+    return None
+
+
+async def _file_cleanup_loop(retention_days: int) -> None:
+    """
+    Periodically delete uploaded files older than the retention period.
+
+    Runs once after a short startup delay, then every 24 hours. Only
+    deletes files whose names contain a parseable timestamp older than
+    retention_days. Files without a recognized timestamp prefix are
+    left untouched.
+
+    Args:
+        retention_days: Delete files older than this many days. Must be > 0.
+    """
+    await asyncio.sleep(_CLEANUP_STARTUP_DELAY)
+
+    files_dir = DATA_DIR / "files"
+
+    while True:
+        if not files_dir.is_dir():
+            await asyncio.sleep(_CLEANUP_INTERVAL)
+            continue
+
+        cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+        deleted = 0
+        errors = 0
+
+        # Walk all files, including per-user subdirectories
+        for path in files_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            ts = _file_age(path)
+            if ts is None:
+                # No recognizable timestamp - leave it alone
+                continue
+            if ts < cutoff:
+                try:
+                    path.unlink()
+                    deleted += 1
+                except OSError:
+                    errors += 1
+
+        # Remove empty per-user directories left behind after deletion.
+        # Only removes immediate subdirectories of files/ (the {chat_id} dirs),
+        # not files/ itself.
+        for subdir in files_dir.iterdir():
+            if subdir.is_dir():
+                try:
+                    subdir.rmdir()  # Only succeeds if empty
+                except OSError:
+                    pass  # Not empty or permission error - fine, skip it
+
+        if deleted or errors:
+            logging.info(
+                "File cleanup: deleted %d files older than %d days%s",
+                deleted,
+                retention_days,
+                f" ({errors} errors)" if errors else "",
+            )
+
+        await asyncio.sleep(_CLEANUP_INTERVAL)
 
 
 def main() -> None:
@@ -240,6 +334,12 @@ def main() -> None:
 
             # Start the subprocess pool's idle eviction task.
             app.bot_data["pool"].start()
+
+            # Start periodic file cleanup if a retention policy is configured.
+            if config.file_retention_days > 0:
+                cleanup_task = asyncio.create_task(_file_cleanup_loop(config.file_retention_days))
+                # Store reference to prevent GC; task self-cancels on loop shutdown
+                app.bot_data["cleanup_task"] = cleanup_task
 
             # In polling mode, start the Updater's long-polling loop. PTB's
             # start_polling() automatically calls delete_webhook() first, which

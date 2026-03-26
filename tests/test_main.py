@@ -1,18 +1,21 @@
 """
-Tests for main.py - setup_logging() and _bootstrap_memory().
+Tests for main.py - setup_logging(), _bootstrap_memory(), and _file_age/_file_cleanup_loop.
 
 The main() and _init_and_run() functions orchestrate the full application
-lifecycle and are impractical to unit test. setup_logging() and
-_bootstrap_memory() are testable in isolation.
+lifecycle and are impractical to unit test. The helper functions are
+testable in isolation.
 """
 
+import asyncio
 import logging
+from datetime import UTC, datetime
 from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from kai.main import _bootstrap_memory, setup_logging
+from kai.main import _bootstrap_memory, _file_age, _file_cleanup_loop, setup_logging
 
 # ── setup_logging() ──────────────────────────────────────────────────
 
@@ -133,3 +136,220 @@ class TestBootstrapMemory:
         _bootstrap_memory()
 
         assert memory_file.read_text() == "User prefers dry humor."
+
+
+# ── _file_age() ──────────────────────────────────────────────────────
+
+
+class TestFileAge:
+    def test_parses_valid_timestamp(self):
+        """Extracts datetime from YYYYMMDD_HHMMSS prefix."""
+        path = Path("20260228_084059_615331_photo_abc.jpg")
+        result = _file_age(path)
+        assert result is not None
+        assert result.year == 2026
+        assert result.month == 2
+        assert result.day == 28
+        assert result.hour == 8
+        assert result.minute == 40
+        assert result.second == 59
+        assert result.tzinfo == UTC
+
+    def test_returns_none_for_no_prefix(self):
+        """Files without timestamp prefix return None."""
+        assert _file_age(Path("readme.txt")) is None
+        assert _file_age(Path("photo.jpg")) is None
+
+    def test_returns_none_for_malformed_timestamp(self):
+        """Malformed timestamps (invalid date) return None."""
+        assert _file_age(Path("99991301_999999_file.txt")) is None
+
+    def test_returns_none_for_partial_match(self):
+        """Partial matches (missing microsecond separator) return None."""
+        assert _file_age(Path("20260228_084059.jpg")) is None
+
+
+# ── _file_cleanup_loop() ────────────────────────────────────────────
+
+
+class TestFileCleanupLoop:
+    @pytest.mark.asyncio
+    async def test_deletes_old_files(self, tmp_path, monkeypatch):
+        """Files older than retention cutoff are deleted."""
+        monkeypatch.setattr("kai.main.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.main._CLEANUP_STARTUP_DELAY", 0)
+        monkeypatch.setattr("kai.main._CLEANUP_INTERVAL", 0)
+
+        files_dir = tmp_path / "files"
+        files_dir.mkdir()
+        # Old file (60 days ago)
+        old_file = files_dir / "20260101_120000_000000_photo.jpg"
+        old_file.write_bytes(b"old")
+        # New file (today-ish)
+        now = datetime.now(UTC)
+        ts = now.strftime("%Y%m%d_%H%M%S")
+        new_file = files_dir / f"{ts}_000000_photo.jpg"
+        new_file.write_bytes(b"new")
+
+        # Run one iteration then cancel
+        call_count = 0
+
+        async def mock_sleep(duration):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                raise asyncio.CancelledError
+
+        with patch("kai.main.asyncio.sleep", side_effect=mock_sleep):
+            try:
+                await _file_cleanup_loop(30)
+            except asyncio.CancelledError:
+                pass
+
+        assert not old_file.exists()
+        assert new_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_preserves_files_without_timestamp(self, tmp_path, monkeypatch):
+        """Files without timestamp prefix are never deleted."""
+        monkeypatch.setattr("kai.main.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.main._CLEANUP_STARTUP_DELAY", 0)
+        monkeypatch.setattr("kai.main._CLEANUP_INTERVAL", 0)
+
+        files_dir = tmp_path / "files"
+        files_dir.mkdir()
+        manual_file = files_dir / "readme.txt"
+        manual_file.write_text("keep me")
+
+        call_count = 0
+
+        async def mock_sleep(duration):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                raise asyncio.CancelledError
+
+        with patch("kai.main.asyncio.sleep", side_effect=mock_sleep):
+            try:
+                await _file_cleanup_loop(1)
+            except asyncio.CancelledError:
+                pass
+
+        assert manual_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_removes_empty_user_directories(self, tmp_path, monkeypatch):
+        """Empty per-user directories are removed after cleanup."""
+        monkeypatch.setattr("kai.main.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.main._CLEANUP_STARTUP_DELAY", 0)
+        monkeypatch.setattr("kai.main._CLEANUP_INTERVAL", 0)
+
+        files_dir = tmp_path / "files"
+        user_dir = files_dir / "12345"
+        user_dir.mkdir(parents=True)
+        old_file = user_dir / "20260101_120000_000000_photo.jpg"
+        old_file.write_bytes(b"old")
+
+        call_count = 0
+
+        async def mock_sleep(duration):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                raise asyncio.CancelledError
+
+        with patch("kai.main.asyncio.sleep", side_effect=mock_sleep):
+            try:
+                await _file_cleanup_loop(30)
+            except asyncio.CancelledError:
+                pass
+
+        assert not old_file.exists()
+        assert not user_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_leaves_nonempty_user_directories(self, tmp_path, monkeypatch):
+        """Non-empty per-user directories are left intact."""
+        monkeypatch.setattr("kai.main.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.main._CLEANUP_STARTUP_DELAY", 0)
+        monkeypatch.setattr("kai.main._CLEANUP_INTERVAL", 0)
+
+        files_dir = tmp_path / "files"
+        user_dir = files_dir / "12345"
+        user_dir.mkdir(parents=True)
+        # One old (deleted), one without timestamp (kept)
+        old_file = user_dir / "20260101_120000_000000_photo.jpg"
+        old_file.write_bytes(b"old")
+        manual_file = user_dir / "keep_me.txt"
+        manual_file.write_text("important")
+
+        call_count = 0
+
+        async def mock_sleep(duration):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                raise asyncio.CancelledError
+
+        with patch("kai.main.asyncio.sleep", side_effect=mock_sleep):
+            try:
+                await _file_cleanup_loop(30)
+            except asyncio.CancelledError:
+                pass
+
+        assert not old_file.exists()
+        assert manual_file.exists()
+        assert user_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_handles_missing_files_directory(self, tmp_path, monkeypatch):
+        """Missing files/ directory is handled gracefully."""
+        monkeypatch.setattr("kai.main.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.main._CLEANUP_STARTUP_DELAY", 0)
+        monkeypatch.setattr("kai.main._CLEANUP_INTERVAL", 0)
+        # No files/ directory created
+
+        call_count = 0
+
+        async def mock_sleep(duration):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                raise asyncio.CancelledError
+
+        with patch("kai.main.asyncio.sleep", side_effect=mock_sleep):
+            try:
+                await _file_cleanup_loop(30)
+            except asyncio.CancelledError:
+                pass
+        # Should not raise
+
+    @pytest.mark.asyncio
+    async def test_handles_unlink_oserror(self, tmp_path, monkeypatch):
+        """OSError during unlink is counted but doesn't crash the loop."""
+        monkeypatch.setattr("kai.main.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.main._CLEANUP_STARTUP_DELAY", 0)
+        monkeypatch.setattr("kai.main._CLEANUP_INTERVAL", 0)
+
+        files_dir = tmp_path / "files"
+        files_dir.mkdir()
+        old_file = files_dir / "20260101_120000_000000_photo.jpg"
+        old_file.write_bytes(b"old")
+
+        call_count = 0
+
+        async def mock_sleep(duration):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                raise asyncio.CancelledError
+
+        with (
+            patch("kai.main.asyncio.sleep", side_effect=mock_sleep),
+            patch.object(Path, "unlink", side_effect=OSError("permission denied")),
+        ):
+            try:
+                await _file_cleanup_loop(30)
+            except asyncio.CancelledError:
+                pass
+        # Should not raise - error is counted, not propagated
