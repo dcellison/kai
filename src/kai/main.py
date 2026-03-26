@@ -165,42 +165,45 @@ async def _file_cleanup_loop(retention_days: int) -> None:
             await asyncio.sleep(_CLEANUP_INTERVAL)
             continue
 
-        cutoff = datetime.now(UTC) - timedelta(days=retention_days)
-        deleted = 0
-        errors = 0
+        try:
+            cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+            deleted = 0
+            errors = 0
 
-        # Walk all files, including per-user subdirectories
-        for path in files_dir.rglob("*"):
-            if not path.is_file():
-                continue
-            ts = _file_age(path)
-            if ts is None:
-                # No recognizable timestamp - leave it alone
-                continue
-            if ts < cutoff:
-                try:
-                    path.unlink()
-                    deleted += 1
-                except OSError:
-                    errors += 1
+            # Walk all files, including per-user subdirectories
+            for path in files_dir.rglob("*"):
+                if not path.is_file():
+                    continue
+                ts = _file_age(path)
+                if ts is None:
+                    # No recognizable timestamp - leave it alone
+                    continue
+                if ts < cutoff:
+                    try:
+                        path.unlink()
+                        deleted += 1
+                    except OSError:
+                        errors += 1
 
-        # Remove empty per-user directories left behind after deletion.
-        # Only removes immediate subdirectories of files/ (the {chat_id} dirs),
-        # not files/ itself.
-        for subdir in files_dir.iterdir():
-            if subdir.is_dir():
-                try:
-                    subdir.rmdir()  # Only succeeds if empty
-                except OSError:
-                    pass  # Not empty or permission error - fine, skip it
+            # Remove empty per-user directories left behind after deletion.
+            # Only removes immediate subdirectories of files/ (the {chat_id}
+            # dirs), not files/ itself.
+            for subdir in files_dir.iterdir():
+                if subdir.is_dir():
+                    try:
+                        subdir.rmdir()  # Only succeeds if empty
+                    except OSError:
+                        pass  # Not empty or permission error - skip
 
-        if deleted or errors:
-            logging.info(
-                "File cleanup: deleted %d files older than %d days%s",
-                deleted,
-                retention_days,
-                f" ({errors} errors)" if errors else "",
-            )
+            if deleted or errors:
+                logging.info(
+                    "File cleanup: deleted %d files older than %d days%s",
+                    deleted,
+                    retention_days,
+                    f" ({errors} errors)" if errors else "",
+                )
+        except Exception:
+            logging.exception("File cleanup error (will retry in %ds)", _CLEANUP_INTERVAL)
 
         await asyncio.sleep(_CLEANUP_INTERVAL)
 
