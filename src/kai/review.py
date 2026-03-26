@@ -762,7 +762,7 @@ async def send_review_summary(
     }
 
     body: dict[str, str | int] = {"text": text}
-    if notify_chat_id:
+    if notify_chat_id is not None:
         body["chat_id"] = notify_chat_id
 
     try:

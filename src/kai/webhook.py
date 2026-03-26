@@ -560,9 +560,13 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
     # Resolve GitHub notification target. If GITHUB_NOTIFY_CHAT_ID is
     # configured, all GitHub event notifications go there (typically a
     # separate Telegram group). Otherwise, use the per-user DM resolution.
+    # notify_chat_id is only set when the group override is active; when
+    # None, review/triage use their default behavior (no chat_id in POST).
     github_notify_chat_id = request.app.get("github_notify_chat_id")
-    if github_notify_chat_id:
+    notify_chat_id: int | None = None
+    if github_notify_chat_id is not None:
         chat_id = github_notify_chat_id
+        notify_chat_id = github_notify_chat_id
     else:
         # Route to the user whose GitHub handle matches the event actor.
         # For PR events, use the PR author (who should see review feedback).
@@ -615,7 +619,7 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
                     claude_user=request.app.get("claude_user"),
                     local_repo_path=local_repo_path,
                     spec_dir=request.app.get("spec_dir", "specs"),
-                    notify_chat_id=chat_id,
+                    notify_chat_id=notify_chat_id,
                 )
             )
             _background_tasks.add(task)
@@ -653,7 +657,7 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
                     webhook_port=request.app["webhook_port"],
                     webhook_secret=request.app["webhook_secret"],
                     claude_user=request.app.get("claude_user"),
-                    notify_chat_id=chat_id,
+                    notify_chat_id=notify_chat_id,
                 )
             )
             _background_tasks.add(task)

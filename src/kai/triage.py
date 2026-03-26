@@ -747,7 +747,7 @@ async def apply_triage(
     }
 
     body: dict[str, str | int] = {"text": text}
-    if notify_chat_id:
+    if notify_chat_id is not None:
         body["chat_id"] = notify_chat_id
 
     try:
@@ -869,7 +869,7 @@ async def _send_error_notification(
     }
 
     body: dict[str, str | int] = {"text": text}
-    if notify_chat_id:
+    if notify_chat_id is not None:
         body["chat_id"] = notify_chat_id
 
     try:
