@@ -37,6 +37,7 @@ from kai.install import (
     _start_service,
     _stop_service,
     _user_home,
+    _validate_chat_id,
     _validate_port,
     _validate_positive_float,
     _validate_positive_int,
@@ -350,6 +351,11 @@ class TestCmdConfig:
         assert _validate_user_ids("abc") is False
         assert _validate_port("0") is False
         assert _validate_port("99999") is False
+        # Chat ID accepts any non-zero integer (group IDs are negative)
+        assert _validate_chat_id("-1001234567890") is True
+        assert _validate_chat_id("12345") is True
+        assert _validate_chat_id("0") is False
+        assert _validate_chat_id("abc") is False
 
 
 # ── Apply subcommand ─────────────────────────────────────────────────
