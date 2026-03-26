@@ -766,6 +766,36 @@ services:
         svc = loaded["testapi"]
         assert svc.allow_path_suffix is True
 
+    async def test_opted_in_still_validates_path_suffix(self, tmp_path, monkeypatch):
+        """Opted-in services still reject query strings, fragments, and traversal."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  testapi:
+    url: https://api.example.com/
+    method: GET
+    allow_path_suffix: true
+    auth:
+      type: bearer
+      env: API_KEY
+""",
+        )
+        load_services(path)
+
+        result = await call_service("testapi", path_suffix="page?secret=1")
+        assert result.success is False
+        assert "query string" in result.error
+
+        result = await call_service("testapi", path_suffix="page#frag")
+        assert result.success is False
+        assert "fragment" in result.error
+
+        result = await call_service("testapi", path_suffix="/../etc/passwd")
+        assert result.success is False
+        assert ".." in result.error
+
 
 class TestResponseSizeCap:
     """Tests for the response body size cap."""
