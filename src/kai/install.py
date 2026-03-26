@@ -173,6 +173,14 @@ def _validate_positive_int(value: str) -> bool:
         return False
 
 
+def _validate_chat_id(value: str) -> bool:
+    """Check that a string is a valid Telegram chat ID (any non-zero integer)."""
+    try:
+        return int(value) != 0
+    except ValueError:
+        return False
+
+
 # ── Config subcommand ────────────────────────────────────────────────
 
 
@@ -365,6 +373,20 @@ def _cmd_config() -> None:
     )
     print()
 
+    # -- GitHub notifications --
+    print("-- GitHub notifications --")
+    github_notify_chat_id = ""
+    while True:
+        github_notify_chat_id = _prompt(
+            "GitHub notification chat ID (optional)",
+            existing_env.get("GITHUB_NOTIFY_CHAT_ID", ""),
+        )
+        # Empty is valid (feature disabled)
+        if not github_notify_chat_id or _validate_chat_id(github_notify_chat_id):
+            break
+        print("  Must be a valid Telegram chat ID (integer).")
+    print()
+
     # -- Optional features --
     print("-- Optional features --")
     voice_enabled = _prompt_bool(
@@ -424,6 +446,8 @@ def _cmd_config() -> None:
             env["PR_REVIEW_COOLDOWN"] = pr_review_cooldown
     if issue_triage_enabled:
         env["ISSUE_TRIAGE_ENABLED"] = "true"
+    if github_notify_chat_id:
+        env["GITHUB_NOTIFY_CHAT_ID"] = github_notify_chat_id
 
     # Build and write install.conf
     conf = {

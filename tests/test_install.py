@@ -291,6 +291,7 @@ class TestCmdConfig:
                 "",  # allowed workspaces (empty)
                 "false",  # pr review enabled
                 "false",  # issue triage enabled
+                "",  # github notify chat id (empty)
                 "false",  # voice
                 "false",  # tts
                 "",  # claude user (empty)
