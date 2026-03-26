@@ -339,11 +339,11 @@ class TestPruneExpired:
         """_record_triage prunes expired entries before adding a new one."""
         import time
 
-        from kai.webhook import _record_triage
+        from kai.webhook import _TRIAGE_COOLDOWN_SECONDS, _record_triage
 
         _triage_cooldowns.clear()
-        # Add an old entry directly
-        _triage_cooldowns[("repo", 10)] = time.time() - 120
+        # Add an entry past the cooldown threshold
+        _triage_cooldowns[("repo", 10)] = time.time() - (_TRIAGE_COOLDOWN_SECONDS + 60)
 
         # Record a new triage - should prune the old entry first
         _record_triage("repo", 20)
