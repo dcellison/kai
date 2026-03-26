@@ -6,8 +6,9 @@ Provides functionality to:
 2. Retrieve recent messages for injection into new Claude sessions
 3. Serve as the "episodic memory" layer of Kai's three-layer memory system
 
-Log files are stored in DATA_DIR/history/ as date-stamped JSONL files
-(e.g., 2026-02-11.jsonl). Each line is a JSON object with fields:
+Log files are stored in per-user subdirectories under DATA_DIR/history/
+(e.g., DATA_DIR/history/<chat_id>/2026-02-11.jsonl). Each line is a JSON
+object with fields:
     ts       — ISO 8601 timestamp
     dir      — "user" or "assistant"
     chat_id  — Telegram chat ID
@@ -58,7 +59,11 @@ def log_message(
         text: The message text content.
         media: Optional metadata dict for non-text messages (photos, voice, documents).
     """
-    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    # Per-user subdirectory: DATA_DIR/history/<chat_id>/YYYY-MM-DD.jsonl
+    # Separates users on disk so grep/jq searches are naturally scoped
+    # and one user's history can be managed independently.
+    user_dir = _LOG_DIR / str(chat_id)
+    user_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now(UTC)
     record = {
         "ts": now.isoformat(),
@@ -67,7 +72,7 @@ def log_message(
         "text": text,
         "media": media,
     }
-    filepath = _LOG_DIR / f"{now.strftime('%Y-%m-%d')}.jsonl"
+    filepath = user_dir / f"{now.strftime('%Y-%m-%d')}.jsonl"
     try:
         with open(filepath, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -83,6 +88,10 @@ def get_recent_history(chat_id: int | None = None) -> str:
     _MAX_RECENT_MESSAGES messages. This ensures Kai has ambient recall even
     after gaps of several days without conversation.
 
+    When chat_id is provided, scans only that user's subdirectory
+    (DATA_DIR/history/<chat_id>/), plus any legacy flat files from before
+    per-user isolation was added. When None, scans all subdirectories.
+
     Injected into the first prompt of each new Claude session (in claude.py)
     to give Kai ambient awareness of recent conversations without loading the
     full history. Long messages are truncated and the total count is capped.
@@ -92,12 +101,6 @@ def get_recent_history(chat_id: int | None = None) -> str:
             When None, include all messages (backward-compatible for
             single-user deployments).
 
-    Note: pre-Phase-2 records (no chat_id field) are included for all
-    users since there is no way to determine which user they belong to
-    without threading the admin's chat_id through PersistentClaude.
-    Phase 3 per-user subprocess isolation eliminates shared history
-    entirely, making this a non-issue.
-
     Returns:
         A newline-separated string of formatted messages like
         "[2026-02-11 07:00] You: hello", or an empty string if no history exists.
@@ -105,9 +108,21 @@ def get_recent_history(chat_id: int | None = None) -> str:
     if not _LOG_DIR.exists():
         return ""
 
-    # List all JSONL files and sort newest-first (ISO date filenames sort
-    # lexicographically, so reversed gives us most recent first)
-    files = sorted(_LOG_DIR.glob("*.jsonl"), reverse=True)
+    if chat_id is not None:
+        # Scan only this user's subdirectory for per-user isolation.
+        user_dir = _LOG_DIR / str(chat_id)
+        files = sorted(user_dir.glob("*.jsonl"), reverse=True) if user_dir.exists() else []
+        # Also include legacy flat files (pre-per-user migration) - the
+        # chat_id filter in the parsing loop handles mixed records correctly.
+        # These age out naturally as new writes go to per-user directories.
+        legacy = [f for f in _LOG_DIR.glob("*.jsonl") if f.is_file()]
+        files = sorted(set(files) | set(legacy), key=lambda p: p.name, reverse=True)
+    else:
+        # Scan all user directories (backward compat / admin view).
+        # Sort by filename (date) not full path, so files from different
+        # user directories on the same date interleave chronologically.
+        files = sorted(_LOG_DIR.rglob("*.jsonl"), key=lambda p: p.name, reverse=True)
+
     if not files:
         return ""
 

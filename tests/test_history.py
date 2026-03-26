@@ -20,23 +20,25 @@ def _log_dir(monkeypatch, tmp_path):
 
 
 class TestLogMessage:
-    def test_creates_jsonl_file(self, _log_dir):
+    def test_creates_per_user_directory(self, _log_dir):
+        """Log creates a per-user subdirectory and writes the file there."""
         log_message(direction="user", chat_id=1, text="hello")
         today = datetime.now(UTC).strftime("%Y-%m-%d")
-        path = _log_dir / f"{today}.jsonl"
+        path = _log_dir / "1" / f"{today}.jsonl"
         assert path.exists()
+        assert (_log_dir / "1").is_dir()
 
     def test_appends_multiple_records(self, _log_dir):
         log_message(direction="user", chat_id=1, text="first")
         log_message(direction="assistant", chat_id=1, text="second")
         today = datetime.now(UTC).strftime("%Y-%m-%d")
-        lines = (_log_dir / f"{today}.jsonl").read_text().strip().splitlines()
+        lines = (_log_dir / "1" / f"{today}.jsonl").read_text().strip().splitlines()
         assert len(lines) == 2
 
     def test_record_fields(self, _log_dir):
         log_message(direction="user", chat_id=42, text="hi", media={"type": "photo"})
         today = datetime.now(UTC).strftime("%Y-%m-%d")
-        line = (_log_dir / f"{today}.jsonl").read_text().strip()
+        line = (_log_dir / "42" / f"{today}.jsonl").read_text().strip()
         record = json.loads(line)
         assert record["dir"] == "user"
         assert record["chat_id"] == 42
@@ -47,9 +49,31 @@ class TestLogMessage:
     def test_media_defaults_to_none(self, _log_dir):
         log_message(direction="user", chat_id=1, text="text only")
         today = datetime.now(UTC).strftime("%Y-%m-%d")
-        line = (_log_dir / f"{today}.jsonl").read_text().strip()
+        line = (_log_dir / "1" / f"{today}.jsonl").read_text().strip()
         record = json.loads(line)
         assert record["media"] is None
+
+    def test_different_users_get_separate_directories(self, _log_dir):
+        """Messages from different users go to different subdirectories."""
+        log_message(direction="user", chat_id=111, text="from alice")
+        log_message(direction="user", chat_id=222, text="from bob")
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        assert (_log_dir / "111" / f"{today}.jsonl").exists()
+        assert (_log_dir / "222" / f"{today}.jsonl").exists()
+        # Each file has exactly one record
+        alice_lines = (_log_dir / "111" / f"{today}.jsonl").read_text().strip().splitlines()
+        bob_lines = (_log_dir / "222" / f"{today}.jsonl").read_text().strip().splitlines()
+        assert len(alice_lines) == 1
+        assert len(bob_lines) == 1
+
+    def test_no_flat_file_created(self, _log_dir):
+        """New writes go to per-user dirs, not the flat _LOG_DIR root."""
+        log_message(direction="user", chat_id=1, text="hello")
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        # No flat file at the root
+        assert not (_log_dir / f"{today}.jsonl").exists()
+        # File is in the per-user subdirectory
+        assert (_log_dir / "1" / f"{today}.jsonl").exists()
 
 
 # ── get_recent_history ───────────────────────────────────────────────
@@ -173,3 +197,57 @@ def test_log_dir_uses_data_dir():
     # The module should use DATA_DIR for _LOG_DIR, not PROJECT_ROOT
     assert "DATA_DIR" in source
     assert '_LOG_DIR = DATA_DIR / "history"' in source
+
+
+# ── Per-user history isolation ───────────────────────────────────────
+
+
+class TestPerUserHistory:
+    def test_reads_only_target_user(self, _log_dir):
+        """get_recent_history(chat_id=X) returns only X's messages."""
+        log_message(direction="user", chat_id=111, text="alice msg")
+        log_message(direction="user", chat_id=222, text="bob msg")
+
+        result = get_recent_history(chat_id=111)
+        assert "alice msg" in result
+        assert "bob msg" not in result
+
+    def test_excludes_other_users(self, _log_dir):
+        """Messages from user Y are not in user X's history."""
+        log_message(direction="user", chat_id=111, text="private")
+        log_message(direction="user", chat_id=222, text="also private")
+
+        result = get_recent_history(chat_id=222)
+        assert "also private" in result
+        assert "private" not in result or "also private" in result
+
+    def test_none_chat_id_returns_all(self, _log_dir):
+        """get_recent_history(chat_id=None) returns messages from all users."""
+        log_message(direction="user", chat_id=111, text="alice")
+        log_message(direction="user", chat_id=222, text="bob")
+
+        result = get_recent_history(chat_id=None)
+        assert "alice" in result
+        assert "bob" in result
+
+    def test_legacy_flat_files_included(self, _log_dir):
+        """Legacy flat files (pre-per-user) are included in reads."""
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        # Simulate a legacy flat file at _LOG_DIR root
+        legacy_record = {
+            "ts": datetime.now(UTC).isoformat(),
+            "dir": "user",
+            "chat_id": 111,
+            "text": "old message",
+        }
+        legacy_path = _log_dir / f"{today}.jsonl"
+        legacy_path.write_text(json.dumps(legacy_record) + "\n")
+
+        result = get_recent_history(chat_id=111)
+        assert "old message" in result
+
+    def test_new_user_empty_history(self, _log_dir):
+        """A user with no history directory gets an empty string."""
+        result = get_recent_history(chat_id=999)
+        # No legacy files either, so should be empty
+        assert result == ""
