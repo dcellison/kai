@@ -63,6 +63,7 @@ services:
   # ntfy:
   #   url: https://ntfy.sh
   #   method: POST
+  #   allow_path_suffix: true
   #   auth:
   #     type: none
   #   description: "Send push notifications via ntfy"
@@ -79,6 +80,7 @@ services:
   # jina_reader:
   #   url: https://r.jina.ai/
   #   method: GET
+  #   allow_path_suffix: true
   #   auth:
   #     type: bearer
   #     env: JINA_API_KEY

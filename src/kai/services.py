@@ -99,6 +99,7 @@ class ServiceDef:
     params: dict[str, str] = field(default_factory=dict)
     description: str = ""
     notes: str = ""
+    allow_path_suffix: bool = False
 
 
 @dataclass
@@ -210,6 +211,7 @@ def _load_and_register(raw: object) -> dict[str, ServiceDef]:
             params={str(k): str(v) for k, v in params.items()},
             description=entry.get("description", ""),
             notes=entry.get("notes", ""),
+            allow_path_suffix=bool(entry.get("allow_path_suffix", False)),
         )
 
     _services = result
@@ -368,6 +370,16 @@ async def call_service(
     # Inject auth into query params if applicable
     if api_key and svc.auth.type == "query" and svc.auth.name:
         merged_params[svc.auth.name] = api_key
+
+    # Check whether the service allows path_suffix at all. Default is deny
+    # to prevent services from being used as open HTTP proxies (SSRF).
+    # Services that need it (Jina Reader, ntfy) opt in explicitly in
+    # services.yaml with allow_path_suffix: true.
+    if path_suffix and not svc.allow_path_suffix:
+        return ServiceResponse(
+            success=False,
+            error=f"Service '{name}' does not allow path_suffix",
+        )
 
     # Validate path_suffix to prevent request smuggling via crafted paths.
     # Reject query strings, fragments, and path traversal segments. Note:

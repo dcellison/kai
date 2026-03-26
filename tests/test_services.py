@@ -504,6 +504,7 @@ services:
   jina:
     url: https://r.jina.ai/
     method: GET
+    allow_path_suffix: true
     auth:
       type: bearer
       env: JINA_KEY
@@ -643,6 +644,127 @@ services:
         assert result.success is True
         assert result.status == 429
         assert "rate limited" in result.body
+
+
+class TestPathSuffixAllow:
+    """Tests for the allow_path_suffix SSRF prevention."""
+
+    async def test_denied_by_default(self, tmp_path, monkeypatch):
+        """path_suffix is rejected when allow_path_suffix is not set."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  testapi:
+    url: https://api.example.com
+    method: POST
+    auth:
+      type: bearer
+      env: API_KEY
+""",
+        )
+        load_services(path)
+
+        result = await call_service("testapi", path_suffix="/secret")
+        assert result.success is False
+        assert "does not allow path_suffix" in result.error
+
+    async def test_allowed_when_opted_in(self, tmp_path, monkeypatch):
+        """path_suffix is accepted when allow_path_suffix is true."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  testapi:
+    url: https://api.example.com/
+    method: GET
+    allow_path_suffix: true
+    auth:
+      type: bearer
+      env: API_KEY
+""",
+        )
+        load_services(path)
+
+        mock_response = _mock_streamed_response(b"ok")
+        mock_session = MagicMock()
+        mock_session.request = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kai.services.aiohttp.ClientSession", return_value=mock_session):
+            result = await call_service("testapi", path_suffix="target")
+
+        assert result.success is True
+
+    async def test_no_suffix_works_regardless(self, tmp_path, monkeypatch):
+        """Calling without path_suffix works whether allow is set or not."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  testapi:
+    url: https://api.example.com
+    method: POST
+    auth:
+      type: bearer
+      env: API_KEY
+""",
+        )
+        load_services(path)
+
+        mock_response = _mock_streamed_response(b'{"result": "ok"}')
+        mock_session = MagicMock()
+        mock_session.request = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kai.services.aiohttp.ClientSession", return_value=mock_session):
+            result = await call_service("testapi", body={"q": "test"})
+
+        assert result.success is True
+
+    async def test_defaults_to_false(self, tmp_path, monkeypatch):
+        """allow_path_suffix defaults to False when absent from YAML."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  testapi:
+    url: https://api.example.com
+    method: POST
+    auth:
+      type: bearer
+      env: API_KEY
+""",
+        )
+        loaded = load_services(path)
+        svc = loaded["testapi"]
+        assert svc.allow_path_suffix is False
+
+    async def test_parsed_from_yaml(self, tmp_path, monkeypatch):
+        """allow_path_suffix: true is correctly parsed from YAML."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  testapi:
+    url: https://api.example.com
+    method: GET
+    allow_path_suffix: true
+    auth:
+      type: bearer
+      env: API_KEY
+""",
+        )
+        loaded = load_services(path)
+        svc = loaded["testapi"]
+        assert svc.allow_path_suffix is True
 
 
 class TestResponseSizeCap:
