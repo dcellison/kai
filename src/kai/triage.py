@@ -840,4 +840,5 @@ async def _send_error_notification(
             "Failed to send triage error notification for %s#%d",
             metadata.repo,
             metadata.number,
+            exc_info=True,
         )
