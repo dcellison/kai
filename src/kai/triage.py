@@ -428,12 +428,26 @@ def _parse_triage_json(raw: str) -> dict:
     text = text.strip()
 
     # If Claude added preamble text before the JSON (e.g., "Here's the
-    # analysis:\n{...}"), try to extract the outermost JSON object.
+    # analysis:\n{...}"), try to extract a valid JSON object. The naive
+    # first-{-to-last-} approach can grab the wrong span when the preamble
+    # contains braces, so we validate each candidate by trying json.loads
+    # on each { position until one succeeds.
     if text and not text.startswith("{"):
-        brace_start = text.find("{")
         brace_end = text.rfind("}")
-        if brace_start != -1 and brace_end > brace_start:
-            text = text[brace_start : brace_end + 1]
+        if brace_end != -1:
+            pos = 0
+            while pos <= brace_end:
+                brace_start = text.find("{", pos)
+                if brace_start == -1 or brace_start > brace_end:
+                    break
+                candidate = text[brace_start : brace_end + 1]
+                try:
+                    json.loads(candidate)
+                    text = candidate
+                    break
+                except json.JSONDecodeError:
+                    # This { didn't produce valid JSON; try the next one
+                    pos = brace_start + 1
 
     try:
         result = json.loads(text)

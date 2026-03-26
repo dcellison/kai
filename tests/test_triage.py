@@ -404,6 +404,24 @@ class TestParseTriageJson:
         result = _parse_triage_json(raw)
         assert result == {"labels": ["bug"], "priority": "high"}
 
+    def test_preamble_with_braces(self):
+        """Preamble containing braces doesn't confuse the extractor."""
+        raw = 'Here\'s the {"quick": "note"} before the real response:\n{"labels": ["bug"], "priority": "high"}'
+        result = _parse_triage_json(raw)
+        assert result == {"labels": ["bug"], "priority": "high"}
+
+    def test_preamble_with_multiple_brace_groups(self):
+        """Multiple brace groups in preamble are skipped to find valid JSON."""
+        raw = 'See {x} and {y: z} for context.\n{"labels": ["enhancement"]}'
+        result = _parse_triage_json(raw)
+        assert result == {"labels": ["enhancement"]}
+
+    def test_no_valid_json_raises(self):
+        """Text with braces but no valid JSON still raises ValueError."""
+        raw = "Here is {some broken and {nested stuff}"
+        with pytest.raises(ValueError, match="non-JSON"):
+            _parse_triage_json(raw)
+
 
 # ── _sanitize_search_query ──────────────────────────────────────────
 
