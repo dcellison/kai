@@ -211,7 +211,7 @@ def _load_and_register(raw: object) -> dict[str, ServiceDef]:
             params={str(k): str(v) for k, v in params.items()},
             description=entry.get("description", ""),
             notes=entry.get("notes", ""),
-            allow_path_suffix=bool(entry.get("allow_path_suffix", False)),
+            allow_path_suffix=entry.get("allow_path_suffix", False) is True,
         )
 
     _services = result
