@@ -1370,10 +1370,12 @@ async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str, chat_
                         chat_id,
                         "Webhook health monitor has failed 3 consecutive checks. Self-healing may be degraded.",
                     )
-                    failure_notified = True
                 except Exception:
                     # If we can't even reach Telegram, just log it.
                     log.warning("Could not send health monitor failure notification")
+                # Set regardless of whether the send succeeded. We tried
+                # once per failure sequence - don't retry every 5 minutes.
+                failure_notified = True
 
         await asyncio.sleep(_HEALTH_CHECK_INTERVAL)
 

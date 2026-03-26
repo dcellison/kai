@@ -1107,5 +1107,5 @@ class TestWebhookHealthMonitor:
             except asyncio.CancelledError:
                 pass
 
-        # send_message was attempted but failed - loop didn't crash
-        bot.send_message.assert_called()
+        # send_message was attempted exactly once (not retried after failure)
+        bot.send_message.assert_called_once()
