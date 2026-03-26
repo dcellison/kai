@@ -413,6 +413,8 @@ class TestCmdApply:
         assert "[DRY RUN]" in output
         # Verify nothing was actually created
         assert not (tmp_path / "opt" / "kai").exists()
+        # Secrets reminder should NOT appear during dry run
+        assert "contains secrets" not in output
 
     def test_generates_env_file_content(self):
         """The generated env file contains all provided values."""

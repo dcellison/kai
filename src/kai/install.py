@@ -1153,6 +1153,15 @@ def _cmd_apply() -> None:
         print(f"  Data:    {data_dir}")
         print("  Secrets: /etc/kai/env")
         print(f"  User:    {service_user}")
+        # Remind the user that install.conf contains secrets and can be
+        # cleaned up. Don't auto-delete - the user may want to re-run
+        # apply or adjust config.
+        if INSTALL_CONF.exists():
+            print(
+                f"\nNote: {INSTALL_CONF} contains secrets (bot token, webhook secret)."
+                "\nYou can safely delete it now that secrets are in /etc/kai/env."
+                "\nTo reconfigure later, re-run: python -m kai install config"
+            )
 
 
 def _apply_directories(
