@@ -825,6 +825,10 @@ def load_config() -> Config:
         webhook_port = int(os.environ.get("WEBHOOK_PORT", "8080"))
     except ValueError:
         raise SystemExit("WEBHOOK_PORT must be an integer") from None
+    try:
+        file_retention_days = int(os.environ.get("FILE_RETENTION_DAYS", "0"))
+    except ValueError:
+        raise SystemExit("FILE_RETENTION_DAYS must be an integer") from None
 
     # PR review agent config
     pr_review_enabled = os.environ.get("PR_REVIEW_ENABLED", "").lower() in ("1", "true", "yes")
@@ -915,7 +919,7 @@ def load_config() -> Config:
         github_repo=os.getenv("GITHUB_REPO", ""),
         spec_dir=os.getenv("SPEC_DIR", "specs"),
         issue_triage_enabled=issue_triage_enabled,
-        file_retention_days=int(os.environ.get("FILE_RETENTION_DAYS", "0")),
+        file_retention_days=file_retention_days,
         user_configs=user_configs,
         totp_session_minutes=totp_session_minutes,
         totp_challenge_seconds=totp_challenge_seconds,
