@@ -43,6 +43,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime
@@ -556,20 +557,27 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
     """
     bot = request.app["telegram_bot"]
 
-    # Route to the user whose GitHub handle matches the event actor.
-    # For PR events, use the PR author (who should see review feedback).
-    # For all other events, use the sender (who performed the action).
-    # Falls back to the default admin for unknown actors.
-    config = request.app.get("config")
-    if config and event_type == "pull_request":
-        pr_author = payload.get("pull_request", {}).get("user", {}).get("login", "")
-        target_user = config.get_user_by_github(pr_author) if pr_author else None
-    elif config:
-        sender_login = payload.get("sender", {}).get("login", "")
-        target_user = config.get_user_by_github(sender_login) if sender_login else None
+    # Resolve GitHub notification target. If GITHUB_NOTIFY_CHAT_ID is
+    # configured, all GitHub event notifications go there (typically a
+    # separate Telegram group). Otherwise, use the per-user DM resolution.
+    github_notify_chat_id = request.app.get("github_notify_chat_id")
+    if github_notify_chat_id:
+        chat_id = github_notify_chat_id
     else:
-        target_user = None
-    chat_id = target_user.telegram_id if target_user else request.app["chat_id"]
+        # Route to the user whose GitHub handle matches the event actor.
+        # For PR events, use the PR author (who should see review feedback).
+        # For all other events, use the sender (who performed the action).
+        # Falls back to the default admin for unknown actors.
+        config = request.app.get("config")
+        if config and event_type == "pull_request":
+            pr_author = payload.get("pull_request", {}).get("user", {}).get("login", "")
+            target_user = config.get_user_by_github(pr_author) if pr_author else None
+        elif config:
+            sender_login = payload.get("sender", {}).get("login", "")
+            target_user = config.get_user_by_github(sender_login) if sender_login else None
+        else:
+            target_user = None
+        chat_id = target_user.telegram_id if target_user else request.app["chat_id"]
 
     # ── PR review routing ────────────────────────────────────────
     # When PR review is enabled, reviewable PR events (opened, reopened,
@@ -607,6 +615,7 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
                     claude_user=request.app.get("claude_user"),
                     local_repo_path=local_repo_path,
                     spec_dir=request.app.get("spec_dir", "specs"),
+                    notify_chat_id=chat_id,
                 )
             )
             _background_tasks.add(task)
@@ -644,6 +653,7 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
                     webhook_port=request.app["webhook_port"],
                     webhook_secret=request.app["webhook_secret"],
                     claude_user=request.app.get("claude_user"),
+                    notify_chat_id=chat_id,
                 )
             )
             _background_tasks.add(task)
@@ -1465,6 +1475,16 @@ async def start(telegram_app, config) -> None:
 
     # Issue triage agent config
     _app["issue_triage_enabled"] = config.issue_triage_enabled
+
+    # Optional: route GitHub notifications to a separate Telegram group.
+    # When set, all GitHub event notifications go to this chat_id instead
+    # of the per-user DM. Interactive chat is unaffected.
+    github_notify_raw = os.environ.get("GITHUB_NOTIFY_CHAT_ID", "")
+    if github_notify_raw:
+        try:
+            _app["github_notify_chat_id"] = int(github_notify_raw)
+        except ValueError:
+            log.warning("Invalid GITHUB_NOTIFY_CHAT_ID: %s (ignoring)", github_notify_raw)
 
     _app.router.add_get("/health", _handle_health)
 

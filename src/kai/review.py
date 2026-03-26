@@ -733,6 +733,7 @@ async def send_review_summary(
     success: bool,
     webhook_port: int,
     webhook_secret: str,
+    notify_chat_id: int | None = None,
 ) -> None:
     """
     Send a brief review summary to Telegram via the send-message API.
@@ -760,10 +761,14 @@ async def send_review_summary(
         "X-Webhook-Secret": webhook_secret,
     }
 
+    body: dict[str, str | int] = {"text": text}
+    if notify_chat_id:
+        body["chat_id"] = notify_chat_id
+
     try:
         async with (
             aiohttp.ClientSession() as session,
-            session.post(url, json={"text": text}, headers=headers) as resp,
+            session.post(url, json=body, headers=headers) as resp,
         ):
             if resp.status != 200:
                 log.warning("send-message API returned %d for review summary", resp.status)
@@ -778,6 +783,7 @@ async def review_pr(
     claude_user: str | None = None,
     local_repo_path: str | None = None,
     spec_dir: str = "specs",
+    notify_chat_id: int | None = None,
 ) -> None:
     """
     Full review pipeline: fetch diff, build prompt, run review, post results.
@@ -842,20 +848,20 @@ async def review_pr(
 
         if not review_text.strip():
             log.warning("Empty review output for %s#%d", metadata.repo, metadata.number)
-            await send_review_summary(metadata, False, webhook_port, webhook_secret)
+            await send_review_summary(metadata, False, webhook_port, webhook_secret, notify_chat_id)
             return
 
         # Step 4: Post the review as a GitHub PR comment
         posted = await post_review_comment(metadata.repo, metadata.number, review_text)
 
         # Step 5: Send Telegram summary
-        await send_review_summary(metadata, posted, webhook_port, webhook_secret)
+        await send_review_summary(metadata, posted, webhook_port, webhook_secret, notify_chat_id)
 
     except Exception:
         log.exception("Review failed for %s#%d", metadata.repo, metadata.number)
         # Best-effort failure notification so the user knows something broke
         try:
-            await send_review_summary(metadata, False, webhook_port, webhook_secret)
+            await send_review_summary(metadata, False, webhook_port, webhook_secret, notify_chat_id)
         except Exception:
             log.exception(
                 "Failed to send failure notification for %s#%d",

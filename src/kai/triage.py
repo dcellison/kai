@@ -546,6 +546,7 @@ async def apply_triage(
     webhook_port: int,
     webhook_secret: str,
     projects_json: str = "[]",
+    notify_chat_id: int | None = None,
 ) -> None:
     """
     Apply triage results: labels, project assignment, comment, and notification.
@@ -745,10 +746,14 @@ async def apply_triage(
         "X-Webhook-Secret": webhook_secret,
     }
 
+    body: dict[str, str | int] = {"text": text}
+    if notify_chat_id:
+        body["chat_id"] = notify_chat_id
+
     try:
         async with (
             aiohttp.ClientSession() as session,
-            session.post(url, json={"text": text}, headers=headers) as resp,
+            session.post(url, json=body, headers=headers) as resp,
         ):
             if resp.status != 200:
                 log.warning("send-message API returned %d for triage summary", resp.status)
@@ -761,6 +766,7 @@ async def triage_issue(
     webhook_port: int,
     webhook_secret: str,
     claude_user: str | None = None,
+    notify_chat_id: int | None = None,
 ) -> None:
     """
     Full triage pipeline: analyze issue, apply labels, post results.
@@ -801,7 +807,9 @@ async def triage_issue(
 
         if not raw_response.strip():
             log.warning("Empty triage output for %s#%d", metadata.repo, metadata.number)
-            await _send_error_notification(metadata, "Empty response from Claude", webhook_port, webhook_secret)
+            await _send_error_notification(
+                metadata, "Empty response from Claude", webhook_port, webhook_secret, notify_chat_id
+            )
             return
 
         # Step 5: Parse the JSON response
@@ -809,7 +817,9 @@ async def triage_issue(
 
         # Step 6: Apply triage (labels, project, comment, telegram).
         # Pass projects JSON to avoid a redundant gh project list call.
-        await apply_triage(metadata, triage_result, webhook_port, webhook_secret, projects_json=projects)
+        await apply_triage(
+            metadata, triage_result, webhook_port, webhook_secret, projects_json=projects, notify_chat_id=notify_chat_id
+        )
 
     except Exception as exc:
         log.exception(
@@ -827,6 +837,7 @@ async def triage_issue(
             str(exc),
             webhook_port,
             webhook_secret,
+            notify_chat_id,
         )
 
 
@@ -835,6 +846,7 @@ async def _send_error_notification(
     error_detail: str,
     webhook_port: int,
     webhook_secret: str,
+    notify_chat_id: int | None = None,
 ) -> None:
     """
     Send a triage failure notification to Telegram.
@@ -856,10 +868,14 @@ async def _send_error_notification(
         "X-Webhook-Secret": webhook_secret,
     }
 
+    body: dict[str, str | int] = {"text": text}
+    if notify_chat_id:
+        body["chat_id"] = notify_chat_id
+
     try:
         async with (
             aiohttp.ClientSession() as session,
-            session.post(url, json={"text": text}, headers=headers) as resp,
+            session.post(url, json=body, headers=headers) as resp,
         ):
             if resp.status != 200:
                 log.warning(

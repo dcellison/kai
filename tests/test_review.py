@@ -754,7 +754,7 @@ class TestReviewPR:
             author="alice",
             branch="feature/x",
         )
-        mock_summary.assert_called_once_with(expected_meta, True, 8080, "secret")
+        mock_summary.assert_called_once_with(expected_meta, True, 8080, "secret", None)
 
     @pytest.mark.asyncio
     async def test_empty_diff_skips_review(self):
