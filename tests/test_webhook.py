@@ -16,6 +16,7 @@ from kai.webhook import (
     _fmt_pull_request_review,
     _fmt_push,
     _handle_github,
+    _prune_expired,
     _record_review,
     _resolve_local_repo,
     _review_cooldowns,
@@ -261,30 +262,94 @@ class TestReviewCooldown:
 
     def test_recent_review_skipped(self):
         """A PR reviewed within the cooldown window should be skipped."""
-        _record_review("owner/repo", 1)
+        _record_review("owner/repo", 1, 300)
         assert _should_skip_review("owner/repo", 1, 300) is True
 
     def test_different_pr_not_skipped(self):
         """Cooldown is per-PR, so a different PR number is not skipped."""
-        _record_review("owner/repo", 1)
+        _record_review("owner/repo", 1, 300)
         assert _should_skip_review("owner/repo", 2, 300) is False
 
     def test_different_repo_not_skipped(self):
         """Cooldown is per-repo+PR, so a different repo is not skipped."""
-        _record_review("owner/repo", 1)
+        _record_review("owner/repo", 1, 300)
         assert _should_skip_review("other/repo", 1, 300) is False
 
     def test_expired_cooldown_not_skipped(self):
         """After cooldown expires, the PR can be reviewed again."""
         from unittest.mock import patch
 
-        _record_review("owner/repo", 1)
+        _record_review("owner/repo", 1, 300)
         # Advance time past the cooldown
         import time
 
         future = time.time() + 301
         with patch("kai.webhook.time.time", return_value=future):
             assert _should_skip_review("owner/repo", 1, 300) is False
+
+
+# ── _prune_expired / cooldown dict cleanup ───────────────────────────
+
+
+class TestPruneExpired:
+    def test_removes_old_entries(self):
+        """Entries older than max_age are removed."""
+        import time
+
+        cooldowns: dict[tuple[str, int], float] = {
+            ("repo", 1): time.time() - 500,
+            ("repo", 2): time.time() - 100,
+        }
+        _prune_expired(cooldowns, 300)
+        assert ("repo", 1) not in cooldowns
+        assert ("repo", 2) in cooldowns
+
+    def test_retains_recent_entries(self):
+        """Entries newer than max_age are kept."""
+        import time
+
+        cooldowns: dict[tuple[str, int], float] = {
+            ("repo", 1): time.time(),
+            ("repo", 2): time.time() - 10,
+        }
+        _prune_expired(cooldowns, 300)
+        assert len(cooldowns) == 2
+
+    def test_empty_dict_is_noop(self):
+        """Pruning an empty dict does nothing."""
+        cooldowns: dict[tuple[str, int], float] = {}
+        _prune_expired(cooldowns, 300)
+        assert len(cooldowns) == 0
+
+    def test_record_review_prunes_before_adding(self):
+        """_record_review prunes expired entries before adding a new one."""
+        import time
+
+        _review_cooldowns.clear()
+        # Add an old entry directly
+        _review_cooldowns[("repo", 1)] = time.time() - 500
+
+        # Record a new review - should prune the old entry first
+        _record_review("repo", 2, 300)
+
+        assert ("repo", 1) not in _review_cooldowns
+        assert ("repo", 2) in _review_cooldowns
+
+    def test_record_triage_prunes_before_adding(self):
+        """_record_triage prunes expired entries before adding a new one."""
+        import time
+
+        from kai.webhook import _record_triage
+
+        _triage_cooldowns.clear()
+        # Add an old entry directly
+        _triage_cooldowns[("repo", 10)] = time.time() - 120
+
+        # Record a new triage - should prune the old entry first
+        _record_triage("repo", 20)
+
+        assert ("repo", 10) not in _triage_cooldowns
+        assert ("repo", 20) in _triage_cooldowns
 
 
 # ── PR review routing (integration tests) ──────────────────────────

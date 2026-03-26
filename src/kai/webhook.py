@@ -97,6 +97,24 @@ _ERROR_RECENCY_THRESHOLD = 600  # 10 minutes
 _review_cooldowns: dict[tuple[str, int], float] = {}
 
 
+def _prune_expired(cooldowns: dict[tuple[str, int], float], max_age: float) -> None:
+    """
+    Remove entries older than max_age seconds from a cooldown dict.
+
+    Called during record operations to prevent unbounded growth.
+    Builds a list of expired keys first to avoid mutating the dict
+    during iteration.
+
+    Args:
+        cooldowns: The cooldown dict to prune.
+        max_age: Maximum entry age in seconds.
+    """
+    now = time.time()
+    expired = [k for k, ts in cooldowns.items() if (now - ts) >= max_age]
+    for k in expired:
+        del cooldowns[k]
+
+
 def _should_skip_review(repo: str, pr_number: int, cooldown: int) -> bool:
     """
     Check if a PR was reviewed recently enough to skip this event.
@@ -116,10 +134,11 @@ def _should_skip_review(repo: str, pr_number: int, cooldown: int) -> bool:
     return (time.time() - last_review) < cooldown
 
 
-def _record_review(repo: str, pr_number: int) -> None:
+def _record_review(repo: str, pr_number: int, cooldown: float) -> None:
     """
     Record that a PR review was just initiated, updating the cooldown timestamp.
 
+    Prunes expired entries first to prevent unbounded dict growth.
     Called after a review is successfully launched (not after it completes,
     since the review runs as a background task and we want to prevent
     duplicate launches, not duplicate completions).
@@ -127,7 +146,9 @@ def _record_review(repo: str, pr_number: int) -> None:
     Args:
         repo: GitHub repo full name (e.g., "dcellison/kai").
         pr_number: The PR number.
+        cooldown: Cooldown period in seconds (used as pruning threshold).
     """
+    _prune_expired(_review_cooldowns, cooldown)
     _review_cooldowns[(repo, pr_number)] = time.time()
 
 
@@ -165,6 +186,7 @@ def _record_triage(repo: str, issue_number: int) -> None:
     """
     Record that an issue triage was just initiated.
 
+    Prunes expired entries first to prevent unbounded dict growth.
     Called after a triage is successfully launched (not after it completes,
     since the triage runs as a background task and we want to prevent
     duplicate launches, not duplicate completions).
@@ -173,6 +195,7 @@ def _record_triage(repo: str, issue_number: int) -> None:
         repo: GitHub repo full name (e.g., "dcellison/kai").
         issue_number: The issue number.
     """
+    _prune_expired(_triage_cooldowns, _TRIAGE_COOLDOWN_SECONDS)
     _triage_cooldowns[(repo, issue_number)] = time.time()
 
 
@@ -550,7 +573,7 @@ async def _handle_github(request: web.Request) -> web.Response:
                 log.info("Skipping review of %s PR #%d (cooldown)", repo, pr_number)
                 return web.json_response({"msg": "review_cooldown"})
 
-            _record_review(repo, pr_number)
+            _record_review(repo, pr_number, cooldown)
 
             # Resolve a local repo path for spec/convention loading.
             # Checks home workspace, WORKSPACE_BASE, ALLOWED_WORKSPACES,
