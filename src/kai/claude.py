@@ -694,6 +694,12 @@ class PersistentClaude:
         only sends a signal and is itself idempotent.
         """
         self._send_signal(signal.SIGKILL)
+        # Cancel the stderr drain so it does not outlive the process.
+        # For /stop, _kill() will cancel it again (harmless - cancel is
+        # idempotent). For eviction, this is the only cleanup point.
+        if self._stderr_task:
+            self._stderr_task.cancel()
+            self._stderr_task = None
 
     def _get_workspace_system_prompt(self) -> str | None:
         """

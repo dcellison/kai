@@ -253,6 +253,34 @@ class TestProcessSignals:
             # Should not raise
             claude._send_signal(signal.SIGKILL)
 
+    def test_force_kill_cancels_stderr_task(self):
+        """force_kill cancels the stderr drain task."""
+        claude = _make_claude()
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+
+        mock_task = MagicMock()
+        claude._stderr_task = mock_task
+
+        claude.force_kill()
+
+        mock_task.cancel.assert_called_once()
+        assert claude._stderr_task is None
+
+    def test_force_kill_no_stderr_task(self):
+        """force_kill works when _stderr_task is None."""
+        claude = _make_claude()
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+        claude._stderr_task = None
+
+        # Should not raise
+        claude.force_kill()
+
 
 # ── Properties ───────────────────────────────────────────────────────
 
