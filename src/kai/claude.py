@@ -224,7 +224,8 @@ class PersistentClaude:
                 current_user = None
             if effective_claude_user == current_user:
                 log.warning(
-                    "os_user %r matches the bot process user; skipping sudo (no isolation)",
+                    "claude_user %r matches the bot process user; "
+                    "skipping sudo (no isolation)",
                     effective_claude_user,
                 )
                 effective_claude_user = None
