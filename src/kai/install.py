@@ -1155,7 +1155,10 @@ def _cmd_apply() -> None:
             _start_service(platform, dry_run)
         except Exception:
             print("WARNING: Failed to restart service after apply.")
-            print("Manually restart with: sudo launchctl kickstart system/com.syrinx.kai")
+            if platform == "darwin":
+                print("Manually restart with: sudo launchctl kickstart system/com.syrinx.kai")
+            else:
+                print("Manually restart with: sudo systemctl start kai")
 
     # -- Summary --
     print()
