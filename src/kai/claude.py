@@ -695,8 +695,8 @@ class PersistentClaude:
         """
         self._send_signal(signal.SIGKILL)
         # Cancel the stderr drain so it does not outlive the process.
-        # For /stop, _kill() will cancel it again (harmless - cancel is
-        # idempotent). For eviction, this is the only cleanup point.
+        # For /stop, _kill() will see _stderr_task=None and skip its own
+        # cancel. For eviction, this is the only cleanup point.
         if self._stderr_task:
             self._stderr_task.cancel()
             self._stderr_task = None
