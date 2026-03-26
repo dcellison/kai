@@ -1486,7 +1486,12 @@ async def start(telegram_app, config) -> None:
     github_notify_raw = os.environ.get("GITHUB_NOTIFY_CHAT_ID", "")
     if github_notify_raw:
         try:
-            _app["github_notify_chat_id"] = int(github_notify_raw)
+            notify_id = int(github_notify_raw)
+            _app["github_notify_chat_id"] = notify_id
+            # Add to allowed_user_ids so _resolve_chat_id accepts it
+            # when review.py/triage.py POST to /api/send-message with
+            # the group chat_id in the body.
+            _app["allowed_user_ids"].add(notify_id)
         except ValueError:
             log.warning("Invalid GITHUB_NOTIFY_CHAT_ID: %s (ignoring)", github_notify_raw)
 
