@@ -373,6 +373,7 @@ class TestFileCleanupLoop:
         with (
             patch("kai.main.asyncio.sleep", side_effect=mock_sleep),
             patch.object(Path, "rglob", side_effect=PermissionError("denied")),
+            patch("kai.main.logging.exception") as mock_log,
         ):
             try:
                 await _file_cleanup_loop(30)
@@ -381,4 +382,6 @@ class TestFileCleanupLoop:
 
         # Loop ran twice (not terminated after first exception)
         assert call_count == 3
+        # Error was logged
+        mock_log.assert_called()
         # Should not raise - error is counted, not propagated
