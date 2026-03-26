@@ -194,7 +194,11 @@ async def search_related_issues(repo: str, title: str, body: str, issue_number: 
         raw = stdout.decode().strip() or "[]"
         try:
             issues = json.loads(raw)
-            # Exclude the current issue from its own related-issue results
+            if not isinstance(issues, list):
+                return "[]"
+            # Exclude the current issue from its own related-issue results.
+            # issue_number=0 (default) means no filtering; GitHub issues
+            # are 1-indexed so 0 is a safe "not provided" sentinel.
             if issue_number:
                 issues = [i for i in issues if i.get("number") != issue_number]
             return json.dumps(issues)
