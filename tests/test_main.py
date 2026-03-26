@@ -353,3 +353,32 @@ class TestFileCleanupLoop:
             except asyncio.CancelledError:
                 pass
         # Should not raise - error is counted, not propagated
+
+    @pytest.mark.asyncio
+    async def test_rglob_exception_does_not_kill_loop(self, tmp_path, monkeypatch):
+        """PermissionError from rglob is logged and the loop continues."""
+        monkeypatch.setattr("kai.main.DATA_DIR", tmp_path)
+        monkeypatch.setattr("kai.main._CLEANUP_STARTUP_DELAY", 0)
+        monkeypatch.setattr("kai.main._CLEANUP_INTERVAL", 0)
+        (tmp_path / "files").mkdir()
+
+        call_count = 0
+
+        async def mock_sleep(duration):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 2:
+                raise asyncio.CancelledError
+
+        with (
+            patch("kai.main.asyncio.sleep", side_effect=mock_sleep),
+            patch.object(Path, "rglob", side_effect=PermissionError("denied")),
+        ):
+            try:
+                await _file_cleanup_loop(30)
+            except asyncio.CancelledError:
+                pass
+
+        # Loop ran twice (not terminated after first exception)
+        assert call_count == 3
+        # Should not raise - error is counted, not propagated
