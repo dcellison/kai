@@ -1633,13 +1633,14 @@ class TestSavePrompt:
         claude = _make_claude()
         mock_proc = MagicMock()
         mock_proc.returncode = None
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdin.write = MagicMock()
         claude._proc = mock_proc
         claude._fresh_session = True
 
         await claude._save_prompt()
 
         # No stdin write should have occurred
-        mock_proc.stdin = MagicMock()
         mock_proc.stdin.write.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1709,8 +1710,26 @@ class TestSavePrompt:
         await claude._save_prompt()
 
     @pytest.mark.asyncio
-    async def test_stops_on_timeout(self):
-        """_save_prompt stops reading on timeout."""
+    async def test_stops_on_deadline_expired(self):
+        """_save_prompt exits when the deadline has elapsed."""
+        claude = _make_claude()
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdin.write = MagicMock()
+        mock_proc.stdin.drain = AsyncMock()
+        mock_proc.stdout = AsyncMock()
+        # readline should never be called if the deadline is already past
+        mock_proc.stdout.readline = AsyncMock(side_effect=AssertionError("should not be called"))
+        claude._proc = mock_proc
+        claude._fresh_session = False
+
+        # Use timeout=0 so deadline expires immediately after write
+        await claude._save_prompt(timeout=0)
+
+    @pytest.mark.asyncio
+    async def test_stops_on_readline_timeout(self):
+        """_save_prompt handles TimeoutError from readline."""
         claude = _make_claude()
         mock_proc = MagicMock()
         mock_proc.returncode = None
@@ -1722,9 +1741,7 @@ class TestSavePrompt:
         claude._proc = mock_proc
         claude._fresh_session = False
 
-        # Patch time so the deadline is already expired
-        with patch("kai.claude.time.monotonic", return_value=0):
-            await claude._save_prompt()
+        await claude._save_prompt(timeout=5)
 
     @pytest.mark.asyncio
     async def test_handles_json_parse_error(self):

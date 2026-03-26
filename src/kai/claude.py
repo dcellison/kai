@@ -370,7 +370,8 @@ class PersistentClaude:
                 self._session_age_hours(),
                 self.max_session_hours,
             )
-            await self._save_prompt()
+            # Shorter timeout for recycle since the user is waiting
+            await self._save_prompt(timeout=10)
             await self._kill()
 
         try:
@@ -702,13 +703,19 @@ class PersistentClaude:
             self._stderr_task.cancel()
             self._stderr_task = None
 
-    async def _save_prompt(self) -> None:
+    async def _save_prompt(self, timeout: float = 30) -> None:
         """
         Send a save prompt to the inner Claude before shutdown.
 
         Gives the subprocess a chance to persist useful context to MEMORY.md
         before it is killed. Best-effort: if the prompt times out or the
         process is unresponsive, the caller proceeds with shutdown anyway.
+
+        Args:
+            timeout: Maximum seconds to wait for the save operation.
+                Defaults to 30s for idle eviction/graceful shutdown.
+                Use a shorter value (e.g., 10s) for user-visible paths
+                like session recycle where latency matters.
 
         Prerequisites:
           - self._proc is alive and responsive
@@ -724,11 +731,10 @@ class PersistentClaude:
 
         save_msg = (
             "You are about to be shut down. Save anything worth remembering "
-            "from this session to your memory file, then respond with just "
-            "the word DONE. Only save genuinely useful information - user "
-            "preferences, personal facts, decisions, corrections, or "
-            "important context. Do not save session-specific details like "
-            "current task progress or temporary debugging state."
+            "from this session to your memory file. Only save genuinely "
+            "useful information - user preferences, personal facts, decisions, "
+            "corrections, or important context. Do not save session-specific "
+            "details like current task progress or temporary debugging state."
         )
 
         content = [{"type": "text", "text": save_msg}]
@@ -754,10 +760,10 @@ class PersistentClaude:
             return
 
         # Read and discard response lines until we see the result event or
-        # timeout. The 30-second timeout covers the entire save operation
-        # (read current memory, decide what to save, write file, respond).
+        # timeout. The timeout covers the entire save operation (read current
+        # memory, decide what to save, write file, respond).
         try:
-            deadline = time.monotonic() + 30
+            deadline = time.monotonic() + timeout
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
