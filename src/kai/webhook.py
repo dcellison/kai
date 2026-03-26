@@ -1272,7 +1272,7 @@ async def _handle_send_file(request: web.Request) -> web.Response:
 # ── Webhook health monitor ───────────────────────────────────────────
 
 
-async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str) -> None:
+async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str, chat_id: int) -> None:
     """
     Periodically check Telegram webhook health and re-register if needed.
 
@@ -1292,6 +1292,15 @@ async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str) -> No
 
     Condition 3 requires two consecutive checks to avoid false positives
     from normal message bursts (a single check catching in-flight updates).
+
+    If 3 consecutive health checks fail, the admin is notified once via
+    Telegram. The notification resets after a successful check.
+
+    Args:
+        bot: The Telegram bot instance.
+        webhook_url: The configured webhook URL.
+        webhook_secret: The Telegram webhook secret token.
+        chat_id: Admin chat ID for failure notifications.
     """
     await asyncio.sleep(_HEALTH_CHECK_INTERVAL)  # skip the first check (just registered)
 
@@ -1299,6 +1308,8 @@ async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str) -> No
     # reading is normal (messages in flight); two in a row means delivery
     # is stalled - Telegram is queuing but not successfully pushing.
     prev_pending: int = 0
+    consecutive_failures: int = 0
+    failure_notified: bool = False
 
     while True:
         try:
@@ -1341,10 +1352,28 @@ async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str) -> No
                 # immediately trigger again on the next check
                 prev_pending = 0
 
+            consecutive_failures = 0
+            failure_notified = False
+
         except Exception:
             # Don't let a failed health check kill the monitor loop.
             # Network blips, API rate limits, etc. are transient.
             log.exception("Webhook health check failed")
+            consecutive_failures += 1
+
+            # Notify admin once after 3 consecutive failures (15 min of
+            # downtime at the 5-minute check interval). Don't spam - only
+            # notify once until a successful check resets the flag.
+            if consecutive_failures >= 3 and not failure_notified:
+                try:
+                    await bot.send_message(
+                        chat_id,
+                        "Webhook health monitor has failed 3 consecutive checks. Self-healing may be degraded.",
+                    )
+                    failure_notified = True
+                except Exception:
+                    # If we can't even reach Telegram, just log it.
+                    log.warning("Could not send health monitor failure notification")
 
         await asyncio.sleep(_HEALTH_CHECK_INTERVAL)
 
@@ -1507,6 +1536,7 @@ async def start(telegram_app, config) -> None:
                 telegram_app.bot,
                 config.telegram_webhook_url,
                 config.telegram_webhook_secret,
+                _app["chat_id"],
             )
         )
 

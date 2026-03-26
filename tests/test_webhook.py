@@ -1,5 +1,6 @@
 """Tests for webhook.py pure functions and GitHub event formatters."""
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -24,6 +25,7 @@ from kai.webhook import (
     _strip_markdown,
     _triage_cooldowns,
     _verify_github_signature,
+    _webhook_health_loop,
 )
 
 # ── _verify_github_signature ─────────────────────────────────────────
@@ -996,3 +998,114 @@ class TestGitHubExceptionHandler:
                 },
             )
             assert resp.status == 200
+
+
+# ── Webhook health monitor ─────────────────────────────────────────
+
+
+class TestWebhookHealthMonitor:
+    """Tests for consecutive failure tracking and admin notification."""
+
+    @pytest.mark.asyncio
+    async def test_failure_counter_increments(self):
+        """Consecutive failures increment on exception."""
+        bot = AsyncMock()
+        bot.get_webhook_info = AsyncMock(side_effect=RuntimeError("API down"))
+
+        call_count = 0
+
+        async def mock_sleep(_duration):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 2:
+                raise asyncio.CancelledError
+
+        with patch("kai.webhook.asyncio.sleep", side_effect=mock_sleep):
+            try:
+                await _webhook_health_loop(bot, "https://example.com/webhook", "secret", 12345)
+            except asyncio.CancelledError:
+                pass
+
+        # Two failed checks (first sleep skips initial check, then two iterations)
+        # Bot should not have been asked to send a notification (threshold is 3)
+        bot.send_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_notification_after_three_failures(self):
+        """Admin is notified after 3 consecutive failures."""
+        bot = AsyncMock()
+        bot.get_webhook_info = AsyncMock(side_effect=RuntimeError("API down"))
+        bot.send_message = AsyncMock()
+
+        call_count = 0
+
+        async def mock_sleep(_duration):
+            nonlocal call_count
+            call_count += 1
+            # First sleep is the initial skip, then 4 more iterations
+            if call_count > 4:
+                raise asyncio.CancelledError
+
+        with patch("kai.webhook.asyncio.sleep", side_effect=mock_sleep):
+            try:
+                await _webhook_health_loop(bot, "https://example.com/webhook", "secret", 12345)
+            except asyncio.CancelledError:
+                pass
+
+        # Notification sent exactly once after 3 failures
+        bot.send_message.assert_called_once()
+        args = bot.send_message.call_args
+        assert args[0][0] == 12345
+        assert "3 consecutive" in args[0][1]
+
+    @pytest.mark.asyncio
+    async def test_counter_resets_on_success(self):
+        """Successful check resets failure counter and notification flag."""
+        bot = AsyncMock()
+        # First two calls fail, third succeeds
+        mock_info = AsyncMock()
+        mock_info.url = "https://example.com/webhook"
+        mock_info.last_error_date = None
+        mock_info.pending_update_count = 0
+        bot.get_webhook_info = AsyncMock(side_effect=[RuntimeError("fail"), RuntimeError("fail"), mock_info])
+
+        call_count = 0
+
+        async def mock_sleep(_duration):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 3:
+                raise asyncio.CancelledError
+
+        with patch("kai.webhook.asyncio.sleep", side_effect=mock_sleep):
+            try:
+                await _webhook_health_loop(bot, "https://example.com/webhook", "secret", 12345)
+            except asyncio.CancelledError:
+                pass
+
+        # No notification (only 2 consecutive failures, then recovery)
+        bot.send_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failed_notification_does_not_crash(self):
+        """If the notification itself fails, the loop continues."""
+        bot = AsyncMock()
+        bot.get_webhook_info = AsyncMock(side_effect=RuntimeError("API down"))
+        bot.send_message = AsyncMock(side_effect=RuntimeError("Telegram unreachable"))
+
+        call_count = 0
+
+        async def mock_sleep(_duration):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 4:
+                raise asyncio.CancelledError
+
+        with patch("kai.webhook.asyncio.sleep", side_effect=mock_sleep):
+            try:
+                await _webhook_health_loop(bot, "https://example.com/webhook", "secret", 12345)
+            except asyncio.CancelledError:
+                pass
+
+        # send_message was attempted but failed - loop didn't crash
+        bot.send_message.assert_called()
