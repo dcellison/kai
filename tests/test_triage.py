@@ -995,7 +995,9 @@ class TestApplyTriageNotifyChatId:
             mock_resp = AsyncMock()
             mock_resp.status = 200
             mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+            mock_session.post.return_value.__aexit__ = AsyncMock(return_value=False)
             mock_session_cls.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_session_cls.return_value.__aexit__ = AsyncMock(return_value=False)
             await apply_triage(meta, result, 8080, "secret", notify_chat_id=-100999)
 
         # The Telegram summary POST should include chat_id
