@@ -539,11 +539,7 @@ async def _handle_github(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         return web.Response(status=400, text="Invalid JSON")
 
-    # Top-level exception handler for all post-validation logic.
-    # Returns 500 on any unexpected error so GitHub sees a clean response
-    # rather than aiohttp's default error handler. GitHub retries 5xx
-    # responses, but a deterministic error (e.g., KeyError from an unusual
-    # payload shape) would fail the same way each time regardless.
+    # Catch unexpected exceptions so GitHub gets a clean 500 rather than an aiohttp traceback.
     try:
         return await _process_github_event(request, payload, event_type)
     except Exception:
@@ -556,8 +552,7 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
     Process a validated GitHub webhook event.
 
     Handles user routing, PR review dispatch, issue triage dispatch,
-    event formatting, and Telegram delivery. Extracted from _handle_github
-    so the caller can wrap it in a top-level exception handler.
+    event formatting, and Telegram delivery.
     """
     bot = request.app["telegram_bot"]
 
