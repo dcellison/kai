@@ -1089,58 +1089,73 @@ def _cmd_apply() -> None:
     # -- Stop service before making changes --
     _stop_service(platform, dry_run)
 
-    # -- Step 1: Create directories --
-    # Resolve WORKSPACE_BASE, expanding ~ relative to the service user's home
-    # (not root's, since we're running under sudo).
-    ws_base_raw = env.get("WORKSPACE_BASE", "")
-    ws_base: Path | None = None
-    if ws_base_raw:
-        if ws_base_raw.startswith("~"):
-            svc_home = _user_home(service_user)
-            # Strip ~ or ~/ prefix, then join with the service user's home.
-            # Bare "~" produces an empty suffix, which resolves to svc_home itself.
-            suffix = ws_base_raw.removeprefix("~").lstrip("/")
-            ws_base = Path(svc_home) / suffix if suffix else Path(svc_home)
-        else:
-            ws_base = Path(ws_base_raw)
-    _apply_directories(install_path, data_path, svc_uid, svc_gid, dry_run, ws_base)
+    try:
+        # -- Step 1: Create directories --
+        # Resolve WORKSPACE_BASE, expanding ~ relative to the service user's home
+        # (not root's, since we're running under sudo).
+        ws_base_raw = env.get("WORKSPACE_BASE", "")
+        ws_base: Path | None = None
+        if ws_base_raw:
+            if ws_base_raw.startswith("~"):
+                svc_home = _user_home(service_user)
+                # Strip ~ or ~/ prefix, then join with the service user's home.
+                # Bare "~" produces an empty suffix, which resolves to svc_home itself.
+                suffix = ws_base_raw.removeprefix("~").lstrip("/")
+                ws_base = Path(svc_home) / suffix if suffix else Path(svc_home)
+            else:
+                ws_base = Path(ws_base_raw)
+        _apply_directories(install_path, data_path, svc_uid, svc_gid, dry_run, ws_base)
 
-    # Warn about traversal issues for workspace paths. These are non-fatal
-    # since the user may fix permissions separately after install.
-    ws_paths: list[Path] = []
-    if ws_base:
-        ws_paths.append(ws_base)
-    ws_paths.extend(_parse_workspaces(env))
-    for ws_path in ws_paths:
-        warning = _check_traversal(ws_path, service_user)
-        if warning:
-            print(f"  WARNING: {warning}")
+        # Warn about traversal issues for workspace paths. These are non-fatal
+        # since the user may fix permissions separately after install.
+        ws_paths: list[Path] = []
+        if ws_base:
+            ws_paths.append(ws_base)
+        ws_paths.extend(_parse_workspaces(env))
+        for ws_path in ws_paths:
+            warning = _check_traversal(ws_path, service_user)
+            if warning:
+                print(f"  WARNING: {warning}")
 
-    # -- Step 2: Copy source --
-    _apply_source(install_path, svc_uid, svc_gid, dry_run)
+        # -- Step 2: Copy source --
+        _apply_source(install_path, svc_uid, svc_gid, dry_run)
 
-    # -- Step 3: Create/update venv --
-    _apply_venv(install_path, is_update, dry_run)
+        # -- Step 3: Create/update venv --
+        _apply_venv(install_path, is_update, dry_run)
 
-    # -- Step 4: Copy models (if they exist in source) --
-    _apply_models(install_path, dry_run)
+        # -- Step 4: Copy models (if they exist in source) --
+        _apply_models(install_path, dry_run)
 
-    # -- Step 5: Write secrets --
-    _apply_secrets(env, dry_run)
+        # -- Step 5: Write secrets --
+        _apply_secrets(env, dry_run)
 
-    # -- Step 6: Configure sudoers --
-    claude_user = env.get("CLAUDE_USER") or None
-    _apply_sudoers(service_user, dry_run, claude_user)
+        # -- Step 6: Configure sudoers --
+        claude_user = env.get("CLAUDE_USER") or None
+        _apply_sudoers(service_user, dry_run, claude_user)
 
-    # -- Step 7: Migrate runtime data --
-    _apply_migrate(data_path, install_path, svc_uid, svc_gid, dry_run)
+        # -- Step 7: Migrate runtime data --
+        _apply_migrate(data_path, install_path, svc_uid, svc_gid, dry_run)
 
-    # -- Step 8: Generate service definition --
-    webhook_port = int(env.get("WEBHOOK_PORT", "8080"))
-    _apply_service(install_dir, data_dir, service_user, platform, dry_run, webhook_port)
-
-    # -- Start service after all changes --
-    _start_service(platform, dry_run)
+        # -- Step 8: Generate service definition --
+        webhook_port = int(env.get("WEBHOOK_PORT", "8080"))
+        _apply_service(install_dir, data_dir, service_user, platform, dry_run, webhook_port)
+    except Exception:
+        print("\nInstallation failed. See error above.")
+        print("The installation may be in a partial state.")
+        print("Fix the issue and re-run: sudo python -m kai install apply")
+        raise
+    finally:
+        # Always restart the service, even after failure. A partially updated
+        # installation is better than an offline bot. Most steps are idempotent,
+        # so re-running apply after fixing the cause will complete the update.
+        # Wrapped in its own try/except so a start failure does not mask the
+        # original exception (Python replaces the propagating exception if
+        # finally raises).
+        try:
+            _start_service(platform, dry_run)
+        except Exception:
+            print("WARNING: Failed to restart service after apply.")
+            print("Manually restart with: sudo launchctl kickstart system/com.syrinx.kai")
 
     # -- Summary --
     print()
