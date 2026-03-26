@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kai"
-version = "1.2.0"
+version = "1.3.0"
 description = "Telegram gateway to Claude Code CLI"
 license = "Apache-2.0"
 requires-python = ">=3.13"
