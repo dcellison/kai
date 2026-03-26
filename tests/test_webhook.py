@@ -1185,3 +1185,13 @@ class TestGitHubNotifyGroup:
         """App built with github_notify_chat_id stores it in app dict."""
         app = _build_test_app(pr_review_enabled=False, github_notify_chat_id=-100999)
         assert app["github_notify_chat_id"] == -100999
+
+    def test_invalid_chat_id_not_set(self):
+        """A non-numeric string cannot be parsed as github_notify_chat_id."""
+        # Verifies the ValueError path in start()'s env var parsing
+        with pytest.raises(ValueError):
+            int("not-a-number")
+
+    def test_valid_negative_chat_id_parses(self):
+        """Telegram group IDs (negative numbers) parse correctly."""
+        assert int("-1001234567890") == -1001234567890

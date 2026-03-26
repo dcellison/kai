@@ -968,3 +968,40 @@ class TestSendErrorNotification:
 
         body = mock_session.post.call_args[1]["json"]
         assert "chat_id" not in body
+
+
+# ── apply_triage notify_chat_id ──────────────────────────────────────
+
+
+class TestApplyTriageNotifyChatId:
+    """Verify apply_triage threads notify_chat_id into the POST body."""
+
+    @pytest.mark.asyncio
+    async def test_chat_id_in_triage_summary(self):
+        """apply_triage includes chat_id in the Telegram summary POST when set."""
+        meta = _make_metadata(labels=[])
+        result = _triage_result(labels=["bug"])
+
+        async def mock_exec(*args, **kwargs):
+            if "label" in args and "list" in args and "--search" in args:
+                return _mock_subprocess(stdout="[]")
+            return _mock_subprocess(stdout="")
+
+        with (
+            patch("kai.triage.asyncio.create_subprocess_exec", side_effect=mock_exec),
+            patch("kai.triage.aiohttp.ClientSession") as mock_session_cls,
+        ):
+            mock_session = AsyncMock()
+            mock_resp = AsyncMock()
+            mock_resp.status = 200
+            mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+            mock_session_cls.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            await apply_triage(meta, result, 8080, "secret", notify_chat_id=-100999)
+
+        # The Telegram summary POST should include chat_id
+        post_calls = mock_session.post.call_args_list
+        # Find the send-message call (URL contains /api/send-message)
+        summary_call = [c for c in post_calls if "/api/send-message" in str(c)]
+        assert len(summary_call) >= 1
+        body = summary_call[0][1]["json"]
+        assert body["chat_id"] == -100999
