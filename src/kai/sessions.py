@@ -53,12 +53,19 @@ async def init_db(db_path: Path) -> None:
     Called once at startup from main.py. Uses aiosqlite.Row as the row
     factory so query results can be accessed by column name.
 
+    All DDL (CREATE TABLE, ALTER TABLE, migrations) runs inside a single
+    explicit transaction. On failure, ROLLBACK undoes everything - the
+    database is either fully initialized or completely unchanged. SQLite
+    supports transactional DDL, unlike PostgreSQL and MySQL.
+
     Args:
         db_path: Path to the SQLite database file (created if missing).
     """
     global _db
     _db = await aiosqlite.connect(str(db_path))
     _get_db().row_factory = aiosqlite.Row
+    # PRAGMAs are database configuration, not schema. They must execute
+    # before any transaction begins.
     # WAL mode allows concurrent readers during writes, which prevents
     # multi-user requests from blocking each other on the database.
     # busy_timeout retries for 5 seconds on lock contention instead of
@@ -68,90 +75,100 @@ async def init_db(db_path: Path) -> None:
         if row and row[0] != "wal":
             log.warning("Failed to enable WAL mode; journal_mode is %s", row[0])
     await _get_db().execute("PRAGMA busy_timeout=5000")
-    await _get_db().execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            chat_id INTEGER PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            model TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            total_cost_usd REAL DEFAULT 0.0
-        )
-    """)
-    await _get_db().execute("""
-        CREATE TABLE IF NOT EXISTS jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            job_type TEXT NOT NULL,
-            prompt TEXT NOT NULL,
-            schedule_type TEXT NOT NULL,
-            schedule_data TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            active INTEGER DEFAULT 1,
-            auto_remove INTEGER DEFAULT 0,
-            notify_on_check INTEGER DEFAULT 0
-        )
-    """)
 
-    # Schema evolution: add notify_on_check column to existing databases that don't have it
-    cursor = await _get_db().execute("PRAGMA table_info(jobs)")
-    columns = [row[1] for row in await cursor.fetchall()]
-    if "notify_on_check" not in columns:
-        await _get_db().execute("ALTER TABLE jobs ADD COLUMN notify_on_check INTEGER DEFAULT 0")
-    await _get_db().execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-    """)
-    await _get_db().execute("""
-        CREATE TABLE IF NOT EXISTS workspace_history (
-            path TEXT NOT NULL,
-            chat_id INTEGER NOT NULL,
-            last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (path, chat_id)
-        )
-    """)
-    # Schema evolution: migrate old workspace_history tables (path-only PK)
-    # to the new composite PK (path, chat_id). SQLite does not support
-    # ALTER TABLE to change primary keys, so we recreate the table.
-    # Existing rows get chat_id=0; main.py calls backfill_workspace_history()
-    # to assign them to the admin user.
-    cursor = await _get_db().execute("PRAGMA table_info(workspace_history)")
-    ws_columns = [row[1] for row in await cursor.fetchall()]
-    if "chat_id" not in ws_columns:
-        # Recreate with composite PK: copy data, drop old, rename new.
-        # Use executescript() which runs all statements atomically in a
-        # single call, avoiding reliance on Python's sqlite3 transaction
-        # suppression rules and aiosqlite's internal locking for DDL.
-        try:
-            await _get_db().executescript("""
-                BEGIN IMMEDIATE;
+    # BEGIN IMMEDIATE acquires the write lock up front rather than on
+    # the first write statement, preventing a deadlock if another
+    # connection holds a read lock during our init sequence.
+    await _get_db().execute("BEGIN IMMEDIATE")
+    try:
+        log.debug("Creating sessions table")
+        await _get_db().execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                chat_id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                model TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                total_cost_usd REAL DEFAULT 0.0
+            )
+        """)
+        log.debug("Creating jobs table")
+        await _get_db().execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                job_type TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                schedule_type TEXT NOT NULL,
+                schedule_data TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                active INTEGER DEFAULT 1,
+                auto_remove INTEGER DEFAULT 0,
+                notify_on_check INTEGER DEFAULT 0
+            )
+        """)
+
+        # Schema evolution: add notify_on_check column to existing
+        # databases that don't have it
+        cursor = await _get_db().execute("PRAGMA table_info(jobs)")
+        columns = [row[1] for row in await cursor.fetchall()]
+        if "notify_on_check" not in columns:
+            log.debug("Adding notify_on_check column to jobs table")
+            await _get_db().execute("ALTER TABLE jobs ADD COLUMN notify_on_check INTEGER DEFAULT 0")
+
+        log.debug("Creating settings table")
+        await _get_db().execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        log.debug("Creating workspace_history table")
+        await _get_db().execute("""
+            CREATE TABLE IF NOT EXISTS workspace_history (
+                path TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (path, chat_id)
+            )
+        """)
+
+        # Schema evolution: migrate old workspace_history tables (path-only
+        # PK) to the new composite PK (path, chat_id). SQLite does not
+        # support ALTER TABLE to change primary keys, so we recreate the
+        # table. Existing rows get chat_id=0; main.py calls
+        # backfill_workspace_history() to assign them to the admin user.
+        # Individual execute() calls (not executescript) so they participate
+        # in the outer transaction naturally.
+        cursor = await _get_db().execute("PRAGMA table_info(workspace_history)")
+        ws_columns = [row[1] for row in await cursor.fetchall()]
+        if "chat_id" not in ws_columns:
+            log.debug("Migrating workspace_history to composite PK (path, chat_id)")
+            await _get_db().execute("""
                 CREATE TABLE workspace_history_new (
                     path TEXT NOT NULL,
                     chat_id INTEGER NOT NULL DEFAULT 0,
                     last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (path, chat_id)
-                );
-                INSERT INTO workspace_history_new (path, last_used_at)
-                    SELECT path, last_used_at FROM workspace_history;
-                DROP TABLE workspace_history;
-                ALTER TABLE workspace_history_new RENAME TO workspace_history;
-                COMMIT;
+                )
             """)
+            await _get_db().execute("""
+                INSERT INTO workspace_history_new (path, last_used_at)
+                    SELECT path, last_used_at FROM workspace_history
+            """)
+            await _get_db().execute("DROP TABLE workspace_history")
+            await _get_db().execute("ALTER TABLE workspace_history_new RENAME TO workspace_history")
+
+        await _get_db().execute("COMMIT")
+    except Exception:
+        # Roll back the entire init sequence. The database is left in its
+        # pre-init state (no partial tables, no half-migrated schema).
+        try:
+            await _get_db().execute("ROLLBACK")
         except Exception:
-            # executescript() does not auto-rollback on failure. Clean up
-            # the open transaction so the long-lived connection is reusable.
-            try:
-                await _get_db().execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-    # Commit any pending DML from earlier in init_db (e.g., ALTER TABLE
-    # ADD COLUMN for jobs). No-op after a successful migration since
-    # executescript's COMMIT already committed.
-    await _get_db().commit()
+            pass
+        raise
 
 
 # ── Session management ───────────────────────────────────────────────

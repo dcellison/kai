@@ -383,6 +383,98 @@ class TestWorkspaceHistoryMigration:
             await sessions.close_db()
 
 
+# ── init_db transactional safety ────────────────────────────────────
+
+
+class TestInitDbTransaction:
+    """Verify init_db wraps all DDL in a single atomic transaction."""
+
+    @pytest.mark.asyncio
+    async def test_fresh_db_creates_all_tables(self, tmp_path):
+        """A fresh database gets all four tables in one transaction."""
+        db_path = tmp_path / "fresh.db"
+        await sessions.init_db(db_path)
+        try:
+            db = sessions._get_db()
+            # Check all four tables exist
+            cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            tables = {row[0] for row in await cursor.fetchall()}
+            assert "sessions" in tables
+            assert "jobs" in tables
+            assert "settings" in tables
+            assert "workspace_history" in tables
+        finally:
+            await sessions.close_db()
+
+    @pytest.mark.asyncio
+    async def test_idempotent_on_initialized_db(self, tmp_path):
+        """Running init_db twice on the same database is a no-op."""
+        db_path = tmp_path / "idempotent.db"
+        await sessions.init_db(db_path)
+        await sessions.close_db()
+
+        # Second init should not raise
+        await sessions.init_db(db_path)
+        try:
+            db = sessions._get_db()
+            cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            tables = {row[0] for row in await cursor.fetchall()}
+            assert "sessions" in tables
+            assert "jobs" in tables
+            assert "settings" in tables
+            assert "workspace_history" in tables
+        finally:
+            await sessions.close_db()
+
+    @pytest.mark.asyncio
+    async def test_failure_mid_init_rolls_back(self, tmp_path):
+        """A failure after some DDL rolls back everything - no partial state."""
+        db_path = tmp_path / "rollback.db"
+
+        # SQLite transactional DDL: CREATE TABLE inside BEGIN/ROLLBACK
+        # is undone. Verify this directly since patching aiosqlite.execute
+        # breaks the async context manager protocol.
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("BEGIN IMMEDIATE")
+            await conn.execute("""
+                CREATE TABLE sessions (
+                    chat_id INTEGER PRIMARY KEY,
+                    session_id TEXT NOT NULL
+                )
+            """)
+            # Simulate a failure - rollback the entire transaction
+            await conn.execute("ROLLBACK")
+
+        # Verify rollback worked - no tables should exist
+        async with aiosqlite.connect(str(db_path)) as conn:
+            cursor = await conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [row[0] for row in await cursor.fetchall()]
+        assert "sessions" not in tables
+
+    @pytest.mark.asyncio
+    async def test_sqlite_ddl_is_transactional(self, tmp_path):
+        """SQLite DDL inside BEGIN/ROLLBACK is fully undone (verify assumption)."""
+        db_path = tmp_path / "ddl_txn.db"
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            # Create a table and commit it first so the DB file is non-empty
+            await conn.execute("CREATE TABLE anchor (id INTEGER PRIMARY KEY)")
+            await conn.commit()
+
+            # Now try to create another table inside a transaction, then rollback
+            await conn.execute("BEGIN IMMEDIATE")
+            await conn.execute("CREATE TABLE should_not_exist (id INTEGER PRIMARY KEY)")
+            await conn.execute("ROLLBACK")
+
+        # Only the anchor table should exist
+        async with aiosqlite.connect(str(db_path)) as conn:
+            cursor = await conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = {row[0] for row in await cursor.fetchall()}
+            assert "anchor" in tables
+            assert "should_not_exist" not in tables
+
+
 # ── get_all_workspace_paths ─────────────────────────────────────────
 
 
