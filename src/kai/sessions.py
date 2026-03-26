@@ -76,11 +76,11 @@ async def init_db(db_path: Path) -> None:
             log.warning("Failed to enable WAL mode; journal_mode is %s", row[0])
     await _get_db().execute("PRAGMA busy_timeout=5000")
 
-    # BEGIN IMMEDIATE acquires the write lock up front rather than on
-    # the first write statement, preventing a deadlock if another
-    # connection holds a read lock during our init sequence.
-    await _get_db().execute("BEGIN IMMEDIATE")
     try:
+        # BEGIN IMMEDIATE acquires the write lock up front rather than on
+        # the first write statement, preventing a deadlock if another
+        # connection holds a read lock during our init sequence.
+        await _get_db().execute("BEGIN IMMEDIATE")
         log.debug("Creating sessions table")
         await _get_db().execute("""
             CREATE TABLE IF NOT EXISTS sessions (
