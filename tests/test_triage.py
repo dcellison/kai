@@ -223,6 +223,46 @@ class TestSearchRelatedIssues:
             result = await search_related_issues("owner/repo", "Test issue", "body")
         assert result == "[]"
 
+    @pytest.mark.asyncio
+    async def test_excludes_current_issue(self):
+        """The current issue is excluded from its own search results."""
+        results = [
+            {"number": 10, "title": "Related issue"},
+            {"number": 42, "title": "Current issue"},
+            {"number": 20, "title": "Another related"},
+        ]
+        mock_proc = _mock_subprocess(stdout=json.dumps(results))
+
+        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await search_related_issues("owner/repo", "Test", "body", issue_number=42)
+
+        parsed = json.loads(result)
+        numbers = [i["number"] for i in parsed]
+        assert 42 not in numbers
+        assert 10 in numbers
+        assert 20 in numbers
+
+    @pytest.mark.asyncio
+    async def test_empty_after_exclusion(self):
+        """If the current issue is the only result, returns empty list."""
+        results = [{"number": 42, "title": "Only me"}]
+        mock_proc = _mock_subprocess(stdout=json.dumps(results))
+
+        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await search_related_issues("owner/repo", "Test", "body", issue_number=42)
+
+        assert json.loads(result) == []
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_returns_empty(self):
+        """Invalid JSON from gh is handled gracefully."""
+        mock_proc = _mock_subprocess(stdout="not valid json at all")
+
+        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await search_related_issues("owner/repo", "Test", "body", issue_number=1)
+
+        assert result == "[]"
+
 
 # ── list_projects ───────────────────────────────────────────────────
 

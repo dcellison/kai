@@ -141,7 +141,7 @@ def _sanitize_search_query(title: str) -> str:
     return cleaned[:128]
 
 
-async def search_related_issues(repo: str, title: str, body: str) -> str:
+async def search_related_issues(repo: str, title: str, body: str, issue_number: int = 0) -> str:
     """
     Search for related issues in the repo using the GitHub CLI.
 
@@ -149,10 +149,14 @@ async def search_related_issues(repo: str, title: str, body: str) -> str:
     gh issue list. The query is sanitized before use since titles are
     user-controlled, untrusted input.
 
+    When issue_number is provided, the current issue is excluded from the
+    results to prevent it from appearing in its own related-issue list.
+
     Args:
         repo: Full repository name (e.g., "dcellison/kai").
         title: Issue title to extract search terms from.
         body: Issue body (unused for now, reserved for future relevance).
+        issue_number: The issue being triaged (excluded from results).
 
     Returns:
         JSON string of related issues. Returns "[]" on any failure rather
@@ -187,7 +191,16 @@ async def search_related_issues(repo: str, title: str, body: str) -> str:
             log.warning("gh issue list --search failed for %s: %s", repo, error)
             return "[]"
 
-        return stdout.decode().strip() or "[]"
+        raw = stdout.decode().strip() or "[]"
+        try:
+            issues = json.loads(raw)
+            # Exclude the current issue from its own related-issue results
+            if issue_number:
+                issues = [i for i in issues if i.get("number") != issue_number]
+            return json.dumps(issues)
+        except json.JSONDecodeError:
+            log.warning("Invalid JSON from gh issue list --search for %s", repo)
+            return "[]"
     except Exception:
         log.exception("Failed to search related issues for %s", repo)
         return "[]"
@@ -770,7 +783,7 @@ async def triage_issue(
         metadata = extract_issue_metadata(payload)
 
         # Step 1: Search for related/duplicate issues
-        related_issues = await search_related_issues(metadata.repo, metadata.title, metadata.body)
+        related_issues = await search_related_issues(metadata.repo, metadata.title, metadata.body, metadata.number)
 
         # Step 2: List available project boards
         owner = metadata.repo.split("/")[0]
