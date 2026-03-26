@@ -1669,6 +1669,22 @@ class TestSavePrompt:
         await claude._save_prompt()
 
     @pytest.mark.asyncio
+    async def test_handles_drain_runtime_error(self):
+        """_save_prompt handles RuntimeError from drain() gracefully."""
+        claude = _make_claude()
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdin.write = MagicMock()
+        mock_proc.stdin.drain = AsyncMock(side_effect=RuntimeError("transport closed"))
+        mock_proc.stdout = AsyncMock()
+        claude._proc = mock_proc
+        claude._fresh_session = False
+
+        # Should not raise
+        await claude._save_prompt()
+
+    @pytest.mark.asyncio
     async def test_stops_on_result_event(self):
         """_save_prompt stops reading when it sees a result event."""
         claude = _make_claude()
@@ -1865,7 +1881,7 @@ class TestSavePrompt:
             try:
                 async for _ in claude._send_locked("test", chat_id=123):
                     pass
-            except (AssertionError, StopAsyncIteration):
+            except (StopAsyncIteration, AttributeError, TypeError):
                 pass  # Expected - no real process after kill
 
         assert call_order[0] == "save_prompt_timeout=10"
