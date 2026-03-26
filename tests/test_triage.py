@@ -914,3 +914,57 @@ class TestSendErrorNotification:
             await _send_error_notification(metadata, "test error", 8080, "secret")
 
         assert "Failed to send triage error notification" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_notify_chat_id_included_in_body(self):
+        """When notify_chat_id is set, chat_id is included in the POST body."""
+        metadata = IssueMetadata(
+            repo="owner/repo",
+            number=42,
+            title="Test issue",
+            body="body",
+            author="user",
+            url="https://github.com/owner/repo/issues/42",
+            labels=[],
+        )
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_session = AsyncMock()
+        mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kai.triage.aiohttp.ClientSession") as mock_cs:
+            mock_cs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_cs.return_value.__aexit__ = AsyncMock(return_value=False)
+            await _send_error_notification(metadata, "test error", 8080, "secret", notify_chat_id=-100999)
+
+        body = mock_session.post.call_args[1]["json"]
+        assert body["chat_id"] == -100999
+
+    @pytest.mark.asyncio
+    async def test_no_chat_id_when_notify_none(self):
+        """When notify_chat_id is None, chat_id is NOT in the POST body."""
+        metadata = IssueMetadata(
+            repo="owner/repo",
+            number=42,
+            title="Test issue",
+            body="body",
+            author="user",
+            url="https://github.com/owner/repo/issues/42",
+            labels=[],
+        )
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_session = AsyncMock()
+        mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kai.triage.aiohttp.ClientSession") as mock_cs:
+            mock_cs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_cs.return_value.__aexit__ = AsyncMock(return_value=False)
+            await _send_error_notification(metadata, "test error", 8080, "secret", notify_chat_id=None)
+
+        body = mock_session.post.call_args[1]["json"]
+        assert "chat_id" not in body

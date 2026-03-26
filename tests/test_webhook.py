@@ -387,6 +387,7 @@ def _build_test_app(
     pr_review_enabled: bool = True,
     cooldown: int = 300,
     issue_triage_enabled: bool = False,
+    github_notify_chat_id: int | None = None,
 ) -> web.Application:
     """Build a minimal aiohttp app with _handle_github wired up."""
     app = web.Application()
@@ -408,6 +409,8 @@ def _build_test_app(
     mock_bot = AsyncMock()
     app["telegram_bot"] = mock_bot
     app["chat_id"] = 12345
+    if github_notify_chat_id is not None:
+        app["github_notify_chat_id"] = github_notify_chat_id
     app.router.add_post("/webhook/github", _handle_github)
     return app
 
@@ -1109,3 +1112,76 @@ class TestWebhookHealthMonitor:
 
         # send_message was attempted exactly once (not retried after failure)
         bot.send_message.assert_called_once()
+
+
+# ── GitHub notification group routing ────────────────────────────────
+
+
+class TestGitHubNotifyGroup:
+    """Tests for routing GitHub notifications to a separate Telegram group."""
+
+    @pytest.mark.asyncio
+    async def test_notification_routes_to_group(self, _clear_cooldowns):
+        """When github_notify_chat_id is set, notifications go to the group."""
+        app = _build_test_app(pr_review_enabled=False, github_notify_chat_id=-100999)
+        payload = {
+            "ref": "refs/heads/main",
+            "commits": [{"message": "test", "author": {"name": "dev"}}],
+            "repository": {"full_name": "owner/repo"},
+            "compare": "https://github.com/owner/repo/compare/a...b",
+        }
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/webhook/github",
+                data=body,
+                headers={
+                    "X-GitHub-Event": "push",
+                    "X-Hub-Signature-256": sig,
+                },
+            )
+            assert resp.status == 200
+
+        # Notification should go to the group chat_id, not the default DM
+        call_args = app["telegram_bot"].send_message.call_args
+        assert call_args[0][0] == -100999
+
+    @pytest.mark.asyncio
+    async def test_notification_routes_to_dm_when_unset(self, _clear_cooldowns):
+        """When github_notify_chat_id is not set, notifications go to DM."""
+        app = _build_test_app(pr_review_enabled=False)
+        payload = {
+            "ref": "refs/heads/main",
+            "commits": [{"message": "test", "author": {"name": "dev"}}],
+            "repository": {"full_name": "owner/repo"},
+            "compare": "https://github.com/owner/repo/compare/a...b",
+        }
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/webhook/github",
+                data=body,
+                headers={
+                    "X-GitHub-Event": "push",
+                    "X-Hub-Signature-256": sig,
+                },
+            )
+            assert resp.status == 200
+
+        # Notification should go to the default admin DM (12345)
+        call_args = app["telegram_bot"].send_message.call_args
+        assert call_args[0][0] == 12345
+
+    def test_app_without_group_has_no_key(self):
+        """App built without github_notify_chat_id has no key in app dict."""
+        app = _build_test_app(pr_review_enabled=False)
+        assert "github_notify_chat_id" not in app
+
+    def test_app_with_group_has_key(self):
+        """App built with github_notify_chat_id stores it in app dict."""
+        app = _build_test_app(pr_review_enabled=False, github_notify_chat_id=-100999)
+        assert app["github_notify_chat_id"] == -100999

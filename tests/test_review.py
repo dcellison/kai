@@ -720,6 +720,44 @@ class TestSendReviewSummary:
             # Should not raise
             await send_review_summary(meta, True, 8080, "secret")
 
+    @pytest.mark.asyncio
+    async def test_notify_chat_id_included_in_body(self):
+        """When notify_chat_id is set, chat_id is included in the POST body."""
+        meta = _metadata()
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_session = AsyncMock()
+        mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kai.review.aiohttp.ClientSession") as mock_cs:
+            mock_cs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_cs.return_value.__aexit__ = AsyncMock(return_value=False)
+            await send_review_summary(meta, True, 8080, "secret", notify_chat_id=-100123)
+
+        body = mock_session.post.call_args[1]["json"]
+        assert body["chat_id"] == -100123
+
+    @pytest.mark.asyncio
+    async def test_no_chat_id_in_body_when_notify_none(self):
+        """When notify_chat_id is None, chat_id is NOT in the POST body."""
+        meta = _metadata()
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_session = AsyncMock()
+        mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kai.review.aiohttp.ClientSession") as mock_cs:
+            mock_cs.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_cs.return_value.__aexit__ = AsyncMock(return_value=False)
+            await send_review_summary(meta, True, 8080, "secret", notify_chat_id=None)
+
+        body = mock_session.post.call_args[1]["json"]
+        assert "chat_id" not in body
+
 
 # ── review_pr (orchestrator) ────────────────────────────────────────
 
