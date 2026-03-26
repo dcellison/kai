@@ -418,7 +418,7 @@ class PersistentClaude:
 
             # Always inject the per-user history directory path so the inner
             # Claude's grep/jq searches are naturally scoped to this user.
-            history_dir = str(DATA_DIR / "history" / str(chat_id)) if chat_id else str(DATA_DIR / "history")
+            history_dir = str(DATA_DIR / "history" / str(chat_id)) if chat_id is not None else str(DATA_DIR / "history")
 
             # Inject recent conversation history for continuity.
             # Filter by chat_id so each user's session only sees their

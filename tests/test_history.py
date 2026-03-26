@@ -214,12 +214,12 @@ class TestPerUserHistory:
 
     def test_excludes_other_users(self, _log_dir):
         """Messages from user Y are not in user X's history."""
-        log_message(direction="user", chat_id=111, text="private")
-        log_message(direction="user", chat_id=222, text="also private")
+        log_message(direction="user", chat_id=111, text="from alice")
+        log_message(direction="user", chat_id=222, text="from bob")
 
         result = get_recent_history(chat_id=222)
-        assert "also private" in result
-        assert "private" not in result or "also private" in result
+        assert "from bob" in result
+        assert "from alice" not in result
 
     def test_none_chat_id_returns_all(self, _log_dir):
         """get_recent_history(chat_id=None) returns messages from all users."""
