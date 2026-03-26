@@ -1823,6 +1823,54 @@ class TestSavePrompt:
 
         mock_save.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_session_recycle_calls_save_prompt_before_kill(self):
+        """Session recycle calls _save_prompt(timeout=10) before _kill()."""
+        claude = _make_claude()
+        claude.max_session_hours = 0.001  # Tiny value so _should_recycle is True
+        claude._session_started_at = 0  # Long ago
+
+        # Mock a running process
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdin.write = MagicMock()
+        mock_proc.stdin.drain = AsyncMock()
+        mock_proc.stdout = AsyncMock()
+        mock_proc.stdout.readline = AsyncMock(return_value=json.dumps({"type": "result"}).encode() + b"\n")
+        claude._proc = mock_proc
+        claude._fresh_session = False
+
+        call_order: list[str] = []
+
+        async def tracking_save(timeout=30):
+            call_order.append(f"save_prompt_timeout={timeout}")
+            # Don't actually send a save prompt
+            return
+
+        async def tracking_kill():
+            call_order.append("kill")
+
+        with (
+            patch.object(claude, "_save_prompt", side_effect=tracking_save),
+            patch.object(claude, "_kill", side_effect=tracking_kill),
+        ):
+            # Only need to verify the recycle path fires and calls
+            # save_prompt then kill in order. We don't need to run
+            # the full _send_locked - just trigger the recycle check.
+            # Since _should_recycle returns True, _send_locked will
+            # call save_prompt then kill before _ensure_started.
+            # Catch the StopAsyncIteration when the generator can't
+            # proceed without a real process.
+            try:
+                async for _ in claude._send_locked("test", chat_id=123):
+                    pass
+            except (AssertionError, StopAsyncIteration):
+                pass  # Expected - no real process after kill
+
+        assert call_order[0] == "save_prompt_timeout=10"
+        assert call_order[1] == "kill"
+
 
 # ── change_workspace ─────────────────────────────────────────────────
 
