@@ -11,6 +11,7 @@ from kai.triage import (
     IssueMetadata,
     _parse_triage_json,
     _sanitize_search_query,
+    _send_error_notification,
     apply_triage,
     build_triage_prompt,
     extract_issue_metadata,
@@ -778,3 +779,80 @@ class TestTriageIssue:
         mock_session.post.assert_called_once()
         body = mock_session.post.call_args[1]["json"]
         assert "failed" in body["text"].lower()
+
+
+# ── _send_error_notification ──────────────────────────────────────
+
+
+class TestSendErrorNotification:
+    """Verify _send_error_notification never raises."""
+
+    @pytest.mark.asyncio
+    async def test_does_not_raise_on_connection_error(self):
+        """Connection failure is caught and logged, not raised."""
+        metadata = IssueMetadata(
+            repo="owner/repo",
+            number=42,
+            title="Test issue",
+            body="body",
+            author="user",
+            url="https://github.com/owner/repo/issues/42",
+            labels=[],
+        )
+
+        mock_session = AsyncMock()
+        mock_session.post = AsyncMock(side_effect=ConnectionError("refused"))
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kai.triage.aiohttp.ClientSession", return_value=mock_session):
+            # Should not raise
+            await _send_error_notification(metadata, "test error", 8080, "secret")
+
+    @pytest.mark.asyncio
+    async def test_does_not_raise_on_timeout(self):
+        """Timeout is caught and logged, not raised."""
+
+        metadata = IssueMetadata(
+            repo="owner/repo",
+            number=42,
+            title="Test issue",
+            body="body",
+            author="user",
+            url="https://github.com/owner/repo/issues/42",
+            labels=[],
+        )
+
+        mock_session = AsyncMock()
+        mock_session.post = AsyncMock(side_effect=TimeoutError())
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kai.triage.aiohttp.ClientSession", return_value=mock_session):
+            await _send_error_notification(metadata, "test error", 8080, "secret")
+
+    @pytest.mark.asyncio
+    async def test_logs_warning_on_failure(self, caplog):
+        """A warning is logged when the notification fails."""
+        metadata = IssueMetadata(
+            repo="owner/repo",
+            number=42,
+            title="Test issue",
+            body="body",
+            author="user",
+            url="https://github.com/owner/repo/issues/42",
+            labels=[],
+        )
+
+        mock_session = AsyncMock()
+        mock_session.post = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("kai.triage.aiohttp.ClientSession", return_value=mock_session),
+            caplog.at_level("WARNING", logger="kai.triage"),
+        ):
+            await _send_error_notification(metadata, "test error", 8080, "secret")
+
+        assert "Failed to send triage error notification" in caplog.text

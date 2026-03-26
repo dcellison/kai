@@ -791,19 +791,12 @@ async def triage_issue(
         # notification, so just log and bail.
         if metadata is None:
             return
-        try:
-            await _send_error_notification(
-                metadata,
-                str(exc),
-                webhook_port,
-                webhook_secret,
-            )
-        except Exception:
-            log.exception(
-                "Failed to send failure notification for %s#%d",
-                metadata.repo,
-                metadata.number,
-            )
+        await _send_error_notification(
+            metadata,
+            str(exc),
+            webhook_port,
+            webhook_secret,
+        )
 
 
 async def _send_error_notification(
@@ -817,6 +810,7 @@ async def _send_error_notification(
 
     Called when the triage pipeline fails at any point. Sends a brief
     message so the user knows something went wrong and can check the logs.
+    Never raises - logs a warning on failure and returns.
 
     Args:
         metadata: Issue metadata for context.
@@ -831,12 +825,19 @@ async def _send_error_notification(
         "X-Webhook-Secret": webhook_secret,
     }
 
-    async with (
-        aiohttp.ClientSession() as session,
-        session.post(url, json={"text": text}, headers=headers) as resp,
-    ):
-        if resp.status != 200:
-            log.warning(
-                "send-message API returned %d for triage error notification",
-                resp.status,
-            )
+    try:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.post(url, json={"text": text}, headers=headers) as resp,
+        ):
+            if resp.status != 200:
+                log.warning(
+                    "send-message API returned %d for triage error notification",
+                    resp.status,
+                )
+    except Exception:
+        log.warning(
+            "Failed to send triage error notification for %s#%d",
+            metadata.repo,
+            metadata.number,
+        )
