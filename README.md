@@ -24,8 +24,8 @@ Giving an AI agent shell access is a real trust decision. Kai's approach is laye
 - **Telegram auth** - only explicitly whitelisted user IDs can interact. Unauthorized messages are silently dropped before reaching any handler.
 - **TOTP gate** (optional) - two-factor authentication via time-based one-time passwords. After a configurable idle timeout, Kai requires a 6-digit authenticator code before processing anything. The secret lives in a root-owned file (mode 0600) that the bot process cannot read directly; it verifies codes through narrowly-scoped sudoers rules. Even if someone compromises your Telegram account, they can't use your assistant without your authenticator device. Rate limiting with disk-persisted lockout protects against brute force.
 - **Process isolation** - authentication state lives in the bot's in-memory context, not in the filesystem or conversation history. The inner Claude process cannot read, manipulate, or bypass the auth gate.
-- **Path confinement** - file exchange operations are restricted to the active workspace via `Path.relative_to()`. Traversal attempts are rejected.
-- **Service proxy** - external API keys live in server-side config (`services.yaml`) and are injected at request time. Claude calls APIs through a local proxy endpoint; the keys never enter the conversation.
+- **Path confinement** - file exchange operations are restricted to the active workspace via `Path.relative_to()`. Traversal attempts are rejected. The send-file API also blocks access to history and memory directories.
+- **Service proxy** - external API keys live in server-side config (`services.yaml`) and are injected at request time. Claude calls APIs through a local proxy endpoint; the keys never enter the conversation. Per-service SSRF controls prevent services from being used as open HTTP proxies.
 - **Multi-user isolation** - each user's data is namespaced by chat ID: separate conversation history, workspace state, scheduled jobs, and file storage. When `os_user` is configured in `users.yaml`, the inner Claude subprocess runs as a dedicated OS account via `sudo -u`, creating a hard process-level boundary between users and between the bot and the AI.
 
 Setup for TOTP requires the optional dependency group and root access:
@@ -75,8 +75,8 @@ When `users.yaml` is absent, Kai falls back to `ALLOWED_USER_IDS` for single-use
 Three layers of persistent context give the agent continuity across sessions:
 
 1. **Auto-memory** - managed by Claude Code per-workspace. Project architecture and patterns.
-2. **Home memory** (`memory/MEMORY.md`) - personal memory, always injected regardless of current workspace. Proactively updated by Kai.
-3. **Conversation history** (`history/`) - JSONL logs, one file per day. Searchable for past conversations.
+2. **Home memory** (`DATA_DIR/memory/MEMORY.md`) - personal memory, always injected regardless of current workspace. Proactively updated by Kai.
+3. **Conversation history** (`DATA_DIR/history/<chat_id>/`) - JSONL logs, one file per day per user. Searchable for past conversations.
 
 Foreign workspaces also get their own `.claude/MEMORY.md` injected alongside home memory. See [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture).
 
@@ -94,13 +94,17 @@ When a new issue is opened, Kai triages it automatically. A one-shot Claude subp
 
 Both agents are fire-and-forget background tasks that run independently of your chat session. They use separate Claude processes, so a review or triage can happen while you're mid-conversation. Opt-in via `PR_REVIEW_ENABLED` and `ISSUE_TRIAGE_ENABLED` in `.env`.
 
+### GitHub notification routing
+
+GitHub event notifications (pushes, PRs, issues, comments, reviews) can be routed to a separate Telegram group via `GITHUB_NOTIFY_CHAT_ID`, keeping your primary DM clean for conversation. Agent output (review comments, triage summaries) also routes to the group. See [GitHub Notification Routing](https://github.com/dcellison/kai/wiki/GitHub-Notification-Routing).
+
 ### Webhooks
 
 An HTTP server receives external events and routes them to the agent. GitHub webhooks (pushes, PRs, issues, comments, reviews) are validated via HMAC-SHA256. A generic endpoint (`POST /webhook`) accepts JSON from any service - CI pipelines, monitoring alerts, deployment hooks, anything that can POST JSON. See [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet).
 
 ### File exchange
 
-Send any file type directly in chat - photos, documents, PDFs, archives, anything. Files are saved to a `files/` directory inside the active workspace with timestamped names, and the agent gets the path so it can work with them via shell tools. Kai can also send files back to you through the internal API. Images render inline; everything else arrives as a document attachment.
+Send any file type directly in chat - photos, documents, PDFs, archives, anything. Files are saved to per-user directories under the data directory with timestamped names, and the agent gets the path so it can work with them via shell tools. Kai can also send files back to you through the internal API. Images render inline; everything else arrives as a document attachment. Set `FILE_RETENTION_DAYS` to automatically clean up old uploads.
 
 ### Streaming responses
 
@@ -193,6 +197,8 @@ cp .env.example .env
 | `TOTP_LOCKOUT_MINUTES` | No | `15` | TOTP lockout duration in minutes |
 | `CLAUDE_USER` | No | | OS user for the inner Claude process (enables process isolation via `sudo -u`) |
 | `CLAUDE_IDLE_TIMEOUT` | No | `1800` | Seconds before idle subprocesses are evicted (0 to disable) |
+| `GITHUB_NOTIFY_CHAT_ID` | No | | Telegram chat ID for routing GitHub notifications to a separate group |
+| `FILE_RETENTION_DAYS` | No | `0` | Days to keep uploaded files before cleanup (0 to disable) |
 
 `CLAUDE_MAX_BUDGET_USD` limits how much work Claude can do in a single session via Claude Code's `--max-budget-usd` flag. On Pro/Max plans this is purely a runaway prevention mechanism (no per-token charges). The session resets on `/new`, model switch, or workspace switch.
 
