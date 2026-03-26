@@ -176,7 +176,10 @@ class TestCommandConstruction:
     @pytest.mark.asyncio
     async def test_self_sudo_skipped(self, caplog):
         """When claude_user matches the current process user, sudo is skipped."""
-        current_user = pwd.getpwuid(os.getuid()).pw_name
+        try:
+            current_user = pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            pytest.skip("UID has no passwd entry; self-sudo-skip path not reachable")
         claude = _make_claude(claude_user=current_user)
 
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
