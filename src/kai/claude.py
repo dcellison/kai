@@ -725,9 +725,8 @@ class PersistentClaude:
         if self._fresh_session or not self.is_alive:
             return
 
-        assert self._proc is not None
-        assert self._proc.stdin is not None
-        assert self._proc.stdout is not None
+        if self._proc is None or self._proc.stdin is None or self._proc.stdout is None:
+            return
 
         save_msg = (
             "You are about to be shut down. Save anything worth remembering "
@@ -754,8 +753,9 @@ class PersistentClaude:
         try:
             self._proc.stdin.write(msg.encode())
             await self._proc.stdin.drain()
-        except OSError:
-            # Pipe broken - process is already dying. Nothing to save.
+        except (OSError, RuntimeError):
+            # OSError: pipe broken. RuntimeError: transport closed during
+            # drain(). Either way, the process is dying. Nothing to save.
             log.debug("Save prompt write failed; process already dying")
             return
 
