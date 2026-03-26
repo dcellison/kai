@@ -56,7 +56,7 @@ async def init_db(db_path: Path) -> None:
     All DDL (CREATE TABLE, ALTER TABLE, migrations) runs inside a single
     explicit transaction. On failure, ROLLBACK undoes everything - the
     database is either fully initialized or completely unchanged. SQLite
-    supports transactional DDL, unlike PostgreSQL and MySQL.
+    supports transactional DDL (as does PostgreSQL; MySQL does not).
 
     Args:
         db_path: Path to the SQLite database file (created if missing).
@@ -170,10 +170,11 @@ async def init_db(db_path: Path) -> None:
             await _get_db().rollback()
         except Exception:
             pass
-        try:
-            await _db.close()
-        except Exception:
-            pass
+        if _db is not None:
+            try:
+                await _db.close()
+            except Exception:
+                pass
         _db = None
         raise
 
