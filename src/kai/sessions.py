@@ -160,14 +160,21 @@ async def init_db(db_path: Path) -> None:
             await _get_db().execute("DROP TABLE workspace_history")
             await _get_db().execute("ALTER TABLE workspace_history_new RENAME TO workspace_history")
 
-        await _get_db().execute("COMMIT")
+        await _get_db().commit()
     except Exception:
         # Roll back the entire init sequence. The database is left in its
         # pre-init state (no partial tables, no half-migrated schema).
+        # Close and nullify the connection so a retry of init_db doesn't
+        # silently overwrite _db with a second open connection.
         try:
-            await _get_db().execute("ROLLBACK")
+            await _get_db().rollback()
         except Exception:
             pass
+        try:
+            await _db.close()
+        except Exception:
+            pass
+        _db = None
         raise
 
 

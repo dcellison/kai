@@ -427,52 +427,50 @@ class TestInitDbTransaction:
             await sessions.close_db()
 
     @pytest.mark.asyncio
-    async def test_failure_mid_init_rolls_back(self, tmp_path):
-        """A failure after some DDL rolls back everything - no partial state."""
-        db_path = tmp_path / "rollback.db"
+    async def test_sqlite_ddl_rollback(self, tmp_path):
+        """SQLite DDL inside BEGIN/ROLLBACK is fully undone.
 
-        # SQLite transactional DDL: CREATE TABLE inside BEGIN/ROLLBACK
-        # is undone. Verify this directly since patching aiosqlite.execute
-        # breaks the async context manager protocol.
-        async with aiosqlite.connect(str(db_path)) as conn:
-            await conn.execute("PRAGMA journal_mode=WAL")
-            await conn.execute("BEGIN IMMEDIATE")
-            await conn.execute("""
-                CREATE TABLE sessions (
-                    chat_id INTEGER PRIMARY KEY,
-                    session_id TEXT NOT NULL
-                )
-            """)
-            # Simulate a failure - rollback the entire transaction
-            await conn.execute("ROLLBACK")
-
-        # Verify rollback worked - no tables should exist
-        async with aiosqlite.connect(str(db_path)) as conn:
-            cursor = await conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = [row[0] for row in await cursor.fetchall()]
-        assert "sessions" not in tables
-
-    @pytest.mark.asyncio
-    async def test_sqlite_ddl_is_transactional(self, tmp_path):
-        """SQLite DDL inside BEGIN/ROLLBACK is fully undone (verify assumption)."""
+        This verifies the core assumption init_db relies on: that CREATE TABLE
+        inside an explicit transaction is rolled back atomically. Committed
+        tables survive; uncommitted ones are removed.
+        """
         db_path = tmp_path / "ddl_txn.db"
 
         async with aiosqlite.connect(str(db_path)) as conn:
-            # Create a table and commit it first so the DB file is non-empty
+            # Committed table survives rollback of later DDL
             await conn.execute("CREATE TABLE anchor (id INTEGER PRIMARY KEY)")
             await conn.commit()
 
-            # Now try to create another table inside a transaction, then rollback
+            # This table is created inside a transaction, then rolled back
             await conn.execute("BEGIN IMMEDIATE")
             await conn.execute("CREATE TABLE should_not_exist (id INTEGER PRIMARY KEY)")
             await conn.execute("ROLLBACK")
 
-        # Only the anchor table should exist
         async with aiosqlite.connect(str(db_path)) as conn:
             cursor = await conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
             tables = {row[0] for row in await cursor.fetchall()}
             assert "anchor" in tables
             assert "should_not_exist" not in tables
+
+    @pytest.mark.asyncio
+    async def test_init_failure_closes_connection(self, tmp_path):
+        """A failed init_db closes and nullifies the connection."""
+        db_path = tmp_path / "fail.db"
+
+        from unittest.mock import patch
+
+        # Force a failure inside init_db by making the commit raise
+        async def failing_commit(self):
+            raise RuntimeError("Simulated commit failure")
+
+        with (
+            patch.object(aiosqlite.Connection, "commit", failing_commit),
+            pytest.raises(RuntimeError, match="Simulated commit failure"),
+        ):
+            await sessions.init_db(db_path)
+
+        # Connection should be closed and _db should be None
+        assert sessions._db is None
 
 
 # ── get_all_workspace_paths ─────────────────────────────────────────
