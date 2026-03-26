@@ -215,7 +215,13 @@ class PersistentClaude:
         # self-sudo fails (sudoers disallows it) and serves no purpose.
         effective_claude_user = self.claude_user
         if effective_claude_user:
-            current_user = pwd.getpwuid(os.getuid()).pw_name
+            # getpwuid raises KeyError when the UID has no passwd entry
+            # (e.g., containers with --user <uid>). Treat that as "unknown
+            # user" and fall through to the sudo path.
+            try:
+                current_user = pwd.getpwuid(os.getuid()).pw_name
+            except KeyError:
+                current_user = None
             if effective_claude_user == current_user:
                 log.warning(
                     "os_user %r matches the bot process user; skipping sudo (no isolation)",
