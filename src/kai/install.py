@@ -362,7 +362,7 @@ def _cmd_config() -> None:
             # fine - PR #192 handles the self-sudo skip for this case.
             default_os_user = existing_env.get("CLAUDE_USER", "") or os.environ.get("USER", "")
             while True:
-                admin_os_user = _prompt("OS user for subprocess isolation", default_os_user) or None
+                admin_os_user = _prompt("OS user for subprocess isolation", default_os_user).strip() or None
                 if admin_os_user is None or _validate_os_user(admin_os_user):
                     break
                 print("  Username may only contain letters, numbers, dots, hyphens, and underscores.")
@@ -720,7 +720,8 @@ def _generate_users_yaml(
     deterministic and human-readable (consistent indentation, field order,
     comment header). All embedded values are pre-validated: telegram_id is
     a positive integer string, name passes _validate_display_name(),
-    os_user passes _validate_os_user(), and home_workspace is quoted.
+    os_user passes _validate_os_user(), and home_workspace is serialized
+    via yaml.dump() to handle arbitrary path characters safely.
 
     Args:
         telegram_id: The admin user's Telegram ID (validated positive int string).
@@ -743,9 +744,10 @@ def _generate_users_yaml(
     if os_user:
         lines.append(f"    os_user: {os_user}")
     if home_workspace:
-        # Quote the path to prevent YAML comment delimiter issues
-        # (e.g., a path containing " #" would be silently truncated).
-        lines.append(f'    home_workspace: "{home_workspace}"')
+        # Use yaml.dump for the path scalar to handle YAML-special
+        # characters (comment delimiters, quotes, etc.) safely.
+        safe_path = yaml.dump(home_workspace, default_flow_style=True).strip()
+        lines.append(f"    home_workspace: {safe_path}")
     lines.append("")  # trailing newline
     return "\n".join(lines)
 
