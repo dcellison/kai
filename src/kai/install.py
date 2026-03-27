@@ -159,8 +159,9 @@ def _validate_telegram_id(value: str) -> bool:
         return False
 
 
-# Letters, digits, spaces, hyphens, underscores. Keeps generated YAML
-# safe without needing quoting logic in _generate_users_yaml().
+# Letters, digits, spaces, hyphens, underscores. Prevents YAML structural
+# characters (colons, hashes) in names; _yaml_scalar() separately handles
+# YAML 1.1 boolean keyword quoting.
 _DISPLAY_NAME_RE = re.compile(r"^[a-zA-Z0-9 _-]+$")
 
 
@@ -174,7 +175,7 @@ _OS_USER_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 
 def _validate_os_user(value: str) -> bool:
-    """Check that an OS username contains only valid characters for YAML output."""
+    """Check that a string contains only valid OS username characters."""
     return bool(value.strip()) and _OS_USER_RE.match(value.strip()) is not None
 
 

@@ -475,6 +475,58 @@ class TestCmdConfig:
         assert data["users"][0]["telegram_id"] == 12345
         assert data["users"][0]["role"] == "admin"
 
+    def test_advanced_user_options(self, tmp_path, monkeypatch):
+        """Advanced path writes os_user and home_workspace, skips CLAUDE_USER."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+
+        inputs = iter(
+            [
+                "/opt/kai",  # install dir
+                "/var/lib/kai",  # data dir
+                "kai",  # service user
+                "darwin",  # platform
+                "fake-token",  # bot token
+                "12345",  # admin telegram ID
+                "admin",  # admin display name
+                "true",  # advanced user options
+                "testuser",  # os_user
+                str(tmp_path),  # home_workspace
+                "polling",  # transport
+                "sonnet",  # model
+                "120",  # timeout
+                "10.0",  # budget
+                "8080",  # port
+                "test-secret",  # webhook secret
+                "~/Projects",  # workspace base
+                "",  # allowed workspaces (empty)
+                "false",  # pr review enabled
+                "false",  # issue triage enabled
+                "",  # github notify chat id (empty)
+                "false",  # voice
+                "false",  # tts
+                # no claude user prompt (skipped by advanced mode)
+                "",  # perplexity key (empty)
+            ]
+        )
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        # Verify users.yaml has os_user and home_workspace
+        yaml_path = tmp_path / "users.yaml"
+        assert yaml_path.exists()
+        data = yaml.safe_load(yaml_path.read_text())
+        entry = data["users"][0]
+        assert entry["os_user"] == "testuser"
+        assert entry["home_workspace"] == str(tmp_path.resolve())
+
+        # CLAUDE_USER should not be in the env (skipped because os_user was set)
+        conf = json.loads((tmp_path / "install.conf").read_text())
+        assert "CLAUDE_USER" not in conf["env"]
+
     def test_reads_existing_defaults(self, tmp_path, monkeypatch, capsys):
         """Config subcommand uses existing install.conf values as defaults."""
         monkeypatch.chdir(tmp_path)
