@@ -551,9 +551,10 @@ class TestResolveClaudeUser:
             pytest.skip("UID has no passwd entry")
         assert resolve_claude_user(current_user) is None
 
-    def test_different_user_returns_unchanged(self):
+    def test_different_user_returns_unchanged(self, monkeypatch):
         """When claude_user differs from current user, returns it unchanged."""
-        assert resolve_claude_user("some_nonexistent_user_xyz") == "some_nonexistent_user_xyz"
+        monkeypatch.setattr("kai.config.pwd.getpwuid", MagicMock(return_value=MagicMock(pw_name="localuser")))
+        assert resolve_claude_user("some_other_user") == "some_other_user"
 
     def test_unknown_uid_returns_unchanged(self, monkeypatch):
         """When pwd.getpwuid raises KeyError, returns claude_user unchanged."""
