@@ -760,8 +760,9 @@ def load_config() -> Config:
     else:
         log.info("Telegram transport: polling (TELEGRAM_WEBHOOK_URL not set)")
 
-    # Parse allowed user IDs. ALLOWED_USER_IDS is required unless
-    # users.yaml exists (which provides its own authorization source).
+    # Parse allowed user IDs. users.yaml is the primary authorization
+    # source. ALLOWED_USER_IDS is a legacy fallback for installations
+    # that haven't migrated yet.
     # Defer the ValueError until after users.yaml is checked so that
     # a malformed env var doesn't block startup when users.yaml is
     # authoritative and would make the env var irrelevant.
@@ -772,9 +773,10 @@ def load_config() -> Config:
         allowed_ids = {int(uid.strip()) for uid in raw_ids.split(",") if uid.strip()}
     except ValueError:
         allowed_ids_error = (
-            "ALLOWED_USER_IDS must be numeric Telegram user IDs (not usernames). "
-            "Message @userinfobot on Telegram to find yours. "
-            "(Or create users.yaml as the authorization source.)"
+            "ALLOWED_USER_IDS contains non-numeric values. "
+            "Consider migrating to users.yaml (run 'make config' or "
+            "see README for the schema). If using ALLOWED_USER_IDS, values must be "
+            "numeric Telegram user IDs - message @userinfobot to find yours."
         )
 
     # Validate optional: workspace base directory (must exist if provided)
@@ -885,7 +887,15 @@ def load_config() -> Config:
         raise SystemExit(allowed_ids_error)
     elif not allowed_ids:
         # No users.yaml and no ALLOWED_USER_IDS - can't start
-        raise SystemExit("ALLOWED_USER_IDS is required in .env (or create users.yaml)")
+        raise SystemExit(
+            "No user authorization configured. "
+            "Run 'make config' to generate users.yaml, "
+            "or create one manually (see README for the schema)."
+        )
+    else:
+        # ALLOWED_USER_IDS is valid and no users.yaml exists. This works
+        # but is the legacy path - nudge toward users.yaml.
+        log.info("Using ALLOWED_USER_IDS from env (legacy). Run 'make config' to migrate to users.yaml.")
 
     # Validate CLAUDE_MODEL against the same VALID_MODELS set used
     # for workspace config. Catches typos at startup instead of

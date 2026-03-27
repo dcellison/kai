@@ -92,13 +92,13 @@ class TestLoadConfigErrors:
 
     def test_missing_user_ids(self, monkeypatch):
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
-        with pytest.raises(SystemExit, match="ALLOWED_USER_IDS"):
+        with pytest.raises(SystemExit, match="No user authorization configured"):
             load_config()
 
     def test_non_numeric_user_ids(self, monkeypatch):
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
         monkeypatch.setenv("ALLOWED_USER_IDS", "notanumber")
-        with pytest.raises(SystemExit, match="numeric"):
+        with pytest.raises(SystemExit, match="non-numeric"):
             load_config()
 
     def test_workspace_base_nonexistent(self, monkeypatch, tmp_path):

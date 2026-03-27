@@ -7,7 +7,7 @@ Covers:
 3. Config.get_user_config() lookup
 4. Config.get_user_by_github() lookup (case-insensitive)
 5. Config.get_admins() filtering
-6. Backward compatibility with ALLOWED_USER_IDS
+6. Legacy fallback via ALLOWED_USER_IDS
 """
 
 import textwrap
