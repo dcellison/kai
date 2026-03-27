@@ -34,6 +34,7 @@ from pathlib import Path
 
 import aiohttp
 
+from kai.config import resolve_claude_user
 from kai.prompt_utils import make_boundary
 
 log = logging.getLogger(__name__)
@@ -640,12 +641,15 @@ async def run_review(
         str(_REVIEW_BUDGET_USD),
     ]
 
-    # When running as a different user, spawn via sudo -u.
-    # Same isolation pattern as PersistentClaude._ensure_started().
-    if claude_user:
-        cmd = ["sudo", "-u", claude_user, "--"] + cmd
+    # Resolve self-sudo: skip sudo when claude_user matches the bot
+    # process user. Uses the resolved value for both the spawn command
+    # and the cleanup path below.
+    effective_user = resolve_claude_user(claude_user)
 
-    # When claude_user is set, start in a new process group so the
+    if effective_user:
+        cmd = ["sudo", "-u", effective_user, "--"] + cmd
+
+    # When spawned via sudo, start in a new process group so the
     # entire tree (sudo + claude) can be killed via os.killpg().
     # Without this, killing sudo orphans the claude Node.js process.
     proc = await asyncio.create_subprocess_exec(
@@ -653,7 +657,7 @@ async def run_review(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        start_new_session=bool(claude_user),
+        start_new_session=bool(effective_user),
     )
 
     try:
@@ -663,10 +667,10 @@ async def run_review(
         )
     except TimeoutError:
         # Kill the subprocess tree if it exceeds the timeout.
-        # When claude_user is set, start_new_session=True puts the
+        # When effective_user is set, start_new_session=True puts the
         # process in a new group (PGID == PID). Kill the group so
         # both sudo and its claude child die, preventing orphans.
-        if claude_user:
+        if effective_user:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:

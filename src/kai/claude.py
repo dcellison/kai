@@ -29,14 +29,13 @@ import asyncio
 import json
 import logging
 import os
-import pwd
 import signal
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file
+from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
 from kai.history import get_recent_history
 
 log = logging.getLogger(__name__)
@@ -208,26 +207,9 @@ class PersistentClaude:
             str(self.max_budget_usd),
         ]
 
-        # When running as a different user, spawn via sudo -u.
-        # The subprocess runs with the target user's UID, home directory,
-        # and environment - completely isolated from the bot user.
-        # Skip sudo when the target user is the same as the bot user -
-        # self-sudo fails (sudoers disallows it) and serves no purpose.
-        effective_claude_user = self.claude_user
-        if effective_claude_user:
-            # getpwuid raises KeyError when the UID has no passwd entry
-            # (e.g., containers with --user <uid>). Treat that as "unknown
-            # user" and fall through to the sudo path.
-            try:
-                current_user = pwd.getpwuid(os.getuid()).pw_name
-            except KeyError:
-                current_user = None
-            if effective_claude_user == current_user:
-                log.warning(
-                    "claude_user %r matches the bot process user; skipping sudo (no isolation)",
-                    effective_claude_user,
-                )
-                effective_claude_user = None
+        # Resolve self-sudo: skip sudo when claude_user matches the bot
+        # process user. The shared utility logs a warning when skipping.
+        effective_claude_user = resolve_claude_user(self.claude_user)
 
         if effective_claude_user:
             cmd = ["sudo", "-u", effective_claude_user, "--"] + claude_cmd

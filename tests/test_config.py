@@ -1,13 +1,14 @@
-"""Tests for config.py load_config(), DATA_DIR, and _read_protected_file()."""
+"""Tests for config.py load_config(), DATA_DIR, _read_protected_file(), and resolve_claude_user()."""
 
 import os
+import pwd
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kai.config import _read_protected_file, load_config
+from kai.config import _read_protected_file, load_config, resolve_claude_user
 
 # All env vars that load_config reads
 _CONFIG_ENV_VARS = [
@@ -528,3 +529,33 @@ class TestIssueTriageConfig:
         monkeypatch.setenv("ISSUE_TRIAGE_ENABLED", "true")
         config = load_config()
         assert config.issue_triage_enabled is True
+
+
+# ── resolve_claude_user() ────────────────────────────────────────────
+
+
+class TestResolveClaudeUser:
+    def test_none_returns_none(self):
+        """None input returns None."""
+        assert resolve_claude_user(None) is None
+
+    def test_empty_string_returns_none(self):
+        """Empty string is falsy, returns None."""
+        assert resolve_claude_user("") is None
+
+    def test_self_sudo_returns_none(self):
+        """When claude_user matches current process user, returns None."""
+        try:
+            current_user = pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            pytest.skip("UID has no passwd entry")
+        assert resolve_claude_user(current_user) is None
+
+    def test_different_user_returns_unchanged(self):
+        """When claude_user differs from current user, returns it unchanged."""
+        assert resolve_claude_user("some_nonexistent_user_xyz") == "some_nonexistent_user_xyz"
+
+    def test_unknown_uid_returns_unchanged(self, monkeypatch):
+        """When pwd.getpwuid raises KeyError, returns claude_user unchanged."""
+        monkeypatch.setattr("kai.config.pwd.getpwuid", MagicMock(side_effect=KeyError("no entry")))
+        assert resolve_claude_user("container_user") == "container_user"

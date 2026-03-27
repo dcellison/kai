@@ -1,9 +1,11 @@
 """Tests for triage.py issue triage pipeline."""
 
 import json
+import os
+import pwd
 import re
 import signal
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -338,6 +340,8 @@ class TestRunTriage:
         with (
             patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc),
             patch("kai.triage.os.killpg") as mock_killpg,
+            # Ensure resolve_claude_user doesn't skip sudo on this machine
+            patch("kai.config.pwd.getpwuid", return_value=MagicMock(pw_name="notkai")),
             pytest.raises(RuntimeError, match="timed out"),
         ):
             await run_triage("test prompt", claude_user="kai")
@@ -350,7 +354,10 @@ class TestRunTriage:
         """claude_user spawns with start_new_session=True."""
         mock_proc = _mock_subprocess(returncode=0, stdout='{"labels": []}')
 
-        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+        with (
+            patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
+            patch("kai.config.pwd.getpwuid", return_value=MagicMock(pw_name="notkai")),
+        ):
             await run_triage("prompt", claude_user="kai")
 
         kwargs = mock_exec.call_args[1]
@@ -366,6 +373,47 @@ class TestRunTriage:
 
         kwargs = mock_exec.call_args[1]
         assert kwargs.get("start_new_session") is False
+
+    @pytest.mark.asyncio
+    async def test_self_sudo_skipped(self):
+        """When claude_user matches bot user, triage skips sudo."""
+        try:
+            current_user = pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            pytest.skip("UID has no passwd entry")
+        mock_proc = _mock_subprocess(returncode=0, stdout='{"labels": [], "priority": "low", "summary": "test"}')
+
+        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_triage("prompt", claude_user=current_user)
+
+        cmd = mock_exec.call_args[0]
+        assert cmd[0] != "sudo", "Self-sudo should be skipped"
+        assert cmd[0] == "claude"
+        kwargs = mock_exec.call_args[1]
+        assert kwargs["start_new_session"] is False
+
+    @pytest.mark.asyncio
+    async def test_self_sudo_timeout_kills_directly(self):
+        """When self-sudo is skipped, timeout kills proc directly (not killpg)."""
+        try:
+            current_user = pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            pytest.skip("UID has no passwd entry")
+        mock_proc = AsyncMock()
+        mock_proc.pid = 12345
+        mock_proc.communicate = AsyncMock(side_effect=TimeoutError)
+        mock_proc.wait = AsyncMock()
+
+        with (
+            patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc),
+            patch("os.killpg") as mock_killpg,
+            pytest.raises(RuntimeError, match="timed out"),
+        ):
+            await run_triage("prompt", claude_user=current_user)
+
+        # Should kill the process directly, not the process group
+        mock_proc.kill.assert_called_once()
+        mock_killpg.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_nonzero_exit(self):

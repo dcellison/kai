@@ -14,6 +14,7 @@ derived from this file's location in the source tree: src/kai/config.py -> proje
 
 import logging
 import os
+import pwd
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +46,41 @@ VALID_MODELS = {"haiku", "sonnet", "opus"}
 # Image file extensions that Telegram renders inline as photos.
 # Shared between bot.py (inbound document handling) and webhook.py (send-file API).
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+# ── Self-sudo resolution ─────────────────────────────────────────────
+
+log = logging.getLogger(__name__)
+
+
+def resolve_claude_user(claude_user: str | None) -> str | None:
+    """
+    Return None if claude_user matches the current process user.
+
+    When the bot process runs as the same OS user specified in
+    claude_user, sudo -u is both unnecessary and likely to fail
+    (sudoers typically disallows self-sudo). This function detects
+    that case and returns None so callers skip the sudo wrapper.
+
+    Returns claude_user unchanged when it differs from the current
+    user, or when the current user cannot be determined (e.g.,
+    containers with unmapped UIDs).
+    """
+    if not claude_user:
+        return None
+    try:
+        current_user = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        # UID has no passwd entry (e.g., containers with --user <uid>).
+        # Can't determine if it's a self-sudo, so fall through to sudo.
+        return claude_user
+    if claude_user == current_user:
+        log.warning(
+            "claude_user %r matches bot process user; skipping sudo",
+            claude_user,
+        )
+        return None
+    return claude_user
 
 
 # ── Per-workspace configuration ──────────────────────────────────────

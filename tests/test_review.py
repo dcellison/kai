@@ -1,6 +1,8 @@
 """Tests for review.py PR review agent - metadata, prompts, subprocess, and output."""
 
 import json
+import os
+import pwd
 import re
 import signal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -556,6 +558,8 @@ class TestRunReview:
             patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
             patch("kai.review.asyncio.wait_for", side_effect=TimeoutError()),
             patch("kai.review.os.killpg") as mock_killpg,
+            # Ensure resolve_claude_user doesn't skip sudo on this machine
+            patch("kai.config.pwd.getpwuid", return_value=MagicMock(pw_name="notkai")),
             pytest.raises(RuntimeError, match="timed out"),
         ):
             await run_review("review this code", claude_user="kai")
@@ -569,7 +573,10 @@ class TestRunReview:
         """claude_user spawns with start_new_session=True for group kill."""
         mock_proc = _mock_process(stdout=b"review output")
 
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+        with (
+            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
+            patch("kai.config.pwd.getpwuid", return_value=MagicMock(pw_name="notkai")),
+        ):
             await run_review("prompt", claude_user="kai")
 
         kwargs = mock_exec.call_args[1]
@@ -591,7 +598,10 @@ class TestRunReview:
         """When claude_user is set, command is prefixed with sudo -u."""
         mock_proc = _mock_process(stdout=b"review output")
 
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+        with (
+            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
+            patch("kai.config.pwd.getpwuid", return_value=MagicMock(pw_name="notkai")),
+        ):
             await run_review("prompt", claude_user="kai")
 
         cmd = mock_exec.call_args[0]
@@ -610,6 +620,47 @@ class TestRunReview:
         cmd = mock_exec.call_args[0]
         assert cmd[0] == "claude"
         assert "sudo" not in cmd
+
+    @pytest.mark.asyncio
+    async def test_self_sudo_skipped(self):
+        """When claude_user matches bot user, review skips sudo."""
+        try:
+            current_user = pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            pytest.skip("UID has no passwd entry")
+        mock_proc = _mock_process(stdout=b"review output")
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review("prompt", claude_user=current_user)
+
+        cmd = mock_exec.call_args[0]
+        assert cmd[0] != "sudo", "Self-sudo should be skipped"
+        assert cmd[0] == "claude"
+        kwargs = mock_exec.call_args[1]
+        assert kwargs["start_new_session"] is False
+
+    @pytest.mark.asyncio
+    async def test_self_sudo_timeout_kills_directly(self):
+        """When self-sudo is skipped, timeout kills proc directly (not killpg)."""
+        try:
+            current_user = pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            pytest.skip("UID has no passwd entry")
+        mock_proc = AsyncMock()
+        mock_proc.pid = 12345
+        mock_proc.communicate = AsyncMock(side_effect=TimeoutError)
+        mock_proc.wait = AsyncMock()
+
+        with (
+            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
+            patch("os.killpg") as mock_killpg,
+            pytest.raises(RuntimeError, match="timed out"),
+        ):
+            await run_review("prompt", claude_user=current_user)
+
+        # Should kill the process directly, not the process group
+        mock_proc.kill.assert_called_once()
+        mock_killpg.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_prompt_sent_via_stdin(self):

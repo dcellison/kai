@@ -188,7 +188,7 @@ class TestCommandConstruction:
             mock_proc.stderr = AsyncMock()
             mock_exec.return_value = mock_proc
 
-            with caplog.at_level("WARNING", logger="kai.claude"):
+            with caplog.at_level("WARNING", logger="kai.config"):
                 await claude._ensure_started()
 
             args = mock_exec.call_args
@@ -199,7 +199,7 @@ class TestCommandConstruction:
             # No process group isolation
             assert args[1].get("start_new_session") is False
             assert claude._pgid is None
-            # Warning was logged
+            # Warning was logged by resolve_claude_user()
             assert "skipping sudo" in caplog.text
 
     @pytest.mark.asyncio
@@ -207,12 +207,13 @@ class TestCommandConstruction:
         """When claude_user is a different user, sudo is still used."""
         claude = _make_claude(claude_user="some_other_user")
 
-        # Patch pwd.getpwuid to return a fixed value so the test doesn't
-        # depend on the real system user being different from "some_other_user".
+        # Patch pwd.getpwuid in config.py (where resolve_claude_user lives)
+        # to return a fixed value so the test doesn't depend on the real
+        # system user being different from "some_other_user".
         mock_pw = MagicMock(pw_name="kai")
         with (
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
-            patch("kai.claude.pwd.getpwuid", return_value=mock_pw),
+            patch("kai.config.pwd.getpwuid", return_value=mock_pw),
         ):
             mock_proc = MagicMock()
             mock_proc.returncode = None
@@ -233,9 +234,10 @@ class TestCommandConstruction:
         claude = _make_claude(claude_user="container_user")
 
         # Simulate a container environment where the UID has no passwd entry.
+        # Patch in config.py where resolve_claude_user() calls pwd.getpwuid.
         with (
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
-            patch("kai.claude.pwd.getpwuid", side_effect=KeyError("uid not found")),
+            patch("kai.config.pwd.getpwuid", side_effect=KeyError("uid not found")),
         ):
             mock_proc = MagicMock()
             mock_proc.returncode = None
