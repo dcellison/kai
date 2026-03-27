@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 
 from kai.install import (
     _LAUNCHD_LABEL,
@@ -32,15 +33,18 @@ from kai.install import (
     _generate_launcher_script,
     _generate_sudoers,
     _generate_systemd_unit,
+    _generate_users_yaml,
     _set_ownership,
     _src_checksum,
     _start_service,
     _stop_service,
     _user_home,
     _validate_chat_id,
+    _validate_display_name,
     _validate_port,
     _validate_positive_float,
     _validate_positive_int,
+    _validate_telegram_id,
     _validate_user_ids,
     cli,
 )
@@ -69,6 +73,50 @@ class TestValidateUserIds:
 
     def test_zero(self):
         assert _validate_user_ids("0") is False
+
+
+class TestValidateTelegramId:
+    def test_positive_integer(self):
+        assert _validate_telegram_id("123456789") is True
+
+    def test_zero(self):
+        assert _validate_telegram_id("0") is False
+
+    def test_negative(self):
+        assert _validate_telegram_id("-1") is False
+
+    def test_non_numeric(self):
+        assert _validate_telegram_id("abc") is False
+
+    def test_empty_string(self):
+        assert _validate_telegram_id("") is False
+
+    def test_strips_whitespace(self):
+        # int() strips whitespace naturally
+        assert _validate_telegram_id(" 123 ") is True
+
+
+class TestValidateDisplayName:
+    def test_simple_name(self):
+        assert _validate_display_name("alice") is True
+
+    def test_with_spaces(self):
+        assert _validate_display_name("Alice Smith") is True
+
+    def test_with_hyphens_underscores(self):
+        assert _validate_display_name("alice-smith_01") is True
+
+    def test_yaml_special_colon(self):
+        assert _validate_display_name("alice: admin") is False
+
+    def test_yaml_special_hash(self):
+        assert _validate_display_name("bob # test") is False
+
+    def test_empty_string(self):
+        assert _validate_display_name("") is False
+
+    def test_whitespace_only(self):
+        assert _validate_display_name("   ") is False
 
 
 class TestValidatePort:
@@ -170,6 +218,61 @@ class TestGenerateEnvFile:
         assert result.startswith("#")
 
 
+class TestGenerateUsersYaml:
+    def test_minimal(self):
+        """Minimal entry has telegram_id, name, and role."""
+        content = _generate_users_yaml("123456789", "alice")
+        data = yaml.safe_load(content)
+        assert isinstance(data["users"], list)
+        assert len(data["users"]) == 1
+        entry = data["users"][0]
+        assert entry["telegram_id"] == 123456789  # int, not string
+        assert entry["name"] == "alice"
+        assert entry["role"] == "admin"
+        assert "os_user" not in entry
+        assert "home_workspace" not in entry
+
+    def test_with_optional_fields(self):
+        """Optional os_user and home_workspace are included when set."""
+        content = _generate_users_yaml(
+            "123456789",
+            "alice",
+            os_user="kai",
+            home_workspace="/opt/kai/home",
+        )
+        data = yaml.safe_load(content)
+        entry = data["users"][0]
+        assert entry["os_user"] == "kai"
+        assert entry["home_workspace"] == "/opt/kai/home"
+
+    def test_roundtrip_with_loader(self, tmp_path, monkeypatch):
+        """Generated YAML can be parsed by _load_user_configs()."""
+        from kai.config import _load_user_configs
+
+        content = _generate_users_yaml("123456789", "alice", os_user="kai")
+        yaml_path = tmp_path / "users.yaml"
+        yaml_path.write_text(content)
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
+        # Skip the protected /etc/kai/ path so we read the tmp_path copy.
+        monkeypatch.setattr("kai.config._read_protected_yaml", lambda _: None)
+        configs = _load_user_configs()
+        assert configs is not None
+        assert 123456789 in configs
+        assert configs[123456789].name == "alice"
+        assert configs[123456789].role == "admin"
+        assert configs[123456789].os_user == "kai"
+
+    def test_includes_header_comment(self):
+        """Generated file starts with a header comment."""
+        content = _generate_users_yaml("123", "test")
+        assert content.startswith("# Kai user configuration")
+
+    def test_trailing_newline(self):
+        """Generated file ends with a trailing newline."""
+        content = _generate_users_yaml("123", "test")
+        assert content.endswith("\n")
+
+
 class TestGenerateSudoers:
     def test_contains_user(self):
         result = _generate_sudoers("kai")
@@ -268,10 +371,24 @@ class TestGenerateSystemdUnit:
 
 
 class TestCmdConfig:
+    @staticmethod
+    def _block_etc_kai(monkeypatch):
+        """Prevent the wizard from detecting /etc/kai/users.yaml on the host."""
+        _real_exists = Path.exists
+
+        def _exists_no_etc(self):
+            if str(self) == "/etc/kai/users.yaml":
+                return False
+            return _real_exists(self)
+
+        monkeypatch.setattr(Path, "exists", _exists_no_etc)
+
     def test_writes_install_conf(self, tmp_path, monkeypatch):
         """Config subcommand writes valid JSON to install.conf."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
 
         # Simulate user inputs for each prompt (in order)
         inputs = iter(
@@ -281,7 +398,9 @@ class TestCmdConfig:
                 "kai",  # service user
                 "darwin",  # platform
                 "fake-token",  # bot token
-                "12345",  # user IDs
+                "12345",  # admin telegram ID
+                "admin",  # admin display name
+                "false",  # advanced user options
                 "polling",  # transport
                 "sonnet",  # model
                 "120",  # timeout
@@ -309,13 +428,21 @@ class TestCmdConfig:
         assert conf["version"] == 1
         assert conf["install_dir"] == "/opt/kai"
         assert conf["env"]["TELEGRAM_BOT_TOKEN"] == "fake-token"
-        assert conf["env"]["ALLOWED_USER_IDS"] == "12345"
+        # ALLOWED_USER_IDS should not be in the env dict
+        assert "ALLOWED_USER_IDS" not in conf["env"]
+        # users.yaml should have been generated
+        yaml_path = tmp_path / "users.yaml"
+        assert yaml_path.exists()
+        data = yaml.safe_load(yaml_path.read_text())
+        assert data["users"][0]["telegram_id"] == 12345
+        assert data["users"][0]["role"] == "admin"
 
-    def test_reads_existing_defaults(self, tmp_path, monkeypatch):
+    def test_reads_existing_defaults(self, tmp_path, monkeypatch, capsys):
         """Config subcommand uses existing install.conf values as defaults."""
         monkeypatch.chdir(tmp_path)
         conf_path = tmp_path / "install.conf"
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
 
         # Write existing config
         existing = {
@@ -326,11 +453,13 @@ class TestCmdConfig:
             "platform": "linux",
             "env": {
                 "TELEGRAM_BOT_TOKEN": "existing-token",
-                "ALLOWED_USER_IDS": "999",
                 "WEBHOOK_SECRET": "existing-secret",
             },
         }
         conf_path.write_text(json.dumps(existing))
+
+        # Place an existing users.yaml so the wizard skips user prompts
+        (tmp_path / "users.yaml").write_text("users:\n  - telegram_id: 999\n    name: existing\n    role: admin\n")
 
         # Press Enter for everything (accept all defaults)
         monkeypatch.setattr("builtins.input", lambda prompt: "")
@@ -341,6 +470,11 @@ class TestCmdConfig:
         # Should preserve existing values when user accepts defaults
         assert conf["install_dir"] == "/custom/path"
         assert conf["env"]["TELEGRAM_BOT_TOKEN"] == "existing-token"
+        # users.yaml should not have been overwritten
+        output = capsys.readouterr().out
+        assert "already configured" in output
+        data = yaml.safe_load((tmp_path / "users.yaml").read_text())
+        assert data["users"][0]["telegram_id"] == 999
 
     def test_validates_required_fields(self):
         """Required-field validation rejects empty input."""
@@ -408,7 +542,7 @@ class TestCmdApply:
                     "data_dir": str(tmp_path / "var" / "lib" / "kai"),
                     "service_user": "nobody",
                     "platform": "darwin",
-                    "env": {"TELEGRAM_BOT_TOKEN": "tok", "ALLOWED_USER_IDS": "1"},
+                    "env": {"TELEGRAM_BOT_TOKEN": "tok"},
                 }
             )
         )
@@ -427,12 +561,10 @@ class TestCmdApply:
         """The generated env file contains all provided values."""
         env = {
             "TELEGRAM_BOT_TOKEN": "test-token",
-            "ALLOWED_USER_IDS": "123",
             "WEBHOOK_PORT": "8080",
         }
         content = _generate_env_file(env)
         assert 'TELEGRAM_BOT_TOKEN="test-token"' in content
-        assert 'ALLOWED_USER_IDS="123"' in content
         assert 'WEBHOOK_PORT="8080"' in content
 
     def test_generates_launchd_plist_for_darwin(self):
