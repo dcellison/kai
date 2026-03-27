@@ -154,8 +154,8 @@ def _validate_user_ids(value: str) -> bool:
 def _validate_telegram_id(value: str) -> bool:
     """Check that a string is a single positive integer (Telegram user ID)."""
     try:
-        return int(value) > 0
-    except ValueError:
+        return int(value.strip()) > 0
+    except (ValueError, AttributeError):
         return False
 
 
@@ -167,6 +167,15 @@ _DISPLAY_NAME_RE = re.compile(r"^[a-zA-Z0-9 _-]+$")
 def _validate_display_name(value: str) -> bool:
     """Check that a display name contains only safe characters for YAML output."""
     return bool(value.strip()) and _DISPLAY_NAME_RE.match(value.strip()) is not None
+
+
+# OS usernames: alphanumeric, dots, hyphens, underscores.
+_OS_USER_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+
+
+def _validate_os_user(value: str) -> bool:
+    """Check that an OS username contains only valid characters for YAML output."""
+    return bool(value.strip()) and _OS_USER_RE.match(value.strip()) is not None
 
 
 def _validate_port(value: str) -> bool:
@@ -285,9 +294,10 @@ def _cmd_config() -> None:
     users_yaml_exists = users_yaml_path.exists()
 
     if not users_yaml_exists:
-        # /etc/kai/users.yaml is mode 0600 owned by root, so
-        # Path.exists() returns False for unprivileged users. That's
-        # fine - worst case we re-prompt and the next 'make install'
+        # /etc/kai/users.yaml is mode 0600 owned by root. Whether
+        # Path.exists() works depends on the parent directory permissions;
+        # it may return True even if the file isn't readable. Either way,
+        # the worst case is re-prompting and the next 'make install'
         # overwrites the deployed copy with the new one.
         etc_users = Path("/etc/kai/users.yaml")
         if etc_users.exists():
@@ -329,6 +339,7 @@ def _cmd_config() -> None:
                 "",
                 required=True,
             )
+            admin_telegram_id = admin_telegram_id.strip()
             if _validate_telegram_id(admin_telegram_id):
                 break
             print("  Must be a positive integer. Message @userinfobot on Telegram to find yours.")
@@ -350,7 +361,11 @@ def _cmd_config() -> None:
             # default means os_user matches the bot process user. This is
             # fine - PR #192 handles the self-sudo skip for this case.
             default_os_user = existing_env.get("CLAUDE_USER", "") or os.environ.get("USER", "")
-            admin_os_user = _prompt("OS user for subprocess isolation", default_os_user) or None
+            while True:
+                admin_os_user = _prompt("OS user for subprocess isolation", default_os_user) or None
+                if admin_os_user is None or _validate_os_user(admin_os_user):
+                    break
+                print("  Username may only contain letters, numbers, dots, hyphens, and underscores.")
 
             # Default home_workspace to PROJECT_ROOT.
             default_home = str(PROJECT_ROOT)
@@ -701,11 +716,11 @@ def _generate_users_yaml(
     """
     Generate a minimal users.yaml with a single admin entry.
 
-    Uses string formatting rather than yaml.dump() because the output
-    is trivial and this avoids pulling PyYAML into the generator.
-    The telegram_id is already validated as a positive integer string,
-    so no quoting is needed. The name is validated by _validate_display_name()
-    to contain only YAML-safe characters.
+    Uses string formatting rather than yaml.dump() to keep the output
+    deterministic and human-readable (consistent indentation, field order,
+    comment header). All embedded values are pre-validated: telegram_id is
+    a positive integer string, name passes _validate_display_name(),
+    os_user passes _validate_os_user(), and home_workspace is quoted.
 
     Args:
         telegram_id: The admin user's Telegram ID (validated positive int string).
@@ -728,7 +743,9 @@ def _generate_users_yaml(
     if os_user:
         lines.append(f"    os_user: {os_user}")
     if home_workspace:
-        lines.append(f"    home_workspace: {home_workspace}")
+        # Quote the path to prevent YAML comment delimiter issues
+        # (e.g., a path containing " #" would be silently truncated).
+        lines.append(f'    home_workspace: "{home_workspace}"')
     lines.append("")  # trailing newline
     return "\n".join(lines)
 

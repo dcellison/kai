@@ -41,6 +41,7 @@ from kai.install import (
     _user_home,
     _validate_chat_id,
     _validate_display_name,
+    _validate_os_user,
     _validate_port,
     _validate_positive_float,
     _validate_positive_int,
@@ -117,6 +118,26 @@ class TestValidateDisplayName:
 
     def test_whitespace_only(self):
         assert _validate_display_name("   ") is False
+
+
+class TestValidateOsUser:
+    def test_simple_name(self):
+        assert _validate_os_user("kai") is True
+
+    def test_with_dot(self):
+        assert _validate_os_user("kai.user") is True
+
+    def test_with_hyphen_underscore(self):
+        assert _validate_os_user("kai-user_01") is True
+
+    def test_yaml_special_colon(self):
+        assert _validate_os_user("kai: admin") is False
+
+    def test_space(self):
+        assert _validate_os_user("kai user") is False
+
+    def test_empty_string(self):
+        assert _validate_os_user("") is False
 
 
 class TestValidatePort:
