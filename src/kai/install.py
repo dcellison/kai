@@ -345,7 +345,7 @@ def _cmd_config() -> None:
             print("  Must be a positive integer. Message @userinfobot on Telegram to find yours.")
 
         while True:
-            admin_name = _prompt("Admin display name", "admin", required=True)
+            admin_name = _prompt("Admin display name", "admin", required=True).strip()
             if _validate_display_name(admin_name):
                 break
             print("  Name may only contain letters, numbers, spaces, hyphens, and underscores.")
