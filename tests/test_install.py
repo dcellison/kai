@@ -304,6 +304,12 @@ class TestGenerateUsersYaml:
         assert entry["os_user"] == "no"
         assert isinstance(entry["os_user"], str)
 
+    def test_os_user_with_trailing_dots_not_corrupted(self):
+        """os_user ending in '...' must not be truncated by document end stripping."""
+        content = _generate_users_yaml("123", "alice", os_user="test...")
+        data = yaml.safe_load(content)
+        assert data["users"][0]["os_user"] == "test..."
+
 
 class TestGenerateSudoers:
     def test_contains_user(self):

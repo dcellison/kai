@@ -733,9 +733,12 @@ def _generate_users_yaml(
         The YAML file contents as a string.
     """
 
-    # yaml.dump() appends "\n...\n" (document end marker) for plain
-    # scalars and "\n" for quoted ones. Strip both so we get a bare
-    # scalar suitable for embedding in a larger YAML document.
+    # yaml.dump() appends a document end marker ("\n...\n") after
+    # plain scalars (e.g., "alice\n...\n") and just "\n" after quoted
+    # ones (e.g., "'yes'\n"). Strip the marker and trailing newlines
+    # so we get a bare scalar for embedding in a larger document.
+    # The removesuffix("...") is safe because the marker is always
+    # on its own line, separated by "\n" from any "..." in the value.
     def _yaml_scalar(value: str) -> str:
         return yaml.dump(value, default_flow_style=True).rstrip("\n").removesuffix("...").rstrip("\n")
 
