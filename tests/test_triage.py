@@ -401,12 +401,12 @@ class TestRunTriage:
             pytest.skip("UID has no passwd entry")
         mock_proc = AsyncMock()
         mock_proc.pid = 12345
-        mock_proc.communicate = AsyncMock(side_effect=TimeoutError)
         mock_proc.wait = AsyncMock()
 
         with (
             patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc),
-            patch("os.killpg") as mock_killpg,
+            patch("kai.triage.asyncio.wait_for", side_effect=TimeoutError()),
+            patch("kai.triage.os.killpg") as mock_killpg,
             pytest.raises(RuntimeError, match="timed out"),
         ):
             await run_triage("prompt", claude_user=current_user)

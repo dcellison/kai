@@ -648,12 +648,12 @@ class TestRunReview:
             pytest.skip("UID has no passwd entry")
         mock_proc = AsyncMock()
         mock_proc.pid = 12345
-        mock_proc.communicate = AsyncMock(side_effect=TimeoutError)
         mock_proc.wait = AsyncMock()
 
         with (
             patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
-            patch("os.killpg") as mock_killpg,
+            patch("kai.review.asyncio.wait_for", side_effect=TimeoutError()),
+            patch("kai.review.os.killpg") as mock_killpg,
             pytest.raises(RuntimeError, match="timed out"),
         ):
             await run_review("prompt", claude_user=current_user)

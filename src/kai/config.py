@@ -50,8 +50,6 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 # ── Self-sudo resolution ─────────────────────────────────────────────
 
-log = logging.getLogger(__name__)
-
 
 def resolve_claude_user(claude_user: str | None) -> str | None:
     """
