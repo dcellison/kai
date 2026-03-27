@@ -293,6 +293,17 @@ class TestGenerateUsersYaml:
         content = _generate_users_yaml("123", "test")
         assert content.endswith("\n")
 
+    def test_yaml_boolean_keywords_roundtrip(self):
+        """YAML 1.1 boolean keywords in name/os_user survive roundtrip."""
+        content = _generate_users_yaml("123", "yes", os_user="no")
+        data = yaml.safe_load(content)
+        entry = data["users"][0]
+        # Must be strings, not booleans
+        assert entry["name"] == "yes"
+        assert isinstance(entry["name"], str)
+        assert entry["os_user"] == "no"
+        assert isinstance(entry["os_user"], str)
+
 
 class TestGenerateSudoers:
     def test_contains_user(self):
