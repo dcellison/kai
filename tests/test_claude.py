@@ -898,8 +898,8 @@ class TestSendLockedErrors:
             readline_count[0] += 1
             if readline_count[0] <= 2:
                 return _assistant_event(f"Output {readline_count[0]}")
-            # Should not reach here - idle timeout fires first
-            return _assistant_event("unreachable")
+            # If we get here, the idle timeout didn't fire as expected
+            pytest.fail("readline reached call 3 - idle timeout did not fire")
 
         proc = _make_mock_proc([])
         proc.stdout.readline = readline_with_output
