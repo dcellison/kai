@@ -875,27 +875,31 @@ class TestSendLockedErrors:
         claude = _make_claude(timeout_seconds=1)  # idle limit = 5s
 
         # Control time progression in kai.claude without affecting asyncio.
-        # After two successful readlines, jump time forward past the idle
-        # limit so the check at the top of the next loop iteration fires.
-        call_count = [0]
+        # The streaming loop calls time.monotonic() in a fixed pattern:
+        #   1. Init: last_activity = time.monotonic()
+        #   2. Idle check (iter 1): time.monotonic() - last_activity
+        #   3. Reset after readline 1: last_activity = time.monotonic()
+        #   4. Idle check (iter 2): time.monotonic() - last_activity
+        #   5. Reset after readline 2: last_activity = time.monotonic()
+        #   6. Idle check (iter 3): time.monotonic() - last_activity <- jump here
+        # Calls 1-5 return small values; call 6+ returns 100.0 so the
+        # idle check sees (100.0 - 0.5) > 5s and fires.
+        mono_call = [0]
 
         def fake_monotonic():
-            call_count[0] += 1
-            # First several calls: normal progression (init, checks, resets)
-            if call_count[0] <= 5:
-                return call_count[0] * 0.1
-            # After that: jump way past the idle limit
+            mono_call[0] += 1
+            if mono_call[0] <= 5:
+                return mono_call[0] * 0.1
             return 100.0
 
-        readline_count = 0
+        readline_count = [0]
 
         async def readline_with_output():
-            nonlocal readline_count
-            readline_count += 1
-            if readline_count <= 2:
-                return _assistant_event(f"Output {readline_count}")
+            readline_count[0] += 1
+            if readline_count[0] <= 2:
+                return _assistant_event(f"Output {readline_count[0]}")
             # Should not reach here - idle timeout fires first
-            return _assistant_event("Should not reach this")
+            return _assistant_event("unreachable")
 
         proc = _make_mock_proc([])
         proc.stdout.readline = readline_with_output
@@ -942,24 +946,33 @@ class TestSendLockedErrors:
         """
         claude = _make_claude(timeout_seconds=1)  # idle limit = 5s, old wall-clock = 5s
 
-        call_count = 0
+        # Simulate a process that takes longer than timeout_seconds * 5 total
+        # but keeps producing output (resetting the idle timer each time).
+        # Uses mocked time so the test runs instantly. Each readline advances
+        # time by 0.5s; after 20 calls that is 10s total, well past the old
+        # 5s wall-clock limit. The idle timer never fires because each
+        # readline resets it to within 0.5s.
+        sim_time = [0.0]
 
-        async def slow_but_active_readline():
-            nonlocal call_count
-            call_count += 1
-            if call_count <= 20:
-                # Emit events every 0.4s - total time ~8s, well past the 5s limit
-                await asyncio.sleep(0.4)
-                return _assistant_event(f"Working... step {call_count}")
-            # Finish with a result event
+        def advancing_monotonic():
+            return sim_time[0]
+
+        call_count = [0]
+
+        async def active_readline():
+            call_count[0] += 1
+            if call_count[0] <= 20:
+                sim_time[0] += 0.5  # advance 0.5s per event
+                return _assistant_event(f"Working... step {call_count[0]}")
             return _result_event("All done")
 
         proc = _make_mock_proc([])
-        proc.stdout.readline = slow_but_active_readline
+        proc.stdout.readline = active_readline
         claude._proc = proc
         claude._fresh_session = False
 
-        events = await _collect_events(claude)
+        with patch("kai.claude.time.monotonic", side_effect=advancing_monotonic):
+            events = await _collect_events(claude)
 
         # Should complete successfully despite total time > timeout_seconds * 5
         done_event = events[-1]
