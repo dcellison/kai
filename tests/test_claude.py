@@ -925,7 +925,7 @@ class TestSendLockedErrors:
                 _result_event("Done"),
             ]
         )
-        claude = _make_claude(timeout_seconds=1)  # wall-clock = 5s
+        claude = _make_claude(timeout_seconds=1)  # idle limit = 5s
         claude._proc = proc
         claude._fresh_session = False
 
