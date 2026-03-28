@@ -150,14 +150,12 @@ _QUEUED_MESSAGE_MARKER = (
 )
 
 # Safety-net timeout for acquiring the per-chat lock (seconds). If the
-# wall-clock timeout in claude.py doesn't fire for some reason, this
-# prevents a stuck interaction from blocking all future messages. Set
-# longer than claude.py's wall-clock limit (timeout_seconds * 5) so the
-# inner timeout fires first when the process is emitting frequent lines.
-# Note: the wall-clock check runs between readline calls, so it can
-# overshoot by up to one readline timeout (timeout_seconds * 3 = 6 min
-# at defaults). Effective worst case is ~16 min, not 10.
-_LOCK_ACQUIRE_TIMEOUT = 660  # 11 minutes
+# idle timeout in claude.py doesn't fire for some reason, this prevents
+# a stuck interaction from blocking all future messages indefinitely.
+# Set generously: the idle timer in claude.py is the real safety net
+# (fires after timeout_seconds * 5 of silence); this is a last-resort
+# backstop for interactions that run legitimately long with active output.
+_LOCK_ACQUIRE_TIMEOUT = 3600  # 1 hour
 
 
 async def _acquire_lock_or_kill(

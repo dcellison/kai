@@ -2458,7 +2458,7 @@ class TestAcquireLockOrKill:
         await held_lock.acquire()
 
         try:
-            # Patch the timeout to something tiny so the test doesn't wait 11 min
+            # Patch the timeout to something tiny so the test doesn't wait 1 hour
             with patch("kai.bot._LOCK_ACQUIRE_TIMEOUT", 0.05):
                 result = await _acquire_lock_or_kill(chat_id, claude, update)
         finally:

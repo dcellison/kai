@@ -575,23 +575,22 @@ class PersistentClaude:
             return
 
         accumulated_text = ""
-        # Wall-clock limit for the entire interaction. The per-readline
-        # timeout below catches dead processes (no output for 6 min), but
-        # a process stuck in a tool-use loop emits progress events that
-        # reset the readline timer indefinitely. This outer limit catches
-        # that case: if the total interaction exceeds N minutes regardless
-        # of output, kill the process.
-        interaction_start = time.monotonic()
-        max_interaction_seconds = self.timeout_seconds * 5  # 10 min at default 120s
+        # Idle-activity timeout for the interaction. Resets every time the
+        # process emits a line of output. If the process goes silent for
+        # this long, it is likely dead or wedged. The per-readline timeout
+        # below (timeout_seconds * 3) is the primary dead-process detector;
+        # this is a secondary safety net measured across the whole interaction.
+        last_activity = time.monotonic()
+        max_idle_seconds = self.timeout_seconds * 5  # 10 min of silence at default 120s
         try:
             while True:
-                # Check wall-clock limit before each readline
-                elapsed = time.monotonic() - interaction_start
-                if elapsed > max_interaction_seconds:
+                # Check idle timeout before each readline
+                idle_seconds = time.monotonic() - last_activity
+                if idle_seconds > max_idle_seconds:
                     log.error(
-                        "Interaction exceeded wall-clock limit (%.0fs > %ds)",
-                        elapsed,
-                        max_interaction_seconds,
+                        "Interaction idle timeout (%.0fs with no output, limit %ds)",
+                        idle_seconds,
+                        max_idle_seconds,
                     )
                     await self._kill()
                     yield StreamEvent(
@@ -600,7 +599,7 @@ class PersistentClaude:
                         response=ClaudeResponse(
                             success=False,
                             text=accumulated_text,
-                            error="Claude interaction timed out (too long)",
+                            error="Claude interaction timed out (no output)",
                         ),
                     )
                     return
@@ -618,6 +617,11 @@ class PersistentClaude:
                         response=ClaudeResponse(success=False, text=accumulated_text, error="Claude timed out"),
                     )
                     return
+
+                # Reset idle timer - process is alive and producing output.
+                # Do NOT reset on empty line (EOF); that means the process died.
+                if line:
+                    last_activity = time.monotonic()
 
                 if not line:
                     # Process died unexpectedly
