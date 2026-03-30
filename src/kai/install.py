@@ -809,7 +809,7 @@ def _generate_sudoers(service_user: str, claude_user: str | None = None) -> str:
     if claude_user:
         svc_home = _user_home(service_user)
         claude_bin = shutil.which("claude") or f"{svc_home}/.local/bin/claude"
-        rules += f"{service_user} ALL=({claude_user}) NOPASSWD: {claude_bin}\n"
+        rules += f"{service_user} ALL=({claude_user}) SETENV: NOPASSWD: {claude_bin}\n"
 
     return rules
 

@@ -347,7 +347,7 @@ class TestGenerateSudoers:
         real_which = shutil.which
         monkeypatch.setattr(shutil, "which", lambda n: "/usr/local/bin/claude" if n == "claude" else real_which(n))
         result = _generate_sudoers("kai", claude_user="alice")
-        assert "kai ALL=(alice) NOPASSWD: /usr/local/bin/claude" in result
+        assert "kai ALL=(alice) SETENV: NOPASSWD: /usr/local/bin/claude" in result
 
     def test_claude_user_rule_fallback(self, monkeypatch):
         """Falls back to service user home when claude is not on PATH."""
@@ -355,7 +355,7 @@ class TestGenerateSudoers:
         real_which = shutil.which
         monkeypatch.setattr(shutil, "which", lambda n: None if n == "claude" else real_which(n))
         result = _generate_sudoers("kai", claude_user="alice")
-        assert "kai ALL=(alice) NOPASSWD: /home/kai/.local/bin/claude" in result
+        assert "kai ALL=(alice) SETENV: NOPASSWD: /home/kai/.local/bin/claude" in result
 
 
 class TestGenerateLaunchdPlist:

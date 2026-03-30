@@ -154,8 +154,9 @@ class TestCommandConstruction:
             assert cmd[0] == "sudo"
             assert cmd[1] == "-u"
             assert cmd[2] == "daniel"
-            assert cmd[3] == "--"
-            assert cmd[4] == "claude"
+            assert cmd[3] == "--preserve-env=KAI_WEBHOOK_SECRET"
+            assert cmd[4] == "--"
+            assert cmd[5] == "claude"
 
     @pytest.mark.asyncio
     async def test_start_new_session_true_with_claude_user(self):
@@ -225,7 +226,10 @@ class TestCommandConstruction:
             args = mock_exec.call_args
             cmd = args[0]
             assert cmd[0] == "sudo"
+            assert cmd[1] == "-u"
             assert cmd[2] == "some_other_user"
+            assert cmd[3] == "--preserve-env=KAI_WEBHOOK_SECRET"
+            assert cmd[4] == "--"
             assert args[1].get("start_new_session") is True
 
     @pytest.mark.asyncio
@@ -252,6 +256,46 @@ class TestCommandConstruction:
             assert cmd[0] == "sudo"
             assert cmd[2] == "container_user"
             assert args[1].get("start_new_session") is True
+
+    @pytest.mark.asyncio
+    async def test_sudo_preserves_webhook_secret_flag(self):
+        """Sudo invocation includes --preserve-env for the webhook secret."""
+        claude = _make_claude(claude_user="some_other_user", webhook_secret="s3cret")
+
+        mock_pw = MagicMock(pw_name="kai")
+        with (
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("kai.config.pwd.getpwuid", return_value=mock_pw),
+        ):
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            cmd = mock_exec.call_args[0]
+            assert "--preserve-env=KAI_WEBHOOK_SECRET" in cmd
+            # Secret is also in the env dict (unchanged behavior).
+            env = mock_exec.call_args[1]["env"]
+            assert env["KAI_WEBHOOK_SECRET"] == "s3cret"
+
+    @pytest.mark.asyncio
+    async def test_no_preserve_env_without_sudo(self):
+        """No --preserve-env flag when not using sudo."""
+        claude = _make_claude(webhook_secret="s3cret")
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            cmd = mock_exec.call_args[0]
+            assert "sudo" not in cmd
+            assert "--preserve-env=KAI_WEBHOOK_SECRET" not in cmd
 
 
 # ── Process signal handling ──────────────────────────────────────────
@@ -1279,6 +1323,29 @@ class TestContextInjection:
         assert "perplexity" in prompt
         assert "Web search" in prompt
         assert "sonar" in prompt
+
+    @pytest.mark.asyncio
+    async def test_api_prompts_mandate_curl(self, home_workspace):
+        """API prompt sections explicitly mandate curl over WebFetch."""
+        proc = _make_mock_proc([_system_event(), _result_event(), b""])
+        claude = _make_claude(
+            workspace=home_workspace,
+            home_workspace=home_workspace,
+            webhook_secret="test-secret",
+            # Services info needed to trigger the External Services section
+            services_info=[
+                {"name": "test-svc", "method": "POST", "description": "Test", "notes": ""},
+            ],
+        )
+        claude._proc = proc
+        claude._fresh_session = True
+
+        with patch("kai.claude.get_recent_history", return_value=""):
+            await _collect_events(claude, "test message")
+
+        prompt = self._extract_prompt(proc)
+        # All four API sections should mandate curl.
+        assert prompt.count("use curl (NEVER WebFetch)") >= 4
 
 
 # ── _send_locked: multi-modal prompt ─────────────────────────────────

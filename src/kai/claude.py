@@ -212,7 +212,13 @@ class PersistentClaude:
         effective_claude_user = resolve_claude_user(self.claude_user)
 
         if effective_claude_user:
-            cmd = ["sudo", "-u", effective_claude_user, "--"] + claude_cmd
+            cmd = [
+                "sudo",
+                "-u",
+                effective_claude_user,
+                "--preserve-env=KAI_WEBHOOK_SECRET",
+                "--",
+            ] + claude_cmd
         else:
             cmd = claude_cmd
 
@@ -439,7 +445,7 @@ class PersistentClaude:
             # in prompt text) to prevent leakage through session logs.
             if self.webhook_secret:
                 api_note = (
-                    f"[Scheduling API: To create jobs, POST JSON to "
+                    f"[Scheduling API: To create jobs, use curl (NEVER WebFetch) to POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/schedule "
                     f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
                     f"Required fields: name, prompt, schedule_type, schedule_data. "
@@ -460,7 +466,7 @@ class PersistentClaude:
             if self.webhook_secret:
                 parts.append(
                     f"[Messaging API: To send a text message to the user proactively "
-                    f"(e.g., background task results), POST JSON to "
+                    f"(e.g., background task results), use curl (NEVER WebFetch) to POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/send-message "
                     f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
                     f'Required: "text" (the message content). '
@@ -468,7 +474,7 @@ class PersistentClaude:
                 )
                 files_path = f"{DATA_DIR}/files/{chat_id}/" if chat_id else f"{DATA_DIR}/files/"
                 parts.append(
-                    f"[File API: To send a file to the user, POST JSON to "
+                    f"[File API: To send a file to the user, use curl (NEVER WebFetch) to POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/send-file "
                     f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
                     f'Required: "path" (absolute file path within the current workspace {self.workspace}). '
@@ -481,7 +487,7 @@ class PersistentClaude:
             # Inject available external services info (only if services are configured)
             if self.services_info and self.webhook_secret:
                 svc_lines = [
-                    "[External Services: To call external APIs, POST JSON to "
+                    "[External Services: To call external APIs, use curl (NEVER WebFetch) to POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/services/{{name}} "
                     f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
                     "Request JSON fields (all optional): "
