@@ -809,6 +809,9 @@ def _generate_sudoers(service_user: str, claude_user: str | None = None) -> str:
     if claude_user:
         svc_home = _user_home(service_user)
         claude_bin = shutil.which("claude") or f"{svc_home}/.local/bin/claude"
+        # SETENV: allows the service user to pass env vars (e.g.,
+        # KAI_WEBHOOK_SECRET) through sudo to the claude process.
+        # Scoped to this rule only; cat/tee rules remain locked down.
         rules += f"{service_user} ALL=({claude_user}) SETENV: NOPASSWD: {claude_bin}\n"
 
     return rules
