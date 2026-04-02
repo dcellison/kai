@@ -442,11 +442,12 @@ def _cmd_config() -> None:
             existing_env.get("CLAUDE_MAX_CONTEXT_WINDOW", "200000"),
         )
         try:
-            if int(max_context_window) >= 0:
+            val = int(max_context_window)
+            if 0 <= val <= 10_000_000:
                 break
         except ValueError:
             pass
-        print("  Must be zero or a positive integer.")
+        print("  Must be 0-10000000 (0 = use default).")
 
     # Autocompact threshold controls when Claude automatically compresses
     # conversation history. Lower values compact sooner, reducing token
