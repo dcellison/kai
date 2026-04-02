@@ -443,6 +443,8 @@ class TestCmdConfig:
                 "sonnet",  # model
                 "120",  # timeout
                 "10.0",  # budget
+                "200000",  # max context window
+                "80",  # autocompact pct
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
@@ -466,6 +468,8 @@ class TestCmdConfig:
         assert conf["version"] == 1
         assert conf["install_dir"] == "/opt/kai"
         assert conf["env"]["TELEGRAM_BOT_TOKEN"] == "fake-token"
+        assert conf["env"]["CLAUDE_MAX_CONTEXT_WINDOW"] == "200000"
+        assert conf["env"]["CLAUDE_AUTOCOMPACT_PCT"] == "80"
         # ALLOWED_USER_IDS should not be in the env dict
         assert "ALLOWED_USER_IDS" not in conf["env"]
         # users.yaml should have been generated
@@ -498,6 +502,8 @@ class TestCmdConfig:
                 "sonnet",  # model
                 "120",  # timeout
                 "10.0",  # budget
+                "200000",  # max context window
+                "80",  # autocompact pct
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base

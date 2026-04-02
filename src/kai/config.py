@@ -206,6 +206,12 @@ class Config:
     claude_idle_timeout: int = 1800  # seconds before idle subprocess eviction; 0 = no eviction
     claude_workspace: Path = field(default_factory=lambda: PROJECT_ROOT / "home")
 
+    # Context window tuning. Both settings help control token usage and
+    # reduce cache invalidation pressure on the inner Claude process.
+    # 0 = use Claude Code defaults (1M window, ~83% autocompact threshold).
+    claude_max_context_window: int = 0  # tokens; passed as --max-context-window CLI flag
+    claude_autocompact_pct: int = 0  # 1-100; passed as CLAUDE_AUTOCOMPACT_PCT_OVERRIDE env var
+
     # Database - uses DATA_DIR so the db lands in the writable data directory
     session_db_path: Path = field(default_factory=lambda: DATA_DIR / "kai.db")
 
@@ -866,6 +872,20 @@ def load_config() -> Config:
     except ValueError:
         raise SystemExit("FILE_RETENTION_DAYS must be an integer") from None
 
+    # Context window tuning - 0 means "use Claude Code defaults"
+    try:
+        claude_max_context_window = int(os.environ.get("CLAUDE_MAX_CONTEXT_WINDOW", "0"))
+        if claude_max_context_window < 0:
+            raise SystemExit("CLAUDE_MAX_CONTEXT_WINDOW must be zero or a positive integer")
+    except ValueError:
+        raise SystemExit("CLAUDE_MAX_CONTEXT_WINDOW must be an integer") from None
+    try:
+        claude_autocompact_pct = int(os.environ.get("CLAUDE_AUTOCOMPACT_PCT", "0"))
+        if claude_autocompact_pct < 0 or claude_autocompact_pct > 100:
+            raise SystemExit("CLAUDE_AUTOCOMPACT_PCT must be 0-100 (0 = use default)")
+    except ValueError:
+        raise SystemExit("CLAUDE_AUTOCOMPACT_PCT must be an integer") from None
+
     # PR review agent config
     pr_review_enabled = os.environ.get("PR_REVIEW_ENABLED", "").lower() in ("1", "true", "yes")
     try:
@@ -950,6 +970,8 @@ def load_config() -> Config:
         claude_max_budget_usd=claude_max_budget_usd,
         claude_max_session_hours=claude_max_session_hours,
         claude_idle_timeout=claude_idle_timeout,
+        claude_max_context_window=claude_max_context_window,
+        claude_autocompact_pct=claude_autocompact_pct,
         webhook_port=webhook_port,
         webhook_secret=os.environ.get("WEBHOOK_SECRET", ""),
         voice_enabled=os.environ.get("VOICE_ENABLED", "").lower() in ("1", "true", "yes"),

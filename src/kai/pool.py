@@ -133,6 +133,8 @@ class SubprocessPool:
             claude_user=os_user,
             max_session_hours=self._config.claude_max_session_hours,
             workspace_config=ws_config,
+            max_context_window=self._config.claude_max_context_window,
+            autocompact_pct=self._config.claude_autocompact_pct,
         )
 
     # ── Prompt routing ──────────────────────────────────────────────

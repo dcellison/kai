@@ -114,6 +114,8 @@ class PersistentClaude:
         claude_user: str | None = None,
         max_session_hours: float = 0,
         workspace_config: WorkspaceConfig | None = None,
+        max_context_window: int = 0,
+        autocompact_pct: int = 0,
     ):
         self.model = model
         self.workspace = workspace
@@ -126,6 +128,8 @@ class PersistentClaude:
         self.claude_user = claude_user
         self.max_session_hours = max_session_hours
         self.workspace_config = workspace_config
+        self.max_context_window = max_context_window
+        self.autocompact_pct = autocompact_pct
 
         # Global defaults, preserved so we can restore them when
         # switching away from a configured workspace.
@@ -207,6 +211,11 @@ class PersistentClaude:
             str(self.max_budget_usd),
         ]
 
+        # Limit context window size to reduce token usage and cache
+        # invalidation pressure. 0 = use Claude Code's default (1M).
+        if self.max_context_window > 0:
+            claude_cmd += ["--max-context-window", str(self.max_context_window)]
+
         # Resolve self-sudo: skip sudo when claude_user matches the bot
         # process user. The shared utility logs a warning when skipping.
         effective_claude_user = resolve_claude_user(self.claude_user)
@@ -245,6 +254,12 @@ class PersistentClaude:
         # Webhook secret last - ensures workspace env can't override it.
         if self.webhook_secret:
             env["KAI_WEBHOOK_SECRET"] = self.webhook_secret
+
+        # Set autocompact threshold so Claude compacts earlier, reducing
+        # token usage. Passed as an env var (not a CLI flag) because
+        # Claude Code reads it from its process environment.
+        if self.autocompact_pct > 0:
+            env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(self.autocompact_pct)
 
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,

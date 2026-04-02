@@ -433,6 +433,38 @@ def _cmd_config() -> None:
         if _validate_positive_float(budget):
             break
         print("  Must be a positive number.")
+
+    # Context window tuning - smaller windows reduce token usage and
+    # cache invalidation pressure on the inner Claude process.
+    while True:
+        max_context_window = _prompt(
+            "Max context window (tokens, 0 = default 1M)",
+            existing_env.get("CLAUDE_MAX_CONTEXT_WINDOW", "200000"),
+        )
+        try:
+            if int(max_context_window) >= 0:
+                break
+        except ValueError:
+            pass
+        print("  Must be zero or a positive integer.")
+
+    # Autocompact threshold controls when Claude automatically compresses
+    # conversation history. Lower values compact sooner, reducing token
+    # usage at the cost of losing raw context earlier. Claude Code caps
+    # this at ~83% regardless of what you set - values above that are
+    # silently clamped.
+    while True:
+        autocompact_pct = _prompt(
+            "Autocompact threshold (% of context window, 0 = default ~83%)",
+            existing_env.get("CLAUDE_AUTOCOMPACT_PCT", "80"),
+        )
+        try:
+            val = int(autocompact_pct)
+            if 0 <= val <= 100:
+                break
+        except ValueError:
+            pass
+        print("  Must be 0-100.")
     print()
 
     # -- Webhook server --
@@ -553,6 +585,12 @@ def _cmd_config() -> None:
         "VOICE_ENABLED": str(voice_enabled).lower(),
         "TTS_ENABLED": str(tts_enabled).lower(),
     }
+
+    # Context window tuning - only include if non-default
+    if max_context_window != "0":
+        env["CLAUDE_MAX_CONTEXT_WINDOW"] = max_context_window
+    if autocompact_pct != "0":
+        env["CLAUDE_AUTOCOMPACT_PCT"] = autocompact_pct
 
     # Conditionally add optional values
     if transport == "webhook":
