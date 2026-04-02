@@ -443,11 +443,11 @@ def _cmd_config() -> None:
         )
         try:
             val = int(max_context_window)
-            if 0 <= val <= 10_000_000:
+            if 0 <= val <= 1_000_000:
                 break
         except ValueError:
             pass
-        print("  Must be 0-10000000 (0 = use default).")
+        print("  Must be 0-1000000 (0 = use default).")
 
     # Autocompact threshold controls when Claude automatically compresses
     # conversation history. Lower values compact sooner, reducing token
