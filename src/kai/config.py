@@ -877,9 +877,7 @@ def load_config() -> Config:
     try:
         claude_max_context_window = int(os.environ.get("CLAUDE_MAX_CONTEXT_WINDOW", "0"))
         if claude_max_context_window < 0 or claude_max_context_window > _MAX_CONTEXT_CEILING:
-            raise SystemExit(
-                f"CLAUDE_MAX_CONTEXT_WINDOW must be 0-{_MAX_CONTEXT_CEILING} (0 = use default)"
-            )
+            raise SystemExit(f"CLAUDE_MAX_CONTEXT_WINDOW must be 0-{_MAX_CONTEXT_CEILING} (0 = use default)")
     except ValueError:
         raise SystemExit("CLAUDE_MAX_CONTEXT_WINDOW must be an integer") from None
     try:
