@@ -586,10 +586,11 @@ def _cmd_config() -> None:
         "TTS_ENABLED": str(tts_enabled).lower(),
     }
 
-    # Context window tuning - only include if non-default
-    if max_context_window != "0":
+    # Context window tuning - only include if non-default.
+    # Compare as int to handle inputs like "000" that pass validation.
+    if int(max_context_window) != 0:
         env["CLAUDE_MAX_CONTEXT_WINDOW"] = max_context_window
-    if autocompact_pct != "0":
+    if int(autocompact_pct) != 0:
         env["CLAUDE_AUTOCOMPACT_PCT"] = autocompact_pct
 
     # Conditionally add optional values

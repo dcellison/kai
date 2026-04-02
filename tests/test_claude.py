@@ -297,6 +297,72 @@ class TestCommandConstruction:
             assert "sudo" not in cmd
             assert "--preserve-env=KAI_WEBHOOK_SECRET" not in cmd
 
+    @pytest.mark.asyncio
+    async def test_max_context_window_in_cmd(self):
+        """--max-context-window flag is added when max_context_window > 0."""
+        claude = _make_claude(max_context_window=200000)
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            cmd = mock_exec.call_args[0]
+            assert "--max-context-window" in cmd
+            idx = cmd.index("--max-context-window")
+            assert cmd[idx + 1] == "200000"
+
+    @pytest.mark.asyncio
+    async def test_no_context_window_flag_when_zero(self):
+        """--max-context-window flag is omitted when max_context_window is 0."""
+        claude = _make_claude(max_context_window=0)
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            cmd = mock_exec.call_args[0]
+            assert "--max-context-window" not in cmd
+
+    @pytest.mark.asyncio
+    async def test_autocompact_pct_in_env(self):
+        """CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is set in subprocess env when configured."""
+        claude = _make_claude(autocompact_pct=80)
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            env = mock_exec.call_args[1]["env"]
+            assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "80"
+
+    @pytest.mark.asyncio
+    async def test_no_autocompact_env_when_zero(self):
+        """CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is not set when autocompact_pct is 0."""
+        claude = _make_claude(autocompact_pct=0)
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            env = mock_exec.call_args[1]["env"]
+            assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in env
+
 
 # ── Process signal handling ──────────────────────────────────────────
 

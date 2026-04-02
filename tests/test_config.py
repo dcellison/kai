@@ -32,6 +32,8 @@ _CONFIG_ENV_VARS = [
     "GITHUB_REPO",
     "SPEC_DIR",
     "ISSUE_TRIAGE_ENABLED",
+    "CLAUDE_MAX_CONTEXT_WINDOW",
+    "CLAUDE_AUTOCOMPACT_PCT",
     "KAI_DATA_DIR",
     "KAI_INSTALL_DIR",
 ]
@@ -81,6 +83,17 @@ class TestLoadConfigDefaults:
         assert config.voice_enabled is False
         assert config.tts_enabled is False
         assert config.workspace_base is None
+        # Context window tuning defaults to 0 (use Claude Code defaults)
+        assert config.claude_max_context_window == 0
+        assert config.claude_autocompact_pct == 0
+
+    def test_context_window_from_env(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_MAX_CONTEXT_WINDOW", "200000")
+        monkeypatch.setenv("CLAUDE_AUTOCOMPACT_PCT", "80")
+        config = load_config()
+        assert config.claude_max_context_window == 200000
+        assert config.claude_autocompact_pct == 80
 
 
 # ── Error cases ──────────────────────────────────────────────────────
@@ -119,6 +132,36 @@ class TestLoadConfigErrors:
         monkeypatch.setenv("CLAUDE_MAX_SESSION_HOURS", "4.5")
         config = load_config()
         assert config.claude_max_session_hours == 4.5
+
+    def test_invalid_context_window(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_MAX_CONTEXT_WINDOW", "not-a-number")
+        with pytest.raises(SystemExit, match="CLAUDE_MAX_CONTEXT_WINDOW"):
+            load_config()
+
+    def test_negative_context_window(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_MAX_CONTEXT_WINDOW", "-1")
+        with pytest.raises(SystemExit, match="CLAUDE_MAX_CONTEXT_WINDOW"):
+            load_config()
+
+    def test_context_window_exceeds_ceiling(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_MAX_CONTEXT_WINDOW", "99999999999")
+        with pytest.raises(SystemExit, match="CLAUDE_MAX_CONTEXT_WINDOW"):
+            load_config()
+
+    def test_invalid_autocompact_pct(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_AUTOCOMPACT_PCT", "not-a-number")
+        with pytest.raises(SystemExit, match="CLAUDE_AUTOCOMPACT_PCT"):
+            load_config()
+
+    def test_autocompact_pct_out_of_range(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_AUTOCOMPACT_PCT", "101")
+        with pytest.raises(SystemExit, match="CLAUDE_AUTOCOMPACT_PCT"):
+            load_config()
 
     def test_invalid_claude_model(self, monkeypatch):
         """CLAUDE_MODEL with an unrecognized value raises SystemExit."""

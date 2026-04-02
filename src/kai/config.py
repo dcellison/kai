@@ -873,10 +873,13 @@ def load_config() -> Config:
         raise SystemExit("FILE_RETENTION_DAYS must be an integer") from None
 
     # Context window tuning - 0 means "use Claude Code defaults"
+    _MAX_CONTEXT_CEILING = 10_000_000  # 10M tokens; sanity check
     try:
         claude_max_context_window = int(os.environ.get("CLAUDE_MAX_CONTEXT_WINDOW", "0"))
-        if claude_max_context_window < 0:
-            raise SystemExit("CLAUDE_MAX_CONTEXT_WINDOW must be zero or a positive integer")
+        if claude_max_context_window < 0 or claude_max_context_window > _MAX_CONTEXT_CEILING:
+            raise SystemExit(
+                f"CLAUDE_MAX_CONTEXT_WINDOW must be 0-{_MAX_CONTEXT_CEILING} (0 = use default)"
+            )
     except ValueError:
         raise SystemExit("CLAUDE_MAX_CONTEXT_WINDOW must be an integer") from None
     try:
