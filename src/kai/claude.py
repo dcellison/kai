@@ -212,9 +212,11 @@ class PersistentClaude:
         ]
 
         # Limit context window size to reduce token usage and cache
-        # invalidation pressure. 0 = use Claude Code's default (1M).
+        # invalidation pressure. Passed via --settings (not a standalone
+        # CLI flag). 0 = use Claude Code's default (1M).
         if self.max_context_window > 0:
-            claude_cmd += ["--max-context-window", str(self.max_context_window)]
+            settings = {"preferences": {"maxContextWindow": self.max_context_window}}
+            claude_cmd += ["--settings", json.dumps(settings)]
 
         # Resolve self-sudo: skip sudo when claude_user matches the bot
         # process user. The shared utility logs a warning when skipping.

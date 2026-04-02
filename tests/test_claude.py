@@ -299,7 +299,7 @@ class TestCommandConstruction:
 
     @pytest.mark.asyncio
     async def test_max_context_window_in_cmd(self):
-        """--max-context-window flag is added when max_context_window > 0."""
+        """--settings with maxContextWindow is added when max_context_window > 0."""
         claude = _make_claude(max_context_window=200000)
 
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
@@ -311,13 +311,14 @@ class TestCommandConstruction:
             await claude._ensure_started()
 
             cmd = mock_exec.call_args[0]
-            assert "--max-context-window" in cmd
-            idx = cmd.index("--max-context-window")
-            assert cmd[idx + 1] == "200000"
+            assert "--settings" in cmd
+            idx = cmd.index("--settings")
+            settings = json.loads(cmd[idx + 1])
+            assert settings["preferences"]["maxContextWindow"] == 200000
 
     @pytest.mark.asyncio
     async def test_no_context_window_flag_when_zero(self):
-        """--max-context-window flag is omitted when max_context_window is 0."""
+        """--settings for context window is omitted when max_context_window is 0."""
         claude = _make_claude(max_context_window=0)
 
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
@@ -329,7 +330,7 @@ class TestCommandConstruction:
             await claude._ensure_started()
 
             cmd = mock_exec.call_args[0]
-            assert "--max-context-window" not in cmd
+            assert "--settings" not in cmd
 
     @pytest.mark.asyncio
     async def test_autocompact_pct_in_env(self):
