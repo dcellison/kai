@@ -701,31 +701,32 @@ async def resolve_user_defaults(
     # ceiling AND the baseline default. If a user has max_budget=20 and
     # hasn't set a /settings budget, they get $20. If they set /settings
     # budget 15, they get $15. They cannot set above $20.
-    budget = (
-        float(db_settings["budget"])
-        if "budget" in db_settings
-        else user_config.max_budget
-        if user_config and user_config.max_budget is not None
-        else config.claude_max_budget_usd
-    )
+    # Defensive try/except matches _restore_workspace and _show_settings.
+    yaml_budget = user_config.max_budget if user_config and user_config.max_budget is not None else None
+    try:
+        budget = float(db_settings["budget"]) if "budget" in db_settings else None
+    except (ValueError, TypeError):
+        budget = None
+    if budget is None:
+        budget = yaml_budget if yaml_budget is not None else config.claude_max_budget_usd
 
     # Timeout: DB > users.yaml > env > 120
-    timeout = (
-        int(db_settings["timeout"])
-        if "timeout" in db_settings
-        else user_config.timeout
-        if user_config and user_config.timeout is not None
-        else config.claude_timeout_seconds
-    )
+    yaml_timeout = user_config.timeout if user_config and user_config.timeout is not None else None
+    try:
+        timeout = int(db_settings["timeout"]) if "timeout" in db_settings else None
+    except (ValueError, TypeError):
+        timeout = None
+    if timeout is None:
+        timeout = yaml_timeout if yaml_timeout is not None else config.claude_timeout_seconds
 
     # Context window: DB > users.yaml > env > 0
-    context_window = (
-        int(db_settings["context_window"])
-        if "context_window" in db_settings
-        else user_config.context_window
-        if user_config and user_config.context_window is not None
-        else config.claude_max_context_window
-    )
+    yaml_ctx = user_config.context_window if user_config and user_config.context_window is not None else None
+    try:
+        context_window = int(db_settings["context_window"]) if "context_window" in db_settings else None
+    except (ValueError, TypeError):
+        context_window = None
+    if context_window is None:
+        context_window = yaml_ctx if yaml_ctx is not None else config.claude_max_context_window
 
     return {
         "model": model,
