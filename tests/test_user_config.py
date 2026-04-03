@@ -36,6 +36,9 @@ class TestUserConfig:
         assert uc.os_user is None
         assert uc.home_workspace is None
         assert uc.max_budget is None
+        assert uc.model is None
+        assert uc.timeout is None
+        assert uc.context_window is None
 
     def test_all_fields(self):
         """Full config with every field populated."""
@@ -47,11 +50,17 @@ class TestUserConfig:
             os_user="alice",
             home_workspace=Path("/home/alice/workspace"),
             max_budget=15.0,
+            model="opus",
+            timeout=300,
+            context_window=200_000,
         )
         assert uc.role == "admin"
         assert uc.github == "alice-dev"
         assert uc.os_user == "alice"
         assert uc.max_budget == 15.0
+        assert uc.model == "opus"
+        assert uc.timeout == 300
+        assert uc.context_window == 200_000
 
     def test_frozen(self):
         """UserConfig is immutable."""
@@ -394,6 +403,164 @@ class TestLoadUserConfigs:
             configs = _load_user_configs()
         assert configs is not None
         assert configs[111].os_user == "alice_os"
+
+    # ── New per-user setting fields (model, timeout, context_window) ──
+
+    def test_model_parsed(self, tmp_path):
+        """Valid model name is stored, lowercased."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                model: Opus
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].model == "opus"
+
+    def test_invalid_model_ignored(self, tmp_path, caplog):
+        """Invalid model name is ignored (set to None), user still loads."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                model: gpt4
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].model is None
+        assert "invalid model" in caplog.text.lower()
+
+    def test_timeout_parsed(self, tmp_path):
+        """Valid timeout is stored as int."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                timeout: 300
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].timeout == 300
+
+    def test_invalid_timeout_ignored(self, tmp_path, caplog):
+        """Negative timeout is ignored, user still loads."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                timeout: -5
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].timeout is None
+        assert "invalid timeout" in caplog.text.lower()
+
+    def test_context_window_parsed(self, tmp_path):
+        """Valid context_window is stored as int."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                context_window: 200000
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].context_window == 200_000
+
+    def test_context_window_zero_allowed(self, tmp_path):
+        """context_window of 0 means 'use default' and is valid."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                context_window: 0
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].context_window == 0
+
+    def test_context_window_below_minimum_ignored(self, tmp_path, caplog):
+        """context_window below 50000 (and not 0) is ignored."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                context_window: 10000
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].context_window is None
+        assert "invalid context_window" in caplog.text.lower()
+
+    def test_new_fields_default_none(self, tmp_path):
+        """New optional fields default to None when omitted."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].model is None
+        assert configs[111].timeout is None
+        assert configs[111].context_window is None
 
 
 # ── Config convenience methods ──────────────────────────────────────

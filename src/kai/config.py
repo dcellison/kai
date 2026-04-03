@@ -43,6 +43,11 @@ DATA_DIR = Path(os.environ.get("KAI_DATA_DIR") or str(PROJECT_ROOT))
 # install.py and bot.py both reference this instead of maintaining their own lists.
 VALID_MODELS = {"haiku", "sonnet", "opus"}
 
+# Maximum context window size in tokens. Claude's hard ceiling.
+# Shared between load_config() (env var validation) and
+# _load_user_configs() (users.yaml validation).
+_MAX_CONTEXT_CEILING = 1_000_000
+
 # Image file extensions that Telegram renders inline as photos.
 # Shared between bot.py (inbound document handling) and webhook.py (send-file API).
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -124,7 +129,8 @@ class UserConfig:
 
     Defines a user's identity, authorization, and resource limits.
     Preferences that the user controls (active model, working budget)
-    live in the settings table, not here.
+    live in the settings table, not here. The fields below are
+    admin-set baselines that users can override within boundaries.
 
     Attributes:
         telegram_id: Telegram user ID (authorization key).
@@ -133,7 +139,12 @@ class UserConfig:
         github: GitHub username for webhook actor routing.
         os_user: OS username for subprocess isolation (Phase 3).
         home_workspace: Per-user home workspace directory.
-        max_budget: Budget ceiling in USD (user cannot exceed via /budget).
+        max_budget: Budget ceiling in USD. Serves double duty as both
+            the admin ceiling (user cannot exceed via /settings budget)
+            and the baseline default (used if user hasn't set their own).
+        model: Default model name (e.g., "opus", "sonnet", "haiku").
+        timeout: Default timeout in seconds for Claude responses.
+        context_window: Default context window size in tokens (0 = default).
     """
 
     telegram_id: int
@@ -143,6 +154,9 @@ class UserConfig:
     os_user: str | None = None
     home_workspace: Path | None = None
     max_budget: float | None = None
+    model: str | None = None
+    timeout: int | None = None
+    context_window: int | None = None
 
 
 # ── Config dataclass ─────────────────────────────────────────────────
@@ -716,6 +730,49 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
                 log.warning("users.yaml: invalid max_budget for %s: %s; skipping entry", name, e)
                 continue
 
+        # Validate optional model (must be in VALID_MODELS if set)
+        model = entry.get("model")
+        if model is not None:
+            model = str(model).strip().lower()
+            if model not in VALID_MODELS:
+                log.warning(
+                    "users.yaml: invalid model '%s' for %s (must be one of %s); ignoring",
+                    model,
+                    name,
+                    sorted(VALID_MODELS),
+                )
+                model = None
+
+        # Validate optional timeout (positive integer)
+        user_timeout = entry.get("timeout")
+        if user_timeout is not None:
+            try:
+                if isinstance(user_timeout, bool):
+                    raise ValueError("must be an integer, not a boolean")
+                user_timeout = int(user_timeout)
+                if user_timeout <= 0:
+                    raise ValueError("must be positive")
+            except (TypeError, ValueError) as e:
+                log.warning("users.yaml: invalid timeout for %s: %s; ignoring", name, e)
+                user_timeout = None
+
+        # Validate optional context_window (0 or 50000-1000000)
+        user_context_window = entry.get("context_window")
+        if user_context_window is not None:
+            try:
+                if isinstance(user_context_window, bool):
+                    raise ValueError("must be an integer, not a boolean")
+                user_context_window = int(user_context_window)
+                if user_context_window < 0:
+                    raise ValueError("must be non-negative")
+                if user_context_window != 0 and user_context_window < 50_000:
+                    raise ValueError("must be at least 50000 (or 0 for default)")
+                if user_context_window > _MAX_CONTEXT_CEILING:
+                    raise ValueError(f"must not exceed {_MAX_CONTEXT_CEILING}")
+            except (TypeError, ValueError) as e:
+                log.warning("users.yaml: invalid context_window for %s: %s; ignoring", name, e)
+                user_context_window = None
+
         configs[telegram_id] = UserConfig(
             telegram_id=telegram_id,
             name=name,
@@ -724,6 +781,9 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
             os_user=os_user,
             home_workspace=home_workspace,
             max_budget=max_budget,
+            model=model,
+            timeout=user_timeout,
+            context_window=user_context_window,
         )
 
     # Warn if no admin is defined - external webhooks will route to
@@ -873,7 +933,6 @@ def load_config() -> Config:
         raise SystemExit("FILE_RETENTION_DAYS must be an integer") from None
 
     # Context window tuning - 0 means "use Claude Code defaults"
-    _MAX_CONTEXT_CEILING = 1_000_000  # 1M tokens; Claude's maximum
     try:
         claude_max_context_window = int(os.environ.get("CLAUDE_MAX_CONTEXT_WINDOW", "0"))
         if claude_max_context_window < 0 or claude_max_context_window > _MAX_CONTEXT_CEILING:

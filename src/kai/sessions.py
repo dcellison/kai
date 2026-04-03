@@ -29,12 +29,12 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 import aiosqlite
 
 if TYPE_CHECKING:
-    from kai.config import WorkspaceConfig
+    from kai.config import Config, WorkspaceConfig
 
 log = logging.getLogger(__name__)
 
@@ -598,6 +598,135 @@ async def build_workspace_config(
         system_prompt=system_prompt,
         system_prompt_file=system_prompt_file,
     )
+
+
+# ── Per-user settings ──────────────────────────────────────────────
+# User-level defaults stored in the generic settings table. Keys are
+# namespaced as {field}:{chat_id} (e.g., "model:12345"), matching the
+# existing voice_mode:{chat_id} convention. These form the "user DB
+# override" layer in the six-tier precedence model:
+#   workspace DB > workspace YAML > user DB > users.yaml > env > hardcoded
+
+# Canonical field names for per-user settings. Must match the storage
+# keys used by set_user_setting / get_user_settings. The user-facing
+# command name "context" is mapped to "context_window" in bot.py
+# via _FIELD_ALIASES.
+_USER_SETTING_FIELDS = {"model", "budget", "timeout", "context_window"}
+
+
+async def get_user_settings(chat_id: int) -> dict[str, str]:
+    """
+    Get all per-user settings from the database.
+
+    Returns a dict of field->value pairs (e.g., {"model": "opus",
+    "budget": "15.0"}). Values are strings; callers parse as needed.
+    Only includes fields that have been explicitly set - missing keys
+    mean the user hasn't overridden that setting.
+    """
+    result = {}
+    for field in _USER_SETTING_FIELDS:
+        val = await get_setting(f"{field}:{chat_id}")
+        if val is not None:
+            result[field] = val
+    return result
+
+
+async def set_user_setting(chat_id: int, field: str, value: str) -> None:
+    """Set a single per-user setting (e.g., model, budget, timeout)."""
+    await set_setting(f"{field}:{chat_id}", value)
+
+
+async def delete_user_setting(chat_id: int, field: str) -> None:
+    """Remove a single per-user setting (reverts to default)."""
+    await delete_setting(f"{field}:{chat_id}")
+
+
+async def delete_all_user_settings(chat_id: int) -> None:
+    """
+    Remove all per-user settings (reverts everything to defaults).
+
+    Iterates the known field set rather than using a LIKE query,
+    since the key format {field}:{chat_id} has the field as a prefix
+    (not a shared prefix). Four deletes vs one LIKE - negligible
+    for an infrequent reset operation.
+    """
+    for field in _USER_SETTING_FIELDS:
+        await delete_setting(f"{field}:{chat_id}")
+
+
+class UserDefaults(TypedDict):
+    """Resolved per-user settings with concrete types (never None)."""
+
+    model: str
+    budget: float
+    timeout: int
+    context_window: int
+
+
+async def resolve_user_defaults(
+    chat_id: int,
+    config: Config,
+) -> UserDefaults:
+    """
+    Resolve per-user settings by layering DB overrides on top of
+    users.yaml and env var defaults.
+
+    Returns a UserDefaults dict with keys: model, budget, timeout,
+    context_window. All values are resolved - never None.
+
+    Precedence (highest to lowest):
+    1. Database (user-set via /settings or /model)
+    2. users.yaml (admin baseline per user)
+    3. Env var (global defaults from .env)
+    4. Hardcoded defaults (in config.py dataclass)
+    """
+    db_settings = await get_user_settings(chat_id)
+    user_config = config.get_user_config(chat_id)
+
+    # Model: DB > users.yaml > env > "sonnet"
+    model = (
+        db_settings.get("model")
+        or (user_config.model if user_config and user_config.model else None)
+        or config.claude_model
+    )
+
+    # Budget: DB > users.yaml max_budget (as default, not ceiling) > env.
+    # max_budget in users.yaml serves double duty - it's both the admin
+    # ceiling AND the baseline default. If a user has max_budget=20 and
+    # hasn't set a /settings budget, they get $20. If they set /settings
+    # budget 15, they get $15. They cannot set above $20.
+    budget = (
+        float(db_settings["budget"])
+        if "budget" in db_settings
+        else user_config.max_budget
+        if user_config and user_config.max_budget is not None
+        else config.claude_max_budget_usd
+    )
+
+    # Timeout: DB > users.yaml > env > 120
+    timeout = (
+        int(db_settings["timeout"])
+        if "timeout" in db_settings
+        else user_config.timeout
+        if user_config and user_config.timeout is not None
+        else config.claude_timeout_seconds
+    )
+
+    # Context window: DB > users.yaml > env > 0
+    context_window = (
+        int(db_settings["context_window"])
+        if "context_window" in db_settings
+        else user_config.context_window
+        if user_config and user_config.context_window is not None
+        else config.claude_max_context_window
+    )
+
+    return {
+        "model": model,
+        "budget": budget,
+        "timeout": timeout,
+        "context_window": context_window,
+    }
 
 
 # ── Workspace history ────────────────────────────────────────────────

@@ -462,6 +462,171 @@ class TestBuildWorkspaceConfig:
         assert result.env_file == Path("/etc/kai/env/extra.env")
 
 
+# ── Per-user settings ──────────────────────────────────────────────
+
+
+class TestUserSettings:
+    """Tests for per-user settings CRUD in the settings table."""
+
+    async def test_empty_returns_empty_dict(self, db):
+        """No settings returns empty dict."""
+        result = await sessions.get_user_settings(111)
+        assert result == {}
+
+    async def test_set_and_get(self, db):
+        """Set a field and retrieve it."""
+        await sessions.set_user_setting(111, "model", "opus")
+        result = await sessions.get_user_settings(111)
+        assert result == {"model": "opus"}
+
+    async def test_set_multiple_fields(self, db):
+        """Multiple fields are returned together."""
+        await sessions.set_user_setting(111, "model", "opus")
+        await sessions.set_user_setting(111, "budget", "15.0")
+        await sessions.set_user_setting(111, "timeout", "300")
+        result = await sessions.get_user_settings(111)
+        assert result == {"model": "opus", "budget": "15.0", "timeout": "300"}
+
+    async def test_delete_single(self, db):
+        """Deleting one field leaves others intact."""
+        await sessions.set_user_setting(111, "model", "opus")
+        await sessions.set_user_setting(111, "budget", "15.0")
+        await sessions.delete_user_setting(111, "model")
+        result = await sessions.get_user_settings(111)
+        assert result == {"budget": "15.0"}
+
+    async def test_delete_all(self, db):
+        """Bulk delete removes all per-user settings."""
+        await sessions.set_user_setting(111, "model", "opus")
+        await sessions.set_user_setting(111, "budget", "15.0")
+        await sessions.set_user_setting(111, "timeout", "300")
+        await sessions.set_user_setting(111, "context_window", "200000")
+        await sessions.delete_all_user_settings(111)
+        result = await sessions.get_user_settings(111)
+        assert result == {}
+
+    async def test_user_isolation(self, db):
+        """User A's settings don't appear in user B's query."""
+        await sessions.set_user_setting(111, "model", "opus")
+        await sessions.set_user_setting(222, "model", "haiku")
+        assert (await sessions.get_user_settings(111)) == {"model": "opus"}
+        assert (await sessions.get_user_settings(222)) == {"model": "haiku"}
+
+    async def test_overwrite_existing(self, db):
+        """Setting a field that already exists overwrites it."""
+        await sessions.set_user_setting(111, "model", "opus")
+        await sessions.set_user_setting(111, "model", "sonnet")
+        result = await sessions.get_user_settings(111)
+        assert result == {"model": "sonnet"}
+
+    async def test_delete_nonexistent_is_noop(self, db):
+        """Deleting a field that doesn't exist is a no-op."""
+        await sessions.delete_user_setting(111, "model")
+        result = await sessions.get_user_settings(111)
+        assert result == {}
+
+
+# ── resolve_user_defaults ─────────────────────────────────────────
+
+
+class TestResolveUserDefaults:
+    """Tests for the per-user settings resolution function."""
+
+    def _make_config(self, user_configs=None, **kwargs):
+        """Build a minimal Config with overridable defaults."""
+        from kai.config import Config
+
+        defaults = {
+            "telegram_bot_token": "test",
+            "allowed_user_ids": {111},
+            "claude_model": "sonnet",
+            "claude_max_budget_usd": 10.0,
+            "claude_timeout_seconds": 120,
+            "claude_max_context_window": 0,
+        }
+        defaults.update(kwargs)
+        if user_configs is not None:
+            defaults["user_configs"] = user_configs
+        return Config(**defaults)
+
+    async def test_no_overrides_returns_globals(self, db):
+        """With no DB or YAML overrides, returns global defaults."""
+        config = self._make_config()
+        result = await sessions.resolve_user_defaults(111, config)
+        assert result["model"] == "sonnet"
+        assert result["budget"] == 10.0
+        assert result["timeout"] == 120
+        assert result["context_window"] == 0
+
+    async def test_db_overrides_globals(self, db):
+        """DB settings override global defaults."""
+        config = self._make_config()
+        await sessions.set_user_setting(111, "model", "opus")
+        await sessions.set_user_setting(111, "budget", "25.0")
+        result = await sessions.resolve_user_defaults(111, config)
+        assert result["model"] == "opus"
+        assert result["budget"] == 25.0
+        # Unset fields still come from globals
+        assert result["timeout"] == 120
+        assert result["context_window"] == 0
+
+    async def test_yaml_overrides_globals(self, db):
+        """users.yaml settings override global defaults."""
+        from kai.config import UserConfig
+
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            model="opus",
+            max_budget=20.0,
+            timeout=300,
+            context_window=200_000,
+        )
+        config = self._make_config(user_configs={111: uc})
+        result = await sessions.resolve_user_defaults(111, config)
+        assert result["model"] == "opus"
+        assert result["budget"] == 20.0
+        assert result["timeout"] == 300
+        assert result["context_window"] == 200_000
+
+    async def test_db_overrides_yaml(self, db):
+        """DB settings take precedence over users.yaml."""
+        from kai.config import UserConfig
+
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            model="opus",
+            max_budget=20.0,
+            timeout=300,
+        )
+        config = self._make_config(user_configs={111: uc})
+        await sessions.set_user_setting(111, "model", "haiku")
+        await sessions.set_user_setting(111, "budget", "5.0")
+        result = await sessions.resolve_user_defaults(111, config)
+        assert result["model"] == "haiku"
+        assert result["budget"] == 5.0
+        # Timeout not overridden in DB, comes from YAML
+        assert result["timeout"] == 300
+
+    async def test_partial_overrides(self, db):
+        """Mix of DB, YAML, and global sources."""
+        from kai.config import UserConfig
+
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            timeout=300,  # YAML only
+        )
+        config = self._make_config(user_configs={111: uc})
+        await sessions.set_user_setting(111, "model", "opus")  # DB only
+        result = await sessions.resolve_user_defaults(111, config)
+        assert result["model"] == "opus"  # from DB
+        assert result["timeout"] == 300  # from YAML
+        assert result["budget"] == 10.0  # from global
+        assert result["context_window"] == 0  # from global
+
+
 # ── Workspace history ────────────────────────────────────────────────
 
 
