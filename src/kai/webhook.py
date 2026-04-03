@@ -610,7 +610,6 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
                 bot,
                 config,
                 fallback_chat_id,
-                None,
             )
         except Exception:
             log.exception(
@@ -634,7 +633,6 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
                 bot,
                 config,
                 chat_id,
-                user_config,
             )
         except Exception:
             log.exception(
@@ -654,7 +652,6 @@ async def _process_github_event_for_user(
     bot: object,
     config: Config,
     chat_id: int,
-    user_config: UserConfig | None,
 ) -> None:
     """Process a GitHub event for a single user.
 
@@ -669,7 +666,6 @@ async def _process_github_event_for_user(
         bot: The Telegram bot instance.
         config: The application Config instance.
         chat_id: The user's Telegram chat ID.
-        user_config: The user's UserConfig, or None for fallback routing.
     """
     # Resolve this user's effective GitHub settings
     settings = await sessions.resolve_github_settings(chat_id, config)
