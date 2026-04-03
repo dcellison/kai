@@ -247,6 +247,10 @@ class SubprocessPool:
                 except (ValueError, TypeError):
                     log.warning("Corrupt context_window in DB for user %d", chat_id)
 
+            # restart() kills the subprocess and spawns a new one, but
+            # the PersistentClaude *object* is preserved. Mutations made
+            # above (budget, timeout, model, context_window) survive the
+            # restart because the new subprocess reads from self.* attrs.
             if needs_restart:
                 log.info("Restarting process for user %d: per-user DB overrides differ", chat_id)
                 await instance.restart()

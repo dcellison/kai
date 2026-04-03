@@ -500,14 +500,16 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except ValueError:
             await update.message.reply_text("Budget must be a positive number.")
             return
-        # Enforce ceiling: users.yaml max_budget or global default
+        # Enforce ceiling: users.yaml max_budget or global default.
+        # 0 means "no admin ceiling" (e.g., CLAUDE_MAX_BUDGET_USD unset
+        # or explicitly 0). Only enforce when a positive ceiling exists.
         user_config = config.get_user_config(chat_id)
         ceiling = (
             user_config.max_budget
             if user_config and user_config.max_budget is not None
             else config.claude_max_budget_usd
         )
-        if budget > ceiling:
+        if ceiling and budget > ceiling:
             await update.message.reply_text(f"Budget cannot exceed ${ceiling:.2f} (admin limit).")
             return
         await sessions.set_user_setting(chat_id, "budget", str(budget))
@@ -610,7 +612,9 @@ async def _show_settings(update: Update, chat_id: int, config: Config) -> None:
     yaml_timeout = user_config.timeout if user_config else None
     timeout, timeout_src = _resolve("timeout", yaml_timeout, config.claude_timeout_seconds, lambda v: f"{int(v)}s")
 
-    # Context window - handled separately because 0 = "default" display
+    # Context window - handled separately from _resolve() because 0 has
+    # special display semantics ("default" instead of "0 tokens") and
+    # resolve_user_defaults() doesn't expose source attribution strings.
     yaml_ctx = user_config.context_window if user_config else None
     ctx_val = (
         int(db_settings["context_window"])
@@ -628,7 +632,8 @@ async def _show_settings(update: Update, chat_id: int, config: Config) -> None:
     )
     ctx_label = f"{ctx_val:,} tokens" if ctx_val > 0 else "default"
 
-    # Budget ceiling (show if set, so user knows their limit)
+    # Budget ceiling (show if set, so user knows their limit).
+    # 0 = no meaningful ceiling, so suppress display (same as None).
     ceiling = user_config.max_budget if user_config and user_config.max_budget is not None else None
     ceiling_line = f"\n\nBudget ceiling: ${ceiling:.2f} (admin)" if ceiling else ""
 
@@ -1213,14 +1218,14 @@ async def _handle_workspace_config(
             await update.message.reply_text("Budget must be a positive number.")
             return
         # Enforce ceiling: per-user max_budget from users.yaml, or the
-        # global claude_max_budget_usd as fallback.
+        # global claude_max_budget_usd as fallback. 0 = no ceiling.
         user_config = config.get_user_config(chat_id)
         ceiling = (
             user_config.max_budget
             if user_config and user_config.max_budget is not None
             else config.claude_max_budget_usd
         )
-        if budget > ceiling:
+        if ceiling and budget > ceiling:
             await update.message.reply_text(f"Budget cannot exceed ${ceiling:.2f} (admin limit).")
             return
         await sessions.set_workspace_config_setting(chat_id, workspace_str, "budget", str(budget))

@@ -683,12 +683,12 @@ async def resolve_user_defaults(
     db_settings = await get_user_settings(chat_id)
     user_config = config.get_user_config(chat_id)
 
-    # Model: DB > users.yaml > env > "sonnet"
-    model = (
-        db_settings.get("model")
-        or (user_config.model if user_config and user_config.model else None)
-        or config.claude_model
-    )
+    # Model: DB > users.yaml > env > "sonnet". Use explicit is-not-None
+    # checks (not `or`) to match budget/timeout/context_window below and
+    # avoid accidentally treating "" as falsy.
+    db_model = db_settings.get("model")
+    yaml_model = user_config.model if user_config else None
+    model = db_model if db_model is not None else yaml_model if yaml_model is not None else config.claude_model
 
     # Budget: DB > users.yaml max_budget (as default, not ceiling) > env.
     # max_budget in users.yaml serves double duty - it's both the admin

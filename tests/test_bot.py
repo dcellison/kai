@@ -3008,6 +3008,27 @@ class TestHandleSettings:
         assert "$5.00" in reply
         assert "admin limit" in reply.lower()
 
+    # ── 5b. Budget allowed when ceiling is zero (no limit) ──────────
+
+    @pytest.mark.asyncio
+    async def test_budget_allowed_when_ceiling_zero(self):
+        """/settings budget 50 succeeds when global ceiling is 0 (no limit)."""
+        # If CLAUDE_MAX_BUDGET_USD=0 and no users.yaml entry, 0 means
+        # "no admin ceiling" - budget should be allowed, not rejected.
+        config = _make_config(claude_max_budget_usd=0.0)
+        update = _make_update(text="/settings budget 50")
+        pool = _make_mock_claude()
+        pool.get_if_exists = MagicMock(return_value=MagicMock())
+        ctx = _make_context(config=config, pool=pool, args=["budget", "50"])
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await handle_settings(update, ctx)
+
+        mock_sessions.set_user_setting.assert_called_once_with(12345, "budget", "50.0")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "$50.00" in reply
+
     # ── 6. Set timeout ─────────────────────────────────────────────
 
     @pytest.mark.asyncio
