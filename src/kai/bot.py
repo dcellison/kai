@@ -594,8 +594,13 @@ async def _show_settings(update: Update, chat_id: int, config: Config) -> None:
 
     def _resolve(db_key: str, yaml_val: object, global_val: object, fmt: object) -> tuple[str, str]:
         """Resolve effective value and source for a setting."""
+        # Wrap fmt in try/except so a corrupt DB row doesn't crash the
+        # display command. Matches the defensive parsing in _restore_workspace.
         if db_key in db_settings:
-            return fmt(db_settings[db_key]), "user override"  # type: ignore[operator]
+            try:
+                return fmt(db_settings[db_key]), "user override"  # type: ignore[operator]
+            except (ValueError, TypeError):
+                pass  # fall through to yaml/global
         if yaml_val is not None:
             return fmt(yaml_val), "users.yaml"  # type: ignore[operator]
         return fmt(global_val), "global default"  # type: ignore[operator]
@@ -622,13 +627,17 @@ async def _show_settings(update: Update, chat_id: int, config: Config) -> None:
     # special display semantics ("default" instead of "0 tokens") and
     # resolve_user_defaults() doesn't expose source attribution strings.
     yaml_ctx = user_config.context_window if user_config else None
-    ctx_val = (
-        int(db_settings["context_window"])
-        if "context_window" in db_settings
-        else yaml_ctx
-        if yaml_ctx is not None
-        else config.claude_max_context_window
-    )
+    try:
+        ctx_val = (
+            int(db_settings["context_window"])
+            if "context_window" in db_settings
+            else yaml_ctx
+            if yaml_ctx is not None
+            else config.claude_max_context_window
+        )
+    except (ValueError, TypeError):
+        # Corrupt DB value - fall through to yaml/global
+        ctx_val = yaml_ctx if yaml_ctx is not None else config.claude_max_context_window
     # Source attribution. When the user explicitly sets context to 0
     # (meaning "use the Claude Code default"), show "global default"
     # instead of "user override" - the intent was to revert, not override.
@@ -648,7 +657,7 @@ async def _show_settings(update: Update, chat_id: int, config: Config) -> None:
         if user_config and user_config.max_budget is not None
         else config.claude_max_budget_usd or None  # 0 means no limit
     )
-    ceiling_line = f"\n\nBudget ceiling: ${ceiling:.2f}" if ceiling else ""
+    ceiling_line = f"\n\nBudget ceiling: ${ceiling:.2f} (admin)" if ceiling else ""
 
     await update.message.reply_text(
         f"Your settings:\n"
