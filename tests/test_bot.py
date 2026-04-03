@@ -3223,6 +3223,68 @@ class TestHandleSettings:
         # Should use the DB field name, not the user-facing alias
         mock_sessions.delete_user_setting.assert_called_once_with(12345, "context_window")
 
+    # ── 17. Reset reverts instance to defaults ────────────────────
+
+    @pytest.mark.asyncio
+    async def test_reset_reverts_instance_model(self):
+        """/settings reset model writes the default back onto the instance."""
+        update = _make_update(text="/settings reset model")
+        config = _make_config()
+        pool = _make_mock_claude()
+        # Simulate an instance with an overridden model
+        instance = MagicMock()
+        instance.model = "opus"
+        pool.get_if_exists = MagicMock(return_value=instance)
+        ctx = _make_context(config=config, pool=pool, args=["reset", "model"])
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await handle_settings(update, ctx)
+
+        # Instance model should be reverted to the config default
+        assert instance.model == config.claude_model
+
+    # ── 18. Reset all reverts all instance fields ─────────────────
+
+    @pytest.mark.asyncio
+    async def test_reset_all_reverts_instance(self):
+        """/settings reset reverts all four fields on the live instance."""
+        update = _make_update(text="/settings reset")
+        config = _make_config()
+        pool = _make_mock_claude()
+        instance = MagicMock()
+        instance.model = "opus"
+        instance.max_budget_usd = 99.0
+        instance.timeout_seconds = 500
+        instance.max_context_window = 500000
+        pool.get_if_exists = MagicMock(return_value=instance)
+        ctx = _make_context(config=config, pool=pool, args=["reset"])
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await handle_settings(update, ctx)
+
+        assert instance.model == config.claude_model
+        assert instance.max_budget_usd == config.claude_max_budget_usd
+        assert instance.timeout_seconds == config.claude_timeout_seconds
+        assert instance.max_context_window == config.claude_max_context_window
+
+    # ── 19. Budget displays "unlimited" when zero ─────────────────
+
+    @pytest.mark.asyncio
+    async def test_show_settings_budget_zero_displays_unlimited(self):
+        """Budget of $0.00 displays as 'unlimited', not '$0.00'."""
+        update = _make_update(text="/settings")
+        config = _make_config(claude_max_budget_usd=0.0)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _show_settings(update, 12345, config)
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "unlimited" in reply.lower()
+        assert "$0.00" not in reply
+
 
 # ── /model persistence ─────────────────────────────────────────────
 

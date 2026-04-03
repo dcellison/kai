@@ -604,9 +604,15 @@ async def _show_settings(update: Update, chat_id: int, config: Config) -> None:
     yaml_model = user_config.model if user_config else None
     model, model_src = _resolve("model", yaml_model, config.claude_model, str)
 
-    # Budget
+    # Budget - 0 means "unlimited" (consistent with the ceiling check
+    # in the budget handler, where 0 = no ceiling).
     yaml_budget = user_config.max_budget if user_config else None
-    budget, budget_src = _resolve("budget", yaml_budget, config.claude_max_budget_usd, lambda v: f"${float(v):.2f}")
+    budget, budget_src = _resolve(
+        "budget",
+        yaml_budget,
+        config.claude_max_budget_usd,
+        lambda v: "unlimited" if float(v) == 0 else f"${float(v):.2f}",
+    )
 
     # Timeout
     yaml_timeout = user_config.timeout if user_config else None
@@ -647,6 +653,33 @@ async def _show_settings(update: Update, chat_id: int, config: Config) -> None:
     )
 
 
+def _revert_instance_field(pool: SubprocessPool, chat_id: int, field: str, config: Config) -> None:
+    """
+    Write the resolved default value for a single field back onto the
+    live PersistentClaude instance.
+
+    Called before restart so that stale in-memory overrides don't
+    persist after a DB entry is deleted. Resolution order mirrors
+    _create_instance(): users.yaml > global config.
+    """
+    instance = pool.get_if_exists(chat_id)
+    if not instance:
+        return
+    user = config.get_user_config(chat_id)
+    if field == "model":
+        instance.model = user.model if user and user.model else config.claude_model
+    elif field == "budget":
+        instance.max_budget_usd = (
+            user.max_budget if user and user.max_budget is not None else config.claude_max_budget_usd
+        )
+    elif field == "timeout":
+        instance.timeout_seconds = user.timeout if user and user.timeout is not None else config.claude_timeout_seconds
+    elif field == "context_window":
+        instance.max_context_window = (
+            user.context_window if user and user.context_window is not None else config.claude_max_context_window
+        )
+
+
 async def _handle_settings_reset(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -673,14 +706,21 @@ async def _handle_settings_reset(
         # Resolve alias (e.g., "context" -> "context_window")
         db_field = _FIELD_ALIASES.get(field, field)
         await sessions.delete_user_setting(chat_id, db_field)
-        # Restart to apply the default
         pool = _get_pool(context)
+        # Write the resolved default back onto the live instance before
+        # restarting. restart() preserves the Python object, so stale
+        # in-memory attributes would persist without this step.
+        _revert_instance_field(pool, chat_id, db_field, config)
         await pool.restart(chat_id)
         await sessions.clear_session(chat_id)
         await update.message.reply_text(f"Cleared {field} override. Using default. Session restarted.")
     else:
         await sessions.delete_all_user_settings(chat_id)
         pool = _get_pool(context)
+        # Revert all four fields to their resolved defaults before
+        # restarting (same rationale as single-field reset above).
+        for f in ("model", "budget", "timeout", "context_window"):
+            _revert_instance_field(pool, chat_id, f, config)
         await pool.restart(chat_id)
         await sessions.clear_session(chat_id)
         await update.message.reply_text("All settings cleared. Using defaults. Session restarted.")
