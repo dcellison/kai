@@ -3285,6 +3285,23 @@ class TestHandleSettings:
         assert "unlimited" in reply.lower()
         assert "$0.00" not in reply
 
+    # ── 20. Global budget ceiling visible in /settings ────────────
+
+    @pytest.mark.asyncio
+    async def test_show_settings_global_ceiling_visible(self):
+        """Users without a yaml entry see the global ceiling in /settings."""
+        update = _make_update(text="/settings")
+        # No user_configs - ceiling should fall through to global default
+        config = _make_config(claude_max_budget_usd=10.0)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _show_settings(update, 12345, config)
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "$10.00" in reply
+        assert "ceiling" in reply.lower()
+
 
 # ── /model persistence ─────────────────────────────────────────────
 

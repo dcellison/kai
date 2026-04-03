@@ -638,10 +638,15 @@ async def _show_settings(update: Update, chat_id: int, config: Config) -> None:
     )
     ctx_label = f"{ctx_val:,} tokens" if ctx_val > 0 else "default"
 
-    # Budget ceiling (show if set, so user knows their limit).
-    # 0 = no meaningful ceiling, so suppress display (same as None).
-    ceiling = user_config.max_budget if user_config and user_config.max_budget is not None else None
-    ceiling_line = f"\n\nBudget ceiling: ${ceiling:.2f} (admin)" if ceiling else ""
+    # Budget ceiling - show when a positive ceiling exists so the user
+    # knows their limit before hitting it. Falls through to the global
+    # default when no users.yaml entry exists. 0 = no limit, suppress.
+    ceiling = (
+        user_config.max_budget
+        if user_config and user_config.max_budget is not None
+        else config.claude_max_budget_usd or None  # 0 means no limit
+    )
+    ceiling_line = f"\n\nBudget ceiling: ${ceiling:.2f}" if ceiling else ""
 
     await update.message.reply_text(
         f"Your settings:\n"

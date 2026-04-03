@@ -679,6 +679,12 @@ async def resolve_user_defaults(
     2. users.yaml (admin baseline per user)
     3. Env var (global defaults from .env)
     4. Hardcoded defaults (in config.py dataclass)
+
+    Note: this does not model workspace-config precedence (which sits
+    above user defaults). Callers that need workspace-aware resolution
+    should use _restore_workspace() in pool.py instead. This function
+    is the canonical user-layer resolver for display, API, and webhook
+    contexts where workspace overrides don't apply.
     """
     db_settings = await get_user_settings(chat_id)
     user_config = config.get_user_config(chat_id)
