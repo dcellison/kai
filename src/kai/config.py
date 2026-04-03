@@ -790,8 +790,7 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
                 user_workspace_base = Path(ws_base_str).expanduser().resolve()
                 if not user_workspace_base.is_dir():
                     log.warning(
-                        "users.yaml: workspace_base not found for %s: %s; "
-                        "using global default",
+                        "users.yaml: workspace_base not found for %s: %s; using global default",
                         name,
                         user_workspace_base,
                     )

@@ -846,8 +846,7 @@ async def add_allowed_workspace(chat_id: int, path: str) -> None:
     """
     db = _get_db()
     await db.execute(
-        "INSERT OR IGNORE INTO allowed_workspaces (chat_id, path) "
-        "VALUES (?, ?)",
+        "INSERT OR IGNORE INTO allowed_workspaces (chat_id, path) VALUES (?, ?)",
         (chat_id, path),
     )
     await db.commit()
@@ -880,17 +879,14 @@ async def get_allowed_workspaces(chat_id: int) -> list[Path]:
     """
     db = _get_db()
     cursor = await db.execute(
-        "SELECT path FROM allowed_workspaces WHERE chat_id = ? "
-        "ORDER BY rowid",
+        "SELECT path FROM allowed_workspaces WHERE chat_id = ? ORDER BY rowid",
         (chat_id,),
     )
     rows = await cursor.fetchall()
     return [Path(row[0]) for row in rows]
 
 
-async def resolve_workspace_access(
-    chat_id: int, config: Config
-) -> tuple[Path | None, list[Path]]:
+async def resolve_workspace_access(chat_id: int, config: Config) -> tuple[Path | None, list[Path]]:
     """
     Resolve per-user workspace_base and allowed_workspaces.
 
@@ -909,11 +905,7 @@ async def resolve_workspace_access(
     user_config = config.get_user_config(chat_id)
 
     # workspace_base: users.yaml > env
-    base = (
-        user_config.workspace_base
-        if user_config and user_config.workspace_base
-        else config.workspace_base
-    )
+    base = user_config.workspace_base if user_config and user_config.workspace_base else config.workspace_base
 
     # allowed_workspaces: union of DB + global, deduplicated.
     # DB entries first so user-added workspaces appear at the top
