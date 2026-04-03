@@ -1066,13 +1066,16 @@ async def _show_workspace_config(
     env_keys: list[str] = []
     if yaml_config and yaml_config.env:
         env_keys.extend(yaml_config.env.keys())
+    env_corrupted = False
     if "env" in db_settings:
         try:
             db_env = json.loads(db_settings["env"])
             env_keys.extend(k for k in db_env if k not in env_keys)
         except json.JSONDecodeError:
-            lines.append("  Env vars: (corrupted - reset with /workspace config reset env)")
-    if env_keys:
+            env_corrupted = True
+    if env_corrupted:
+        lines.append("  Env vars: (corrupted - reset with /workspace config reset env)")
+    elif env_keys:
         lines.append(f"  Env vars: {', '.join(sorted(env_keys))}")
 
     # System prompt
@@ -1173,7 +1176,12 @@ async def _handle_workspace_prompt(
             await update.message.reply_text(f"File too large ({file_size // 1024}KB). Max prompt file size is 100KB.")
             return False
         file = await update.message.document.get_file()
-        content = (await file.download_as_bytearray()).decode("utf-8")
+        raw = await file.download_as_bytearray()
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            await update.message.reply_text("File must be UTF-8 text.")
+            return False
         await sessions.set_workspace_config_setting(chat_id, workspace_str, "prompt", content.strip())
         await update.message.reply_text(f"Prompt set from file ({len(content)} chars).")
         return True
