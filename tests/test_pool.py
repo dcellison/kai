@@ -82,6 +82,44 @@ class TestInstanceCreation:
         assert instance.claude_user is None
         assert instance.workspace == Path("/home/workspace")
 
+    def test_create_uses_user_config_settings(self, tmp_path):
+        """User with model/timeout/budget/context_window in users.yaml gets those values."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        user = UserConfig(
+            telegram_id=111,
+            name="alice",
+            home_workspace=ws,
+            model="opus",
+            max_budget=25.0,
+            timeout=300,
+            context_window=200_000,
+        )
+        config = _make_config(user_configs={111: user})
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+        assert instance.model == "opus"
+        assert instance.max_budget_usd == 25.0
+        assert instance.timeout_seconds == 300
+        assert instance.max_context_window == 200_000
+
+    def test_create_falls_back_to_global_for_missing_user_fields(self):
+        """User with no model/timeout/context_window gets global defaults."""
+        user = UserConfig(telegram_id=111, name="alice")
+        config = _make_config(
+            user_configs={111: user},
+            claude_model="haiku",
+            claude_max_budget_usd=5.0,
+            claude_timeout_seconds=60,
+            claude_max_context_window=100_000,
+        )
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+        assert instance.model == "haiku"
+        assert instance.max_budget_usd == 5.0
+        assert instance.timeout_seconds == 60
+        assert instance.max_context_window == 100_000
+
 
 # ── Per-user actions ────────────────────────────────────────────────
 
@@ -247,6 +285,46 @@ class TestWorkspaceRestoration:
             async for _ in pool.send("test", chat_id=111):
                 pass
             mock_change.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_restore_applies_db_user_settings(self, tmp_path):
+        """DB per-user settings override users.yaml baseline on restore."""
+        ws = tmp_path / "saved_ws"
+        ws.mkdir()
+        # Users.yaml gives alice model=sonnet (via global default)
+        user = UserConfig(telegram_id=111, name="alice")
+        config = _make_config(user_configs={111: user})
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+        # Instance starts with global model "sonnet"
+        assert instance.model == "sonnet"
+
+        # Simulate DB overrides: user set model=opus and budget=20.0
+        db_settings = {"model": "opus", "budget": "20.0"}
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value=db_settings),
+            patch.object(instance, "restart", new_callable=AsyncMock) as mock_restart,
+        ):
+            await pool._restore_workspace(111, instance)
+            # Model is a CLI flag, so changing it triggers restart
+            assert instance.model == "opus"
+            assert instance.max_budget_usd == 20.0
+            mock_restart.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_restore_no_db_settings_no_restart(self, tmp_path):
+        """No DB per-user settings means no unnecessary restart."""
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        instance = pool.get(111)
+
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
+            patch.object(instance, "restart", new_callable=AsyncMock) as mock_restart,
+        ):
+            await pool._restore_workspace(111, instance)
+            mock_restart.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_restore_nonexistent_workspace(self, tmp_path):

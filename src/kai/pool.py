@@ -103,11 +103,12 @@ class SubprocessPool:
         Create a PersistentClaude for a specific user.
 
         Resolution order for each setting:
-        1. UserConfig from users.yaml (os_user, home_workspace)
-        2. Global config defaults (model, budget, timeout)
+        1. UserConfig from users.yaml (os_user, home_workspace, model,
+           budget, timeout, context_window)
+        2. Global config defaults (from .env)
 
-        Saved workspace from the database is deferred to the first
-        send() call (async operation, can't run in sync get()).
+        Per-user DB overrides (set via /settings or /model) are applied
+        in _restore_workspace() since they require async DB access.
         """
         user = self._config.get_user_config(chat_id)
 
@@ -121,19 +122,29 @@ class SubprocessPool:
 
         ws_config = self._config.get_workspace_config(workspace)
 
+        # Per-user baseline from users.yaml, falling back to global config.
+        # These are the values the process starts with. DB overrides (from
+        # /settings or /model) are applied in _restore_workspace().
+        model = user.model if user and user.model else self._config.claude_model
+        budget = user.max_budget if user and user.max_budget is not None else self._config.claude_max_budget_usd
+        timeout = user.timeout if user and user.timeout is not None else self._config.claude_timeout_seconds
+        context_window = (
+            user.context_window if user and user.context_window is not None else self._config.claude_max_context_window
+        )
+
         return PersistentClaude(
-            model=self._config.claude_model,
+            model=model,
             workspace=workspace,
             home_workspace=user.home_workspace if user else self._config.claude_workspace,
             webhook_port=self._config.webhook_port,
             webhook_secret=self._config.webhook_secret,
-            max_budget_usd=self._config.claude_max_budget_usd,
-            timeout_seconds=self._config.claude_timeout_seconds,
+            max_budget_usd=budget,
+            timeout_seconds=timeout,
             services_info=self._services_info,
             claude_user=os_user,
             max_session_hours=self._config.claude_max_session_hours,
             workspace_config=ws_config,
-            max_context_window=self._config.claude_max_context_window,
+            max_context_window=context_window,
             autocompact_pct=self._config.claude_autocompact_pct,
         )
 
@@ -193,6 +204,52 @@ class SubprocessPool:
                 ws_config = await sessions.build_workspace_config(yaml_config, ws_path, chat_id)
                 await instance.change_workspace(ws_path, workspace_config=ws_config)
                 log.info("Restored workspace for user %d: %s", chat_id, ws_path)
+
+        # Apply per-user DB overrides (set via /settings or /model).
+        # _create_instance() already applied users.yaml baselines, so we
+        # only need the DB layer here. Workspace config takes precedence
+        # over user settings (more specific wins).
+        db_settings = await sessions.get_user_settings(chat_id)
+        if db_settings:
+            # Track whether any flag-level setting changed (requires restart
+            # because the value is baked into the CLI command at startup)
+            needs_restart = False
+
+            # Model: only apply if workspace config didn't set one
+            ws_model = instance.workspace_config.model if instance.workspace_config else None
+            if not ws_model and "model" in db_settings and db_settings["model"] != instance.model:
+                instance.model = db_settings["model"]
+                needs_restart = True
+
+            # Budget: workspace config budget overrides user default
+            ws_budget = instance.workspace_config.budget if instance.workspace_config else None
+            if ws_budget is None and "budget" in db_settings:
+                try:
+                    instance.max_budget_usd = float(db_settings["budget"])
+                except (ValueError, TypeError):
+                    log.warning("Corrupt budget in DB for user %d", chat_id)
+
+            # Timeout: workspace config timeout overrides user default
+            ws_timeout = instance.workspace_config.timeout if instance.workspace_config else None
+            if ws_timeout is None and "timeout" in db_settings:
+                try:
+                    instance.timeout_seconds = int(db_settings["timeout"])
+                except (ValueError, TypeError):
+                    log.warning("Corrupt timeout in DB for user %d", chat_id)
+
+            # Context window: CLI flag (--settings), requires restart if changed
+            if "context_window" in db_settings:
+                try:
+                    new_ctx = int(db_settings["context_window"])
+                    if new_ctx != instance.max_context_window:
+                        instance.max_context_window = new_ctx
+                        needs_restart = True
+                except (ValueError, TypeError):
+                    log.warning("Corrupt context_window in DB for user %d", chat_id)
+
+            if needs_restart:
+                log.info("Restarting process for user %d: per-user DB overrides differ", chat_id)
+                await instance.restart()
 
     # ── Per-user actions ────────────────────────────────────────────
 
