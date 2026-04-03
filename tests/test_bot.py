@@ -3618,7 +3618,7 @@ class TestHandleGitHub:
 
     Each test patches sessions to isolate the handler from the database.
     The _mock_resolve helper simulates resolve_github_settings() output,
-    and _mock_db_settings simulates _get_github_db_settings() output for
+    and _mock_db_settings simulates get_github_db_settings() output for
     source attribution in _show_github().
     """
 
@@ -3633,8 +3633,8 @@ class TestHandleGitHub:
         return patch("kai.bot.sessions.resolve_github_settings", new_callable=AsyncMock, return_value=settings)
 
     def _mock_db_settings(self, db_settings=None):
-        """Patch _get_github_db_settings with controlled return values."""
-        return patch("kai.bot.sessions._get_github_db_settings", new_callable=AsyncMock, return_value=db_settings or {})
+        """Patch get_github_db_settings with controlled return values."""
+        return patch("kai.bot.sessions.get_github_db_settings", new_callable=AsyncMock, return_value=db_settings or {})
 
     # ── 1. /github with no config (defaults) ──────────────────────
 
@@ -3703,7 +3703,7 @@ class TestHandleGitHub:
         mock_sessions.set_setting = AsyncMock()
         mock_sessions.delete_setting = AsyncMock()
         mock_sessions.resolve_github_settings = AsyncMock()
-        mock_sessions._get_github_db_settings = AsyncMock(return_value={})
+        mock_sessions.get_github_db_settings = AsyncMock(return_value={})
 
         with patch("kai.bot.sessions", mock_sessions):
             await handle_github(update, ctx)
@@ -3724,7 +3724,7 @@ class TestHandleGitHub:
         mock_sessions = AsyncMock()
         mock_sessions.delete_setting = AsyncMock()
         mock_sessions.resolve_github_settings = AsyncMock()
-        mock_sessions._get_github_db_settings = AsyncMock(return_value={})
+        mock_sessions.get_github_db_settings = AsyncMock(return_value={})
 
         with patch("kai.bot.sessions", mock_sessions):
             await handle_github(update, ctx)

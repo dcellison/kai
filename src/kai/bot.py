@@ -1972,7 +1972,7 @@ async def _show_github(update: Update, chat_id: int, config: Config) -> None:
 
     # Feature toggles with source attribution. Read DB settings directly
     # so we can tell the user where each value comes from.
-    db_settings = await sessions._get_github_db_settings(chat_id)
+    db_settings = await sessions.get_github_db_settings(chat_id)
 
     def _toggle_line(
         label: str,

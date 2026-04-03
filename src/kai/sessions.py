@@ -932,7 +932,7 @@ async def resolve_workspace_access(chat_id: int, config: Config) -> tuple[Path |
 # ── GitHub settings resolution ──────────────────────────────────────
 
 
-async def _get_github_db_settings(chat_id: int) -> dict[str, str]:
+async def get_github_db_settings(chat_id: int) -> dict[str, str]:
     """Read all GitHub-related DB overrides for a user.
 
     Returns a dict of key->value for settings that exist.
@@ -967,7 +967,7 @@ async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSetting
     4. Hardcoded defaults
     """
     user_config = config.get_user_config(chat_id)
-    db = await _get_github_db_settings(chat_id)
+    db = await get_github_db_settings(chat_id)
 
     # Repos: users.yaml only (DB-managed repos are #220)
     repos = user_config.github_repos if user_config else []

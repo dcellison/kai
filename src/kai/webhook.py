@@ -599,16 +599,25 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
         # Fall back to legacy behavior: route to the default admin.
         # request.app["chat_id"] is set in webhook.start() to the first
         # admin in users.yaml or the first ALLOWED_USER_IDS entry.
+        # Wrapped in try/except for consistency with the fan-out path -
+        # a transient failure should return 200, not 500.
         fallback_chat_id = request.app["chat_id"]
-        await _process_github_event_for_user(
-            request,
-            payload,
-            event_type,
-            bot,
-            config,
-            fallback_chat_id,
-            None,
-        )
+        try:
+            await _process_github_event_for_user(
+                request,
+                payload,
+                event_type,
+                bot,
+                config,
+                fallback_chat_id,
+                None,
+            )
+        except Exception:
+            log.exception(
+                "Error processing %s event for fallback admin (chat %d)",
+                event_type,
+                fallback_chat_id,
+            )
         return web.json_response({"status": "ok"})
 
     # Process the event for each subscribed user independently.
