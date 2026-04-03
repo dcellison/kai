@@ -680,6 +680,9 @@ class TestLoadUserConfigs:
                   - valid/repo
                   - no-slash
                   - too/many/slashes
+                  - /
+                  - /repo
+                  - owner/
             """,
         )
         with (

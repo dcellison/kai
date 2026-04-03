@@ -816,7 +816,8 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
         if isinstance(raw_repos, list):
             for repo_entry in raw_repos:
                 repo_str = str(repo_entry).strip()
-                if "/" not in repo_str or repo_str.count("/") != 1:
+                parts = repo_str.split("/")
+                if len(parts) != 2 or not parts[0] or not parts[1]:
                     log.warning(
                         "users.yaml: invalid github_repos entry for %s: %s (expected owner/repo format)",
                         name,

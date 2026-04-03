@@ -613,18 +613,27 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
 
     # Process the event for each subscribed user independently.
     # Each user has their own pr_review/issue_triage flags and
-    # notification destination.
+    # notification destination. Per-user try/except ensures a transient
+    # failure (e.g., DB error) for one user does not block the others.
     for user_config in subscribed_users:
         chat_id = user_config.telegram_id
-        await _process_github_event_for_user(
-            request,
-            payload,
-            event_type,
-            bot,
-            config,
-            chat_id,
-            user_config,
-        )
+        try:
+            await _process_github_event_for_user(
+                request,
+                payload,
+                event_type,
+                bot,
+                config,
+                chat_id,
+                user_config,
+            )
+        except Exception:
+            log.exception(
+                "Error processing %s event for user %s (chat %d)",
+                event_type,
+                user_config.name,
+                chat_id,
+            )
 
     return web.json_response({"status": "ok"})
 

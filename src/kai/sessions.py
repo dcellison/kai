@@ -981,7 +981,7 @@ async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSetting
         # Fall back to the global env var. If that is also unset,
         # use the user's own telegram_id (notifications go to DM).
         global_notify = config.github_notify_chat_id
-        notify = global_notify if global_notify else chat_id
+        notify = global_notify if global_notify is not None else chat_id
 
     # PR review: DB > yaml > env > False
     if "pr_review" in db:

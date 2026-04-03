@@ -3670,6 +3670,7 @@ class TestHandleGitHub:
             issue_triage=False,
         )
         config = _make_config(user_configs={12345: user})
+        update = _make_update(text="/github")
 
         with (
             self._mock_resolve(
@@ -3679,18 +3680,6 @@ class TestHandleGitHub:
                 issue_triage=True,
             ),
             # DB has issue_triage override, pr_review from yaml
-            self._mock_db_settings({"issue_triage": "true"}),
-        ):
-            await _show_github(update=_make_update(text="/github"), chat_id=12345, config=config)
-
-        update = _make_update(text="/github")
-        with (
-            self._mock_resolve(
-                repos=["alice/repo1"],
-                notify_chat_id=99999,
-                pr_review=True,
-                issue_triage=True,
-            ),
             self._mock_db_settings({"issue_triage": "true"}),
         ):
             await _show_github(update, 12345, config)

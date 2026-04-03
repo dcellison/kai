@@ -1604,3 +1604,55 @@ class TestPerUserRouting:
         # Notification should go to the user's notify_chat_id, not their DM
         call_args = app["telegram_bot"].send_message.call_args
         assert call_args[0][0] == -100999
+
+    @pytest.mark.asyncio
+    async def test_fan_out_exception_isolation(self, _clear_cooldowns):
+        """A failure processing one user does not block subsequent users."""
+        user1 = self._make_user_config(111, name="alice", repos=["owner/repo"])
+        user2 = self._make_user_config(222, name="bob", repos=["owner/repo"])
+        config = self._make_config_with_users([user1, user2])
+        app = _build_test_app(config=config)
+        payload = {
+            "ref": "refs/heads/main",
+            "commits": [{"message": "test", "author": {"name": "dev"}}],
+            "repository": {"full_name": "owner/repo"},
+            "compare": "https://github.com/owner/repo/compare/a...b",
+        }
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        # First user raises, second user succeeds
+        call_count = 0
+
+        async def _failing_then_ok(chat_id, config):
+            nonlocal call_count
+            call_count += 1
+            if chat_id == 111:
+                raise RuntimeError("transient DB failure")
+            return {
+                "repos": [],
+                "notify_chat_id": chat_id,
+                "pr_review": False,
+                "issue_triage": False,
+            }
+
+        with patch(
+            "kai.webhook.sessions.resolve_github_settings",
+            side_effect=_failing_then_ok,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "push",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+        # Both users were attempted (resolve called twice)
+        assert call_count == 2
+        # User 2 still got their notification despite user 1's failure
+        call_args = app["telegram_bot"].send_message.call_args
+        assert call_args[0][0] == 222
