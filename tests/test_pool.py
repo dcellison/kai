@@ -272,6 +272,9 @@ class TestWorkspaceRestoration:
 
         with (
             patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            # resolve_workspace_access returns permissive (None, []) so the
+            # workspace passes _is_workspace_allowed.
+            patch("kai.pool.sessions.resolve_workspace_access", new_callable=AsyncMock, return_value=(None, [])),
             patch("kai.pool.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
             patch.object(instance, "change_workspace", new_callable=AsyncMock) as mock_change,
             patch.object(instance, "send", new_callable=MagicMock) as mock_send,
@@ -343,6 +346,77 @@ class TestWorkspaceRestoration:
             # The restore should detect the path doesn't exist and delete
             await pool._restore_workspace(111, pool.get(111))
             mock_delete.assert_called_once_with("workspace:111")
+
+    @pytest.mark.asyncio
+    async def test_restore_workspace_in_user_allowed_list(self, tmp_path):
+        """Saved workspace in per-user allowed list is restored."""
+        ws = tmp_path / "user-ws"
+        ws.mkdir()
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        instance = pool.get(111)
+
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            # Per-user resolve returns the workspace in the allowed list
+            patch(
+                "kai.pool.sessions.resolve_workspace_access",
+                new_callable=AsyncMock,
+                return_value=(None, [ws]),
+            ),
+            patch("kai.pool.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
+            patch.object(instance, "change_workspace", new_callable=AsyncMock) as mock_change,
+        ):
+            await pool._restore_workspace(111, instance)
+            mock_change.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_restore_workspace_no_longer_allowed(self, tmp_path):
+        """Saved workspace not in per-user allowed list is deleted."""
+        ws = tmp_path / "revoked-ws"
+        ws.mkdir()
+        other_base = tmp_path / "base"
+        other_base.mkdir()
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        pool.get(111)
+
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            # Per-user resolve returns base that doesn't cover the workspace
+            patch(
+                "kai.pool.sessions.resolve_workspace_access",
+                new_callable=AsyncMock,
+                return_value=(other_base, []),
+            ),
+            patch("kai.pool.sessions.delete_setting", new_callable=AsyncMock) as mock_delete,
+            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
+        ):
+            await pool._restore_workspace(111, pool.get(111))
+            mock_delete.assert_called_once_with("workspace:111")
+
+    @pytest.mark.asyncio
+    async def test_restore_workspace_under_user_base(self, tmp_path):
+        """Saved workspace under per-user workspace_base is restored."""
+        base = tmp_path / "base"
+        ws = base / "project"
+        ws.mkdir(parents=True)
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        instance = pool.get(111)
+
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            # Per-user resolve returns a base that covers the workspace
+            patch(
+                "kai.pool.sessions.resolve_workspace_access",
+                new_callable=AsyncMock,
+                return_value=(base, []),
+            ),
+            patch("kai.pool.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
+            patch.object(instance, "change_workspace", new_callable=AsyncMock) as mock_change,
+        ):
+            await pool._restore_workspace(111, instance)
+            mock_change.assert_called_once()
 
 
 # ── get_if_exists ───────────────────────────────────────────────────

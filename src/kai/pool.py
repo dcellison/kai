@@ -27,20 +27,28 @@ from kai.config import Config, WorkspaceConfig
 log = logging.getLogger(__name__)
 
 
-def _is_workspace_allowed(path: Path, config: Config) -> bool:
+def _is_workspace_allowed(path: Path, base: Path | None, allowed: list[Path]) -> bool:
     """Return True if path is covered by a configured workspace source.
 
-    Accepts paths under WORKSPACE_BASE or in ALLOWED_WORKSPACES. If
-    neither is configured, all paths are accepted (permissive mode).
-    Duplicated from bot.py to avoid circular import (bot imports pool).
+    Accepts paths under the user's workspace_base or in their allowed
+    list. If neither is configured, all paths are accepted (permissive
+    mode). Duplicated from bot.py to avoid circular import (bot imports
+    pool).
+
+    Args:
+        path: The workspace path to validate (need not exist).
+        base: The user's resolved workspace_base, or None.
+        allowed: The user's effective allowed workspace list
+            (pre-resolved by resolve_workspace_access).
     """
-    base = config.workspace_base
-    if not base and not config.allowed_workspaces:
+    if not base and not allowed:
         return True
     resolved = path.resolve()
     resolved_base = base.resolve() if base else None
     in_base = resolved_base and (str(resolved).startswith(str(resolved_base) + "/") or resolved == resolved_base)
-    in_allowed = resolved in config.allowed_workspaces
+    # allowed list is pre-resolved by resolve_workspace_access(),
+    # so no need to call .resolve() again on each entry.
+    in_allowed = resolved in allowed
     return bool(in_base or in_allowed)
 
 
@@ -175,9 +183,10 @@ class SubprocessPool:
         """Restore a user's saved workspace from the database.
 
         Validates that the saved workspace is still an allowed path
-        (under WORKSPACE_BASE or in ALLOWED_WORKSPACES). An admin who
-        removes a path from the allowed set should not have users
-        silently bypass the restriction on their next message.
+        using per-user workspace access (workspace_base from users.yaml,
+        allowed list from DB + global ALLOWED_WORKSPACES). An admin who
+        removes a path should not have users silently bypass the
+        restriction on their next message.
         """
         saved = await sessions.get_setting(f"workspace:{chat_id}")
         if saved:
@@ -189,21 +198,24 @@ class SubprocessPool:
                     saved,
                 )
                 await sessions.delete_setting(f"workspace:{chat_id}")
-            elif not _is_workspace_allowed(ws_path, self._config):
-                log.warning(
-                    "Saved workspace for user %d is no longer allowed: %s",
-                    chat_id,
-                    saved,
-                )
-                await sessions.delete_setting(f"workspace:{chat_id}")
             else:
-                # Layer DB overrides on top of YAML baseline so user's
-                # per-workspace config (set via /workspace config) is
-                # applied on startup, not just after explicit switches.
-                yaml_config = self._config.get_workspace_config(ws_path)
-                ws_config = await sessions.build_workspace_config(yaml_config, ws_path, chat_id)
-                await instance.change_workspace(ws_path, workspace_config=ws_config)
-                log.info("Restored workspace for user %d: %s", chat_id, ws_path)
+                # Resolve per-user workspace access for the allowed check
+                base, allowed = await sessions.resolve_workspace_access(chat_id, self._config)
+                if not _is_workspace_allowed(ws_path, base, allowed):
+                    log.warning(
+                        "Saved workspace for user %d is no longer allowed: %s",
+                        chat_id,
+                        saved,
+                    )
+                    await sessions.delete_setting(f"workspace:{chat_id}")
+                else:
+                    # Layer DB overrides on top of YAML baseline so user's
+                    # per-workspace config (set via /workspace config) is
+                    # applied on startup, not just after explicit switches.
+                    yaml_config = self._config.get_workspace_config(ws_path)
+                    ws_config = await sessions.build_workspace_config(yaml_config, ws_path, chat_id)
+                    await instance.change_workspace(ws_path, workspace_config=ws_config)
+                    log.info("Restored workspace for user %d: %s", chat_id, ws_path)
 
         # Apply per-user DB overrides (set via /settings or /model).
         # _create_instance() already applied users.yaml baselines, so we

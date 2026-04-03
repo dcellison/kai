@@ -1021,30 +1021,29 @@ def _resolve_workspace_path(target: str, base: Path | None) -> Path | None:
     return resolved
 
 
-def _is_workspace_allowed(path: Path, config: "Config") -> bool:
-    """
-    Return True if path is covered by a configured workspace source.
+def _is_workspace_allowed(path: Path, base: Path | None, allowed: list[Path]) -> bool:
+    """Return True if path is covered by a configured workspace source.
 
-    Accepts paths that are under WORKSPACE_BASE or present in ALLOWED_WORKSPACES.
-    If neither source is configured, all paths are accepted (permissive mode for
-    installs that don't restrict workspace access).
+    Accepts paths under the user's workspace_base or in their allowed
+    list. If neither source is configured, all paths are accepted
+    (permissive mode for installs that don't restrict workspace access).
 
     Args:
         path: The workspace path to validate (need not exist).
-        config: The application config.
-
-    Returns:
-        True if the path is allowed, False if it should be rejected.
+        base: The user's resolved workspace_base, or None.
+        allowed: The user's effective allowed workspace list
+            (pre-resolved by resolve_workspace_access).
     """
-    base = config.workspace_base
-    if not base and not config.allowed_workspaces:
-        # No restrictions configured — open access
+    if not base and not allowed:
+        # No restrictions configured - open access
         return True
     resolved = path.resolve()
     # Resolve base too so symlinks in the base path don't bypass the check
     resolved_base = base.resolve() if base else None
     in_base = resolved_base and (str(resolved).startswith(str(resolved_base) + "/") or resolved == resolved_base)
-    in_allowed = resolved in config.allowed_workspaces
+    # allowed list is pre-resolved by resolve_workspace_access(),
+    # so no need to call .resolve() again on each entry.
+    in_allowed = resolved in allowed
     return bool(in_base or in_allowed)
 
 
@@ -1548,20 +1547,22 @@ async def _apply_config_change(
 
 @_require_auth
 async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /workspaces — show an inline keyboard of recent workspaces."""
+    """Handle /workspaces - show an inline keyboard of recent workspaces."""
     assert update.message is not None
     chat_id = _chat_id(update)
+    config: Config = context.bot_data["config"]
+    # Resolve per-user workspace access (workspace_base + allowed list)
+    base, allowed = await sessions.resolve_workspace_access(chat_id, config)
     history = await sessions.get_workspace_history(chat_id)
     pool = _get_pool(context)
-    config: Config = context.bot_data["config"]
     current = str(pool.get_workspace(chat_id))
     home = str(config.claude_workspace)
 
-    if not history and not config.allowed_workspaces and current == home:
+    if not history and not allowed and current == home:
         await update.message.reply_text("No workspace history yet.\nUse /workspace new <name> to create one.")
         return
 
-    keyboard = await _workspaces_keyboard(history, current, home, config.workspace_base, config.allowed_workspaces)
+    keyboard = await _workspaces_keyboard(history, current, home, base, allowed)
     await update.message.reply_text("Workspaces:", reply_markup=keyboard)
 
 
@@ -1585,21 +1586,22 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     data = query.data.removeprefix("ws:")
     pool = _get_pool(context)
     home = config.claude_workspace
-    base = config.workspace_base
+
+    # Resolve per-user workspace access for this user
+    base, allowed = await sessions.resolve_workspace_access(chat_id, config)
 
     # Resolve target path from callback data
     if data == "home":
         path = home
         label = "Home"
     elif data.startswith("allowed:"):
-        # Pinned workspace from ALLOWED_WORKSPACES config
+        # Pinned workspace from the user's effective allowed list
         try:
             idx = int(data.removeprefix("allowed:"))
         except ValueError:
             await query.answer("Invalid selection.")
             await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
             return
-        allowed = config.allowed_workspaces
         if idx < 0 or idx >= len(allowed):
             await query.answer("Workspace no longer available.")
             await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
@@ -1623,16 +1625,15 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
             return
         path = Path(history[idx]["path"])
-        # Reject history entries that are no longer in an allowed workspace source.
-        # This handles the case where a path was removed from ALLOWED_WORKSPACES
-        # after the user visited it - the history entry persists but access is revoked.
-        if not _is_workspace_allowed(path, config):
+        # Reject history entries that are no longer in an allowed workspace
+        # source. This handles the case where a path was removed from the
+        # user's allowed list after they visited it - the history entry
+        # persists but access is revoked.
+        if not _is_workspace_allowed(path, base, allowed):
             await sessions.delete_workspace_history(str(path), chat_id)
             await query.answer("That workspace is no longer allowed.")
             history = await sessions.get_workspace_history(chat_id)
-            keyboard = await _workspaces_keyboard(
-                history, str(pool.get_workspace(chat_id)), str(home), base, config.allowed_workspaces
-            )
+            keyboard = await _workspaces_keyboard(history, str(pool.get_workspace(chat_id)), str(home), base, allowed)
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return
         # Remove stale entries where the directory no longer exists
@@ -1640,9 +1641,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             await sessions.delete_workspace_history(str(path), chat_id)
             await query.answer("That workspace no longer exists.")
             history = await sessions.get_workspace_history(chat_id)
-            keyboard = await _workspaces_keyboard(
-                history, str(pool.get_workspace(chat_id)), str(home), base, config.allowed_workspaces
-            )
+            keyboard = await _workspaces_keyboard(history, str(pool.get_workspace(chat_id)), str(home), base, allowed)
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return
         label = _short_workspace_name(str(path), base)
@@ -1663,29 +1662,175 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     )
 
 
-_NO_BASE_MSG = "WORKSPACE_BASE is not set. Add it to .env and restart."
+# ── Workspace allow/deny/allowed ────────────────────────────────────
+
+
+async def _handle_workspace_allow(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    target: str,
+) -> None:
+    """Handle /workspace allow <path> - add an allowed workspace."""
+    assert update.message is not None
+    chat_id = _chat_id(update)
+    config: Config = context.bot_data["config"]
+
+    # Parse path from target string ("allow /path/to/dir")
+    parts = target.split(None, 1)
+    if len(parts) < 2:
+        await update.message.reply_text("Usage: /workspace allow <path>")
+        return
+
+    raw_path = parts[1].strip()
+
+    # Require fully absolute path. Reject ~ because expanduser() resolves
+    # to the bot process's $HOME, not the requesting user's home directory.
+    # In multi-user with separate os_user values, ~/projects would point to
+    # the wrong location. Requiring / avoids the ambiguity entirely.
+    if not raw_path.startswith("/"):
+        await update.message.reply_text("Path must be absolute (start with /).")
+        return
+
+    # Resolve to canonical form
+    resolved = Path(raw_path).resolve()
+
+    # Must exist and be a directory
+    if not resolved.is_dir():
+        await update.message.reply_text(f"Not a directory: {resolved}")
+        return
+
+    # Check for redundancy: already under workspace_base?
+    base, allowed = await sessions.resolve_workspace_access(chat_id, config)
+    if base:
+        resolved_base = base.resolve()
+        if str(resolved).startswith(str(resolved_base) + "/") or resolved == resolved_base:
+            await update.message.reply_text(
+                f"Already covered by your workspace base:\n{base}\n\n"
+                "Use /workspace <name> to access directories under it."
+            )
+            return
+
+    # Check for duplicates (already in the effective list)
+    if resolved in [a.resolve() for a in allowed]:
+        await update.message.reply_text("Already in your allowed list.")
+        return
+
+    await sessions.add_allowed_workspace(chat_id, str(resolved))
+    await update.message.reply_text(f"Added: {resolved}")
+
+
+async def _handle_workspace_deny(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    target: str,
+) -> None:
+    """Handle /workspace deny <path> - remove an allowed workspace."""
+    assert update.message is not None
+    chat_id = _chat_id(update)
+
+    parts = target.split(None, 1)
+    if len(parts) < 2:
+        await update.message.reply_text("Usage: /workspace deny <path>")
+        return
+
+    raw_path = parts[1].strip()
+    resolved = Path(raw_path).expanduser().resolve()
+
+    # Check if this is a user-added path (in the database)
+    removed = await sessions.remove_allowed_workspace(chat_id, str(resolved))
+    if removed:
+        await update.message.reply_text(f"Removed: {resolved}")
+    else:
+        # Check if it's a global entry (can't be removed via Telegram)
+        config: Config = context.bot_data["config"]
+        if resolved in [p.resolve() for p in config.allowed_workspaces]:
+            await update.message.reply_text("That workspace is configured globally and cannot be removed via Telegram.")
+        else:
+            await update.message.reply_text("Not in your allowed workspace list.")
+
+
+async def _handle_workspace_allowed(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle /workspace allowed - list all allowed workspaces."""
+    assert update.message is not None
+    chat_id = _chat_id(update)
+    config: Config = context.bot_data["config"]
+    user_config = config.get_user_config(chat_id)
+
+    # Resolve workspace_base: users.yaml > env
+    base = user_config.workspace_base if user_config and user_config.workspace_base else config.workspace_base
+
+    # Build allowed list with source attribution. Avoids calling
+    # resolve_workspace_access() + get_allowed_workspaces() which
+    # would query the DB twice. Only this handler needs attribution.
+    db_paths = await sessions.get_allowed_workspaces(chat_id)
+    db_path_set = {p.resolve() for p in db_paths}
+
+    # Combined list: DB first, then global, deduplicated
+    seen: set[Path] = set()
+    allowed: list[Path] = []
+    for p in db_paths:
+        resolved = p.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            allowed.append(resolved)
+    for p in config.allowed_workspaces:
+        resolved = p.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            allowed.append(resolved)
+
+    lines = []
+    if base:
+        lines.append(f"Workspace base: {base}")
+    else:
+        lines.append("Workspace base: not set")
+
+    if allowed:
+        lines.append("")
+        lines.append("Allowed workspaces:")
+        for p in allowed:
+            source = "you" if p in db_path_set else "global"
+            lines.append(f"  {p} ({source})")
+    else:
+        lines.append("\nNo allowed workspaces configured.")
+
+    if not base and not allowed:
+        lines.append("\nAll directories are accessible (permissive mode).")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+_NO_BASE_MSG = "No workspace base configured. Set workspace_base in users.yaml."
 
 
 @_require_auth
 async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handle /workspace — show, switch, or create workspaces.
+    Handle /workspace - show, switch, or create workspaces.
 
     Subcommands:
-        /workspace              — show current workspace
-        /workspace home         — switch to home workspace
-        /workspace <name>       — switch to a workspace by name (WORKSPACE_BASE, then ALLOWED_WORKSPACES)
-        /workspace new <name>   — create a new workspace with git init and switch to it
+        /workspace                - show current workspace
+        /workspace home           - switch to home workspace
+        /workspace <name>         - switch by name (workspace_base, then allowed list)
+        /workspace new <name>     - create a new workspace with git init
+        /workspace allow <path>   - add an allowed workspace path
+        /workspace deny <path>    - remove an allowed workspace path
+        /workspace allowed        - list all allowed workspaces with sources
 
     Absolute paths and ~ expansion are rejected for security. Name resolution
-    checks WORKSPACE_BASE first, then ALLOWED_WORKSPACES (by directory name).
+    checks workspace_base first, then the allowed list (by directory name).
     """
     assert update.message is not None
     chat_id = _chat_id(update)
     pool = _get_pool(context)
     config: Config = context.bot_data["config"]
     home = config.claude_workspace
-    base = config.workspace_base
+
+    # Resolve per-user workspace access (workspace_base + allowed list)
+    base, allowed = await sessions.resolve_workspace_access(chat_id, config)
 
     # No args: show current workspace
     if not context.args:
@@ -1703,13 +1848,27 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _switch_workspace(update, context, home)
         return
 
+    # Route workspace subcommands. Exact word boundary check
+    # (same pattern as "config") to avoid collisions with workspace
+    # names like "allowlist" or "denied-access".
+    target_lower = target.lower()
+    if target_lower == "allow" or target_lower.startswith("allow "):
+        await _handle_workspace_allow(update, context, target)
+        return
+    if target_lower == "deny" or target_lower.startswith("deny "):
+        await _handle_workspace_deny(update, context, target)
+        return
+    if target_lower == "allowed":
+        await _handle_workspace_allowed(update, context)
+        return
+
     # Reject absolute paths and ~ expansion for security
     if target.startswith("/") or target.startswith("~"):
         await update.message.reply_text("Absolute paths are not allowed. Use a workspace name.")
         return
 
     # "new" keyword: create a new workspace directory with git init
-    if target.lower().startswith("new"):
+    if target_lower.startswith("new"):
         parts = target.split(None, 1)
         if len(parts) < 2:
             await update.message.reply_text("Usage: /workspace new <name>")
@@ -1740,21 +1899,20 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # "config" keyword: view or modify workspace settings.
     # Exact word boundary check to avoid collisions with workspace
     # names starting with "config" (e.g., "configs", "config-backup").
-    target_lower = target.lower()
     if target_lower == "config" or target_lower.startswith("config "):
         await _handle_workspace_config(update, context, target)
         return
 
-    # Try WORKSPACE_BASE first (WORKSPACE_BASE wins on name collision per spec)
+    # Try workspace_base first (base wins on name collision per spec)
     resolved: Path | None = None
     base_candidate = _resolve_workspace_path(target, base)
     if base_candidate is not None and base_candidate.is_dir():
         resolved = base_candidate
 
-    # Fall back to allowed workspaces — match by directory name.
+    # Fall back to allowed workspaces - match by directory name.
     # Multiple matches means the user needs to pick via /workspaces.
     if resolved is None:
-        matches = [p for p in config.allowed_workspaces if p.name == target]
+        matches = [p for p in allowed if p.name == target]
         if len(matches) > 1:
             paths = "\n".join(f"  {p}" for p in matches)
             await update.message.reply_text(
@@ -1765,7 +1923,7 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if resolved is None:
         # Give a helpful message if neither source is configured
-        if not base and not config.allowed_workspaces:
+        if not base and not allowed:
             await update.message.reply_text(_NO_BASE_MSG)
         else:
             await update.message.reply_text(f"Workspace '{target}' not found.")

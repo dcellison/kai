@@ -24,7 +24,10 @@ from kai.bot import (
     _do_switch_workspace,
     _edit_message_safe,
     _handle_settings_reset,
+    _handle_workspace_allow,
+    _handle_workspace_allowed,
     _handle_workspace_config,
+    _handle_workspace_deny,
     _is_authorized,
     _is_workspace_allowed,
     _models_keyboard,
@@ -301,52 +304,45 @@ def _make_config(**overrides) -> Config:
 
 class TestIsWorkspaceAllowed:
     def test_no_sources_allows_anything(self, tmp_path):
-        """With no WORKSPACE_BASE and no ALLOWED_WORKSPACES, all paths are allowed."""
-        config = _make_config()
-        assert _is_workspace_allowed(tmp_path / "anything", config) is True
+        """With no base and no allowed list, all paths are accepted (permissive mode)."""
+        assert _is_workspace_allowed(tmp_path / "anything", None, []) is True
 
     def test_path_under_base_is_allowed(self, tmp_path):
-        """Paths under WORKSPACE_BASE are allowed."""
-        config = _make_config(workspace_base=tmp_path)
-        assert _is_workspace_allowed(tmp_path / "myproject", config) is True
+        """Paths under workspace_base are allowed."""
+        assert _is_workspace_allowed(tmp_path / "myproject", tmp_path, []) is True
 
-    def test_path_in_allowed_workspaces_is_allowed(self, tmp_path):
-        """Paths listed in ALLOWED_WORKSPACES are allowed."""
+    def test_path_in_allowed_list(self, tmp_path):
+        """Paths in the allowed list are allowed."""
         project = tmp_path / "project"
         project.mkdir()
-        config = _make_config(allowed_workspaces=[project])
-        assert _is_workspace_allowed(project, config) is True
+        assert _is_workspace_allowed(project, None, [project]) is True
 
     def test_path_outside_both_is_rejected(self, tmp_path):
-        """Paths not in WORKSPACE_BASE or ALLOWED_WORKSPACES are rejected."""
+        """Paths not under base or in allowed list are rejected."""
         base = tmp_path / "base"
         base.mkdir()
         outside = tmp_path / "outside"
-        config = _make_config(workspace_base=base)
-        assert _is_workspace_allowed(outside, config) is False
+        assert _is_workspace_allowed(outside, base, []) is False
 
-    def test_base_set_allowed_workspaces_empty_rejects_outside(self, tmp_path):
-        """With WORKSPACE_BASE set but no allowed workspaces, outside paths are rejected."""
+    def test_base_set_allowed_empty_rejects_outside(self, tmp_path):
+        """With base set but empty allowed list, outside paths are rejected."""
         base = tmp_path / "base"
         base.mkdir()
-        config = _make_config(workspace_base=base, allowed_workspaces=[])
-        assert _is_workspace_allowed(tmp_path / "other", config) is False
+        assert _is_workspace_allowed(tmp_path / "other", base, []) is False
 
-    def test_only_allowed_workspaces_set_rejects_unlisted(self, tmp_path):
-        """With only ALLOWED_WORKSPACES set, unlisted paths are rejected."""
+    def test_only_allowed_set_rejects_unlisted(self, tmp_path):
+        """With only allowed list set, unlisted paths are rejected."""
         allowed = tmp_path / "allowed"
         allowed.mkdir()
         unlisted = tmp_path / "unlisted"
-        config = _make_config(allowed_workspaces=[allowed])
-        assert _is_workspace_allowed(unlisted, config) is False
+        assert _is_workspace_allowed(unlisted, None, [allowed]) is False
 
     def test_resolves_symlinks_for_comparison(self, tmp_path):
         """Path resolution handles non-canonical paths correctly."""
         project = tmp_path / "project"
         project.mkdir()
-        config = _make_config(allowed_workspaces=[project])
-        # Pass the resolved canonical path — should still match
-        assert _is_workspace_allowed(project.resolve(), config) is True
+        # Pass the resolved canonical path - should still match
+        assert _is_workspace_allowed(project.resolve(), None, [project]) is True
 
 
 # ── create_bot transport mode ──────────────────────────────────────
@@ -462,6 +458,20 @@ def _fake_lock(*_args, **_kwargs):
     The lock starts unlocked, so _notify_if_queued correctly skips notification.
     """
     return asyncio.Lock()
+
+
+def _mock_resolve(base=None, allowed=None):
+    """Return a patch context that mocks sessions.resolve_workspace_access.
+
+    Simplifies handler tests that call handle_workspace, handle_workspaces,
+    or handle_workspace_callback - all of which resolve per-user workspace
+    access at the top of the handler.
+    """
+    return patch(
+        "kai.bot.sessions.resolve_workspace_access",
+        new_callable=AsyncMock,
+        return_value=(base, allowed or []),
+    )
 
 
 def _text_event(text: str) -> StreamEvent:
@@ -1185,7 +1195,8 @@ class TestHandleWorkspace:
         claude = _make_mock_claude(workspace=Path("/home/workspace"))
         update = _make_update()
         ctx = _make_context(claude=claude)
-        await handle_workspace(update, ctx)
+        with _mock_resolve():
+            await handle_workspace(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "Home" in reply or "workspace" in reply.lower()
 
@@ -1199,6 +1210,7 @@ class TestHandleWorkspace:
         update = _make_update()
         ctx = _make_context(claude=claude, config=config, args=["home"])
         with (
+            _mock_resolve(),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.delete_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
@@ -1211,7 +1223,8 @@ class TestHandleWorkspace:
     async def test_absolute_path_rejected(self):
         update = _make_update()
         ctx = _make_context(args=["/tmp/evil"])
-        await handle_workspace(update, ctx)
+        with _mock_resolve():
+            await handle_workspace(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "Absolute paths" in reply
 
@@ -1219,7 +1232,8 @@ class TestHandleWorkspace:
     async def test_tilde_path_rejected(self):
         update = _make_update()
         ctx = _make_context(args=["~/foo"])
-        await handle_workspace(update, ctx)
+        with _mock_resolve():
+            await handle_workspace(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "Absolute paths" in reply
 
@@ -1227,17 +1241,20 @@ class TestHandleWorkspace:
     async def test_new_without_name(self):
         update = _make_update()
         ctx = _make_context(args=["new"])
-        await handle_workspace(update, ctx)
+        with _mock_resolve():
+            await handle_workspace(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "Usage" in reply
 
     @pytest.mark.asyncio
     async def test_new_without_base(self):
+        """'new' with no workspace_base shows the updated error message."""
         update = _make_update()
         ctx = _make_context(config=_make_config(workspace_base=None), args=["new", "myproj"])
-        await handle_workspace(update, ctx)
+        with _mock_resolve():
+            await handle_workspace(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
-        assert "WORKSPACE_BASE" in reply
+        assert "workspace base" in reply.lower()
 
     @pytest.mark.asyncio
     async def test_new_already_exists(self, tmp_path):
@@ -1248,7 +1265,8 @@ class TestHandleWorkspace:
             config=_make_config(workspace_base=tmp_path, claude_workspace=Path("/home")),
             args=["new", "myproj"],
         )
-        await handle_workspace(update, ctx)
+        with _mock_resolve(base=tmp_path):
+            await handle_workspace(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "Already exists" in reply
 
@@ -1262,6 +1280,7 @@ class TestHandleWorkspace:
         mock_proc = MagicMock()
         mock_proc.wait = AsyncMock()
         with (
+            _mock_resolve(base=tmp_path),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
@@ -1276,7 +1295,7 @@ class TestHandleWorkspace:
 
     @pytest.mark.asyncio
     async def test_name_found_in_base(self, tmp_path):
-        """Name resolved via WORKSPACE_BASE."""
+        """Name resolved via workspace_base."""
         project = tmp_path / "myproj"
         project.mkdir()
         claude = _make_mock_claude(workspace=Path("/other"))
@@ -1284,6 +1303,7 @@ class TestHandleWorkspace:
         update = _make_update()
         ctx = _make_context(config=config, claude=claude, args=["myproj"])
         with (
+            _mock_resolve(base=tmp_path),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
@@ -1295,17 +1315,15 @@ class TestHandleWorkspace:
 
     @pytest.mark.asyncio
     async def test_name_found_in_allowed(self, tmp_path):
-        """Name resolved via ALLOWED_WORKSPACES directory name match."""
+        """Name resolved via allowed list directory name match."""
         project = tmp_path / "myproj"
         project.mkdir()
         claude = _make_mock_claude(workspace=Path("/other"))
-        config = _make_config(
-            allowed_workspaces=[project],
-            claude_workspace=Path("/home"),
-        )
+        config = _make_config(claude_workspace=Path("/home"))
         update = _make_update()
         ctx = _make_context(config=config, claude=claude, args=["myproj"])
         with (
+            _mock_resolve(allowed=[project]),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
@@ -1317,24 +1335,26 @@ class TestHandleWorkspace:
 
     @pytest.mark.asyncio
     async def test_multiple_matches_in_allowed(self, tmp_path):
-        """Multiple ALLOWED_WORKSPACES with the same name: shows disambiguation message."""
+        """Multiple allowed workspaces with the same name: shows disambiguation message."""
         proj_a = tmp_path / "a" / "proj"
         proj_b = tmp_path / "b" / "proj"
         proj_a.mkdir(parents=True)
         proj_b.mkdir(parents=True)
-        config = _make_config(allowed_workspaces=[proj_a, proj_b], claude_workspace=Path("/home"))
+        config = _make_config(claude_workspace=Path("/home"))
         update = _make_update()
         ctx = _make_context(config=config, args=["proj"])
-        await handle_workspace(update, ctx)
+        with _mock_resolve(allowed=[proj_a, proj_b]):
+            await handle_workspace(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "Multiple workspaces" in reply
 
     @pytest.mark.asyncio
     async def test_not_found_with_sources(self, tmp_path):
-        config = _make_config(workspace_base=tmp_path, claude_workspace=Path("/home"))
+        config = _make_config(claude_workspace=Path("/home"))
         update = _make_update()
         ctx = _make_context(config=config, args=["nonexistent"])
-        await handle_workspace(update, ctx)
+        with _mock_resolve(base=tmp_path):
+            await handle_workspace(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "not found" in reply.lower()
 
@@ -1343,9 +1363,10 @@ class TestHandleWorkspace:
         config = _make_config(workspace_base=None, allowed_workspaces=[], claude_workspace=Path("/home"))
         update = _make_update()
         ctx = _make_context(config=config, args=["anything"])
-        await handle_workspace(update, ctx)
+        with _mock_resolve():
+            await handle_workspace(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
-        assert "WORKSPACE_BASE" in reply
+        assert "workspace base" in reply.lower()
 
     @pytest.mark.asyncio
     async def test_ws_alias_registered(self):
@@ -1356,7 +1377,8 @@ class TestHandleWorkspace:
         claude = _make_mock_claude(workspace=Path("/home/workspace"))
         update = _make_update()
         ctx = _make_context(claude=claude)
-        await handle_workspace(update, ctx)
+        with _mock_resolve():
+            await handle_workspace(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "Home" in reply or "workspace" in reply.lower()
 
@@ -1371,7 +1393,10 @@ class TestHandleWorkspaces:
         claude = _make_mock_claude(workspace=Path("/home/workspace"))
         config = _make_config(claude_workspace=Path("/home/workspace"))
         ctx = _make_context(config=config, claude=claude)
-        with patch("kai.bot.sessions.get_workspace_history", new_callable=AsyncMock, return_value=[]):
+        with (
+            _mock_resolve(),
+            patch("kai.bot.sessions.get_workspace_history", new_callable=AsyncMock, return_value=[]),
+        ):
             await handle_workspaces(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "No workspace history" in reply
@@ -1383,7 +1408,10 @@ class TestHandleWorkspaces:
         config = _make_config(claude_workspace=Path("/home/workspace"))
         ctx = _make_context(config=config, claude=claude)
         history = [{"path": "/some/project"}]
-        with patch("kai.bot.sessions.get_workspace_history", new_callable=AsyncMock, return_value=history):
+        with (
+            _mock_resolve(),
+            patch("kai.bot.sessions.get_workspace_history", new_callable=AsyncMock, return_value=history),
+        ):
             await handle_workspaces(update, ctx)
         call = update.message.reply_text.call_args
         assert call[1]["reply_markup"] is not None
@@ -1408,6 +1436,7 @@ class TestHandleWorkspaceCallback:
         update = _make_callback_update(data="ws:home")
         ctx = _make_context(config=config, claude=claude)
         with (
+            _mock_resolve(),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.delete_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
@@ -1424,13 +1453,11 @@ class TestHandleWorkspaceCallback:
         project = tmp_path / "proj"
         project.mkdir()
         claude = _make_mock_claude(workspace=Path("/other"))
-        config = _make_config(
-            allowed_workspaces=[project],
-            claude_workspace=Path("/home/workspace"),
-        )
+        config = _make_config(claude_workspace=Path("/home/workspace"))
         update = _make_callback_update(data="ws:allowed:0")
         ctx = _make_context(config=config, claude=claude)
         with (
+            _mock_resolve(allowed=[project]),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
@@ -1444,25 +1471,28 @@ class TestHandleWorkspaceCallback:
     async def test_allowed_nonexistent_dir(self, tmp_path):
         """ws:allowed:<idx> where directory was deleted."""
         gone = tmp_path / "gone"  # not created
-        config = _make_config(allowed_workspaces=[gone], claude_workspace=Path("/home"))
+        config = _make_config(claude_workspace=Path("/home"))
         update = _make_callback_update(data="ws:allowed:0")
         ctx = _make_context(config=config)
-        await handle_workspace_callback(update, ctx)
+        with _mock_resolve(allowed=[gone]):
+            await handle_workspace_callback(update, ctx)
         update.callback_query.answer.assert_called_once_with("That workspace no longer exists.")
 
     @pytest.mark.asyncio
     async def test_allowed_bad_index(self):
         update = _make_callback_update(data="ws:allowed:bad")
         ctx = _make_context()
-        await handle_workspace_callback(update, ctx)
+        with _mock_resolve():
+            await handle_workspace_callback(update, ctx)
         update.callback_query.answer.assert_called_once_with("Invalid selection.")
 
     @pytest.mark.asyncio
     async def test_allowed_out_of_range(self):
-        config = _make_config(allowed_workspaces=[], claude_workspace=Path("/home"))
+        config = _make_config(claude_workspace=Path("/home"))
         update = _make_callback_update(data="ws:allowed:99")
         ctx = _make_context(config=config)
-        await handle_workspace_callback(update, ctx)
+        with _mock_resolve():
+            await handle_workspace_callback(update, ctx)
         update.callback_query.answer.assert_called_once_with("Workspace no longer available.")
 
     @pytest.mark.asyncio
@@ -1476,6 +1506,7 @@ class TestHandleWorkspaceCallback:
         ctx = _make_context(config=config, claude=claude)
         history = [{"path": str(project)}]
         with (
+            _mock_resolve(),
             patch("kai.bot.sessions.get_workspace_history", new_callable=AsyncMock, return_value=history),
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
@@ -1491,18 +1522,18 @@ class TestHandleWorkspaceCallback:
         """History entry disallowed: deleted from history, keyboard refreshed."""
         project = tmp_path / "proj"
         project.mkdir()
-        # Configure with a base that doesn't contain the project
+        # Configure with a base that doesn't contain the project - the
+        # per-user resolve returns base=other_base so the project path
+        # fails _is_workspace_allowed.
         other_base = tmp_path / "base"
         other_base.mkdir()
-        config = _make_config(
-            workspace_base=other_base,
-            claude_workspace=Path("/home/workspace"),
-        )
+        config = _make_config(claude_workspace=Path("/home/workspace"))
         claude = _make_mock_claude(workspace=Path("/home/workspace"))
         update = _make_callback_update(data="ws:0")
         ctx = _make_context(config=config, claude=claude)
         history = [{"path": str(project)}]
         with (
+            _mock_resolve(base=other_base),
             patch("kai.bot.sessions.get_workspace_history", new_callable=AsyncMock, return_value=history),
             patch("kai.bot.sessions.delete_workspace_history", new_callable=AsyncMock) as mock_del,
         ):
@@ -1520,6 +1551,7 @@ class TestHandleWorkspaceCallback:
         ctx = _make_context(config=config, claude=claude)
         history = [{"path": str(gone)}]
         with (
+            _mock_resolve(),
             patch("kai.bot.sessions.get_workspace_history", new_callable=AsyncMock, return_value=history),
             patch("kai.bot.sessions.delete_workspace_history", new_callable=AsyncMock) as mock_del,
         ):
@@ -1534,9 +1566,260 @@ class TestHandleWorkspaceCallback:
         config = _make_config(claude_workspace=home)
         update = _make_callback_update(data="ws:home")
         ctx = _make_context(config=config, claude=claude)
-        await handle_workspace_callback(update, ctx)
+        with _mock_resolve():
+            await handle_workspace_callback(update, ctx)
         edit_text = update.callback_query.edit_message_text.call_args[0][0]
         assert "No change" in edit_text
+
+
+# ── /workspace allow/deny/allowed ───────────────────────────────────
+
+
+class TestHandleWorkspaceAllow:
+    @pytest.mark.asyncio
+    async def test_allow_success(self, tmp_path):
+        """Adding a valid directory path succeeds."""
+        ws = tmp_path / "new-ws"
+        ws.mkdir()
+        update = _make_update()
+        ctx = _make_context(args=["allow", str(ws)])
+        with (
+            _mock_resolve(),
+            patch("kai.bot.sessions.add_allowed_workspace", new_callable=AsyncMock) as mock_add,
+        ):
+            await _handle_workspace_allow(update, ctx, f"allow {ws}")
+        mock_add.assert_called_once_with(12345, str(ws.resolve()))
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Added" in reply
+
+    @pytest.mark.asyncio
+    async def test_allow_no_path(self):
+        """Missing path argument shows usage."""
+        update = _make_update()
+        ctx = _make_context(args=["allow"])
+        await _handle_workspace_allow(update, ctx, "allow")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Usage" in reply
+
+    @pytest.mark.asyncio
+    async def test_allow_relative_path_rejected(self):
+        """Relative paths (not starting with /) are rejected."""
+        update = _make_update()
+        ctx = _make_context(args=["allow", "relative/path"])
+        await _handle_workspace_allow(update, ctx, "allow relative/path")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "absolute" in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_allow_nonexistent_rejected(self):
+        """Non-existent path is rejected."""
+        update = _make_update()
+        ctx = _make_context(args=["allow", "/nonexistent/path"])
+        await _handle_workspace_allow(update, ctx, "allow /nonexistent/path")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Not a directory" in reply
+
+    @pytest.mark.asyncio
+    async def test_allow_under_base_redundant(self, tmp_path):
+        """Path under workspace_base is flagged as redundant."""
+        base = tmp_path / "base"
+        sub = base / "project"
+        sub.mkdir(parents=True)
+        update = _make_update()
+        ctx = _make_context(args=["allow", str(sub)])
+        with _mock_resolve(base=base):
+            await _handle_workspace_allow(update, ctx, f"allow {sub}")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "workspace base" in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_allow_duplicate(self, tmp_path):
+        """Path already in allowed list is flagged as duplicate."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        update = _make_update()
+        ctx = _make_context(args=["allow", str(ws)])
+        with _mock_resolve(allowed=[ws]):
+            await _handle_workspace_allow(update, ctx, f"allow {ws}")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Already" in reply
+
+
+class TestHandleWorkspaceDeny:
+    @pytest.mark.asyncio
+    async def test_deny_success(self, tmp_path):
+        """Removing a user-added path succeeds."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        update = _make_update()
+        ctx = _make_context(args=["deny", str(ws)])
+        with patch(
+            "kai.bot.sessions.remove_allowed_workspace",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            await _handle_workspace_deny(update, ctx, f"deny {ws}")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Removed" in reply
+
+    @pytest.mark.asyncio
+    async def test_deny_no_path(self):
+        """Missing path argument shows usage."""
+        update = _make_update()
+        ctx = _make_context(args=["deny"])
+        await _handle_workspace_deny(update, ctx, "deny")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Usage" in reply
+
+    @pytest.mark.asyncio
+    async def test_deny_global_path(self, tmp_path):
+        """Trying to deny a global ALLOWED_WORKSPACES path shows an explanation."""
+        ws = tmp_path / "global-ws"
+        ws.mkdir()
+        config = _make_config(allowed_workspaces=[ws])
+        update = _make_update()
+        ctx = _make_context(config=config, args=["deny", str(ws)])
+        with patch(
+            "kai.bot.sessions.remove_allowed_workspace",
+            new_callable=AsyncMock,
+            return_value=False,
+        ):
+            await _handle_workspace_deny(update, ctx, f"deny {ws}")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "globally" in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_deny_unknown_path(self, tmp_path):
+        """Denying a path not in any list shows not-found message."""
+        update = _make_update()
+        ctx = _make_context(args=["deny", "/some/unknown/path"])
+        with patch(
+            "kai.bot.sessions.remove_allowed_workspace",
+            new_callable=AsyncMock,
+            return_value=False,
+        ):
+            await _handle_workspace_deny(update, ctx, "deny /some/unknown/path")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Not in your" in reply
+
+
+class TestHandleWorkspaceAllowed:
+    @pytest.mark.asyncio
+    async def test_shows_list_with_sources(self, tmp_path):
+        """Shows allowed workspaces with source attribution."""
+        db_ws = tmp_path / "user-ws"
+        db_ws.mkdir()
+        global_ws = tmp_path / "global-ws"
+        global_ws.mkdir()
+        config = _make_config(allowed_workspaces=[global_ws])
+        update = _make_update()
+        ctx = _make_context(config=config)
+        with patch(
+            "kai.bot.sessions.get_allowed_workspaces",
+            new_callable=AsyncMock,
+            return_value=[db_ws],
+        ):
+            await _handle_workspace_allowed(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "(you)" in reply
+        assert "(global)" in reply
+        assert "Workspace base: not set" in reply
+
+    @pytest.mark.asyncio
+    async def test_permissive_mode(self):
+        """No base and no allowed shows permissive mode message."""
+        config = _make_config()
+        update = _make_update()
+        ctx = _make_context(config=config)
+        with patch(
+            "kai.bot.sessions.get_allowed_workspaces",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            await _handle_workspace_allowed(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "permissive" in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_shows_base(self, tmp_path):
+        """Shows workspace_base when configured."""
+        config = _make_config(workspace_base=tmp_path)
+        update = _make_update()
+        ctx = _make_context(config=config)
+        with patch(
+            "kai.bot.sessions.get_allowed_workspaces",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            await _handle_workspace_allowed(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert f"Workspace base: {tmp_path}" in reply
+
+
+# ── /workspace allow/deny routing via handle_workspace ──────────────
+
+
+class TestWorkspaceSubcommandRouting:
+    @pytest.mark.asyncio
+    async def test_allow_routed(self, tmp_path):
+        """/workspace allow <path> routes to _handle_workspace_allow."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        update = _make_update()
+        ctx = _make_context(args=["allow", str(ws)])
+        with (
+            _mock_resolve(),
+            patch("kai.bot.sessions.add_allowed_workspace", new_callable=AsyncMock),
+        ):
+            await handle_workspace(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Added" in reply
+
+    @pytest.mark.asyncio
+    async def test_deny_routed(self, tmp_path):
+        """/workspace deny <path> routes to _handle_workspace_deny."""
+        update = _make_update()
+        ctx = _make_context(args=["deny", str(tmp_path)])
+        with (
+            _mock_resolve(),
+            patch("kai.bot.sessions.remove_allowed_workspace", new_callable=AsyncMock, return_value=False),
+        ):
+            await handle_workspace(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Not in your" in reply
+
+    @pytest.mark.asyncio
+    async def test_allowed_routed(self):
+        """/workspace allowed routes to _handle_workspace_allowed."""
+        update = _make_update()
+        ctx = _make_context(args=["allowed"])
+        with (
+            _mock_resolve(),
+            patch("kai.bot.sessions.get_allowed_workspaces", new_callable=AsyncMock, return_value=[]),
+        ):
+            await handle_workspace(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Workspace base" in reply
+
+    @pytest.mark.asyncio
+    async def test_name_uses_per_user_allowed(self, tmp_path):
+        """/workspace <name> uses per-user allowed list for name resolution."""
+        project = tmp_path / "myproj"
+        project.mkdir()
+        claude = _make_mock_claude(workspace=Path("/other"))
+        config = _make_config(claude_workspace=Path("/home"))
+        update = _make_update()
+        ctx = _make_context(config=config, claude=claude, args=["myproj"])
+        with (
+            _mock_resolve(allowed=[project]),
+            patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
+            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
+            patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
+            patch("kai.bot.webhook.update_workspace"),
+        ):
+            await handle_workspace(update, ctx)
+        claude.change_workspace.assert_called_once()
 
 
 # ── Workspace config in bot layer ────────────────────────────────────
