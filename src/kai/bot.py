@@ -2026,7 +2026,6 @@ async def _show_github(update: Update, chat_id: int, config: Config) -> None:
 async def _handle_github_notify(
     update: Update,
     chat_id: int,
-    config: Config,
     args: list[str],
 ) -> None:
     """Handle /github notify <chat_id|reset> - set or clear notification destination."""
@@ -2064,7 +2063,6 @@ async def _handle_github_notify(
 async def _handle_github_toggle(
     update: Update,
     chat_id: int,
-    config: Config,
     field: str,
     args: list[str],
 ) -> None:
@@ -2100,15 +2098,15 @@ async def handle_github(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if subcommand == "notify":
-        await _handle_github_notify(update, chat_id, config, args[1:])
+        await _handle_github_notify(update, chat_id, args[1:])
         return
 
     if subcommand == "reviews":
-        await _handle_github_toggle(update, chat_id, config, "pr_review", args[1:])
+        await _handle_github_toggle(update, chat_id, "pr_review", args[1:])
         return
 
     if subcommand == "triage":
-        await _handle_github_toggle(update, chat_id, config, "issue_triage", args[1:])
+        await _handle_github_toggle(update, chat_id, "issue_triage", args[1:])
         return
 
     await update.message.reply_text("Unknown subcommand. Try /github for current settings.")
