@@ -1,0 +1,34 @@
+# Per-user configuration for Kai.
+#
+# Copy to users.yaml (or /etc/kai/users.yaml for protected
+# installations) and customize with your users' details.
+#
+# Required fields: telegram_id, name.
+# All other fields are optional.
+
+users:
+  # Example: admin user with full settings
+  - telegram_id: 123456789
+    name: alice
+    role: admin              # "admin" or "user" (default: "user")
+    github: alice             # GitHub username for webhook routing
+    # os_user: alice          # OS user for subprocess isolation
+    # home_workspace: ~/projects/main  # per-user home workspace
+
+    # max_budget serves double duty: it is both the user's default
+    # budget AND the ceiling they cannot exceed via /settings budget.
+    # If alice sets /settings budget 15, she gets $15. If she tries
+    # /settings budget 25, she gets "Budget cannot exceed $20.00
+    # (admin limit)." If she has not set any /settings budget, she
+    # gets $20 as the baseline default.
+    max_budget: 20.0
+
+    # Optional per-user defaults. Users can override these with
+    # /settings commands. Omitted fields use global defaults from .env.
+    # model: opus             # default model (haiku/sonnet/opus)
+    # timeout: 300            # response timeout in seconds (max 600)
+    # context_window: 200000  # context window in tokens (0 = default)
+
+  # Example: regular user with minimal config
+  # - telegram_id: 987654321
+  #   name: bob
