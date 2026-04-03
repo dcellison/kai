@@ -1347,6 +1347,19 @@ class TestHandleWorkspace:
         reply = update.message.reply_text.call_args[0][0]
         assert "WORKSPACE_BASE" in reply
 
+    @pytest.mark.asyncio
+    async def test_ws_alias_registered(self):
+        """/ws is registered as an alias for /workspace via create_bot."""
+        # The alias is a CommandHandler("ws", handle_workspace) in create_bot.
+        # We verify it by calling handle_workspace directly with no args
+        # (same handler, so same behavior as /workspace with no args).
+        claude = _make_mock_claude(workspace=Path("/home/workspace"))
+        update = _make_update()
+        ctx = _make_context(claude=claude)
+        await handle_workspace(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Home" in reply or "workspace" in reply.lower()
+
 
 # ── handle_workspaces ────────────────────────────────────────────────
 

@@ -53,7 +53,7 @@ from telegram.ext import (
 )
 
 from kai import services, sessions, webhook
-from kai.config import _MAX_CONTEXT_CEILING, DATA_DIR, VALID_MODELS, Config, WorkspaceConfig
+from kai.config import DATA_DIR, MAX_CONTEXT_CEILING, VALID_MODELS, Config, WorkspaceConfig
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
 from kai.pool import SubprocessPool
@@ -564,8 +564,8 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if ctx != 0 and ctx < 50000:
             await update.message.reply_text("Context window must be at least 50000 tokens (or 0 for default).")
             return
-        if ctx > _MAX_CONTEXT_CEILING:
-            await update.message.reply_text(f"Context window cannot exceed {_MAX_CONTEXT_CEILING} tokens.")
+        if ctx > MAX_CONTEXT_CEILING:
+            await update.message.reply_text(f"Context window cannot exceed {MAX_CONTEXT_CEILING} tokens.")
             return
         await sessions.set_user_setting(chat_id, "context_window", str(ctx))
         # Context window is a CLI flag baked in at process startup

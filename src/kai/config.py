@@ -46,7 +46,7 @@ VALID_MODELS = {"haiku", "sonnet", "opus"}
 # Maximum context window size in tokens. Claude's hard ceiling.
 # Shared between load_config() (env var validation) and
 # _load_user_configs() (users.yaml validation).
-_MAX_CONTEXT_CEILING = 1_000_000
+MAX_CONTEXT_CEILING = 1_000_000
 
 # Image file extensions that Telegram renders inline as photos.
 # Shared between bot.py (inbound document handling) and webhook.py (send-file API).
@@ -767,8 +767,8 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
                     raise ValueError("must be non-negative")
                 if user_context_window != 0 and user_context_window < 50_000:
                     raise ValueError("must be at least 50000 (or 0 for default)")
-                if user_context_window > _MAX_CONTEXT_CEILING:
-                    raise ValueError(f"must not exceed {_MAX_CONTEXT_CEILING}")
+                if user_context_window > MAX_CONTEXT_CEILING:
+                    raise ValueError(f"must not exceed {MAX_CONTEXT_CEILING}")
             except (TypeError, ValueError) as e:
                 log.warning("users.yaml: invalid context_window for %s: %s; ignoring", name, e)
                 user_context_window = None
@@ -935,8 +935,8 @@ def load_config() -> Config:
     # Context window tuning - 0 means "use Claude Code defaults"
     try:
         claude_max_context_window = int(os.environ.get("CLAUDE_MAX_CONTEXT_WINDOW", "0"))
-        if claude_max_context_window < 0 or claude_max_context_window > _MAX_CONTEXT_CEILING:
-            raise SystemExit(f"CLAUDE_MAX_CONTEXT_WINDOW must be 0-{_MAX_CONTEXT_CEILING} (0 = use default)")
+        if claude_max_context_window < 0 or claude_max_context_window > MAX_CONTEXT_CEILING:
+            raise SystemExit(f"CLAUDE_MAX_CONTEXT_WINDOW must be 0-{MAX_CONTEXT_CEILING} (0 = use default)")
     except ValueError:
         raise SystemExit("CLAUDE_MAX_CONTEXT_WINDOW must be an integer") from None
     try:
