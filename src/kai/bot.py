@@ -497,7 +497,7 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         try:
             budget = float(value)
-            if budget <= 0:
+            if budget <= 0 or not math.isfinite(budget):
                 raise ValueError
         except ValueError:
             await update.message.reply_text("Budget must be a positive number.")
@@ -1273,7 +1273,7 @@ async def _handle_workspace_config(
             return
         try:
             budget = float(value)
-            if budget <= 0:
+            if budget <= 0 or not math.isfinite(budget):
                 raise ValueError
         except ValueError:
             await update.message.reply_text("Budget must be a positive number.")
