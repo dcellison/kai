@@ -34,6 +34,18 @@ users:
     # timeout: 300            # response timeout in seconds (max 600)
     # context_window: 200000  # context window in tokens (0 = default)
 
+    # GitHub notification settings. github_repos controls which repos
+    # route events to this user. pr_review and issue_triage toggle
+    # automated processing. github_notify_chat_id sends notifications
+    # to a separate chat (e.g., a Telegram group) instead of the DM.
+    # All are optional and overridable via /github commands.
+    # github_repos:
+    #   - alice/my-project
+    #   - alice/other-repo
+    # github_notify_chat_id: -100123456789
+    # pr_review: true
+    # issue_triage: true
+
   # Example: regular user with minimal config
   # - telegram_id: 987654321
   #   name: bob

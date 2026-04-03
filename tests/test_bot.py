@@ -39,6 +39,7 @@ from kai.bot import (
     _save_upload,
     _set_responding,
     _short_workspace_name,
+    _show_github,
     _show_settings,
     _switch_workspace,
     _truncate_for_telegram,
@@ -48,6 +49,7 @@ from kai.bot import (
     create_bot,
     handle_canceljob,
     handle_document,
+    handle_github,
     handle_help,
     handle_jobs,
     handle_message,
@@ -3606,6 +3608,243 @@ class TestHandleSettings:
         reply = update.message.reply_text.call_args[0][0]
         assert "$10.00" in reply
         assert "ceiling" in reply.lower()
+
+
+# ── /github command ─────────────────────────────────────────────────
+
+
+class TestHandleGitHub:
+    """Tests for /github - GitHub notification settings.
+
+    Each test patches sessions to isolate the handler from the database.
+    The _mock_resolve helper simulates resolve_github_settings() output,
+    and _mock_db_settings simulates _get_github_db_settings() output for
+    source attribution in _show_github().
+    """
+
+    def _mock_resolve(self, repos=None, notify_chat_id=12345, pr_review=False, issue_triage=False):
+        """Patch resolve_github_settings with controlled return values."""
+        settings = {
+            "repos": repos or [],
+            "notify_chat_id": notify_chat_id,
+            "pr_review": pr_review,
+            "issue_triage": issue_triage,
+        }
+        return patch("kai.bot.sessions.resolve_github_settings", new_callable=AsyncMock, return_value=settings)
+
+    def _mock_db_settings(self, db_settings=None):
+        """Patch _get_github_db_settings with controlled return values."""
+        return patch("kai.bot.sessions._get_github_db_settings", new_callable=AsyncMock, return_value=db_settings or {})
+
+    # ── 1. /github with no config (defaults) ──────────────────────
+
+    @pytest.mark.asyncio
+    async def test_show_defaults(self):
+        """/github with no user config shows global defaults."""
+        update = _make_update(text="/github")
+        config = _make_config()
+
+        with self._mock_resolve(), self._mock_db_settings():
+            await _show_github(update, 12345, config)
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "GitHub: not configured" in reply
+        assert "Notifications: this chat" in reply
+        assert "PR reviews: off (global default)" in reply
+        assert "Issue triage: off (global default)" in reply
+        assert "No repo subscriptions" in reply
+
+    # ── 2. /github with full config ───────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_show_full_config(self):
+        """/github with user config shows all fields with sources."""
+        from kai.config import UserConfig
+
+        user = UserConfig(
+            telegram_id=12345,
+            name="alice",
+            github="alice",
+            github_repos=["alice/repo1"],
+            pr_review=True,
+            issue_triage=False,
+        )
+        config = _make_config(user_configs={12345: user})
+
+        with (
+            self._mock_resolve(
+                repos=["alice/repo1"],
+                notify_chat_id=99999,
+                pr_review=True,
+                issue_triage=True,
+            ),
+            # DB has issue_triage override, pr_review from yaml
+            self._mock_db_settings({"issue_triage": "true"}),
+        ):
+            await _show_github(update=_make_update(text="/github"), chat_id=12345, config=config)
+
+        update = _make_update(text="/github")
+        with (
+            self._mock_resolve(
+                repos=["alice/repo1"],
+                notify_chat_id=99999,
+                pr_review=True,
+                issue_triage=True,
+            ),
+            self._mock_db_settings({"issue_triage": "true"}),
+        ):
+            await _show_github(update, 12345, config)
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "GitHub: alice" in reply
+        assert "Notifications: 99999" in reply
+        assert "PR reviews: on (users.yaml)" in reply
+        assert "Issue triage: on (user override)" in reply
+        assert "alice/repo1" in reply
+
+    # ── 3. /github notify <chat_id> ───────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_notify_set(self):
+        """/github notify 123456 sets notification chat."""
+        update = _make_update(text="/github notify 123456")
+        config = _make_config()
+        ctx = _make_context(config=config, args=["notify", "123456"])
+        mock_sessions = AsyncMock()
+        mock_sessions.set_setting = AsyncMock()
+        mock_sessions.delete_setting = AsyncMock()
+        mock_sessions.resolve_github_settings = AsyncMock()
+        mock_sessions._get_github_db_settings = AsyncMock(return_value={})
+
+        with patch("kai.bot.sessions", mock_sessions):
+            await handle_github(update, ctx)
+
+        mock_sessions.set_setting.assert_called_once_with("github_notify_chat:12345", "123456")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "123456" in reply
+        assert "restart" in reply.lower()
+
+    # ── 4. /github notify reset ───────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_notify_reset(self):
+        """/github notify reset clears the override."""
+        update = _make_update(text="/github notify reset")
+        config = _make_config()
+        ctx = _make_context(config=config, args=["notify", "reset"])
+        mock_sessions = AsyncMock()
+        mock_sessions.delete_setting = AsyncMock()
+        mock_sessions.resolve_github_settings = AsyncMock()
+        mock_sessions._get_github_db_settings = AsyncMock(return_value={})
+
+        with patch("kai.bot.sessions", mock_sessions):
+            await handle_github(update, ctx)
+
+        mock_sessions.delete_setting.assert_called_once_with("github_notify_chat:12345")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "reset" in reply.lower()
+
+    # ── 5. /github notify abc (invalid) ───────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_notify_invalid(self):
+        """/github notify abc is rejected (not an integer)."""
+        update = _make_update(text="/github notify abc")
+        config = _make_config()
+        ctx = _make_context(config=config, args=["notify", "abc"])
+        mock_sessions = AsyncMock()
+
+        with patch("kai.bot.sessions", mock_sessions):
+            await handle_github(update, ctx)
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "integer" in reply.lower()
+
+    # ── 6. /github reviews on ─────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_reviews_on(self):
+        """/github reviews on enables PR reviews."""
+        update = _make_update(text="/github reviews on")
+        config = _make_config()
+        ctx = _make_context(config=config, args=["reviews", "on"])
+        mock_sessions = AsyncMock()
+        mock_sessions.set_setting = AsyncMock()
+
+        with patch("kai.bot.sessions", mock_sessions):
+            await handle_github(update, ctx)
+
+        mock_sessions.set_setting.assert_called_once_with("pr_review:12345", "true")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "enabled" in reply.lower()
+
+    # ── 7. /github reviews off ────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_reviews_off(self):
+        """/github reviews off disables PR reviews."""
+        update = _make_update(text="/github reviews off")
+        config = _make_config()
+        ctx = _make_context(config=config, args=["reviews", "off"])
+        mock_sessions = AsyncMock()
+        mock_sessions.set_setting = AsyncMock()
+
+        with patch("kai.bot.sessions", mock_sessions):
+            await handle_github(update, ctx)
+
+        mock_sessions.set_setting.assert_called_once_with("pr_review:12345", "false")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "disabled" in reply.lower()
+
+    # ── 8. /github triage on ──────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_triage_on(self):
+        """/github triage on enables issue triage."""
+        update = _make_update(text="/github triage on")
+        config = _make_config()
+        ctx = _make_context(config=config, args=["triage", "on"])
+        mock_sessions = AsyncMock()
+        mock_sessions.set_setting = AsyncMock()
+
+        with patch("kai.bot.sessions", mock_sessions):
+            await handle_github(update, ctx)
+
+        mock_sessions.set_setting.assert_called_once_with("issue_triage:12345", "true")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "enabled" in reply.lower()
+
+    # ── 9. /github reviews (no value) ─────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_reviews_missing_value(self):
+        """/github reviews with no on/off shows usage."""
+        update = _make_update(text="/github reviews")
+        config = _make_config()
+        ctx = _make_context(config=config, args=["reviews"])
+        mock_sessions = AsyncMock()
+
+        with patch("kai.bot.sessions", mock_sessions):
+            await handle_github(update, ctx)
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "usage" in reply.lower()
+
+    # ── 10. /github bogus ─────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_unknown_subcommand(self):
+        """/github bogus shows error message."""
+        update = _make_update(text="/github bogus")
+        config = _make_config()
+        ctx = _make_context(config=config, args=["bogus"])
+        mock_sessions = AsyncMock()
+
+        with patch("kai.bot.sessions", mock_sessions):
+            await handle_github(update, ctx)
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "unknown subcommand" in reply.lower()
 
 
 # ── /model persistence ─────────────────────────────────────────────

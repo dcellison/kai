@@ -1943,6 +1943,177 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await _switch_workspace(update, context, resolved)
 
 
+# ── GitHub notification settings ─────────────────────────────────────
+
+
+async def _show_github(update: Update, chat_id: int, config: Config) -> None:
+    """Display the user's effective GitHub notification settings with source attribution."""
+    assert update.message is not None
+    user_config = config.get_user_config(chat_id)
+
+    # GitHub identity (from users.yaml only, not user-settable)
+    github_user = user_config.github if user_config else None
+
+    # Resolve effective settings using the same precedence as webhook routing
+    effective = await sessions.resolve_github_settings(chat_id, config)
+
+    lines = []
+    if github_user:
+        lines.append(f"GitHub: {github_user}")
+    else:
+        lines.append("GitHub: not configured")
+
+    # Notification destination
+    notify = effective["notify_chat_id"]
+    if notify and notify != chat_id:
+        lines.append(f"Notifications: {notify}")
+    else:
+        lines.append("Notifications: this chat")
+
+    # Feature toggles with source attribution. Read DB settings directly
+    # so we can tell the user where each value comes from.
+    db_settings = await sessions._get_github_db_settings(chat_id)
+
+    def _toggle_line(
+        label: str,
+        db_key: str,
+        yaml_val: bool | None,
+        effective_val: bool,
+    ) -> str:
+        """Format a toggle line with its source (DB override, yaml, or global default)."""
+        state = "on" if effective_val else "off"
+        if db_key in db_settings:
+            source = "user override"
+        elif yaml_val is not None:
+            source = "users.yaml"
+        else:
+            source = "global default"
+        return f"{label}: {state} ({source})"
+
+    yaml_pr = user_config.pr_review if user_config else None
+    yaml_triage = user_config.issue_triage if user_config else None
+
+    lines.append(
+        _toggle_line(
+            "PR reviews",
+            "pr_review",
+            yaml_pr,
+            effective["pr_review"],
+        )
+    )
+    lines.append(
+        _toggle_line(
+            "Issue triage",
+            "issue_triage",
+            yaml_triage,
+            effective["issue_triage"],
+        )
+    )
+
+    # Subscribed repos (from users.yaml only; self-service is #220)
+    repos = effective["repos"]
+    if repos:
+        lines.append("")
+        lines.append("Subscribed repos:")
+        for repo in repos:
+            lines.append(f"  {repo}")
+    else:
+        lines.append("\nNo repo subscriptions configured.")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def _handle_github_notify(
+    update: Update,
+    chat_id: int,
+    config: Config,
+    args: list[str],
+) -> None:
+    """Handle /github notify <chat_id|reset> - set or clear notification destination."""
+    assert update.message is not None
+
+    if not args:
+        await update.message.reply_text("Usage: /github notify <chat_id> or /github notify reset")
+        return
+
+    value = args[0].lower()
+
+    if value == "reset":
+        await sessions.delete_setting(f"github_notify_chat:{chat_id}")
+        await update.message.reply_text("Notification destination reset to this chat.")
+        return
+
+    # Validate chat_id is a valid integer (can be negative for groups)
+    try:
+        notify_id = int(value)
+    except ValueError:
+        await update.message.reply_text("Chat ID must be an integer.")
+        return
+
+    await sessions.set_setting(f"github_notify_chat:{chat_id}", str(notify_id))
+    # Standard notifications (push, PR opened, etc.) use this immediately.
+    # PR reviews and issue triage route through /api/send-message which
+    # validates against allowed_user_ids (populated at startup). New group
+    # chat IDs require a restart for review/triage delivery.
+    await update.message.reply_text(
+        f"GitHub notifications will go to chat {notify_id}.\n"
+        "Note: PR reviews and issue triage will use this after restart."
+    )
+
+
+async def _handle_github_toggle(
+    update: Update,
+    chat_id: int,
+    config: Config,
+    field: str,
+    args: list[str],
+) -> None:
+    """Handle /github reviews on|off and /github triage on|off."""
+    assert update.message is not None
+    label = "PR reviews" if field == "pr_review" else "Issue triage"
+
+    if not args or args[0].lower() not in ("on", "off"):
+        # Usage hint uses the subcommand name, not the internal field name
+        subcmd = "reviews" if field == "pr_review" else "triage"
+        await update.message.reply_text(f"Usage: /github {subcmd} on|off")
+        return
+
+    value = args[0].lower() == "on"
+    await sessions.set_setting(f"{field}:{chat_id}", "true" if value else "false")
+    state = "enabled" if value else "disabled"
+    await update.message.reply_text(f"{label} {state}.")
+
+
+@_require_auth
+async def handle_github(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /github - view and manage GitHub notification settings."""
+    assert update.message is not None
+    chat_id = _chat_id(update)
+    config: Config = context.bot_data["config"]
+
+    args = context.args or []
+    subcommand = args[0].lower() if args else None
+
+    # No subcommand: display current settings
+    if subcommand is None:
+        await _show_github(update, chat_id, config)
+        return
+
+    if subcommand == "notify":
+        await _handle_github_notify(update, chat_id, config, args[1:])
+        return
+
+    if subcommand == "reviews":
+        await _handle_github_toggle(update, chat_id, config, "pr_review", args[1:])
+        return
+
+    if subcommand == "triage":
+        await _handle_github_toggle(update, chat_id, config, "issue_triage", args[1:])
+        return
+
+    await update.message.reply_text("Unknown subcommand. Try /github for current settings.")
+
+
 # ── Server info and help ─────────────────────────────────────────────
 
 
@@ -2004,6 +2175,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/settings - Show your settings\n"
         "/settings <field> <value> - Change a setting\n"
         "/settings reset - Clear all overrides\n"
+        "/github - GitHub notification settings\n"
         "/models - Choose a model\n"
         "/model <name> - Switch model (persists)\n"
         "/voice - Toggle voice on/off\n"
@@ -2799,6 +2971,7 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
     app.add_handler(CommandHandler("voice", handle_voice_command))
     app.add_handler(CommandHandler("voices", handle_voices))
     app.add_handler(CommandHandler("webhooks", handle_webhooks))
+    app.add_handler(CommandHandler("github", handle_github))
     app.add_handler(CommandHandler("stop", handle_stop))
 
     # Callback query handlers for inline keyboards (pattern-matched)
