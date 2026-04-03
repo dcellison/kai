@@ -54,9 +54,11 @@ _REVIEW_MODEL = "sonnet"
 # Sonnet reviews of typical PRs cost well under $0.50.
 _REVIEW_BUDGET_USD = 1.0
 
-# Timeout for the Claude subprocess in seconds. Large diffs may take a
-# while to analyze, but anything beyond 5 minutes is likely stuck.
-_REVIEW_TIMEOUT = 300
+# Timeout for the Claude subprocess in seconds. Sonnet 4.6+ uses extended
+# thinking, which can take significantly longer on large diffs with prior
+# review context. 15 minutes accommodates thinking-heavy reviews while
+# still catching genuinely stuck processes.
+_REVIEW_TIMEOUT = 900
 
 # Header prepended to every review comment on GitHub. Distinguishes
 # automated reviews from human comments. Per design decision #11.
