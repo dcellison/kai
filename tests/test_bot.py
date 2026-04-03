@@ -1672,6 +1672,15 @@ class TestHandleWorkspaceDeny:
         assert "Usage" in reply
 
     @pytest.mark.asyncio
+    async def test_deny_relative_path_rejected(self):
+        """Relative paths are rejected with a clear message."""
+        update = _make_update()
+        ctx = _make_context(args=["deny", "relative/path"])
+        await _handle_workspace_deny(update, ctx, "deny relative/path")
+        reply = update.message.reply_text.call_args[0][0]
+        assert "absolute" in reply.lower()
+
+    @pytest.mark.asyncio
     async def test_deny_global_path(self, tmp_path):
         """Trying to deny a global ALLOWED_WORKSPACES path shows an explanation."""
         ws = tmp_path / "global-ws"

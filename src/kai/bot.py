@@ -1735,8 +1735,14 @@ async def _handle_workspace_deny(
         return
 
     raw_path = parts[1].strip()
-    # No expanduser() - same reasoning as _handle_workspace_allow:
-    # ~ resolves to the bot process's $HOME, not the requesting user's.
+
+    # Same absolute-path requirement as _handle_workspace_allow:
+    # relative paths resolve against cwd and will never match a stored
+    # entry, producing a confusing "not in your list" response.
+    if not raw_path.startswith("/"):
+        await update.message.reply_text("Path must be absolute (start with /).")
+        return
+
     resolved = Path(raw_path).resolve()
 
     # Check if this is a user-added path (in the database)
