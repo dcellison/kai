@@ -15,6 +15,11 @@ users:
     # os_user: alice          # OS user for subprocess isolation
     # home_workspace: ~/projects/main  # per-user home workspace
 
+    # workspace_base: directory for /workspace new and name resolution.
+    # /workspace <name> looks for subdirectories under this path.
+    # Falls back to WORKSPACE_BASE env var if not set.
+    # workspace_base: ~/projects
+
     # max_budget serves double duty: it is both the user's default
     # budget AND the ceiling they cannot exceed via /settings budget.
     # If alice sets /settings budget 15, she gets $15. If she tries
