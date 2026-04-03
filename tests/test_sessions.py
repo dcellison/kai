@@ -423,7 +423,9 @@ class TestBuildWorkspaceConfig:
             env={"EXISTING": "from_yaml", "SHARED": "yaml_value"},
         )
         await sessions.set_workspace_config_setting(
-            111, "/projects/kai", "env",
+            111,
+            "/projects/kai",
+            "env",
             json.dumps({"NEW_VAR": "from_db", "SHARED": "db_wins"}),
         )
         result = await sessions.build_workspace_config(yaml, Path("/projects/kai"), 111)
@@ -441,9 +443,7 @@ class TestBuildWorkspaceConfig:
             path=Path("/projects/kai"),
             system_prompt_file=Path("/etc/kai/prompts/default.txt"),
         )
-        await sessions.set_workspace_config_setting(
-            111, "/projects/kai", "prompt", "Be concise."
-        )
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "prompt", "Be concise.")
         result = await sessions.build_workspace_config(yaml, Path("/projects/kai"), 111)
         assert result is not None
         assert result.system_prompt == "Be concise."
