@@ -22,6 +22,7 @@ from kai.bot import (
     _clear_responding,
     _do_switch_workspace,
     _edit_message_safe,
+    _handle_workspace_config,
     _is_authorized,
     _is_workspace_allowed,
     _models_keyboard,
@@ -2530,3 +2531,347 @@ class TestAcquireLockOrKill:
 
         # Lock must be released after the error
         assert not lock.locked()
+
+
+# ── _handle_workspace_config ────────────────────────────────────────
+
+
+class TestHandleWorkspaceConfig:
+    """Tests for /workspace config subcommands.
+
+    Each test patches the sessions module and pool to isolate the handler
+    from the database and subprocess pool. The handler takes a "target"
+    string that simulates what handle_workspace passes after splitting
+    the user's message (e.g., "config model opus").
+    """
+
+    def _patches(self, mock_sessions, pool=None, config=None):
+        """Build the standard patch set for workspace config tests.
+
+        Returns a context manager stack. mock_sessions should be an
+        AsyncMock with the workspace config helpers pre-configured.
+        """
+        from contextlib import ExitStack
+
+        stack = ExitStack()
+        stack.enter_context(patch("kai.bot.sessions", mock_sessions))
+        return stack
+
+    def _mock_sessions(self, db_settings=None):
+        """Create a mock sessions module with workspace config helpers."""
+        mock = AsyncMock()
+        mock.get_workspace_config_settings = AsyncMock(return_value=db_settings or {})
+        mock.set_workspace_config_setting = AsyncMock()
+        mock.delete_workspace_config_setting = AsyncMock()
+        mock.delete_all_workspace_config = AsyncMock()
+        mock.build_workspace_config = AsyncMock(return_value=None)
+        return mock
+
+    # ── 1. Show config with no overrides ────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_show_config_no_overrides(self):
+        """/workspace config with no overrides shows global defaults."""
+        update = _make_update(text="/workspace config")
+        config = _make_config()
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config")
+
+        reply = update.message.reply_text.call_args[0][0]
+        # Should show model, budget, timeout with "global default" source
+        assert "sonnet" in reply
+        assert "global default" in reply
+
+    # ── 2. Set model ────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_set_model(self):
+        """/workspace config model opus sets the model."""
+        update = _make_update(text="/workspace config model opus")
+        config = _make_config()
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config model opus")
+
+        # Should persist the model setting
+        mock_sessions.set_workspace_config_setting.assert_called_once_with(
+            12345, str(pool.get_workspace(12345)), "model", "opus"
+        )
+        # Should apply config change (rebuild + change_workspace)
+        mock_sessions.build_workspace_config.assert_called_once()
+        pool.change_workspace.assert_called_once()
+        # Should confirm to the user
+        reply = update.message.reply_text.call_args[0][0]
+        assert "opus" in reply.lower()
+
+    # ── 3. Set budget with validation ───────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_set_budget(self):
+        """/workspace config budget 5 sets the budget."""
+        update = _make_update(text="/workspace config budget 5")
+        config = _make_config()
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config budget 5")
+
+        mock_sessions.set_workspace_config_setting.assert_called_once_with(
+            12345, str(pool.get_workspace(12345)), "budget", "5.0"
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        assert "$5.00" in reply
+
+    # ── 4. Reject negative budget ───────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_reject_negative_budget(self):
+        """/workspace config budget -5 is rejected."""
+        update = _make_update(text="/workspace config budget -5")
+        config = _make_config()
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config budget -5")
+
+        # Should not persist anything
+        mock_sessions.set_workspace_config_setting.assert_not_called()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "positive" in reply.lower()
+
+    # ── 5. Set timeout ──────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_set_timeout(self):
+        """/workspace config timeout 300 sets the timeout."""
+        update = _make_update(text="/workspace config timeout 300")
+        config = _make_config()
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config timeout 300")
+
+        mock_sessions.set_workspace_config_setting.assert_called_once_with(
+            12345, str(pool.get_workspace(12345)), "timeout", "300"
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        assert "300" in reply
+
+    # ── 6. Set env var ──────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_set_env_var(self):
+        """/workspace config env FOO=bar sets an env var."""
+        update = _make_update(text="/workspace config env FOO=bar")
+        config = _make_config()
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config env FOO=bar")
+
+        # Should persist the env JSON blob
+        call_args = mock_sessions.set_workspace_config_setting.call_args
+        assert call_args[0][2] == "env"
+        saved_env = json.loads(call_args[0][3])
+        assert saved_env == {"FOO": "bar"}
+        # Should apply config change
+        pool.change_workspace.assert_called_once()
+
+    # ── 7. Remove env var ───────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_remove_env_var(self):
+        """/workspace config env -FOO removes an env var."""
+        update = _make_update(text="/workspace config env -FOO")
+        config = _make_config()
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        # Pre-populate an env var so there's something to remove
+        mock_sessions = self._mock_sessions(db_settings={"env": '{"FOO": "bar"}'})
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config env -FOO")
+
+        # Should delete the env key entirely (empty dict -> delete)
+        mock_sessions.delete_workspace_config_setting.assert_called_once_with(
+            12345, str(pool.get_workspace(12345)), "env"
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Removed" in reply
+
+    # ── 8. List env vars ────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_list_env_vars(self):
+        """/workspace config env (no value) lists env var keys."""
+        update = _make_update(text="/workspace config env")
+        config = _make_config()
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions(db_settings={"env": '{"A": "1", "B": "2"}'})
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config env")
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "A" in reply
+        assert "B" in reply
+        # Should NOT apply config change (read-only operation)
+        pool.change_workspace.assert_not_called()
+
+    # ── 9. Set prompt ───────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_set_prompt(self):
+        """/workspace config prompt Hello world sets the prompt."""
+        update = _make_update(text="/workspace config prompt Hello world")
+        config = _make_config()
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config prompt Hello world")
+
+        mock_sessions.set_workspace_config_setting.assert_called_once_with(
+            12345, str(pool.get_workspace(12345)), "prompt", "Hello world"
+        )
+        pool.change_workspace.assert_called_once()
+
+    # ── 10. Clear prompt ────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_clear_prompt(self):
+        """/workspace config prompt clear clears the prompt."""
+        update = _make_update(text="/workspace config prompt clear")
+        config = _make_config()
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config prompt clear")
+
+        mock_sessions.delete_workspace_config_setting.assert_called_once_with(
+            12345, str(pool.get_workspace(12345)), "prompt"
+        )
+        pool.change_workspace.assert_called_once()
+
+    # ── 11. Reset all overrides ─────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_reset_all(self):
+        """/workspace config reset clears all overrides."""
+        update = _make_update(text="/workspace config reset")
+        config = _make_config()
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config reset")
+
+        mock_sessions.delete_all_workspace_config.assert_called_once_with(12345, str(pool.get_workspace(12345)))
+        pool.change_workspace.assert_called_once()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "global defaults" in reply.lower()
+
+    # ── 12. Reset single field ──────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_reset_single_field(self):
+        """/workspace config reset model clears a single field."""
+        update = _make_update(text="/workspace config reset model")
+        config = _make_config()
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config reset model")
+
+        mock_sessions.delete_workspace_config_setting.assert_called_once_with(
+            12345, str(pool.get_workspace(12345)), "model"
+        )
+        pool.change_workspace.assert_called_once()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "model" in reply.lower()
+
+    # ── 13. Unknown field shows error ───────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_unknown_field(self):
+        """/workspace config bogus shows error with valid field list."""
+        update = _make_update(text="/workspace config bogus")
+        config = _make_config()
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config bogus")
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "bogus" in reply
+        assert "model" in reply
+        assert "budget" in reply
+        # Should NOT apply any config change
+        pool.change_workspace.assert_not_called()
+
+    # ── Budget ceiling enforcement ──────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_budget_ceiling_from_user_config(self):
+        """Budget exceeding per-user max_budget is rejected."""
+        from kai.config import UserConfig
+
+        user = UserConfig(telegram_id=12345, name="test", max_budget=5.0)
+        config = _make_config(user_configs={12345: user})
+        update = _make_update(text="/workspace config budget 10")
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config budget 10")
+
+        # Should reject - 10 exceeds per-user ceiling of 5
+        mock_sessions.set_workspace_config_setting.assert_not_called()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "$5.00" in reply
+        assert "admin limit" in reply.lower()
+
+    # ── Invalid model rejected ──────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_invalid_model_rejected(self):
+        """An unknown model name is rejected."""
+        update = _make_update(text="/workspace config model gpt4")
+        config = _make_config()
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config model gpt4")
+
+        mock_sessions.set_workspace_config_setting.assert_not_called()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "haiku" in reply
+        assert "sonnet" in reply
+        assert "opus" in reply
