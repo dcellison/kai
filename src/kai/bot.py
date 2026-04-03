@@ -484,8 +484,10 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Funnel through _switch_model() - same path as /model and /models
         # keyboard. _switch_model() handles DB write, instance update,
         # process restart, and session clear.
-        await _switch_model(context, chat_id, value.lower())
-        await update.message.reply_text(f"Default model set to {value.lower()}. Session restarted.")
+        model_key = value.lower()
+        await _switch_model(context, chat_id, model_key)
+        display = _AVAILABLE_MODELS.get(model_key, model_key)
+        await update.message.reply_text(f"Default model set to {display}. Session restarted.")
         return
 
     # /settings budget <n>
