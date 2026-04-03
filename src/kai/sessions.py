@@ -480,13 +480,16 @@ async def get_workspace_config_settings(chat_id: int, workspace_path: str) -> di
     "budget": "20.0"}). Values are strings; callers parse as needed.
     Config is per-user-per-workspace: each user has independent overrides.
     """
+    # Use SUBSTR for exact prefix matching instead of LIKE, which
+    # treats underscores in filesystem paths as single-char wildcards.
     prefix = f"ws_config:{chat_id}:{workspace_path}:"
+    prefix_len = len(prefix)
     async with _get_db().execute(
-        "SELECT key, value FROM settings WHERE key LIKE ?",
-        (prefix + "%",),
+        "SELECT key, value FROM settings WHERE SUBSTR(key, 1, ?) = ?",
+        (prefix_len, prefix),
     ) as cursor:
         rows = await cursor.fetchall()
-        return {row["key"].removeprefix(prefix): row["value"] for row in rows}
+        return {row["key"][prefix_len:]: row["value"] for row in rows}
 
 
 async def set_workspace_config_setting(chat_id: int, workspace_path: str, field: str, value: str) -> None:
@@ -503,10 +506,12 @@ async def delete_workspace_config_setting(chat_id: int, workspace_path: str, fie
 
 async def delete_all_workspace_config(chat_id: int, workspace_path: str) -> None:
     """Remove all config overrides for this user's workspace."""
+    # Use SUBSTR for exact prefix matching instead of LIKE, which
+    # treats underscores in filesystem paths as single-char wildcards.
     prefix = f"ws_config:{chat_id}:{workspace_path}:"
     await _get_db().execute(
-        "DELETE FROM settings WHERE key LIKE ?",
-        (prefix + "%",),
+        "DELETE FROM settings WHERE SUBSTR(key, 1, ?) = ?",
+        (len(prefix), prefix),
     )
     await _get_db().commit()
 
@@ -562,7 +567,11 @@ async def build_workspace_config(
         # DB env vars merge on top of YAML env vars (not replace).
         # This lets admins set baseline env vars in YAML and users
         # add their own without losing the baseline.
-        db_env = json.loads(db_settings["env"])
+        try:
+            db_env = json.loads(db_settings["env"])
+        except json.JSONDecodeError:
+            log.warning("Corrupt env JSON in DB for chat %d workspace %s", chat_id, workspace_path)
+            db_env = {}
         if env is None:
             env = db_env
         else:

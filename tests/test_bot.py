@@ -2545,7 +2545,7 @@ class TestHandleWorkspaceConfig:
     the user's message (e.g., "config model opus").
     """
 
-    def _patches(self, mock_sessions, pool=None, config=None):
+    def _patches(self, mock_sessions):
         """Build the standard patch set for workspace config tests.
 
         Returns a context manager stack. mock_sessions should be an

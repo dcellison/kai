@@ -931,7 +931,7 @@ async def _handle_workspace_config(
         if value:
             await sessions.delete_workspace_config_setting(chat_id, workspace_str, value)
             await _apply_config_change(context, chat_id, workspace, config)
-            await update.message.reply_text(f"Cleared {value} override. Using global default.")
+            await update.message.reply_text(f"{value} reset to default.")
         else:
             await sessions.delete_all_workspace_config(chat_id, workspace_str)
             await _apply_config_change(context, chat_id, workspace, config)
@@ -1067,8 +1067,11 @@ async def _show_workspace_config(
     if yaml_config and yaml_config.env:
         env_keys.extend(yaml_config.env.keys())
     if "env" in db_settings:
-        db_env = json.loads(db_settings["env"])
-        env_keys.extend(k for k in db_env if k not in env_keys)
+        try:
+            db_env = json.loads(db_settings["env"])
+            env_keys.extend(k for k in db_env if k not in env_keys)
+        except json.JSONDecodeError:
+            lines.append("  Env vars: (corrupted - reset with /workspace config reset env)")
     if env_keys:
         lines.append(f"  Env vars: {', '.join(sorted(env_keys))}")
 
@@ -1099,7 +1102,11 @@ async def _handle_workspace_env(
     settings = await sessions.get_workspace_config_settings(chat_id, workspace_str)
     env: dict[str, str] = {}
     if "env" in settings:
-        env = json.loads(settings["env"])
+        try:
+            env = json.loads(settings["env"])
+        except json.JSONDecodeError:
+            # Corrupted entry; start fresh
+            env = {}
 
     # /workspace config env - list current vars
     if not value:
@@ -1157,6 +1164,14 @@ async def _handle_workspace_prompt(
     # handles caption-based dispatch, so the handler fires, but
     # context.args is populated from the caption.
     if update.message.document:
+        # Reject oversized files before downloading into memory.
+        # Telegram allows up to 20 MB; 100 KB is generous for a
+        # system prompt that will be stored in SQLite.
+        max_prompt_bytes = 100 * 1024
+        file_size = update.message.document.file_size
+        if file_size and file_size > max_prompt_bytes:
+            await update.message.reply_text(f"File too large ({file_size // 1024}KB). Max prompt file size is 100KB.")
+            return False
         file = await update.message.document.get_file()
         content = (await file.download_as_bytearray()).decode("utf-8")
         await sessions.set_workspace_config_setting(chat_id, workspace_str, "prompt", content.strip())
@@ -1395,8 +1410,11 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _switch_workspace(update, context, resolved)
         return
 
-    # "config" keyword: view or modify workspace settings
-    if target.lower().startswith("config"):
+    # "config" keyword: view or modify workspace settings.
+    # Exact word boundary check to avoid collisions with workspace
+    # names starting with "config" (e.g., "configs", "config-backup").
+    target_lower = target.lower()
+    if target_lower == "config" or target_lower.startswith("config "):
         await _handle_workspace_config(update, context, target)
         return
 
