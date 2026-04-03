@@ -1082,7 +1082,7 @@ async def _show_workspace_config(
             env_corrupted = True
     if env_corrupted:
         lines.append("  Env vars: (DB override corrupted - reset to clear)")
-    if env_keys:
+    elif env_keys:
         lines.append(f"  Env vars: {', '.join(sorted(env_keys))}")
 
     # System prompt
