@@ -40,6 +40,10 @@ class TestUserConfig:
         assert uc.timeout is None
         assert uc.context_window is None
         assert uc.workspace_base is None
+        assert uc.github_repos == []
+        assert uc.github_notify_chat_id is None
+        assert uc.pr_review is None
+        assert uc.issue_triage is None
 
     def test_all_fields(self):
         """Full config with every field populated."""
@@ -55,6 +59,10 @@ class TestUserConfig:
             timeout=300,
             context_window=200_000,
             workspace_base=Path("/home/alice/projects"),
+            github_repos=["alice/repo-a", "alice/repo-b"],
+            github_notify_chat_id=-100123456789,
+            pr_review=True,
+            issue_triage=False,
         )
         assert uc.role == "admin"
         assert uc.github == "alice-dev"
@@ -64,6 +72,10 @@ class TestUserConfig:
         assert uc.timeout == 300
         assert uc.context_window == 200_000
         assert uc.workspace_base == Path("/home/alice/projects")
+        assert uc.github_repos == ["alice/repo-a", "alice/repo-b"]
+        assert uc.github_notify_chat_id == -100123456789
+        assert uc.pr_review is True
+        assert uc.issue_triage is False
 
     def test_frozen(self):
         """UserConfig is immutable."""
@@ -565,6 +577,10 @@ class TestLoadUserConfigs:
         assert configs[111].timeout is None
         assert configs[111].context_window is None
         assert configs[111].workspace_base is None
+        assert configs[111].github_repos == []
+        assert configs[111].github_notify_chat_id is None
+        assert configs[111].pr_review is None
+        assert configs[111].issue_triage is None
 
     # ── workspace_base field ──
 
@@ -628,6 +644,254 @@ class TestLoadUserConfigs:
             configs = _load_user_configs()
         assert configs is not None
         assert configs[111].workspace_base is None
+
+    # ── github_repos field ──
+
+    def test_github_repos_parsed(self, tmp_path):
+        """Valid github_repos list is stored as list of strings."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                github_repos:
+                  - alice/repo-a
+                  - alice/repo-b
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].github_repos == ["alice/repo-a", "alice/repo-b"]
+
+    def test_github_repos_invalid_format(self, tmp_path, caplog):
+        """Invalid repo format (no slash) is skipped with warning."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                github_repos:
+                  - valid/repo
+                  - no-slash
+                  - too/many/slashes
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].github_repos == ["valid/repo"]
+        assert "no-slash" in caplog.text
+        assert "too/many/slashes" in caplog.text
+
+    def test_github_repos_not_list(self, tmp_path, caplog):
+        """Non-list github_repos is ignored with warning."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                github_repos: alice/repo
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].github_repos == []
+        assert "must be a list" in caplog.text
+
+    def test_github_repos_default(self, tmp_path):
+        """Omitted github_repos defaults to empty list."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].github_repos == []
+
+    # ── github_notify_chat_id field ──
+
+    def test_github_notify_chat_id_parsed(self, tmp_path):
+        """Valid github_notify_chat_id is stored as int."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                github_notify_chat_id: 999888777
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].github_notify_chat_id == 999888777
+
+    def test_github_notify_chat_id_negative(self, tmp_path):
+        """Negative chat IDs (group chats) are valid."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                github_notify_chat_id: -100123456789
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].github_notify_chat_id == -100123456789
+
+    def test_github_notify_chat_id_invalid(self, tmp_path, caplog):
+        """Invalid github_notify_chat_id warns and uses None."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                github_notify_chat_id: not-a-number
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].github_notify_chat_id is None
+        assert "invalid github_notify_chat_id" in caplog.text
+
+    # ── pr_review / issue_triage fields ──
+
+    def test_pr_review_bool(self, tmp_path):
+        """pr_review True/False parsed from yaml."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                pr_review: true
+              - telegram_id: 222
+                name: bob
+                pr_review: false
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].pr_review is True
+        assert configs[222].pr_review is False
+
+    def test_pr_review_none_when_omitted(self, tmp_path):
+        """Omitted pr_review defaults to None (use global)."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].pr_review is None
+
+    def test_issue_triage_bool(self, tmp_path):
+        """issue_triage True/False parsed from yaml."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                issue_triage: true
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].issue_triage is True
+
+    def test_pr_review_non_bool_warns(self, tmp_path, caplog):
+        """Non-boolean pr_review warns and uses None."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                pr_review: "yes"
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].pr_review is None
+        assert "pr_review" in caplog.text
+        assert "must be true or false" in caplog.text
+
+    def test_issue_triage_non_bool_warns(self, tmp_path, caplog):
+        """Non-boolean issue_triage warns and uses None."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                issue_triage: 1
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].issue_triage is None
+        assert "issue_triage" in caplog.text
 
 
 # ── Config convenience methods ──────────────────────────────────────

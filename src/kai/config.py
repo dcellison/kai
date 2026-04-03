@@ -160,6 +160,13 @@ class UserConfig:
     timeout: int | None = None
     context_window: int | None = None
     workspace_base: Path | None = None
+    # GitHub notification routing fields. github_repos controls which
+    # repos route webhook events to this user. pr_review and issue_triage
+    # are tri-state: None = use global default, True/False = admin override.
+    github_repos: list[str] = field(default_factory=list)
+    github_notify_chat_id: int | None = None
+    pr_review: bool | None = None
+    issue_triage: bool | None = None
 
 
 # ── Config dataclass ─────────────────────────────────────────────────
@@ -276,6 +283,11 @@ class Config:
     # Issue triage agent: automatically triage new issues when webhooks fire.
     # Disabled by default so existing users are not surprised by automatic triage.
     issue_triage_enabled: bool = False
+
+    # Global notification chat override. When set, acts as fallback for
+    # users without a per-user github_notify_chat_id. Parsed from
+    # GITHUB_NOTIFY_CHAT_ID env var.
+    github_notify_chat_id: int | None = None
 
     # File retention: delete uploaded files older than this many days.
     # 0 = no cleanup (default). Cleanup runs once every 24 hours.
@@ -796,6 +808,68 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
                     )
                     user_workspace_base = None
 
+        # Parse optional github_repos list (list of "owner/repo" strings).
+        # Validate format but don't verify repo existence (that would
+        # require network calls during config loading).
+        raw_repos = entry.get("github_repos", [])
+        github_repos: list[str] = []
+        if isinstance(raw_repos, list):
+            for repo_entry in raw_repos:
+                repo_str = str(repo_entry).strip()
+                if "/" not in repo_str or repo_str.count("/") != 1:
+                    log.warning(
+                        "users.yaml: invalid github_repos entry for %s: %s (expected owner/repo format)",
+                        name,
+                        repo_str,
+                    )
+                    continue
+                github_repos.append(repo_str)
+        else:
+            log.warning(
+                "users.yaml: github_repos for %s must be a list (ignoring)",
+                name,
+            )
+
+        # Parse optional github_notify_chat_id (integer, can be negative
+        # for group chats). Follows the same pattern as telegram_id validation.
+        github_notify_chat_id: int | None = None
+        raw_notify = entry.get("github_notify_chat_id")
+        if raw_notify is not None:
+            try:
+                github_notify_chat_id = int(raw_notify)
+            except (ValueError, TypeError):
+                log.warning(
+                    "users.yaml: invalid github_notify_chat_id for %s: %s",
+                    name,
+                    raw_notify,
+                )
+
+        # Parse optional pr_review and issue_triage booleans.
+        # None means "use global default". Explicit true/false overrides.
+        pr_review: bool | None = None
+        raw_pr = entry.get("pr_review")
+        if raw_pr is not None:
+            if isinstance(raw_pr, bool):
+                pr_review = raw_pr
+            else:
+                log.warning(
+                    "users.yaml: pr_review for %s must be true or false: %s",
+                    name,
+                    raw_pr,
+                )
+
+        issue_triage: bool | None = None
+        raw_triage = entry.get("issue_triage")
+        if raw_triage is not None:
+            if isinstance(raw_triage, bool):
+                issue_triage = raw_triage
+            else:
+                log.warning(
+                    "users.yaml: issue_triage for %s must be true or false: %s",
+                    name,
+                    raw_triage,
+                )
+
         configs[telegram_id] = UserConfig(
             telegram_id=telegram_id,
             name=name,
@@ -808,6 +882,10 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
             timeout=user_timeout,
             context_window=user_context_window,
             workspace_base=user_workspace_base,
+            github_repos=github_repos,
+            github_notify_chat_id=github_notify_chat_id,
+            pr_review=pr_review,
+            issue_triage=issue_triage,
         )
 
     # Warn if no admin is defined - external webhooks will route to
@@ -980,6 +1058,19 @@ def load_config() -> Config:
     # Issue triage agent config
     issue_triage_enabled = os.environ.get("ISSUE_TRIAGE_ENABLED", "").lower() in ("1", "true", "yes")
 
+    # Global GitHub notification chat override. When set, acts as fallback
+    # for users without a per-user github_notify_chat_id in users.yaml or DB.
+    github_notify_raw = os.environ.get("GITHUB_NOTIFY_CHAT_ID", "")
+    github_notify_chat_id: int | None = None
+    if github_notify_raw:
+        try:
+            github_notify_chat_id = int(github_notify_raw)
+        except ValueError:
+            log.warning(
+                "Invalid GITHUB_NOTIFY_CHAT_ID: %s (ignoring)",
+                github_notify_raw,
+            )
+
     try:
         totp_session_minutes = int(os.environ.get("TOTP_SESSION_MINUTES", "30"))
     except ValueError:
@@ -1069,6 +1160,7 @@ def load_config() -> Config:
         github_repo=os.getenv("GITHUB_REPO", ""),
         spec_dir=os.getenv("SPEC_DIR", "specs"),
         issue_triage_enabled=issue_triage_enabled,
+        github_notify_chat_id=github_notify_chat_id,
         file_retention_days=file_retention_days,
         user_configs=user_configs,
         totp_session_minutes=totp_session_minutes,

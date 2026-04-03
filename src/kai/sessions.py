@@ -929,6 +929,84 @@ async def resolve_workspace_access(chat_id: int, config: Config) -> tuple[Path |
     return base, combined
 
 
+# ── GitHub settings resolution ──────────────────────────────────────
+
+
+async def _get_github_db_settings(chat_id: int) -> dict[str, str]:
+    """Read all GitHub-related DB overrides for a user.
+
+    Returns a dict of key->value for settings that exist.
+    Keys: "pr_review", "issue_triage", "github_notify_chat".
+    """
+    result: dict[str, str] = {}
+    for key in ("pr_review", "issue_triage", "github_notify_chat"):
+        val = await get_setting(f"{key}:{chat_id}")
+        if val is not None:
+            result[key] = val
+    return result
+
+
+class GitHubSettings(TypedDict):
+    """Resolved per-user GitHub notification settings."""
+
+    repos: list[str]
+    notify_chat_id: int
+    pr_review: bool
+    issue_triage: bool
+
+
+async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSettings:
+    """
+    Resolve per-user GitHub settings by layering DB overrides on top
+    of users.yaml and env var defaults.
+
+    Precedence (highest to lowest):
+    1. Database (user-set via /github commands)
+    2. users.yaml (admin baseline per user)
+    3. Env var (global defaults)
+    4. Hardcoded defaults
+    """
+    user_config = config.get_user_config(chat_id)
+    db = await _get_github_db_settings(chat_id)
+
+    # Repos: users.yaml only (DB-managed repos are #220)
+    repos = user_config.github_repos if user_config else []
+
+    # Notification destination: DB > yaml > env > telegram_id
+    if "github_notify_chat" in db:
+        notify = int(db["github_notify_chat"])
+    elif user_config and user_config.github_notify_chat_id is not None:
+        notify = user_config.github_notify_chat_id
+    else:
+        # Fall back to the global env var. If that is also unset,
+        # use the user's own telegram_id (notifications go to DM).
+        global_notify = config.github_notify_chat_id
+        notify = global_notify if global_notify else chat_id
+
+    # PR review: DB > yaml > env > False
+    if "pr_review" in db:
+        pr_review = db["pr_review"] == "true"
+    elif user_config and user_config.pr_review is not None:
+        pr_review = user_config.pr_review
+    else:
+        pr_review = config.pr_review_enabled
+
+    # Issue triage: DB > yaml > env > False
+    if "issue_triage" in db:
+        issue_triage = db["issue_triage"] == "true"
+    elif user_config and user_config.issue_triage is not None:
+        issue_triage = user_config.issue_triage
+    else:
+        issue_triage = config.issue_triage_enabled
+
+    return {
+        "repos": repos,
+        "notify_chat_id": notify,
+        "pr_review": pr_review,
+        "issue_triage": issue_triage,
+    }
+
+
 # ── Lifecycle ────────────────────────────────────────────────────────
 
 

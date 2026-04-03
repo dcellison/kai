@@ -32,6 +32,7 @@ _CONFIG_ENV_VARS = [
     "GITHUB_REPO",
     "SPEC_DIR",
     "ISSUE_TRIAGE_ENABLED",
+    "GITHUB_NOTIFY_CHAT_ID",
     "CLAUDE_MAX_CONTEXT_WINDOW",
     "CLAUDE_AUTOCOMPACT_PCT",
     "KAI_DATA_DIR",
@@ -572,6 +573,39 @@ class TestIssueTriageConfig:
         monkeypatch.setenv("ISSUE_TRIAGE_ENABLED", "true")
         config = load_config()
         assert config.issue_triage_enabled is True
+
+
+# ── GITHUB_NOTIFY_CHAT_ID config ───────────────────────────────────
+
+
+class TestGitHubNotifyChatIdConfig:
+    def test_default_none(self, monkeypatch):
+        """Unset GITHUB_NOTIFY_CHAT_ID defaults to None."""
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.github_notify_chat_id is None
+
+    def test_valid_positive(self, monkeypatch):
+        """Positive chat ID is parsed correctly."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("GITHUB_NOTIFY_CHAT_ID", "123456789")
+        config = load_config()
+        assert config.github_notify_chat_id == 123456789
+
+    def test_valid_negative(self, monkeypatch):
+        """Negative chat ID (group chat) is parsed correctly."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("GITHUB_NOTIFY_CHAT_ID", "-100123456789")
+        config = load_config()
+        assert config.github_notify_chat_id == -100123456789
+
+    def test_invalid_warns(self, monkeypatch, caplog):
+        """Non-numeric value warns and uses None."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("GITHUB_NOTIFY_CHAT_ID", "not-a-number")
+        config = load_config()
+        assert config.github_notify_chat_id is None
+        assert "invalid github_notify_chat_id" in caplog.text.lower()
 
 
 # ── resolve_claude_user() ────────────────────────────────────────────

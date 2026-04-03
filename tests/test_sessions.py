@@ -841,6 +841,173 @@ class TestResolveWorkspaceAccess:
         assert allowed[1] == global_path.resolve()
 
 
+# ── resolve_github_settings ───────────────────────────────────────
+
+
+class TestResolveGitHubSettings:
+    """Tests for per-user GitHub notification settings resolution."""
+
+    def _make_config(self, user_configs=None, **kwargs):
+        """Build a minimal Config with overridable defaults."""
+        from kai.config import Config
+
+        defaults = {
+            "telegram_bot_token": "test",
+            "allowed_user_ids": {111},
+            "pr_review_enabled": False,
+            "issue_triage_enabled": False,
+        }
+        defaults.update(kwargs)
+        if user_configs is not None:
+            defaults["user_configs"] = user_configs
+        return Config(**defaults)
+
+    async def test_no_config_returns_global_defaults(self, db):
+        """Without user config or DB overrides, returns global defaults."""
+        config = self._make_config()
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["repos"] == []
+        assert result["notify_chat_id"] == 111  # falls back to telegram_id
+        assert result["pr_review"] is False
+        assert result["issue_triage"] is False
+
+    async def test_yaml_overrides_globals(self, db):
+        """users.yaml values override global defaults."""
+        from kai.config import UserConfig
+
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            github_repos=["alice/repo-a"],
+            github_notify_chat_id=-100999,
+            pr_review=True,
+            issue_triage=True,
+        )
+        config = self._make_config(user_configs={111: uc})
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["repos"] == ["alice/repo-a"]
+        assert result["notify_chat_id"] == -100999
+        assert result["pr_review"] is True
+        assert result["issue_triage"] is True
+
+    async def test_db_overrides_yaml(self, db):
+        """DB settings override users.yaml values."""
+        from kai.config import UserConfig
+
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            pr_review=True,
+            issue_triage=True,
+            github_notify_chat_id=-100999,
+        )
+        config = self._make_config(user_configs={111: uc})
+
+        # Set DB overrides that flip the yaml values
+        await sessions.set_setting("pr_review:111", "false")
+        await sessions.set_setting("issue_triage:111", "false")
+        await sessions.set_setting("github_notify_chat:111", "-200888")
+
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["pr_review"] is False
+        assert result["issue_triage"] is False
+        assert result["notify_chat_id"] == -200888
+
+    async def test_db_overrides_env(self, db):
+        """DB settings override env var global defaults."""
+        config = self._make_config(
+            pr_review_enabled=True,
+            issue_triage_enabled=True,
+        )
+        await sessions.set_setting("pr_review:111", "false")
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["pr_review"] is False
+        # issue_triage not in DB, falls through to env
+        assert result["issue_triage"] is True
+
+    async def test_notify_fallback_chain(self, db):
+        """Notification destination: DB > yaml > env > telegram_id."""
+        from kai.config import UserConfig
+
+        # Level 4: no config at all - falls back to telegram_id
+        config = self._make_config()
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["notify_chat_id"] == 111
+
+        # Level 3: global env var set
+        config = self._make_config(github_notify_chat_id=-300)
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["notify_chat_id"] == -300
+
+        # Level 2: yaml set (overrides env)
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            github_notify_chat_id=-200,
+        )
+        config = self._make_config(
+            user_configs={111: uc},
+            github_notify_chat_id=-300,
+        )
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["notify_chat_id"] == -200
+
+        # Level 1: DB set (overrides yaml)
+        await sessions.set_setting("github_notify_chat:111", "-100")
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["notify_chat_id"] == -100
+
+    async def test_partial_overrides(self, db):
+        """Some fields from DB, some from yaml, some from globals."""
+        from kai.config import UserConfig
+
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            pr_review=True,
+            # issue_triage omitted (None) - falls to global
+        )
+        config = self._make_config(
+            user_configs={111: uc},
+            issue_triage_enabled=True,
+        )
+        # Override only pr_review in DB
+        await sessions.set_setting("pr_review:111", "false")
+
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["pr_review"] is False  # DB override
+        assert result["issue_triage"] is True  # global default
+
+    async def test_pr_review_none_uses_global(self, db):
+        """yaml pr_review=None falls through to global env var."""
+        from kai.config import UserConfig
+
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            # pr_review not set (None)
+        )
+        config = self._make_config(
+            user_configs={111: uc},
+            pr_review_enabled=True,
+        )
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["pr_review"] is True
+
+    async def test_repos_from_yaml_only(self, db):
+        """Repos come from users.yaml, not DB (DB repos are #220)."""
+        from kai.config import UserConfig
+
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            github_repos=["alice/repo-a", "alice/repo-b"],
+        )
+        config = self._make_config(user_configs={111: uc})
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["repos"] == ["alice/repo-a", "alice/repo-b"]
+
+
 # ── Workspace history migration ─────────────────────────────────────
 
 
