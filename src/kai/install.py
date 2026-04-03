@@ -38,7 +38,7 @@ from pathlib import Path
 
 import yaml
 
-from kai.config import PROJECT_ROOT, VALID_MODELS
+from kai.config import _MAX_CONTEXT_CEILING, PROJECT_ROOT, VALID_MODELS
 
 # Config file written by `config`, read by `apply`.
 # Anchored to PROJECT_ROOT so it resolves correctly regardless of CWD.
@@ -443,11 +443,11 @@ def _cmd_config() -> None:
         )
         try:
             val = int(max_context_window)
-            if 0 <= val <= 1_000_000:
+            if 0 <= val <= _MAX_CONTEXT_CEILING:
                 break
         except ValueError:
             pass
-        print("  Must be 0-1000000 (0 = use default).")
+        print(f"  Must be 0-{_MAX_CONTEXT_CEILING} (0 = use default).")
 
     # Autocompact threshold controls when Claude automatically compresses
     # conversation history. Lower values compact sooner, reducing token

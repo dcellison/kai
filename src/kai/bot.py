@@ -53,7 +53,7 @@ from telegram.ext import (
 )
 
 from kai import services, sessions, webhook
-from kai.config import DATA_DIR, VALID_MODELS, Config, WorkspaceConfig
+from kai.config import _MAX_CONTEXT_CEILING, DATA_DIR, VALID_MODELS, Config, WorkspaceConfig
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
 from kai.pool import SubprocessPool
@@ -564,8 +564,8 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if ctx != 0 and ctx < 50000:
             await update.message.reply_text("Context window must be at least 50000 tokens (or 0 for default).")
             return
-        if ctx > 1000000:
-            await update.message.reply_text("Context window cannot exceed 1000000 tokens.")
+        if ctx > _MAX_CONTEXT_CEILING:
+            await update.message.reply_text(f"Context window cannot exceed {_MAX_CONTEXT_CEILING} tokens.")
             return
         await sessions.set_user_setting(chat_id, "context_window", str(ctx))
         # Context window is a CLI flag baked in at process startup
@@ -627,23 +627,26 @@ async def _show_settings(update: Update, chat_id: int, config: Config) -> None:
     # special display semantics ("default" instead of "0 tokens") and
     # resolve_user_defaults() doesn't expose source attribution strings.
     yaml_ctx = user_config.context_window if user_config else None
+    ctx_from_db = False
     try:
-        ctx_val = (
-            int(db_settings["context_window"])
-            if "context_window" in db_settings
-            else yaml_ctx
-            if yaml_ctx is not None
-            else config.claude_max_context_window
-        )
+        if "context_window" in db_settings:
+            ctx_val = int(db_settings["context_window"])
+            ctx_from_db = True
+        elif yaml_ctx is not None:
+            ctx_val = yaml_ctx
+        else:
+            ctx_val = config.claude_max_context_window
     except (ValueError, TypeError):
         # Corrupt DB value - fall through to yaml/global
         ctx_val = yaml_ctx if yaml_ctx is not None else config.claude_max_context_window
     # Source attribution. When the user explicitly sets context to 0
     # (meaning "use the Claude Code default"), show "global default"
     # instead of "user override" - the intent was to revert, not override.
-    if "context_window" in db_settings and ctx_val > 0:
+    # ctx_from_db is False after a corrupt DB parse, so attribution stays
+    # correct on fallback (unlike checking "context_window" in db_settings).
+    if ctx_from_db and ctx_val > 0:
         ctx_src = "user override"
-    elif "context_window" not in db_settings and yaml_ctx is not None:
+    elif not ctx_from_db and yaml_ctx is not None:
         ctx_src = "users.yaml"
     else:
         ctx_src = "global default"
