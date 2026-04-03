@@ -658,6 +658,189 @@ class TestWorkspaceHistory:
         assert len(history) == 3
 
 
+# ── Allowed workspaces ──────────────────────────────────────────────
+
+
+class TestAllowedWorkspaces:
+    """Tests for per-user allowed workspace CRUD."""
+
+    async def test_add_and_retrieve(self, db):
+        """Add a workspace and retrieve it."""
+        await sessions.add_allowed_workspace(111, "/projects/repo-a")
+        result = await sessions.get_allowed_workspaces(111)
+        assert len(result) == 1
+        assert result[0] == Path("/projects/repo-a")
+
+    async def test_add_duplicate_ignored(self, db):
+        """INSERT OR IGNORE prevents duplicate entries."""
+        await sessions.add_allowed_workspace(111, "/projects/repo-a")
+        await sessions.add_allowed_workspace(111, "/projects/repo-a")
+        result = await sessions.get_allowed_workspaces(111)
+        assert len(result) == 1
+
+    async def test_remove_existing(self, db):
+        """Remove returns True and deletes the entry."""
+        await sessions.add_allowed_workspace(111, "/projects/repo-a")
+        removed = await sessions.remove_allowed_workspace(111, "/projects/repo-a")
+        assert removed is True
+        result = await sessions.get_allowed_workspaces(111)
+        assert len(result) == 0
+
+    async def test_remove_not_found(self, db):
+        """Remove returns False when path is not in the user's list."""
+        removed = await sessions.remove_allowed_workspace(111, "/nonexistent")
+        assert removed is False
+
+    async def test_get_empty_list(self, db):
+        """Returns empty list for a user with no allowed workspaces."""
+        result = await sessions.get_allowed_workspaces(999)
+        assert result == []
+
+    async def test_insertion_order_preserved(self, db):
+        """Paths are returned in insertion order (ORDER BY rowid)."""
+        await sessions.add_allowed_workspace(111, "/projects/b")
+        await sessions.add_allowed_workspace(111, "/projects/a")
+        await sessions.add_allowed_workspace(111, "/projects/c")
+        result = await sessions.get_allowed_workspaces(111)
+        assert [str(p) for p in result] == [
+            "/projects/b",
+            "/projects/a",
+            "/projects/c",
+        ]
+
+    async def test_user_isolation(self, db):
+        """User A's entries are not visible to user B."""
+        await sessions.add_allowed_workspace(111, "/projects/alice")
+        await sessions.add_allowed_workspace(222, "/projects/bob")
+        alice = await sessions.get_allowed_workspaces(111)
+        bob = await sessions.get_allowed_workspaces(222)
+        assert len(alice) == 1
+        assert str(alice[0]) == "/projects/alice"
+        assert len(bob) == 1
+        assert str(bob[0]) == "/projects/bob"
+
+
+# ── resolve_workspace_access ────────────────────────────────────────
+
+
+class TestResolveWorkspaceAccess:
+    """Tests for per-user workspace_base and allowed_workspaces resolution."""
+
+    def _make_config(self, user_configs=None, **kwargs):
+        """Build a minimal Config with overridable defaults."""
+        from kai.config import Config
+
+        defaults = {
+            "telegram_bot_token": "test",
+            "allowed_user_ids": {111},
+        }
+        defaults.update(kwargs)
+        if user_configs is not None:
+            defaults["user_configs"] = user_configs
+        return Config(**defaults)
+
+    async def test_no_user_config_falls_back_to_global(self, db, tmp_path):
+        """Without users.yaml, uses global workspace_base."""
+        ws_base = tmp_path / "projects"
+        ws_base.mkdir()
+        config = self._make_config(workspace_base=ws_base)
+        base, allowed = await sessions.resolve_workspace_access(111, config)
+        assert base == ws_base
+        assert allowed == []
+
+    async def test_user_workspace_base_wins(self, db, tmp_path):
+        """users.yaml workspace_base overrides global."""
+        from kai.config import UserConfig
+
+        global_base = tmp_path / "global"
+        global_base.mkdir()
+        user_base = tmp_path / "alice"
+        user_base.mkdir()
+
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            workspace_base=user_base,
+        )
+        config = self._make_config(
+            user_configs={111: uc},
+            workspace_base=global_base,
+        )
+        base, _allowed = await sessions.resolve_workspace_access(111, config)
+        assert base == user_base
+
+    async def test_no_workspace_base_returns_none(self, db):
+        """Returns None when neither user nor global base is set."""
+        config = self._make_config()
+        base, _allowed = await sessions.resolve_workspace_access(111, config)
+        assert base is None
+
+    async def test_allowed_union_db_and_global(self, db, tmp_path):
+        """Effective list is the union of DB entries and global config."""
+        db_path = tmp_path / "db-repo"
+        db_path.mkdir()
+        global_path = tmp_path / "global-repo"
+        global_path.mkdir()
+
+        await sessions.add_allowed_workspace(111, str(db_path.resolve()))
+        config = self._make_config(
+            allowed_workspaces=[global_path.resolve()],
+        )
+        _base, allowed = await sessions.resolve_workspace_access(111, config)
+        assert len(allowed) == 2
+        assert db_path.resolve() in allowed
+        assert global_path.resolve() in allowed
+
+    async def test_allowed_db_only(self, db, tmp_path):
+        """DB entries work without any global config."""
+        db_path = tmp_path / "repo"
+        db_path.mkdir()
+        await sessions.add_allowed_workspace(111, str(db_path.resolve()))
+        config = self._make_config()
+        _base, allowed = await sessions.resolve_workspace_access(111, config)
+        assert len(allowed) == 1
+        assert allowed[0] == db_path.resolve()
+
+    async def test_allowed_global_only(self, db, tmp_path):
+        """Global entries work when user has no DB entries."""
+        global_path = tmp_path / "repo"
+        global_path.mkdir()
+        config = self._make_config(
+            allowed_workspaces=[global_path.resolve()],
+        )
+        _base, allowed = await sessions.resolve_workspace_access(111, config)
+        assert len(allowed) == 1
+        assert allowed[0] == global_path.resolve()
+
+    async def test_allowed_dedup(self, db, tmp_path):
+        """Same path in DB and global is counted once."""
+        shared = tmp_path / "repo"
+        shared.mkdir()
+        resolved = shared.resolve()
+
+        await sessions.add_allowed_workspace(111, str(resolved))
+        config = self._make_config(
+            allowed_workspaces=[resolved],
+        )
+        _base, allowed = await sessions.resolve_workspace_access(111, config)
+        assert len(allowed) == 1
+
+    async def test_db_entries_appear_first(self, db, tmp_path):
+        """DB entries come before global entries in the combined list."""
+        db_path = tmp_path / "db-repo"
+        db_path.mkdir()
+        global_path = tmp_path / "global-repo"
+        global_path.mkdir()
+
+        await sessions.add_allowed_workspace(111, str(db_path.resolve()))
+        config = self._make_config(
+            allowed_workspaces=[global_path.resolve()],
+        )
+        _base, allowed = await sessions.resolve_workspace_access(111, config)
+        assert allowed[0] == db_path.resolve()
+        assert allowed[1] == global_path.resolve()
+
+
 # ── Workspace history migration ─────────────────────────────────────
 
 

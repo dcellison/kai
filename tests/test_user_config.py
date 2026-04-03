@@ -39,6 +39,7 @@ class TestUserConfig:
         assert uc.model is None
         assert uc.timeout is None
         assert uc.context_window is None
+        assert uc.workspace_base is None
 
     def test_all_fields(self):
         """Full config with every field populated."""
@@ -53,6 +54,7 @@ class TestUserConfig:
             model="opus",
             timeout=300,
             context_window=200_000,
+            workspace_base=Path("/home/alice/projects"),
         )
         assert uc.role == "admin"
         assert uc.github == "alice-dev"
@@ -61,6 +63,7 @@ class TestUserConfig:
         assert uc.model == "opus"
         assert uc.timeout == 300
         assert uc.context_window == 200_000
+        assert uc.workspace_base == Path("/home/alice/projects")
 
     def test_frozen(self):
         """UserConfig is immutable."""
@@ -561,6 +564,70 @@ class TestLoadUserConfigs:
         assert configs[111].model is None
         assert configs[111].timeout is None
         assert configs[111].context_window is None
+        assert configs[111].workspace_base is None
+
+    # ── workspace_base field ──
+
+    def test_workspace_base_parsed(self, tmp_path):
+        """Valid workspace_base directory is stored as resolved Path."""
+        ws_base = tmp_path / "projects"
+        ws_base.mkdir()
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            users:
+              - telegram_id: 111
+                name: alice
+                workspace_base: {ws_base}
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].workspace_base == ws_base.resolve()
+
+    def test_workspace_base_missing_dir_warns(self, tmp_path, caplog):
+        """Non-existent workspace_base warns and falls back to None."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                workspace_base: /nonexistent/path/12345
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert len(configs) == 1
+        assert configs[111].workspace_base is None
+        assert "workspace_base not found" in caplog.text.lower()
+
+    def test_workspace_base_empty_string(self, tmp_path):
+        """Empty workspace_base string is treated as None."""
+        self._write_yaml(
+            tmp_path,
+            """\
+            users:
+              - telegram_id: 111
+                name: alice
+                workspace_base: ""
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs()
+        assert configs is not None
+        assert configs[111].workspace_base is None
 
 
 # ── Config convenience methods ──────────────────────────────────────

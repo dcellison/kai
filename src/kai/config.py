@@ -145,6 +145,8 @@ class UserConfig:
         model: Default model name (e.g., "opus", "sonnet", "haiku").
         timeout: Default timeout in seconds for Claude responses.
         context_window: Default context window size in tokens (0 = default).
+        workspace_base: Base directory for /workspace new and name resolution.
+            Falls back to global WORKSPACE_BASE env var if not set.
     """
 
     telegram_id: int
@@ -157,6 +159,7 @@ class UserConfig:
     model: str | None = None
     timeout: int | None = None
     context_window: int | None = None
+    workspace_base: Path | None = None
 
 
 # ── Config dataclass ─────────────────────────────────────────────────
@@ -773,6 +776,27 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
                 log.warning("users.yaml: invalid context_window for %s: %s; ignoring", name, e)
                 user_context_window = None
 
+        # Validate optional workspace_base (absolute path to a directory).
+        # Warn but don't skip the user if the directory doesn't exist.
+        # Unlike home_workspace (which keeps the path and lets runtime
+        # handle the fallback), workspace_base is set to None so name
+        # resolution falls back to the global WORKSPACE_BASE cleanly.
+        user_workspace_base = entry.get("workspace_base")
+        if user_workspace_base is not None:
+            ws_base_str = str(user_workspace_base).strip()
+            if not ws_base_str:
+                user_workspace_base = None
+            else:
+                user_workspace_base = Path(ws_base_str).expanduser().resolve()
+                if not user_workspace_base.is_dir():
+                    log.warning(
+                        "users.yaml: workspace_base not found for %s: %s; "
+                        "using global default",
+                        name,
+                        user_workspace_base,
+                    )
+                    user_workspace_base = None
+
         configs[telegram_id] = UserConfig(
             telegram_id=telegram_id,
             name=name,
@@ -784,6 +808,7 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
             model=model,
             timeout=user_timeout,
             context_window=user_context_window,
+            workspace_base=user_workspace_base,
         )
 
     # Warn if no admin is defined - external webhooks will route to

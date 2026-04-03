@@ -17,8 +17,12 @@ into four tables:
    workspace path, voice mode/name preferences, and future extensibility.
    Keys are namespaced strings like "voice_mode:{chat_id}".
 
-4. **workspace_history** — Recently used workspace paths for the /workspaces
+4. **workspace_history** - Recently used workspace paths for the /workspaces
    inline keyboard. Sorted by last_used_at for recency ordering.
+
+5. **allowed_workspaces** - Per-user allowed workspace paths, managed via
+   /workspace allow and /workspace deny. Unioned with global ALLOWED_WORKSPACES
+   env var for the effective access list.
 
 All functions use a module-level aiosqlite connection initialized by init_db()
 at startup. The database file is kai.db at the project root.
@@ -129,6 +133,14 @@ async def init_db(db_path: Path) -> None:
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            )
+        """)
+        log.debug("Creating allowed_workspaces table")
+        await _get_db().execute("""
+            CREATE TABLE IF NOT EXISTS allowed_workspaces (
+                chat_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                PRIMARY KEY (chat_id, path)
             )
         """)
         log.debug("Creating workspace_history table")
@@ -820,6 +832,109 @@ async def backfill_workspace_history(default_chat_id: int) -> None:
             cursor.rowcount,
             default_chat_id,
         )
+
+
+# ── Per-user allowed workspaces ──────────────────────────────────────
+
+
+async def add_allowed_workspace(chat_id: int, path: str) -> None:
+    """
+    Add a workspace path to the user's allowed list.
+
+    Uses INSERT OR IGNORE so adding a duplicate is a no-op.
+    Paths should be resolved to canonical form before storage.
+    """
+    db = _get_db()
+    await db.execute(
+        "INSERT OR IGNORE INTO allowed_workspaces (chat_id, path) "
+        "VALUES (?, ?)",
+        (chat_id, path),
+    )
+    await db.commit()
+
+
+async def remove_allowed_workspace(chat_id: int, path: str) -> bool:
+    """
+    Remove a workspace path from the user's allowed list.
+
+    Returns True if a row was deleted, False if the path was not
+    in the user's list (distinguishes "removed" from "not found"
+    so the caller can give appropriate feedback).
+    """
+    db = _get_db()
+    cursor = await db.execute(
+        "DELETE FROM allowed_workspaces WHERE chat_id = ? AND path = ?",
+        (chat_id, path),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def get_allowed_workspaces(chat_id: int) -> list[Path]:
+    """
+    Get the user's allowed workspace paths from the database.
+
+    Returns paths in insertion order. These are only the user-added
+    paths; the global ALLOWED_WORKSPACES fallback is handled by
+    resolve_workspace_access().
+    """
+    db = _get_db()
+    cursor = await db.execute(
+        "SELECT path FROM allowed_workspaces WHERE chat_id = ? "
+        "ORDER BY rowid",
+        (chat_id,),
+    )
+    rows = await cursor.fetchall()
+    return [Path(row[0]) for row in rows]
+
+
+async def resolve_workspace_access(
+    chat_id: int, config: Config
+) -> tuple[Path | None, list[Path]]:
+    """
+    Resolve per-user workspace_base and allowed_workspaces.
+
+    Returns (workspace_base, allowed_workspaces) with per-user config
+    applied. The allowed list is the union of user-added DB entries and
+    the global ALLOWED_WORKSPACES env var, deduplicated by resolved path.
+
+    Precedence for workspace_base:
+        1. users.yaml workspace_base (admin-set per user)
+        2. Global WORKSPACE_BASE env var
+
+    Precedence for allowed_workspaces:
+        Union of DB entries (user-managed) and global config (admin-set).
+        Deduplicated; DB entries appear first in the list.
+    """
+    user_config = config.get_user_config(chat_id)
+
+    # workspace_base: users.yaml > env
+    base = (
+        user_config.workspace_base
+        if user_config and user_config.workspace_base
+        else config.workspace_base
+    )
+
+    # allowed_workspaces: union of DB + global, deduplicated.
+    # DB entries first so user-added workspaces appear at the top
+    # of the /workspaces keyboard and /workspace allowed list.
+    db_allowed = await get_allowed_workspaces(chat_id)
+    seen: set[Path] = set()
+    combined: list[Path] = []
+
+    for p in db_allowed:
+        resolved = p.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            combined.append(resolved)
+
+    for p in config.allowed_workspaces:
+        resolved = p.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            combined.append(resolved)
+
+    return base, combined
 
 
 # ── Lifecycle ────────────────────────────────────────────────────────
