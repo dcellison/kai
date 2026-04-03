@@ -1711,7 +1711,8 @@ async def _handle_workspace_allow(
             return
 
     # Check for duplicates (already in the effective list)
-    if resolved in [a.resolve() for a in allowed]:
+    # allowed list is pre-resolved by resolve_workspace_access()
+    if resolved in allowed:
         await update.message.reply_text("Already in your allowed list.")
         return
 
@@ -1796,6 +1797,8 @@ async def _handle_workspace_allowed(
         for p in allowed:
             source = "you" if p in db_path_set else "global"
             lines.append(f"  {p} ({source})")
+    elif base:
+        lines.append("\nNo additional allowed paths beyond workspace base.")
     else:
         lines.append("\nNo allowed workspaces configured.")
 
