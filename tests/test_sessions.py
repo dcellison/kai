@@ -1,5 +1,7 @@
 """Tests for sessions.py async database CRUD."""
 
+from pathlib import Path
+
 import aiosqlite
 import pytest
 
@@ -353,6 +355,111 @@ class TestWorkspaceConfigSettings:
         await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "sonnet")
         result = await sessions.get_workspace_config_settings(111, "/projects/kai")
         assert result == {"model": "sonnet"}
+
+
+# ── build_workspace_config merge logic ─────────────────────────────
+
+
+class TestBuildWorkspaceConfig:
+    """Tests for the YAML + DB merge function."""
+
+    async def test_neither_returns_none(self, db):
+        """No YAML config and no DB overrides returns None."""
+        result = await sessions.build_workspace_config(None, Path("/projects/kai"), 111)
+        assert result is None
+
+    async def test_yaml_only(self, db):
+        """YAML config present, no DB overrides, returns YAML values."""
+        from kai.config import WorkspaceConfig
+
+        yaml = WorkspaceConfig(path=Path("/projects/kai"), model="opus", budget=15.0)
+        result = await sessions.build_workspace_config(yaml, Path("/projects/kai"), 111)
+        assert result is not None
+        assert result.model == "opus"
+        assert result.budget == 15.0
+
+    async def test_db_only(self, db):
+        """No YAML config, DB overrides present, returns DB values."""
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "haiku")
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "budget", "5.0")
+        result = await sessions.build_workspace_config(None, Path("/projects/kai"), 111)
+        assert result is not None
+        assert result.model == "haiku"
+        assert result.budget == 5.0
+        assert result.path == Path("/projects/kai")
+
+    async def test_db_overrides_yaml(self, db):
+        """DB values take precedence over YAML values."""
+        from kai.config import WorkspaceConfig
+
+        yaml = WorkspaceConfig(path=Path("/projects/kai"), model="opus", budget=15.0)
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "sonnet")
+        result = await sessions.build_workspace_config(yaml, Path("/projects/kai"), 111)
+        assert result is not None
+        assert result.model == "sonnet"
+        # Budget from YAML is preserved (not overridden)
+        assert result.budget == 15.0
+
+    async def test_partial_override(self, db):
+        """YAML has model+budget, DB overrides only model. Budget from YAML."""
+        from kai.config import WorkspaceConfig
+
+        yaml = WorkspaceConfig(path=Path("/projects/kai"), model="opus", budget=20.0, timeout=300)
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "haiku")
+        result = await sessions.build_workspace_config(yaml, Path("/projects/kai"), 111)
+        assert result is not None
+        assert result.model == "haiku"
+        assert result.budget == 20.0
+        assert result.timeout == 300
+
+    async def test_env_merge(self, db):
+        """DB env vars merge on top of YAML env vars; DB wins on collision."""
+        import json
+
+        from kai.config import WorkspaceConfig
+
+        yaml = WorkspaceConfig(
+            path=Path("/projects/kai"),
+            env={"EXISTING": "from_yaml", "SHARED": "yaml_value"},
+        )
+        await sessions.set_workspace_config_setting(
+            111, "/projects/kai", "env",
+            json.dumps({"NEW_VAR": "from_db", "SHARED": "db_wins"}),
+        )
+        result = await sessions.build_workspace_config(yaml, Path("/projects/kai"), 111)
+        assert result is not None
+        assert result.env is not None
+        assert result.env["EXISTING"] == "from_yaml"
+        assert result.env["NEW_VAR"] == "from_db"
+        assert result.env["SHARED"] == "db_wins"
+
+    async def test_db_prompt_replaces_yaml_file(self, db):
+        """DB prompt clears system_prompt_file from YAML."""
+        from kai.config import WorkspaceConfig
+
+        yaml = WorkspaceConfig(
+            path=Path("/projects/kai"),
+            system_prompt_file=Path("/etc/kai/prompts/default.txt"),
+        )
+        await sessions.set_workspace_config_setting(
+            111, "/projects/kai", "prompt", "Be concise."
+        )
+        result = await sessions.build_workspace_config(yaml, Path("/projects/kai"), 111)
+        assert result is not None
+        assert result.system_prompt == "Be concise."
+        assert result.system_prompt_file is None
+
+    async def test_env_file_preserved_from_yaml(self, db):
+        """env_file from YAML is preserved even when DB has no env override."""
+        from kai.config import WorkspaceConfig
+
+        yaml = WorkspaceConfig(
+            path=Path("/projects/kai"),
+            env_file=Path("/etc/kai/env/extra.env"),
+        )
+        result = await sessions.build_workspace_config(yaml, Path("/projects/kai"), 111)
+        assert result is not None
+        assert result.env_file == Path("/etc/kai/env/extra.env")
 
 
 # ── Workspace history ────────────────────────────────────────────────

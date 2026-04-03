@@ -234,6 +234,7 @@ class TestWorkspaceRestoration:
 
         with (
             patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch("kai.pool.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
             patch.object(instance, "change_workspace", new_callable=AsyncMock) as mock_change,
             patch.object(instance, "send", new_callable=MagicMock) as mock_send,
         ):

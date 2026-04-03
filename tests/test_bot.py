@@ -1190,6 +1190,7 @@ class TestHandleWorkspace:
         with (
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.delete_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
             patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace(update, ctx)
@@ -1254,6 +1255,7 @@ class TestHandleWorkspace:
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
+            patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
             patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace(update, ctx)
@@ -1274,6 +1276,7 @@ class TestHandleWorkspace:
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
+            patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
             patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace(update, ctx)
@@ -1295,6 +1298,7 @@ class TestHandleWorkspace:
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
+            patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
             patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace(update, ctx)
@@ -1382,6 +1386,7 @@ class TestHandleWorkspaceCallback:
         with (
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.delete_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
             patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace_callback(update, ctx)
@@ -1405,6 +1410,7 @@ class TestHandleWorkspaceCallback:
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
+            patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
             patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace_callback(update, ctx)
@@ -1450,6 +1456,7 @@ class TestHandleWorkspaceCallback:
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
+            patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
             patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace_callback(update, ctx)
@@ -1554,8 +1561,11 @@ class TestSwitchWorkspaceConfig:
         claude = _make_mock_claude()
         ctx = _make_context(config=config, claude=claude)
 
+        mock_sessions = AsyncMock()
+        # build_workspace_config returns the merged config (here, just YAML)
+        mock_sessions.build_workspace_config = AsyncMock(return_value=ws_config)
         with (
-            patch("kai.bot.sessions", new_callable=AsyncMock),
+            patch("kai.bot.sessions", mock_sessions),
             patch("kai.bot.webhook"),
         ):
             result = await _do_switch_workspace(ctx, 12345, ws_path.resolve())
@@ -1573,8 +1583,11 @@ class TestSwitchWorkspaceConfig:
         claude = _make_mock_claude()
         ctx = _make_context(config=config, claude=claude)
 
+        mock_sessions = AsyncMock()
+        # No YAML config, no DB overrides -> returns None
+        mock_sessions.build_workspace_config = AsyncMock(return_value=None)
         with (
-            patch("kai.bot.sessions", new_callable=AsyncMock),
+            patch("kai.bot.sessions", mock_sessions),
             patch("kai.bot.webhook"),
         ):
             result = await _do_switch_workspace(ctx, 12345, ws_path.resolve())
@@ -1598,8 +1611,10 @@ class TestSwitchWorkspaceConfig:
         update = _make_update()
         ctx = _make_context(config=config, claude=claude)
 
+        mock_sessions = AsyncMock()
+        mock_sessions.build_workspace_config = AsyncMock(return_value=ws_config)
         with (
-            patch("kai.bot.sessions", new_callable=AsyncMock),
+            patch("kai.bot.sessions", mock_sessions),
             patch("kai.bot.webhook"),
         ):
             await _switch_workspace(update, ctx, ws_path.resolve())

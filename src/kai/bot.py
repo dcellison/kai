@@ -776,8 +776,9 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     config: Config = context.bot_data["config"]
     home = config.claude_workspace
 
-    # Look up per-workspace config for the target workspace.
-    ws_config = config.get_workspace_config(path)
+    # Layer DB overrides (from /workspace config) on top of YAML baseline.
+    yaml_config = config.get_workspace_config(path)
+    ws_config = await sessions.build_workspace_config(yaml_config, path, chat_id)
     await pool.change_workspace(chat_id, path, workspace_config=ws_config)
     # Per-user file confinement is handled at request time in webhook.py
     # via pool.get_workspace(chat_id), so no global update needed here.

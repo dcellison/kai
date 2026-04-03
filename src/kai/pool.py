@@ -186,7 +186,11 @@ class SubprocessPool:
                 )
                 await sessions.delete_setting(f"workspace:{chat_id}")
             else:
-                ws_config = self._config.get_workspace_config(ws_path)
+                # Layer DB overrides on top of YAML baseline so user's
+                # per-workspace config (set via /workspace config) is
+                # applied on startup, not just after explicit switches.
+                yaml_config = self._config.get_workspace_config(ws_path)
+                ws_config = await sessions.build_workspace_config(yaml_config, ws_path, chat_id)
                 await instance.change_workspace(ws_path, workspace_config=ws_config)
                 log.info("Restored workspace for user %d: %s", chat_id, ws_path)
 
