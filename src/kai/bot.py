@@ -1734,7 +1734,9 @@ async def _handle_workspace_deny(
         return
 
     raw_path = parts[1].strip()
-    resolved = Path(raw_path).expanduser().resolve()
+    # No expanduser() - same reasoning as _handle_workspace_allow:
+    # ~ resolves to the bot process's $HOME, not the requesting user's.
+    resolved = Path(raw_path).resolve()
 
     # Check if this is a user-added path (in the database)
     removed = await sessions.remove_allowed_workspace(chat_id, str(resolved))
@@ -1803,7 +1805,7 @@ async def _handle_workspace_allowed(
     await update.message.reply_text("\n".join(lines))
 
 
-_NO_BASE_MSG = "No workspace base configured. Set workspace_base in users.yaml."
+_NO_BASE_MSG = "No workspace base configured. Set workspace_base in users.yaml or WORKSPACE_BASE in .env."
 
 
 @_require_auth
