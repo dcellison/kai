@@ -43,7 +43,6 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import re
 import time
 from datetime import datetime
@@ -53,7 +52,7 @@ from aiohttp import web
 from telegram import Update
 
 from kai import cron, review, services, sessions, triage
-from kai.config import DATA_DIR, IMAGE_EXTENSIONS
+from kai.config import DATA_DIR, IMAGE_EXTENSIONS, Config, UserConfig
 from kai.telegram_utils import chunk_text
 
 log = logging.getLogger(__name__)
@@ -548,48 +547,122 @@ async def _handle_github(request: web.Request) -> web.Response:
         return web.json_response({"msg": "internal_error"}, status=500)
 
 
-async def _process_github_event(request: web.Request, payload: dict, event_type: str) -> web.Response:
-    """
-    Process a validated GitHub webhook event.
+def _get_subscribed_users(config: Config, repo_full_name: str) -> list[UserConfig]:
+    """Find all users subscribed to a GitHub repo.
 
-    Handles user routing, PR review dispatch, issue triage dispatch,
-    event formatting, and Telegram delivery.
+    Matches repo_full_name against each user's github_repos list.
+    Comparison is case-insensitive since GitHub repo names are
+    case-insensitive.
+
+    Args:
+        config: The application Config instance.
+        repo_full_name: Full GitHub repo name (e.g., "dcellison/kai").
+
+    Returns:
+        List of UserConfig objects for users subscribed to this repo.
+    """
+    if config.user_configs is None:
+        return []
+    repo_lower = repo_full_name.lower()
+    return [uc for uc in config.user_configs.values() if any(r.lower() == repo_lower for r in uc.github_repos)]
+
+
+async def _process_github_event(request: web.Request, payload: dict, event_type: str) -> web.Response:
+    """Process a validated GitHub webhook event.
+
+    Routes the event to all users subscribed to the triggering repo
+    via _get_subscribed_users(). Each user gets their own feature flag
+    check and notification destination via resolve_github_settings().
+
+    When no users are subscribed (e.g., single-user installs without
+    github_repos configured), falls back to the admin chat_id so
+    existing behavior is preserved.
     """
     bot = request.app["telegram_bot"]
+    config: Config = request.app["config"]
 
-    # Resolve GitHub notification target. If GITHUB_NOTIFY_CHAT_ID is
-    # configured, all GitHub event notifications go there (typically a
-    # separate Telegram group). Otherwise, use the per-user DM resolution.
-    # notify_chat_id is only set when the group override is active; when
-    # None, review/triage use their default behavior (no chat_id in POST).
-    github_notify_chat_id = request.app.get("github_notify_chat_id")
-    notify_chat_id: int | None = None
-    if github_notify_chat_id is not None:
-        chat_id = github_notify_chat_id
-        notify_chat_id = github_notify_chat_id
-    else:
-        # Route to the user whose GitHub handle matches the event actor.
-        # For PR events, use the PR author (who should see review feedback).
-        # For all other events, use the sender (who performed the action).
-        # Falls back to the default admin for unknown actors.
-        config = request.app.get("config")
-        if config and event_type == "pull_request":
-            pr_author = payload.get("pull_request", {}).get("user", {}).get("login", "")
-            target_user = config.get_user_by_github(pr_author) if pr_author else None
-        elif config:
-            sender_login = payload.get("sender", {}).get("login", "")
-            target_user = config.get_user_by_github(sender_login) if sender_login else None
-        else:
-            target_user = None
-        chat_id = target_user.telegram_id if target_user else request.app["chat_id"]
+    # Extract the repo that triggered this event
+    repo_full_name = payload.get("repository", {}).get("full_name", "")
+
+    # Find all users subscribed to this repo
+    subscribed_users = _get_subscribed_users(config, repo_full_name)
+
+    if not subscribed_users:
+        # No user subscribed to this repo. Log a warning so the admin
+        # knows events are arriving for an untracked repo. Don't silently
+        # drop - this helps diagnose misconfigured webhooks.
+        log.warning(
+            "GitHub %s event for %s: no subscribed users",
+            event_type,
+            repo_full_name,
+        )
+        # Fall back to legacy behavior: route to the default admin.
+        # request.app["chat_id"] is set in webhook.start() to the first
+        # admin in users.yaml or the first ALLOWED_USER_IDS entry.
+        fallback_chat_id = request.app["chat_id"]
+        await _process_github_event_for_user(
+            request,
+            payload,
+            event_type,
+            bot,
+            config,
+            fallback_chat_id,
+            None,
+        )
+        return web.json_response({"status": "ok"})
+
+    # Process the event for each subscribed user independently.
+    # Each user has their own pr_review/issue_triage flags and
+    # notification destination.
+    for user_config in subscribed_users:
+        chat_id = user_config.telegram_id
+        await _process_github_event_for_user(
+            request,
+            payload,
+            event_type,
+            bot,
+            config,
+            chat_id,
+            user_config,
+        )
+
+    return web.json_response({"status": "ok"})
+
+
+async def _process_github_event_for_user(
+    request: web.Request,
+    payload: dict,
+    event_type: str,
+    bot: object,
+    config: Config,
+    chat_id: int,
+    user_config: UserConfig | None,
+) -> None:
+    """Process a GitHub event for a single user.
+
+    Resolves the user's GitHub settings (pr_review, issue_triage,
+    notify_chat_id) and dispatches accordingly. Called once per
+    subscribed user for each incoming event.
+
+    Args:
+        request: The aiohttp request (for app config access).
+        payload: The GitHub webhook payload dict.
+        event_type: GitHub event type (e.g., "pull_request", "issues").
+        bot: The Telegram bot instance.
+        config: The application Config instance.
+        chat_id: The user's Telegram chat ID.
+        user_config: The user's UserConfig, or None for fallback routing.
+    """
+    # Resolve this user's effective GitHub settings
+    settings = await sessions.resolve_github_settings(chat_id, config)
+    target_chat_id = settings["notify_chat_id"]
 
     # ── PR review routing ────────────────────────────────────────
-    # When PR review is enabled, reviewable PR events (opened, reopened,
-    # synchronize) are routed to the review pipeline instead of the
-    # notification formatter. Non-reviewable actions (closed, merged)
-    # still get the standard Telegram notification.
-    pr_review_enabled = request.app.get("pr_review_enabled", False)
-    if pr_review_enabled and event_type == "pull_request":
+    # When PR review is enabled for this user, reviewable PR events
+    # (opened, reopened, synchronize) are routed to the review pipeline
+    # instead of the notification formatter. Non-reviewable actions
+    # (closed, merged) still get the standard Telegram notification.
+    if settings["pr_review"] and event_type == "pull_request":
         action = payload.get("action", "")
         if action in ("opened", "reopened", "synchronize"):
             pr = payload.get("pull_request", {})
@@ -597,9 +670,16 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
             repo = payload.get("repository", {}).get("full_name", "")
             cooldown = request.app.get("pr_review_cooldown", 300)
 
+            # Cooldown is server-level, shared across all users.
+            # One review per PR per cooldown window regardless of
+            # how many users are subscribed.
             if _should_skip_review(repo, pr_number, cooldown):
-                log.info("Skipping review of %s PR #%d (cooldown)", repo, pr_number)
-                return web.json_response({"msg": "review_cooldown"})
+                log.info(
+                    "Skipping review of %s PR #%d (cooldown)",
+                    repo,
+                    pr_number,
+                )
+                return
 
             _record_review(repo, pr_number, cooldown)
 
@@ -611,6 +691,8 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
             # Launch the review as a fire-and-forget background task.
             # Same pattern as Telegram update processing: create_task +
             # _background_tasks set to prevent GC during execution.
+            # Always pass target_chat_id so the review notification
+            # reaches the subscribing user, not the default admin.
             task = asyncio.create_task(
                 review.review_pr(
                     payload,
@@ -619,22 +701,28 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
                     claude_user=request.app.get("claude_user"),
                     local_repo_path=local_repo_path,
                     spec_dir=request.app.get("spec_dir", "specs"),
-                    notify_chat_id=notify_chat_id,
+                    notify_chat_id=target_chat_id,
                 )
             )
             _background_tasks.add(task)
             task.add_done_callback(_background_tasks.discard)
 
-            log.info("PR review triggered for %s PR #%d (%s)", repo, pr_number, action)
-            return web.json_response({"status": "review_triggered"})
+            log.info(
+                "PR review triggered for %s PR #%d (%s) for user %d",
+                repo,
+                pr_number,
+                action,
+                chat_id,
+            )
+            return
 
     # ── Issue triage routing ────────────────────────────────────
-    # When issue triage is enabled, opened issues are routed to the
-    # triage pipeline. The triage Telegram summary replaces the basic
-    # _fmt_issues() notification (richer content). Non-triaged actions
-    # (closed, reopened) still fall through to the standard formatter.
-    issue_triage_enabled = request.app.get("issue_triage_enabled", False)
-    if issue_triage_enabled and event_type == "issues":
+    # When issue triage is enabled for this user, opened issues are
+    # routed to the triage pipeline. The triage Telegram summary
+    # replaces the basic _fmt_issues() notification (richer content).
+    # Non-triaged actions (closed, reopened) still fall through to
+    # the standard formatter.
+    if settings["issue_triage"] and event_type == "issues":
         action = payload.get("action", "")
         if action == "opened":
             issue = payload.get("issue", {})
@@ -647,7 +735,7 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
                     repo,
                     issue_number,
                 )
-                return web.json_response({"msg": "triage_cooldown"})
+                return
 
             _record_triage(repo, issue_number)
 
@@ -657,41 +745,47 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
                     webhook_port=request.app["webhook_port"],
                     webhook_secret=request.app["webhook_secret"],
                     claude_user=request.app.get("claude_user"),
-                    notify_chat_id=notify_chat_id,
+                    notify_chat_id=target_chat_id,
                 )
             )
             _background_tasks.add(task)
             task.add_done_callback(_background_tasks.discard)
 
             log.info(
-                "Issue triage triggered for %s issue #%d",
+                "Issue triage triggered for %s issue #%d for user %d",
                 repo,
                 issue_number,
+                chat_id,
             )
-            return web.json_response({"status": "triage_triggered"})
+            return
 
     # ── Standard notification path ───────────────────────────────
     # Look up the formatter for this event type
     formatter = _GITHUB_FORMATTERS.get(event_type)
     if not formatter:
-        return web.json_response({"msg": "ignored", "event": event_type})
+        return
 
     message = formatter(payload)
     if not message:
-        return web.json_response({"msg": "ignored", "event": event_type})
+        return
 
     # Send to Telegram with Markdown, falling back to plain text on parse failure
     try:
-        await bot.send_message(chat_id, message, parse_mode="Markdown")
+        await bot.send_message(target_chat_id, message, parse_mode="Markdown")
     except Exception:
         try:
-            await bot.send_message(chat_id, _strip_markdown(message))
+            await bot.send_message(target_chat_id, _strip_markdown(message))
         except Exception:
-            log.exception("Failed to send GitHub notification")
-            return web.json_response({"msg": "error"})
-    log.info("Sent GitHub %s notification to chat %d", event_type, chat_id)
-
-    return web.json_response({"status": "ok"})
+            log.exception(
+                "Failed to send GitHub notification to chat %d",
+                target_chat_id,
+            )
+    log.info(
+        "Sent GitHub %s notification to chat %d (user %d)",
+        event_type,
+        target_chat_id,
+        chat_id,
+    )
 
 
 @_require_secret
@@ -1462,11 +1556,10 @@ async def start(telegram_app, config) -> None:
     # Set by main.py after pool creation; may be None during init.
     _app["pool"] = telegram_app.bot_data.get("pool")
 
-    # PR review agent config - stored in app for access by _handle_github()
-    _app["pr_review_enabled"] = config.pr_review_enabled
+    # Server-level config for review/triage background tasks. Per-user
+    # feature flags (pr_review, issue_triage) are resolved at event time
+    # via sessions.resolve_github_settings(), not stored here.
     _app["pr_review_cooldown"] = config.pr_review_cooldown
-
-    # Additional config needed by review background tasks
     _app["webhook_port"] = config.webhook_port
     _app["claude_user"] = config.claude_user
 
@@ -1477,23 +1570,25 @@ async def start(telegram_app, config) -> None:
     _app["allowed_workspaces"] = [str(p) for p in config.allowed_workspaces]
     _app["spec_dir"] = config.spec_dir
 
-    # Issue triage agent config
-    _app["issue_triage_enabled"] = config.issue_triage_enabled
-
-    # Optional: route GitHub notifications to a separate Telegram group.
-    # When set, all GitHub event notifications go to this chat_id instead
-    # of the per-user DM. Interactive chat is unaffected.
-    github_notify_raw = os.environ.get("GITHUB_NOTIFY_CHAT_ID", "")
-    if github_notify_raw:
-        try:
-            notify_id = int(github_notify_raw)
-            _app["github_notify_chat_id"] = notify_id
-            # Add to allowed_user_ids so _resolve_chat_id accepts it
-            # when review.py/triage.py POST to /api/send-message with
-            # the group chat_id in the body.
-            _app["allowed_user_ids"].add(notify_id)
-        except ValueError:
-            log.warning("Invalid GITHUB_NOTIFY_CHAT_ID: %s (ignoring)", github_notify_raw)
+    # Add per-user github_notify_chat_id values to allowed_user_ids
+    # so review/triage agents can POST to /api/send-message with
+    # these chat_ids. Loads from both users.yaml and DB.
+    if config.user_configs:
+        for uc in config.user_configs.values():
+            if uc.github_notify_chat_id is not None:
+                _app["allowed_user_ids"].add(uc.github_notify_chat_id)
+        # Also add any DB-stored notify chat IDs (set via /github notify).
+        # webhook.start() is already async so the await is fine.
+        for uid in config.user_configs:
+            val = await sessions.get_setting(f"github_notify_chat:{uid}")
+            if val:
+                try:
+                    _app["allowed_user_ids"].add(int(val))
+                except ValueError:
+                    pass
+    # Also add the global env var fallback if set
+    if config.github_notify_chat_id is not None:
+        _app["allowed_user_ids"].add(config.github_notify_chat_id)
 
     _app.router.add_get("/health", _handle_health)
 

@@ -10,12 +10,14 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kai.config import UserConfig
 from kai.webhook import (
     _fmt_issue_comment,
     _fmt_issues,
     _fmt_pull_request,
     _fmt_pull_request_review,
     _fmt_push,
+    _get_subscribed_users,
     _handle_github,
     _prune_expired,
     _record_review,
@@ -384,17 +386,23 @@ def _make_pr_payload(action: str, pr_number: int = 42, merged: bool = False) -> 
 
 
 def _build_test_app(
-    pr_review_enabled: bool = True,
     cooldown: int = 300,
-    issue_triage_enabled: bool = False,
-    github_notify_chat_id: int | None = None,
+    config: object | None = None,
 ) -> web.Application:
-    """Build a minimal aiohttp app with _handle_github wired up."""
+    """Build a minimal aiohttp app with _handle_github wired up.
+
+    The config parameter controls per-user routing. When None, a mock
+    Config with user_configs=None is used, which causes _get_subscribed_users
+    to return empty and the fallback path (admin chat_id) to fire. To test
+    per-user routing, pass a mock with user_configs populated.
+
+    Feature flags (pr_review, issue_triage, notify_chat_id) are now resolved
+    per-user via resolve_github_settings() instead of app dict globals.
+    Tests should mock sessions.resolve_github_settings to control these.
+    """
     app = web.Application()
     app["webhook_secret"] = _TEST_SECRET
-    app["pr_review_enabled"] = pr_review_enabled
     app["pr_review_cooldown"] = cooldown
-    app["issue_triage_enabled"] = issue_triage_enabled
     # Config needed by review background tasks
     app["webhook_port"] = 8080
     app["claude_user"] = None
@@ -409,8 +417,14 @@ def _build_test_app(
     mock_bot = AsyncMock()
     app["telegram_bot"] = mock_bot
     app["chat_id"] = 12345
-    if github_notify_chat_id is not None:
-        app["github_notify_chat_id"] = github_notify_chat_id
+    # Config for per-user routing. Default mock has no user_configs,
+    # so all events fall through to admin chat_id.
+    if config is None:
+        mock_config = AsyncMock()
+        mock_config.user_configs = None
+        app["config"] = mock_config
+    else:
+        app["config"] = config
     app.router.add_post("/webhook/github", _handle_github)
     return app
 
@@ -432,177 +446,49 @@ def _mock_resolve_repo():
         yield
 
 
+def _mock_settings(
+    pr_review: bool = False,
+    issue_triage: bool = False,
+    notify_chat_id: int = 12345,
+    repos: list | None = None,
+):
+    """Return a context manager that mocks resolve_github_settings.
+
+    Provides a consistent way to control per-user feature flags in
+    routing tests. The returned settings dict matches the GitHubSettings
+    TypedDict shape from sessions.py.
+    """
+    settings = {
+        "repos": repos or [],
+        "notify_chat_id": notify_chat_id,
+        "pr_review": pr_review,
+        "issue_triage": issue_triage,
+    }
+    return patch(
+        "kai.webhook.sessions.resolve_github_settings",
+        new_callable=AsyncMock,
+        return_value=settings,
+    )
+
+
 class TestPRReviewRouting:
-    """Integration tests for PR review routing in _handle_github."""
+    """Integration tests for PR review routing in _handle_github.
+
+    These tests use _mock_settings() to control per-user feature flags
+    via resolve_github_settings(). The default _build_test_app() has no
+    user_configs, so all events hit the fallback path (admin chat_id)
+    and the mocked settings control whether review/triage triggers.
+    """
 
     @pytest.mark.asyncio
     async def test_routes_opened_when_enabled(self, _clear_cooldowns, _mock_resolve_repo):
         """Reviewable PR events are routed to review pipeline, not Telegram."""
-        app = _build_test_app(pr_review_enabled=True)
+        app = _build_test_app()
         payload = _make_pr_payload("opened")
         body = json.dumps(payload).encode()
         sig = _sign_payload(payload)
 
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/webhook/github",
-                data=body,
-                headers={
-                    "X-GitHub-Event": "pull_request",
-                    "X-Hub-Signature-256": sig,
-                },
-            )
-            data = await resp.json()
-            assert resp.status == 200
-            assert data["status"] == "review_triggered"
-            # Should NOT have sent a Telegram notification
-            app["telegram_bot"].send_message.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_falls_through_when_disabled(self, _clear_cooldowns):
-        """With PR review disabled, opened events go to the notification formatter."""
-        app = _build_test_app(pr_review_enabled=False)
-        payload = _make_pr_payload("opened")
-        body = json.dumps(payload).encode()
-        sig = _sign_payload(payload)
-
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/webhook/github",
-                data=body,
-                headers={
-                    "X-GitHub-Event": "pull_request",
-                    "X-Hub-Signature-256": sig,
-                },
-            )
-            data = await resp.json()
-            assert resp.status == 200
-            # Falls through to _fmt_pull_request, which formats a notification
-            assert data.get("status") == "ok"
-            app["telegram_bot"].send_message.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_cooldown_skips_recent(self, _clear_cooldowns, _mock_resolve_repo):
-        """Second event for the same PR within cooldown returns review_cooldown."""
-        app = _build_test_app(pr_review_enabled=True, cooldown=300)
-        payload = _make_pr_payload("synchronize", pr_number=10)
-        body = json.dumps(payload).encode()
-        sig = _sign_payload(payload)
-
-        async with TestClient(TestServer(app)) as client:
-            # First request triggers a review
-            resp1 = await client.post(
-                "/webhook/github",
-                data=body,
-                headers={
-                    "X-GitHub-Event": "pull_request",
-                    "X-Hub-Signature-256": sig,
-                },
-            )
-            data1 = await resp1.json()
-            assert data1["status"] == "review_triggered"
-
-            # Second request hits cooldown
-            resp2 = await client.post(
-                "/webhook/github",
-                data=body,
-                headers={
-                    "X-GitHub-Event": "pull_request",
-                    "X-Hub-Signature-256": sig,
-                },
-            )
-            data2 = await resp2.json()
-            assert data2["msg"] == "review_cooldown"
-
-    @pytest.mark.asyncio
-    async def test_cooldown_allows_after_expiry(self, _clear_cooldowns, _mock_resolve_repo):
-        """After cooldown expires, the same PR can be reviewed again."""
-        from unittest.mock import patch
-
-        app = _build_test_app(pr_review_enabled=True, cooldown=60)
-        payload = _make_pr_payload("synchronize", pr_number=10)
-        body = json.dumps(payload).encode()
-        sig = _sign_payload(payload)
-
-        async with TestClient(TestServer(app)) as client:
-            # First request
-            resp1 = await client.post(
-                "/webhook/github",
-                data=body,
-                headers={
-                    "X-GitHub-Event": "pull_request",
-                    "X-Hub-Signature-256": sig,
-                },
-            )
-            assert (await resp1.json())["status"] == "review_triggered"
-
-            # Advance time past the cooldown
-            import time
-
-            future = time.time() + 61
-            with patch("kai.webhook.time.time", return_value=future):
-                resp2 = await client.post(
-                    "/webhook/github",
-                    data=body,
-                    headers={
-                        "X-GitHub-Event": "pull_request",
-                        "X-Hub-Signature-256": sig,
-                    },
-                )
-                assert (await resp2.json())["status"] == "review_triggered"
-
-    @pytest.mark.asyncio
-    async def test_closed_still_notifies(self, _clear_cooldowns):
-        """Closed PRs go through the standard notification path, not the review pipeline."""
-        app = _build_test_app(pr_review_enabled=True)
-        payload = _make_pr_payload("closed", merged=False)
-        body = json.dumps(payload).encode()
-        sig = _sign_payload(payload)
-
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/webhook/github",
-                data=body,
-                headers={
-                    "X-GitHub-Event": "pull_request",
-                    "X-Hub-Signature-256": sig,
-                },
-            )
-            data = await resp.json()
-            assert resp.status == 200
-            # Should fall through to _fmt_pull_request for the "closed" notification
-            assert data.get("status") == "ok"
-            app["telegram_bot"].send_message.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_synchronize_routed(self, _clear_cooldowns, _mock_resolve_repo):
-        """synchronize events (new push to existing PR) are routed to review."""
-        app = _build_test_app(pr_review_enabled=True)
-        payload = _make_pr_payload("synchronize", pr_number=99)
-        body = json.dumps(payload).encode()
-        sig = _sign_payload(payload)
-
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/webhook/github",
-                data=body,
-                headers={
-                    "X-GitHub-Event": "pull_request",
-                    "X-Hub-Signature-256": sig,
-                },
-            )
-            data = await resp.json()
-            assert data["status"] == "review_triggered"
-
-    @pytest.mark.asyncio
-    async def test_launches_background_task(self, _clear_cooldowns, _mock_resolve_repo):
-        """Reviewable PR events launch review.review_pr as a background task."""
-        app = _build_test_app(pr_review_enabled=True)
-        payload = _make_pr_payload("opened")
-        body = json.dumps(payload).encode()
-        sig = _sign_payload(payload)
-
-        with patch("kai.webhook.review.review_pr", new_callable=AsyncMock) as mock_review:
+        with _mock_settings(pr_review=True):
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
                     "/webhook/github",
@@ -612,11 +498,176 @@ class TestPRReviewRouting:
                         "X-Hub-Signature-256": sig,
                     },
                 )
-                assert (await resp.json())["status"] == "review_triggered"
+                data = await resp.json()
+                assert resp.status == 200
+                assert data["status"] == "ok"
+                # Should NOT have sent a Telegram notification (review task fires instead)
+                app["telegram_bot"].send_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_falls_through_when_disabled(self, _clear_cooldowns):
+        """With PR review disabled, opened events go to the notification formatter."""
+        app = _build_test_app()
+        payload = _make_pr_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with _mock_settings(pr_review=False):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                data = await resp.json()
+                assert resp.status == 200
+                # Falls through to _fmt_pull_request, which formats a notification
+                assert data.get("status") == "ok"
+                app["telegram_bot"].send_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cooldown_skips_recent(self, _clear_cooldowns, _mock_resolve_repo):
+        """Second event for the same PR within cooldown is silently skipped."""
+        app = _build_test_app(cooldown=300)
+        payload = _make_pr_payload("synchronize", pr_number=10)
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with _mock_settings(pr_review=True):
+            async with TestClient(TestServer(app)) as client:
+                # First request triggers a review
+                resp1 = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                data1 = await resp1.json()
+                assert data1["status"] == "ok"
+
+                # Second request hits cooldown - still returns ok since
+                # _process_github_event_for_user returns None (no response)
+                resp2 = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                data2 = await resp2.json()
+                assert data2["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_cooldown_allows_after_expiry(self, _clear_cooldowns, _mock_resolve_repo):
+        """After cooldown expires, the same PR can be reviewed again."""
+        app = _build_test_app(cooldown=60)
+        payload = _make_pr_payload("synchronize", pr_number=10)
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with _mock_settings(pr_review=True):
+            async with TestClient(TestServer(app)) as client:
+                # First request
+                resp1 = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert (await resp1.json())["status"] == "ok"
+
+                # Advance time past the cooldown
+                import time
+
+                future = time.time() + 61
+                with patch("kai.webhook.time.time", return_value=future):
+                    resp2 = await client.post(
+                        "/webhook/github",
+                        data=body,
+                        headers={
+                            "X-GitHub-Event": "pull_request",
+                            "X-Hub-Signature-256": sig,
+                        },
+                    )
+                    assert (await resp2.json())["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_closed_still_notifies(self, _clear_cooldowns):
+        """Closed PRs go through the standard notification path, not the review pipeline."""
+        app = _build_test_app()
+        payload = _make_pr_payload("closed", merged=False)
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with _mock_settings(pr_review=True):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                data = await resp.json()
+                assert resp.status == 200
+                # Should fall through to _fmt_pull_request for the "closed" notification
+                assert data.get("status") == "ok"
+                app["telegram_bot"].send_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_synchronize_routed(self, _clear_cooldowns, _mock_resolve_repo):
+        """synchronize events (new push to existing PR) are routed to review."""
+        app = _build_test_app()
+        payload = _make_pr_payload("synchronize", pr_number=99)
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with _mock_settings(pr_review=True):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                data = await resp.json()
+                assert data["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_launches_background_task(self, _clear_cooldowns, _mock_resolve_repo):
+        """Reviewable PR events launch review.review_pr as a background task."""
+        app = _build_test_app()
+        payload = _make_pr_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with (
+            _mock_settings(pr_review=True),
+            patch("kai.webhook.review.review_pr", new_callable=AsyncMock) as mock_review,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert (await resp.json())["status"] == "ok"
 
             # Allow the background task to complete
-            import asyncio
-
             await asyncio.sleep(0.01)
 
             mock_review.assert_called_once()
@@ -777,12 +828,13 @@ class TestResolveLocalRepo:
     @pytest.mark.asyncio
     async def test_handler_uses_resolve(self, _clear_cooldowns):
         """_handle_github calls _resolve_local_repo instead of old home_repo_name logic."""
-        app = _build_test_app(pr_review_enabled=True)
+        app = _build_test_app()
         payload = _make_pr_payload("opened")
         body = json.dumps(payload).encode()
         sig = _sign_payload(payload)
 
         with (
+            _mock_settings(pr_review=True),
             patch(
                 "kai.webhook._resolve_local_repo",
                 new_callable=AsyncMock,
@@ -799,9 +851,7 @@ class TestResolveLocalRepo:
                         "X-Hub-Signature-256": sig,
                     },
                 )
-                assert (await resp.json())["status"] == "review_triggered"
-
-            import asyncio
+                assert (await resp.json())["status"] == "ok"
 
             await asyncio.sleep(0.01)
 
@@ -829,17 +879,23 @@ def _make_issue_payload(action: str = "opened", issue_number: int = 10) -> dict:
 
 
 class TestIssueTriageRouting:
-    """Integration tests for issue triage routing in _handle_github."""
+    """Integration tests for issue triage routing in _handle_github.
+
+    Uses _mock_settings() to control per-user issue_triage flag.
+    """
 
     @pytest.mark.asyncio
     async def test_routes_opened_when_enabled(self, _clear_cooldowns):
         """Opened issues are routed to triage pipeline when enabled."""
-        app = _build_test_app(issue_triage_enabled=True)
+        app = _build_test_app()
         payload = _make_issue_payload("opened")
         body = json.dumps(payload).encode()
         sig = _sign_payload(payload)
 
-        with patch("kai.webhook.triage.triage_issue", new_callable=AsyncMock):
+        with (
+            _mock_settings(issue_triage=True),
+            patch("kai.webhook.triage.triage_issue", new_callable=AsyncMock),
+        ):
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
                     "/webhook/github",
@@ -851,41 +907,45 @@ class TestIssueTriageRouting:
                 )
                 data = await resp.json()
                 assert resp.status == 200
-                assert data["status"] == "triage_triggered"
+                assert data["status"] == "ok"
                 # Should NOT have sent a standard Telegram notification
                 app["telegram_bot"].send_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_falls_through_when_disabled(self, _clear_cooldowns):
         """With issue triage disabled, opened events go to the notification formatter."""
-        app = _build_test_app(issue_triage_enabled=False)
+        app = _build_test_app()
         payload = _make_issue_payload("opened")
         body = json.dumps(payload).encode()
         sig = _sign_payload(payload)
 
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/webhook/github",
-                data=body,
-                headers={
-                    "X-GitHub-Event": "issues",
-                    "X-Hub-Signature-256": sig,
-                },
-            )
-            await resp.json()
-            assert resp.status == 200
-            # Falls through to standard formatter, which sends a Telegram message
-            app["telegram_bot"].send_message.assert_called_once()
+        with _mock_settings(issue_triage=False):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "issues",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                await resp.json()
+                assert resp.status == 200
+                # Falls through to standard formatter, which sends a Telegram message
+                app["telegram_bot"].send_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_cooldown(self, _clear_cooldowns):
-        """Second opened event within cooldown returns triage_cooldown."""
-        app = _build_test_app(issue_triage_enabled=True)
+        """Second opened event within cooldown is silently skipped."""
+        app = _build_test_app()
         payload = _make_issue_payload("opened", issue_number=10)
         body = json.dumps(payload).encode()
         sig = _sign_payload(payload)
 
-        with patch("kai.webhook.triage.triage_issue", new_callable=AsyncMock):
+        with (
+            _mock_settings(issue_triage=True),
+            patch("kai.webhook.triage.triage_issue", new_callable=AsyncMock),
+        ):
             async with TestClient(TestServer(app)) as client:
                 # First event - triggers triage
                 resp1 = await client.post(
@@ -896,9 +956,9 @@ class TestIssueTriageRouting:
                         "X-Hub-Signature-256": sig,
                     },
                 )
-                assert (await resp1.json())["status"] == "triage_triggered"
+                assert (await resp1.json())["status"] == "ok"
 
-                # Second event - cooldown
+                # Second event - cooldown (silently skipped, still returns ok)
                 resp2 = await client.post(
                     "/webhook/github",
                     data=body,
@@ -907,29 +967,30 @@ class TestIssueTriageRouting:
                         "X-Hub-Signature-256": sig,
                     },
                 )
-                assert (await resp2.json())["msg"] == "triage_cooldown"
+                assert (await resp2.json())["status"] == "ok"
 
     @pytest.mark.asyncio
     async def test_closed_still_notifies(self, _clear_cooldowns):
         """Closed issues still go through the standard notification path."""
-        app = _build_test_app(issue_triage_enabled=True)
+        app = _build_test_app()
         payload = _make_issue_payload("closed")
         body = json.dumps(payload).encode()
         sig = _sign_payload(payload)
 
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/webhook/github",
-                data=body,
-                headers={
-                    "X-GitHub-Event": "issues",
-                    "X-Hub-Signature-256": sig,
-                },
-            )
-            await resp.json()
-            assert resp.status == 200
-            # Closed events fall through to standard formatter
-            app["telegram_bot"].send_message.assert_called_once()
+        with _mock_settings(issue_triage=True):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "issues",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                await resp.json()
+                assert resp.status == 200
+                # Closed events fall through to standard formatter
+                app["telegram_bot"].send_message.assert_called_once()
 
 
 # ── _handle_github exception handling ──────────────────────────────
@@ -941,7 +1002,7 @@ class TestGitHubExceptionHandler:
     @pytest.mark.asyncio
     async def test_exception_returns_500(self, _clear_cooldowns):
         """An unhandled exception in event processing returns 500."""
-        app = _build_test_app(pr_review_enabled=False)
+        app = _build_test_app()
         # Remove telegram_bot to trigger KeyError in _process_github_event
         del app["telegram_bot"]
         payload = {"action": "opened", "repository": {"full_name": "owner/repo"}}
@@ -981,7 +1042,7 @@ class TestGitHubExceptionHandler:
     @pytest.mark.asyncio
     async def test_happy_path_unaffected(self, _clear_cooldowns):
         """Normal event processing still returns 200."""
-        app = _build_test_app(pr_review_enabled=False)
+        app = _build_test_app()
         payload = {
             "ref": "refs/heads/main",
             "commits": [{"message": "test commit", "author": {"name": "dev"}}],
@@ -991,16 +1052,17 @@ class TestGitHubExceptionHandler:
         body = json.dumps(payload).encode()
         sig = _sign_payload(payload)
 
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/webhook/github",
-                data=body,
-                headers={
-                    "X-GitHub-Event": "push",
-                    "X-Hub-Signature-256": sig,
-                },
-            )
-            assert resp.status == 200
+        with _mock_settings():
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "push",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
 
 
 # ── Webhook health monitor ─────────────────────────────────────────
@@ -1118,12 +1180,17 @@ class TestWebhookHealthMonitor:
 
 
 class TestGitHubNotifyGroup:
-    """Tests for routing GitHub notifications to a separate Telegram group."""
+    """Tests for routing GitHub notifications to a per-user notify_chat_id.
+
+    The notify_chat_id is now resolved per-user via resolve_github_settings()
+    instead of a global app dict key. These tests verify that notifications
+    reach the correct destination based on the resolved settings.
+    """
 
     @pytest.mark.asyncio
     async def test_notification_routes_to_group(self, _clear_cooldowns):
-        """When github_notify_chat_id is set, notifications go to the group."""
-        app = _build_test_app(pr_review_enabled=False, github_notify_chat_id=-100999)
+        """When notify_chat_id resolves to a group, notifications go there."""
+        app = _build_test_app()
         payload = {
             "ref": "refs/heads/main",
             "commits": [{"message": "test", "author": {"name": "dev"}}],
@@ -1133,16 +1200,17 @@ class TestGitHubNotifyGroup:
         body = json.dumps(payload).encode()
         sig = _sign_payload(payload)
 
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/webhook/github",
-                data=body,
-                headers={
-                    "X-GitHub-Event": "push",
-                    "X-Hub-Signature-256": sig,
-                },
-            )
-            assert resp.status == 200
+        with _mock_settings(notify_chat_id=-100999):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "push",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
 
         # Notification should go to the group chat_id, not the default DM
         call_args = app["telegram_bot"].send_message.call_args
@@ -1150,8 +1218,8 @@ class TestGitHubNotifyGroup:
 
     @pytest.mark.asyncio
     async def test_notification_routes_to_dm_when_unset(self, _clear_cooldowns):
-        """When github_notify_chat_id is not set, notifications go to DM."""
-        app = _build_test_app(pr_review_enabled=False)
+        """When notify_chat_id resolves to user's DM, notifications go there."""
+        app = _build_test_app()
         payload = {
             "ref": "refs/heads/main",
             "commits": [{"message": "test", "author": {"name": "dev"}}],
@@ -1161,32 +1229,378 @@ class TestGitHubNotifyGroup:
         body = json.dumps(payload).encode()
         sig = _sign_payload(payload)
 
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/webhook/github",
-                data=body,
-                headers={
-                    "X-GitHub-Event": "push",
-                    "X-Hub-Signature-256": sig,
-                },
-            )
-            assert resp.status == 200
+        # notify_chat_id matches the admin chat_id (DM, not group)
+        with _mock_settings(notify_chat_id=12345):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "push",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
 
         # Notification should go to the default admin DM (12345)
         call_args = app["telegram_bot"].send_message.call_args
         assert call_args[0][0] == 12345
 
-    def test_app_without_group_has_no_key(self):
-        """App built without github_notify_chat_id has no key in app dict."""
-        app = _build_test_app(pr_review_enabled=False)
-        assert "github_notify_chat_id" not in app
 
-    def test_app_with_group_has_key(self):
-        """App built with github_notify_chat_id stores it in app dict."""
-        app = _build_test_app(pr_review_enabled=False, github_notify_chat_id=-100999)
-        assert app["github_notify_chat_id"] == -100999
+# ── _get_subscribed_users ──────────────────────────────────────────
 
-    def test_valid_negative_chat_id_parses(self):
-        """Telegram group IDs (negative numbers) are accepted."""
-        app = _build_test_app(pr_review_enabled=False, github_notify_chat_id=-1001234567890)
-        assert app["github_notify_chat_id"] == -1001234567890
+
+class TestGetSubscribedUsers:
+    """Tests for the per-user repo subscription lookup."""
+
+    def _make_config(self, user_configs: dict | None = None) -> AsyncMock:
+        """Build a mock Config with the given user_configs dict."""
+        config = AsyncMock()
+        config.user_configs = user_configs
+        return config
+
+    def _make_user(
+        self,
+        telegram_id: int,
+        name: str = "testuser",
+        repos: list[str] | None = None,
+    ) -> UserConfig:
+        """Build a UserConfig with the given github_repos."""
+        return UserConfig(
+            telegram_id=telegram_id,
+            name=name,
+            github_repos=repos or [],
+        )
+
+    def test_exact_match(self):
+        """User with matching repo is returned."""
+        user = self._make_user(111, repos=["dcellison/kai"])
+        config = self._make_config({111: user})
+        result = _get_subscribed_users(config, "dcellison/kai")
+        assert result == [user]
+
+    def test_case_insensitive(self):
+        """Repo matching is case-insensitive (GitHub repos are)."""
+        user = self._make_user(111, repos=["dcellison/kai"])
+        config = self._make_config({111: user})
+        result = _get_subscribed_users(config, "Dcellison/Kai")
+        assert result == [user]
+
+    def test_multiple_users(self):
+        """Multiple users subscribed to the same repo are all returned."""
+        user1 = self._make_user(111, name="alice", repos=["dcellison/kai"])
+        user2 = self._make_user(222, name="bob", repos=["dcellison/kai"])
+        config = self._make_config({111: user1, 222: user2})
+        result = _get_subscribed_users(config, "dcellison/kai")
+        assert len(result) == 2
+        assert user1 in result
+        assert user2 in result
+
+    def test_no_match(self):
+        """No users subscribed to the repo returns empty list."""
+        user = self._make_user(111, repos=["dcellison/other"])
+        config = self._make_config({111: user})
+        result = _get_subscribed_users(config, "dcellison/kai")
+        assert result == []
+
+    def test_no_user_configs(self):
+        """Config with user_configs=None returns empty list."""
+        config = self._make_config(None)
+        result = _get_subscribed_users(config, "dcellison/kai")
+        assert result == []
+
+
+# ── Per-user webhook routing ────────────────────────────────────────
+
+
+class TestPerUserRouting:
+    """Tests for per-user repo-based event routing.
+
+    These tests create apps with user_configs populated so that
+    _get_subscribed_users returns specific users. Each user's
+    feature flags are controlled via resolve_github_settings mock.
+    """
+
+    def _make_user_config(
+        self,
+        telegram_id: int,
+        name: str = "testuser",
+        repos: list[str] | None = None,
+    ) -> UserConfig:
+        """Build a UserConfig for routing tests."""
+        return UserConfig(
+            telegram_id=telegram_id,
+            name=name,
+            github_repos=repos or [],
+        )
+
+    def _make_config_with_users(self, users: list) -> AsyncMock:
+        """Build a mock Config with user_configs populated."""
+        config = AsyncMock()
+        config.user_configs = {u.telegram_id: u for u in users}
+        # get_user_config returns the UserConfig for a given ID
+        config.get_user_config = lambda uid: config.user_configs.get(uid)
+        return config
+
+    @pytest.mark.asyncio
+    async def test_event_routes_to_subscribed_user(self, _clear_cooldowns):
+        """Event for a subscribed repo reaches the correct user."""
+        user = self._make_user_config(111, repos=["owner/repo"])
+        config = self._make_config_with_users([user])
+        app = _build_test_app(config=config)
+        payload = {
+            "ref": "refs/heads/main",
+            "commits": [{"message": "test", "author": {"name": "dev"}}],
+            "repository": {"full_name": "owner/repo"},
+            "compare": "https://github.com/owner/repo/compare/a...b",
+        }
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        # Mock resolve_github_settings to route to user 111's DM
+        with _mock_settings(notify_chat_id=111):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "push",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+        # Notification should go to user 111, not the admin (12345)
+        call_args = app["telegram_bot"].send_message.call_args
+        assert call_args[0][0] == 111
+
+    @pytest.mark.asyncio
+    async def test_event_routes_to_multiple_users(self, _clear_cooldowns):
+        """Event for a repo subscribed by two users reaches both."""
+        user1 = self._make_user_config(111, name="alice", repos=["owner/repo"])
+        user2 = self._make_user_config(222, name="bob", repos=["owner/repo"])
+        config = self._make_config_with_users([user1, user2])
+        app = _build_test_app(config=config)
+        payload = {
+            "ref": "refs/heads/main",
+            "commits": [{"message": "test", "author": {"name": "dev"}}],
+            "repository": {"full_name": "owner/repo"},
+            "compare": "https://github.com/owner/repo/compare/a...b",
+        }
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        # Return different notify_chat_id per user so we can verify both
+        call_count = 0
+
+        async def _per_user_settings(chat_id, config):
+            nonlocal call_count
+            call_count += 1
+            return {
+                "repos": [],
+                "notify_chat_id": chat_id,
+                "pr_review": False,
+                "issue_triage": False,
+            }
+
+        with patch(
+            "kai.webhook.sessions.resolve_github_settings",
+            side_effect=_per_user_settings,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "push",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+        # Both users should receive notifications
+        assert app["telegram_bot"].send_message.call_count == 2
+        sent_to = {c[0][0] for c in app["telegram_bot"].send_message.call_args_list}
+        assert sent_to == {111, 222}
+
+    @pytest.mark.asyncio
+    async def test_event_fallback_to_admin(self, _clear_cooldowns):
+        """No subscribers for a repo routes to the admin chat_id."""
+        # User subscribed to a different repo
+        user = self._make_user_config(111, repos=["owner/other-repo"])
+        config = self._make_config_with_users([user])
+        app = _build_test_app(config=config)
+        payload = {
+            "ref": "refs/heads/main",
+            "commits": [{"message": "test", "author": {"name": "dev"}}],
+            "repository": {"full_name": "owner/repo"},
+            "compare": "https://github.com/owner/repo/compare/a...b",
+        }
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        # Fallback resolves settings for admin (12345)
+        with _mock_settings(notify_chat_id=12345):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "push",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+        # Should go to admin chat_id (12345), not user 111
+        call_args = app["telegram_bot"].send_message.call_args
+        assert call_args[0][0] == 12345
+
+    @pytest.mark.asyncio
+    async def test_pr_review_per_user_flag(self, _clear_cooldowns, _mock_resolve_repo):
+        """Only users with pr_review=True trigger review."""
+        user = self._make_user_config(111, repos=["owner/repo"])
+        config = self._make_config_with_users([user])
+        app = _build_test_app(config=config)
+        payload = _make_pr_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with (
+            _mock_settings(pr_review=True, notify_chat_id=111),
+            patch("kai.webhook.review.review_pr", new_callable=AsyncMock) as mock_review,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+            # Allow background task to complete
+            await asyncio.sleep(0.01)
+            mock_review.assert_called_once()
+            # Verify notify_chat_id is passed to the review agent
+            assert mock_review.call_args[1]["notify_chat_id"] == 111
+
+    @pytest.mark.asyncio
+    async def test_issue_triage_per_user_flag(self, _clear_cooldowns):
+        """Only users with issue_triage=True trigger triage."""
+        user = self._make_user_config(111, repos=["owner/repo"])
+        config = self._make_config_with_users([user])
+        app = _build_test_app(config=config)
+        payload = _make_issue_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with (
+            _mock_settings(issue_triage=True, notify_chat_id=111),
+            patch("kai.webhook.triage.triage_issue", new_callable=AsyncMock) as mock_triage,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "issues",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+            # Allow background task to complete
+            await asyncio.sleep(0.01)
+            mock_triage.assert_called_once()
+            # Verify notify_chat_id is passed to the triage agent
+            assert mock_triage.call_args[1]["notify_chat_id"] == 111
+
+    @pytest.mark.asyncio
+    async def test_cooldown_shared_across_users(self, _clear_cooldowns, _mock_resolve_repo):
+        """One review per PR per cooldown window regardless of subscriber count.
+
+        The cooldown dict is server-level, so if user A triggers a review
+        for PR #42, user B's subscription won't trigger a second review.
+        """
+        user1 = self._make_user_config(111, name="alice", repos=["owner/repo"])
+        user2 = self._make_user_config(222, name="bob", repos=["owner/repo"])
+        config = self._make_config_with_users([user1, user2])
+        app = _build_test_app(config=config)
+        payload = _make_pr_payload("opened", pr_number=42)
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        review_count = 0
+
+        async def _per_user_settings(chat_id, config):
+            return {
+                "repos": [],
+                "notify_chat_id": chat_id,
+                "pr_review": True,
+                "issue_triage": False,
+            }
+
+        async def _counting_review(*args, **kwargs):
+            nonlocal review_count
+            review_count += 1
+
+        with (
+            patch(
+                "kai.webhook.sessions.resolve_github_settings",
+                side_effect=_per_user_settings,
+            ),
+            patch("kai.webhook.review.review_pr", side_effect=_counting_review),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+            # Allow background tasks to complete
+            await asyncio.sleep(0.01)
+
+        # Only one review should have been launched despite two subscribers.
+        # The second user hits the cooldown set by the first user's review.
+        assert review_count == 1
+
+    @pytest.mark.asyncio
+    async def test_standard_notification_per_user(self, _clear_cooldowns):
+        """Push events are formatted and sent to each subscribed user's notify_chat_id."""
+        user = self._make_user_config(111, repos=["owner/repo"])
+        config = self._make_config_with_users([user])
+        app = _build_test_app(config=config)
+        payload = {
+            "ref": "refs/heads/main",
+            "commits": [{"message": "test", "author": {"name": "dev"}}],
+            "repository": {"full_name": "owner/repo"},
+            "compare": "https://github.com/owner/repo/compare/a...b",
+            "pusher": {"name": "testuser"},
+        }
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        # Route notification to user's group chat
+        with _mock_settings(notify_chat_id=-100999):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "push",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+        # Notification should go to the user's notify_chat_id, not their DM
+        call_args = app["telegram_bot"].send_message.call_args
+        assert call_args[0][0] == -100999

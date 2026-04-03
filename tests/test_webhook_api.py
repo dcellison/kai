@@ -580,12 +580,21 @@ def _sign_body(secret: str, body: bytes) -> str:
 
 @pytest.fixture()
 def github_request():
-    """Create a mock request for the GitHub webhook endpoint."""
+    """Create a mock request for the GitHub webhook endpoint.
+
+    Includes a mock config with user_configs=None (no per-user routing)
+    and mocks resolve_github_settings to return defaults. This simulates
+    fallback routing where events go to the admin chat_id.
+    """
+    mock_config = MagicMock()
+    mock_config.user_configs = None
     request = MagicMock(spec=web.Request)
     request.app = {
         "webhook_secret": "test-secret",
         "telegram_bot": AsyncMock(),
         "chat_id": 12345,
+        "config": mock_config,
+        "pr_review_cooldown": 300,
     }
     request.headers = {}
     return request
@@ -606,6 +615,26 @@ def _github_push_payload() -> dict:
 
 
 class TestGitHubWebhook:
+    @pytest.fixture(autouse=True)
+    def _mock_github_settings(self):
+        """Mock resolve_github_settings for all GitHub webhook tests.
+
+        Returns default settings (no review, no triage, admin chat_id)
+        so the standard notification path fires for push/issues events.
+        """
+        settings = {
+            "repos": [],
+            "notify_chat_id": 12345,
+            "pr_review": False,
+            "issue_triage": False,
+        }
+        with patch(
+            "kai.webhook.sessions.resolve_github_settings",
+            new_callable=AsyncMock,
+            return_value=settings,
+        ):
+            yield
+
     async def test_valid_push_sends_markdown(self, github_request):
         """Valid signature + push event sends a Markdown-formatted message."""
         payload = _github_push_payload()
@@ -642,8 +671,13 @@ class TestGitHubWebhook:
         assert resp.status == 200
         assert bot.send_message.call_count == 2
 
-    async def test_both_sends_fail_returns_error(self, github_request):
-        """When both Markdown and plain text fail, returns error response."""
+    async def test_both_sends_fail_logs_error(self, github_request):
+        """When both Markdown and plain text fail, error is logged but HTTP returns ok.
+
+        Per-user routing handles send failures per-user (logged, not
+        surfaced in HTTP response) since GitHub doesn't retry based on
+        response codes anyway.
+        """
         payload = _github_push_payload()
         body = json.dumps(payload).encode()
         github_request.read = AsyncMock(return_value=body)
@@ -656,8 +690,9 @@ class TestGitHubWebhook:
 
         resp = await _handle_github(github_request)
 
+        # Both sends failed, but HTTP response is still ok (error logged)
         body_json = json.loads(resp.body.decode())
-        assert body_json["msg"] == "error"
+        assert body_json["status"] == "ok"
 
     async def test_invalid_signature_returns_401(self, github_request):
         """Requests with an invalid HMAC signature are rejected."""
@@ -689,7 +724,7 @@ class TestGitHubWebhook:
         github_request.app["telegram_bot"].send_message.assert_not_called()
 
     async def test_unknown_event_type_ignored(self, github_request):
-        """Unsupported event types (e.g. 'star') are silently ignored."""
+        """Unsupported event types (e.g. 'star') are silently acknowledged."""
         payload = {"action": "created"}
         body = json.dumps(payload).encode()
         github_request.read = AsyncMock(return_value=body)
@@ -701,7 +736,10 @@ class TestGitHubWebhook:
         resp = await _handle_github(github_request)
 
         body_json = json.loads(resp.body.decode())
-        assert body_json["msg"] == "ignored"
+        # Per-user routing always returns "ok" - the event is still
+        # silently dropped (no formatter, no notification sent)
+        assert body_json["status"] == "ok"
+        github_request.app["telegram_bot"].send_message.assert_not_called()
 
     async def test_filtered_action_ignored(self, github_request):
         """Known event type with filtered action (e.g. PR 'edited') is ignored."""
@@ -717,7 +755,10 @@ class TestGitHubWebhook:
         resp = await _handle_github(github_request)
 
         body_json = json.loads(resp.body.decode())
-        assert body_json["msg"] == "ignored"
+        # Per-user routing always returns "ok" - the formatter returns
+        # None for "edited" so no notification is sent
+        assert body_json["status"] == "ok"
+        github_request.app["telegram_bot"].send_message.assert_not_called()
 
     async def test_invalid_json_after_valid_signature_returns_400(self, github_request):
         """Valid signature over malformed JSON body returns 400."""
