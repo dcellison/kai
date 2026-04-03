@@ -560,9 +560,15 @@ async def build_workspace_config(
     if "model" in db_settings:
         model = db_settings["model"]
     if "budget" in db_settings:
-        budget = float(db_settings["budget"])
+        try:
+            budget = float(db_settings["budget"])
+        except (ValueError, TypeError):
+            log.warning("Corrupt budget in DB for chat %d workspace %s", chat_id, workspace_path)
     if "timeout" in db_settings:
-        timeout = int(db_settings["timeout"])
+        try:
+            timeout = int(db_settings["timeout"])
+        except (ValueError, TypeError):
+            log.warning("Corrupt timeout in DB for chat %d workspace %s", chat_id, workspace_path)
     if "env" in db_settings:
         # DB env vars merge on top of YAML env vars (not replace).
         # This lets admins set baseline env vars in YAML and users

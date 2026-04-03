@@ -1044,24 +1044,30 @@ async def _show_workspace_config(
     lines.append(f"  Model: {model} ({_source('model')})")
 
     # Budget
-    budget = (
-        float(db_settings["budget"])
-        if "budget" in db_settings
-        else yaml_config.budget
-        if yaml_config and yaml_config.budget is not None
-        else config.claude_max_budget_usd
-    )
-    lines.append(f"  Budget: ${budget:.2f} ({_source('budget')})")
+    try:
+        budget = (
+            float(db_settings["budget"])
+            if "budget" in db_settings
+            else yaml_config.budget
+            if yaml_config and yaml_config.budget is not None
+            else config.claude_max_budget_usd
+        )
+        lines.append(f"  Budget: ${budget:.2f} ({_source('budget')})")
+    except (ValueError, TypeError):
+        lines.append("  Budget: (corrupted - reset with /workspace config reset budget)")
 
     # Timeout
-    timeout = (
-        int(db_settings["timeout"])
-        if "timeout" in db_settings
-        else yaml_config.timeout
-        if yaml_config and yaml_config.timeout is not None
-        else config.claude_timeout_seconds
-    )
-    lines.append(f"  Timeout: {timeout}s ({_source('timeout')})")
+    try:
+        timeout = (
+            int(db_settings["timeout"])
+            if "timeout" in db_settings
+            else yaml_config.timeout
+            if yaml_config and yaml_config.timeout is not None
+            else config.claude_timeout_seconds
+        )
+        lines.append(f"  Timeout: {timeout}s ({_source('timeout')})")
+    except (ValueError, TypeError):
+        lines.append("  Timeout: (corrupted - reset with /workspace config reset timeout)")
 
     # Env vars (show keys only, not values - may contain secrets)
     env_keys: list[str] = []
