@@ -458,6 +458,63 @@ async def delete_setting(key: str) -> None:
     await _get_db().commit()
 
 
+# ── Workspace config overrides ─────────────────────────────────────
+# Per-user-per-workspace settings stored in the generic settings table.
+# Keys are namespaced as ws_config:{chat_id}:{workspace_path}:{field}.
+# Each user has independent overrides, so User A can set opus on a repo
+# while User B uses sonnet on the same repo.
+
+
+async def get_workspace_config_settings(
+    chat_id: int, workspace_path: str
+) -> dict[str, str]:
+    """
+    Get all config overrides for a user's workspace.
+
+    Returns a dict of field->value pairs (e.g., {"model": "opus",
+    "budget": "20.0"}). Values are strings; callers parse as needed.
+    Config is per-user-per-workspace: each user has independent overrides.
+    """
+    prefix = f"ws_config:{chat_id}:{workspace_path}:"
+    async with _get_db().execute(
+        "SELECT key, value FROM settings WHERE key LIKE ?",
+        (prefix + "%",),
+    ) as cursor:
+        rows = await cursor.fetchall()
+        return {
+            row["key"].removeprefix(prefix): row["value"]
+            for row in rows
+        }
+
+
+async def set_workspace_config_setting(
+    chat_id: int, workspace_path: str, field: str, value: str
+) -> None:
+    """Set a single workspace config field for this user."""
+    key = f"ws_config:{chat_id}:{workspace_path}:{field}"
+    await set_setting(key, value)
+
+
+async def delete_workspace_config_setting(
+    chat_id: int, workspace_path: str, field: str
+) -> None:
+    """Remove a single workspace config field override for this user."""
+    key = f"ws_config:{chat_id}:{workspace_path}:{field}"
+    await delete_setting(key)
+
+
+async def delete_all_workspace_config(
+    chat_id: int, workspace_path: str
+) -> None:
+    """Remove all config overrides for this user's workspace."""
+    prefix = f"ws_config:{chat_id}:{workspace_path}:"
+    await _get_db().execute(
+        "DELETE FROM settings WHERE key LIKE ?",
+        (prefix + "%",),
+    )
+    await _get_db().commit()
+
+
 # ── Workspace history ────────────────────────────────────────────────
 
 

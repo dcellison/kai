@@ -279,6 +279,82 @@ class TestSettings:
         assert await sessions.get_setting("key") is None
 
 
+# ── Workspace config overrides ─────────────────────────────────────
+
+
+class TestWorkspaceConfigSettings:
+    """Tests for per-user-per-workspace config stored in the settings table."""
+
+    async def test_empty_for_unconfigured(self, db):
+        """Returns empty dict when no overrides exist."""
+        result = await sessions.get_workspace_config_settings(111, "/some/path")
+        assert result == {}
+
+    async def test_set_and_get(self, db):
+        """Set a field and retrieve it."""
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "opus")
+        result = await sessions.get_workspace_config_settings(111, "/projects/kai")
+        assert result == {"model": "opus"}
+
+    async def test_set_multiple_fields(self, db):
+        """Multiple fields for the same workspace are returned together."""
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "opus")
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "budget", "20.0")
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "timeout", "300")
+        result = await sessions.get_workspace_config_settings(111, "/projects/kai")
+        assert result == {"model": "opus", "budget": "20.0", "timeout": "300"}
+
+    async def test_delete_single_field(self, db):
+        """Deleting one field leaves others intact."""
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "opus")
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "budget", "20.0")
+        await sessions.delete_workspace_config_setting(111, "/projects/kai", "model")
+        result = await sessions.get_workspace_config_settings(111, "/projects/kai")
+        assert result == {"budget": "20.0"}
+
+    async def test_delete_all(self, db):
+        """Bulk delete removes all overrides for a workspace."""
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "opus")
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "budget", "20.0")
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "timeout", "300")
+        await sessions.delete_all_workspace_config(111, "/projects/kai")
+        result = await sessions.get_workspace_config_settings(111, "/projects/kai")
+        assert result == {}
+
+    async def test_workspace_isolation(self, db):
+        """Settings for workspace A don't leak into workspace B."""
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "opus")
+        await sessions.set_workspace_config_setting(111, "/projects/anvil", "model", "haiku")
+        kai = await sessions.get_workspace_config_settings(111, "/projects/kai")
+        anvil = await sessions.get_workspace_config_settings(111, "/projects/anvil")
+        assert kai == {"model": "opus"}
+        assert anvil == {"model": "haiku"}
+
+    async def test_user_isolation(self, db):
+        """Settings for user A don't leak into user B on the same workspace."""
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "opus")
+        await sessions.set_workspace_config_setting(222, "/projects/kai", "model", "haiku")
+        user_a = await sessions.get_workspace_config_settings(111, "/projects/kai")
+        user_b = await sessions.get_workspace_config_settings(222, "/projects/kai")
+        assert user_a == {"model": "opus"}
+        assert user_b == {"model": "haiku"}
+
+    async def test_delete_all_preserves_other_workspaces(self, db):
+        """Bulk delete for workspace A doesn't touch workspace B."""
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "opus")
+        await sessions.set_workspace_config_setting(111, "/projects/anvil", "model", "haiku")
+        await sessions.delete_all_workspace_config(111, "/projects/kai")
+        assert await sessions.get_workspace_config_settings(111, "/projects/kai") == {}
+        assert await sessions.get_workspace_config_settings(111, "/projects/anvil") == {"model": "haiku"}
+
+    async def test_overwrite_existing_field(self, db):
+        """Setting a field that already exists overwrites it."""
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "opus")
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "sonnet")
+        result = await sessions.get_workspace_config_settings(111, "/projects/kai")
+        assert result == {"model": "sonnet"}
+
+
 # ── Workspace history ────────────────────────────────────────────────
 
 
