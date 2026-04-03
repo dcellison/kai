@@ -237,7 +237,10 @@ class SubprocessPool:
                 except (ValueError, TypeError):
                     log.warning("Corrupt timeout in DB for user %d", chat_id)
 
-            # Context window: CLI flag (--settings), requires restart if changed
+            # Context window: CLI flag (--settings), requires restart if changed.
+            # No workspace-config guard here because WorkspaceConfig doesn't
+            # have a context_window field. If one is added, guard this block
+            # the same way model/budget/timeout are guarded above.
             if "context_window" in db_settings:
                 try:
                     new_ctx = int(db_settings["context_window"])
