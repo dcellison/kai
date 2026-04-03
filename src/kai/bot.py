@@ -346,9 +346,9 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # Keys must match VALID_MODELS in config.py (the single source of truth
 # for valid model identifiers). Values are display names for Telegram.
 _AVAILABLE_MODELS = {
-    "opus": "\U0001f9e0 Claude Opus 4.6",
-    "sonnet": "\u26a1 Claude Sonnet 4.5",
-    "haiku": "\U0001fab6 Claude Haiku 4.5",
+    "opus": "\U0001f9e0 Claude Opus",
+    "sonnet": "\u26a1 Claude Sonnet",
+    "haiku": "\U0001fab6 Claude Haiku",
 }
 
 
