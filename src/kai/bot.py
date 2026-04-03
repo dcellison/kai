@@ -629,13 +629,15 @@ async def _show_settings(update: Update, chat_id: int, config: Config) -> None:
         if yaml_ctx is not None
         else config.claude_max_context_window
     )
-    ctx_src = (
-        "user override"
-        if "context_window" in db_settings
-        else "users.yaml"
-        if yaml_ctx is not None
-        else "global default"
-    )
+    # Source attribution. When the user explicitly sets context to 0
+    # (meaning "use the Claude Code default"), show "global default"
+    # instead of "user override" - the intent was to revert, not override.
+    if "context_window" in db_settings and ctx_val > 0:
+        ctx_src = "user override"
+    elif "context_window" not in db_settings and yaml_ctx is not None:
+        ctx_src = "users.yaml"
+    else:
+        ctx_src = "global default"
     ctx_label = f"{ctx_val:,} tokens" if ctx_val > 0 else "default"
 
     # Budget ceiling - show when a positive ceiling exists so the user
