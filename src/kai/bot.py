@@ -929,9 +929,10 @@ async def _handle_workspace_config(
     # /workspace config reset [field]
     if field == "reset":
         if value:
-            await sessions.delete_workspace_config_setting(chat_id, workspace_str, value)
+            field_to_reset = value.lower()
+            await sessions.delete_workspace_config_setting(chat_id, workspace_str, field_to_reset)
             await _apply_config_change(context, chat_id, workspace, config)
-            await update.message.reply_text(f"{value} reset to default.")
+            await update.message.reply_text(f"{field_to_reset} reset to default.")
         else:
             await sessions.delete_all_workspace_config(chat_id, workspace_str)
             await _apply_config_change(context, chat_id, workspace, config)
