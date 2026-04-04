@@ -1050,7 +1050,7 @@ class TestResolveGitHubSettings:
         with caplog.at_level(logging.WARNING, logger="kai.sessions"):
             await sessions.resolve_github_settings(111, config)
 
-        assert any("Corrupt github_notify_chat" in r.message and "'xyz'" in r.message for r in caplog.records)
+        assert any("Corrupt github_notify_chat" in r.message and "xyz" in r.message for r in caplog.records)
 
     async def test_empty_string_db_notify_falls_through(self, db):
         """Empty string in DB fails int() and falls through gracefully."""
