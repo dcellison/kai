@@ -49,7 +49,7 @@ from datetime import datetime
 from pathlib import Path
 
 from aiohttp import web
-from telegram import Update
+from telegram import Bot, Update
 
 from kai import cron, review, services, sessions, triage
 from kai.config import DATA_DIR, IMAGE_EXTENSIONS, Config, UserConfig
@@ -649,7 +649,7 @@ async def _process_github_event_for_user(
     request: web.Request,
     payload: dict,
     event_type: str,
-    bot: object,
+    bot: Bot,
     config: Config,
     chat_id: int,
 ) -> None:
