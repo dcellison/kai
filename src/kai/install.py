@@ -294,12 +294,6 @@ def _cmd_config() -> None:
     users_yaml_path = PROJECT_ROOT / "users.yaml"
     users_yaml_exists = users_yaml_path.exists()
 
-    # Check if users.yaml already exists (either location). When it
-    # does, per-user config is the primary path and deprecated env vars
-    # should not be prompted - they would just create confusion.
-    # Initialized here, finalized after the /etc/kai/ check below.
-    has_users_yaml = users_yaml_exists
-
     if not users_yaml_exists:
         # /etc/kai/users.yaml is mode 0600 owned by root. Whether
         # Path.exists() works depends on the parent directory permissions;
@@ -309,7 +303,6 @@ def _cmd_config() -> None:
         etc_users = Path("/etc/kai/users.yaml")
         if etc_users.exists():
             users_yaml_exists = True
-            has_users_yaml = True
 
     # Track whether advanced mode set os_user, so we can skip the
     # CLAUDE_USER prompt later (section 8). Needs to be in scope
@@ -419,7 +412,7 @@ def _cmd_config() -> None:
     # When users.yaml exists, model/timeout/budget/context are per-user
     # settings managed via /settings commands or users.yaml fields.
     # Only prompt for truly global Claude settings (autocompact).
-    if has_users_yaml:
+    if users_yaml_exists:
         print("-- Claude --")
         print("  Model, timeout, budget, and context window are now per-user.")
         print("  Set defaults in users.yaml or let users configure via /settings.")
@@ -506,7 +499,7 @@ def _cmd_config() -> None:
     print()
 
     # -- Workspaces --
-    if has_users_yaml:
+    if users_yaml_exists:
         print("-- Workspaces --")
         print("  Workspace base and allowed workspaces are now per-user.")
         print("  Set workspace_base in users.yaml. Users manage allowed")
@@ -531,7 +524,7 @@ def _cmd_config() -> None:
     print()
 
     # -- PR review agent --
-    if has_users_yaml:
+    if users_yaml_exists:
         print("-- PR review agent --")
         print("  PR review is now per-user. Set 'pr_review' in users.yaml")
         print("  or let users toggle via /github reviews on|off.")
@@ -557,7 +550,7 @@ def _cmd_config() -> None:
 
     # -- Issue triage agent --
     # Independent from PR review - you might want one without the other.
-    if has_users_yaml:
+    if users_yaml_exists:
         print("-- Issue triage agent --")
         print("  Issue triage is now per-user. Set 'issue_triage' in users.yaml")
         print("  or let users toggle via /github triage on|off.")
@@ -571,7 +564,7 @@ def _cmd_config() -> None:
     print()
 
     # -- GitHub notifications --
-    if has_users_yaml:
+    if users_yaml_exists:
         print("-- GitHub notifications --")
         print("  Notification routing is now per-user. Set 'github_notify_chat_id'")
         print("  in users.yaml or let users configure via /github notify.")
@@ -605,7 +598,7 @@ def _cmd_config() -> None:
     # or if users.yaml exists (os_user is per-user there).
     # CLAUDE_USER is the global fallback; os_user in users.yaml takes
     # precedence per-user at runtime.
-    if has_users_yaml:
+    if users_yaml_exists:
         # os_user is set per-user in users.yaml; skip the global prompt
         claude_user = ""
     elif admin_os_user:
@@ -637,7 +630,7 @@ def _cmd_config() -> None:
 
     # Deprecated per-user vars: only include without users.yaml
     # (legacy single-user mode). With users.yaml, these are noise.
-    if not has_users_yaml:
+    if not users_yaml_exists:
         env["CLAUDE_MODEL"] = model
         env["CLAUDE_TIMEOUT_SECONDS"] = timeout
         env["CLAUDE_MAX_BUDGET_USD"] = budget
@@ -646,7 +639,7 @@ def _cmd_config() -> None:
     # Compare as int to handle inputs like "000" that pass validation.
     # CLAUDE_MAX_CONTEXT_WINDOW is deprecated (per-user), but
     # CLAUDE_AUTOCOMPACT_PCT is truly global (machine resource limit).
-    if not has_users_yaml and max_context_window and int(max_context_window) != 0:
+    if not users_yaml_exists and max_context_window and int(max_context_window) != 0:
         env["CLAUDE_MAX_CONTEXT_WINDOW"] = max_context_window
     if int(autocompact_pct) != 0:
         env["CLAUDE_AUTOCOMPACT_PCT"] = autocompact_pct
@@ -662,7 +655,7 @@ def _cmd_config() -> None:
         env["PERPLEXITY_API_KEY"] = perplexity_key
 
     # Deprecated per-user optional vars: only write without users.yaml
-    if not has_users_yaml:
+    if not users_yaml_exists:
         if workspace_base:
             env["WORKSPACE_BASE"] = workspace_base
         if allowed_workspaces:
@@ -679,8 +672,9 @@ def _cmd_config() -> None:
             env["GITHUB_NOTIFY_CHAT_ID"] = github_notify_chat_id
     else:
         # PR_REVIEW_COOLDOWN is a global rate limit - always write it
-        # when review is enabled for any user, even with users.yaml.
-        if pr_review_enabled and pr_review_cooldown != "300":
+        # if non-default, since any user may have PR review enabled
+        # via users.yaml even when the global env var is unset.
+        if pr_review_cooldown != "300":
             env["PR_REVIEW_COOLDOWN"] = pr_review_cooldown
 
     # Build and write install.conf

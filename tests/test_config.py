@@ -1,5 +1,6 @@
 """Tests for config.py load_config(), DATA_DIR, _read_protected_file(), and resolve_claude_user()."""
 
+import logging
 import os
 import pwd
 import subprocess
@@ -680,7 +681,8 @@ class TestDeprecationWarnings:
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
         monkeypatch.setenv(var, value)
         _mock_user_configs(monkeypatch)
-        load_config()
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
         assert f"{var} in env is deprecated" in caplog.text
 
     def test_no_warning_without_users_yaml(self, monkeypatch, caplog):
@@ -689,7 +691,8 @@ class TestDeprecationWarnings:
         monkeypatch.setenv("CLAUDE_MODEL", "opus")
         # _load_user_configs returns None (no users.yaml) by default
         # because _clean_env patches _read_protected_file to None
-        load_config()
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
         assert "deprecated" not in caplog.text.lower()
 
     def test_empty_var_does_not_warn(self, monkeypatch, caplog):
@@ -699,7 +702,8 @@ class TestDeprecationWarnings:
         # CLAUDE_MODEL fails the model validation step downstream.
         monkeypatch.setenv("CLAUDE_USER", "")
         _mock_user_configs(monkeypatch)
-        load_config()
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
         assert "CLAUDE_USER in env is deprecated" not in caplog.text
 
 
