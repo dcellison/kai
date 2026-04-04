@@ -588,14 +588,23 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
     subscribed_users = _get_subscribed_users(config, repo_full_name)
 
     if not subscribed_users:
-        # No user subscribed to this repo. Log a warning so the admin
-        # knows events are arriving for an untracked repo. Don't silently
-        # drop - this helps diagnose misconfigured webhooks.
-        log.warning(
-            "GitHub %s event for %s: no subscribed users",
-            event_type,
-            repo_full_name,
-        )
+        # No subscribers for this repo. If user_configs exist (someone
+        # has github_repos configured), this is likely a misconfiguration
+        # worth warning about. If no user_configs exist at all, this is
+        # just a single-user install using the legacy admin fallback -
+        # log at debug to avoid noise on every webhook event.
+        if config.user_configs:
+            log.warning(
+                "GitHub %s event for %s: no subscribed users",
+                event_type,
+                repo_full_name,
+            )
+        else:
+            log.debug(
+                "GitHub %s event for %s: no user_configs, using admin fallback",
+                event_type,
+                repo_full_name,
+            )
         # Fall back to legacy behavior: route to the default admin.
         # request.app["chat_id"] is set in webhook.start() to the first
         # admin in users.yaml or the first ALLOWED_USER_IDS entry.
