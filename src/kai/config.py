@@ -1127,6 +1127,31 @@ def load_config() -> Config:
         # but is the legacy path - nudge toward users.yaml.
         log.info("Using ALLOWED_USER_IDS from env (legacy). Run 'make config' to migrate to users.yaml.")
 
+    # Deprecation warnings for env vars superseded by users.yaml.
+    # The vars still work as global fallbacks, but users.yaml is the
+    # primary configuration path. Warnings guide admins to migrate.
+    if user_configs is not None:
+        _deprecated_env_vars = {
+            "CLAUDE_MODEL": "Set per-user 'model' in users.yaml or use /settings model",
+            "CLAUDE_MAX_BUDGET_USD": "Set per-user 'max_budget' in users.yaml or use /settings budget",
+            "CLAUDE_TIMEOUT_SECONDS": "Set per-user 'timeout' in users.yaml or use /settings timeout",
+            "CLAUDE_MAX_CONTEXT_WINDOW": "Set per-user 'context_window' in users.yaml or use /settings context",
+            "CLAUDE_USER": "Set per-user 'os_user' in users.yaml",
+            "WORKSPACE_BASE": "Set per-user 'workspace_base' in users.yaml",
+            "ALLOWED_WORKSPACES": "Users can manage their own via /workspace allow",
+            "PR_REVIEW_ENABLED": "Set per-user 'pr_review' in users.yaml or use /github reviews",
+            "ISSUE_TRIAGE_ENABLED": "Set per-user 'issue_triage' in users.yaml or use /github triage",
+            "GITHUB_NOTIFY_CHAT_ID": "Set per-user 'github_notify_chat_id' in users.yaml or use /github notify",
+        }
+        for var, guidance in _deprecated_env_vars.items():
+            if os.environ.get(var, "").strip():
+                log.warning(
+                    "%s in env is deprecated (users.yaml exists). %s. "
+                    "This env var will be removed in a future release.",
+                    var,
+                    guidance,
+                )
+
     # Validate CLAUDE_MODEL against the same VALID_MODELS set used
     # for workspace config. Catches typos at startup instead of
     # letting them propagate to a confusing runtime failure.

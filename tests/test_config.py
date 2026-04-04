@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kai.config import _read_protected_file, load_config, resolve_claude_user
+from kai.config import UserConfig, _read_protected_file, load_config, resolve_claude_user
 
 # All env vars that load_config reads
 _CONFIG_ENV_VARS = [
@@ -637,3 +637,67 @@ class TestResolveClaudeUser:
         """When pwd.getpwuid raises KeyError, returns claude_user unchanged."""
         monkeypatch.setattr("kai.config.pwd.getpwuid", MagicMock(side_effect=KeyError("no entry")))
         assert resolve_claude_user("container_user") == "container_user"
+
+
+# ── Deprecation warnings ────────────────────────────────────────────
+
+
+def _mock_user_configs(monkeypatch):
+    """Patch _load_user_configs to return a minimal user config dict.
+
+    When _load_user_configs returns a dict (not None), the deprecation
+    warning block fires because it means users.yaml exists.
+    """
+    user = UserConfig(telegram_id=123, name="testuser")
+    monkeypatch.setattr(
+        "kai.config._load_user_configs",
+        lambda: {123: user},
+    )
+
+
+# Deprecated env vars and representative test values. /tmp is used
+# for path vars because it always exists on both macOS and Linux.
+_DEPRECATED_VARS_WITH_VALUES = {
+    "CLAUDE_MODEL": "sonnet",
+    "CLAUDE_MAX_BUDGET_USD": "10.0",
+    "CLAUDE_TIMEOUT_SECONDS": "120",
+    "CLAUDE_MAX_CONTEXT_WINDOW": "200000",
+    "CLAUDE_USER": "kai",
+    "WORKSPACE_BASE": "/tmp",
+    "ALLOWED_WORKSPACES": "/tmp",
+    "PR_REVIEW_ENABLED": "true",
+    "ISSUE_TRIAGE_ENABLED": "true",
+    "GITHUB_NOTIFY_CHAT_ID": "12345",
+}
+
+
+class TestDeprecationWarnings:
+    """Verify deprecated env vars emit warnings when users.yaml exists."""
+
+    @pytest.mark.parametrize("var,value", _DEPRECATED_VARS_WITH_VALUES.items())
+    def test_warns_when_users_yaml_exists(self, monkeypatch, caplog, var, value):
+        """Deprecated env var emits warning when users.yaml is present."""
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
+        monkeypatch.setenv(var, value)
+        _mock_user_configs(monkeypatch)
+        load_config()
+        assert f"{var} in env is deprecated" in caplog.text
+
+    def test_no_warning_without_users_yaml(self, monkeypatch, caplog):
+        """Deprecated env vars do NOT warn when users.yaml is absent."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_MODEL", "opus")
+        # _load_user_configs returns None (no users.yaml) by default
+        # because _clean_env patches _read_protected_file to None
+        load_config()
+        assert "deprecated" not in caplog.text.lower()
+
+    def test_empty_var_does_not_warn(self, monkeypatch, caplog):
+        """Empty string env vars are not treated as 'set'."""
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
+        # Use CLAUDE_USER instead of CLAUDE_MODEL because an empty
+        # CLAUDE_MODEL fails the model validation step downstream.
+        monkeypatch.setenv("CLAUDE_USER", "")
+        _mock_user_configs(monkeypatch)
+        load_config()
+        assert "CLAUDE_USER in env is deprecated" not in caplog.text
