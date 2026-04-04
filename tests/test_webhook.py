@@ -1418,6 +1418,8 @@ class TestPerUserRouting:
                 )
                 assert resp.status == 200
 
+        # Resolver called once per subscribed user
+        assert call_count == 2
         # Both users should receive notifications
         assert app["telegram_bot"].send_message.call_count == 2
         sent_to = {c[0][0] for c in app["telegram_bot"].send_message.call_args_list}
