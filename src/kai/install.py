@@ -599,7 +599,7 @@ def _cmd_config() -> None:
     # CLAUDE_USER is the global fallback; os_user in users.yaml takes
     # precedence per-user at runtime.
     if users_yaml_exists:
-        # os_user is set per-user in users.yaml; skip the global prompt
+        print("  OS user isolation is now per-user. Set 'os_user' in users.yaml.")
         claude_user = ""
     elif admin_os_user:
         claude_user = ""

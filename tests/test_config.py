@@ -929,5 +929,6 @@ class TestLegacyEnvOnlyMode:
         """No deprecation warnings when users.yaml is absent."""
         _set_required(monkeypatch)
         monkeypatch.setenv("CLAUDE_MODEL", "opus")
-        load_config()
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
         assert "deprecated" not in caplog.text.lower()
