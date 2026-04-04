@@ -28,7 +28,7 @@ def is_workspace_allowed(path: Path, base: Path | None, allowed: list[Path]) -> 
     resolved = path.resolve()
     # Resolve base too so symlinks in the base path don't bypass the check
     resolved_base = base.resolve() if base else None
-    in_base = resolved_base and (str(resolved).startswith(str(resolved_base) + "/") or resolved == resolved_base)
+    in_base = resolved_base and resolved.is_relative_to(resolved_base)
     # allowed list is pre-resolved by resolve_workspace_access(),
     # so no need to call .resolve() again on each entry.
     in_allowed = resolved in allowed
