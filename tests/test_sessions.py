@@ -1007,6 +1007,59 @@ class TestResolveGitHubSettings:
         result = await sessions.resolve_github_settings(111, config)
         assert result["repos"] == ["alice/repo-a", "alice/repo-b"]
 
+    # ── Corrupt DB notify value handling ──────────────────────────
+
+    async def test_corrupt_db_notify_falls_through_to_yaml(self, db):
+        """Non-numeric DB value falls through to users.yaml entry."""
+        from kai.config import UserConfig
+
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            github_notify_chat_id=-100999,
+        )
+        config = self._make_config(user_configs={111: uc})
+        await sessions.set_setting("github_notify_chat:111", "not-a-number")
+
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["notify_chat_id"] == -100999
+
+    async def test_corrupt_db_notify_falls_through_to_env(self, db):
+        """Non-numeric DB value falls through to global env var."""
+        config = self._make_config(github_notify_chat_id=-300)
+        await sessions.set_setting("github_notify_chat:111", "abc")
+
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["notify_chat_id"] == -300
+
+    async def test_corrupt_db_notify_falls_through_to_telegram_id(self, db):
+        """Non-numeric DB value falls through to user's own telegram_id."""
+        config = self._make_config()
+        await sessions.set_setting("github_notify_chat:111", "garbage")
+
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["notify_chat_id"] == 111
+
+    async def test_corrupt_db_notify_logs_warning(self, db, caplog):
+        """Corrupt DB value emits a warning with the bad value."""
+        import logging
+
+        config = self._make_config()
+        await sessions.set_setting("github_notify_chat:111", "xyz")
+
+        with caplog.at_level(logging.WARNING, logger="kai.sessions"):
+            await sessions.resolve_github_settings(111, config)
+
+        assert any("Corrupt github_notify_chat" in r.message and "'xyz'" in r.message for r in caplog.records)
+
+    async def test_empty_string_db_notify_falls_through(self, db):
+        """Empty string in DB fails int() and falls through gracefully."""
+        config = self._make_config(github_notify_chat_id=-500)
+        await sessions.set_setting("github_notify_chat:111", "")
+
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["notify_chat_id"] == -500
+
 
 # ── Workspace history migration ─────────────────────────────────────
 

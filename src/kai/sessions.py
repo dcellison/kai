@@ -972,16 +972,28 @@ async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSetting
     # Repos: users.yaml only (DB-managed repos are #220)
     repos = user_config.github_repos if user_config else []
 
-    # Notification destination: DB > yaml > env > telegram_id
+    # Notification destination: DB > yaml > env > telegram_id.
+    # Defensive try/except matches budget/timeout/context_window above.
+    # A corrupt DB value falls through to yaml/env/default rather than
+    # aborting the entire resolution.
+    notify: int | None = None
     if "github_notify_chat" in db:
-        notify = int(db["github_notify_chat"])
-    elif user_config and user_config.github_notify_chat_id is not None:
-        notify = user_config.github_notify_chat_id
-    else:
-        # Fall back to the global env var. If that is also unset,
-        # use the user's own telegram_id (notifications go to DM).
-        global_notify = config.github_notify_chat_id
-        notify = global_notify if global_notify is not None else chat_id
+        try:
+            notify = int(db["github_notify_chat"])
+        except (ValueError, TypeError):
+            log.warning(
+                "Corrupt github_notify_chat in DB for chat %d: %r (ignoring)",
+                chat_id,
+                db["github_notify_chat"],
+            )
+    if notify is None:
+        if user_config and user_config.github_notify_chat_id is not None:
+            notify = user_config.github_notify_chat_id
+        else:
+            # Fall back to the global env var. If that is also unset,
+            # use the user's own telegram_id (notifications go to DM).
+            global_notify = config.github_notify_chat_id
+            notify = global_notify if global_notify is not None else chat_id
 
     # PR review: DB > yaml > env > False
     if "pr_review" in db:
