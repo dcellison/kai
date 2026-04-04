@@ -1119,7 +1119,7 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text(f"Workspace: {path}{note_suffix}{config_suffix}\nSession cleared.")
 
 
-async def _workspaces_keyboard(
+def _workspaces_keyboard(
     history: list[dict],
     current_path: str,
     home_path: str,
@@ -1537,7 +1537,7 @@ async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("No workspace history yet.\nUse /workspace new <name> to create one.")
         return
 
-    keyboard = await _workspaces_keyboard(history, current, home, base, allowed)
+    keyboard = _workspaces_keyboard(history, current, home, base, allowed)
     await update.message.reply_text("Workspaces:", reply_markup=keyboard)
 
 
@@ -1608,7 +1608,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             await sessions.delete_workspace_history(str(path), chat_id)
             await query.answer("That workspace is no longer allowed.")
             history = await sessions.get_workspace_history(chat_id)
-            keyboard = await _workspaces_keyboard(history, str(pool.get_workspace(chat_id)), str(home), base, allowed)
+            keyboard = _workspaces_keyboard(history, str(pool.get_workspace(chat_id)), str(home), base, allowed)
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return
         # Remove stale entries where the directory no longer exists
@@ -1616,7 +1616,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             await sessions.delete_workspace_history(str(path), chat_id)
             await query.answer("That workspace no longer exists.")
             history = await sessions.get_workspace_history(chat_id)
-            keyboard = await _workspaces_keyboard(history, str(pool.get_workspace(chat_id)), str(home), base, allowed)
+            keyboard = _workspaces_keyboard(history, str(pool.get_workspace(chat_id)), str(home), base, allowed)
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return
         label = _short_workspace_name(str(path), base)
@@ -1853,8 +1853,9 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("Absolute paths are not allowed. Use a workspace name.")
         return
 
-    # "new" keyword: create a new workspace directory with git init
-    if target_lower.startswith("new"):
+    # "new" keyword: create a new workspace directory with git init.
+    # Exact word boundary so names like "newsletter" aren't caught.
+    if target_lower == "new" or target_lower.startswith("new "):
         parts = target.split(None, 1)
         if len(parts) < 2:
             await update.message.reply_text("Usage: /workspace new <name>")
@@ -1878,7 +1879,14 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        await proc.wait()
+        rc = await proc.wait()
+        if rc != 0:
+            # Directory was created but git init failed (git missing,
+            # permissions, etc.). Warn the user but still switch - the
+            # workspace is usable without version control.
+            await update.message.reply_text(
+                f"Warning: git init failed (exit code {rc}). The workspace was created but has no git repo."
+            )
         await _switch_workspace(update, context, resolved)
         return
 

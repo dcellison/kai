@@ -196,7 +196,7 @@ class TestWorkspacesKeyboard:
     @pytest.mark.asyncio
     async def test_home_always_first(self, tmp_path):
         """Home button appears first regardless of history or allowed workspaces."""
-        markup = await _workspaces_keyboard([], "/home", "/home", None, [])
+        markup = _workspaces_keyboard([], "/home", "/home", None, [])
         assert _button_labels(markup)[0] == "\U0001f3e0 Home \U0001f7e2"
 
     @pytest.mark.asyncio
@@ -205,7 +205,7 @@ class TestWorkspacesKeyboard:
         pinned = tmp_path / "pinned"
         pinned.mkdir()
         history = [{"path": "/other/project"}]
-        markup = await _workspaces_keyboard(history, "/other/project", "/home", None, [pinned])
+        markup = _workspaces_keyboard(history, "/other/project", "/home", None, [pinned])
         labels = _button_labels(markup)
         # Home, then pinned, then history
         assert labels[0].startswith("\U0001f3e0 Home")
@@ -217,7 +217,7 @@ class TestWorkspacesKeyboard:
         """Pinned workspaces use ws:allowed:<index> callback data."""
         pinned = tmp_path / "project-a"
         pinned.mkdir()
-        markup = await _workspaces_keyboard([], "/home", "/home", None, [pinned])
+        markup = _workspaces_keyboard([], "/home", "/home", None, [pinned])
         callbacks = _button_callbacks(markup)
         assert "ws:allowed:0" in callbacks
 
@@ -227,7 +227,7 @@ class TestWorkspacesKeyboard:
         pinned = tmp_path / "shared"
         pinned.mkdir()
         history = [{"path": str(pinned)}]
-        markup = await _workspaces_keyboard(history, "/home", "/home", None, [pinned])
+        markup = _workspaces_keyboard(history, "/home", "/home", None, [pinned])
         labels = _button_labels(markup)
         # Should be: Home + one "shared" entry — not two "shared" entries
         assert labels.count("shared") == 1
@@ -241,14 +241,14 @@ class TestWorkspacesKeyboard:
         """Green dot appears on the pinned workspace button when it is current."""
         pinned = tmp_path / "active"
         pinned.mkdir()
-        markup = await _workspaces_keyboard([], str(pinned), "/home", None, [pinned])
+        markup = _workspaces_keyboard([], str(pinned), "/home", None, [pinned])
         labels = _button_labels(markup)
         assert any("active" in lbl and "\U0001f7e2" in lbl for lbl in labels)
 
     @pytest.mark.asyncio
     async def test_no_allowed_no_history_shows_only_home(self):
         """With no allowed workspaces and no history, only the Home button appears."""
-        markup = await _workspaces_keyboard([], "/home", "/home", None, [])
+        markup = _workspaces_keyboard([], "/home", "/home", None, [])
         assert len(_button_labels(markup)) == 1
 
     @pytest.mark.asyncio
@@ -258,7 +258,7 @@ class TestWorkspacesKeyboard:
         foo_b = tmp_path / "clients" / "foo"
         foo_a.mkdir(parents=True)
         foo_b.mkdir(parents=True)
-        markup = await _workspaces_keyboard([], "/home", "/home", None, [foo_a, foo_b])
+        markup = _workspaces_keyboard([], "/home", "/home", None, [foo_a, foo_b])
         labels = _button_labels(markup)
         assert "projects/foo" in labels
         assert "clients/foo" in labels
@@ -272,7 +272,7 @@ class TestWorkspacesKeyboard:
         baz = tmp_path / "baz"
         bar.mkdir()
         baz.mkdir()
-        markup = await _workspaces_keyboard([], "/home", "/home", None, [bar, baz])
+        markup = _workspaces_keyboard([], "/home", "/home", None, [bar, baz])
         labels = _button_labels(markup)
         assert "bar" in labels
         assert "baz" in labels
@@ -1294,6 +1294,64 @@ class TestHandleWorkspace:
         # Directory should have been created
         assert (tmp_path / "fresh").is_dir()
         claude.change_workspace.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_new_git_init_failure_warns(self, tmp_path):
+        """Failed git init warns the user but still switches workspace."""
+        update = _make_update()
+        claude = _make_mock_claude(workspace=Path("/home"))
+        config = _make_config(workspace_base=tmp_path, claude_workspace=Path("/home"))
+        ctx = _make_context(config=config, claude=claude, args=["new", "broken"])
+        # Simulate git init returning a non-zero exit code
+        mock_proc = MagicMock()
+        mock_proc.wait = AsyncMock(return_value=1)
+        with (
+            _mock_resolve(base=tmp_path),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc),
+            patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
+            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
+            patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
+            patch("kai.bot.webhook.update_workspace"),
+        ):
+            await handle_workspace(update, ctx)
+        # Warning about git init failure was sent
+        replies = [call[0][0] for call in update.message.reply_text.call_args_list]
+        assert any("git init failed" in r for r in replies)
+        # Workspace switch still happened despite the failure
+        claude.change_workspace.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_workspace_new_prefix_not_caught(self, tmp_path):
+        """Workspace names starting with 'new' are not mistaken for /workspace new."""
+        # "newsletter" is a valid workspace name, not the "new" subcommand
+        project = tmp_path / "newsletter"
+        project.mkdir()
+        claude = _make_mock_claude(workspace=Path("/other"))
+        config = _make_config(workspace_base=tmp_path, claude_workspace=Path("/home"))
+        update = _make_update()
+        ctx = _make_context(config=config, claude=claude, args=["newsletter"])
+        with (
+            _mock_resolve(base=tmp_path),
+            patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
+            patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
+            patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
+            patch("kai.bot.webhook.update_workspace"),
+        ):
+            await handle_workspace(update, ctx)
+        # Should switch to the workspace, not show "Usage: /workspace new <name>"
+        claude.change_workspace.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_workspace_new_bare_shows_usage(self):
+        """'/workspace new' with no name shows usage hint."""
+        update = _make_update()
+        ctx = _make_context(args=["new"])
+        with _mock_resolve():
+            await handle_workspace(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Usage" in reply
 
     @pytest.mark.asyncio
     async def test_name_found_in_base(self, tmp_path):
