@@ -2006,10 +2006,52 @@ async def _show_github(update: Update, chat_id: int, config: Config) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+async def _is_notify_chat_used(
+    notify_chat_id: int,
+    exclude_user: int,
+    config: Config,
+) -> bool:
+    """
+    Check if any user other than exclude_user still uses this chat_id
+    as their GitHub notification destination.
+
+    Checks users.yaml (via config), the database, and the global env
+    var fallback. Returns True if at least one other source references
+    this chat_id.
+
+    Note: this does a linear scan of all users with one DB query per
+    user. Fine for a personal assistant with a handful of users.
+    """
+    # Check users.yaml entries
+    if config.user_configs:
+        for uid, uc in config.user_configs.items():
+            if uid == exclude_user:
+                continue
+            if uc.github_notify_chat_id == notify_chat_id:
+                return True
+
+    # Check DB entries for all other users
+    if config.user_configs:
+        for uid in config.user_configs:
+            if uid == exclude_user:
+                continue
+            val = await sessions.get_setting(f"github_notify_chat:{uid}")
+            if val:
+                try:
+                    if int(val) == notify_chat_id:
+                        return True
+                except ValueError:
+                    continue
+
+    # Also check the global env var fallback
+    return config.github_notify_chat_id == notify_chat_id
+
+
 async def _handle_github_notify(
     update: Update,
     chat_id: int,
     args: list[str],
+    config: Config,
 ) -> None:
     """Handle /github notify <chat_id|reset> - set or clear notification destination."""
     assert update.message is not None
@@ -2021,7 +2063,29 @@ async def _handle_github_notify(
     value = args[0].lower()
 
     if value == "reset":
+        # Read the current notify chat_id before deleting it, so we can
+        # remove it from the live allowed_user_ids set.
+        old_val = await sessions.get_setting(f"github_notify_chat:{chat_id}")
         await sessions.delete_setting(f"github_notify_chat:{chat_id}")
+        if old_val:
+            try:
+                old_chat_id = int(old_val)
+            except ValueError:
+                old_chat_id = None
+            # Never remove the user's own chat_id from the allowed
+            # set. This is the primary guard for legacy mode (no
+            # users.yaml) where remove_allowed_chat_id's user_configs
+            # check cannot fire. Also correct in multi-user mode -
+            # a user's own ID was in allowed_user_ids before any
+            # notify additions and must stay.
+            if old_chat_id is not None and old_chat_id != chat_id:
+                still_used = await _is_notify_chat_used(
+                    old_chat_id,
+                    exclude_user=chat_id,
+                    config=config,
+                )
+                if not still_used:
+                    webhook.remove_allowed_chat_id(old_chat_id)
         await update.message.reply_text("Notification destination reset to this chat.")
         return
 
@@ -2033,14 +2097,12 @@ async def _handle_github_notify(
         return
 
     await sessions.set_setting(f"github_notify_chat:{chat_id}", str(notify_id))
-    # Standard notifications (push, PR opened, etc.) use this immediately.
-    # PR reviews and issue triage route through /api/send-message which
-    # validates against allowed_user_ids (populated at startup). New group
-    # chat IDs require a restart for review/triage delivery.
-    await update.message.reply_text(
-        f"GitHub notifications will go to chat {notify_id}.\n"
-        "Note: PR reviews and issue triage will use this after restart."
-    )
+
+    # Update the live allowed_user_ids set so /api/send-message accepts
+    # this chat_id immediately, without requiring a restart.
+    webhook.add_allowed_chat_id(notify_id)
+
+    await update.message.reply_text(f"GitHub notifications will go to chat {notify_id}.")
 
 
 async def _handle_github_toggle(
@@ -2081,7 +2143,7 @@ async def handle_github(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if subcommand == "notify":
-        await _handle_github_notify(update, chat_id, args[1:])
+        await _handle_github_notify(update, chat_id, args[1:], config)
         return
 
     if subcommand == "reviews":

@@ -1758,3 +1758,48 @@ def update_workspace(workspace: str) -> None:
     """
     if _app is not None:
         _app["workspace"] = workspace
+
+
+def add_allowed_chat_id(chat_id: int) -> None:
+    """
+    Add a chat_id to the live allowed_user_ids set.
+
+    Called by bot.py when /github notify sets a new notification
+    destination. Without this, the new chat_id is rejected by
+    _resolve_chat_id() until the next restart.
+    """
+    if _app is not None:
+        allowed = _app.get("allowed_user_ids")
+        if allowed is not None:
+            allowed.add(chat_id)
+
+
+def remove_allowed_chat_id(chat_id: int) -> None:
+    """
+    Remove a chat_id from the live allowed_user_ids set, but only
+    if it does not belong to an actual authorized user.
+
+    Called by bot.py when /github notify reset clears a notification
+    destination. A user's own telegram_id must never be removed.
+
+    Important: config.allowed_user_ids and _app["allowed_user_ids"]
+    are the SAME set object (assigned by reference at start()). We
+    cannot use config.allowed_user_ids as the guard because any
+    chat_id we previously added via add_allowed_chat_id() would also
+    appear there. Instead, check config.user_configs (a dict keyed
+    by telegram_id, populated at load time, never mutated at runtime).
+
+    In legacy mode (no users.yaml), config.user_configs is None and
+    this guard does not fire. The caller in bot.py must handle the
+    self-ID case before calling this function.
+    """
+    if _app is not None:
+        allowed = _app.get("allowed_user_ids")
+        if allowed is None:
+            return
+        # Never remove a chat_id that belongs to an actual user.
+        # user_configs keys are telegram_ids of real users.
+        config = _app.get("config")
+        if config and config.user_configs and chat_id in config.user_configs:
+            return
+        allowed.discard(chat_id)
