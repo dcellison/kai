@@ -3755,6 +3755,8 @@ class TestHandleGitHub:
         mock_sessions.delete_setting = AsyncMock()
         mock_sessions.resolve_github_settings = AsyncMock()
         mock_sessions.get_github_db_settings = AsyncMock(return_value={})
+        # No existing notify setting (fresh set)
+        mock_sessions.get_setting = AsyncMock(return_value=None)
 
         with (
             patch("kai.bot.sessions", mock_sessions),
@@ -3902,6 +3904,8 @@ class TestHandleGitHub:
         ctx = _make_context(config=config, args=["notify", "-100999"])
         mock_sessions = AsyncMock()
         mock_sessions.set_setting = AsyncMock()
+        # No existing notify setting (fresh set)
+        mock_sessions.get_setting = AsyncMock(return_value=None)
 
         with (
             patch("kai.bot.sessions", mock_sessions),
@@ -3913,6 +3917,78 @@ class TestHandleGitHub:
         mock_add.assert_called_once_with(-100999)
         reply = update.message.reply_text.call_args[0][0]
         assert "restart" not in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_notify_set_overwrite_cleans_up_old(self):
+        """Overwriting a notify destination removes the old chat_id from allowed set.
+
+        Without this cleanup, the old chat_id would linger in allowed_user_ids
+        until restart - an auth leak for abandoned group chats.
+        """
+        update = _make_update(text="/github notify -100888")
+        config = _make_config()
+        ctx = _make_context(config=config, args=["notify", "-100888"])
+        mock_sessions = AsyncMock()
+        mock_sessions.set_setting = AsyncMock()
+        # Existing notify setting points to a different group chat
+        mock_sessions.get_setting = AsyncMock(return_value="-100999")
+
+        with (
+            patch("kai.bot.sessions", mock_sessions),
+            patch("kai.bot.webhook.add_allowed_chat_id") as mock_add,
+            patch("kai.bot.webhook.remove_allowed_chat_id") as mock_remove,
+            patch("kai.bot._is_notify_chat_used", new_callable=AsyncMock, return_value=False),
+        ):
+            await handle_github(update, ctx)
+
+        # Old destination removed, new one added
+        mock_remove.assert_called_once_with(-100999)
+        mock_add.assert_called_once_with(-100888)
+
+    @pytest.mark.asyncio
+    async def test_notify_set_overwrite_skips_cleanup_when_shared(self):
+        """Overwriting a notify destination keeps the old chat_id if another user uses it."""
+        update = _make_update(text="/github notify -100888")
+        config = _make_config()
+        ctx = _make_context(config=config, args=["notify", "-100888"])
+        mock_sessions = AsyncMock()
+        mock_sessions.set_setting = AsyncMock()
+        mock_sessions.get_setting = AsyncMock(return_value="-100999")
+
+        with (
+            patch("kai.bot.sessions", mock_sessions),
+            patch("kai.bot.webhook.add_allowed_chat_id") as mock_add,
+            patch("kai.bot.webhook.remove_allowed_chat_id") as mock_remove,
+            # Another user still uses the old chat_id
+            patch("kai.bot._is_notify_chat_used", new_callable=AsyncMock, return_value=True),
+        ):
+            await handle_github(update, ctx)
+
+        # Old destination kept (still used), new one added
+        mock_remove.assert_not_called()
+        mock_add.assert_called_once_with(-100888)
+
+    @pytest.mark.asyncio
+    async def test_notify_set_overwrite_same_value_no_cleanup(self):
+        """Setting the same notify destination again does not trigger cleanup."""
+        update = _make_update(text="/github notify -100999")
+        config = _make_config()
+        ctx = _make_context(config=config, args=["notify", "-100999"])
+        mock_sessions = AsyncMock()
+        mock_sessions.set_setting = AsyncMock()
+        # Same value already stored
+        mock_sessions.get_setting = AsyncMock(return_value="-100999")
+
+        with (
+            patch("kai.bot.sessions", mock_sessions),
+            patch("kai.bot.webhook.add_allowed_chat_id") as mock_add,
+            patch("kai.bot.webhook.remove_allowed_chat_id") as mock_remove,
+        ):
+            await handle_github(update, ctx)
+
+        # No removal needed (same value), just re-add (idempotent)
+        mock_remove.assert_not_called()
+        mock_add.assert_called_once_with(-100999)
 
     @pytest.mark.asyncio
     async def test_notify_reset_removes_from_allowed_ids(self):

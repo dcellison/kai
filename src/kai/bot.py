@@ -2022,19 +2022,16 @@ async def _is_notify_chat_used(
     Note: this does a linear scan of all users with one DB query per
     user. Fine for a personal assistant with a handful of users.
     """
-    # Check users.yaml entries
+    # In legacy mode (user_configs is None) there are no other users
+    # to check - skip straight to the global env var fallback.
     if config.user_configs:
         for uid, uc in config.user_configs.items():
             if uid == exclude_user:
                 continue
+            # Check the users.yaml entry for this user
             if uc.github_notify_chat_id == notify_chat_id:
                 return True
-
-    # Check DB entries for all other users
-    if config.user_configs:
-        for uid in config.user_configs:
-            if uid == exclude_user:
-                continue
+            # Check DB override for this user
             val = await sessions.get_setting(f"github_notify_chat:{uid}")
             if val:
                 try:
@@ -2095,6 +2092,25 @@ async def _handle_github_notify(
     except ValueError:
         await update.message.reply_text("Chat ID must be an integer.")
         return
+
+    # If there is an existing notify destination that differs from the
+    # new one, clean it up from allowed_user_ids before overwriting.
+    # Without this, the old chat_id would linger in the set until
+    # restart - a minor auth leak for abandoned group chats.
+    old_val = await sessions.get_setting(f"github_notify_chat:{chat_id}")
+    if old_val:
+        try:
+            old_notify = int(old_val)
+        except ValueError:
+            old_notify = None
+        if old_notify is not None and old_notify != notify_id and old_notify != chat_id:
+            still_used = await _is_notify_chat_used(
+                old_notify,
+                exclude_user=chat_id,
+                config=config,
+            )
+            if not still_used:
+                webhook.remove_allowed_chat_id(old_notify)
 
     await sessions.set_setting(f"github_notify_chat:{chat_id}", str(notify_id))
 
