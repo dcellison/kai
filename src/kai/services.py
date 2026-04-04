@@ -29,6 +29,7 @@ Auth injection by type:
 
 import logging
 import os
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -382,13 +383,16 @@ async def call_service(
         )
 
     # Validate path_suffix to prevent request smuggling via crafted paths.
-    # Reject query strings, fragments, and path traversal segments. Note:
-    # full URLs as path_suffix are valid (e.g., Jina Reader uses
-    # path_suffix="https://example.com" appended to "https://r.jina.ai/").
+    # Reject query strings, fragments, and path traversal segments.
+    # Decode percent-encoding first so %2e%2e, %3F, %23 can't bypass
+    # the raw-string checks (#222). Note: full URLs as path_suffix are
+    # valid (e.g., Jina Reader uses path_suffix="https://example.com"
+    # appended to "https://r.jina.ai/").
     if path_suffix:
-        if "?" in path_suffix or "#" in path_suffix:
+        decoded = urllib.parse.unquote(path_suffix)
+        if "?" in decoded or "#" in decoded:
             return ServiceResponse(success=False, error="path_suffix must not contain query string or fragment")
-        if "/.." in path_suffix or path_suffix.startswith(".."):
+        if "/.." in decoded or decoded.startswith(".."):
             return ServiceResponse(success=False, error="path_suffix must not contain '..' segments")
 
     # Construct the full URL (base + optional path suffix)

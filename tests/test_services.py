@@ -796,6 +796,162 @@ services:
         assert result.success is False
         assert ".." in result.error
 
+    async def test_percent_encoded_traversal_rejected(self, tmp_path, monkeypatch):
+        """Percent-encoded '..' segments are caught after decoding (#222)."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  testapi:
+    url: https://api.example.com/
+    method: GET
+    allow_path_suffix: true
+    auth:
+      type: bearer
+      env: API_KEY
+""",
+        )
+        load_services(path)
+
+        # %2e = '.', so /%2e%2e/ is /../
+        result = await call_service("testapi", path_suffix="/%2e%2e/etc/passwd")
+        assert result.success is False
+        assert ".." in result.error
+
+    async def test_percent_encoded_query_string_rejected(self, tmp_path, monkeypatch):
+        """Percent-encoded '?' is caught after decoding (#222)."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  testapi:
+    url: https://api.example.com/
+    method: GET
+    allow_path_suffix: true
+    auth:
+      type: bearer
+      env: API_KEY
+""",
+        )
+        load_services(path)
+
+        # %3F = '?'
+        result = await call_service("testapi", path_suffix="page%3Fsecret=1")
+        assert result.success is False
+        assert "query string" in result.error
+
+    async def test_percent_encoded_fragment_rejected(self, tmp_path, monkeypatch):
+        """Percent-encoded '#' is caught after decoding (#222)."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  testapi:
+    url: https://api.example.com/
+    method: GET
+    allow_path_suffix: true
+    auth:
+      type: bearer
+      env: API_KEY
+""",
+        )
+        load_services(path)
+
+        # %23 = '#'
+        result = await call_service("testapi", path_suffix="page%23frag")
+        assert result.success is False
+        assert "fragment" in result.error
+
+    async def test_mixed_encoded_traversal_rejected(self, tmp_path, monkeypatch):
+        """Mixed raw and percent-encoded traversal is caught (#222)."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  testapi:
+    url: https://api.example.com/
+    method: GET
+    allow_path_suffix: true
+    auth:
+      type: bearer
+      env: API_KEY
+""",
+        )
+        load_services(path)
+
+        # One dot raw, one dot encoded: /.%2e/ decodes to /../
+        result = await call_service("testapi", path_suffix="/.%2e/secret")
+        assert result.success is False
+        assert ".." in result.error
+
+    async def test_legitimate_percent_encoding_allowed(self, tmp_path, monkeypatch):
+        """Percent-encoded characters that aren't attacks pass through (#222)."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  testapi:
+    url: https://api.example.com/
+    method: GET
+    allow_path_suffix: true
+    auth:
+      type: bearer
+      env: API_KEY
+""",
+        )
+        load_services(path)
+
+        mock_response = _mock_streamed_response(b"ok")
+        mock_session = MagicMock()
+        mock_session.request = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        # %20 = space, perfectly legitimate in a URL path
+        with patch("kai.services.aiohttp.ClientSession", return_value=mock_session):
+            result = await call_service("testapi", path_suffix="hello%20world")
+
+        assert result.success is True
+
+    async def test_double_encoded_traversal_not_rejected(self, tmp_path, monkeypatch):
+        """Double percent-encoded '..' (%252e%252e) decodes to %2e%2e, not '..',
+        so it passes validation. This is correct - the target server would need
+        to double-decode to see '..' which is non-standard behavior. This test
+        documents the expected behavior, not a gap."""
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  testapi:
+    url: https://api.example.com/
+    method: GET
+    allow_path_suffix: true
+    auth:
+      type: bearer
+      env: API_KEY
+""",
+        )
+        load_services(path)
+
+        mock_response = _mock_streamed_response(b"ok")
+        mock_session = MagicMock()
+        mock_session.request = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        # %252e decodes to %2e (literal string), not to '.'
+        # Single unquote: /%252e%252e/ -> /%2e%2e/ (no '..' present)
+        with patch("kai.services.aiohttp.ClientSession", return_value=mock_session):
+            result = await call_service("testapi", path_suffix="/%252e%252e/foo")
+
+        assert result.success is True
+
 
 class TestResponseSizeCap:
     """Tests for the response body size cap."""
