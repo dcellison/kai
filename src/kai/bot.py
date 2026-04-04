@@ -60,6 +60,7 @@ from kai.pool import SubprocessPool
 from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
+from kai.workspace_utils import is_workspace_allowed
 
 # TOTP is optional (requires pip install -e '.[totp]'). When the extra is not
 # installed, is_totp_configured() returns False and the gate is fully disabled.
@@ -1021,32 +1022,6 @@ def _resolve_workspace_path(target: str, base: Path | None) -> Path | None:
     return resolved
 
 
-def _is_workspace_allowed(path: Path, base: Path | None, allowed: list[Path]) -> bool:
-    """Return True if path is covered by a configured workspace source.
-
-    Accepts paths under the user's workspace_base or in their allowed
-    list. If neither source is configured, all paths are accepted
-    (permissive mode for installs that don't restrict workspace access).
-
-    Args:
-        path: The workspace path to validate (need not exist).
-        base: The user's resolved workspace_base, or None.
-        allowed: The user's effective allowed workspace list
-            (pre-resolved by resolve_workspace_access).
-    """
-    if not base and not allowed:
-        # No restrictions configured - open access
-        return True
-    resolved = path.resolve()
-    # Resolve base too so symlinks in the base path don't bypass the check
-    resolved_base = base.resolve() if base else None
-    in_base = resolved_base and (str(resolved).startswith(str(resolved_base) + "/") or resolved == resolved_base)
-    # allowed list is pre-resolved by resolve_workspace_access(),
-    # so no need to call .resolve() again on each entry.
-    in_allowed = resolved in allowed
-    return bool(in_base or in_allowed)
-
-
 def _short_workspace_name(path: str, base: Path | None) -> str:
     """
     Shorten a workspace path for display in Telegram messages and keyboards.
@@ -1629,7 +1604,7 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
         # source. This handles the case where a path was removed from the
         # user's allowed list after they visited it - the history entry
         # persists but access is revoked.
-        if not _is_workspace_allowed(path, base, allowed):
+        if not is_workspace_allowed(path, base, allowed):
             await sessions.delete_workspace_history(str(path), chat_id)
             await query.answer("That workspace is no longer allowed.")
             history = await sessions.get_workspace_history(chat_id)

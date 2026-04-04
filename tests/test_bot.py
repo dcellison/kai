@@ -29,7 +29,6 @@ from kai.bot import (
     _handle_workspace_config,
     _handle_workspace_deny,
     _is_authorized,
-    _is_workspace_allowed,
     _models_keyboard,
     _notify_if_queued,
     _prepend_queue_marker,
@@ -75,6 +74,7 @@ from kai.bot import (
 from kai.claude import ClaudeResponse, StreamEvent
 from kai.config import Config
 from kai.tts import DEFAULT_VOICE, VOICES
+from kai.workspace_utils import is_workspace_allowed
 
 # ── _resolve_workspace_path ──────────────────────────────────────────
 
@@ -278,7 +278,7 @@ class TestWorkspacesKeyboard:
         assert "baz" in labels
 
 
-# ── _is_workspace_allowed ────────────────────────────────────────────
+# ── is_workspace_allowed ─────────────────────────────────────────────
 
 
 def _make_config(**overrides) -> Config:
@@ -307,44 +307,44 @@ def _make_config(**overrides) -> Config:
 class TestIsWorkspaceAllowed:
     def test_no_sources_allows_anything(self, tmp_path):
         """With no base and no allowed list, all paths are accepted (permissive mode)."""
-        assert _is_workspace_allowed(tmp_path / "anything", None, []) is True
+        assert is_workspace_allowed(tmp_path / "anything", None, []) is True
 
     def test_path_under_base_is_allowed(self, tmp_path):
         """Paths under workspace_base are allowed."""
-        assert _is_workspace_allowed(tmp_path / "myproject", tmp_path, []) is True
+        assert is_workspace_allowed(tmp_path / "myproject", tmp_path, []) is True
 
     def test_path_in_allowed_list(self, tmp_path):
         """Paths in the allowed list are allowed."""
         project = tmp_path / "project"
         project.mkdir()
-        assert _is_workspace_allowed(project, None, [project]) is True
+        assert is_workspace_allowed(project, None, [project]) is True
 
     def test_path_outside_both_is_rejected(self, tmp_path):
         """Paths not under base or in allowed list are rejected."""
         base = tmp_path / "base"
         base.mkdir()
         outside = tmp_path / "outside"
-        assert _is_workspace_allowed(outside, base, []) is False
+        assert is_workspace_allowed(outside, base, []) is False
 
     def test_base_set_allowed_empty_rejects_outside(self, tmp_path):
         """With base set but empty allowed list, outside paths are rejected."""
         base = tmp_path / "base"
         base.mkdir()
-        assert _is_workspace_allowed(tmp_path / "other", base, []) is False
+        assert is_workspace_allowed(tmp_path / "other", base, []) is False
 
     def test_only_allowed_set_rejects_unlisted(self, tmp_path):
         """With only allowed list set, unlisted paths are rejected."""
         allowed = tmp_path / "allowed"
         allowed.mkdir()
         unlisted = tmp_path / "unlisted"
-        assert _is_workspace_allowed(unlisted, None, [allowed]) is False
+        assert is_workspace_allowed(unlisted, None, [allowed]) is False
 
     def test_resolves_symlinks_for_comparison(self, tmp_path):
         """Path resolution handles non-canonical paths correctly."""
         project = tmp_path / "project"
         project.mkdir()
         # Pass the resolved canonical path - should still match
-        assert _is_workspace_allowed(project.resolve(), None, [project]) is True
+        assert is_workspace_allowed(project.resolve(), None, [project]) is True
 
 
 # ── create_bot transport mode ──────────────────────────────────────
