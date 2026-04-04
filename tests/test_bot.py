@@ -193,14 +193,12 @@ def _button_callbacks(markup) -> list[str]:
 
 
 class TestWorkspacesKeyboard:
-    @pytest.mark.asyncio
-    async def test_home_always_first(self, tmp_path):
+    def test_home_always_first(self, tmp_path):
         """Home button appears first regardless of history or allowed workspaces."""
         markup = _workspaces_keyboard([], "/home", "/home", None, [])
         assert _button_labels(markup)[0] == "\U0001f3e0 Home \U0001f7e2"
 
-    @pytest.mark.asyncio
-    async def test_allowed_workspaces_appear_before_history(self, tmp_path):
+    def test_allowed_workspaces_appear_before_history(self, tmp_path):
         """Pinned workspaces appear between Home and history entries."""
         pinned = tmp_path / "pinned"
         pinned.mkdir()
@@ -212,8 +210,7 @@ class TestWorkspacesKeyboard:
         assert labels[1] == "pinned"
         assert labels[2].endswith("\U0001f7e2")  # history entry marked as current
 
-    @pytest.mark.asyncio
-    async def test_allowed_workspace_callback_data(self, tmp_path):
+    def test_allowed_workspace_callback_data(self, tmp_path):
         """Pinned workspaces use ws:allowed:<index> callback data."""
         pinned = tmp_path / "project-a"
         pinned.mkdir()
@@ -221,23 +218,21 @@ class TestWorkspacesKeyboard:
         callbacks = _button_callbacks(markup)
         assert "ws:allowed:0" in callbacks
 
-    @pytest.mark.asyncio
-    async def test_history_deduplicated_against_allowed(self, tmp_path):
+    def test_history_deduplicated_against_allowed(self, tmp_path):
         """A path in both allowed and history appears only once (in allowed section)."""
         pinned = tmp_path / "shared"
         pinned.mkdir()
         history = [{"path": str(pinned)}]
         markup = _workspaces_keyboard(history, "/home", "/home", None, [pinned])
         labels = _button_labels(markup)
-        # Should be: Home + one "shared" entry — not two "shared" entries
+        # Should be: Home + one "shared" entry - not two "shared" entries
         assert labels.count("shared") == 1
         callbacks = _button_callbacks(markup)
         # The single entry should be the allowed version, not a bare history index
         assert "ws:allowed:0" in callbacks
         assert not any(c == "ws:0" for c in callbacks)
 
-    @pytest.mark.asyncio
-    async def test_current_workspace_marked_in_allowed(self, tmp_path):
+    def test_current_workspace_marked_in_allowed(self, tmp_path):
         """Green dot appears on the pinned workspace button when it is current."""
         pinned = tmp_path / "active"
         pinned.mkdir()
@@ -245,14 +240,12 @@ class TestWorkspacesKeyboard:
         labels = _button_labels(markup)
         assert any("active" in lbl and "\U0001f7e2" in lbl for lbl in labels)
 
-    @pytest.mark.asyncio
-    async def test_no_allowed_no_history_shows_only_home(self):
+    def test_no_allowed_no_history_shows_only_home(self):
         """With no allowed workspaces and no history, only the Home button appears."""
         markup = _workspaces_keyboard([], "/home", "/home", None, [])
         assert len(_button_labels(markup)) == 1
 
-    @pytest.mark.asyncio
-    async def test_disambiguates_duplicate_names(self, tmp_path):
+    def test_disambiguates_duplicate_names(self, tmp_path):
         """Two allowed workspaces with the same directory name get parent/name labels."""
         foo_a = tmp_path / "projects" / "foo"
         foo_b = tmp_path / "clients" / "foo"
@@ -265,8 +258,7 @@ class TestWorkspacesKeyboard:
         # Neither bare "foo" label should appear
         assert "foo" not in labels
 
-    @pytest.mark.asyncio
-    async def test_unique_names_not_disambiguated(self, tmp_path):
+    def test_unique_names_not_disambiguated(self, tmp_path):
         """Allowed workspaces with unique names keep their short labels."""
         bar = tmp_path / "bar"
         baz = tmp_path / "baz"
