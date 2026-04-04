@@ -1608,7 +1608,11 @@ async def start(telegram_app, config) -> None:
                 try:
                     _app["allowed_user_ids"].add(int(val))
                 except ValueError:
-                    pass
+                    log.warning(
+                        "Invalid github_notify_chat for user %s in DB: %s (ignoring)",
+                        uid,
+                        val,
+                    )
     # Also add the global env var fallback if set
     if config.github_notify_chat_id is not None:
         _app["allowed_user_ids"].add(config.github_notify_chat_id)
