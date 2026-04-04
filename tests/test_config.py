@@ -839,7 +839,10 @@ class TestResolutionWithoutEnvVars:
             user_configs={123: user},
             # claude_model defaults to "sonnet" via dataclass
         )
-        # The pool resolves: user.model > config.claude_model
+        # Intentionally inlines the resolution pattern rather than calling
+        # SubprocessPool._create_instance, which requires mocking the Claude
+        # binary and process spawning. Tests the precedence contract, not
+        # the pool integration.
         resolved = user.model if user.model else config.claude_model
         assert resolved == "opus"
 
