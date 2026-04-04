@@ -294,6 +294,12 @@ def _cmd_config() -> None:
     users_yaml_path = PROJECT_ROOT / "users.yaml"
     users_yaml_exists = users_yaml_path.exists()
 
+    # Check if users.yaml already exists (either location). When it
+    # does, per-user config is the primary path and deprecated env vars
+    # should not be prompted - they would just create confusion.
+    # Initialized here, finalized after the /etc/kai/ check below.
+    has_users_yaml = users_yaml_exists
+
     if not users_yaml_exists:
         # /etc/kai/users.yaml is mode 0600 owned by root. Whether
         # Path.exists() works depends on the parent directory permissions;
@@ -303,6 +309,7 @@ def _cmd_config() -> None:
         etc_users = Path("/etc/kai/users.yaml")
         if etc_users.exists():
             users_yaml_exists = True
+            has_users_yaml = True
 
     # Track whether advanced mode set os_user, so we can skip the
     # CLAUDE_USER prompt later (section 8). Needs to be in scope
@@ -409,45 +416,57 @@ def _cmd_config() -> None:
     print()
 
     # -- Claude --
-    print("-- Claude --")
-    model = _prompt_choice(
-        "Claude model",
-        sorted(VALID_MODELS),
-        existing_env.get("CLAUDE_MODEL", "sonnet"),
-    )
-
-    while True:
-        timeout = _prompt(
-            "Claude timeout (seconds)",
-            existing_env.get("CLAUDE_TIMEOUT_SECONDS", "120"),
+    # When users.yaml exists, model/timeout/budget/context are per-user
+    # settings managed via /settings commands or users.yaml fields.
+    # Only prompt for truly global Claude settings (autocompact).
+    if has_users_yaml:
+        print("-- Claude --")
+        print("  Model, timeout, budget, and context window are now per-user.")
+        print("  Set defaults in users.yaml or let users configure via /settings.")
+        model = existing_env.get("CLAUDE_MODEL", "")
+        timeout = existing_env.get("CLAUDE_TIMEOUT_SECONDS", "")
+        budget = existing_env.get("CLAUDE_MAX_BUDGET_USD", "")
+        max_context_window = existing_env.get("CLAUDE_MAX_CONTEXT_WINDOW", "")
+    else:
+        print("-- Claude --")
+        model = _prompt_choice(
+            "Claude model",
+            sorted(VALID_MODELS),
+            existing_env.get("CLAUDE_MODEL", "sonnet"),
         )
-        if _validate_positive_int(timeout):
-            break
-        print("  Must be a positive integer.")
 
-    while True:
-        budget = _prompt(
-            "Claude budget (USD)",
-            existing_env.get("CLAUDE_MAX_BUDGET_USD", "10.0"),
-        )
-        if _validate_positive_float(budget):
-            break
-        print("  Must be a positive number.")
-
-    # Context window tuning - smaller windows reduce token usage and
-    # cache invalidation pressure on the inner Claude process.
-    while True:
-        max_context_window = _prompt(
-            "Max context window (tokens, 0 = default 1M)",
-            existing_env.get("CLAUDE_MAX_CONTEXT_WINDOW", "200000"),
-        )
-        try:
-            val = int(max_context_window)
-            if 0 <= val <= MAX_CONTEXT_CEILING:
+        while True:
+            timeout = _prompt(
+                "Claude timeout (seconds)",
+                existing_env.get("CLAUDE_TIMEOUT_SECONDS", "120"),
+            )
+            if _validate_positive_int(timeout):
                 break
-        except ValueError:
-            pass
-        print(f"  Must be 0-{MAX_CONTEXT_CEILING} (0 = use default).")
+            print("  Must be a positive integer.")
+
+        while True:
+            budget = _prompt(
+                "Claude budget (USD)",
+                existing_env.get("CLAUDE_MAX_BUDGET_USD", "10.0"),
+            )
+            if _validate_positive_float(budget):
+                break
+            print("  Must be a positive number.")
+
+        # Context window tuning - smaller windows reduce token usage and
+        # cache invalidation pressure on the inner Claude process.
+        while True:
+            max_context_window = _prompt(
+                "Max context window (tokens, 0 = default 1M)",
+                existing_env.get("CLAUDE_MAX_CONTEXT_WINDOW", "200000"),
+            )
+            try:
+                val = int(max_context_window)
+                if 0 <= val <= MAX_CONTEXT_CEILING:
+                    break
+            except ValueError:
+                pass
+            print(f"  Must be 0-{MAX_CONTEXT_CEILING} (0 = use default).")
 
     # Autocompact threshold controls when Claude automatically compresses
     # conversation history. Lower values compact sooner, reducing token
@@ -487,61 +506,88 @@ def _cmd_config() -> None:
     print()
 
     # -- Workspaces --
-    print("-- Workspaces --")
-    workspace_base = _prompt(
-        "Workspace base directory",
-        existing_env.get("WORKSPACE_BASE", ""),
-    )
-    # Expand ~ for display but store as-is (load_config handles expansion)
-    if workspace_base.startswith("~"):
-        expanded = os.path.expanduser(workspace_base)
-        print(f"  (expands to {expanded})")
+    if has_users_yaml:
+        print("-- Workspaces --")
+        print("  Workspace base and allowed workspaces are now per-user.")
+        print("  Set workspace_base in users.yaml. Users manage allowed")
+        print("  workspaces via /workspace allow and /workspace deny.")
+        workspace_base = existing_env.get("WORKSPACE_BASE", "")
+        allowed_workspaces = existing_env.get("ALLOWED_WORKSPACES", "")
+    else:
+        print("-- Workspaces --")
+        workspace_base = _prompt(
+            "Workspace base directory",
+            existing_env.get("WORKSPACE_BASE", ""),
+        )
+        # Expand ~ for display but store as-is (load_config handles expansion)
+        if workspace_base.startswith("~"):
+            expanded = os.path.expanduser(workspace_base)
+            print(f"  (expands to {expanded})")
 
-    allowed_workspaces = _prompt(
-        "Allowed workspaces (comma-separated paths, optional)",
-        existing_env.get("ALLOWED_WORKSPACES", ""),
-    )
+        allowed_workspaces = _prompt(
+            "Allowed workspaces (comma-separated paths, optional)",
+            existing_env.get("ALLOWED_WORKSPACES", ""),
+        )
     print()
 
     # -- PR review agent --
-    print("-- PR review agent --")
-    pr_review_enabled = _prompt_bool(
-        "Enable PR review agent",
-        existing_env.get("PR_REVIEW_ENABLED", "false").lower() in ("1", "true", "yes"),
-    )
-    pr_review_cooldown = "300"
-    if pr_review_enabled:
-        while True:
-            pr_review_cooldown = _prompt(
-                "Review cooldown in seconds (prevents spam from rapid pushes)",
-                existing_env.get("PR_REVIEW_COOLDOWN", "300"),
-            )
-            if _validate_positive_int(pr_review_cooldown):
-                break
-            print("  Must be a positive integer.")
+    if has_users_yaml:
+        print("-- PR review agent --")
+        print("  PR review is now per-user. Set 'pr_review' in users.yaml")
+        print("  or let users toggle via /github reviews on|off.")
+        pr_review_enabled = existing_env.get("PR_REVIEW_ENABLED", "false").lower() in ("1", "true", "yes")
+        pr_review_cooldown = existing_env.get("PR_REVIEW_COOLDOWN", "300")
+    else:
+        print("-- PR review agent --")
+        pr_review_enabled = _prompt_bool(
+            "Enable PR review agent",
+            existing_env.get("PR_REVIEW_ENABLED", "false").lower() in ("1", "true", "yes"),
+        )
+        pr_review_cooldown = "300"
+        if pr_review_enabled:
+            while True:
+                pr_review_cooldown = _prompt(
+                    "Review cooldown in seconds (prevents spam from rapid pushes)",
+                    existing_env.get("PR_REVIEW_COOLDOWN", "300"),
+                )
+                if _validate_positive_int(pr_review_cooldown):
+                    break
+                print("  Must be a positive integer.")
     print()
 
     # -- Issue triage agent --
     # Independent from PR review - you might want one without the other.
-    print("-- Issue triage agent --")
-    issue_triage_enabled = _prompt_bool(
-        "Enable issue triage agent",
-        existing_env.get("ISSUE_TRIAGE_ENABLED", "false").lower() in ("1", "true", "yes"),
-    )
+    if has_users_yaml:
+        print("-- Issue triage agent --")
+        print("  Issue triage is now per-user. Set 'issue_triage' in users.yaml")
+        print("  or let users toggle via /github triage on|off.")
+        issue_triage_enabled = existing_env.get("ISSUE_TRIAGE_ENABLED", "false").lower() in ("1", "true", "yes")
+    else:
+        print("-- Issue triage agent --")
+        issue_triage_enabled = _prompt_bool(
+            "Enable issue triage agent",
+            existing_env.get("ISSUE_TRIAGE_ENABLED", "false").lower() in ("1", "true", "yes"),
+        )
     print()
 
     # -- GitHub notifications --
-    print("-- GitHub notifications --")
-    github_notify_chat_id = ""
-    while True:
-        github_notify_chat_id = _prompt(
-            "GitHub notification chat ID (optional)",
-            existing_env.get("GITHUB_NOTIFY_CHAT_ID", ""),
-        )
-        # Empty is valid (feature disabled)
-        if not github_notify_chat_id or _validate_chat_id(github_notify_chat_id):
-            break
-        print("  Must be a valid Telegram chat ID (integer).")
+    if has_users_yaml:
+        print("-- GitHub notifications --")
+        print("  Notification routing is now per-user. Set 'github_notify_chat_id'")
+        print("  in users.yaml or let users configure via /github notify.")
+        github_notify_chat_id = existing_env.get("GITHUB_NOTIFY_CHAT_ID", "")
+    else:
+        print("-- GitHub notifications --")
+        github_notify_chat_id = ""
+        while True:
+            github_notify_chat_id = _prompt(
+                "GitHub notification chat ID (optional)",
+                existing_env.get("GITHUB_NOTIFY_CHAT_ID", ""),
+            )
+            # Empty is valid (feature disabled)
+            if not github_notify_chat_id or _validate_chat_id(github_notify_chat_id):
+                break
+            print("  Must be a valid Telegram chat ID (integer).")
     print()
 
     # -- Optional features --
@@ -555,10 +601,14 @@ def _cmd_config() -> None:
         existing_env.get("TTS_ENABLED", "false").lower() in ("1", "true", "yes"),
     )
 
-    # Skip if the user already set os_user via advanced user options.
+    # Skip if the user already set os_user via advanced user options
+    # or if users.yaml exists (os_user is per-user there).
     # CLAUDE_USER is the global fallback; os_user in users.yaml takes
     # precedence per-user at runtime.
-    if admin_os_user:
+    if has_users_yaml:
+        # os_user is set per-user in users.yaml; skip the global prompt
+        claude_user = ""
+    elif admin_os_user:
         claude_user = ""
     else:
         claude_user = _prompt(
@@ -575,21 +625,28 @@ def _cmd_config() -> None:
     )
     print()
 
-    # Build the env dict (only include non-empty values)
+    # Build the env dict (only include non-empty values).
+    # Truly global vars are always written regardless of users.yaml.
     env: dict[str, str] = {
         "TELEGRAM_BOT_TOKEN": bot_token,
-        "CLAUDE_MODEL": model,
-        "CLAUDE_TIMEOUT_SECONDS": timeout,
-        "CLAUDE_MAX_BUDGET_USD": budget,
         "WEBHOOK_PORT": port,
         "WEBHOOK_SECRET": webhook_secret,
         "VOICE_ENABLED": str(voice_enabled).lower(),
         "TTS_ENABLED": str(tts_enabled).lower(),
     }
 
+    # Deprecated per-user vars: only include without users.yaml
+    # (legacy single-user mode). With users.yaml, these are noise.
+    if not has_users_yaml:
+        env["CLAUDE_MODEL"] = model
+        env["CLAUDE_TIMEOUT_SECONDS"] = timeout
+        env["CLAUDE_MAX_BUDGET_USD"] = budget
+
     # Context window tuning - only include if non-default.
     # Compare as int to handle inputs like "000" that pass validation.
-    if int(max_context_window) != 0:
+    # CLAUDE_MAX_CONTEXT_WINDOW is deprecated (per-user), but
+    # CLAUDE_AUTOCOMPACT_PCT is truly global (machine resource limit).
+    if not has_users_yaml and max_context_window and int(max_context_window) != 0:
         env["CLAUDE_MAX_CONTEXT_WINDOW"] = max_context_window
     if int(autocompact_pct) != 0:
         env["CLAUDE_AUTOCOMPACT_PCT"] = autocompact_pct
@@ -601,22 +658,30 @@ def _cmd_config() -> None:
             env["TELEGRAM_WEBHOOK_URL"] = webhook_url
         if tg_webhook_secret:
             env["TELEGRAM_WEBHOOK_SECRET"] = tg_webhook_secret
-    if workspace_base:
-        env["WORKSPACE_BASE"] = workspace_base
-    if allowed_workspaces:
-        env["ALLOWED_WORKSPACES"] = allowed_workspaces
-    if claude_user:
-        env["CLAUDE_USER"] = claude_user
     if perplexity_key:
         env["PERPLEXITY_API_KEY"] = perplexity_key
-    if pr_review_enabled:
-        env["PR_REVIEW_ENABLED"] = "true"
-        if pr_review_cooldown != "300":
+
+    # Deprecated per-user optional vars: only write without users.yaml
+    if not has_users_yaml:
+        if workspace_base:
+            env["WORKSPACE_BASE"] = workspace_base
+        if allowed_workspaces:
+            env["ALLOWED_WORKSPACES"] = allowed_workspaces
+        if claude_user:
+            env["CLAUDE_USER"] = claude_user
+        if pr_review_enabled:
+            env["PR_REVIEW_ENABLED"] = "true"
+            if pr_review_cooldown != "300":
+                env["PR_REVIEW_COOLDOWN"] = pr_review_cooldown
+        if issue_triage_enabled:
+            env["ISSUE_TRIAGE_ENABLED"] = "true"
+        if github_notify_chat_id:
+            env["GITHUB_NOTIFY_CHAT_ID"] = github_notify_chat_id
+    else:
+        # PR_REVIEW_COOLDOWN is a global rate limit - always write it
+        # when review is enabled for any user, even with users.yaml.
+        if pr_review_enabled and pr_review_cooldown != "300":
             env["PR_REVIEW_COOLDOWN"] = pr_review_cooldown
-    if issue_triage_enabled:
-        env["ISSUE_TRIAGE_ENABLED"] = "true"
-    if github_notify_chat_id:
-        env["GITHUB_NOTIFY_CHAT_ID"] = github_notify_chat_id
 
     # Build and write install.conf
     conf = {
