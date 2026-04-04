@@ -389,6 +389,8 @@ async def call_service(
     # valid (e.g., Jina Reader uses path_suffix="https://example.com"
     # appended to "https://r.jina.ai/").
     if path_suffix:
+        # unquote uses UTF-8 with errors='replace'; overlong sequences
+        # (e.g., %c0%ae for '.') become replacement chars, not '.', so no bypass.
         decoded = urllib.parse.unquote(path_suffix)
         if "?" in decoded or "#" in decoded:
             return ServiceResponse(success=False, error="path_suffix must not contain query string or fragment")
