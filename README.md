@@ -68,7 +68,7 @@ Each user gets:
 - **Per-user home workspace** - each user can have their own default workspace directory.
 - **Role-based routing** - admins receive unattributed webhook events (GitHub pushes, generic webhooks). Regular users interact only through Telegram messages.
 
-Run `make config` to generate `users.yaml`, or create one manually. See the [Multi-User](#multi-user) section below for the full schema. When `users.yaml` is absent, Kai falls back to `ALLOWED_USER_IDS` for backward compatibility. If neither is set, Kai refuses to start (fail-closed). The `CLAUDE_USER` env var acts as a global fallback for subprocess isolation; per-user `os_user` in `users.yaml` takes precedence when set.
+Run `make config` to generate `users.yaml`, or create one manually from `users.example.yaml`. See the [Multi-User Setup](https://github.com/dcellison/kai/wiki/Multi-User-Setup) wiki page for the full field reference. When `users.yaml` is absent, Kai falls back to `ALLOWED_USER_IDS` for backward compatibility. If neither is set, Kai refuses to start (fail-closed). The `CLAUDE_USER` env var acts as a global fallback for subprocess isolation; per-user `os_user` in `users.yaml` takes precedence when set.
 
 ### Memory
 
@@ -138,11 +138,21 @@ If interrupted mid-response, Kai notifies you on restart and asks you to resend 
 | `/stop` | Interrupt a response mid-stream |
 | `/models` | Interactive model picker |
 | `/model <name>` | Switch model (`opus`, `sonnet`, `haiku`) |
-| `/workspace` | Show current workspace |
+| `/settings` | Show per-user settings (model, budget, timeout, context window) |
+| `/settings <field> <value>` | Change a setting (`model`, `budget`, `timeout`, `context`) |
+| `/settings reset [field]` | Clear all overrides, or one field |
+| `/workspace` (or `/ws`) | Show current workspace |
 | `/workspace <name>` | Switch by name (resolved under `WORKSPACE_BASE`) |
 | `/workspace home` | Return to default workspace |
 | `/workspace new <name>` | Create a new workspace with git init |
+| `/workspace allow <path>` | Add an allowed workspace for your user |
+| `/workspace deny <path>` | Remove an allowed workspace for your user |
+| `/workspace allowed` | List your allowed workspaces |
 | `/workspaces` | Interactive workspace picker |
+| `/github` | Show GitHub notification settings |
+| `/github notify <chat_id>` | Route your GitHub notifications to a specific chat |
+| `/github reviews on\|off` | Enable or disable the PR review agent for you |
+| `/github triage on\|off` | Enable or disable the issue triage agent for you |
 | `/voice` | Toggle voice responses on/off |
 | `/voice only` | Voice-only mode (no text) |
 | `/voice on` | Text + voice mode |
@@ -177,28 +187,35 @@ cp .env.example .env
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | Yes | | Bot token from BotFather |
-| `ALLOWED_USER_IDS` | Yes* | | Comma-separated Telegram user IDs (*not required when `users.yaml` exists) |
-| `CLAUDE_MODEL` | No | `sonnet` | Default model (`opus`, `sonnet`, or `haiku`) |
-| `CLAUDE_TIMEOUT_SECONDS` | No | `120` | Per-message timeout |
-| `CLAUDE_MAX_BUDGET_USD` | No | `10.0` | Session budget cap |
-| `WORKSPACE_BASE` | No | | Base directory for workspace name resolution |
-| `ALLOWED_WORKSPACES` | No | | Comma-separated absolute paths accessible as workspaces outside `WORKSPACE_BASE` |
+| `ALLOWED_USER_IDS` | Deprecated* | | Comma-separated Telegram user IDs. Superseded by `users.yaml`; use `make config` instead. (*Still works if `users.yaml` absent.) |
+| `CLAUDE_MODEL` | Deprecated* | `sonnet` | Default model. Set per-user in `users.yaml` or via `/settings model`. |
+| `CLAUDE_TIMEOUT_SECONDS` | Deprecated* | `120` | Per-message timeout. Set per-user in `users.yaml` or via `/settings timeout`. |
+| `CLAUDE_MAX_BUDGET_USD` | Deprecated* | `10.0` | Session budget cap. Set per-user in `users.yaml` or via `/settings budget`. |
+| `CLAUDE_MAX_CONTEXT_WINDOW` | Deprecated* | `0` | Context window size in tokens (0 = Claude Code default). Set per-user in `users.yaml` or via `/settings context`. |
+| `CLAUDE_AUTOCOMPACT_PCT` | No | `80` | Context compression threshold (%). When usage hits this, Claude compresses history. Can only lower the default (~83%), not raise it. |
+| `CLAUDE_MAX_SESSION_HOURS` | No | `0` | Maximum session age in hours before recycling the subprocess (0 = no limit). Recommended: 4-8 on memory-constrained machines. |
+| `WORKSPACE_BASE` | Deprecated* | | Base directory for workspace name resolution. Set per-user in `users.yaml`. |
+| `ALLOWED_WORKSPACES` | Deprecated* | | Comma-separated extra workspace paths. Users now manage their own via `/workspace allow`. |
 | `WEBHOOK_PORT` | No | `8080` | HTTP server port for webhooks and scheduling API |
 | `WEBHOOK_SECRET` | No | | Secret for webhook validation and scheduling API auth |
 | `TELEGRAM_WEBHOOK_URL` | No | | Telegram webhook URL (enables webhook mode; omit for polling) |
 | `TELEGRAM_WEBHOOK_SECRET` | No | | Separate secret for Telegram webhook auth (defaults to `WEBHOOK_SECRET`) |
-| `PR_REVIEW_ENABLED` | No | `false` | Enable automatic PR review on push |
-| `ISSUE_TRIAGE_ENABLED` | No | `false` | Enable automatic issue triage on open |
+| `PR_REVIEW_ENABLED` | Deprecated* | `false` | Enable automatic PR review globally. Set per-user in `users.yaml` or via `/github reviews`. |
+| `PR_REVIEW_COOLDOWN` | No | `300` | Minimum seconds between reviews of the same PR. Machine-wide resource limit, not per-user. |
+| `SPEC_DIR` | No | `specs` | Spec directory relative to repo root, for branch-name matching in PR reviews |
+| `ISSUE_TRIAGE_ENABLED` | Deprecated* | `false` | Enable automatic issue triage globally. Set per-user in `users.yaml` or via `/github triage`. |
+| `GITHUB_NOTIFY_CHAT_ID` | Deprecated* | | Global fallback for GitHub notification routing. Set per-user in `users.yaml` or via `/github notify`. |
+| `CLAUDE_USER` | Deprecated* | | Global OS user for subprocess isolation. Set per-user via `os_user` in `users.yaml`. |
+| `CLAUDE_IDLE_TIMEOUT` | No | `1800` | Seconds before idle subprocesses are evicted (0 to disable) |
 | `VOICE_ENABLED` | No | `false` | Enable voice message transcription |
 | `TTS_ENABLED` | No | `false` | Enable text-to-speech voice responses |
 | `TOTP_SESSION_MINUTES` | No | `30` | Minutes before TOTP re-authentication is required |
 | `TOTP_CHALLENGE_SECONDS` | No | `120` | Seconds the code entry window stays open |
 | `TOTP_LOCKOUT_ATTEMPTS` | No | `3` | Failed TOTP attempts before temporary lockout |
 | `TOTP_LOCKOUT_MINUTES` | No | `15` | TOTP lockout duration in minutes |
-| `CLAUDE_USER` | No | | OS user for the inner Claude process (enables process isolation via `sudo -u`) |
-| `CLAUDE_IDLE_TIMEOUT` | No | `1800` | Seconds before idle subprocesses are evicted (0 to disable) |
-| `GITHUB_NOTIFY_CHAT_ID` | No | | Telegram chat ID for routing GitHub notifications to a separate group |
 | `FILE_RETENTION_DAYS` | No | `0` | Days to keep uploaded files before cleanup (0 to disable) |
+
+*Deprecated vars still work for backward compatibility when `users.yaml` is absent. When `users.yaml` is present, `users.yaml` wins and a warning is logged. Run `make config` to migrate.
 
 `CLAUDE_MAX_BUDGET_USD` limits how much work Claude can do in a single session via Claude Code's `--max-budget-usd` flag. On Pro/Max plans this is purely a runaway prevention mechanism (no per-token charges). The session resets on `/new`, model switch, or workspace switch.
 
@@ -323,7 +340,10 @@ kai/
 │   ├── triage.py             # Issue triage agent (one-shot Claude subprocess)
 │   ├── services.py           # External service proxy for third-party APIs
 │   ├── transcribe.py         # Voice message transcription (ffmpeg + whisper-cpp)
-│   └── tts.py                # Text-to-speech synthesis (Piper TTS + ffmpeg)
+│   ├── tts.py                # Text-to-speech synthesis (Piper TTS + ffmpeg)
+│   ├── prompt_utils.py       # Shared prompt construction utilities
+│   ├── telegram_utils.py     # Telegram-specific helper functions
+│   └── workspace_utils.py    # Workspace path resolution and validation
 ├── tests/                    # Test suite
 ├── home/                     # Claude Code home workspace
 │   ├── .claude/              # Identity and memory template
