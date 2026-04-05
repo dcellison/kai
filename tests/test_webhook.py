@@ -1314,6 +1314,45 @@ class TestGetSubscribedUsers:
         result = _get_subscribed_users(config, "dcellison/kai")
         assert result == []
 
+    @pytest.mark.asyncio
+    async def test_no_subscribed_users_warning_includes_remediation_hint(self, _clear_cooldowns, caplog):
+        """Warning for unmatched repo includes github_repos hint."""
+        import logging
+
+        # User has repos, but not the one in the payload
+        user = self._make_user(111, repos=["owner/other-repo"])
+        config = self._make_config({111: user})
+        app = _build_test_app(config=config)
+        payload = {
+            "ref": "refs/heads/main",
+            "commits": [{"message": "test", "author": {"name": "dev"}}],
+            "repository": {"full_name": "owner/target-repo"},
+            "compare": "https://github.com/owner/target-repo/compare/a...b",
+        }
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with caplog.at_level(logging.WARNING, logger="kai.webhook"):
+            async with TestClient(TestServer(app)) as client:
+                await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "push",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+
+        # Warning should mention github_repos and include the repo name
+        # at least twice (once in the event description, once in the hint).
+        warning_records = [
+            r for r in caplog.records if r.levelno >= logging.WARNING and "no subscribed users" in r.message
+        ]
+        assert len(warning_records) == 1
+        msg = warning_records[0].message
+        assert "github_repos" in msg
+        assert msg.count("owner/target-repo") >= 2
+
 
 # ── Per-user webhook routing ────────────────────────────────────────
 

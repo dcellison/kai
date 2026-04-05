@@ -713,6 +713,105 @@ class TestDeprecationWarnings:
         assert "CLAUDE_USER in env is deprecated" not in caplog.text
 
 
+# ── GitHub repos empty warning ───────────────────────────────────────
+
+
+class TestGitHubReposWarning:
+    """Verify startup warning when GitHub features are on but no repos configured."""
+
+    def test_warns_when_pr_review_enabled_no_repos(self, monkeypatch, caplog):
+        """PR review enabled globally + no github_repos = warning."""
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
+        monkeypatch.setenv("PR_REVIEW_ENABLED", "true")
+        _mock_user_configs(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
+        assert "PR review" in caplog.text
+        assert "github_repos" in caplog.text
+
+    def test_warns_when_issue_triage_enabled_no_repos(self, monkeypatch, caplog):
+        """Issue triage enabled globally + no github_repos = warning."""
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
+        monkeypatch.setenv("ISSUE_TRIAGE_ENABLED", "true")
+        _mock_user_configs(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
+        assert "issue triage" in caplog.text
+        assert "github_repos" in caplog.text
+
+    def test_warns_when_both_features_enabled_no_repos(self, monkeypatch, caplog):
+        """Both features enabled + no github_repos = warning naming both."""
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
+        monkeypatch.setenv("PR_REVIEW_ENABLED", "true")
+        monkeypatch.setenv("ISSUE_TRIAGE_ENABLED", "true")
+        _mock_user_configs(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
+        assert "PR review" in caplog.text
+        assert "issue triage" in caplog.text
+
+    def test_warns_when_per_user_pr_review_enabled_no_repos(self, monkeypatch, caplog):
+        """Per-user pr_review=True (no global env var) + no repos = warning."""
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
+        user = UserConfig(telegram_id=123, name="testuser", pr_review=True)
+        monkeypatch.setattr("kai.config._load_user_configs", lambda: {123: user})
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
+        assert "PR review" in caplog.text
+        assert "github_repos" in caplog.text
+
+    def test_no_warn_when_repos_configured(self, monkeypatch, caplog):
+        """No warning when at least one user has github_repos set."""
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
+        monkeypatch.setenv("PR_REVIEW_ENABLED", "true")
+        user = UserConfig(telegram_id=123, name="testuser", github_repos=["owner/repo"])
+        monkeypatch.setattr("kai.config._load_user_configs", lambda: {123: user})
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
+        # The github_repos warning should not fire; filter out deprecation
+        # warnings which also mention github_repos tangentially.
+        repo_warnings = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and "github_repos" in r.message and "deprecated" not in r.message
+        ]
+        assert repo_warnings == []
+
+    def test_no_warn_when_features_disabled(self, monkeypatch, caplog):
+        """No warning when neither feature is enabled (empty repos is fine)."""
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
+        _mock_user_configs(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
+        repo_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and "github_repos" in r.message]
+        assert repo_warnings == []
+
+    def test_no_warn_when_no_user_configs(self, monkeypatch, caplog):
+        """No warning in env-var-only mode (no users.yaml)."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("PR_REVIEW_ENABLED", "true")
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
+        repo_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and "github_repos" in r.message]
+        assert repo_warnings == []
+
+    def test_warns_only_when_all_users_have_no_repos(self, monkeypatch, caplog):
+        """No warning when at least one of multiple users has repos."""
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
+        monkeypatch.setenv("PR_REVIEW_ENABLED", "true")
+        user_a = UserConfig(telegram_id=123, name="alice", github_repos=["owner/repo"])
+        user_b = UserConfig(telegram_id=456, name="bob")
+        monkeypatch.setattr("kai.config._load_user_configs", lambda: {123: user_a, 456: user_b})
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
+        repo_warnings = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and "github_repos" in r.message and "deprecated" not in r.message
+        ]
+        assert repo_warnings == []
+
+
 # ── Minimal env + users.yaml operation ─────────────────────────────
 
 # Truly global env vars - the only ones needed when users.yaml exists.

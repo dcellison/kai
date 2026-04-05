@@ -595,8 +595,11 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
         # log at debug to avoid noise on every webhook event.
         if config.user_configs:
             log.warning(
-                "GitHub %s event for %s: no subscribed users",
+                "GitHub %s event for %s: no subscribed users. "
+                "Add 'github_repos: [%s]' to users.yaml to receive "
+                "events for this repo.",
                 event_type,
+                repo_full_name,
                 repo_full_name,
             )
         else:
