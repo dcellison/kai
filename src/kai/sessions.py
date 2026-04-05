@@ -1009,7 +1009,12 @@ async def get_effective_repos(chat_id: int, yaml_repos: list[str]) -> list[str]:
 async def get_github_db_settings(chat_id: int) -> dict[str, str]:
     """Read all GitHub-related DB overrides for a user.
 
-    Returns a dict of key->value for settings that exist.
+    Returns a dict of key->value for settings that exist. All values
+    are raw strings. Note: "github_repos_added" and "github_repos_removed"
+    are JSON-encoded arrays (e.g., '["owner/repo"]'), not parsed lists.
+    Use get_github_added_repos()/get_github_removed_repos() for parsed
+    access, or get_effective_repos() for the resolved list.
+
     Keys: "pr_review", "issue_triage", "github_notify_chat",
     "github_repos_added", "github_repos_removed".
     """
