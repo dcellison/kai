@@ -1930,9 +1930,11 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 # ── GitHub notification settings ─────────────────────────────────────
 
-# Regex for validating owner/repo format. Each component allows
-# alphanumeric characters, hyphens, underscores, and periods -
-# matching GitHub's actual naming rules.
+# Permissive sanity check for owner/repo format. Accepts alphanumeric
+# characters, hyphens, underscores, and periods in each component.
+# More permissive than GitHub's actual rules (e.g., allows leading
+# dots), but catches obvious typos. The GitHub API returns 404 for
+# names that pass this regex but aren't valid repos.
 _REPO_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
 
 

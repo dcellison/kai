@@ -71,7 +71,7 @@ async def check_webhook_exists(
     """
     Check if a webhook pointing to target_url exists on owner/repo.
 
-    Paginates through all hooks (GitHub returns up to 30 per page) and
+    Paginates through all hooks (requesting 100 per page) and
     compares each hook's config.url against target_url. The comparison
     is case-insensitive since URLs are case-insensitive in the scheme
     and authority components.

@@ -345,6 +345,40 @@ class TestHandleGithubAdd:
         assert "alice/repo" not in call_args[1]
 
     @pytest.mark.asyncio
+    async def test_readd_after_remove_404_rolls_back(self):
+        """Re-add that gets a 404 restores the removal (puts repo back in removed list)."""
+        update = _make_update()
+        config = _make_config()
+        # Repo was previously removed, user tries to re-add it
+        patches = self._patch_sessions(
+            effective=[],
+            added=[],
+            removed=["alice/repo"],
+            token="ghp_test",
+        )
+
+        with (
+            patch("kai.bot.sessions", MagicMock(**patches)) as mock_sessions,
+            patch(
+                "kai.bot._github_api_ensure_webhook",
+                new_callable=AsyncMock,
+                side_effect=GitHubAPIError(404, "Not Found"),
+            ),
+        ):
+            await _handle_github_add(update, 12345, ["alice/repo"], config)
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "not found" in reply.lower()
+        # The removal should have been restored (repo back in removed list)
+        mock_sessions.set_github_removed_repos.assert_called()
+        # First call clears it from removed (the re-add), second call
+        # restores it (the 404 rollback)
+        calls = mock_sessions.set_github_removed_repos.call_args_list
+        assert len(calls) == 2
+        # Second call should put alice/repo back
+        assert "alice/repo" in calls[1][0][1]
+
+    @pytest.mark.asyncio
     async def test_polling_mode_shows_manual_fallback(self):
         """In polling mode (no webhook URL), always shows manual fallback."""
         update = _make_update()
