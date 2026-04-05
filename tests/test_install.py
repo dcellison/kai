@@ -1913,6 +1913,31 @@ class TestApplySource:
         output = capsys.readouterr().out
         assert "IDENTITY.md" in output
 
+    def test_warns_when_identity_md_missing(self, tmp_path, capsys):
+        """Warns when IDENTITY.md is missing but home/.claude/ exists."""
+        src = tmp_path / "source"
+        (src / "src").mkdir(parents=True)
+        (src / "src" / "module.py").write_text("code")
+        (src / "pyproject.toml").write_text("[project]")
+        ws_claude = src / "home" / ".claude"
+        ws_claude.mkdir(parents=True)
+        (ws_claude / "CLAUDE.md").write_text("identity")
+        # No IDENTITY.md - should warn about dangling symlink
+        install = tmp_path / "install"
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._copy_tree"),
+            patch("kai.install._set_ownership"),
+            patch("shutil.copy2"),
+            patch("os.chown"),
+        ):
+            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+        output = capsys.readouterr().out
+        assert "WARNING" in output
+        assert "IDENTITY.md" in output
+        assert "dangle" in output
+
 
 # ── _apply_models ────────────────────────────────────────────────────
 

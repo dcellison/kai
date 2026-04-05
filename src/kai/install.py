@@ -1634,6 +1634,11 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         shutil.copy2(identity_src, identity_dst)
         os.chown(identity_dst, svc_uid, svc_gid)
         print(f"  Copied {identity_dst}")
+    elif ws_claude_src.is_dir():
+        # IDENTITY.md missing but home/.claude/ exists - the symlink at
+        # home/.claude/CLAUDE.md will dangle, silently breaking identity
+        # injection. Warn loudly so the user can fix it.
+        print(f"  WARNING: {identity_src} not found; home/.claude/CLAUDE.md symlink may dangle")
 
 
 def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
