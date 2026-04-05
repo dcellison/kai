@@ -145,7 +145,7 @@ curl -s -X POST http://localhost:8080/api/send-file \
 - `chat_id` - integer; required for routing
 - `path` - required; absolute path within the current workspace
 - `caption` - string; optional
-- Images (png, jpg, gif, webp) are sent as photos (rendered inline). Everything else is sent as a document attachment.
+- Images (png, jpg, webp) are sent as photos (rendered inline). Everything else is sent as a document attachment.
 
 ## Issue-First Workflow
 
