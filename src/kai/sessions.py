@@ -948,9 +948,10 @@ async def get_github_added_repos(chat_id: int) -> list[str]:
         return []
     try:
         repos = json.loads(val)
-        assert isinstance(repos, list)
+        if not isinstance(repos, list):
+            raise ValueError("expected list")
         return repos
-    except (json.JSONDecodeError, AssertionError):
+    except (json.JSONDecodeError, ValueError):
         log.warning("Corrupt github_repos_added for chat %d: %r", chat_id, val)
         return []
 
@@ -966,9 +967,10 @@ async def get_github_removed_repos(chat_id: int) -> list[str]:
         return []
     try:
         repos = json.loads(val)
-        assert isinstance(repos, list)
+        if not isinstance(repos, list):
+            raise ValueError("expected list")
         return repos
-    except (json.JSONDecodeError, AssertionError):
+    except (json.JSONDecodeError, ValueError):
         log.warning("Corrupt github_repos_removed for chat %d: %r", chat_id, val)
         return []
 
@@ -996,7 +998,12 @@ async def get_effective_repos(chat_id: int, yaml_repos: list[str]) -> list[str]:
     """
     added = await get_github_added_repos(chat_id)
     removed = await get_github_removed_repos(chat_id)
-    return sorted((set(r.lower() for r in yaml_repos) | set(added)) - set(removed))
+    # Lowercase everything defensively. added/removed are stored
+    # lowercase by the set_ helpers, but direct DB edits or migrations
+    # could introduce mixed-case values.
+    return sorted(
+        (set(r.lower() for r in yaml_repos) | set(r.lower() for r in added)) - set(r.lower() for r in removed)
+    )
 
 
 async def get_github_db_settings(chat_id: int) -> dict[str, str]:
