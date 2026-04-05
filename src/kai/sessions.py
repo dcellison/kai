@@ -701,12 +701,16 @@ async def resolve_user_defaults(
     db_settings = await get_user_settings(chat_id)
     user_config = config.get_user_config(chat_id)
 
-    # Model: DB > users.yaml > env > "sonnet". Use explicit is-not-None
-    # checks (not `or`) to match budget/timeout/context_window below and
-    # avoid accidentally treating "" as falsy.
-    db_model = db_settings.get("model")
+    # Model: DB > users.yaml > env > "sonnet".
+    # Strip whitespace so "" and " " don't pass through as valid model
+    # names. The UI validates before storing, but direct DB manipulation
+    # could insert empty strings that cause confusing runtime errors.
+    # After stripping, truthiness is safe: empty string and None both
+    # fall through correctly.
+    raw_db_model = db_settings.get("model")
+    db_model = raw_db_model.strip() if raw_db_model is not None else None
     yaml_model = user_config.model if user_config else None
-    model = db_model if db_model is not None else yaml_model if yaml_model is not None else config.claude_model
+    model = db_model if db_model else yaml_model if yaml_model else config.claude_model
 
     # Budget: DB > users.yaml max_budget (as default, not ceiling) > env.
     # max_budget in users.yaml serves double duty - it's both the admin
@@ -997,7 +1001,7 @@ async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSetting
 
     # PR review: DB > yaml > env > False
     if "pr_review" in db:
-        pr_review = db["pr_review"] == "true"
+        pr_review = db["pr_review"].lower() == "true"
     elif user_config and user_config.pr_review is not None:
         pr_review = user_config.pr_review
     else:
@@ -1005,7 +1009,7 @@ async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSetting
 
     # Issue triage: DB > yaml > env > False
     if "issue_triage" in db:
-        issue_triage = db["issue_triage"] == "true"
+        issue_triage = db["issue_triage"].lower() == "true"
     elif user_config and user_config.issue_triage is not None:
         issue_triage = user_config.issue_triage
     else:

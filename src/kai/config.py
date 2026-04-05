@@ -454,6 +454,9 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
     # or dev config on a production system).
     data = _read_protected_yaml("workspaces.yaml")
     if data is _YAML_MALFORMED:
+        # Fail open: return empty dict so the system continues without
+        # workspace overrides. Workspace config is convenience, not
+        # security-critical.
         log.warning("Skipping workspace config: /etc/kai/workspaces.yaml is malformed or empty")
         return {}
     if data is None:
@@ -624,6 +627,9 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
     # Same dual-mode loading pattern as _load_workspace_configs.
     data = _read_protected_yaml("users.yaml")
     if data is _YAML_MALFORMED:
+        # Fail closed: return None so the caller falls back to
+        # ALLOWED_USER_IDS (or exits if that is also unset). Auth
+        # config must not silently degrade.
         log.warning("Skipping user config: /etc/kai/users.yaml is malformed or empty")
         return None
     if data is None:
@@ -1130,6 +1136,9 @@ def load_config() -> Config:
     # Deprecation warnings for env vars superseded by users.yaml.
     # The vars still work as global fallbacks, but users.yaml is the
     # primary configuration path. Warnings guide admins to migrate.
+    # Only fire when users.yaml parsed successfully. If users.yaml is
+    # malformed, the system falls back to ALLOWED_USER_IDS and the env
+    # vars are actively needed (not deprecated in that context).
     if user_configs is not None:
         _deprecated_env_vars = {
             "CLAUDE_MODEL": "Set per-user 'model' in users.yaml or use /settings model",

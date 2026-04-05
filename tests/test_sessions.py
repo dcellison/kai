@@ -626,6 +626,32 @@ class TestResolveUserDefaults:
         assert result["budget"] == 10.0  # from global
         assert result["context_window"] == 0  # from global
 
+    # ── Empty/blank model fallthrough (finding 1) ────────────────
+
+    async def test_empty_string_model_falls_through(self, db):
+        """Empty string model in DB falls through to config default."""
+        config = self._make_config()
+        await sessions.set_user_setting(111, "model", "")
+        result = await sessions.resolve_user_defaults(111, config)
+        assert result["model"] == "sonnet"
+
+    async def test_whitespace_model_falls_through(self, db):
+        """Whitespace-only model in DB falls through to config default."""
+        config = self._make_config()
+        await sessions.set_user_setting(111, "model", "  ")
+        result = await sessions.resolve_user_defaults(111, config)
+        assert result["model"] == "sonnet"
+
+    async def test_empty_db_model_falls_through_to_yaml(self, db):
+        """Empty string model in DB falls through to yaml, not config."""
+        from kai.config import UserConfig
+
+        uc = UserConfig(telegram_id=111, name="alice", model="opus")
+        config = self._make_config(user_configs={111: uc})
+        await sessions.set_user_setting(111, "model", "")
+        result = await sessions.resolve_user_defaults(111, config)
+        assert result["model"] == "opus"
+
 
 # ── Workspace history ────────────────────────────────────────────────
 
@@ -1059,6 +1085,22 @@ class TestResolveGitHubSettings:
 
         result = await sessions.resolve_github_settings(111, config)
         assert result["notify_chat_id"] == -500
+
+    # ── Case-insensitive booleans (finding 5) ────────────────────
+
+    async def test_pr_review_case_insensitive(self, db):
+        """Mixed-case 'True' in DB resolves to True, not False."""
+        config = self._make_config()
+        await sessions.set_setting("pr_review:111", "True")
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["pr_review"] is True
+
+    async def test_issue_triage_case_insensitive(self, db):
+        """Uppercase 'TRUE' in DB resolves to True, not False."""
+        config = self._make_config()
+        await sessions.set_setting("issue_triage:111", "TRUE")
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["issue_triage"] is True
 
 
 # ── Workspace history migration ─────────────────────────────────────
