@@ -1600,6 +1600,35 @@ class TestSetOwnership:
         assert sub / "a.txt" in chowned_paths
         assert sub / "b.txt" in chowned_paths
 
+    def test_symlink_uses_lchown(self, tmp_path):
+        """Symlinks are chowned via lchown, not following to target."""
+        target = tmp_path / "target.txt"
+        target.write_text("x")
+        link = tmp_path / "link.txt"
+        link.symlink_to(target)
+
+        with patch("os.lchown") as mock_lchown, patch("os.chown") as mock_chown:
+            _set_ownership(link, 1000, 1000)
+
+        mock_lchown.assert_called_once_with(link, 1000, 1000)
+        mock_chown.assert_not_called()
+
+    def test_recursive_symlink_uses_lchown(self, tmp_path):
+        """Recursive chown uses lchown for symlinks to avoid following them."""
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "file.txt").touch()
+        (sub / "link.txt").symlink_to("file.txt")
+
+        with patch("os.lchown") as mock_lchown, patch("os.chown") as mock_chown:
+            _set_ownership(tmp_path, 0, 0, recursive=True)
+
+        lchowned = {call[0][0] for call in mock_lchown.call_args_list}
+        chowned = {call[0][0] for call in mock_chown.call_args_list}
+        assert sub / "link.txt" in lchowned
+        assert sub / "link.txt" not in chowned
+        assert sub / "file.txt" in chowned
+
 
 # ── _copy_tree ───────────────────────────────────────────────────────
 
@@ -1669,6 +1698,20 @@ class TestCopyTree:
 
         assert (dst / "keep" / "file.txt").read_text() == "kept"
         assert not (dst / "skip").exists()
+
+    def test_preserves_symlinks(self, tmp_path: Path) -> None:
+        """Symlinks are recreated at the destination, not dereferenced."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "real.txt").write_text("content")
+        (src / "link.txt").symlink_to("real.txt")
+        dst = tmp_path / "dst"
+
+        _copy_tree(src, dst)
+
+        assert (dst / "real.txt").read_text() == "content"
+        assert (dst / "link.txt").is_symlink()
+        assert os.readlink(dst / "link.txt") == "real.txt"
 
 
 # ── _user_home ───────────────────────────────────────────────────────
@@ -1745,7 +1788,7 @@ class TestApplySource:
         assert "home config" not in output
 
     def test_actual(self, tmp_path):
-        """Actual: copies source, pyproject.toml, and home/.claude/."""
+        """Actual: copies source, pyproject.toml, home/.claude/, and IDENTITY.md."""
         # Set up source structure
         src = tmp_path / "source"
         (src / "src").mkdir(parents=True)
@@ -1754,6 +1797,7 @@ class TestApplySource:
         ws_claude = src / "home" / ".claude"
         ws_claude.mkdir(parents=True)
         (ws_claude / "CLAUDE.md").write_text("identity")
+        (src / "home" / "IDENTITY.md").write_text("# Kai")
         install = tmp_path / "install"
         install.mkdir()
 
@@ -1769,13 +1813,17 @@ class TestApplySource:
         assert mock_copy.call_count == 2
         # Should call _set_ownership twice: once for src/, once for home/.claude/
         assert mock_own.call_count == 2
-        mock_cp.assert_called_once()
-        # os.chown called twice: once for pyproject.toml (root), once for
-        # the .claude/ directory itself (service user)
+        # shutil.copy2 called twice: pyproject.toml and IDENTITY.md
+        assert mock_cp.call_count == 2
+        # os.chown: pyproject.toml (root), .claude/ dir (svc), IDENTITY.md (svc)
         ws_claude_dst = install / "home" / ".claude"
+        identity_dst = install / "home" / "IDENTITY.md"
         chown_calls = mock_chown.call_args_list
         assert any(c.args == (ws_claude_dst, 1000, 1000) for c in chown_calls), (
             f"Expected os.chown({ws_claude_dst}, 1000, 1000) in {chown_calls}"
+        )
+        assert any(c.args == (identity_dst, 1000, 1000) for c in chown_calls), (
+            f"Expected os.chown({identity_dst}, 1000, 1000) in {chown_calls}"
         )
 
     def test_actual_no_home_claude(self, tmp_path):
@@ -1826,6 +1874,44 @@ class TestApplySource:
         # Second _copy_tree call is for home/.claude/
         ws_call = mock_copy.call_args_list[1]
         assert ws_call[0][2] == _HOME_CLAUDE_EXCLUDES
+
+    def test_copies_identity_md_with_svc_ownership(self, tmp_path):
+        """IDENTITY.md is copied and owned by the service user, not root."""
+        src = tmp_path / "source"
+        (src / "src").mkdir(parents=True)
+        (src / "src" / "module.py").write_text("code")
+        (src / "pyproject.toml").write_text("[project]")
+        (src / "home" / ".claude").mkdir(parents=True)
+        (src / "home" / "IDENTITY.md").write_text("# Kai")
+        install = tmp_path / "install"
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._copy_tree"),
+            patch("kai.install._set_ownership"),
+            patch("shutil.copy2") as mock_cp,
+            patch("os.chown") as mock_chown,
+        ):
+            _apply_source(install, svc_uid=1001, svc_gid=1001, dry_run=False)
+
+        # Find the IDENTITY.md copy call
+        identity_dst = install / "home" / "IDENTITY.md"
+        identity_calls = [c for c in mock_cp.call_args_list if c[0][1] == identity_dst]
+        assert len(identity_calls) == 1
+
+        # IDENTITY.md must be chowned to the service user, not root
+        chown_calls = {(c[0][0], c[0][1], c[0][2]) for c in mock_chown.call_args_list}
+        assert (identity_dst, 1001, 1001) in chown_calls
+
+    def test_dry_run_includes_identity_md(self, tmp_path, capsys):
+        """Dry run mentions IDENTITY.md when it exists."""
+        src = tmp_path / "source"
+        (src / "home" / ".claude").mkdir(parents=True)
+        (src / "home" / "IDENTITY.md").write_text("# Kai")
+        with patch("kai.install.PROJECT_ROOT", src):
+            _apply_source(tmp_path / "install", svc_uid=1000, svc_gid=1000, dry_run=True)
+        output = capsys.readouterr().out
+        assert "IDENTITY.md" in output
 
 
 # ── _apply_models ────────────────────────────────────────────────────

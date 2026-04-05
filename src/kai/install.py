@@ -734,16 +734,27 @@ def _set_ownership(path: Path, uid: int, gid: int, recursive: bool = False) -> N
     """
     Set ownership of a path, optionally recursing into directories.
 
+    Uses lchown for symlinks so ownership is set on the symlink inode
+    itself, not the target file. Without this, chowning a symlink to
+    root would silently chown its target to root too.
+
     Args:
         path: File or directory to chown.
         uid: User ID for the new owner.
         gid: Group ID for the new group.
         recursive: If True, walk the directory tree and chown everything.
     """
-    os.chown(path, uid, gid)
+    # lchown for symlinks to avoid following them to their targets.
+    if path.is_symlink():
+        os.lchown(path, uid, gid)
+    else:
+        os.chown(path, uid, gid)
     if recursive and path.is_dir():
         for child in path.rglob("*"):
-            os.chown(child, uid, gid)
+            if child.is_symlink():
+                os.lchown(child, uid, gid)
+            else:
+                os.chown(child, uid, gid)
 
 
 def _copy_tree(src: Path, dst: Path, excludes: set[str] | None = None) -> None:
@@ -779,7 +790,18 @@ def _copy_tree(src: Path, dst: Path, excludes: set[str] | None = None) -> None:
 
         for f in files:
             if f not in ignored:
-                shutil.copy2(Path(src_dir) / f, dst_dir / f)
+                src_file = Path(src_dir) / f
+                dst_file = dst_dir / f
+                if src_file.is_symlink():
+                    # Recreate symlinks rather than following them and
+                    # copying content. Preserves relative link targets
+                    # (e.g., home/.claude/CLAUDE.md -> ../IDENTITY.md).
+                    link_target = os.readlink(src_file)
+                    if dst_file.exists() or dst_file.is_symlink():
+                        dst_file.unlink()
+                    os.symlink(link_target, dst_file)
+                else:
+                    shutil.copy2(src_file, dst_file)
 
 
 def _generate_env_file(env: dict[str, str]) -> str:
@@ -1571,11 +1593,16 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
             old_ws.rename(new_ws)
             print(f"  Renamed {old_ws} -> {new_ws}")
 
+    identity_src = PROJECT_ROOT / "home" / "IDENTITY.md"
+    identity_dst = install_path / "home" / "IDENTITY.md"
+
     if dry_run:
         print(f"[DRY RUN] Would copy: {src_src} -> {src_dst}")
         print(f"[DRY RUN] Would copy: {pyproject_src} -> {pyproject_dst}")
         if ws_claude_src.is_dir():
             print(f"[DRY RUN] Would copy: {ws_claude_src} -> {ws_claude_dst}")
+        if identity_src.is_file():
+            print(f"[DRY RUN] Would copy: {identity_src} -> {identity_dst}")
         return
 
     _copy_tree(src_src, src_dst, _SOURCE_EXCLUDES)
@@ -1598,6 +1625,15 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         _set_ownership(ws_claude_dst, 0, 0, recursive=True)
         os.chown(ws_claude_dst, svc_uid, svc_gid)
         print(f"  Copied home config to {ws_claude_dst}")
+
+    # Copy home/IDENTITY.md (the editable identity file pointed to by the
+    # home/.claude/CLAUDE.md symlink). Owned by the service user, not root,
+    # so inner Claude can write to it from Telegram.
+    if identity_src.is_file():
+        identity_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(identity_src, identity_dst)
+        os.chown(identity_dst, svc_uid, svc_gid)
+        print(f"  Copied {identity_dst}")
 
 
 def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
