@@ -54,7 +54,7 @@ When searching the web:
 
 ## Chat History
 
-All past conversations are logged as JSONL, one file per day (e.g., `2026-02-10.jsonl`). The history directory path is injected into your session context - look for `[Recent conversations (search /path/to/history/)]` or `[Chat history is stored in /path/to/history/]`. Each line is a JSON object with fields: `ts` (ISO timestamp), `dir` (`user` or `assistant`), `chat_id`, `text`, and optional `media`. When asked about past conversations, search these files with grep or jq.
+All past conversations are logged as JSONL, one file per day (e.g., `2026-02-10.jsonl`). The history directory path is injected into your session context - look for `[Recent conversations (search /path/to/history/)]` (when recent history is available) or `[Chat history is stored in /path/to/history/]` (when no recent history exists). Each line is a JSON object with fields: `ts` (ISO timestamp), `dir` (`user` or `assistant`), `chat_id`, `text`, and optional `media`. When asked about past conversations, search these files with grep or jq.
 
 ## Scheduling Jobs
 
@@ -98,7 +98,7 @@ For auto-remove jobs, start your response with `CONDITION_MET: <message>` when t
 - `job_type` - `reminder` (default) or `claude`
 - `auto_remove` - deactivate when condition met (claude jobs only)
 - `notify_on_check` - send CONDITION_NOT_MET messages to user (auto_remove only, default false)
-- `chat_id` - required for correct routing in multi-user setups
+- `chat_id` - integer; required for correct routing in multi-user setups
 
 ### Managing jobs:
 ```bash
