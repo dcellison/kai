@@ -1356,8 +1356,8 @@ class TestGetSubscribedUsers:
         assert admin in result
         assert user in result
 
-    def test_admin_wildcard_case_insensitive_not_doubled(self):
-        """Admin wildcard + case-insensitive explicit match = 2 results."""
+    def test_admin_wildcard_with_case_insensitive_explicit_user(self):
+        """Admin wildcard and case-insensitive explicit match coexist."""
         admin = self._make_user(111, name="admin", role="admin")
         user = self._make_user(222, name="user", repos=["Owner/Repo"])
         config = self._make_config({111: admin, 222: user})
