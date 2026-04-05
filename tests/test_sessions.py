@@ -1102,6 +1102,20 @@ class TestResolveGitHubSettings:
         result = await sessions.resolve_github_settings(111, config)
         assert result["issue_triage"] is True
 
+    async def test_pr_review_false_case_insensitive(self, db):
+        """Mixed-case 'False' in DB resolves to False, not True."""
+        config = self._make_config(pr_review_enabled=True)
+        await sessions.set_setting("pr_review:111", "False")
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["pr_review"] is False
+
+    async def test_issue_triage_false_case_insensitive(self, db):
+        """Uppercase 'FALSE' in DB resolves to False, not True."""
+        config = self._make_config(issue_triage_enabled=True)
+        await sessions.set_setting("issue_triage:111", "FALSE")
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["issue_triage"] is False
+
 
 # ── Workspace history migration ─────────────────────────────────────
 
