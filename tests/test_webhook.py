@@ -1935,7 +1935,7 @@ class TestPerUserRouting:
 
     @pytest.mark.asyncio
     async def test_admin_wildcard_receives_event(self, _clear_cooldowns):
-        """Admin with empty github_repos receives push events."""
+        """Admin with empty github_repos receives push events via wildcard."""
         admin = self._make_user_config(111, role="admin")
         config = self._make_config_with_users([admin])
         app = _build_test_app(config=config)
@@ -1948,7 +1948,19 @@ class TestPerUserRouting:
         body = json.dumps(payload).encode()
         sig = _sign_payload(payload)
 
-        with _mock_settings(notify_chat_id=111):
+        # Return different notify_chat_id per caller so we can distinguish
+        # wildcard routing (chat_id=111) from fallback routing (chat_id=12345).
+        # The fallback calls resolve_github_settings with app["chat_id"]=12345,
+        # the wildcard path calls with the admin's telegram_id=111.
+        async def _per_caller_settings(chat_id, config):
+            return {
+                "repos": [],
+                "notify_chat_id": chat_id,
+                "pr_review": False,
+                "issue_triage": False,
+            }
+
+        with patch("kai.webhook.sessions.resolve_github_settings", side_effect=_per_caller_settings):
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
                     "/webhook/github",
@@ -1960,7 +1972,7 @@ class TestPerUserRouting:
                 )
                 assert resp.status == 200
 
-        # Admin received the event via wildcard, not fallback
+        # Admin received the event via wildcard (111), not fallback (12345)
         call_args = app["telegram_bot"].send_message.call_args
         assert call_args[0][0] == 111
 
