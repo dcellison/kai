@@ -3687,6 +3687,14 @@ class TestHandleGitHub:
         """Patch get_github_db_settings with controlled return values."""
         return patch("kai.bot.sessions.get_github_db_settings", new_callable=AsyncMock, return_value=db_settings or {})
 
+    def _mock_added_repos(self, added=None):
+        """Patch get_github_added_repos with controlled return values."""
+        return patch("kai.bot.sessions.get_github_added_repos", new_callable=AsyncMock, return_value=added or [])
+
+    def _mock_get_setting(self, value=None):
+        """Patch get_setting (used for token lookup in _show_github)."""
+        return patch("kai.bot.sessions.get_setting", new_callable=AsyncMock, return_value=value)
+
     # ── 1. /github with no config (defaults) ──────────────────────
 
     @pytest.mark.asyncio
@@ -3695,7 +3703,12 @@ class TestHandleGitHub:
         update = _make_update(text="/github")
         config = _make_config()
 
-        with self._mock_resolve(), self._mock_db_settings():
+        with (
+            self._mock_resolve(),
+            self._mock_db_settings(),
+            self._mock_added_repos(),
+            self._mock_get_setting(),
+        ):
             await _show_github(update, 12345, config)
 
         reply = update.message.reply_text.call_args[0][0]
@@ -3704,6 +3717,7 @@ class TestHandleGitHub:
         assert "PR reviews: off (global default)" in reply
         assert "Issue triage: off (global default)" in reply
         assert "No repo subscriptions" in reply
+        assert "GitHub token: not set" in reply
 
     # ── 2. /github with full config ───────────────────────────────
 
@@ -3732,6 +3746,8 @@ class TestHandleGitHub:
             ),
             # DB has issue_triage override, pr_review from yaml
             self._mock_db_settings({"issue_triage": "true"}),
+            self._mock_added_repos(),
+            self._mock_get_setting("ghp_fake_token"),
         ):
             await _show_github(update, 12345, config)
 
@@ -3741,6 +3757,8 @@ class TestHandleGitHub:
         assert "PR reviews: on (users.yaml)" in reply
         assert "Issue triage: on (user override)" in reply
         assert "alice/repo1" in reply
+        assert "(users.yaml)" in reply
+        assert "GitHub token: stored" in reply
 
     # ── 3. /github notify <chat_id> ───────────────────────────────
 

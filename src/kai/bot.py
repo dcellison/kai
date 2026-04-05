@@ -35,10 +35,12 @@ import functools
 import json
 import logging
 import math
+import re
 import shutil
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction, ParseMode
@@ -52,7 +54,7 @@ from telegram.ext import (
     filters,
 )
 
-from kai import services, sessions, webhook
+from kai import github_api, services, sessions, webhook
 from kai.config import DATA_DIR, MAX_CONTEXT_CEILING, VALID_MODELS, Config, WorkspaceConfig
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
@@ -1928,6 +1930,338 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 # ── GitHub notification settings ─────────────────────────────────────
 
+# Regex for validating owner/repo format. Each component allows
+# alphanumeric characters, hyphens, underscores, and periods -
+# matching GitHub's actual naming rules.
+_REPO_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
+
+
+def _derive_webhook_url(telegram_webhook_url: str) -> str:
+    """
+    Derive the GitHub webhook URL from the Telegram webhook URL.
+
+    Replaces the path component with /webhook/github, preserving the
+    scheme and authority. For example:
+        https://api.syrinx.net/webhook/telegram -> https://api.syrinx.net/webhook/github
+
+    Callers must guard against telegram_webhook_url being None (polling
+    mode) before calling this function.
+    """
+    parsed = urlparse(telegram_webhook_url)
+    return urlunparse(parsed._replace(path="/webhook/github"))
+
+
+async def _github_api_ensure_webhook(
+    repo: str,
+    token: str,
+    config: Config,
+) -> None:
+    """
+    Register a webhook on repo if one doesn't already exist.
+
+    Checks for an existing hook first (idempotent). On success, stores
+    the hook ID in the settings table so deregistration doesn't need to
+    re-query GitHub.
+
+    Raises:
+        github_api.GitHubAPIError: On failure (401, 403, 404, etc.), or
+            status 0 if telegram_webhook_url is None (polling mode).
+    """
+    if config.telegram_webhook_url is None:
+        raise github_api.GitHubAPIError(0, "No webhook URL configured (polling mode)")
+    owner, name = repo.split("/", 1)
+    webhook_url = _derive_webhook_url(config.telegram_webhook_url)
+
+    # Check if already registered (idempotent)
+    exists, hook_id = await github_api.check_webhook_exists(owner, name, token, webhook_url)
+    if exists:
+        # Store the hook ID in case it wasn't stored before (e.g.,
+        # manually created webhook)
+        if hook_id is not None:
+            await sessions.set_setting(f"github_hook_id:{repo}", str(hook_id))
+        return
+
+    # Register the webhook and store the returned ID
+    hook_id = await github_api.register_webhook(
+        owner,
+        name,
+        token,
+        webhook_url,
+        config.webhook_secret,
+    )
+    await sessions.set_setting(f"github_hook_id:{repo}", str(hook_id))
+
+
+async def _github_api_remove_webhook(
+    repo: str,
+    token: str,
+    config: Config,
+) -> None:
+    """
+    Remove the Kai webhook from repo.
+
+    Looks up the stored hook ID first. If not stored (webhook was
+    manually created), falls back to querying GitHub to find it.
+    No-op if telegram_webhook_url is None (polling mode) or the hook
+    is already gone.
+
+    Raises:
+        github_api.GitHubAPIError: On unexpected errors.
+    """
+    if config.telegram_webhook_url is None:
+        return
+    owner, name = repo.split("/", 1)
+
+    # Try stored hook ID first
+    stored_id = await sessions.get_setting(f"github_hook_id:{repo}")
+    if stored_id:
+        await github_api.deregister_webhook(owner, name, int(stored_id), token)
+        await sessions.delete_setting(f"github_hook_id:{repo}")
+        return
+
+    # Fall back: find the hook ID by querying GitHub
+    webhook_url = _derive_webhook_url(config.telegram_webhook_url)
+    exists, hook_id = await github_api.check_webhook_exists(owner, name, token, webhook_url)
+    if not exists or hook_id is None:
+        return  # Already gone
+    await github_api.deregister_webhook(owner, name, hook_id, token)
+
+
+async def _handle_github_token(
+    update: Update,
+    chat_id: int,
+    args: list[str],
+) -> None:
+    """
+    Handle /github token <ghp_...> and /github token clear.
+
+    Stores or clears the user's GitHub PAT. The token is stored as
+    plaintext in SQLite - acceptable for a local deployment where
+    DB file access implies host access. Never logged, never echoed.
+    """
+    assert update.message is not None
+
+    if not args:
+        await update.message.reply_text("Usage: /github token <token> or /github token clear")
+        return
+
+    if args[0].lower() == "clear":
+        await sessions.delete_setting(f"github_token:{chat_id}")
+        await update.message.reply_text("GitHub token removed.")
+        return
+
+    # Store the token. Plaintext in SQLite is acceptable for local
+    # deployment where DB file access implies host access.
+    await sessions.set_setting(f"github_token:{chat_id}", args[0])
+    await update.message.reply_text("GitHub token stored.")
+
+
+def _manual_webhook_text(repo: str, webhook_url: str | None) -> str:
+    """
+    Build the manual fallback text shown when automatic webhook
+    registration is not possible (no token, 403, or polling mode).
+    """
+    lines = [
+        "Webhook registration requires a GitHub token with admin:repo_hook scope. To set one: /github token <your_pat>",
+        "",
+        "To register the webhook manually, go to:",
+        f"  {repo} Settings > Webhooks > Add webhook",
+    ]
+    if webhook_url:
+        lines.append(f"  URL: {webhook_url}")
+    lines.extend(
+        [
+            "  Content type: application/json",
+            "  Secret: (ask your Kai admin)",
+            "  Events: Pushes, Pull requests, Issues, Issue comments, PR reviews",
+        ]
+    )
+    return "\n".join(lines)
+
+
+async def _handle_github_add(
+    update: Update,
+    chat_id: int,
+    args: list[str],
+    config: Config,
+) -> None:
+    """
+    Handle /github add <owner/repo> - subscribe to a repo's notifications.
+
+    If the user has a stored GitHub PAT, attempts to auto-register the
+    webhook. Falls back to manual instructions on 403 (no admin access)
+    or when no token is stored.
+    """
+    assert update.message is not None
+
+    if not args:
+        await update.message.reply_text("Usage: /github add <owner/repo>")
+        return
+
+    # Validate owner/repo format
+    raw_repo = args[0]
+    if not _REPO_PATTERN.match(raw_repo):
+        await update.message.reply_text("Invalid repo format. Expected: owner/repo (e.g., dcellison/kai)")
+        return
+
+    repo = raw_repo.lower()
+
+    # Get the user's yaml baseline for effective computation
+    user_config = config.get_user_config(chat_id)
+    yaml_repos = user_config.github_repos if user_config else []
+    effective = await sessions.get_effective_repos(chat_id, yaml_repos)
+    added = await sessions.get_github_added_repos(chat_id)
+    removed = await sessions.get_github_removed_repos(chat_id)
+
+    # Check if already subscribed
+    if repo in effective:
+        await update.message.reply_text(f"Already subscribed to `{repo}`.")
+        return
+
+    # Determine if this is a re-add (cancels a previous remove)
+    is_readd = repo in removed
+    if is_readd:
+        # Remove from the removed list (the add cancels the remove).
+        # Don't skip webhook registration - it may have been deregistered.
+        removed = [r for r in removed if r != repo]
+        await sessions.set_github_removed_repos(chat_id, removed)
+    else:
+        # Add to the added list
+        added.append(repo)
+        await sessions.set_github_added_repos(chat_id, added)
+
+    # Derive the webhook URL for manual fallback text
+    webhook_url = _derive_webhook_url(config.telegram_webhook_url) if config.telegram_webhook_url else None
+
+    # Attempt automatic webhook registration if the user has a token
+    token = await sessions.get_setting(f"github_token:{chat_id}")
+    verb = "Re-subscribed" if is_readd else "Subscribed"
+
+    if token:
+        try:
+            await _github_api_ensure_webhook(repo, token, config)
+            await update.message.reply_text(f"{verb} to `{repo}` notifications. Webhook registered.")
+            return
+        except github_api.GitHubAPIError as e:
+            if e.status == 401:
+                await update.message.reply_text(
+                    f"{verb} to `{repo}` notifications.\n\n"
+                    "GitHub token is invalid or expired. "
+                    "Update it with /github token <new_pat>"
+                )
+                return
+            if e.status == 403:
+                # No admin access - subscription succeeds, show manual fallback
+                await update.message.reply_text(
+                    f"{verb} to `{repo}` notifications.\n\n" + _manual_webhook_text(repo, webhook_url)
+                )
+                return
+            if e.status == 404:
+                # Repo not found - roll back the subscription
+                if is_readd:
+                    removed.append(repo)
+                    await sessions.set_github_removed_repos(chat_id, removed)
+                else:
+                    added = [r for r in added if r != repo]
+                    await sessions.set_github_added_repos(chat_id, added)
+                await update.message.reply_text(f"Repository `{repo}` not found. Check the name and try again.")
+                return
+            # Network error or other - subscription succeeds, warn
+            log.warning("GitHub API error registering webhook for %s: %s", repo, e)
+            await update.message.reply_text(
+                f"{verb} to `{repo}` notifications.\n\n"
+                "Could not register webhook automatically (network error). "
+                f"You can retry with /github add {repo}."
+            )
+            return
+
+    # No token - subscription succeeds, show manual fallback
+    await update.message.reply_text(f"{verb} to `{repo}` notifications.\n\n" + _manual_webhook_text(repo, webhook_url))
+
+
+async def _handle_github_remove(
+    update: Update,
+    chat_id: int,
+    args: list[str],
+    config: Config,
+) -> None:
+    """
+    Handle /github remove <owner/repo> - unsubscribe from repo notifications.
+
+    If this user was the last subscriber and has a stored GitHub PAT,
+    attempts to deregister the webhook. Otherwise notifies the user
+    about manual cleanup.
+    """
+    assert update.message is not None
+
+    if not args:
+        await update.message.reply_text("Usage: /github remove <owner/repo>")
+        return
+
+    # Validate owner/repo format
+    raw_repo = args[0]
+    if not _REPO_PATTERN.match(raw_repo):
+        await update.message.reply_text("Invalid repo format. Expected: owner/repo (e.g., dcellison/kai)")
+        return
+
+    repo = raw_repo.lower()
+
+    # Get the user's current effective repos
+    user_config = config.get_user_config(chat_id)
+    yaml_repos = user_config.github_repos if user_config else []
+    effective = await sessions.get_effective_repos(chat_id, yaml_repos)
+
+    if repo not in effective:
+        await update.message.reply_text(f"Not subscribed to `{repo}`.")
+        return
+
+    # Remove the subscription. If repo is in the DB-added list, remove
+    # it from there. Otherwise, add it to the removed list (to override
+    # the yaml baseline).
+    added = await sessions.get_github_added_repos(chat_id)
+    if repo in added:
+        added = [r for r in added if r != repo]
+        await sessions.set_github_added_repos(chat_id, added)
+    else:
+        removed = await sessions.get_github_removed_repos(chat_id)
+        removed.append(repo)
+        await sessions.set_github_removed_repos(chat_id, removed)
+
+    # Check if any other user is still subscribed to this repo.
+    # A linear scan of all users is fine for small deployments.
+    other_subscribers = False
+    if config.user_configs:
+        for uid, uc in config.user_configs.items():
+            if uid == chat_id:
+                continue
+            uc_effective = await sessions.get_effective_repos(uc.telegram_id, uc.github_repos)
+            if repo in uc_effective:
+                other_subscribers = True
+                break
+
+    token = await sessions.get_setting(f"github_token:{chat_id}")
+
+    if other_subscribers:
+        await update.message.reply_text(f"Unsubscribed from `{repo}`. Webhook kept (other users are still subscribed).")
+        return
+
+    # Last subscriber - try to remove the webhook
+    if token:
+        try:
+            await _github_api_remove_webhook(repo, token, config)
+            await update.message.reply_text(f"Unsubscribed from `{repo}`. Webhook removed (no other subscribers).")
+        except github_api.GitHubAPIError as e:
+            log.warning("GitHub API error removing webhook for %s: %s", repo, e)
+            await update.message.reply_text(
+                f"Unsubscribed from `{repo}`. "
+                "Could not remove webhook automatically - you may want to remove it manually."
+            )
+    else:
+        await update.message.reply_text(
+            f"Unsubscribed from `{repo}`. No other subscribers. "
+            "To remove the webhook, go to the repo's Settings > Webhooks."
+        )
+
 
 async def _show_github(update: Update, chat_id: int, config: Config) -> None:
     """Display the user's effective GitHub notification settings with source attribution."""
@@ -1993,15 +2327,32 @@ async def _show_github(update: Update, chat_id: int, config: Config) -> None:
         )
     )
 
-    # Subscribed repos (from users.yaml only; self-service is #220)
+    # Subscribed repos with source attribution. Build sets from each
+    # source so we can label each repo's origin in the display.
+    yaml_repos_set = set(r.lower() for r in (user_config.github_repos if user_config else []))
+    db_added = await sessions.get_github_added_repos(chat_id)
+    db_added_set = set(db_added)
+
     repos = effective["repos"]
     if repos:
         lines.append("")
         lines.append("Subscribed repos:")
         for repo in repos:
-            lines.append(f"  {repo}")
+            # A repo in the DB-added set was added via /github add.
+            # Everything else comes from users.yaml (DB-removed repos
+            # are already excluded from the effective list).
+            if repo in db_added_set:
+                lines.append(f"  {repo}  (added via /github add)")
+            elif repo in yaml_repos_set:
+                lines.append(f"  {repo}  (users.yaml)")
+            else:
+                lines.append(f"  {repo}")
     else:
         lines.append("\nNo repo subscriptions configured.")
+
+    # Token status (never show the actual token value)
+    token = await sessions.get_setting(f"github_token:{chat_id}")
+    lines.append(f"\nGitHub token: {'stored' if token else 'not set'}")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -2170,7 +2521,21 @@ async def handle_github(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _handle_github_toggle(update, chat_id, "issue_triage", args[1:])
         return
 
-    await update.message.reply_text("Unknown subcommand. Try /github for current settings.")
+    if subcommand == "token":
+        await _handle_github_token(update, chat_id, args[1:])
+        return
+
+    if subcommand == "add":
+        await _handle_github_add(update, chat_id, args[1:], config)
+        return
+
+    if subcommand == "remove":
+        await _handle_github_remove(update, chat_id, args[1:], config)
+        return
+
+    await update.message.reply_text(
+        "Unknown subcommand. Valid: notify, reviews, triage, add, remove, token\nRun /github for current settings."
+    )
 
 
 # ── Server info and help ─────────────────────────────────────────────
