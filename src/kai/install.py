@@ -1603,6 +1603,8 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
             print(f"[DRY RUN] Would copy: {ws_claude_src} -> {ws_claude_dst}")
         if identity_src.is_file():
             print(f"[DRY RUN] Would copy: {identity_src} -> {identity_dst}")
+        elif ws_claude_src.is_dir():
+            print(f"[DRY RUN] WARNING: {identity_src} not found; home/.claude/CLAUDE.md symlink may dangle")
         return
 
     _copy_tree(src_src, src_dst, _SOURCE_EXCLUDES)

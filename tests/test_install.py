@@ -1913,6 +1913,18 @@ class TestApplySource:
         output = capsys.readouterr().out
         assert "IDENTITY.md" in output
 
+    def test_dry_run_warns_when_identity_md_missing(self, tmp_path, capsys):
+        """Dry run warns when IDENTITY.md is missing but home/.claude/ exists."""
+        src = tmp_path / "source"
+        (src / "home" / ".claude").mkdir(parents=True)
+        # No IDENTITY.md
+        with patch("kai.install.PROJECT_ROOT", src):
+            _apply_source(tmp_path / "install", svc_uid=1000, svc_gid=1000, dry_run=True)
+        output = capsys.readouterr().out
+        assert "WARNING" in output
+        assert "IDENTITY.md" in output
+        assert "dangle" in output
+
     def test_warns_when_identity_md_missing(self, tmp_path, capsys):
         """Warns when IDENTITY.md is missing but home/.claude/ exists."""
         src = tmp_path / "source"
