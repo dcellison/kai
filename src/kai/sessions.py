@@ -1002,7 +1002,7 @@ async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSetting
 
     # PR review: DB > yaml > env > False
     if "pr_review" in db:
-        pr_review = db["pr_review"].lower() == "true"
+        pr_review = isinstance(db["pr_review"], str) and db["pr_review"].lower() == "true"
     elif user_config and user_config.pr_review is not None:
         pr_review = user_config.pr_review
     else:
@@ -1010,7 +1010,7 @@ async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSetting
 
     # Issue triage: DB > yaml > env > False
     if "issue_triage" in db:
-        issue_triage = db["issue_triage"].lower() == "true"
+        issue_triage = isinstance(db["issue_triage"], str) and db["issue_triage"].lower() == "true"
     elif user_config and user_config.issue_triage is not None:
         issue_triage = user_config.issue_triage
     else:
