@@ -2229,6 +2229,12 @@ async def _handle_github_remove(
 
     # Check if any other user is still subscribed to this repo.
     # A linear scan of all users is fine for small deployments.
+    # Note: when user_configs is None (env-var-only mode without
+    # users.yaml), we cannot enumerate other users. The check is
+    # skipped and the webhook may be deregistered while other users
+    # who added the repo via /github add are still subscribed. This
+    # is a known limitation of env-var-only deployments; users.yaml
+    # is required for accurate cross-user subscriber tracking.
     other_subscribers = False
     if config.user_configs:
         for uid, uc in config.user_configs.items():
@@ -2343,7 +2349,7 @@ async def _show_github(update: Update, chat_id: int, config: Config) -> None:
             # are already excluded from the effective list).
             if repo in db_added_set:
                 lines.append(f"  {repo}  (added via /github add)")
-            elif repo in yaml_repos_set:
+            elif repo.lower() in yaml_repos_set:
                 lines.append(f"  {repo}  (users.yaml)")
             else:
                 lines.append(f"  {repo}")
