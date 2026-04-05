@@ -1796,8 +1796,10 @@ class TestApplySource:
         (src / "pyproject.toml").write_text("[project]")
         ws_claude = src / "home" / ".claude"
         ws_claude.mkdir(parents=True)
-        (ws_claude / "CLAUDE.md").write_text("identity")
+        # Mirror the real layout: IDENTITY.md is the real file,
+        # .claude/CLAUDE.md is a symlink pointing to it.
         (src / "home" / "IDENTITY.md").write_text("# Kai")
+        (ws_claude / "CLAUDE.md").symlink_to("../IDENTITY.md")
         install = tmp_path / "install"
         install.mkdir()
 
