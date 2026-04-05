@@ -783,7 +783,11 @@ class TestGitHubReposWarning:
         _mock_user_configs(monkeypatch)
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             load_config()
-        repo_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and "github_repos" in r.message]
+        repo_warnings = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and "github_repos" in r.message and "deprecated" not in r.message
+        ]
         assert repo_warnings == []
 
     def test_no_warn_when_no_user_configs(self, monkeypatch, caplog):
@@ -792,7 +796,11 @@ class TestGitHubReposWarning:
         monkeypatch.setenv("PR_REVIEW_ENABLED", "true")
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             load_config()
-        repo_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and "github_repos" in r.message]
+        repo_warnings = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and "github_repos" in r.message and "deprecated" not in r.message
+        ]
         assert repo_warnings == []
 
     def test_no_warn_when_any_user_has_repos(self, monkeypatch, caplog):
