@@ -795,7 +795,7 @@ class TestGitHubReposWarning:
         repo_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and "github_repos" in r.message]
         assert repo_warnings == []
 
-    def test_warns_only_when_all_users_have_no_repos(self, monkeypatch, caplog):
+    def test_no_warn_when_any_user_has_repos(self, monkeypatch, caplog):
         """No warning when at least one of multiple users has repos."""
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
         monkeypatch.setenv("PR_REVIEW_ENABLED", "true")

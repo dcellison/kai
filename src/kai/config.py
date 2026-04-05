@@ -1167,16 +1167,16 @@ def load_config() -> Config:
         # incoming webhook. The fallback path in _process_github_event()
         # delivers basic notifications but does not guarantee the agents
         # fire.
-        _no_repos = not any(uc.github_repos for uc in user_configs.values())
-        if _no_repos:
-            _review_on = pr_review_enabled or any(uc.pr_review is True for uc in user_configs.values())
-            _triage_on = issue_triage_enabled or any(uc.issue_triage is True for uc in user_configs.values())
-            if _review_on or _triage_on:
-                _features = []
-                if _review_on:
-                    _features.append("PR review")
-                if _triage_on:
-                    _features.append("issue triage")
+        no_repos = not any(uc.github_repos for uc in user_configs.values())
+        if no_repos:
+            review_on = pr_review_enabled or any(uc.pr_review is True for uc in user_configs.values())
+            triage_on = issue_triage_enabled or any(uc.issue_triage is True for uc in user_configs.values())
+            if review_on or triage_on:
+                features = []
+                if review_on:
+                    features.append("PR review")
+                if triage_on:
+                    features.append("issue triage")
                 log.warning(
                     "GitHub features enabled (%s) but no users have "
                     "github_repos configured. GitHub webhook events will "
@@ -1184,7 +1184,7 @@ def load_config() -> Config:
                     "to users.yaml entries. See: https://github.com/"
                     "dcellison/kai/wiki/Multi-User-Setup"
                     "#what-you-must-set-manually",
-                    ", ".join(_features),
+                    ", ".join(features),
                 )
 
     # Validate CLAUDE_MODEL against the same VALID_MODELS set used
