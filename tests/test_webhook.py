@@ -1256,7 +1256,21 @@ class TestGitHubNotifyGroup:
 
 
 class TestGetSubscribedUsers:
-    """Tests for the per-user repo subscription lookup."""
+    """Tests for the per-user repo subscription lookup.
+
+    All tests mock get_effective_repos to return yaml repos as-is
+    (no DB layer), isolating the subscription matching logic.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _mock_effective_repos(self):
+        """Mock get_effective_repos to pass through yaml repos unchanged."""
+
+        async def _passthrough(chat_id: int, yaml_repos: list[str]) -> list[str]:
+            return sorted(r.lower() for r in yaml_repos)
+
+        with patch("kai.webhook.sessions.get_effective_repos", side_effect=_passthrough):
+            yield
 
     def _make_config(self, user_configs: dict | None = None) -> AsyncMock:
         """Build a mock Config with the given user_configs dict."""
@@ -1279,99 +1293,99 @@ class TestGetSubscribedUsers:
             role=role,
         )
 
-    def test_exact_match(self):
+    async def test_exact_match(self):
         """User with matching repo is returned."""
         user = self._make_user(111, repos=["dcellison/kai"])
         config = self._make_config({111: user})
-        result = _get_subscribed_users(config, "dcellison/kai")
+        result = await _get_subscribed_users(config, "dcellison/kai")
         assert result == [user]
 
-    def test_case_insensitive(self):
+    async def test_case_insensitive(self):
         """Repo matching is case-insensitive (GitHub repos are)."""
         user = self._make_user(111, repos=["dcellison/kai"])
         config = self._make_config({111: user})
-        result = _get_subscribed_users(config, "Dcellison/Kai")
+        result = await _get_subscribed_users(config, "Dcellison/Kai")
         assert result == [user]
 
-    def test_multiple_users(self):
+    async def test_multiple_users(self):
         """Multiple users subscribed to the same repo are all returned."""
         user1 = self._make_user(111, name="alice", repos=["dcellison/kai"])
         user2 = self._make_user(222, name="bob", repos=["dcellison/kai"])
         config = self._make_config({111: user1, 222: user2})
-        result = _get_subscribed_users(config, "dcellison/kai")
+        result = await _get_subscribed_users(config, "dcellison/kai")
         assert len(result) == 2
         assert user1 in result
         assert user2 in result
 
-    def test_no_match(self):
+    async def test_no_match(self):
         """No users subscribed to the repo returns empty list."""
         user = self._make_user(111, repos=["dcellison/other"])
         config = self._make_config({111: user})
-        result = _get_subscribed_users(config, "dcellison/kai")
+        result = await _get_subscribed_users(config, "dcellison/kai")
         assert result == []
 
-    def test_no_user_configs(self):
+    async def test_no_user_configs(self):
         """Config with user_configs=None returns empty list."""
         config = self._make_config(None)
-        result = _get_subscribed_users(config, "dcellison/kai")
+        result = await _get_subscribed_users(config, "dcellison/kai")
         assert result == []
 
     # ── Admin wildcard tests ─────────────────────────────────────
 
-    def test_admin_with_no_repos_is_wildcard(self):
+    async def test_admin_with_no_repos_is_wildcard(self):
         """Admin with empty github_repos receives all events."""
         admin = self._make_user(111, role="admin")
         config = self._make_config({111: admin})
-        result = _get_subscribed_users(config, "any/repo")
+        result = await _get_subscribed_users(config, "any/repo")
         assert result == [admin]
 
-    def test_admin_with_explicit_repos_not_wildcard(self):
+    async def test_admin_with_explicit_repos_not_wildcard(self):
         """Admin with explicit repos only receives those repos."""
         admin = self._make_user(111, role="admin", repos=["owner/other"])
         config = self._make_config({111: admin})
-        result = _get_subscribed_users(config, "owner/repo")
+        result = await _get_subscribed_users(config, "owner/repo")
         assert result == []
 
-    def test_admin_with_matching_explicit_repo(self):
+    async def test_admin_with_matching_explicit_repo(self):
         """Admin with explicit matching repo appears once (no duplicate)."""
         admin = self._make_user(111, role="admin", repos=["owner/repo"])
         config = self._make_config({111: admin})
-        result = _get_subscribed_users(config, "owner/repo")
+        result = await _get_subscribed_users(config, "owner/repo")
         assert result == [admin]
 
-    def test_regular_user_with_no_repos_not_wildcard(self):
+    async def test_regular_user_with_no_repos_not_wildcard(self):
         """Non-admin with empty github_repos receives nothing."""
         user = self._make_user(111, role="user")
         config = self._make_config({111: user})
-        result = _get_subscribed_users(config, "any/repo")
+        result = await _get_subscribed_users(config, "any/repo")
         assert result == []
 
-    def test_admin_wildcard_and_explicit_subscriber_both_returned(self):
+    async def test_admin_wildcard_and_explicit_subscriber_both_returned(self):
         """Admin wildcard and explicit subscriber both appear."""
         admin = self._make_user(111, name="admin", role="admin")
         user = self._make_user(222, name="user", repos=["owner/repo"])
         config = self._make_config({111: admin, 222: user})
-        result = _get_subscribed_users(config, "owner/repo")
+        result = await _get_subscribed_users(config, "owner/repo")
         assert len(result) == 2
         assert admin in result
         assert user in result
 
-    def test_admin_wildcard_with_case_insensitive_explicit_user(self):
+    async def test_admin_wildcard_with_case_insensitive_explicit_user(self):
         """Admin wildcard and case-insensitive explicit match coexist."""
         admin = self._make_user(111, name="admin", role="admin")
         user = self._make_user(222, name="user", repos=["Owner/Repo"])
         config = self._make_config({111: admin, 222: user})
-        result = _get_subscribed_users(config, "owner/repo")
+        result = await _get_subscribed_users(config, "owner/repo")
         assert len(result) == 2
         assert admin in result
         assert user in result
 
-    def test_multiple_admin_wildcards(self):
+    async def test_multiple_admin_wildcards(self):
         """Multiple admins with empty repos all receive events."""
         admin1 = self._make_user(111, name="alice", role="admin")
         admin2 = self._make_user(222, name="bob", role="admin")
         config = self._make_config({111: admin1, 222: admin2})
-        result = _get_subscribed_users(config, "any/repo")
+        result = await _get_subscribed_users(config, "any/repo")
         assert len(result) == 2
         assert admin1 in result
         assert admin2 in result
@@ -1425,7 +1439,18 @@ class TestPerUserRouting:
     These tests create apps with user_configs populated so that
     _get_subscribed_users returns specific users. Each user's
     feature flags are controlled via resolve_github_settings mock.
+    get_effective_repos is mocked to pass through yaml repos (no DB).
     """
+
+    @pytest.fixture(autouse=True)
+    def _mock_effective_repos(self):
+        """Mock get_effective_repos to pass through yaml repos unchanged."""
+
+        async def _passthrough(chat_id: int, yaml_repos: list[str]) -> list[str]:
+            return sorted(r.lower() for r in yaml_repos)
+
+        with patch("kai.webhook.sessions.get_effective_repos", side_effect=_passthrough):
+            yield
 
     def _make_user_config(
         self,

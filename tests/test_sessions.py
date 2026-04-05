@@ -867,6 +867,72 @@ class TestResolveWorkspaceAccess:
         assert allowed[1] == global_path.resolve()
 
 
+# ── Effective repos ───────────────────────────────────────────────
+
+
+class TestEffectiveRepos:
+    """Tests for the union/minus repo computation."""
+
+    async def test_yaml_only(self, db):
+        """With no DB overrides, returns yaml repos lowercased."""
+        result = await sessions.get_effective_repos(111, ["Owner/Repo"])
+        assert result == ["owner/repo"]
+
+    async def test_db_added(self, db):
+        """DB-added repos are included in the effective list."""
+        await sessions.set_github_added_repos(111, ["other/added"])
+        result = await sessions.get_effective_repos(111, ["owner/repo"])
+        assert "other/added" in result
+        assert "owner/repo" in result
+
+    async def test_db_removed(self, db):
+        """DB-removed repos are excluded from the effective list."""
+        await sessions.set_github_removed_repos(111, ["owner/repo"])
+        result = await sessions.get_effective_repos(111, ["Owner/Repo"])
+        assert result == []
+
+    async def test_union_minus(self, db):
+        """Full union/minus: yaml + added - removed."""
+        await sessions.set_github_added_repos(111, ["extra/repo"])
+        await sessions.set_github_removed_repos(111, ["yaml/removed"])
+        result = await sessions.get_effective_repos(111, ["yaml/kept", "yaml/removed"])
+        assert "yaml/kept" in result
+        assert "extra/repo" in result
+        assert "yaml/removed" not in result
+
+    async def test_add_cancels_remove(self, db):
+        """Adding a repo that was previously removed cancels the removal."""
+        await sessions.set_github_removed_repos(111, ["owner/repo"])
+        # Simulate the cancel-out: remove from removed list
+        await sessions.set_github_removed_repos(111, [])
+        await sessions.set_github_added_repos(111, ["owner/repo"])
+        result = await sessions.get_effective_repos(111, [])
+        assert result == ["owner/repo"]
+
+    async def test_empty_everything(self, db):
+        """No yaml repos and no DB entries returns empty list."""
+        result = await sessions.get_effective_repos(111, [])
+        assert result == []
+
+    async def test_case_normalization(self, db):
+        """All repos are lowercased for consistent matching."""
+        await sessions.set_github_added_repos(111, ["Owner/UPPER"])
+        result = await sessions.get_effective_repos(111, ["YAML/Mixed"])
+        assert result == ["owner/upper", "yaml/mixed"]
+
+    async def test_corrupt_added_repos(self, db):
+        """Corrupt JSON in added repos returns empty list."""
+        await sessions.set_setting("github_repos_added:111", "not json")
+        result = await sessions.get_effective_repos(111, ["owner/repo"])
+        assert result == ["owner/repo"]
+
+    async def test_corrupt_removed_repos(self, db):
+        """Corrupt JSON in removed repos returns empty list."""
+        await sessions.set_setting("github_repos_removed:111", "{}")
+        result = await sessions.get_effective_repos(111, ["owner/repo"])
+        assert result == ["owner/repo"]
+
+
 # ── resolve_github_settings ───────────────────────────────────────
 
 
@@ -911,6 +977,7 @@ class TestResolveGitHubSettings:
         )
         config = self._make_config(user_configs={111: uc})
         result = await sessions.resolve_github_settings(111, config)
+        # get_effective_repos lowercases all repos
         assert result["repos"] == ["alice/repo-a"]
         assert result["notify_chat_id"] == -100999
         assert result["pr_review"] is True

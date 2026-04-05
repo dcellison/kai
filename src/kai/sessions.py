@@ -937,14 +937,83 @@ async def resolve_workspace_access(chat_id: int, config: Config) -> tuple[Path |
 # ── GitHub settings resolution ──────────────────────────────────────
 
 
+async def get_github_added_repos(chat_id: int) -> list[str]:
+    """Return repos the user has added via /github add, or [].
+
+    Values are stored as a JSON array of lowercase strings in the
+    settings table under the key "github_repos_added:{chat_id}".
+    """
+    val = await get_setting(f"github_repos_added:{chat_id}")
+    if val is None:
+        return []
+    try:
+        repos = json.loads(val)
+        assert isinstance(repos, list)
+        return repos
+    except (json.JSONDecodeError, AssertionError):
+        log.warning("Corrupt github_repos_added for chat %d: %r", chat_id, val)
+        return []
+
+
+async def get_github_removed_repos(chat_id: int) -> list[str]:
+    """Return repos the user has removed via /github remove, or [].
+
+    Values are stored as a JSON array of lowercase strings in the
+    settings table under the key "github_repos_removed:{chat_id}".
+    """
+    val = await get_setting(f"github_repos_removed:{chat_id}")
+    if val is None:
+        return []
+    try:
+        repos = json.loads(val)
+        assert isinstance(repos, list)
+        return repos
+    except (json.JSONDecodeError, AssertionError):
+        log.warning("Corrupt github_repos_removed for chat %d: %r", chat_id, val)
+        return []
+
+
+async def set_github_added_repos(chat_id: int, repos: list[str]) -> None:
+    """Persist the user's added-repos list. Stores lowercase."""
+    normalized = [r.lower() for r in repos]
+    await set_setting(f"github_repos_added:{chat_id}", json.dumps(normalized))
+
+
+async def set_github_removed_repos(chat_id: int, repos: list[str]) -> None:
+    """Persist the user's removed-repos list. Stores lowercase."""
+    normalized = [r.lower() for r in repos]
+    await set_setting(f"github_repos_removed:{chat_id}", json.dumps(normalized))
+
+
+async def get_effective_repos(chat_id: int, yaml_repos: list[str]) -> list[str]:
+    """Compute the effective repo list for a user.
+
+    Returns the union of yaml_repos and DB-added repos, minus DB-removed
+    repos. All values are lowercased for case-insensitive matching.
+    This is the single source of truth for the union/minus formula;
+    both resolve_github_settings() and webhook._get_subscribed_users()
+    call this function.
+    """
+    added = await get_github_added_repos(chat_id)
+    removed = await get_github_removed_repos(chat_id)
+    return sorted((set(r.lower() for r in yaml_repos) | set(added)) - set(removed))
+
+
 async def get_github_db_settings(chat_id: int) -> dict[str, str]:
     """Read all GitHub-related DB overrides for a user.
 
     Returns a dict of key->value for settings that exist.
-    Keys: "pr_review", "issue_triage", "github_notify_chat".
+    Keys: "pr_review", "issue_triage", "github_notify_chat",
+    "github_repos_added", "github_repos_removed".
     """
     result: dict[str, str] = {}
-    for key in ("pr_review", "issue_triage", "github_notify_chat"):
+    for key in (
+        "pr_review",
+        "issue_triage",
+        "github_notify_chat",
+        "github_repos_added",
+        "github_repos_removed",
+    ):
         val = await get_setting(f"{key}:{chat_id}")
         if val is not None:
             result[key] = val
@@ -974,8 +1043,9 @@ async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSetting
     user_config = config.get_user_config(chat_id)
     db = await get_github_db_settings(chat_id)
 
-    # Repos: users.yaml only (DB-managed repos are #220)
-    repos = user_config.github_repos if user_config else []
+    # Repos: yaml baseline + DB-added - DB-removed (#220).
+    yaml_repos = user_config.github_repos if user_config else []
+    repos = await get_effective_repos(chat_id, yaml_repos)
 
     # Notification destination: DB > yaml > env > telegram_id.
     # Defensive try/except matches budget/timeout/context_window above.

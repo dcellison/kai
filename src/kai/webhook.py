@@ -547,22 +547,24 @@ async def _handle_github(request: web.Request) -> web.Response:
         return web.json_response({"msg": "internal_error"}, status=500)
 
 
-def _get_subscribed_users(config: Config, repo_full_name: str) -> list[UserConfig]:
+async def _get_subscribed_users(config: Config, repo_full_name: str) -> list[UserConfig]:
     """Find all users subscribed to a GitHub repo.
 
-    Matches repo_full_name against each user's github_repos list.
+    Computes each user's effective repo list (yaml + DB-added - DB-removed)
+    via sessions.get_effective_repos(), then matches against repo_full_name.
     Comparison is case-insensitive since GitHub repo names are
     case-insensitive.
 
-    Admin users with empty github_repos are treated as wildcards: they
+    Admin users with empty effective repos are treated as wildcards: they
     receive all events for all repos, matching the pre-multi-user behavior
     where admins received GitHub events globally. An admin who wants to
-    receive only specific repos should list them explicitly - once any
-    repos are listed, the wildcard no longer applies.
+    receive only specific repos should list them explicitly or use
+    /github add - once any repos are in the effective list, the wildcard
+    no longer applies.
 
-    Non-admin users with empty github_repos receive nothing. Regular users
-    never received global events before the multi-user buildout, so this
-    is the correct backward-compatible default.
+    Non-admin users with empty effective repos receive nothing. Regular
+    users never received global events before the multi-user buildout, so
+    this is the correct backward-compatible default.
 
     Args:
         config: The application Config instance.
@@ -576,19 +578,21 @@ def _get_subscribed_users(config: Config, repo_full_name: str) -> list[UserConfi
         return []
     repo_lower = repo_full_name.lower()
 
-    # Users with an explicit github_repos entry matching this repo.
-    explicitly_subscribed = [
-        uc for uc in config.user_configs.values() if any(r.lower() == repo_lower for r in uc.github_repos)
-    ]
+    explicitly_subscribed: list[UserConfig] = []
+    admin_wildcards: list[UserConfig] = []
 
-    # Admin users with no github_repos act as wildcards: include them for
-    # every repo. Non-empty github_repos on an admin means they have opted
-    # into specific repos only, so they are excluded here (and already
-    # captured by the explicit check above when the repo matches).
-    admin_wildcards = [uc for uc in config.user_configs.values() if uc.role == "admin" and not uc.github_repos]
+    for uc in config.user_configs.values():
+        # Compute effective repos: yaml baseline + DB-added - DB-removed.
+        effective = await sessions.get_effective_repos(uc.telegram_id, uc.github_repos)
 
-    # No deduplication needed: admin_wildcards requires empty github_repos,
-    # so no user can appear in both lists simultaneously.
+        if repo_lower in effective:
+            explicitly_subscribed.append(uc)
+        elif uc.role == "admin" and not effective:
+            # Admin with no effective repos = wildcard (receives all events).
+            admin_wildcards.append(uc)
+
+    # No deduplication needed: admin_wildcards requires empty effective
+    # repos, so no user can appear in both lists simultaneously.
     return explicitly_subscribed + admin_wildcards
 
 
@@ -611,7 +615,7 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
     repo_full_name = payload.get("repository", {}).get("full_name", "")
 
     # Find all users subscribed to this repo
-    subscribed_users = _get_subscribed_users(config, repo_full_name)
+    subscribed_users = await _get_subscribed_users(config, repo_full_name)
 
     if not subscribed_users:
         # No subscribers and no admin wildcards for this repo.
