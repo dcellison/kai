@@ -554,17 +554,42 @@ def _get_subscribed_users(config: Config, repo_full_name: str) -> list[UserConfi
     Comparison is case-insensitive since GitHub repo names are
     case-insensitive.
 
+    Admin users with empty github_repos are treated as wildcards: they
+    receive all events for all repos, matching the pre-multi-user behavior
+    where admins received GitHub events globally. An admin who wants to
+    receive only specific repos should list them explicitly - once any
+    repos are listed, the wildcard no longer applies.
+
+    Non-admin users with empty github_repos receive nothing. Regular users
+    never received global events before the multi-user buildout, so this
+    is the correct backward-compatible default.
+
     Args:
         config: The application Config instance.
         repo_full_name: Full GitHub repo name (e.g., "dcellison/kai").
 
     Returns:
-        List of UserConfig objects for users subscribed to this repo.
+        List of UserConfig objects for users who should receive this event.
+        May contain both explicitly-subscribed users and admin wildcards.
     """
     if config.user_configs is None:
         return []
     repo_lower = repo_full_name.lower()
-    return [uc for uc in config.user_configs.values() if any(r.lower() == repo_lower for r in uc.github_repos)]
+
+    # Users with an explicit github_repos entry matching this repo.
+    explicitly_subscribed = [
+        uc for uc in config.user_configs.values() if any(r.lower() == repo_lower for r in uc.github_repos)
+    ]
+
+    # Admin users with no github_repos act as wildcards: include them for
+    # every repo. Non-empty github_repos on an admin means they have opted
+    # into specific repos only, so they are excluded here (and already
+    # captured by the explicit check above when the repo matches).
+    admin_wildcards = [uc for uc in config.user_configs.values() if uc.role == "admin" and not uc.github_repos]
+
+    # No deduplication needed: admin_wildcards requires empty github_repos,
+    # so no user can appear in both lists simultaneously.
+    return explicitly_subscribed + admin_wildcards
 
 
 async def _process_github_event(request: web.Request, payload: dict, event_type: str) -> web.Response:
@@ -574,9 +599,10 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
     via _get_subscribed_users(). Each user gets their own feature flag
     check and notification destination via resolve_github_settings().
 
-    When no users are subscribed (e.g., single-user installs without
-    github_repos configured), falls back to the admin chat_id so
-    existing behavior is preserved.
+    Admin users with empty github_repos receive all events (wildcard).
+    Only reaches the fallback path when no user is subscribed and no
+    admin wildcard exists - for example, when no users.yaml is configured
+    or when all admins have opted into specific repos only.
     """
     bot = request.app["telegram_bot"]
     config: Config = request.app["config"]
@@ -588,11 +614,11 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
     subscribed_users = _get_subscribed_users(config, repo_full_name)
 
     if not subscribed_users:
-        # No subscribers for this repo. If user_configs exist (someone
-        # has github_repos configured), this is likely a misconfiguration
-        # worth warning about. If no user_configs exist at all, this is
-        # just a single-user install using the legacy admin fallback -
-        # log at debug to avoid noise on every webhook event.
+        # No subscribers and no admin wildcards for this repo.
+        # This can happen when:
+        #   - No users.yaml exists (env-var only mode, debug-log to avoid noise)
+        #   - All admins have explicit github_repos that don't include this repo
+        #   - No admins are configured (unusual; warned at config load time)
         if config.user_configs:
             log.warning(
                 "GitHub %s event for %s: no subscribed users. "
@@ -608,11 +634,9 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
                 event_type,
                 repo_full_name,
             )
-        # Fall back to legacy behavior: route to the default admin.
-        # request.app["chat_id"] is set in webhook.start() to the first
-        # admin in users.yaml or the first ALLOWED_USER_IDS entry.
-        # Wrapped in try/except for consistency with the fan-out path -
-        # a transient failure should return 200, not 500.
+        # Fall back to the first admin in the app config so the event is
+        # not silently dropped. Wrapped in try/except for consistency with
+        # the fan-out path - a transient failure should return 200, not 500.
         fallback_chat_id = request.app["chat_id"]
         try:
             await _process_github_event_for_user(

@@ -1269,12 +1269,14 @@ class TestGetSubscribedUsers:
         telegram_id: int,
         name: str = "testuser",
         repos: list[str] | None = None,
+        role: str = "user",
     ) -> UserConfig:
-        """Build a UserConfig with the given github_repos."""
+        """Build a UserConfig with the given github_repos and role."""
         return UserConfig(
             telegram_id=telegram_id,
             name=name,
             github_repos=repos or [],
+            role=role,
         )
 
     def test_exact_match(self):
@@ -1313,6 +1315,66 @@ class TestGetSubscribedUsers:
         config = self._make_config(None)
         result = _get_subscribed_users(config, "dcellison/kai")
         assert result == []
+
+    # ── Admin wildcard tests ─────────────────────────────────────
+
+    def test_admin_with_no_repos_is_wildcard(self):
+        """Admin with empty github_repos receives all events."""
+        admin = self._make_user(111, role="admin")
+        config = self._make_config({111: admin})
+        result = _get_subscribed_users(config, "any/repo")
+        assert result == [admin]
+
+    def test_admin_with_explicit_repos_not_wildcard(self):
+        """Admin with explicit repos only receives those repos."""
+        admin = self._make_user(111, role="admin", repos=["owner/other"])
+        config = self._make_config({111: admin})
+        result = _get_subscribed_users(config, "owner/repo")
+        assert result == []
+
+    def test_admin_with_matching_explicit_repo(self):
+        """Admin with explicit matching repo appears once (no duplicate)."""
+        admin = self._make_user(111, role="admin", repos=["owner/repo"])
+        config = self._make_config({111: admin})
+        result = _get_subscribed_users(config, "owner/repo")
+        assert result == [admin]
+
+    def test_regular_user_with_no_repos_not_wildcard(self):
+        """Non-admin with empty github_repos receives nothing."""
+        user = self._make_user(111, role="user")
+        config = self._make_config({111: user})
+        result = _get_subscribed_users(config, "any/repo")
+        assert result == []
+
+    def test_admin_wildcard_and_explicit_subscriber_both_returned(self):
+        """Admin wildcard and explicit subscriber both appear."""
+        admin = self._make_user(111, name="admin", role="admin")
+        user = self._make_user(222, name="user", repos=["owner/repo"])
+        config = self._make_config({111: admin, 222: user})
+        result = _get_subscribed_users(config, "owner/repo")
+        assert len(result) == 2
+        assert admin in result
+        assert user in result
+
+    def test_admin_wildcard_case_insensitive_not_doubled(self):
+        """Admin wildcard + case-insensitive explicit match = 2 results."""
+        admin = self._make_user(111, name="admin", role="admin")
+        user = self._make_user(222, name="user", repos=["Owner/Repo"])
+        config = self._make_config({111: admin, 222: user})
+        result = _get_subscribed_users(config, "owner/repo")
+        assert len(result) == 2
+        assert admin in result
+        assert user in result
+
+    def test_multiple_admin_wildcards(self):
+        """Multiple admins with empty repos all receive events."""
+        admin1 = self._make_user(111, name="alice", role="admin")
+        admin2 = self._make_user(222, name="bob", role="admin")
+        config = self._make_config({111: admin1, 222: admin2})
+        result = _get_subscribed_users(config, "any/repo")
+        assert len(result) == 2
+        assert admin1 in result
+        assert admin2 in result
 
     @pytest.mark.asyncio
     async def test_no_subscribed_users_warning_includes_remediation_hint(self, _clear_cooldowns, caplog):
@@ -1370,12 +1432,14 @@ class TestPerUserRouting:
         telegram_id: int,
         name: str = "testuser",
         repos: list[str] | None = None,
+        role: str = "user",
     ) -> UserConfig:
         """Build a UserConfig for routing tests."""
         return UserConfig(
             telegram_id=telegram_id,
             name=name,
             github_repos=repos or [],
+            role=role,
         )
 
     def _make_config_with_users(self, users: list) -> AsyncMock:
@@ -1866,6 +1930,100 @@ class TestPerUserRouting:
             await asyncio.sleep(0.01)
             mock_triage.assert_called_once()
             assert mock_triage.call_args[1]["claude_user"] == "global-user"
+
+    # ── Admin wildcard integration tests ─────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_admin_wildcard_receives_event(self, _clear_cooldowns):
+        """Admin with empty github_repos receives push events."""
+        admin = self._make_user_config(111, role="admin")
+        config = self._make_config_with_users([admin])
+        app = _build_test_app(config=config)
+        payload = {
+            "ref": "refs/heads/main",
+            "commits": [{"message": "test", "author": {"name": "dev"}}],
+            "repository": {"full_name": "any/repo"},
+            "compare": "https://github.com/any/repo/compare/a...b",
+        }
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with _mock_settings(notify_chat_id=111):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "push",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+        # Admin received the event via wildcard, not fallback
+        call_args = app["telegram_bot"].send_message.call_args
+        assert call_args[0][0] == 111
+
+    @pytest.mark.asyncio
+    async def test_admin_wildcard_triggers_pr_review(self, _clear_cooldowns, _mock_resolve_repo):
+        """Admin wildcard with pr_review=True triggers the review agent."""
+        admin = self._make_user_config(111, role="admin")
+        config = self._make_config_with_users([admin])
+        app = _build_test_app(config=config)
+        payload = _make_pr_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with (
+            _mock_settings(pr_review=True, notify_chat_id=111),
+            patch("kai.webhook.review.review_pr", new_callable=AsyncMock) as mock_review,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+            # Allow background task to complete
+            await asyncio.sleep(0.01)
+            mock_review.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_regular_user_no_repos_receives_nothing(self, _clear_cooldowns):
+        """Non-admin with empty github_repos does not receive events."""
+        user = self._make_user_config(111, role="user")
+        config = self._make_config_with_users([user])
+        app = _build_test_app(config=config)
+        payload = {
+            "ref": "refs/heads/main",
+            "commits": [{"message": "test", "author": {"name": "dev"}}],
+            "repository": {"full_name": "any/repo"},
+            "compare": "https://github.com/any/repo/compare/a...b",
+        }
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        # Fallback resolves settings for the default admin (12345)
+        with _mock_settings(notify_chat_id=12345):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "push",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+        # Event goes to fallback admin (12345), not user 111
+        call_args = app["telegram_bot"].send_message.call_args
+        assert call_args[0][0] == 12345
 
 
 # ── add_allowed_chat_id / remove_allowed_chat_id ────────────────────
