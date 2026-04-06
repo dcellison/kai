@@ -206,13 +206,18 @@ def build_session_context(
     """
     parts: list[str] = []
 
-    # When in a foreign workspace, inject Kai's identity from home
+    # When in a foreign workspace, inject Kai's identity from home.
+    # try/except guards against race (file deleted between exists()
+    # and read_text()) and permission errors, matching the pattern
+    # in get_workspace_system_prompt().
     if workspace != home_workspace:
         identity_path = home_workspace / ".claude" / "CLAUDE.md"
-        if identity_path.exists():
+        try:
             identity = identity_path.read_text().strip()
             if identity:
                 parts.append(f"[Your core identity and instructions:]\n{identity}")
+        except OSError:
+            pass
 
     # Always inject Kai's personal memory from DATA_DIR. This file
     # lives outside the install tree (/var/lib/kai/memory/ in production)
