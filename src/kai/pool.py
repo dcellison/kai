@@ -1,15 +1,14 @@
 """
-Per-user Claude subprocess pool with lazy creation and idle eviction.
+Per-user agent subprocess pool with lazy creation and idle eviction.
 
 Provides functionality to:
-1. Manage a dict of PersistentClaude instances keyed by chat_id
+1. Manage a dict of AgentBackend instances keyed by chat_id
 2. Create instances lazily on first message with per-user configuration
 3. Route prompts to the correct user's subprocess
 4. Evict idle subprocesses to reclaim memory on resource-constrained machines
 5. Restore per-user saved workspaces on first interaction
 
-This replaces the single shared PersistentClaude instance from Phases 1-2.
-Each user gets their own Claude subprocess with full conversation isolation,
+Each user gets their own backend instance with full conversation isolation,
 independent lifecycle, and OS-level enforcement via sudo -u when os_user is
 configured in users.yaml.
 """
@@ -21,7 +20,8 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from kai import sessions
-from kai.claude import PersistentClaude, StreamEvent
+from kai.backend import AgentBackend, StreamEvent
+from kai.claude import ClaudeCodeBackend
 from kai.config import Config, WorkspaceConfig
 from kai.workspace_utils import is_workspace_allowed
 
@@ -38,9 +38,9 @@ _FORCE_KILL_TIMEOUT = 5
 
 class SubprocessPool:
     """
-    Per-user Claude subprocess pool with lazy creation and idle eviction.
+    Per-user agent subprocess pool with lazy creation and idle eviction.
 
-    Each user gets an independent PersistentClaude instance running as their
+    Each user gets an independent AgentBackend instance running as their
     OS user. Instances are created on first message and evicted after idle
     timeout to manage memory on resource-constrained machines.
 
@@ -59,7 +59,7 @@ class SubprocessPool:
     ):
         self._config = config
         self._services_info = services_info
-        self._pool: dict[int, PersistentClaude] = {}
+        self._pool: dict[int, AgentBackend] = {}
         self._last_activity: dict[int, float] = {}
         self._needs_workspace_restore: set[int] = set()
         self._in_flight: set[int] = set()  # chat_ids with active send()
@@ -67,13 +67,13 @@ class SubprocessPool:
 
     # ── Instance management ─────────────────────────────────────────
 
-    def get(self, chat_id: int) -> PersistentClaude:
+    def get(self, chat_id: int) -> AgentBackend:
         """
-        Get or create a PersistentClaude for the given user.
+        Get or create a backend instance for the given user.
 
         Creates lazily on first access. The subprocess itself starts even
-        later (on first send()), not here - PersistentClaude.__init__ is
-        cheap; _ensure_started() is where the process spawns.
+        later (on first send()), not here - __init__ is cheap;
+        _ensure_started() is where the process spawns.
         """
         if chat_id not in self._pool:
             instance = self._create_instance(chat_id)
@@ -82,9 +82,9 @@ class SubprocessPool:
         self._last_activity[chat_id] = time.monotonic()
         return self._pool[chat_id]
 
-    def _create_instance(self, chat_id: int) -> PersistentClaude:
+    def _create_instance(self, chat_id: int) -> ClaudeCodeBackend:
         """
-        Create a PersistentClaude for a specific user.
+        Create a ClaudeCodeBackend for a specific user.
 
         Resolution order for each setting:
         1. UserConfig from users.yaml (os_user, home_workspace, model,
@@ -116,7 +116,7 @@ class SubprocessPool:
             user.context_window if user and user.context_window is not None else self._config.claude_max_context_window
         )
 
-        return PersistentClaude(
+        return ClaudeCodeBackend(
             model=model,
             workspace=workspace,
             home_workspace=user.home_workspace if user else self._config.claude_workspace,
@@ -155,7 +155,7 @@ class SubprocessPool:
             self._in_flight.discard(chat_id)
             self._last_activity[chat_id] = time.monotonic()
 
-    async def _restore_workspace(self, chat_id: int, instance: PersistentClaude) -> None:
+    async def _restore_workspace(self, chat_id: int, instance: AgentBackend) -> None:
         """Restore a user's saved workspace from the database.
 
         Validates that the saved workspace is still an allowed path
@@ -239,7 +239,7 @@ class SubprocessPool:
                     log.warning("Corrupt context_window in DB for user %d", chat_id)
 
             # restart() kills the subprocess and spawns a new one, but
-            # the PersistentClaude *object* is preserved. Mutations made
+            # the backend *object* is preserved. Mutations made
             # above (budget, timeout, model, context_window) survive the
             # restart because the new subprocess reads from self.* attrs.
             if needs_restart:
@@ -248,7 +248,7 @@ class SubprocessPool:
 
     # ── Per-user actions ────────────────────────────────────────────
 
-    def get_if_exists(self, chat_id: int) -> PersistentClaude | None:
+    def get_if_exists(self, chat_id: int) -> AgentBackend | None:
         """
         Look up a user's subprocess without creating one.
 

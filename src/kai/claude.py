@@ -1,28 +1,20 @@
 """
-Persistent Claude Code subprocess manager.
+Claude Code subprocess backend.
 
-Provides functionality to:
-1. Manage a long-running Claude Code subprocess with stream-json I/O
-2. Inject identity, memory, history, and API context on each new session
-3. Stream partial responses for real-time Telegram message updates
-4. Handle workspace switching, model changes, and graceful shutdown
+Implements the AgentBackend ABC for Claude Code's stream-json protocol.
+Manages a long-running subprocess that accepts prompts on stdin and
+streams responses on stdout as newline-delimited JSON.
 
-This is the core bridge between Telegram (bot.py) and Claude Code. Instead of
-launching a new Claude process per message, a single persistent process is kept
-alive and communicated with via newline-delimited JSON on stdin/stdout. This
-preserves Claude's conversation context across messages within a session.
+This is the concrete backend that pool.py instantiates by default.
+Process management (spawn, stream, kill, restart) lives here; context
+injection (identity, memory, history, API docs) lives in backend.py
+as shared functions usable by any backend.
 
 The stream-json protocol:
     Input:  {"type": "user", "message": {"role": "user", "content": [...]}}
-    Output: {"type": "system", ...}      — session metadata
-            {"type": "assistant", ...}   — partial text (streaming)
-            {"type": "result", ...}      — final response with cost/session info
-
-Context injection on first message of each session:
-    1. Identity (CLAUDE.md from home workspace, when in a foreign workspace)
-    2. Personal memory (MEMORY.md from home workspace)
-    3. Recent conversation history (last 20 messages from JSONL logs)
-    4. Scheduling API endpoint info (URL, secret, field reference)
+    Output: {"type": "system", ...}      - session metadata
+            {"type": "assistant", ...}   - partial text (streaming)
+            {"type": "result", ...}      - final response with cost/session info
 """
 
 import asyncio
@@ -32,72 +24,37 @@ import os
 import signal
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from pathlib import Path
 
+from kai.backend import (
+    AgentBackend,
+    AgentResponse,
+    ApiContext,
+    StreamEvent,
+    build_foreign_workspace_reminder,
+    build_session_context,
+    prepend_to_prompt,
+)
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
-from kai.history import get_recent_history
 
 log = logging.getLogger(__name__)
 
 
-# ── Protocol types ───────────────────────────────────────────────────
+# ── Claude Code backend ─────────────────────────────────────────────
 
 
-@dataclass
-class ClaudeResponse:
+class ClaudeCodeBackend(AgentBackend):
     """
-    Final response from a Claude Code interaction.
+    AgentBackend implementation for Claude Code's stream-json protocol.
 
-    Attributes:
-        success: True if Claude returned a valid response, False on error.
-        text: The full response text (accumulated from streaming chunks).
-        session_id: Claude's session identifier (used for session continuity).
-        cost_usd: Cost of this interaction in USD (from Claude's billing).
-        duration_ms: Wall-clock duration of the interaction in milliseconds.
-        error: Error message if success is False, None otherwise.
-    """
+    Manages the lifecycle of a Claude Code subprocess: starting, sending
+    messages, streaming responses, killing/restarting, and workspace
+    switching. All message sends are serialized via an internal asyncio
+    lock to prevent interleaving.
 
-    success: bool
-    text: str
-    session_id: str | None = None
-    cost_usd: float = 0.0
-    duration_ms: int = 0
-    error: str | None = None
-
-
-@dataclass
-class StreamEvent:
-    """
-    A partial update emitted during Claude's streaming response.
-
-    Yielded by PersistentClaude.send() as Claude generates text. The final
-    event has done=True and includes the complete ClaudeResponse.
-
-    Attributes:
-        text_so_far: Accumulated response text up to this point.
-        done: True if this is the final event (response complete or error).
-        response: The complete ClaudeResponse, set only when done=True.
-    """
-
-    text_so_far: str
-    done: bool = False
-    response: ClaudeResponse | None = None
-
-
-# ── Persistent Claude process ────────────────────────────────────────
-
-
-class PersistentClaude:
-    """
-    A long-running Claude Code subprocess using stream-json I/O for multi-turn chat.
-
-    Manages the lifecycle of the Claude process: starting, sending messages,
-    streaming responses, killing/restarting, and workspace switching. All message
-    sends are serialized via an internal asyncio lock to prevent interleaving.
-
-    The process runs with --permission-mode bypassPermissions (required for headless
-    operation via Telegram) and --max-budget-usd to cap per-session spending.
+    The process runs with --permission-mode bypassPermissions (required
+    for headless operation via Telegram) and --max-budget-usd to cap
+    per-session spending.
     """
 
     def __init__(
@@ -117,19 +74,26 @@ class PersistentClaude:
         max_context_window: int = 0,
         autocompact_pct: int = 0,
     ):
+        # ABC-required attributes (pool.py reads/writes these)
         self.model = model
         self.workspace = workspace
         self.home_workspace = home_workspace or workspace
-        self.webhook_port = webhook_port
-        self.webhook_secret = webhook_secret
         self.max_budget_usd = max_budget_usd
         self.timeout_seconds = timeout_seconds
-        self.services_info = services_info or []
-        self.claude_user = claude_user
-        self.max_session_hours = max_session_hours
         self.workspace_config = workspace_config
         self.max_context_window = max_context_window
+
+        # Claude-Code-specific attributes (not on the ABC)
+        self.claude_user = claude_user
+        self.max_session_hours = max_session_hours
         self.autocompact_pct = autocompact_pct
+
+        # API context for session injection (passed to build_session_context)
+        self._api_context = ApiContext(
+            webhook_port=webhook_port,
+            webhook_secret=webhook_secret,
+            services_info=services_info or [],
+        )
 
         # Global defaults, preserved so we can restore them when
         # switching away from a configured workspace.
@@ -254,8 +218,8 @@ class PersistentClaude:
             if self.workspace_config.env:
                 env.update(self.workspace_config.env)
         # Webhook secret last - ensures workspace env can't override it.
-        if self.webhook_secret:
-            env["KAI_WEBHOOK_SECRET"] = self.webhook_secret
+        if self._api_context.webhook_secret:
+            env["KAI_WEBHOOK_SECRET"] = self._api_context.webhook_secret
 
         # Set autocompact threshold so Claude compacts earlier, reducing
         # token usage. Passed as an env var (not a CLI flag) because
@@ -359,7 +323,7 @@ class PersistentClaude:
 
         Yields:
             StreamEvent objects with accumulated text. The final event has
-            done=True and includes the complete ClaudeResponse.
+            done=True and includes the complete AgentResponse.
         """
         async with self._lock:
             async for event in self._send_locked(prompt, chat_id=chat_id):
@@ -384,7 +348,7 @@ class PersistentClaude:
 
         Yields:
             StreamEvent objects with accumulated text. The final event has
-            done=True and includes the complete ClaudeResponse.
+            done=True and includes the complete AgentResponse.
         """
         # Recycle the session if it has exceeded the age limit. This prevents
         # unbounded memory growth in the inner Claude process (Node.js/V8),
@@ -407,166 +371,32 @@ class PersistentClaude:
             yield StreamEvent(
                 text_so_far="",
                 done=True,
-                response=ClaudeResponse(success=False, text="", error="claude CLI not found"),
+                response=AgentResponse(success=False, text="", error="claude CLI not found"),
             )
             return
 
-        # Inject identity and memory on the first message of a new session
+        # Inject identity, memory, history, and API context on the
+        # first message of a new session. Context injection logic lives
+        # in backend.py as shared functions usable by any backend.
         if self._fresh_session:
             self._fresh_session = False
-            parts = []
-
-            # When in a foreign workspace, inject Kai's identity from home
-            if self.workspace != self.home_workspace:
-                identity_path = self.home_workspace / ".claude" / "CLAUDE.md"
-                if identity_path.exists():
-                    identity = identity_path.read_text().strip()
-                    if identity:
-                        parts.append(f"[Your core identity and instructions:]\n{identity}")
-
-            # Always inject Kai's personal memory from DATA_DIR. This file
-            # lives outside the install tree (/var/lib/kai/memory/ in production)
-            # so it survives make install. Available regardless of which
-            # workspace the inner Claude is operating in.
-            memory_path = DATA_DIR / "memory" / "MEMORY.md"
-            if memory_path.exists():
-                memory = memory_path.read_text().strip()
-                if memory:
-                    parts.append(f"[Your persistent memory (file: {memory_path}):]\n{memory}")
-                else:
-                    parts.append(f"[Your persistent memory (file: {memory_path}):]\n(currently empty)")
-            else:
-                parts.append(f"[Your persistent memory (file: {memory_path}):]\n(not yet created)")
-
-            # Per-workspace system prompt from workspaces.yaml. Injected
-            # between the identity/memory block and conversation history,
-            # so it acts as workspace-specific instructions.
-            ws_prompt = self._get_workspace_system_prompt()
-            if ws_prompt:
-                parts.append(f"## Workspace Instructions\n\n{ws_prompt}")
-
-            # Always inject the per-user history directory path so the inner
-            # Claude's grep/jq searches are naturally scoped to this user.
-            history_dir = str(DATA_DIR / "history" / str(chat_id)) if chat_id is not None else str(DATA_DIR / "history")
-
-            # Inject recent conversation history for continuity.
-            # Filter by chat_id so each user's session only sees their
-            # own messages (Phase 2 per-user data isolation).
-            recent = get_recent_history(chat_id=chat_id)
-            if recent:
-                parts.append(f"[Recent conversations (search {history_dir}/ for full logs):]\n{recent}")
-            else:
-                parts.append(
-                    f"[Chat history is stored in {history_dir}/ as daily JSONL files. Search with grep or jq when asked about past conversations.]"
-                )
-
-            # Inject scheduling API info (always, so cron works from any workspace).
-            # The secret is passed via $KAI_WEBHOOK_SECRET env var (not embedded
-            # in prompt text) to prevent leakage through session logs.
-            if self.webhook_secret:
-                api_note = (
-                    f"[Scheduling API: To create jobs, use curl (NEVER WebFetch) to POST JSON to "
-                    f"http://localhost:{self.webhook_port}/api/schedule "
-                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
-                    f"Required fields: name, prompt, schedule_type, schedule_data. "
-                    f"Optional: job_type (reminder|claude), auto_remove (bool). "
-                    f"To list jobs: GET /api/jobs. To update: PATCH /api/jobs/{{id}}. "
-                    f"To delete: DELETE /api/jobs/{{id}}.]"
-                )
-                if self.workspace != self.home_workspace:
-                    api_note = (
-                        f"[Workspace context: You are working in {self.workspace}. "
-                        f"Your home workspace is {self.home_workspace}.]\n{api_note}"
-                    )
-                parts.append(api_note)
-
-            # Inject messaging and file exchange API info so Claude can
-            # proactively send text or files to the user (e.g., when a
-            # background task completes or a scheduled job has results).
-            if self.webhook_secret:
-                parts.append(
-                    f"[Messaging API: To send a text message to the user proactively "
-                    f"(e.g., background task results), use curl (NEVER WebFetch) to POST JSON to "
-                    f"http://localhost:{self.webhook_port}/api/send-message "
-                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
-                    f'Required: "text" (the message content). '
-                    f"Long messages are automatically split at Telegram's 4096-char limit.]"
-                )
-                files_path = f"{DATA_DIR}/files/{chat_id}/" if chat_id else f"{DATA_DIR}/files/"
-                parts.append(
-                    f"[File API: To send a file to the user, use curl (NEVER WebFetch) to POST JSON to "
-                    f"http://localhost:{self.webhook_port}/api/send-file "
-                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
-                    f'Required: "path" (absolute file path within the current workspace {self.workspace}). '
-                    f'Optional: "caption". Images are sent as photos, '
-                    f"everything else as documents.\n"
-                    f"Incoming files from the user are auto-saved to "
-                    f"{files_path} and their paths are included in the message.]"
-                )
-
-            # Inject available external services info (only if services are configured)
-            if self.services_info and self.webhook_secret:
-                svc_lines = [
-                    "[External Services: To call external APIs, use curl (NEVER WebFetch) to POST JSON to "
-                    f"http://localhost:{self.webhook_port}/api/services/{{name}} "
-                    f"with header 'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' (environment variable). "
-                    "Request JSON fields (all optional): "
-                    '"body" (dict - forwarded as JSON), '
-                    '"params" (dict - query parameters), '
-                    '"path_suffix" (str - appended to base URL).',
-                    "",
-                    "Available services:",
-                ]
-                for svc in self.services_info:
-                    svc_lines.append(f"  - {svc['name']} ({svc['method']}): {svc['description']}")
-                    if svc.get("notes"):
-                        svc_lines.append(f"    Notes: {svc['notes']}")
-                svc_lines.append("")
-                svc_lines.append(
-                    "Example (Perplexity web search):\n"
-                    f"  curl -s -X POST http://localhost:{self.webhook_port}/api/services/perplexity "
-                    f"-H 'Content-Type: application/json' "
-                    f"""-H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET" """
-                    """-d '{"body": {"model": "sonar", "messages": [{"role": "user", "content": "your query"}]}}'"""
-                )
-                svc_lines.append(
-                    "Prefer external services over built-in WebSearch/WebFetch when available "
-                    "— they provide better results.]"
-                )
-                parts.append("\n".join(svc_lines))
-
-            # Include chat_id so inner Claude can pass it back in API
-            # calls for correct multi-user routing. Without this, all
-            # API calls route to the default admin user.
-            if chat_id is not None:
-                parts.append(
-                    f"[Your chat_id for API calls: {chat_id}. Include "
-                    f'"chat_id": {chat_id} in the JSON body of all '
-                    f"POST requests to /api/schedule, /api/send-message, "
-                    f"and /api/send-file so responses route to the "
-                    f"correct user.]"
-                )
-
-            if parts:
-                prefix = "\n\n".join(parts) + "\n\n"
-                if isinstance(prompt, str):
-                    prompt = prefix + prompt
-                elif isinstance(prompt, list):
-                    prompt = [{"type": "text", "text": prefix}] + prompt
-
-        # When in a foreign workspace, remind on every message to only respond
-        # to what the user asks — workspace context (CLAUDE.md, git branch,
-        # auto-memory) can otherwise trigger autonomous action.
-        if self.workspace != self.home_workspace:
-            reminder = (
-                "[IMPORTANT: This message is from a user via Telegram. "
-                "Respond ONLY to what they wrote below. Do NOT continue, "
-                "resume, or start any previous work, plans, or tasks.]"
+            session_ctx = build_session_context(
+                workspace=self.workspace,
+                home_workspace=self.home_workspace,
+                api=self._api_context,
+                workspace_config=self.workspace_config,
+                chat_id=chat_id,
+                data_dir=DATA_DIR,
             )
-            if isinstance(prompt, str):
-                prompt = reminder + "\n\n" + prompt
-            elif isinstance(prompt, list):
-                prompt = [{"type": "text", "text": reminder}] + prompt
+            if session_ctx:
+                prompt = prepend_to_prompt(prompt, session_ctx)
+
+        # When in a foreign workspace, remind on every message to only
+        # respond to what the user asks - workspace context (CLAUDE.md,
+        # git branch, auto-memory) can otherwise trigger autonomous action.
+        reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace)
+        if reminder:
+            prompt = prepend_to_prompt(prompt, reminder)
 
         content = prompt if isinstance(prompt, list) else [{"type": "text", "text": prompt}]
         msg = (
@@ -594,9 +424,7 @@ class PersistentClaude:
             yield StreamEvent(
                 text_so_far="",
                 done=True,
-                response=ClaudeResponse(
-                    success=False, text="", error="Claude process died, restarting on next message"
-                ),
+                response=AgentResponse(success=False, text="", error="Claude process died, restarting on next message"),
             )
             return
 
@@ -622,7 +450,7 @@ class PersistentClaude:
                     yield StreamEvent(
                         text_so_far=accumulated_text,
                         done=True,
-                        response=ClaudeResponse(
+                        response=AgentResponse(
                             success=False,
                             text=accumulated_text,
                             error="Claude interaction timed out (no output)",
@@ -640,7 +468,7 @@ class PersistentClaude:
                     yield StreamEvent(
                         text_so_far=accumulated_text,
                         done=True,
-                        response=ClaudeResponse(success=False, text=accumulated_text, error="Claude timed out"),
+                        response=AgentResponse(success=False, text=accumulated_text, error="Claude timed out"),
                     )
                     return
 
@@ -656,7 +484,7 @@ class PersistentClaude:
                     yield StreamEvent(
                         text_so_far=accumulated_text,
                         done=True,
-                        response=ClaudeResponse(
+                        response=AgentResponse(
                             success=bool(accumulated_text),
                             text=accumulated_text,
                             error=None if accumulated_text else "Claude process ended unexpectedly",
@@ -684,7 +512,7 @@ class PersistentClaude:
                     # when nothing was accumulated (e.g., system-only responses).
                     result_text = event.get("result", "")
                     text = accumulated_text if accumulated_text else result_text
-                    response = ClaudeResponse(
+                    response = AgentResponse(
                         success=not event.get("is_error", False),
                         text=text,
                         session_id=event.get("session_id", self._session_id),
@@ -712,7 +540,7 @@ class PersistentClaude:
             yield StreamEvent(
                 text_so_far=accumulated_text,
                 done=True,
-                response=ClaudeResponse(success=False, text=accumulated_text, error=str(e)),
+                response=AgentResponse(success=False, text=accumulated_text, error=str(e)),
             )
 
     def force_kill(self) -> None:
@@ -823,28 +651,6 @@ class PersistentClaude:
             # Any error reading the response - log and move on.
             # The subprocess will be killed momentarily regardless.
             log.debug("Save prompt response read failed; proceeding with shutdown")
-
-    def _get_workspace_system_prompt(self) -> str | None:
-        """
-        Get the system prompt for the current workspace config.
-
-        Returns the inline system_prompt if set, or reads from
-        system_prompt_file on each invocation to pick up changes.
-        Returns None if neither is configured.
-        """
-        if not self.workspace_config:
-            return None
-        if self.workspace_config.system_prompt:
-            return self.workspace_config.system_prompt
-        if self.workspace_config.system_prompt_file:
-            # File path was validated at config load time (fail-fast on typos).
-            # Read content here so updates are picked up without restart.
-            try:
-                return self.workspace_config.system_prompt_file.read_text()
-            except OSError:
-                log.warning("Cannot read system_prompt_file: %s", self.workspace_config.system_prompt_file)
-                return None
-        return None
 
     async def change_workspace(
         self,

@@ -16,6 +16,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 from telegram.error import BadRequest
 
+from kai.backend import AgentResponse, StreamEvent
 from kai.bot import (
     _FIELD_ALIASES,
     _QUEUED_MESSAGE_MARKER,
@@ -72,7 +73,6 @@ from kai.bot import (
     handle_workspace_callback,
     handle_workspaces,
 )
-from kai.claude import ClaudeResponse, StreamEvent
 from kai.config import Config
 from kai.tts import DEFAULT_VOICE, VOICES
 from kai.workspace_utils import is_workspace_allowed
@@ -409,7 +409,7 @@ def _make_mock_claude(model="sonnet", workspace=None, is_alive=True):
     """Create a mock SubprocessPool with pool-compatible methods.
 
     Despite the name (kept for backward compatibility with existing test
-    call sites), this returns a pool-like mock, not a PersistentClaude.
+    call sites), this returns a pool-like mock, not a ClaudeCodeBackend.
     """
     pool = MagicMock()
     ws = workspace or Path("/home/workspace")
@@ -475,11 +475,11 @@ def _text_event(text: str) -> StreamEvent:
 
 
 def _done_event(text="Final response", cost=0.01, session_id="sess-1", success=True, error=None) -> StreamEvent:
-    """Final streaming event with a ClaudeResponse."""
+    """Final streaming event with a AgentResponse."""
     return StreamEvent(
         text_so_far=text,
         done=True,
-        response=ClaudeResponse(
+        response=AgentResponse(
             text=text,
             success=success,
             error=error,

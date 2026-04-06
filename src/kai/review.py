@@ -622,7 +622,7 @@ async def run_review(
     main chat session.
 
     When claude_user is set, the subprocess is spawned via sudo -u for
-    OS-level isolation, matching the pattern used by PersistentClaude.
+    OS-level isolation, matching the pattern used by ClaudeCodeBackend.
 
     Args:
         prompt: The complete review prompt (from build_review_prompt).

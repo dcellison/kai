@@ -23,14 +23,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kai.claude import PersistentClaude, StreamEvent
+from kai.backend import StreamEvent
+from kai.claude import ClaudeCodeBackend
 from kai.config import WorkspaceConfig
 
 # ── Shared helpers ───────────────────────────────────────────────────
 
 
-def _make_claude(**kwargs) -> PersistentClaude:
-    """Create a PersistentClaude with sensible defaults for testing."""
+def _make_claude(**kwargs) -> ClaudeCodeBackend:
+    """Create a ClaudeCodeBackend with sensible defaults for testing."""
     defaults = {
         "model": "sonnet",
         "workspace": Path("/tmp/test-workspace"),
@@ -38,7 +39,7 @@ def _make_claude(**kwargs) -> PersistentClaude:
         "timeout_seconds": 30,
     }
     defaults.update(kwargs)
-    return PersistentClaude(**defaults)
+    return ClaudeCodeBackend(**defaults)
 
 
 def _json_line(obj: dict) -> bytes:
@@ -67,7 +68,7 @@ def _make_mock_proc(stdout_lines: list[bytes]) -> MagicMock:
     return proc
 
 
-async def _collect_events(claude: PersistentClaude, prompt: str | list = "test") -> list[StreamEvent]:
+async def _collect_events(claude: ClaudeCodeBackend, prompt: str | list = "test") -> list[StreamEvent]:
     """Send a prompt and collect all yielded StreamEvents."""
     events = []
     async for event in claude._send_locked(prompt):
@@ -756,7 +757,7 @@ class TestSendLockedBasic:
     @pytest.fixture(autouse=True)
     def _patch_kill(self, monkeypatch):
         """Prevent _kill from interacting with mock processes after test scenarios."""
-        monkeypatch.setattr(PersistentClaude, "_kill", AsyncMock())
+        monkeypatch.setattr(ClaudeCodeBackend, "_kill", AsyncMock())
 
     @pytest.mark.asyncio
     async def test_writes_json_to_stdin(self):
@@ -798,7 +799,7 @@ class TestSendLockedBasic:
 
     @pytest.mark.asyncio
     async def test_final_event_has_claude_response(self):
-        """Final event has done=True with a complete ClaudeResponse."""
+        """Final event has done=True with a complete AgentResponse."""
         proc = _make_mock_proc(
             [
                 _system_event(),
@@ -924,7 +925,7 @@ class TestSendLockedErrors:
     @pytest.fixture(autouse=True)
     def _patch_kill(self, monkeypatch):
         """Prevent _kill from interacting with mock processes after test scenarios."""
-        monkeypatch.setattr(PersistentClaude, "_kill", AsyncMock())
+        monkeypatch.setattr(ClaudeCodeBackend, "_kill", AsyncMock())
 
     @pytest.mark.asyncio
     async def test_cli_not_found(self):
@@ -1135,7 +1136,7 @@ class TestSendLockedErrors:
 class TestSendLockedResult:
     @pytest.fixture(autouse=True)
     def _patch_kill(self, monkeypatch):
-        monkeypatch.setattr(PersistentClaude, "_kill", AsyncMock())
+        monkeypatch.setattr(ClaudeCodeBackend, "_kill", AsyncMock())
 
     @pytest.mark.asyncio
     async def test_is_error_sets_failure(self):
@@ -1205,7 +1206,7 @@ class TestContextInjection:
 
     @pytest.fixture(autouse=True)
     def _patch_kill(self, monkeypatch):
-        monkeypatch.setattr(PersistentClaude, "_kill", AsyncMock())
+        monkeypatch.setattr(ClaudeCodeBackend, "_kill", AsyncMock())
 
     @pytest.fixture()
     def home_workspace(self, tmp_path, monkeypatch):
@@ -1253,7 +1254,7 @@ class TestContextInjection:
         claude._proc = proc
         claude._fresh_session = True
 
-        with patch("kai.claude.get_recent_history", return_value="User: hello\nKai: hi"):
+        with patch("kai.backend.get_recent_history", return_value="User: hello\nKai: hi"):
             await _collect_events(claude, "What's up?")
 
         prompt = self._extract_prompt(proc)
@@ -1290,7 +1291,7 @@ class TestContextInjection:
         claude._proc = proc
         claude._fresh_session = True
 
-        with patch("kai.claude.get_recent_history", return_value=""):
+        with patch("kai.backend.get_recent_history", return_value=""):
             await _collect_events(claude, "Help me")
 
         prompt = self._extract_prompt(proc)
@@ -1314,7 +1315,7 @@ class TestContextInjection:
         claude._proc = proc
         claude._fresh_session = True
 
-        with patch("kai.claude.get_recent_history", return_value=""):
+        with patch("kai.backend.get_recent_history", return_value=""):
             await _collect_events(claude, "Test")
 
         prompt = self._extract_prompt(proc)
@@ -1336,7 +1337,7 @@ class TestContextInjection:
         claude._proc = proc
         claude._fresh_session = True
 
-        with patch("kai.claude.get_recent_history", return_value=""):
+        with patch("kai.backend.get_recent_history", return_value=""):
             await _collect_events(claude, "Test")
 
         prompt = self._extract_prompt(proc)
@@ -1356,7 +1357,7 @@ class TestContextInjection:
         claude._proc = proc
         claude._fresh_session = True
 
-        with patch("kai.claude.get_recent_history", return_value=""):
+        with patch("kai.backend.get_recent_history", return_value=""):
             await _collect_events(claude, "Test")
 
         prompt = self._extract_prompt(proc)
@@ -1383,7 +1384,7 @@ class TestContextInjection:
         claude._proc = proc
         claude._fresh_session = True
 
-        with patch("kai.claude.get_recent_history", return_value=""):
+        with patch("kai.backend.get_recent_history", return_value=""):
             await _collect_events(claude, "Test")
 
         prompt = self._extract_prompt(proc)
@@ -1407,7 +1408,7 @@ class TestContextInjection:
         claude._proc = proc
         claude._fresh_session = True
 
-        with patch("kai.claude.get_recent_history", return_value=""):
+        with patch("kai.backend.get_recent_history", return_value=""):
             await _collect_events(claude, "test message")
 
         prompt = self._extract_prompt(proc)
@@ -1421,7 +1422,7 @@ class TestContextInjection:
 class TestMultiModalPrompt:
     @pytest.fixture(autouse=True)
     def _patch_kill(self, monkeypatch):
-        monkeypatch.setattr(PersistentClaude, "_kill", AsyncMock())
+        monkeypatch.setattr(ClaudeCodeBackend, "_kill", AsyncMock())
 
     @pytest.mark.asyncio
     async def test_list_prompt_with_context_injection(self, tmp_path, monkeypatch):
@@ -1452,7 +1453,7 @@ class TestMultiModalPrompt:
             {"type": "text", "text": "What's in this image?"},
         ]
 
-        with patch("kai.claude.get_recent_history", return_value=""):
+        with patch("kai.backend.get_recent_history", return_value=""):
             await _collect_events(claude, prompt_list)
 
         written = proc.stdin.write.call_args[0][0]
@@ -2326,32 +2327,36 @@ class TestWorkspaceConfig:
         assert claude.model == "opus"  # config model, not haiku
 
     def test_system_prompt_inline(self):
-        """_get_workspace_system_prompt returns inline prompt."""
+        """get_workspace_system_prompt returns inline prompt."""
+        from kai.backend import get_workspace_system_prompt
+
         ws_config = WorkspaceConfig(path=Path("/tmp/ws"), system_prompt="Be concise.")
-        claude = _make_claude(workspace_config=ws_config)
-        assert claude._get_workspace_system_prompt() == "Be concise."
+        assert get_workspace_system_prompt(ws_config) == "Be concise."
 
     def test_system_prompt_from_file(self, tmp_path):
-        """_get_workspace_system_prompt reads from file."""
+        """get_workspace_system_prompt reads from file."""
+        from kai.backend import get_workspace_system_prompt
+
         prompt_file = tmp_path / "prompt.txt"
         prompt_file.write_text("Use pytest.")
         ws_config = WorkspaceConfig(path=Path("/tmp/ws"), system_prompt_file=prompt_file)
-        claude = _make_claude(workspace_config=ws_config)
-        assert claude._get_workspace_system_prompt() == "Use pytest."
+        assert get_workspace_system_prompt(ws_config) == "Use pytest."
 
     def test_system_prompt_file_deleted(self, tmp_path):
         """Returns None if system_prompt_file is deleted after load."""
+        from kai.backend import get_workspace_system_prompt
+
         prompt_file = tmp_path / "prompt.txt"
         prompt_file.write_text("hello")
         ws_config = WorkspaceConfig(path=Path("/tmp/ws"), system_prompt_file=prompt_file)
-        claude = _make_claude(workspace_config=ws_config)
         prompt_file.unlink()
-        assert claude._get_workspace_system_prompt() is None
+        assert get_workspace_system_prompt(ws_config) is None
 
     def test_system_prompt_none_without_config(self):
         """Returns None when no workspace config is set."""
-        claude = _make_claude()
-        assert claude._get_workspace_system_prompt() is None
+        from kai.backend import get_workspace_system_prompt
+
+        assert get_workspace_system_prompt(None) is None
 
     @pytest.mark.asyncio
     async def test_env_merge_in_ensure_started(self):
@@ -2383,8 +2388,7 @@ class TestWorkspaceConfig:
             path=Path("/tmp/ws"),
             env={"KAI_WEBHOOK_SECRET": "evil"},
         )
-        claude = _make_claude(workspace_config=ws_config)
-        claude.webhook_secret = "real_secret"
+        claude = _make_claude(workspace_config=ws_config, webhook_secret="real_secret")
         claude._fresh_session = False
 
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:

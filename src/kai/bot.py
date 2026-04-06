@@ -18,7 +18,7 @@ The response flow for a text message:
     2. Message logged to JSONL history
     3. Per-chat lock acquired (prevents concurrent Claude interactions)
     4. Flag file written (for crash recovery)
-    5. Prompt sent to PersistentClaude.send() → streaming begins
+    5. Prompt sent to ClaudeCodeBackend.send() → streaming begins
     6. Live message created and progressively edited (2-second intervals)
     7. Final response delivered (text, voice, or both depending on voice mode)
     8. Session saved to database (cost tracking)
@@ -680,7 +680,7 @@ async def _show_settings(update: Update, chat_id: int, config: Config) -> None:
 def _revert_instance_field(pool: SubprocessPool, chat_id: int, field: str, config: Config) -> None:
     """
     Write the resolved default value for a single field back onto the
-    live PersistentClaude instance.
+    live ClaudeCodeBackend instance.
 
     Called before restart so that stale in-memory overrides don't
     persist after a DB entry is deleted. Resolution order mirrors
@@ -3198,7 +3198,7 @@ async def _handle_response(
         context: Telegram callback context.
         chat_id: The Telegram chat ID.
         prompt: Text string or list of content blocks to send to Claude.
-        claude: The PersistentClaude instance.
+        claude: The ClaudeCodeBackend instance.
         model: Current model name (for session tracking).
     """
     assert update.message is not None
@@ -3354,7 +3354,7 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
     """
     Build and configure the Telegram Application with all handlers.
 
-    Creates the python-telegram-bot Application, initializes the PersistentClaude
+    Creates the python-telegram-bot Application, initializes the ClaudeCodeBackend
     subprocess manager, stores both in bot_data, and registers all command,
     callback, and message handlers.
 
