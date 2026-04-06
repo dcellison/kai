@@ -31,19 +31,17 @@ def _write_yaml(tmp_path, content: str):
 
 
 def _mock_streamed_response(data: bytes, status: int = 200) -> MagicMock:
-    """Create a mock aiohttp response with streaming content.read() support."""
+    """Create a mock aiohttp response that returns the full body via read().
+
+    Uses resp.read() (not resp.content.read()) to match the production
+    code path, which buffers all chunks before returning.
+    """
     mock_response = AsyncMock()
     mock_response.status = status
     mock_response.get_encoding = MagicMock(return_value="utf-8")
 
-    # Mock content.read() to return the data (capped by the requested size)
-    async def mock_read(n: int = -1) -> bytes:
-        if n < 0:
-            return data
-        return data[:n]
-
-    mock_response.content = MagicMock()
-    mock_response.content.read = AsyncMock(side_effect=mock_read)
+    # Mock resp.read() to return the complete body
+    mock_response.read = AsyncMock(return_value=data)
     mock_response.__aenter__ = AsyncMock(return_value=mock_response)
     mock_response.__aexit__ = AsyncMock(return_value=False)
     return mock_response
@@ -1019,6 +1017,45 @@ services:
         assert result.success is True
         # Body should be truncated to the cap
         assert len(result.body) == _MAX_RESPONSE_BYTES
+
+    async def test_chunked_response_read_completely(self, tmp_path, monkeypatch):
+        """Chunked transfer encoding responses are read in full, not truncated.
+
+        resp.read() buffers all chunks before returning, unlike
+        resp.content.read(n) which returns after the first chunk.
+        This test verifies the full body is captured.
+        """
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  testapi:
+    url: https://api.example.com
+    method: POST
+    auth:
+      type: bearer
+      env: API_KEY
+""",
+        )
+        load_services(path)
+
+        # Simulate a multi-chunk response (the kind Perplexity sends)
+        full_body = b'{"answer": "This is a complete response from a chunked API"}'
+        mock_response = _mock_streamed_response(full_body)
+        mock_session = MagicMock()
+        mock_session.request = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kai.services.aiohttp.ClientSession", return_value=mock_session):
+            result = await call_service("testapi", body={"query": "test"})
+
+        assert result.success is True
+        # Verify the full body came through, not just a first-chunk fragment
+        assert result.body == full_body.decode("utf-8")
+        # Confirm resp.read() was called (not resp.content.read())
+        mock_response.read.assert_called_once()
 
     async def test_response_encoding_respected(self, tmp_path, monkeypatch):
         """Response is decoded using the charset from Content-Type."""

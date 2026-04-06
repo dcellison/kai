@@ -417,10 +417,13 @@ async def call_service(
                 json=body if body is not None else None,
                 timeout=timeout,
             ) as resp:
-                # Read with a size cap to prevent OOM from oversized
-                # responses. Read one extra byte to detect truncation
-                # without a second read call.
-                raw = await resp.content.read(_MAX_RESPONSE_BYTES + 1)
+                # Read the full response body. resp.read() buffers all
+                # chunks before returning, which is necessary for
+                # chunked transfer encoding (resp.content.read(n)
+                # returns after the first chunk, truncating the body).
+                # The truncation guard below still caps at
+                # _MAX_RESPONSE_BYTES for OOM protection.
+                raw = await resp.read()
                 truncated = len(raw) > _MAX_RESPONSE_BYTES
                 if truncated:
                     raw = raw[:_MAX_RESPONSE_BYTES]
