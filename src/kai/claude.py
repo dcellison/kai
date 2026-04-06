@@ -388,8 +388,7 @@ class ClaudeCodeBackend(AgentBackend):
                 chat_id=chat_id,
                 data_dir=DATA_DIR,
             )
-            if session_ctx:
-                prompt = prepend_to_prompt(prompt, session_ctx)
+            prompt = prepend_to_prompt(prompt, session_ctx)
 
         # When in a foreign workspace, remind on every message to only
         # respond to what the user asks - workspace context (CLAUDE.md,

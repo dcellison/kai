@@ -2326,37 +2326,8 @@ class TestWorkspaceConfig:
             await claude.change_workspace(Path("/tmp/ws"), workspace_config=ws_config)
         assert claude.model == "opus"  # config model, not haiku
 
-    def test_system_prompt_inline(self):
-        """get_workspace_system_prompt returns inline prompt."""
-        from kai.backend import get_workspace_system_prompt
-
-        ws_config = WorkspaceConfig(path=Path("/tmp/ws"), system_prompt="Be concise.")
-        assert get_workspace_system_prompt(ws_config) == "Be concise."
-
-    def test_system_prompt_from_file(self, tmp_path):
-        """get_workspace_system_prompt reads from file."""
-        from kai.backend import get_workspace_system_prompt
-
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text("Use pytest.")
-        ws_config = WorkspaceConfig(path=Path("/tmp/ws"), system_prompt_file=prompt_file)
-        assert get_workspace_system_prompt(ws_config) == "Use pytest."
-
-    def test_system_prompt_file_deleted(self, tmp_path):
-        """Returns None if system_prompt_file is deleted after load."""
-        from kai.backend import get_workspace_system_prompt
-
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text("hello")
-        ws_config = WorkspaceConfig(path=Path("/tmp/ws"), system_prompt_file=prompt_file)
-        prompt_file.unlink()
-        assert get_workspace_system_prompt(ws_config) is None
-
-    def test_system_prompt_none_without_config(self):
-        """Returns None when no workspace config is set."""
-        from kai.backend import get_workspace_system_prompt
-
-        assert get_workspace_system_prompt(None) is None
+    # System prompt tests moved to tests/test_backend.py
+    # (TestGetWorkspaceSystemPrompt class)
 
     @pytest.mark.asyncio
     async def test_env_merge_in_ensure_started(self):
