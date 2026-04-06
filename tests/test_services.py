@@ -1087,6 +1087,48 @@ services:
         # All three chunks should be joined into the complete body
         assert result.body == expected.decode("utf-8")
 
+    async def test_oversized_multi_chunk_truncated(self, tmp_path, monkeypatch):
+        """The streaming loop breaks early when multiple chunks exceed the cap.
+
+        Unlike test_oversized_response_truncated (single chunk), this
+        verifies the break fires mid-iteration when cumulative chunk
+        size crosses _MAX_RESPONSE_BYTES.
+        """
+        monkeypatch.setenv("API_KEY", "tok")
+        path = _write_yaml(
+            tmp_path,
+            """
+services:
+  testapi:
+    url: https://api.example.com
+    method: POST
+    auth:
+      type: bearer
+      env: API_KEY
+""",
+        )
+        load_services(path)
+
+        from kai.services import _MAX_RESPONSE_BYTES
+
+        # Three chunks whose total exceeds the cap. The loop should
+        # break after the second chunk pushes total past the limit.
+        half = _MAX_RESPONSE_BYTES // 2
+        remainder = _MAX_RESPONSE_BYTES - half + 500
+        chunks = [b"a" * half, b"b" * remainder, b"c" * 1000]
+        mock_response = _mock_multi_chunk_response(chunks)
+        mock_session = MagicMock()
+        mock_session.request = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kai.services.aiohttp.ClientSession", return_value=mock_session):
+            result = await call_service("testapi", body={"query": "test"})
+
+        assert result.success is True
+        # Body should be truncated to exactly the cap
+        assert len(result.body) == _MAX_RESPONSE_BYTES
+
     async def test_response_encoding_respected(self, tmp_path, monkeypatch):
         """Response is decoded using the charset from Content-Type."""
         monkeypatch.setenv("API_KEY", "tok")
