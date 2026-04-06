@@ -186,13 +186,13 @@ def build_session_context(
     workspace_config: WorkspaceConfig | None,
     chat_id: int | None,
     data_dir: Path,
-) -> str | None:
+) -> str:
     """
     Build the context prefix for the first message of a new session.
 
-    Returns the full prefix string (identity + memory + history + API
-    docs), or None if there is nothing to inject. The caller prepends
-    this to the prompt before sending.
+    Always returns a non-empty string because the memory section
+    unconditionally appends to parts (exists, empty, or missing).
+    The caller prepends this to the prompt before sending.
 
     Extracted from claude.py _send_locked() lines 414-548.
 
@@ -222,15 +222,16 @@ def build_session_context(
     # Always inject Kai's personal memory from DATA_DIR. This file
     # lives outside the install tree (/var/lib/kai/memory/ in production)
     # so it survives make install. Available regardless of which
-    # workspace the inner Claude is operating in.
+    # workspace the inner Claude is operating in. try/except guards
+    # against race and permission errors (same pattern as identity).
     memory_path = data_dir / "memory" / "MEMORY.md"
-    if memory_path.exists():
+    try:
         memory = memory_path.read_text().strip()
         if memory:
             parts.append(f"[Your persistent memory (file: {memory_path}):]\n{memory}")
         else:
             parts.append(f"[Your persistent memory (file: {memory_path}):]\n(currently empty)")
-    else:
+    except OSError:
         parts.append(f"[Your persistent memory (file: {memory_path}):]\n(not yet created)")
 
     # Per-workspace system prompt from workspaces.yaml. Injected
@@ -341,8 +342,6 @@ def build_session_context(
             f"correct user.]"
         )
 
-    if not parts:
-        return None
     # No trailing \n\n here - prepend_to_prompt() adds the separator
     # between the context block and the user's message.
     return "\n\n".join(parts)
