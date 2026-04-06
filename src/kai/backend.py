@@ -133,7 +133,13 @@ class AgentBackend(ABC):
 
     @abstractmethod
     async def send(self, prompt: str | list, chat_id: int | None = None) -> AsyncIterator[StreamEvent]:
-        """Send a message and yield streaming events."""
+        """Send a message and yield streaming events.
+
+        Implementations should be async generators (use yield, not
+        return). The AsyncIterator return type is the consumer-facing
+        interface; pool.py iterates over the result, it does not send
+        values into the generator.
+        """
         ...
 
     @abstractmethod
@@ -332,7 +338,9 @@ def build_session_context(
 
     if not parts:
         return None
-    return "\n\n".join(parts) + "\n\n"
+    # No trailing \n\n here - prepend_to_prompt() adds the separator
+    # between the context block and the user's message.
+    return "\n\n".join(parts)
 
 
 def build_foreign_workspace_reminder(workspace: Path, home_workspace: Path) -> str | None:

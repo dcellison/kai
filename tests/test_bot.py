@@ -475,7 +475,7 @@ def _text_event(text: str) -> StreamEvent:
 
 
 def _done_event(text="Final response", cost=0.01, session_id="sess-1", success=True, error=None) -> StreamEvent:
-    """Final streaming event with a AgentResponse."""
+    """Final streaming event with an AgentResponse."""
     return StreamEvent(
         text_so_far=text,
         done=True,
