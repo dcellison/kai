@@ -31,17 +31,45 @@ def _write_yaml(tmp_path, content: str):
 
 
 def _mock_streamed_response(data: bytes, status: int = 200) -> MagicMock:
-    """Create a mock aiohttp response that returns the full body via read().
+    """Create a mock aiohttp response with iter_chunked() support.
 
-    Uses resp.read() (not resp.content.read()) to match the production
-    code path, which buffers all chunks before returning.
+    Simulates the production code path which streams via
+    resp.content.iter_chunked(). The data is yielded as a single
+    chunk by default; use _mock_multi_chunk_response() to simulate
+    multi-chunk delivery.
     """
     mock_response = AsyncMock()
     mock_response.status = status
     mock_response.get_encoding = MagicMock(return_value="utf-8")
 
-    # Mock resp.read() to return the complete body
-    mock_response.read = AsyncMock(return_value=data)
+    # Mock content.iter_chunked() as an async generator yielding
+    # the full body in one piece
+    async def _iter_chunked(_size: int = 65536):
+        yield data
+
+    mock_response.content = MagicMock()
+    mock_response.content.iter_chunked = _iter_chunked
+    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_response.__aexit__ = AsyncMock(return_value=False)
+    return mock_response
+
+
+def _mock_multi_chunk_response(chunk_list: list[bytes], status: int = 200) -> MagicMock:
+    """Create a mock aiohttp response that yields multiple chunks.
+
+    Used to verify that iter_chunked() reassembles all chunks
+    into the complete response body.
+    """
+    mock_response = AsyncMock()
+    mock_response.status = status
+    mock_response.get_encoding = MagicMock(return_value="utf-8")
+
+    async def _iter_chunked(_size: int = 65536):
+        for chunk in chunk_list:
+            yield chunk
+
+    mock_response.content = MagicMock()
+    mock_response.content.iter_chunked = _iter_chunked
     mock_response.__aenter__ = AsyncMock(return_value=mock_response)
     mock_response.__aexit__ = AsyncMock(return_value=False)
     return mock_response
@@ -1018,12 +1046,12 @@ services:
         # Body should be truncated to the cap
         assert len(result.body) == _MAX_RESPONSE_BYTES
 
-    async def test_chunked_response_read_completely(self, tmp_path, monkeypatch):
-        """Chunked transfer encoding responses are read in full, not truncated.
+    async def test_multi_chunk_response_reassembled(self, tmp_path, monkeypatch):
+        """Multiple chunks from iter_chunked() are joined into the full body.
 
-        resp.read() buffers all chunks before returning, unlike
-        resp.content.read(n) which returns after the first chunk.
-        This test verifies the full body is captured.
+        APIs using chunked transfer encoding (like Perplexity) deliver
+        the response in multiple pieces. This test verifies all chunks
+        are collected and reassembled.
         """
         monkeypatch.setenv("API_KEY", "tok")
         path = _write_yaml(
@@ -1040,9 +1068,13 @@ services:
         )
         load_services(path)
 
-        # Simulate a multi-chunk response (the kind Perplexity sends)
-        full_body = b'{"answer": "This is a complete response from a chunked API"}'
-        mock_response = _mock_streamed_response(full_body)
+        # Split a JSON body across three chunks, the way a chunked
+        # transfer encoding response would arrive
+        chunk1 = b'{"answer": "'
+        chunk2 = b"This is a complete"
+        chunk3 = b' response from a chunked API"}'
+        expected = chunk1 + chunk2 + chunk3
+        mock_response = _mock_multi_chunk_response([chunk1, chunk2, chunk3])
         mock_session = MagicMock()
         mock_session.request = MagicMock(return_value=mock_response)
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
@@ -1052,10 +1084,8 @@ services:
             result = await call_service("testapi", body={"query": "test"})
 
         assert result.success is True
-        # Verify the full body came through, not just a first-chunk fragment
-        assert result.body == full_body.decode("utf-8")
-        # Confirm resp.read() was called (not resp.content.read())
-        mock_response.read.assert_called_once()
+        # All three chunks should be joined into the complete body
+        assert result.body == expected.decode("utf-8")
 
     async def test_response_encoding_respected(self, tmp_path, monkeypatch):
         """Response is decoded using the charset from Content-Type."""
