@@ -285,6 +285,32 @@ class TestBuildSessionContext:
         assert "Scheduling API" not in result
         assert "Messaging API" not in result
 
+    def test_workspace_system_prompt_included(self, tmp_path):
+        """Workspace system prompt appears in the assembled context string."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+        (data_dir / "memory").mkdir(parents=True)
+
+        ws_config = WorkspaceConfig(
+            path=workspace,
+            system_prompt="Always respond in haiku form.",
+        )
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=ws_config,
+                chat_id=None,
+                data_dir=data_dir,
+            )
+
+        assert result is not None
+        assert "Workspace Instructions" in result
+        assert "Always respond in haiku form." in result
+
 
 # ── Test build_foreign_workspace_reminder ───────────────────────────
 

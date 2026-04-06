@@ -375,8 +375,10 @@ def prepend_to_prompt(prompt: str | list, prefix: str) -> str | list:
     if not prefix:
         return prompt
     if isinstance(prompt, str):
+        # String prompts get a \n\n separator between prefix and prompt.
         return prefix + "\n\n" + prompt
-    # list-of-content-blocks: insert a text block at the front
+    # List prompts: insert a separate text block at the front. No \n\n
+    # needed because content blocks are independent elements in the API.
     return [{"type": "text", "text": prefix}] + prompt
 
 
