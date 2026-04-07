@@ -931,6 +931,21 @@ class TestShutdown:
         await g.shutdown()  # Should not raise
 
     @pytest.mark.asyncio
+    async def test_shutdown_terminate_oserror(self):
+        """shutdown() handles OSError from terminate() when process already exited."""
+        g = _make_goose()
+        proc = MagicMock()
+        proc.returncode = None
+        proc.terminate = MagicMock(side_effect=OSError("already dead"))
+        proc.wait = AsyncMock()
+        g._proc = proc
+
+        await g.shutdown()
+
+        assert g._proc is None
+        assert g._session_id is None
+
+    @pytest.mark.asyncio
     async def test_shutdown_sigkill_fallback(self):
         """shutdown() falls back to SIGKILL on SIGTERM timeout."""
         g = _make_goose()
