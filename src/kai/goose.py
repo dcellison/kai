@@ -314,7 +314,6 @@ class GooseBackend(AgentBackend):
             has done=True and includes the complete AgentResponse.
         """
         async with self._lock:
-            await self._ensure_started()
             async for event in self._send_locked(prompt, chat_id):
                 yield event
 
@@ -360,10 +359,10 @@ class GooseBackend(AgentBackend):
         # Coerce prompt to ACP format (array of content blocks).
         # Goose supports images but the initial implementation handles
         # text only. Non-text blocks are logged and skipped.
+        acp_prompt: list[dict] = []
         if isinstance(prompt, str):
             acp_prompt = [{"type": "text", "text": prompt}]
         else:
-            acp_prompt: list[dict] = []
             for block in prompt:
                 if block.get("type") == "text":
                     acp_prompt.append({"type": "text", "text": block["text"]})
@@ -560,9 +559,8 @@ class GooseBackend(AgentBackend):
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except TimeoutError:
                 pass
-            if self._stderr_task:
-                self._stderr_task.cancel()
-                self._stderr_task = None
+            # force_kill() already cancelled _stderr_task and set it to
+            # None, so no additional cleanup needed here.
             self._proc = None
             self._session_id = None
 
