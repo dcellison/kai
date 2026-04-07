@@ -280,6 +280,33 @@ class TestPropertyAccessors:
         pool = SubprocessPool(config=_make_config(default_model="haiku"), services_info=[])
         assert pool.get_model(999) == "haiku"
 
+    @pytest.mark.asyncio
+    async def test_get_effective_model_existing_instance(self):
+        """get_effective_model returns the instance's model when it exists."""
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        instance = pool.get(111)
+        instance.model = "opus"
+        assert await pool.get_effective_model(111) == "opus"
+
+    @pytest.mark.asyncio
+    async def test_get_effective_model_no_instance(self):
+        """get_effective_model falls back to DB settings when no instance exists."""
+        pool = SubprocessPool(config=_make_config(default_model="sonnet"), services_info=[])
+        # Simulate a user who set opus via /model (persisted in user settings DB).
+        # With no instance, get_model() would return "sonnet" (global default),
+        # but get_effective_model() should resolve from the DB and return "opus".
+        with patch(
+            "kai.sessions.resolve_user_defaults",
+            new_callable=AsyncMock,
+            return_value={
+                "model": "opus",
+                "budget": 10.0,
+                "timeout": 120,
+                "context_window": 0,
+            },
+        ):
+            assert await pool.get_effective_model(999) == "opus"
+
     def test_get_workspace_no_instance(self):
         """get_workspace returns global default when no instance exists."""
         pool = SubprocessPool(config=_make_config(), services_info=[])
