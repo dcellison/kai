@@ -747,7 +747,7 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
         ctx_src = "users.yaml"
     else:
         ctx_src = "global default"
-    ctx_label = f"{ctx_val:,} tokens" if ctx_val > 0 else "default"
+    ctx_label = f"{ctx_val:,} tokens" if ctx_val > 0 else "not set (model default)"
 
     # Budget ceiling - show when a positive ceiling exists so the user
     # knows their limit before hitting it. Falls through to the global
