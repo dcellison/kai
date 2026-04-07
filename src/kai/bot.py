@@ -438,6 +438,12 @@ async def _switch_model(context: ContextTypes.DEFAULT_TYPE, chat_id: int, model:
     pool.set_model(chat_id, model)
     # Persist to settings table so the choice survives restarts
     await sessions.set_user_setting(chat_id, "model", model)
+    # Clear any workspace-level model override so the switch actually
+    # takes effect. Without this, a prior /workspace config model entry
+    # shadows the user setting (workspace config has higher precedence)
+    # and the model would revert on the next service restart.
+    workspace = str(pool.get_workspace(chat_id))
+    await sessions.delete_workspace_config_setting(chat_id, workspace, "model")
     await pool.restart(chat_id)
     await sessions.clear_session(chat_id)
 

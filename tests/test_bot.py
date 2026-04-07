@@ -954,6 +954,7 @@ class TestHandleModel:
         with (
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.set_user_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.delete_workspace_config_setting", new_callable=AsyncMock),
         ):
             await handle_model(update, ctx)
         pool.set_model.assert_called_once_with(ANY, "opus")
@@ -996,6 +997,7 @@ class TestHandleModelCallback:
         with (
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.set_user_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.delete_workspace_config_setting", new_callable=AsyncMock),
         ):
             await handle_model_callback(update, ctx)
         pool.set_model.assert_called_once_with(ANY, "opus")
