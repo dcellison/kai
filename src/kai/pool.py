@@ -23,6 +23,7 @@ from kai import sessions
 from kai.backend import AgentBackend, StreamEvent
 from kai.claude import ClaudeCodeBackend
 from kai.config import (
+    OPEN_ENDED_PROVIDERS,
     PROVIDER_DEFAULTS,
     Config,
     WorkspaceConfig,
@@ -127,6 +128,18 @@ class SubprocessPool:
             model = user.model
         elif effective_provider == global_provider:
             model = self._config.default_model
+            # Catch the case where the global backend itself is an open-ended
+            # provider and DEFAULT_MODEL is something generic like "sonnet".
+            # Startup validation passes because open-ended providers accept
+            # any model string, but the provider API will reject it.
+            if effective_provider in OPEN_ENDED_PROVIDERS:
+                log.warning(
+                    "No model configured for open-ended provider '%s' (chat %d); "
+                    "using global default '%s' which may not be valid for this provider",
+                    effective_provider,
+                    chat_id,
+                    model,
+                )
         else:
             model = PROVIDER_DEFAULTS.get(effective_provider, "")
             if not model:
