@@ -538,7 +538,7 @@ class TestCmdConfig:
         assert "CLAUDE_USER" not in conf["env"]
 
     def test_goose_backend_writes_env(self, tmp_path, monkeypatch):
-        """Selecting goose backend writes AGENT_BACKEND and ANTHROPIC_API_KEY."""
+        """Selecting goose backend writes AGENT_BACKEND to env."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
@@ -556,7 +556,6 @@ class TestCmdConfig:
                 "false",  # advanced user options
                 "polling",  # transport
                 "goose",  # agent backend
-                "sk-ant-test-key",  # anthropic api key
                 "sonnet",  # model
                 "120",  # timeout
                 "10.0",  # budget
@@ -581,7 +580,9 @@ class TestCmdConfig:
 
         conf = json.loads((tmp_path / "install.conf").read_text())
         assert conf["env"]["AGENT_BACKEND"] == "goose"
-        assert conf["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
+        # Provider API keys are not managed by Kai - they go directly
+        # into /etc/kai/env or the shell environment for Goose to read.
+        assert "ANTHROPIC_API_KEY" not in conf["env"]
 
     def test_reads_existing_defaults(self, tmp_path, monkeypatch, capsys):
         """Config subcommand uses existing install.conf values as defaults."""

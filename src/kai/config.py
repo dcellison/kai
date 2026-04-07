@@ -311,10 +311,6 @@ class Config:
     # Agent backend selection: "claude" (default) uses Claude Code CLI,
     # "goose" uses Goose ACP (Agent Client Protocol) as the agent harness.
     agent_backend: str = "claude"
-    # Anthropic API key for the Goose backend. Goose calls the Anthropic
-    # API directly (not via Claude Code), so it needs its own credential.
-    # Inherited by the subprocess environment; not logged or echoed.
-    anthropic_api_key: str = ""
 
     def get_workspace_config(self, workspace: Path) -> WorkspaceConfig | None:
         """
@@ -1114,12 +1110,6 @@ def load_config() -> Config:
             f"AGENT_BACKEND '{agent_backend}' is not valid (must be one of: {', '.join(sorted(VALID_BACKENDS))})"
         )
 
-    # Anthropic API key for the Goose backend. Passthrough string;
-    # do not log this value. Inherited by the Goose subprocess.
-    anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if agent_backend == "goose" and not anthropic_api_key:
-        raise SystemExit("ANTHROPIC_API_KEY is required when AGENT_BACKEND=goose")
-
     # Per-workspace configuration. Loaded after ALLOWED_WORKSPACES so
     # YAML-defined workspaces can be merged into the allowed set.
     workspace_configs = _load_workspace_configs()
@@ -1254,5 +1244,4 @@ def load_config() -> Config:
         totp_lockout_attempts=totp_lockout_attempts,
         totp_lockout_minutes=totp_lockout_minutes,
         agent_backend=agent_backend,
-        anthropic_api_key=anthropic_api_key,
     )

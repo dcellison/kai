@@ -415,16 +415,9 @@ def _cmd_config() -> None:
         sorted(VALID_BACKENDS),
         existing_env.get("AGENT_BACKEND", "claude"),
     )
-
-    # Anthropic API key is only needed for Goose (it calls the Anthropic
-    # API directly, unlike Claude Code which uses its own auth).
-    anthropic_api_key = ""
     if agent_backend == "goose":
-        anthropic_api_key = _prompt(
-            "Anthropic API key",
-            existing_env.get("ANTHROPIC_API_KEY", ""),
-            required=True,
-        )
+        print("  Note: Goose requires a provider API key (e.g. ANTHROPIC_API_KEY)")
+        print("  in the environment. Add it to /etc/kai/env after installation.")
     print()
 
     # -- Claude --
@@ -651,8 +644,6 @@ def _cmd_config() -> None:
     # Only write non-default values to keep the env file clean.
     if agent_backend != "claude":
         env["AGENT_BACKEND"] = agent_backend
-    if anthropic_api_key:
-        env["ANTHROPIC_API_KEY"] = anthropic_api_key
 
     # Deprecated per-user vars: only include without users.yaml
     # (legacy single-user mode). With users.yaml, these are noise.
