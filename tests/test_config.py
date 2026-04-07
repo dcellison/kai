@@ -96,6 +96,9 @@ class TestLoadConfigDefaults:
         # Context window tuning defaults to 0 (use Claude Code defaults)
         assert config.claude_max_context_window == 0
         assert config.claude_autocompact_pct == 0
+        # Agent backend defaults
+        assert config.agent_backend == "claude"
+        assert config.anthropic_api_key == ""
 
     def test_context_window_from_env(self, monkeypatch):
         _set_required(monkeypatch)
@@ -178,6 +181,20 @@ class TestLoadConfigErrors:
         _set_required(monkeypatch)
         monkeypatch.setenv("CLAUDE_MODEL", "sonet")
         with pytest.raises(SystemExit, match="CLAUDE_MODEL"):
+            load_config()
+
+    def test_invalid_agent_backend(self, monkeypatch):
+        """AGENT_BACKEND with an unrecognized value raises SystemExit."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("AGENT_BACKEND", "invalid")
+        with pytest.raises(SystemExit, match="AGENT_BACKEND"):
+            load_config()
+
+    def test_goose_backend_missing_api_key(self, monkeypatch):
+        """AGENT_BACKEND=goose without ANTHROPIC_API_KEY raises SystemExit."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("AGENT_BACKEND", "goose")
+        with pytest.raises(SystemExit, match="ANTHROPIC_API_KEY"):
             load_config()
 
 

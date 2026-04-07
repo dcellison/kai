@@ -1861,16 +1861,23 @@ def _apply_goose_config(
         print(f"  WARNING: Goose config template not found at {src}; skipping")
         return
 
+    # Track whether we're creating .config for the first time so we
+    # can set ownership on it below. mkdir(parents=True) creates both
+    # .config/ and .config/goose/ if needed.
+    config_dir = svc_home / ".config"
+    config_dir_is_new = not config_dir.exists()
+
     goose_dir.mkdir(parents=True, exist_ok=True)
     # Own the .config/goose tree by the service user so Goose can
     # write runtime state (session logs, etc.) alongside the config.
     _set_ownership(goose_dir, svc_uid, svc_gid)
-    # Also own the parent .config dir if we just created it
-    config_dir = svc_home / ".config"
-    if config_dir.exists():
+    # Only chown .config itself if we just created it. An existing
+    # .config may be shared with other tools and should keep its
+    # current ownership.
+    if config_dir_is_new:
         _set_ownership(config_dir, svc_uid, svc_gid)
 
-    shutil.copy2(str(src), str(dst))
+    shutil.copy2(src, dst)
     os.chmod(dst, 0o644)
     _set_ownership(dst, svc_uid, svc_gid)
     print(f"  Deployed Goose config to {dst}")

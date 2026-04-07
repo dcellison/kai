@@ -537,6 +537,52 @@ class TestCmdConfig:
         conf = json.loads((tmp_path / "install.conf").read_text())
         assert "CLAUDE_USER" not in conf["env"]
 
+    def test_goose_backend_writes_env(self, tmp_path, monkeypatch):
+        """Selecting goose backend writes AGENT_BACKEND and ANTHROPIC_API_KEY."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+
+        inputs = iter(
+            [
+                "/opt/kai",  # install dir
+                "/var/lib/kai",  # data dir
+                "kai",  # service user
+                "darwin",  # platform
+                "fake-token",  # bot token
+                "12345",  # admin telegram ID
+                "admin",  # admin display name
+                "false",  # advanced user options
+                "polling",  # transport
+                "goose",  # agent backend
+                "sk-ant-test-key",  # anthropic api key
+                "sonnet",  # model
+                "120",  # timeout
+                "10.0",  # budget
+                "200000",  # max context window
+                "80",  # autocompact pct
+                "8080",  # port
+                "test-secret",  # webhook secret
+                "~/Projects",  # workspace base
+                "",  # allowed workspaces (empty)
+                "false",  # pr review enabled
+                "false",  # issue triage enabled
+                "",  # github notify chat id (empty)
+                "false",  # voice
+                "false",  # tts
+                "",  # claude user (empty)
+                "",  # perplexity key (empty)
+            ]
+        )
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        conf = json.loads((tmp_path / "install.conf").read_text())
+        assert conf["env"]["AGENT_BACKEND"] == "goose"
+        assert conf["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
+
     def test_reads_existing_defaults(self, tmp_path, monkeypatch, capsys):
         """Config subcommand uses existing install.conf values as defaults."""
         monkeypatch.chdir(tmp_path)

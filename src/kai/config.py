@@ -1117,6 +1117,8 @@ def load_config() -> Config:
     # Anthropic API key for the Goose backend. Passthrough string;
     # do not log this value. Inherited by the Goose subprocess.
     anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if agent_backend == "goose" and not anthropic_api_key:
+        raise SystemExit("ANTHROPIC_API_KEY is required when AGENT_BACKEND=goose")
 
     # Per-workspace configuration. Loaded after ALLOWED_WORKSPACES so
     # YAML-defined workspaces can be merged into the allowed set.
