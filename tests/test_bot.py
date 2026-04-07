@@ -2952,7 +2952,7 @@ class TestHandleWorkspaceConfig:
         stack.enter_context(patch("kai.bot.sessions", mock_sessions))
         return stack
 
-    def _mock_sessions(self, db_settings=None):
+    def _mock_sessions(self, db_settings=None, user_settings=None):
         """Create a mock sessions module with workspace config helpers."""
         mock = AsyncMock()
         mock.get_workspace_config_settings = AsyncMock(return_value=db_settings or {})
@@ -2960,6 +2960,10 @@ class TestHandleWorkspaceConfig:
         mock.delete_workspace_config_setting = AsyncMock()
         mock.delete_all_workspace_config = AsyncMock()
         mock.build_workspace_config = AsyncMock(return_value=None)
+        # _show_workspace_config also fetches user-level settings for its
+        # fallback chain (workspace DB > workspaces.yaml > user DB >
+        # users.yaml > global default).
+        mock.get_user_settings = AsyncMock(return_value=user_settings or {})
         return mock
 
     # ── 1. Show config with no overrides ────────────────────────────
@@ -2980,6 +2984,23 @@ class TestHandleWorkspaceConfig:
         # Should show model, budget, timeout with "global default" source
         assert "sonnet" in reply
         assert "global default" in reply
+
+    @pytest.mark.asyncio
+    async def test_show_config_user_setting_fallback(self):
+        """/workspace config shows user-level model when no workspace override exists."""
+        update = _make_update(text="/workspace config")
+        config = _make_config()
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        # User set opus via /model, but no workspace-level override
+        mock_sessions = self._mock_sessions(user_settings={"model": "opus"})
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config")
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "opus" in reply
+        assert "user setting" in reply
 
     # ── 2. Set model ────────────────────────────────────────────────
 

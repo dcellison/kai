@@ -309,7 +309,7 @@ def main() -> None:
             await app.bot.set_my_commands(
                 [
                     BotCommand("models", "Choose a model"),
-                    BotCommand("model", "Switch model (opus, sonnet, haiku)"),
+                    BotCommand("model", "Switch model directly"),
                     BotCommand("new", "Start a fresh session"),
                     BotCommand("workspace", "Switch working directory"),
                     BotCommand("workspaces", "List recent workspaces"),

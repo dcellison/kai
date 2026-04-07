@@ -1439,43 +1439,59 @@ async def _show_workspace_config(
     yaml_config = config.get_workspace_config(workspace)
     db_settings = await sessions.get_workspace_config_settings(chat_id, str(workspace))
 
+    # Fetch user-level settings so the display reflects the full
+    # precedence chain: workspace DB > workspaces.yaml > user DB >
+    # users.yaml > global default. Without these, fields that the user
+    # set via /settings or /model would show "global default" instead
+    # of the actual effective value.
+    user_settings = await sessions.get_user_settings(chat_id)
+    user_config = config.get_user_config(chat_id)
+
     lines = [f"Config for {workspace.name}:"]
 
-    # Helper to determine source of each field
-    def _source(field_name: str) -> str:
-        if field_name in db_settings:
-            return "user override"
-        if yaml_config and getattr(yaml_config, field_name, None) is not None:
-            return "workspaces.yaml"
-        return "global default"
+    # Model: workspace DB > workspaces.yaml > user DB > users.yaml > global
+    if "model" in db_settings:
+        model, model_src = db_settings["model"], "workspace override"
+    elif yaml_config and yaml_config.model:
+        model, model_src = yaml_config.model, "workspaces.yaml"
+    elif "model" in user_settings:
+        model, model_src = user_settings["model"], "user setting"
+    elif user_config and user_config.model:
+        model, model_src = user_config.model, "users.yaml"
+    else:
+        model, model_src = config.default_model, "global default"
+    lines.append(f"  Model: {model} ({model_src})")
 
-    # Model
-    model = db_settings.get("model") or (yaml_config.model if yaml_config else None) or config.default_model
-    lines.append(f"  Model: {model} ({_source('model')})")
-
-    # Budget
+    # Budget: workspace DB > workspaces.yaml > user DB > users.yaml > global.
+    # users.yaml uses max_budget (serves as both ceiling and default).
     try:
-        budget = (
-            float(db_settings["budget"])
-            if "budget" in db_settings
-            else yaml_config.budget
-            if yaml_config and yaml_config.budget is not None
-            else config.claude_max_budget_usd
-        )
-        lines.append(f"  Budget: ${budget:.2f} ({_source('budget')})")
+        if "budget" in db_settings:
+            budget, budget_src = float(db_settings["budget"]), "workspace override"
+        elif yaml_config and yaml_config.budget is not None:
+            budget, budget_src = yaml_config.budget, "workspaces.yaml"
+        elif "budget" in user_settings:
+            budget, budget_src = float(user_settings["budget"]), "user setting"
+        elif user_config and user_config.max_budget is not None:
+            budget, budget_src = user_config.max_budget, "users.yaml"
+        else:
+            budget, budget_src = config.claude_max_budget_usd, "global default"
+        lines.append(f"  Budget: ${budget:.2f} ({budget_src})")
     except (ValueError, TypeError):
         lines.append("  Budget: (corrupted - reset with /workspace config reset budget)")
 
-    # Timeout
+    # Timeout: workspace DB > workspaces.yaml > user DB > users.yaml > global
     try:
-        timeout = (
-            int(db_settings["timeout"])
-            if "timeout" in db_settings
-            else yaml_config.timeout
-            if yaml_config and yaml_config.timeout is not None
-            else config.claude_timeout_seconds
-        )
-        lines.append(f"  Timeout: {timeout}s ({_source('timeout')})")
+        if "timeout" in db_settings:
+            timeout, timeout_src = int(db_settings["timeout"]), "workspace override"
+        elif yaml_config and yaml_config.timeout is not None:
+            timeout, timeout_src = yaml_config.timeout, "workspaces.yaml"
+        elif "timeout" in user_settings:
+            timeout, timeout_src = int(user_settings["timeout"]), "user setting"
+        elif user_config and user_config.timeout is not None:
+            timeout, timeout_src = user_config.timeout, "users.yaml"
+        else:
+            timeout, timeout_src = config.claude_timeout_seconds, "global default"
+        lines.append(f"  Timeout: {timeout}s ({timeout_src})")
     except (ValueError, TypeError):
         lines.append("  Timeout: (corrupted - reset with /workspace config reset timeout)")
 
@@ -1499,7 +1515,7 @@ async def _show_workspace_config(
     prompt = db_settings.get("prompt")
     if prompt:
         preview = prompt[:100] + ("..." if len(prompt) > 100 else "")
-        lines.append(f"  Prompt: {preview} (user override)")
+        lines.append(f"  Prompt: {preview} (workspace override)")
     elif yaml_config and yaml_config.system_prompt:
         preview = yaml_config.system_prompt[:100]
         if len(yaml_config.system_prompt) > 100:
@@ -2718,25 +2734,45 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         "/stop - Interrupt current response\n"
         "/new - Start a fresh session\n"
+        "\n"
+        "/models - Choose a model\n"
+        "/model <name> - Switch model directly\n"
+        "\n"
+        "/settings - Show your settings\n"
+        "/settings model <name> - Default model\n"
+        "/settings budget <n> - Spending cap (USD)\n"
+        "/settings timeout <n> - Response timeout (seconds)\n"
+        "/settings context <n> - Context window (tokens)\n"
+        "/settings reset [field] - Clear overrides\n"
+        "\n"
         "/workspace (or /ws) - Show current workspace\n"
         "/workspace <name> - Switch by name\n"
-        "/workspace new <name> - Create + git init + switch\n"
         "/workspace home - Return to default\n"
+        "/workspace new <name> - Create + git init + switch\n"
         "/workspace allow <path> - Add an allowed workspace\n"
         "/workspace deny <path> - Remove an allowed workspace\n"
         "/workspace allowed - List your workspaces\n"
+        "/workspace config - Show workspace settings\n"
+        "/workspace config <field> <value> - Override a setting\n"
+        "/workspace config env KEY=VALUE - Set an env var\n"
+        "/workspace config prompt <text> - Set system prompt\n"
+        "/workspace config reset [field] - Clear overrides\n"
         "/workspaces - Switch workspace (inline buttons)\n"
-        "/settings - Show your settings\n"
-        "/settings <field> <value> - Change a setting\n"
-        "/settings reset - Clear all overrides\n"
-        "/github - GitHub notification settings\n"
-        "/models - Choose a model\n"
-        "/model <name> - Switch model (persists)\n"
+        "\n"
+        "/github - Show GitHub settings\n"
+        "/github notify [on|off] - Toggle notifications\n"
+        "/github reviews [on|off] - Toggle PR reviews\n"
+        "/github triage [on|off] - Toggle issue triage\n"
+        "/github token [<token>] - Manage access token\n"
+        "/github add <repo> - Watch a repo\n"
+        "/github remove <repo> - Unwatch a repo\n"
+        "\n"
         "/voice - Toggle voice on/off\n"
         "/voice only - Voice only (no text)\n"
         "/voice on - Text + voice\n"
         "/voice <name> - Set voice\n"
         "/voices - Choose a voice (inline buttons)\n"
+        "\n"
         "/stats - Show session info and cost\n"
         "/jobs - List scheduled jobs\n"
         "/canceljob <id> - Cancel a job\n"
