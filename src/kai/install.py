@@ -409,22 +409,16 @@ def _cmd_config() -> None:
     print()
 
     # -- Agent backend --
-    # The prompt is gated behind an existing AGENT_BACKEND value so
-    # users who haven't opted into Goose never see the choice. Once
-    # GooseBackend ships (#262), remove the gate and always prompt.
-    if existing_env.get("AGENT_BACKEND", "claude") != "claude":
-        print("-- Agent backend --")
-        agent_backend = _prompt_choice(
-            "Agent backend",
-            sorted(VALID_BACKENDS),
-            existing_env.get("AGENT_BACKEND", "claude"),
-        )
-        if agent_backend == "goose":
-            print("  Note: Goose requires a provider API key (e.g. ANTHROPIC_API_KEY)")
-            print("  in the environment. Add it to /etc/kai/env after installation.")
-        print()
-    else:
-        agent_backend = "claude"
+    print("-- Agent backend --")
+    agent_backend = _prompt_choice(
+        "Agent backend",
+        sorted(VALID_BACKENDS),
+        existing_env.get("AGENT_BACKEND", "claude"),
+    )
+    if agent_backend == "goose":
+        print("  Note: Goose requires a provider API key (e.g. ANTHROPIC_API_KEY)")
+        print("  in the environment. Add it to /etc/kai/env after installation.")
+    print()
 
     # -- Claude --
     # When users.yaml exists, model/timeout/budget/context are per-user

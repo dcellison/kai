@@ -440,7 +440,7 @@ class TestCmdConfig:
                 "admin",  # admin display name
                 "false",  # advanced user options
                 "polling",  # transport
-                # agent backend prompt not shown (gated behind existing non-claude value)
+                "claude",  # agent backend
                 "sonnet",  # model
                 "120",  # timeout
                 "10.0",  # budget
@@ -502,7 +502,7 @@ class TestCmdConfig:
                 "testuser",  # os_user
                 str(tmp_path),  # home_workspace
                 "polling",  # transport
-                # agent backend prompt not shown (gated behind existing non-claude value)
+                "claude",  # agent backend
                 "sonnet",  # model
                 "120",  # timeout
                 "10.0",  # budget

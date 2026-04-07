@@ -23,6 +23,7 @@ from kai import sessions
 from kai.backend import AgentBackend, StreamEvent
 from kai.claude import ClaudeCodeBackend
 from kai.config import Config, WorkspaceConfig
+from kai.goose import GooseBackend
 from kai.workspace_utils import is_workspace_allowed
 
 log = logging.getLogger(__name__)
@@ -82,9 +83,13 @@ class SubprocessPool:
         self._last_activity[chat_id] = time.monotonic()
         return self._pool[chat_id]
 
-    def _create_instance(self, chat_id: int) -> ClaudeCodeBackend:
+    def _create_instance(self, chat_id: int) -> AgentBackend:
         """
-        Create a ClaudeCodeBackend for a specific user.
+        Create an AgentBackend for a specific user.
+
+        Backend selection: config.agent_backend determines whether to
+        construct a ClaudeCodeBackend or GooseBackend. Both share the
+        same ABC interface; pool.py is backend-agnostic after this point.
 
         Resolution order for each setting:
         1. UserConfig from users.yaml (os_user, home_workspace, model,
@@ -101,9 +106,6 @@ class SubprocessPool:
         if user and user.home_workspace:
             workspace = user.home_workspace
 
-        # os_user for sudo -u isolation. None = run as bot user.
-        os_user = user.os_user if user else self._config.claude_user
-
         ws_config = self._config.get_workspace_config(workspace)
 
         # Per-user baseline from users.yaml, falling back to global config.
@@ -115,11 +117,32 @@ class SubprocessPool:
         context_window = (
             user.context_window if user and user.context_window is not None else self._config.claude_max_context_window
         )
+        home_ws = user.home_workspace if user else self._config.claude_workspace
+
+        # Backend selection: "goose" uses Goose ACP, anything else
+        # (including the default "claude") uses Claude Code CLI.
+        if self._config.agent_backend == "goose":
+            return GooseBackend(
+                model=model,
+                workspace=workspace,
+                home_workspace=home_ws,
+                webhook_port=self._config.webhook_port,
+                webhook_secret=self._config.webhook_secret,
+                max_budget_usd=budget,
+                timeout_seconds=timeout,
+                services_info=self._services_info,
+                workspace_config=ws_config,
+                max_context_window=context_window,
+            )
+
+        # os_user for sudo -u isolation. None = run as bot user.
+        # Only relevant for ClaudeCodeBackend (Goose doesn't use sudo).
+        os_user = user.os_user if user else self._config.claude_user
 
         return ClaudeCodeBackend(
             model=model,
             workspace=workspace,
-            home_workspace=user.home_workspace if user else self._config.claude_workspace,
+            home_workspace=home_ws,
             webhook_port=self._config.webhook_port,
             webhook_secret=self._config.webhook_secret,
             max_budget_usd=budget,
