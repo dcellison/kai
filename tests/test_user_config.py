@@ -3,7 +3,7 @@ Tests for per-user configuration (users.yaml).
 
 Covers:
 1. UserConfig dataclass construction
-2. _load_user_configs() YAML parsing, validation, and edge cases
+2. _load_user_configs("claude", "") YAML parsing, validation, and edge cases
 3. Config.get_user_config() lookup
 4. Config.get_user_by_github() lookup (case-insensitive)
 5. Config.get_admins() filtering
@@ -118,7 +118,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
 
         assert configs is not None
         assert len(configs) == 2
@@ -137,7 +137,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is None
 
     def test_empty_file(self, tmp_path):
@@ -147,7 +147,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is None
 
     def test_invalid_yaml(self, tmp_path):
@@ -157,7 +157,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is None
 
     def test_missing_telegram_id(self, tmp_path):
@@ -174,7 +174,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert len(configs) == 0
 
@@ -192,7 +192,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert len(configs) == 0
 
@@ -210,7 +210,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert len(configs) == 0
 
@@ -229,7 +229,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert len(configs) == 0
 
@@ -248,7 +248,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert len(configs) == 0
 
@@ -267,7 +267,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert len(configs) == 0
 
@@ -285,7 +285,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert len(configs) == 0
 
@@ -305,7 +305,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert len(configs) == 1
         assert configs[111].name == "alice"
@@ -325,7 +325,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert len(configs) == 1
         assert configs[111].home_workspace is None
@@ -345,7 +345,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert len(configs) == 1
         # home_workspace falls back to None (global default)
@@ -355,7 +355,7 @@ class TestLoadUserConfigs:
         """Protected file (/etc/kai/users.yaml) is tried before local."""
         protected_data = {"users": [{"telegram_id": 111, "name": "alice", "role": "admin"}]}
         with patch("kai.config._read_protected_yaml", return_value=protected_data):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].name == "alice"
 
@@ -377,7 +377,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert len(configs) == 2
         assert "no admin users defined" in caplog.text.lower()
@@ -396,7 +396,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].role == "user"
 
@@ -415,7 +415,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].os_user == "alice_os"
 
@@ -436,7 +436,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].model == "opus"
 
@@ -455,7 +455,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].model is None
         assert "invalid model" in caplog.text.lower()
@@ -475,7 +475,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].timeout == 300
 
@@ -494,7 +494,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].timeout is None
         assert "invalid timeout" in caplog.text.lower()
@@ -514,7 +514,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].context_window == 200_000
 
@@ -533,7 +533,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].context_window == 0
 
@@ -552,7 +552,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].context_window is None
         assert "invalid context_window" in caplog.text.lower()
@@ -571,7 +571,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].model is None
         assert configs[111].timeout is None
@@ -601,7 +601,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].workspace_base == ws_base.resolve()
 
@@ -620,7 +620,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert len(configs) == 1
         assert configs[111].workspace_base is None
@@ -641,7 +641,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].workspace_base is None
 
@@ -664,7 +664,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].github_repos == ["alice/repo-a", "alice/repo-b"]
 
@@ -689,7 +689,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].github_repos == ["valid/repo"]
         assert "no-slash" in caplog.text
@@ -710,7 +710,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].github_repos == []
         assert "must be a list" in caplog.text
@@ -729,7 +729,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].github_repos == []
 
@@ -750,7 +750,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].github_notify_chat_id == 999888777
 
@@ -769,7 +769,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].github_notify_chat_id == -100123456789
 
@@ -788,7 +788,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].github_notify_chat_id is None
         assert "invalid github_notify_chat_id" in caplog.text
@@ -813,7 +813,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].pr_review is True
         assert configs[222].pr_review is False
@@ -832,7 +832,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].pr_review is None
 
@@ -851,7 +851,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].issue_triage is True
 
@@ -870,7 +870,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].pr_review is None
         assert "pr_review" in caplog.text
@@ -891,7 +891,7 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
-            configs = _load_user_configs()
+            configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].issue_triage is None
         assert "issue_triage" in caplog.text

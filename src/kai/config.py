@@ -39,10 +39,6 @@ PROJECT_ROOT = Path(os.environ.get("KAI_INSTALL_DIR") or str(_FILE_ROOT))
 # Uses `or` so that an empty string also falls back (same pattern as CLAUDE_USER).
 DATA_DIR = Path(os.environ.get("KAI_DATA_DIR") or str(PROJECT_ROOT))
 
-# Single source of truth for valid Claude model names.
-# install.py and bot.py both reference this instead of maintaining their own lists.
-VALID_MODELS = {"haiku", "sonnet", "opus"}
-
 # Valid agent backend choices. "claude" uses Claude Code CLI,
 # "goose" uses Goose ACP. Shared between load_config() and install.py.
 VALID_BACKENDS = {"claude", "goose"}
@@ -59,6 +55,75 @@ GOOSE_PROVIDER_KEY_VARS: dict[str, str] = {
     "google": "GOOGLE_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
 }
+
+# ── Provider-aware model registry ──────────────────────────────────────
+
+# Maps provider name to a dict of model_key -> display_name. Keys are
+# the identifiers passed to GOOSE_MODEL (for Goose) or --model (for
+# Claude CLI). Values are display names for the Telegram keyboard.
+# Goose passes model IDs through verbatim to the provider API - no
+# aliasing layer - so these must be the exact strings the APIs accept.
+PROVIDER_MODELS: dict[str, dict[str, str]] = {
+    "anthropic": {
+        "opus": "\U0001f9e0 Opus",
+        "sonnet": "\u26a1 Sonnet",
+        "haiku": "\U0001fab6 Haiku",
+    },
+    "openai": {
+        "gpt-5.4": "\U0001f7e2 GPT-5.4",
+        "gpt-5.4-mini": "\U0001f7e1 GPT-5.4 Mini",
+        "gpt-5.4-nano": "\U0001f535 GPT-5.4 Nano",
+    },
+    "google": {
+        "gemini-3.1-pro": "\u264a Gemini 3.1 Pro",
+        "gemini-3-flash": "\u264a Gemini 3 Flash",
+        "gemini-3-deep-think": "\u264a Gemini 3 Deep Think",
+    },
+}
+
+# Default model for each provider, used when no model is explicitly
+# configured. Open-ended providers (openrouter, ollama) have no
+# default - users on those providers MUST have a model set.
+PROVIDER_DEFAULTS: dict[str, str] = {
+    "anthropic": "sonnet",
+    "openai": "gpt-5.4",
+    "google": "gemini-3-flash",
+}
+
+# Providers that accept arbitrary model IDs with no curated list.
+# These show a text-based UI instead of an inline keyboard in bot.py.
+OPEN_ENDED_PROVIDERS: frozenset[str] = frozenset({"openrouter", "ollama"})
+
+# Union of all model keys from curated providers. Used for workspace
+# config validation where the provider is unknown (workspaces can be
+# used by users on different providers).
+_ALL_CURATED_MODELS: frozenset[str] = frozenset(model for models in PROVIDER_MODELS.values() for model in models)
+
+
+def get_effective_provider(backend: str, goose_provider: str) -> str:
+    """Derive the effective provider from backend + goose_provider.
+
+    The Claude backend always uses Anthropic models. The Goose backend
+    uses whatever provider is configured.
+    """
+    if backend == "claude":
+        return "anthropic"
+    return goose_provider
+
+
+def validate_model_for_provider(model: str, provider: str) -> bool:
+    """Check if a model is valid for a provider.
+
+    Returns True if the provider is open-ended (accepts any model)
+    or if the model is in the provider's curated list.
+    """
+    if provider in OPEN_ENDED_PROVIDERS:
+        return True
+    models = PROVIDER_MODELS.get(provider)
+    if models is None:
+        return True  # Unknown provider - accept anything
+    return model in models
+
 
 # Maximum context window size in tokens. Claude's hard ceiling.
 # Shared between load_config() (env var validation) and
@@ -177,6 +242,10 @@ class UserConfig:
     timeout: int | None = None
     context_window: int | None = None
     workspace_base: Path | None = None
+    # Per-user backend/provider override. Admin-controlled via users.yaml,
+    # not user-configurable via /settings. None = use global config.
+    agent_backend: str | None = None
+    goose_provider: str | None = None
     # GitHub notification routing fields. github_repos controls which
     # repos route webhook events to this user. pr_review and issue_triage
     # are tri-state: None = use global default, True/False = admin override.
@@ -207,7 +276,7 @@ class Config:
             Sent by Telegram as X-Telegram-Bot-Api-Secret-Token header on each update.
             Only required in webhook mode. Defaults to WEBHOOK_SECRET if not explicitly set.
         allowed_user_ids: Set of Telegram user IDs permitted to interact with the bot (required)
-        claude_model: Model name passed to the inner Claude Code process (haiku/sonnet/opus)
+        default_model: Default model name, provider-dependent (e.g. sonnet, gpt-5.4, gemini-3-flash)
         claude_timeout_seconds: Seconds before a Claude response is considered timed out
         claude_max_budget_usd: Per-session spending cap in USD
         claude_max_session_hours: Hours before the inner Claude process is recycled. Prevents
@@ -240,7 +309,7 @@ class Config:
     telegram_webhook_secret: str | None = None
 
     # Claude Code process configuration
-    claude_model: str = "sonnet"
+    default_model: str = "sonnet"
     claude_timeout_seconds: int = 120
     claude_max_budget_usd: float = 10.0
     claude_max_session_hours: float = 0  # 0 = no limit
@@ -541,18 +610,21 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
             log.warning("workspaces.yaml: invalid claude section for %s", path)
             continue
 
-        # Validate model
+        # Validate model against the union of all curated provider
+        # models. Workspaces don't have a provider field - they can be
+        # used by users on different providers - so any curated model
+        # key is accepted. Open-ended provider model IDs are also fine.
         model = claude_section.get("model")
         if model is not None:
             model = str(model)
-            if model not in VALID_MODELS:
+            if model not in _ALL_CURATED_MODELS:
                 log.warning(
-                    "workspaces.yaml: invalid model '%s' for %s (must be one of %s); skipping entry",
+                    "workspaces.yaml: unrecognized model '%s' for %s "
+                    "(not in any curated provider list); proceeding anyway",
                     model,
                     path,
-                    VALID_MODELS,
                 )
-                continue
+                # Don't skip - could be an open-ended provider model ID
 
         # Validate budget (same bool guard as timeout - float(True) is 1.0)
         budget = claude_section.get("budget")
@@ -640,13 +712,22 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
 _VALID_ROLES = {"admin", "user"}
 
 
-def _load_user_configs() -> dict[int, UserConfig] | None:
+def _load_user_configs(
+    global_backend: str,
+    global_provider: str,
+) -> dict[int, UserConfig] | None:
     """
     Load per-user configs from users.yaml.
 
     Tries /etc/kai/users.yaml first (protected), falls back to
     PROJECT_ROOT/users.yaml (dev). Returns None if neither exists
     (signals the caller to fall back to ALLOWED_USER_IDS).
+
+    Args:
+        global_backend: The global agent_backend from env config.
+        global_provider: The global goose_provider from env config.
+            Both are needed to cascade per-user model validation:
+            a user's effective provider determines which models are valid.
 
     Returns a dict keyed by telegram_id for O(1) lookup.
     """
@@ -777,16 +858,57 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
                 log.warning("users.yaml: invalid max_budget for %s: %s; skipping entry", name, e)
                 continue
 
-        # Validate optional model (must be in VALID_MODELS if set)
+        # Validate optional agent_backend (must be valid if set)
+        user_backend: str | None = None
+        raw_backend = entry.get("agent_backend")
+        if raw_backend is not None:
+            backend_str = str(raw_backend).strip().lower()
+            if backend_str not in VALID_BACKENDS:
+                raise SystemExit(
+                    f"users.yaml: user '{name}' has invalid agent_backend '{backend_str}' "
+                    f"(must be one of: {', '.join(sorted(VALID_BACKENDS))})"
+                )
+            user_backend = backend_str
+
+        # Validate optional goose_provider (must be valid if set)
+        user_provider: str | None = None
+        raw_provider = entry.get("goose_provider")
+        if raw_provider is not None:
+            provider_str = str(raw_provider).strip().lower()
+            if provider_str not in VALID_GOOSE_PROVIDERS:
+                raise SystemExit(
+                    f"users.yaml: user '{name}' has invalid goose_provider '{provider_str}' "
+                    f"(must be one of: {', '.join(sorted(VALID_GOOSE_PROVIDERS))})"
+                )
+            user_provider = provider_str
+
+        # If user has goose backend but no provider can be resolved
+        # (neither user-level nor global), that's a fatal config error.
+        eff_backend = user_backend or global_backend
+        if eff_backend == "goose":
+            eff_provider_str = user_provider or global_provider
+            if not eff_provider_str:
+                raise SystemExit(
+                    f"users.yaml: user '{name}' has agent_backend='goose' but no "
+                    f"goose_provider is configured (set it in users.yaml or as "
+                    f"GOOSE_PROVIDER env var)"
+                )
+
+        # Validate optional model against the user's effective provider.
+        # Cascade: user override -> global config, same as pool.py.
         model = entry.get("model")
         if model is not None:
             model = str(model).strip().lower()
-            if model not in VALID_MODELS:
+            eff_provider_name = user_provider or global_provider
+            eff_provider = get_effective_provider(eff_backend, eff_provider_name)
+            if not validate_model_for_provider(model, eff_provider):
+                valid = sorted(PROVIDER_MODELS.get(eff_provider, {}).keys())
                 log.warning(
-                    "users.yaml: invalid model '%s' for %s (must be one of %s); ignoring",
+                    "users.yaml: invalid model '%s' for %s (provider '%s', must be one of %s); ignoring",
                     model,
                     name,
-                    sorted(VALID_MODELS),
+                    eff_provider,
+                    valid,
                 )
                 model = None
 
@@ -915,6 +1037,8 @@ def _load_user_configs() -> dict[int, UserConfig] | None:
             timeout=user_timeout,
             context_window=user_context_window,
             workspace_base=user_workspace_base,
+            agent_backend=user_backend,
+            goose_provider=user_provider,
             github_repos=github_repos,
             github_notify_chat_id=github_notify_chat_id,
             pr_review=pr_review,
@@ -1153,7 +1277,7 @@ def load_config() -> Config:
     # Per-user configuration. If users.yaml exists, it is authoritative;
     # ALLOWED_USER_IDS is ignored. If users.yaml does not exist,
     # ALLOWED_USER_IDS works as before (backward-compatible).
-    user_configs = _load_user_configs()
+    user_configs = _load_user_configs(agent_backend, goose_provider)
     if user_configs is not None:
         if raw_ids:
             log.warning("ALLOWED_USER_IDS is set but users.yaml exists; using users.yaml")
@@ -1185,7 +1309,7 @@ def load_config() -> Config:
     # vars are actively needed (not deprecated in that context).
     if user_configs is not None:
         _deprecated_env_vars = {
-            "CLAUDE_MODEL": "Set per-user 'model' in users.yaml or use /settings model",
+            "CLAUDE_MODEL": "Renamed to DEFAULT_MODEL. Set per-user 'model' in users.yaml or use /settings model",
             "CLAUDE_MAX_BUDGET_USD": "Set per-user 'max_budget' in users.yaml or use /settings budget",
             "CLAUDE_TIMEOUT_SECONDS": "Set per-user 'timeout' in users.yaml or use /settings timeout",
             "CLAUDE_MAX_CONTEXT_WINDOW": "Set per-user 'context_window' in users.yaml or use /settings context",
@@ -1231,13 +1355,25 @@ def load_config() -> Config:
                     ", ".join(features),
                 )
 
-    # Validate CLAUDE_MODEL against the same VALID_MODELS set used
-    # for workspace config. Catches typos at startup instead of
-    # letting them propagate to a confusing runtime failure.
-    claude_model = os.environ.get("CLAUDE_MODEL", "sonnet")
-    if claude_model not in VALID_MODELS:
+    # Read DEFAULT_MODEL, falling back to CLAUDE_MODEL for backward
+    # compat with existing /etc/kai/env files that haven't been
+    # regenerated via make config.
+    default_model = os.environ.get(
+        "DEFAULT_MODEL",
+        os.environ.get("CLAUDE_MODEL", "sonnet"),
+    )
+    if os.environ.get("CLAUDE_MODEL") and not os.environ.get("DEFAULT_MODEL"):
+        log.warning("CLAUDE_MODEL is deprecated, use DEFAULT_MODEL instead")
+
+    # Validate DEFAULT_MODEL against the effective global provider.
+    # Catches typos at startup instead of letting them propagate to
+    # a confusing runtime failure.
+    global_provider = get_effective_provider(agent_backend, goose_provider)
+    if not validate_model_for_provider(default_model, global_provider):
+        valid = sorted(PROVIDER_MODELS.get(global_provider, {}).keys())
         raise SystemExit(
-            f"CLAUDE_MODEL '{claude_model}' is not valid (must be one of: {', '.join(sorted(VALID_MODELS))})"
+            f"DEFAULT_MODEL '{default_model}' is not valid for provider "
+            f"'{global_provider}' (must be one of: {', '.join(valid)})"
         )
 
     return Config(
@@ -1245,7 +1381,7 @@ def load_config() -> Config:
         telegram_webhook_url=telegram_webhook_url,
         telegram_webhook_secret=telegram_webhook_secret,
         allowed_user_ids=allowed_ids,
-        claude_model=claude_model,
+        default_model=default_model,
         claude_timeout_seconds=claude_timeout_seconds,
         claude_max_budget_usd=claude_max_budget_usd,
         claude_max_session_hours=claude_max_session_hours,

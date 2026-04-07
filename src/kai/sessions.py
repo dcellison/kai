@@ -711,7 +711,7 @@ async def resolve_user_defaults(
     db_model = raw_db_model.strip() if raw_db_model is not None else None
     raw_yaml_model = user_config.model if user_config else None
     yaml_model = raw_yaml_model.strip() if raw_yaml_model is not None else None
-    model = db_model if db_model else yaml_model if yaml_model else config.claude_model
+    model = db_model if db_model else yaml_model if yaml_model else config.default_model
 
     # Budget: DB > users.yaml max_budget (as default, not ceiling) > env.
     # max_budget in users.yaml serves double duty - it's both the admin

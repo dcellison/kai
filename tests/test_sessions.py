@@ -539,7 +539,7 @@ class TestResolveUserDefaults:
         defaults = {
             "telegram_bot_token": "test",
             "allowed_user_ids": {111},
-            "claude_model": "sonnet",
+            "default_model": "sonnet",
             "claude_max_budget_usd": 10.0,
             "claude_timeout_seconds": 120,
             "claude_max_context_window": 0,

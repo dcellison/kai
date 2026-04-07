@@ -268,7 +268,7 @@ class TestGenerateUsersYaml:
         assert entry["home_workspace"] == "/opt/kai/home"
 
     def test_roundtrip_with_loader(self, tmp_path, monkeypatch):
-        """Generated YAML can be parsed by _load_user_configs()."""
+        """Generated YAML can be parsed by _load_user_configs("claude", "")."""
         from kai.config import _load_user_configs
 
         content = _generate_users_yaml("123456789", "alice", os_user="kai")
@@ -277,7 +277,7 @@ class TestGenerateUsersYaml:
         monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
         # Skip the protected /etc/kai/ path so we read the tmp_path copy.
         monkeypatch.setattr("kai.config._read_protected_yaml", lambda _: None)
-        configs = _load_user_configs()
+        configs = _load_user_configs("claude", "")
         assert configs is not None
         assert 123456789 in configs
         assert configs[123456789].name == "alice"

@@ -93,6 +93,7 @@ class GooseBackend(AgentBackend):
         self.timeout_seconds = timeout_seconds
         self.workspace_config = workspace_config
         self.max_context_window = max_context_window
+        self.provider = goose_provider  # ABC-mandated; bot.py reads this
         self.goose_provider = goose_provider
 
         # API context for session injection (passed to build_session_context)

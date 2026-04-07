@@ -55,7 +55,17 @@ from telegram.ext import (
 )
 
 from kai import github_api, services, sessions, webhook
-from kai.config import DATA_DIR, MAX_CONTEXT_CEILING, VALID_MODELS, Config, WorkspaceConfig
+from kai.config import (
+    DATA_DIR,
+    MAX_CONTEXT_CEILING,
+    OPEN_ENDED_PROVIDERS,
+    PROVIDER_DEFAULTS,
+    PROVIDER_MODELS,
+    Config,
+    WorkspaceConfig,
+    get_effective_provider,
+    validate_model_for_provider,
+)
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
 from kai.pool import SubprocessPool
@@ -345,20 +355,23 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ── Model selection ──────────────────────────────────────────────────
 
-# Available Claude models with display names (emoji prefix for visual distinction)
-# Keys must match VALID_MODELS in config.py (the single source of truth
-# for valid model identifiers). Values are display names for Telegram.
-_AVAILABLE_MODELS = {
-    "opus": "\U0001f9e0 Claude Opus",
-    "sonnet": "\u26a1 Claude Sonnet",
-    "haiku": "\U0001fab6 Claude Haiku",
-}
+
+def _get_user_models(pool: SubprocessPool, chat_id: int) -> dict[str, str] | None:
+    """Get the curated model dict for a user's provider, or None if open-ended.
+
+    Returns the PROVIDER_MODELS entry for the user's effective provider.
+    None means the provider accepts arbitrary model IDs (no keyboard).
+    """
+    instance = pool.get(chat_id)
+    if instance.provider in OPEN_ENDED_PROVIDERS:
+        return None
+    return PROVIDER_MODELS.get(instance.provider)
 
 
-def _models_keyboard(current: str) -> InlineKeyboardMarkup:
+def _models_keyboard(current: str, models: dict[str, str]) -> InlineKeyboardMarkup:
     """Build an inline keyboard with model choices, highlighting the current model."""
     buttons = []
-    for key, name in _AVAILABLE_MODELS.items():
+    for key, name in models.items():
         label = f"{name} \U0001f7e2" if key == current else name
         buttons.append([InlineKeyboardButton(label, callback_data=f"model:{key}")])
     return InlineKeyboardMarkup(buttons)
@@ -366,12 +379,23 @@ def _models_keyboard(current: str) -> InlineKeyboardMarkup:
 
 @_require_auth
 async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /models — show an inline keyboard for model selection."""
+    """Handle /models - show model selection UI appropriate for the user's provider."""
     assert update.message is not None
     pool = _get_pool(context)
+    chat_id = _chat_id(update)
+    models = _get_user_models(pool, chat_id)
+
+    if models is None:
+        # Open-ended provider - no keyboard, show current model
+        current = pool.get_model(chat_id)
+        await update.message.reply_text(
+            f"Current model: {current}\nUse /model <id> to switch to any model your provider supports."
+        )
+        return
+
     await update.message.reply_text(
         "Choose a model:",
-        reply_markup=_models_keyboard(pool.get_model(_chat_id(update))),
+        reply_markup=_models_keyboard(pool.get_model(chat_id), models),
     )
 
 
@@ -396,8 +420,9 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
     """
     Handle inline keyboard model selection.
 
-    Validates authorization and the selected model, switches if different
-    from current, and updates the keyboard message with confirmation text.
+    Validates authorization and the selected model against the user's
+    provider, switches if different from current, and updates the
+    keyboard message with confirmation text.
     """
     assert update.callback_query is not None
     query = update.callback_query
@@ -408,37 +433,57 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     assert query.data is not None
     model = query.data.removeprefix("model:")
-    if model not in _AVAILABLE_MODELS:
+    pool = _get_pool(context)
+    chat_id = _chat_id(update)
+
+    # Validate against the user's provider model list
+    if not validate_model_for_provider(model, pool.get(chat_id).provider):
         await query.answer("Invalid model.")
         return
 
-    pool = _get_pool(context)
-    if model == pool.get_model(_chat_id(update)):
+    if model == pool.get_model(chat_id):
         await query.answer()
         await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
         return
 
     await query.answer()
-    await _switch_model(context, _chat_id(update), model)
+    await _switch_model(context, chat_id, model)
+    models = _get_user_models(pool, chat_id)
+    display = models.get(model, model) if models else model
     await query.edit_message_text(
-        f"Switched to {_AVAILABLE_MODELS[model]}. Session restarted.",
+        f"Switched to {display}. Session restarted.",
         reply_markup=InlineKeyboardMarkup([]),
     )
 
 
 @_require_auth
 async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /model <name> — switch model directly via text command."""
+    """Handle /model <name> - switch model directly via text command."""
     assert update.message is not None
+    pool = _get_pool(context)
+    chat_id = _chat_id(update)
+
     if not context.args:
-        await update.message.reply_text("Usage: /model <opus|sonnet|haiku>")
+        models = _get_user_models(pool, chat_id)
+        if models:
+            opts = " | ".join(sorted(models.keys()))
+            await update.message.reply_text(f"Usage: /model <{opts}>")
+        else:
+            await update.message.reply_text("Usage: /model <model_id>")
         return
+
     model = context.args[0].lower()
-    if model not in _AVAILABLE_MODELS:
-        await update.message.reply_text("Choose: opus, sonnet, or haiku")
+    instance = pool.get(chat_id)
+
+    if not validate_model_for_provider(model, instance.provider):
+        valid = sorted(PROVIDER_MODELS.get(instance.provider, {}).keys())
+        await update.message.reply_text(f"Choose: {', '.join(valid)}")
         return
-    await _switch_model(context, _chat_id(update), model)
-    await update.message.reply_text(f"Model set to {_AVAILABLE_MODELS[model]}. Session restarted.")
+
+    await _switch_model(context, chat_id, model)
+    models = _get_user_models(pool, chat_id)
+    display = models.get(model, model) if models else model
+    await update.message.reply_text(f"Model set to {display}. Session restarted.")
 
 
 # ── Per-user settings ──────────────────────────────────────────────
@@ -468,7 +513,7 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # /settings - show current
     if field is None:
-        await _show_settings(update, chat_id, config)
+        await _show_settings(update, context, chat_id, config)
         return
 
     # /settings reset [field]
@@ -478,18 +523,29 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # /settings model <name>
     if field == "model":
+        pool = _get_pool(context)
         if not value:
-            await update.message.reply_text("Usage: /settings model <haiku|sonnet|opus>")
+            user_models = _get_user_models(pool, chat_id)
+            if user_models:
+                opts = " | ".join(sorted(user_models.keys()))
+                await update.message.reply_text(f"Usage: /settings model <{opts}>")
+            else:
+                await update.message.reply_text("Usage: /settings model <model_id>")
             return
-        if value.lower() not in VALID_MODELS:
-            await update.message.reply_text(f"Unknown model. Choose from: {', '.join(sorted(VALID_MODELS))}")
+
+        model_key = value.lower()
+        instance = pool.get(chat_id)
+        if not validate_model_for_provider(model_key, instance.provider):
+            valid = sorted(PROVIDER_MODELS.get(instance.provider, {}).keys())
+            await update.message.reply_text(f"Unknown model. Choose from: {', '.join(valid)}")
             return
+
         # Funnel through _switch_model() - same path as /model and /models
         # keyboard. _switch_model() handles DB write, instance update,
         # process restart, and session clear.
-        model_key = value.lower()
         await _switch_model(context, chat_id, model_key)
-        display = _AVAILABLE_MODELS.get(model_key, model_key)
+        user_models = _get_user_models(pool, chat_id)
+        display = user_models.get(model_key, model_key) if user_models else model_key
         await update.message.reply_text(f"Default model set to {display}. Session restarted.")
         return
 
@@ -591,7 +647,7 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(f"Unknown setting: {field}\nSettings: model, budget, timeout, context, reset")
 
 
-async def _show_settings(update: Update, chat_id: int, config: Config) -> None:
+async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, config: Config) -> None:
     """Display the user's effective settings with source attribution."""
     assert update.message is not None
     db_settings = await sessions.get_user_settings(chat_id)
@@ -612,7 +668,7 @@ async def _show_settings(update: Update, chat_id: int, config: Config) -> None:
 
     # Model
     yaml_model = user_config.model if user_config else None
-    model, model_src = _resolve("model", yaml_model, config.claude_model, str)
+    model, model_src = _resolve("model", yaml_model, config.default_model, str)
 
     # Budget - 0 means "unlimited" (consistent with the ceiling check
     # in the budget handler, where 0 = no ceiling).
@@ -667,9 +723,15 @@ async def _show_settings(update: Update, chat_id: int, config: Config) -> None:
     )
     ceiling_line = f"\n\nBudget ceiling: ${ceiling:.2f} (admin)" if ceiling else ""
 
+    # Provider info - always show so users know their configuration
+    pool = _get_pool(context)
+    instance = pool.get_if_exists(chat_id)
+    provider_line = f"\n  Provider: {instance.provider}" if instance else ""
+
     await update.message.reply_text(
         f"Your settings:\n"
-        f"  Model: {model} ({model_src})\n"
+        f"  Model: {model} ({model_src})"
+        f"{provider_line}\n"
         f"  Budget: {budget} ({budget_src})\n"
         f"  Timeout: {timeout} ({timeout_src})\n"
         f"  Context: {ctx_label} ({ctx_src})"
@@ -691,7 +753,18 @@ def _revert_instance_field(pool: SubprocessPool, chat_id: int, field: str, confi
         return
     user = config.get_user_config(chat_id)
     if field == "model":
-        instance.model = user.model if user and user.model else config.claude_model
+        if user and user.model:
+            instance.model = user.model
+        else:
+            # Fall back to provider default, not necessarily config.default_model.
+            # If the user's provider differs from the global provider, the
+            # global default_model may be invalid for their provider.
+            provider = instance.provider
+            effective_global = get_effective_provider(config.agent_backend, config.goose_provider)
+            if provider == effective_global:
+                instance.model = config.default_model
+            else:
+                instance.model = PROVIDER_DEFAULTS.get(provider, config.default_model)
     elif field == "budget":
         instance.max_budget_usd = (
             user.max_budget if user and user.max_budget is not None else config.claude_max_budget_usd
@@ -1231,11 +1304,19 @@ async def _handle_workspace_config(
 
     # /workspace config model <name>
     if field == "model":
+        pool = _get_pool(context)
+        instance = pool.get(chat_id)
         if not value:
-            await update.message.reply_text("Usage: /workspace config model <haiku|sonnet|opus>")
+            user_models = _get_user_models(pool, chat_id)
+            if user_models:
+                opts = " | ".join(sorted(user_models.keys()))
+                await update.message.reply_text(f"Usage: /workspace config model <{opts}>")
+            else:
+                await update.message.reply_text("Usage: /workspace config model <model_id>")
             return
-        if value.lower() not in VALID_MODELS:
-            await update.message.reply_text(f"Unknown model. Choose from: {', '.join(sorted(VALID_MODELS))}")
+        if not validate_model_for_provider(value.lower(), instance.provider):
+            valid = sorted(PROVIDER_MODELS.get(instance.provider, {}).keys())
+            await update.message.reply_text(f"Unknown model. Choose from: {', '.join(valid)}")
             return
         await sessions.set_workspace_config_setting(chat_id, workspace_str, "model", value.lower())
         await _apply_config_change(context, chat_id, workspace, config)
@@ -1328,7 +1409,7 @@ async def _show_workspace_config(
         return "global default"
 
     # Model
-    model = db_settings.get("model") or (yaml_config.model if yaml_config else None) or config.claude_model
+    model = db_settings.get("model") or (yaml_config.model if yaml_config else None) or config.default_model
     lines.append(f"  Model: {model} ({_source('model')})")
 
     # Budget

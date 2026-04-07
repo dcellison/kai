@@ -22,7 +22,13 @@ from pathlib import Path
 from kai import sessions
 from kai.backend import AgentBackend, StreamEvent
 from kai.claude import ClaudeCodeBackend
-from kai.config import Config, WorkspaceConfig
+from kai.config import (
+    PROVIDER_DEFAULTS,
+    Config,
+    WorkspaceConfig,
+    get_effective_provider,
+    validate_model_for_provider,
+)
 from kai.goose import GooseBackend
 from kai.workspace_utils import is_workspace_allowed
 
@@ -87,13 +93,13 @@ class SubprocessPool:
         """
         Create an AgentBackend for a specific user.
 
-        Backend selection: config.agent_backend determines whether to
-        construct a ClaudeCodeBackend or GooseBackend. Both share the
-        same ABC interface; pool.py is backend-agnostic after this point.
+        Backend selection: per-user agent_backend (from users.yaml)
+        overrides the global config.agent_backend. Both share the same
+        ABC interface; pool.py is backend-agnostic after this point.
 
         Resolution order for each setting:
         1. UserConfig from users.yaml (os_user, home_workspace, model,
-           budget, timeout, context_window)
+           budget, timeout, context_window, agent_backend, goose_provider)
         2. Global config defaults (from .env)
 
         Per-user DB overrides (set via /settings or /model) are applied
@@ -108,10 +114,22 @@ class SubprocessPool:
 
         ws_config = self._config.get_workspace_config(workspace)
 
-        # Per-user baseline from users.yaml, falling back to global config.
-        # These are the values the process starts with. DB overrides (from
-        # /settings or /model) are applied in _restore_workspace().
-        model = user.model if user and user.model else self._config.claude_model
+        # Per-user backend and provider, falling back to global config.
+        backend = user.agent_backend if user and user.agent_backend else self._config.agent_backend
+        provider = user.goose_provider if user and user.goose_provider else self._config.goose_provider
+
+        # Per-user model. When the user's effective provider differs from
+        # the global provider, the global default_model may not be valid.
+        # Fall back to the provider's default model instead.
+        effective_provider = get_effective_provider(backend, provider)
+        global_provider = get_effective_provider(self._config.agent_backend, self._config.goose_provider)
+        if user and user.model:
+            model = user.model
+        elif effective_provider == global_provider:
+            model = self._config.default_model
+        else:
+            model = PROVIDER_DEFAULTS.get(effective_provider, self._config.default_model)
+
         budget = user.max_budget if user and user.max_budget is not None else self._config.claude_max_budget_usd
         timeout = user.timeout if user and user.timeout is not None else self._config.claude_timeout_seconds
         context_window = (
@@ -121,7 +139,7 @@ class SubprocessPool:
 
         # Backend selection: "goose" uses Goose ACP, anything else
         # (including the default "claude") uses Claude Code CLI.
-        if self._config.agent_backend == "goose":
+        if backend == "goose":
             return GooseBackend(
                 model=model,
                 workspace=workspace,
@@ -133,7 +151,7 @@ class SubprocessPool:
                 services_info=self._services_info,
                 workspace_config=ws_config,
                 max_context_window=context_window,
-                goose_provider=self._config.goose_provider,
+                goose_provider=provider,
             )
 
         # os_user for sudo -u isolation. None = run as bot user.
@@ -227,11 +245,22 @@ class SubprocessPool:
             # because the value is baked into the CLI command at startup)
             needs_restart = False
 
-            # Model: only apply if workspace config didn't set one
+            # Model: only apply if workspace config didn't set one.
+            # Validate against the instance's provider - a provider change
+            # (in users.yaml) can invalidate a stored model.
             ws_model = instance.workspace_config.model if instance.workspace_config else None
             if not ws_model and "model" in db_settings and db_settings["model"] != instance.model:
-                instance.model = db_settings["model"]
-                needs_restart = True
+                stored_model = db_settings["model"]
+                if validate_model_for_provider(stored_model, instance.provider):
+                    instance.model = stored_model
+                    needs_restart = True
+                else:
+                    log.warning(
+                        "Ignoring stored model '%s' for user %d (invalid for provider '%s')",
+                        stored_model,
+                        chat_id,
+                        instance.provider,
+                    )
 
             # Budget: workspace config budget overrides user default
             ws_budget = instance.workspace_config.budget if instance.workspace_config else None
@@ -342,7 +371,7 @@ class SubprocessPool:
     def get_model(self, chat_id: int) -> str:
         """Get the active model for a user (or global default if no instance)."""
         instance = self.get_if_exists(chat_id)
-        return instance.model if instance else self._config.claude_model
+        return instance.model if instance else self._config.default_model
 
     def set_model(self, chat_id: int, model: str) -> None:
         """Set the model for a user's subprocess."""

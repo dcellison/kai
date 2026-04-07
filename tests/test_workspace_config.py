@@ -331,8 +331,8 @@ class TestLoadWorkspaceConfigs:
         assert len(configs) == 1
         assert configs[ws.resolve()].model == "opus"
 
-    def test_invalid_model(self, tmp_path):
-        """Invalid model name causes the entry to be skipped."""
+    def test_unrecognized_model_warns_but_keeps(self, tmp_path, caplog):
+        """Unrecognized model name warns but keeps the entry (may be open-ended provider)."""
         ws = tmp_path / "ws"
         ws.mkdir()
         self._write_yaml(
@@ -341,7 +341,7 @@ class TestLoadWorkspaceConfigs:
             workspaces:
               - path: {ws}
                 claude:
-                  model: gpt-4
+                  model: some-custom-model
             """,
         )
         with (
@@ -349,7 +349,9 @@ class TestLoadWorkspaceConfigs:
             patch("kai.config.PROJECT_ROOT", tmp_path),
         ):
             configs = _load_workspace_configs()
-        assert configs == {}
+        assert len(configs) == 1
+        assert configs[ws.resolve()].model == "some-custom-model"
+        assert "unrecognized model" in caplog.text
 
     def test_bool_budget_rejected(self, tmp_path):
         """Boolean budget (e.g. true) is rejected, not silently cast to $1.00."""

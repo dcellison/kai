@@ -17,6 +17,7 @@ _CONFIG_ENV_VARS = [
     "TELEGRAM_WEBHOOK_URL",
     "TELEGRAM_WEBHOOK_SECRET",
     "ALLOWED_USER_IDS",
+    "DEFAULT_MODEL",
     "CLAUDE_MODEL",
     "CLAUDE_TIMEOUT_SECONDS",
     "CLAUDE_MAX_BUDGET_USD",
@@ -82,7 +83,7 @@ class TestLoadConfigDefaults:
     def test_defaults(self, monkeypatch):
         _set_required(monkeypatch)
         config = load_config()
-        assert config.claude_model == "sonnet"
+        assert config.default_model == "sonnet"
         assert config.claude_timeout_seconds == 120
         assert config.claude_max_budget_usd == 10.0
         assert config.claude_max_session_hours == 0
@@ -175,11 +176,11 @@ class TestLoadConfigErrors:
         with pytest.raises(SystemExit, match="CLAUDE_AUTOCOMPACT_PCT"):
             load_config()
 
-    def test_invalid_claude_model(self, monkeypatch):
-        """CLAUDE_MODEL with an unrecognized value raises SystemExit."""
+    def test_invalid_default_model(self, monkeypatch):
+        """DEFAULT_MODEL with an unrecognized value raises SystemExit."""
         _set_required(monkeypatch)
-        monkeypatch.setenv("CLAUDE_MODEL", "sonet")
-        with pytest.raises(SystemExit, match="CLAUDE_MODEL"):
+        monkeypatch.setenv("DEFAULT_MODEL", "sonet")
+        with pytest.raises(SystemExit, match="DEFAULT_MODEL"):
             load_config()
 
     def test_invalid_agent_backend(self, monkeypatch):
@@ -222,6 +223,8 @@ class TestLoadConfigErrors:
         _set_required(monkeypatch)
         monkeypatch.setenv("AGENT_BACKEND", "goose")
         monkeypatch.setenv("GOOSE_PROVIDER", "openai")
+        # DEFAULT_MODEL must be valid for the openai provider
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4")
         cfg = load_config()
         assert cfg.goose_provider == "openai"
 
@@ -230,11 +233,17 @@ class TestLoadConfigErrors:
 
 
 class TestLoadConfigOptional:
-    def test_claude_model_from_env(self, monkeypatch):
-        """CLAUDE_MODEL is read from environment when set."""
+    def test_default_model_from_env(self, monkeypatch):
+        """DEFAULT_MODEL is read from environment when set."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("DEFAULT_MODEL", "opus")
+        assert load_config().default_model == "opus"
+
+    def test_claude_model_backward_compat(self, monkeypatch):
+        """Old CLAUDE_MODEL env var is still read when DEFAULT_MODEL is absent."""
         _set_required(monkeypatch)
         monkeypatch.setenv("CLAUDE_MODEL", "opus")
-        assert load_config().claude_model == "opus"
+        assert load_config().default_model == "opus"
 
     def test_voice_enabled_true(self, monkeypatch):
         _set_required(monkeypatch)
@@ -705,7 +714,7 @@ def _mock_user_configs(monkeypatch):
     user = UserConfig(telegram_id=123, name="testuser")
     monkeypatch.setattr(
         "kai.config._load_user_configs",
-        lambda: {123: user},
+        lambda *_a: {123: user},
     )
 
 
@@ -739,9 +748,14 @@ class TestDeprecationWarnings:
         assert f"{var} in env is deprecated" in caplog.text
 
     def test_no_warning_without_users_yaml(self, monkeypatch, caplog):
-        """Deprecated env vars do NOT warn when users.yaml is absent."""
+        """Per-user deprecated env vars do NOT warn when users.yaml is absent.
+
+        Note: CLAUDE_MODEL still emits a standalone rename warning (it was
+        renamed to DEFAULT_MODEL) regardless of users.yaml. This test uses
+        a non-CLAUDE_MODEL var to verify the users.yaml-gated warnings.
+        """
         _set_required(monkeypatch)
-        monkeypatch.setenv("CLAUDE_MODEL", "opus")
+        monkeypatch.setenv("CLAUDE_USER", "somebody")
         # _load_user_configs returns None (no users.yaml) by default
         # because _clean_env patches _read_protected_file to None
         with caplog.at_level(logging.WARNING, logger="kai.config"):
@@ -801,7 +815,7 @@ class TestGitHubReposWarning:
         """Per-user pr_review=True (no global env var) + no repos = warning."""
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
         user = UserConfig(telegram_id=123, name="testuser", pr_review=True)
-        monkeypatch.setattr("kai.config._load_user_configs", lambda: {123: user})
+        monkeypatch.setattr("kai.config._load_user_configs", lambda *_a: {123: user})
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             load_config()
         assert "PR review" in caplog.text
@@ -812,7 +826,7 @@ class TestGitHubReposWarning:
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
         monkeypatch.setenv("PR_REVIEW_ENABLED", "true")
         user = UserConfig(telegram_id=123, name="testuser", github_repos=["owner/repo"])
-        monkeypatch.setattr("kai.config._load_user_configs", lambda: {123: user})
+        monkeypatch.setattr("kai.config._load_user_configs", lambda *_a: {123: user})
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             load_config()
         # The github_repos warning should not fire; filter out deprecation
@@ -856,7 +870,7 @@ class TestGitHubReposWarning:
         monkeypatch.setenv("PR_REVIEW_ENABLED", "true")
         user_a = UserConfig(telegram_id=123, name="alice", github_repos=["owner/repo"])
         user_b = UserConfig(telegram_id=456, name="bob")
-        monkeypatch.setattr("kai.config._load_user_configs", lambda: {123: user_a, 456: user_b})
+        monkeypatch.setattr("kai.config._load_user_configs", lambda *_a: {123: user_a, 456: user_b})
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             load_config()
         repo_warnings = [
@@ -892,7 +906,7 @@ class TestMinimalEnvWithUsersYaml:
         _mock_user_configs(monkeypatch)
         config = load_config()
         # Uses dataclass defaults when no env var is set
-        assert config.claude_model == "sonnet"
+        assert config.default_model == "sonnet"
         assert config.claude_timeout_seconds == 120
         assert config.claude_max_budget_usd == 10.0
         assert config.claude_max_context_window == 0
@@ -907,17 +921,17 @@ class TestMinimalEnvWithUsersYaml:
         assert config.user_configs is not None
 
     def test_per_user_model_without_env(self, monkeypatch):
-        """Per-user model from users.yaml works when CLAUDE_MODEL is unset."""
+        """Per-user model from users.yaml works when DEFAULT_MODEL is unset."""
         for var, val in _MINIMAL_GLOBAL_ENV.items():
             monkeypatch.setenv(var, val)
         user = UserConfig(telegram_id=123, name="testuser", model="opus")
         monkeypatch.setattr(
             "kai.config._load_user_configs",
-            lambda: {123: user},
+            lambda *_a: {123: user},
         )
         config = load_config()
         # Global default is "sonnet" (dataclass default)
-        assert config.claude_model == "sonnet"
+        assert config.default_model == "sonnet"
         # Per-user is "opus" from users.yaml
         assert config.user_configs is not None
         assert config.user_configs[123].model == "opus"
@@ -929,7 +943,7 @@ class TestMinimalEnvWithUsersYaml:
         user = UserConfig(telegram_id=123, name="testuser", max_budget=25.0)
         monkeypatch.setattr(
             "kai.config._load_user_configs",
-            lambda: {123: user},
+            lambda *_a: {123: user},
         )
         config = load_config()
         assert config.claude_max_budget_usd == 10.0  # dataclass default
@@ -943,7 +957,7 @@ class TestMinimalEnvWithUsersYaml:
         user = UserConfig(telegram_id=123, name="testuser", workspace_base=tmp_path)
         monkeypatch.setattr(
             "kai.config._load_user_configs",
-            lambda: {123: user},
+            lambda *_a: {123: user},
         )
         config = load_config()
         assert config.workspace_base is None  # global is unset
@@ -964,7 +978,7 @@ class TestMinimalEnvWithUsersYaml:
         )
         monkeypatch.setattr(
             "kai.config._load_user_configs",
-            lambda: {123: user},
+            lambda *_a: {123: user},
         )
         config = load_config()
         # Global env fallbacks are all at their defaults
@@ -1003,7 +1017,7 @@ class TestResolutionWithoutEnvVars:
         # SubprocessPool._create_instance, which requires mocking the Claude
         # binary and process spawning. Tests the precedence contract, not
         # the pool integration.
-        resolved = user.model if user.model else config.claude_model
+        resolved = user.model if user.model else config.default_model
         assert resolved == "opus"
 
     @pytest.mark.asyncio
@@ -1080,15 +1094,15 @@ class TestLegacyEnvOnlyMode:
         monkeypatch.setenv("CLAUDE_MAX_BUDGET_USD", "25.0")
         monkeypatch.setenv("CLAUDE_TIMEOUT_SECONDS", "300")
         config = load_config()
-        assert config.claude_model == "opus"
+        assert config.default_model == "opus"
         assert config.claude_max_budget_usd == 25.0
         assert config.claude_timeout_seconds == 300
         assert config.user_configs is None
 
     def test_no_deprecation_warnings(self, monkeypatch, caplog):
-        """No deprecation warnings when users.yaml is absent."""
+        """No users.yaml deprecation warnings when users.yaml is absent."""
         _set_required(monkeypatch)
-        monkeypatch.setenv("CLAUDE_MODEL", "opus")
+        monkeypatch.setenv("DEFAULT_MODEL", "opus")
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             load_config()
         assert "deprecated" not in caplog.text.lower()

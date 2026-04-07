@@ -41,10 +41,12 @@ import yaml
 from kai.config import (
     GOOSE_PROVIDER_KEY_VARS,
     MAX_CONTEXT_CEILING,
+    OPEN_ENDED_PROVIDERS,
     PROJECT_ROOT,
+    PROVIDER_DEFAULTS,
+    PROVIDER_MODELS,
     VALID_BACKENDS,
     VALID_GOOSE_PROVIDERS,
-    VALID_MODELS,
 )
 
 # Config file written by `config`, read by `apply`.
@@ -450,21 +452,40 @@ def _cmd_config() -> None:
     # When users.yaml exists, model/timeout/budget/context are per-user
     # settings managed via /settings commands or users.yaml fields.
     # Only prompt for truly global Claude settings (autocompact).
+    # Determine the effective provider for model choices. Claude
+    # backend always uses Anthropic; Goose uses the selected provider.
+    eff_provider = "anthropic" if agent_backend == "claude" else goose_provider
+
     if users_yaml_exists:
         print("-- Claude --")
         print("  Model, timeout, budget, and context window are now per-user.")
         print("  Set defaults in users.yaml or let users configure via /settings.")
-        model = existing_env.get("CLAUDE_MODEL", "")
+        # Read DEFAULT_MODEL, falling back to CLAUDE_MODEL for backward compat
+        model = existing_env.get("DEFAULT_MODEL", existing_env.get("CLAUDE_MODEL", ""))
         timeout = existing_env.get("CLAUDE_TIMEOUT_SECONDS", "")
         budget = existing_env.get("CLAUDE_MAX_BUDGET_USD", "")
         max_context_window = existing_env.get("CLAUDE_MAX_CONTEXT_WINDOW", "")
     else:
         print("-- Claude --")
-        model = _prompt_choice(
-            "Claude model",
-            sorted(VALID_MODELS),
-            existing_env.get("CLAUDE_MODEL", "sonnet"),
+        # Show provider-aware model choices
+        provider_models = PROVIDER_MODELS.get(eff_provider)
+        default_model_val = existing_env.get(
+            "DEFAULT_MODEL",
+            existing_env.get("CLAUDE_MODEL", PROVIDER_DEFAULTS.get(eff_provider, "")),
         )
+        if provider_models and eff_provider not in OPEN_ENDED_PROVIDERS:
+            model = _prompt_choice(
+                "Default model",
+                sorted(provider_models.keys()),
+                default_model_val,
+            )
+        else:
+            # Open-ended provider - free-text model ID
+            model = _prompt(
+                "Default model ID",
+                default_model_val,
+                required=True,
+            )
 
         while True:
             timeout = _prompt(
@@ -681,7 +702,7 @@ def _cmd_config() -> None:
     # Deprecated per-user vars: only include without users.yaml
     # (legacy single-user mode). With users.yaml, these are noise.
     if not users_yaml_exists:
-        env["CLAUDE_MODEL"] = model
+        env["DEFAULT_MODEL"] = model
         env["CLAUDE_TIMEOUT_SECONDS"] = timeout
         env["CLAUDE_MAX_BUDGET_USD"] = budget
 

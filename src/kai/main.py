@@ -220,7 +220,7 @@ def main() -> None:
     setup_logging()
 
     config = load_config()
-    logging.info("Kai starting (model=%s, users=%s)", config.claude_model, config.allowed_user_ids)
+    logging.info("Kai starting (model=%s, users=%s)", config.default_model, config.allowed_user_ids)
 
     # Load external service definitions. In a protected installation, services.yaml
     # lives in /etc/kai/ (root-owned). Falls back to PROJECT_ROOT for development.

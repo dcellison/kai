@@ -82,6 +82,7 @@ class ClaudeCodeBackend(AgentBackend):
         self.timeout_seconds = timeout_seconds
         self.workspace_config = workspace_config
         self.max_context_window = max_context_window
+        self.provider = "anthropic"  # Claude CLI always uses Anthropic
 
         # Claude-Code-specific attributes (not on the ABC)
         self.claude_user = claude_user

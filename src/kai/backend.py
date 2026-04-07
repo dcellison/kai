@@ -108,12 +108,11 @@ class AgentBackend(ABC):
     restore, /settings, and /model commands). These are generic to any
     backend:
         model, workspace, home_workspace, max_budget_usd,
-        timeout_seconds, max_context_window, workspace_config
+        timeout_seconds, max_context_window, workspace_config, provider
 
     Backend-specific attributes (NOT on the ABC) stay on the concrete
     class. For ClaudeCodeBackend these include: claude_user,
-    max_session_hours, autocompact_pct. Future backends will have their
-    own (e.g., GooseBackend might have goose_recipe, provider_config).
+    max_session_hours, autocompact_pct. For GooseBackend: goose_provider.
     The pool never touches these directly; they are set at construction
     by _create_instance().
     """
@@ -130,6 +129,7 @@ class AgentBackend(ABC):
     timeout_seconds: int
     max_context_window: int
     workspace_config: WorkspaceConfig | None
+    provider: str
 
     @abstractmethod
     async def send(self, prompt: str | list, chat_id: int | None = None) -> AsyncIterator[StreamEvent]:
