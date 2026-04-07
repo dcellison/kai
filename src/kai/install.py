@@ -1849,8 +1849,9 @@ def _apply_goose_config(
         return
 
     if not src.exists():
-        print(f"  WARNING: Goose config template not found at {src}; skipping")
-        return
+        # A missing template in the install tree is a packaging bug,
+        # not a recoverable runtime condition. Fail hard.
+        raise SystemExit(f"Goose config template not found at {src}")
 
     # Track whether we're creating .config for the first time so we
     # can set ownership on it below. mkdir(parents=True) creates both
