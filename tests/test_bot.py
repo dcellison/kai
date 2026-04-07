@@ -954,11 +954,14 @@ class TestHandleModel:
         with (
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.set_user_setting", new_callable=AsyncMock),
-            patch("kai.bot.sessions.delete_workspace_config_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.delete_workspace_config_setting", new_callable=AsyncMock) as mock_delete,
         ):
             await handle_model(update, ctx)
         pool.set_model.assert_called_once_with(ANY, "opus")
         pool.restart.assert_called_once()
+        # Model switch must clear workspace config override to prevent
+        # the stale entry from shadowing the user setting on restart.
+        mock_delete.assert_called_once_with(ANY, ANY, "model")
 
 
 # ── handle_model_callback ────────────────────────────────────────────
@@ -997,12 +1000,15 @@ class TestHandleModelCallback:
         with (
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.set_user_setting", new_callable=AsyncMock),
-            patch("kai.bot.sessions.delete_workspace_config_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.delete_workspace_config_setting", new_callable=AsyncMock) as mock_delete,
         ):
             await handle_model_callback(update, ctx)
         pool.set_model.assert_called_once_with(ANY, "opus")
         edit_text = update.callback_query.edit_message_text.call_args[0][0]
         assert "Switched" in edit_text
+        # Model switch must clear workspace config override to prevent
+        # the stale entry from shadowing the user setting on restart.
+        mock_delete.assert_called_once_with(ANY, ANY, "model")
 
 
 # ── handle_voice_command ─────────────────────────────────────────────
