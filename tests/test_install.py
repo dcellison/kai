@@ -440,7 +440,7 @@ class TestCmdConfig:
                 "admin",  # admin display name
                 "false",  # advanced user options
                 "polling",  # transport
-                "claude",  # agent backend
+                # agent backend prompt not shown (gated behind existing non-claude value)
                 "sonnet",  # model
                 "120",  # timeout
                 "10.0",  # budget
@@ -502,7 +502,7 @@ class TestCmdConfig:
                 "testuser",  # os_user
                 str(tmp_path),  # home_workspace
                 "polling",  # transport
-                "claude",  # agent backend
+                # agent backend prompt not shown (gated behind existing non-claude value)
                 "sonnet",  # model
                 "120",  # timeout
                 "10.0",  # budget
@@ -540,9 +540,15 @@ class TestCmdConfig:
     def test_goose_backend_writes_env(self, tmp_path, monkeypatch):
         """Selecting goose backend writes AGENT_BACKEND to env."""
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        conf_path = tmp_path / "install.conf"
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+
+        # Pre-seed existing config with goose backend so the prompt
+        # appears (it is gated behind an existing non-claude value).
+        existing = {"version": 1, "env": {"AGENT_BACKEND": "goose"}}
+        conf_path.write_text(json.dumps(existing))
 
         inputs = iter(
             [
@@ -555,7 +561,7 @@ class TestCmdConfig:
                 "admin",  # admin display name
                 "false",  # advanced user options
                 "polling",  # transport
-                "goose",  # agent backend
+                "goose",  # agent backend (prompt shown because existing config has goose)
                 "sonnet",  # model
                 "120",  # timeout
                 "10.0",  # budget
