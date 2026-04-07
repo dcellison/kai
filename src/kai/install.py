@@ -1661,6 +1661,8 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     # _apply_goose_config() reads the Goose extension config from here.
     # Root-owned since they're installer input, not runtime output.
     if config_src.is_dir():
+        # home/ may already exist from the .claude/ copy above, but
+        # ensure it's there when config/ exists without .claude/.
         config_dst.parent.mkdir(parents=True, exist_ok=True)
         _copy_tree(config_src, config_dst)
         _set_ownership(config_dst, 0, 0, recursive=True)
