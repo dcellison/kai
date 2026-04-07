@@ -210,6 +210,13 @@ class TestLoadConfigErrors:
         cfg = load_config()
         assert cfg.goose_provider == ""
 
+    def test_invalid_goose_provider_ignored_for_claude(self, monkeypatch):
+        """Even an invalid GOOSE_PROVIDER is ignored when backend=claude."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("GOOSE_PROVIDER", "completelywrong")
+        cfg = load_config()
+        assert cfg.goose_provider == ""
+
     def test_valid_goose_provider(self, monkeypatch):
         """Valid GOOSE_PROVIDER is accepted and stored."""
         _set_required(monkeypatch)

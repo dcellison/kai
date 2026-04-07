@@ -344,20 +344,7 @@ class TestHandshake:
 
     @pytest.mark.asyncio
     async def test_model_env_var_set(self):
-        """GOOSE_MODEL env var is set from _ANTHROPIC_MODEL_MAP during startup."""
-        g = _make_goose(model="opus")
-        proc = _make_mock_proc(_handshake_lines())
-
-        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
-            await g._ensure_started()
-
-        # Check the env dict passed to create_subprocess_exec
-        call_kwargs = mock_exec.call_args[1]
-        assert call_kwargs["env"]["GOOSE_MODEL"] == "claude-opus-4-6"
-
-    @pytest.mark.asyncio
-    async def test_model_mapped_for_anthropic(self):
-        """Anthropic provider maps logical names to full model IDs."""
+        """GOOSE_MODEL env var is set during startup."""
         g = _make_goose(model="opus", goose_provider="anthropic")
         proc = _make_mock_proc(_handshake_lines())
 

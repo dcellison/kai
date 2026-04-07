@@ -83,7 +83,7 @@ class GooseBackend(AgentBackend):
         services_info: list[dict] | None = None,
         workspace_config: WorkspaceConfig | None = None,
         max_context_window: int = 0,
-        goose_provider: str = "anthropic",
+        goose_provider: str = "",
     ):
         # ABC-required attributes (pool.py reads/writes these)
         self.model = model
