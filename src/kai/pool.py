@@ -398,6 +398,24 @@ class SubprocessPool:
         instance = self.get_if_exists(chat_id)
         return instance.model if instance else self._config.default_model
 
+    async def get_effective_model(self, chat_id: int) -> str:
+        """Get the effective model, checking persisted settings if no instance exists.
+
+        Unlike get_model() which returns the global default when no
+        subprocess instance exists (e.g., after a service restart before
+        the first message), this method resolves the model from the DB
+        using the same precedence chain as resolve_user_defaults():
+        user settings DB > users.yaml > global default.
+
+        Use this in command handlers that display the current model
+        (like /models) where accuracy matters more than speed.
+        """
+        instance = self.get_if_exists(chat_id)
+        if instance:
+            return instance.model
+        defaults = await sessions.resolve_user_defaults(chat_id, self._config)
+        return defaults["model"]
+
     def set_model(self, chat_id: int, model: str) -> None:
         """Set the model for a user's subprocess."""
         instance = self.get(chat_id)

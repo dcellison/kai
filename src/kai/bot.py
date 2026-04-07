@@ -412,8 +412,11 @@ async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     models = _get_user_models(pool, chat_id, config)
 
     if models is None:
-        # Open-ended provider - no keyboard, show current model
-        current = pool.get_model(chat_id)
+        # Open-ended provider - no keyboard, show current model.
+        # Use get_effective_model() so the displayed model reflects
+        # persisted settings even before the first message (when no
+        # subprocess instance exists yet after a service restart).
+        current = await pool.get_effective_model(chat_id)
         await update.message.reply_text(
             f"Current model: {current}\nUse /model <id> to switch to any model your provider supports."
         )
@@ -421,7 +424,7 @@ async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await update.message.reply_text(
         "Choose a model:",
-        reply_markup=_models_keyboard(pool.get_model(chat_id), models),
+        reply_markup=_models_keyboard(await pool.get_effective_model(chat_id), models),
     )
 
 

@@ -414,6 +414,7 @@ def _make_mock_claude(model="sonnet", workspace=None, is_alive=True, provider="a
     pool = MagicMock()
     ws = workspace or Path("/home/workspace")
     pool.get_model = MagicMock(return_value=model)
+    pool.get_effective_model = AsyncMock(return_value=model)
     pool.set_model = MagicMock()
     pool.get_workspace = MagicMock(return_value=ws)
     pool.is_alive = MagicMock(return_value=is_alive)
