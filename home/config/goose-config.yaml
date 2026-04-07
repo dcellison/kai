@@ -1,0 +1,29 @@
+# Goose extension configuration for Kai.
+#
+# Deployed to ~/.config/goose/config.yaml by `make install` when
+# AGENT_BACKEND=goose. Controls which Goose extensions are loaded
+# in ACP mode (`goose acp`).
+#
+# GOOSE_MODEL is intentionally omitted here - it is set at runtime
+# via environment variable so that model switching (/model command)
+# works without rewriting this file.
+
+extensions:
+  developer:
+    enabled: true
+    type: platform
+    name: developer
+    description: Write and edit files, and execute shell commands
+    display_name: Developer
+    bundled: true
+    available_tools: []
+  todo:
+    enabled: false
+    type: platform
+    name: todo
+    bundled: true
+    available_tools: []
+  # All other extensions: disabled by default. Add entries here
+  # if you need additional Goose extensions in ACP mode.
+
+GOOSE_PROVIDER: anthropic

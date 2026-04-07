@@ -43,6 +43,10 @@ DATA_DIR = Path(os.environ.get("KAI_DATA_DIR") or str(PROJECT_ROOT))
 # install.py and bot.py both reference this instead of maintaining their own lists.
 VALID_MODELS = {"haiku", "sonnet", "opus"}
 
+# Valid agent backend choices. "claude" uses Claude Code CLI,
+# "goose" uses Goose ACP. Shared between load_config() and install.py.
+VALID_BACKENDS = {"claude", "goose"}
+
 # Maximum context window size in tokens. Claude's hard ceiling.
 # Shared between load_config() (env var validation) and
 # _load_user_configs() (users.yaml validation).
@@ -303,6 +307,14 @@ class Config:
     totp_challenge_seconds: int = 120
     totp_lockout_attempts: int = 3
     totp_lockout_minutes: int = 15
+
+    # Agent backend selection: "claude" (default) uses Claude Code CLI,
+    # "goose" uses Goose ACP (Agent Client Protocol) as the agent harness.
+    agent_backend: str = "claude"
+    # Anthropic API key for the Goose backend. Goose calls the Anthropic
+    # API directly (not via Claude Code), so it needs its own credential.
+    # Inherited by the subprocess environment; not logged or echoed.
+    anthropic_api_key: str = ""
 
     def get_workspace_config(self, workspace: Path) -> WorkspaceConfig | None:
         """
@@ -1095,6 +1107,17 @@ def load_config() -> Config:
     except ValueError:
         raise SystemExit("TOTP_LOCKOUT_MINUTES must be an integer") from None
 
+    # Agent backend selection - "claude" (default) or "goose"
+    agent_backend = os.environ.get("AGENT_BACKEND", "claude").strip().lower()
+    if agent_backend not in VALID_BACKENDS:
+        raise SystemExit(
+            f"AGENT_BACKEND '{agent_backend}' is not valid (must be one of: {', '.join(sorted(VALID_BACKENDS))})"
+        )
+
+    # Anthropic API key for the Goose backend. Passthrough string;
+    # do not log this value. Inherited by the Goose subprocess.
+    anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
     # Per-workspace configuration. Loaded after ALLOWED_WORKSPACES so
     # YAML-defined workspaces can be merged into the allowed set.
     workspace_configs = _load_workspace_configs()
@@ -1228,4 +1251,6 @@ def load_config() -> Config:
         totp_challenge_seconds=totp_challenge_seconds,
         totp_lockout_attempts=totp_lockout_attempts,
         totp_lockout_minutes=totp_lockout_minutes,
+        agent_backend=agent_backend,
+        anthropic_api_key=anthropic_api_key,
     )

@@ -440,6 +440,7 @@ class TestCmdConfig:
                 "admin",  # admin display name
                 "false",  # advanced user options
                 "polling",  # transport
+                "claude",  # agent backend
                 "sonnet",  # model
                 "120",  # timeout
                 "10.0",  # budget
@@ -472,6 +473,8 @@ class TestCmdConfig:
         assert conf["env"]["CLAUDE_AUTOCOMPACT_PCT"] == "80"
         # ALLOWED_USER_IDS should not be in the env dict
         assert "ALLOWED_USER_IDS" not in conf["env"]
+        # Default backend should not appear in env (only non-default values)
+        assert "AGENT_BACKEND" not in conf["env"]
         # users.yaml should have been generated
         yaml_path = tmp_path / "users.yaml"
         assert yaml_path.exists()
@@ -499,6 +502,7 @@ class TestCmdConfig:
                 "testuser",  # os_user
                 str(tmp_path),  # home_workspace
                 "polling",  # transport
+                "claude",  # agent backend
                 "sonnet",  # model
                 "120",  # timeout
                 "10.0",  # budget
