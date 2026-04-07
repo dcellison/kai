@@ -1848,6 +1848,14 @@ def _apply_goose_config(
     if not src.exists():
         raise SystemExit(f"Goose config template not found at {src}")
 
+    # Warn if the goose binary isn't on PATH. Not fatal because the
+    # user may install it after running make install, but a clear
+    # message now saves debugging an opaque runtime error later.
+    if not shutil.which("goose"):
+        print("  WARNING: 'goose' binary not found on PATH.")
+        print("  Kai will fail to start the Goose backend until goose is installed.")
+        print("  See https://github.com/block/goose for installation instructions.")
+
     if dry_run:
         print(f"[DRY RUN] Would create: {goose_dir}")
         print(f"[DRY RUN] Would copy: {src} -> {dst}")

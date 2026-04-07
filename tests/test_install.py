@@ -13,6 +13,7 @@ import yaml
 from kai.install import (
     _LAUNCHD_LABEL,
     _apply_directories,
+    _apply_goose_config,
     _apply_migrate,
     _apply_models,
     _apply_secrets,
@@ -2091,3 +2092,50 @@ class TestApplyServiceDryRun:
         _apply_service("/opt/kai", "/var/lib/kai", "kai", "linux", dry_run=True)
         output = capsys.readouterr().out
         assert "DRY RUN" in output
+
+
+class TestApplyGooseConfig:
+    """Tests for _apply_goose_config() goose binary check."""
+
+    def _setup(self, tmp_path):
+        """Create a minimal install tree with the goose config template."""
+        install_path = tmp_path / "opt" / "kai"
+        config_dir = install_path / "home" / "config"
+        config_dir.mkdir(parents=True)
+        (config_dir / "goose-config.yaml").write_text("extensions: {}\n")
+        return install_path
+
+    def test_warns_when_goose_not_on_path(self, tmp_path, capsys, monkeypatch):
+        """Warning printed when goose binary is not found on PATH."""
+        install_path = self._setup(tmp_path)
+        svc_home = tmp_path / "home" / "kai"
+        svc_home.mkdir(parents=True)
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+
+        # Ensure shutil.which returns None (goose not installed)
+        monkeypatch.setattr("shutil.which", lambda cmd: None)
+
+        uid = os.getuid()
+        gid = os.getgid()
+        _apply_goose_config("kai", install_path, uid, gid, dry_run=False)
+
+        output = capsys.readouterr().out
+        assert "WARNING" in output
+        assert "goose" in output.lower()
+
+    def test_no_warning_when_goose_on_path(self, tmp_path, capsys, monkeypatch):
+        """No warning printed when goose binary exists on PATH."""
+        install_path = self._setup(tmp_path)
+        svc_home = tmp_path / "home" / "kai"
+        svc_home.mkdir(parents=True)
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+
+        # Simulate goose being on PATH
+        monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/goose")
+
+        uid = os.getuid()
+        gid = os.getgid()
+        _apply_goose_config("kai", install_path, uid, gid, dry_run=False)
+
+        output = capsys.readouterr().out
+        assert "WARNING" not in output
