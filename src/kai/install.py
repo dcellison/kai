@@ -1843,15 +1843,15 @@ def _apply_goose_config(
     dst = goose_dir / "config.yaml"
     src = install_path / "home" / "config" / "goose-config.yaml"
 
+    # Check before dry_run so a missing template is caught during
+    # pre-validation, not only on the real install run.
+    if not src.exists():
+        raise SystemExit(f"Goose config template not found at {src}")
+
     if dry_run:
         print(f"[DRY RUN] Would create: {goose_dir}")
         print(f"[DRY RUN] Would copy: {src} -> {dst}")
         return
-
-    if not src.exists():
-        # A missing template in the install tree is a packaging bug,
-        # not a recoverable runtime condition. Fail hard.
-        raise SystemExit(f"Goose config template not found at {src}")
 
     # Track whether we're creating .config for the first time so we
     # can set ownership on it below. mkdir(parents=True) creates both
