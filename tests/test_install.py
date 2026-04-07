@@ -2036,17 +2036,11 @@ class TestApplySource:
         # Verify the specific home/config/ copy call rather than relying
         # on total call count (which depends on fixture state).
         config_dst = install / "home" / "config"
-        config_calls = [
-            c for c in mock_copy.call_args_list
-            if c[0][0] == config_dir and c[0][1] == config_dst
-        ]
+        config_calls = [c for c in mock_copy.call_args_list if c[0][0] == config_dir and c[0][1] == config_dst]
         assert len(config_calls) == 1
 
         # home/config/ should be root-owned (static template, not runtime data)
-        own_calls = [
-            c for c in mock_own.call_args_list
-            if c[0] == (config_dst, 0, 0) and c[1].get("recursive") is True
-        ]
+        own_calls = [c for c in mock_own.call_args_list if c[0] == (config_dst, 0, 0) and c[1].get("recursive") is True]
         assert len(own_calls) == 1
 
     def test_dry_run_includes_home_config(self, tmp_path, capsys):
