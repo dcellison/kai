@@ -38,7 +38,14 @@ from pathlib import Path
 
 import yaml
 
-from kai.config import MAX_CONTEXT_CEILING, PROJECT_ROOT, VALID_BACKENDS, VALID_MODELS
+from kai.config import (
+    GOOSE_PROVIDER_KEY_VARS,
+    MAX_CONTEXT_CEILING,
+    PROJECT_ROOT,
+    VALID_BACKENDS,
+    VALID_GOOSE_PROVIDERS,
+    VALID_MODELS,
+)
 
 # Config file written by `config`, read by `apply`.
 # Anchored to PROJECT_ROOT so it resolves correctly regardless of CWD.
@@ -415,9 +422,28 @@ def _cmd_config() -> None:
         sorted(VALID_BACKENDS),
         existing_env.get("AGENT_BACKEND", "claude"),
     )
+
+    # Goose-specific: provider and API key. The provider choice
+    # determines which env var to prompt for (or none for ollama).
+    goose_provider = ""
+    goose_api_key_var = ""
+    goose_api_key = ""
     if agent_backend == "goose":
-        print("  Note: Goose requires a provider API key (e.g. ANTHROPIC_API_KEY)")
-        print("  in the environment. Add it to /etc/kai/env after installation.")
+        goose_provider = _prompt_choice(
+            "Goose LLM provider",
+            sorted(VALID_GOOSE_PROVIDERS),
+            existing_env.get("GOOSE_PROVIDER", ""),
+        )
+        goose_api_key_var = GOOSE_PROVIDER_KEY_VARS.get(goose_provider, "")
+        if goose_api_key_var:
+            goose_api_key = _prompt(
+                f"{goose_api_key_var}",
+                existing_env.get(goose_api_key_var, ""),
+                required=True,
+            )
+        else:
+            # Ollama: no API key needed (local inference)
+            print(f"  {goose_provider} does not require an API key.")
     print()
 
     # -- Claude --
@@ -644,6 +670,13 @@ def _cmd_config() -> None:
     # Only write non-default values to keep the env file clean.
     if agent_backend != "claude":
         env["AGENT_BACKEND"] = agent_backend
+
+    # Goose provider and API key. Written alongside the backend choice
+    # so they survive into /etc/kai/env and are not wiped on reinstall.
+    if goose_provider:
+        env["GOOSE_PROVIDER"] = goose_provider
+    if goose_api_key_var and goose_api_key:
+        env[goose_api_key_var] = goose_api_key
 
     # Deprecated per-user vars: only include without users.yaml
     # (legacy single-user mode). With users.yaml, these are noise.

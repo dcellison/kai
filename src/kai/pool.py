@@ -133,6 +133,7 @@ class SubprocessPool:
                 services_info=self._services_info,
                 workspace_config=ws_config,
                 max_context_window=context_window,
+                goose_provider=self._config.goose_provider,
             )
 
         # os_user for sudo -u isolation. None = run as bot user.

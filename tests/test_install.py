@@ -563,6 +563,8 @@ class TestCmdConfig:
                 "false",  # advanced user options
                 "polling",  # transport
                 "goose",  # agent backend (prompt shown because existing config has goose)
+                "anthropic",  # goose provider
+                "sk-ant-test-key",  # ANTHROPIC_API_KEY
                 "sonnet",  # model
                 "120",  # timeout
                 "10.0",  # budget
@@ -587,9 +589,8 @@ class TestCmdConfig:
 
         conf = json.loads((tmp_path / "install.conf").read_text())
         assert conf["env"]["AGENT_BACKEND"] == "goose"
-        # Provider API keys are not managed by Kai - they go directly
-        # into /etc/kai/env or the shell environment for Goose to read.
-        assert "ANTHROPIC_API_KEY" not in conf["env"]
+        assert conf["env"]["GOOSE_PROVIDER"] == "anthropic"
+        assert conf["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
 
     def test_reads_existing_defaults(self, tmp_path, monkeypatch, capsys):
         """Config subcommand uses existing install.conf values as defaults."""

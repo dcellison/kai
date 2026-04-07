@@ -83,6 +83,7 @@ class GooseBackend(AgentBackend):
         services_info: list[dict] | None = None,
         workspace_config: WorkspaceConfig | None = None,
         max_context_window: int = 0,
+        goose_provider: str = "anthropic",
     ):
         # ABC-required attributes (pool.py reads/writes these)
         self.model = model
@@ -92,6 +93,7 @@ class GooseBackend(AgentBackend):
         self.timeout_seconds = timeout_seconds
         self.workspace_config = workspace_config
         self.max_context_window = max_context_window
+        self.goose_provider = goose_provider
 
         # API context for session injection (passed to build_session_context)
         self._api_context = ApiContext(
@@ -156,7 +158,13 @@ class GooseBackend(AgentBackend):
         # 4. Per-workspace inline env values (override env_file)
         # 5. Webhook secret (LAST - workspace env can't override it)
         env = os.environ.copy()
-        mapped = _ANTHROPIC_MODEL_MAP.get(self.model, self.model)
+        # Kai's logical model names ("sonnet", "opus", "haiku") only apply
+        # to the Anthropic provider. Other providers require full model IDs
+        # set via user config (users.yaml or /settings). Pass through unchanged.
+        if self.goose_provider == "anthropic":
+            mapped = _ANTHROPIC_MODEL_MAP.get(self.model, self.model)
+        else:
+            mapped = self.model
         if mapped:
             env["GOOSE_MODEL"] = mapped
         if self.workspace_config:
