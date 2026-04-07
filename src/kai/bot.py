@@ -798,7 +798,17 @@ def _revert_instance_field(pool: SubprocessPool, chat_id: int, field: str, confi
             if provider == effective_global:
                 instance.model = config.default_model
             else:
-                instance.model = PROVIDER_DEFAULTS.get(provider, config.default_model)
+                fallback = PROVIDER_DEFAULTS.get(provider, "")
+                if not fallback:
+                    # Open-ended provider with no default - same warning
+                    # as pool.py _create_instance for consistency.
+                    log.warning(
+                        "No default model for provider '%s'; using global default '%s' which may not be valid",
+                        provider,
+                        config.default_model,
+                    )
+                    fallback = config.default_model
+                instance.model = fallback
     elif field == "budget":
         instance.max_budget_usd = (
             user.max_budget if user and user.max_budget is not None else config.claude_max_budget_usd
