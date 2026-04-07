@@ -365,7 +365,16 @@ def _get_user_models(pool: SubprocessPool, chat_id: int) -> dict[str, str] | Non
     instance = pool.get(chat_id)
     if instance.provider in OPEN_ENDED_PROVIDERS:
         return None
-    return PROVIDER_MODELS.get(instance.provider)
+    models = PROVIDER_MODELS.get(instance.provider)
+    if models is None:
+        # Provider is not open-ended but has no curated list. This means
+        # PROVIDER_MODELS is missing an entry for a valid provider -
+        # programming oversight, not user error.
+        log.warning(
+            "Provider '%s' has no curated model list; falling back to text input",
+            instance.provider,
+        )
+    return models
 
 
 def _models_keyboard(current: str, models: dict[str, str]) -> InlineKeyboardMarkup:

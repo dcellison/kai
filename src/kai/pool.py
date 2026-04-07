@@ -128,7 +128,19 @@ class SubprocessPool:
         elif effective_provider == global_provider:
             model = self._config.default_model
         else:
-            model = PROVIDER_DEFAULTS.get(effective_provider, self._config.default_model)
+            model = PROVIDER_DEFAULTS.get(effective_provider, "")
+            if not model:
+                # Open-ended provider (openrouter, ollama) with no model configured.
+                # Use the global default as a last resort but warn - it's almost
+                # certainly wrong (e.g., "sonnet" sent to ollama).
+                log.warning(
+                    "No model configured for provider '%s' (chat %d); "
+                    "falling back to global default '%s' which may not be valid",
+                    effective_provider,
+                    chat_id,
+                    self._config.default_model,
+                )
+                model = self._config.default_model
 
         budget = user.max_budget if user and user.max_budget is not None else self._config.claude_max_budget_usd
         timeout = user.timeout if user and user.timeout is not None else self._config.claude_timeout_seconds

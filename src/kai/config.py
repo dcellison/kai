@@ -115,13 +115,25 @@ def validate_model_for_provider(model: str, provider: str) -> bool:
     """Check if a model is valid for a provider.
 
     Returns True if the provider is open-ended (accepts any model)
-    or if the model is in the provider's curated list.
+    or if the model is in the provider's curated list. Unknown providers
+    (not in PROVIDER_MODELS or OPEN_ENDED_PROVIDERS) are accepted with
+    a warning - this catches the case where VALID_GOOSE_PROVIDERS gains
+    a new entry but PROVIDER_MODELS was not updated to match.
     """
     if provider in OPEN_ENDED_PROVIDERS:
         return True
     models = PROVIDER_MODELS.get(provider)
     if models is None:
-        return True  # Unknown provider - accept anything
+        # Provider is valid (passed VALID_GOOSE_PROVIDERS check) but has
+        # no curated model list and is not explicitly open-ended. This
+        # is a programming oversight - log it so it's visible.
+        if provider:
+            log.warning(
+                "Provider '%s' has no entry in PROVIDER_MODELS or OPEN_ENDED_PROVIDERS; accepting model '%s' unchecked",
+                provider,
+                model,
+            )
+        return True
     return model in models
 
 
@@ -882,35 +894,48 @@ def _load_user_configs(
                 )
             user_provider = provider_str
 
+        # Resolve effective backend and provider for this user.
+        # Used for both the goose-without-provider check and model validation.
+        eff_backend = user_backend or global_backend
+        eff_provider_str = user_provider or global_provider
+        eff_provider = get_effective_provider(eff_backend, eff_provider_str)
+
         # If user has goose backend but no provider can be resolved
         # (neither user-level nor global), that's a fatal config error.
-        eff_backend = user_backend or global_backend
-        if eff_backend == "goose":
-            eff_provider_str = user_provider or global_provider
-            if not eff_provider_str:
-                raise SystemExit(
-                    f"users.yaml: user '{name}' has agent_backend='goose' but no "
-                    f"goose_provider is configured (set it in users.yaml or as "
-                    f"GOOSE_PROVIDER env var)"
-                )
+        if eff_backend == "goose" and not eff_provider_str:
+            raise SystemExit(
+                f"users.yaml: user '{name}' has agent_backend='goose' but no "
+                f"goose_provider is configured (set it in users.yaml or as "
+                f"GOOSE_PROVIDER env var)"
+            )
 
-        # Validate optional model against the user's effective provider.
-        # Cascade: user override -> global config, same as pool.py.
+        # Warn if user is on an open-ended provider with no model set.
+        # PROVIDER_DEFAULTS has no entry for openrouter/ollama, so the
+        # pool would fall back to the global default_model (e.g., "sonnet")
+        # which is almost certainly wrong for that provider.
         model = entry.get("model")
         if model is not None:
             model = str(model).strip().lower()
-            eff_provider_name = user_provider or global_provider
-            eff_provider = get_effective_provider(eff_backend, eff_provider_name)
-            if not validate_model_for_provider(model, eff_provider):
-                valid = sorted(PROVIDER_MODELS.get(eff_provider, {}).keys())
-                log.warning(
-                    "users.yaml: invalid model '%s' for %s (provider '%s', must be one of %s); ignoring",
-                    model,
-                    name,
-                    eff_provider,
-                    valid,
-                )
-                model = None
+        if model is None and eff_provider in OPEN_ENDED_PROVIDERS:
+            log.warning(
+                "users.yaml: user '%s' is on open-ended provider '%s' with no "
+                "model set; they must set one via /model or users.yaml",
+                name,
+                eff_provider,
+            )
+
+        # Validate optional model against the user's effective provider.
+        # Cascade: user override -> global config, same as pool.py.
+        if model is not None and not validate_model_for_provider(model, eff_provider):
+            valid = sorted(PROVIDER_MODELS.get(eff_provider, {}).keys())
+            log.warning(
+                "users.yaml: invalid model '%s' for %s (provider '%s', must be one of %s); ignoring",
+                model,
+                name,
+                eff_provider,
+                valid,
+            )
+            model = None
 
         # Validate optional timeout (positive integer)
         user_timeout = entry.get("timeout")
