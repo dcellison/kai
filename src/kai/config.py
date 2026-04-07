@@ -51,7 +51,7 @@ VALID_BACKENDS = {"claude", "goose"}
 VALID_GOOSE_PROVIDERS = {"anthropic", "openai", "google", "openrouter", "ollama"}
 
 # Maps each Goose provider to its API key environment variable name.
-# Used by install.py for prompting and by load_config() for validation.
+# Used by install.py for prompting the correct API key env var.
 # Ollama is absent because it requires no API key (local inference).
 GOOSE_PROVIDER_KEY_VARS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
