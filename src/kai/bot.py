@@ -356,25 +356,29 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ── Model selection ──────────────────────────────────────────────────
 
 
+def _get_user_provider(pool: SubprocessPool, chat_id: int, config: Config) -> str:
+    """Derive the effective provider for a user without creating an instance.
+
+    Checks the running instance first; falls back to the config cascade
+    (user -> global) so read-only commands avoid spawning a subprocess.
+    """
+    instance = pool.get_if_exists(chat_id)
+    if instance:
+        return instance.provider
+    # No running instance - derive from config cascade (same as _create_instance)
+    user_config = config.get_user_config(chat_id)
+    uc_backend = user_config.agent_backend if user_config and user_config.agent_backend else config.agent_backend
+    uc_provider = user_config.goose_provider if user_config and user_config.goose_provider else config.goose_provider
+    return get_effective_provider(uc_backend, uc_provider)
+
+
 def _get_user_models(pool: SubprocessPool, chat_id: int, config: Config) -> dict[str, str] | None:
     """Get the curated model dict for a user's provider, or None if open-ended.
 
     Returns the PROVIDER_MODELS entry for the user's effective provider.
     None means the provider accepts arbitrary model IDs (no keyboard).
-    Uses the running instance if available, otherwise derives the provider
-    from config so read-only commands don't create a subprocess as a side effect.
     """
-    instance = pool.get_if_exists(chat_id)
-    if instance:
-        provider = instance.provider
-    else:
-        # No running instance - derive from config cascade (same as _create_instance)
-        user_config = config.get_user_config(chat_id)
-        uc_backend = user_config.agent_backend if user_config and user_config.agent_backend else config.agent_backend
-        uc_provider = (
-            user_config.goose_provider if user_config and user_config.goose_provider else config.goose_provider
-        )
-        provider = get_effective_provider(uc_backend, uc_provider)
+    provider = _get_user_provider(pool, chat_id, config)
     if provider in OPEN_ENDED_PROVIDERS:
         return None
     models = PROVIDER_MODELS.get(provider)
@@ -747,19 +751,11 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     ceiling_line = f"\n\nBudget ceiling: ${ceiling:.2f} (admin)" if ceiling else ""
 
     # Provider info - always show so users know their configuration.
-    # Derive from the running instance if available, otherwise from
-    # config (same cascade as _create_instance) so new users see
-    # their provider before any session starts.
+    # Uses the shared helper that checks the running instance first,
+    # falling back to config cascade so new users see their provider
+    # before any session starts.
     pool = _get_pool(context)
-    instance = pool.get_if_exists(chat_id)
-    if instance:
-        provider = instance.provider
-    else:
-        uc_backend = user_config.agent_backend if user_config and user_config.agent_backend else config.agent_backend
-        uc_provider = (
-            user_config.goose_provider if user_config and user_config.goose_provider else config.goose_provider
-        )
-        provider = get_effective_provider(uc_backend, uc_provider)
+    provider = _get_user_provider(pool, chat_id, config)
     provider_line = f"\n  Provider: {provider}"
 
     await update.message.reply_text(
@@ -1349,7 +1345,6 @@ async def _handle_workspace_config(
     # /workspace config model <name>
     if field == "model":
         pool = _get_pool(context)
-        instance = pool.get(chat_id)
         if not value:
             user_models = _get_user_models(pool, chat_id, config)
             if user_models:
@@ -1358,6 +1353,8 @@ async def _handle_workspace_config(
             else:
                 await update.message.reply_text("Usage: /workspace config model <model_id>")
             return
+        # Value provided - need instance for provider validation
+        instance = pool.get(chat_id)
         if not validate_model_for_provider(value.lower(), instance.provider):
             valid = sorted(PROVIDER_MODELS.get(instance.provider, {}).keys())
             await update.message.reply_text(f"Unknown model. Choose from: {', '.join(valid)}")
