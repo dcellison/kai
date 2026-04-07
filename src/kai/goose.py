@@ -612,13 +612,19 @@ class GooseBackend(AgentBackend):
         if self._proc:
             try:
                 self._proc.terminate()
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
-            except TimeoutError:
-                self.force_kill()
+            except OSError:
+                # Process already exited between the _proc check and
+                # terminate(). Fall through to cleanup below.
+                pass
+            else:
                 try:
                     await asyncio.wait_for(self._proc.wait(), timeout=5)
                 except TimeoutError:
-                    log.warning("GooseBackend: process did not exit after SIGKILL")
+                    self.force_kill()
+                    try:
+                        await asyncio.wait_for(self._proc.wait(), timeout=5)
+                    except TimeoutError:
+                        log.warning("GooseBackend: process did not exit after SIGKILL")
         if self._stderr_task:
             self._stderr_task.cancel()
             self._stderr_task = None
