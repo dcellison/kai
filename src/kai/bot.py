@@ -476,7 +476,9 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("Invalid model.")
         return
 
-    if model == pool.get_model(chat_id):
+    # Use get_effective_model so the comparison matches the keyboard highlight,
+    # which also uses get_effective_model to mark the active model.
+    if model == await pool.get_effective_model(chat_id):
         await query.answer()
         await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
         return
