@@ -732,10 +732,21 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     )
     ceiling_line = f"\n\nBudget ceiling: ${ceiling:.2f} (admin)" if ceiling else ""
 
-    # Provider info - always show so users know their configuration
+    # Provider info - always show so users know their configuration.
+    # Derive from the running instance if available, otherwise from
+    # config (same cascade as _create_instance) so new users see
+    # their provider before any session starts.
     pool = _get_pool(context)
     instance = pool.get_if_exists(chat_id)
-    provider_line = f"\n  Provider: {instance.provider}" if instance else ""
+    if instance:
+        provider = instance.provider
+    else:
+        uc_backend = user_config.agent_backend if user_config and user_config.agent_backend else config.agent_backend
+        uc_provider = (
+            user_config.goose_provider if user_config and user_config.goose_provider else config.goose_provider
+        )
+        provider = get_effective_provider(uc_backend, uc_provider)
+    provider_line = f"\n  Provider: {provider}"
 
     await update.message.reply_text(
         f"Your settings:\n"

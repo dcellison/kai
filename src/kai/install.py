@@ -701,6 +701,10 @@ def _cmd_config() -> None:
 
     # Deprecated per-user vars: only include without users.yaml
     # (legacy single-user mode). With users.yaml, these are noise.
+    # Remove stale CLAUDE_MODEL if present - it was renamed to
+    # DEFAULT_MODEL and leaving both keys causes silent confusion
+    # (the deprecation warning is suppressed when DEFAULT_MODEL exists).
+    env.pop("CLAUDE_MODEL", None)
     if not users_yaml_exists:
         env["DEFAULT_MODEL"] = model
         env["CLAUDE_TIMEOUT_SECONDS"] = timeout

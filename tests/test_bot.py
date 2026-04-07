@@ -3292,14 +3292,16 @@ class TestHandleSettings:
         """/settings with no overrides shows global defaults."""
         update = _make_update(text="/settings")
         config = _make_config()
+        ctx = _make_context(config=config)
         mock_sessions = self._mock_sessions()
 
         with self._patches(mock_sessions):
-            await _show_settings(update, MagicMock(), 12345, config)
+            await _show_settings(update, ctx, 12345, config)
 
         reply = update.message.reply_text.call_args[0][0]
         assert "sonnet" in reply
         assert "global default" in reply
+        assert "anthropic" in reply.lower()
 
     # ── 2. Set model ───────────────────────────────────────────────
 
@@ -3646,10 +3648,11 @@ class TestHandleSettings:
         """Budget of $0.00 displays as 'unlimited', not '$0.00'."""
         update = _make_update(text="/settings")
         config = _make_config(claude_max_budget_usd=0.0)
+        ctx = _make_context(config=config)
         mock_sessions = self._mock_sessions()
 
         with self._patches(mock_sessions):
-            await _show_settings(update, MagicMock(), 12345, config)
+            await _show_settings(update, ctx, 12345, config)
 
         reply = update.message.reply_text.call_args[0][0]
         assert "unlimited" in reply.lower()
@@ -3663,10 +3666,11 @@ class TestHandleSettings:
         update = _make_update(text="/settings")
         # No user_configs - ceiling should fall through to global default
         config = _make_config(claude_max_budget_usd=10.0)
+        ctx = _make_context(config=config)
         mock_sessions = self._mock_sessions()
 
         with self._patches(mock_sessions):
-            await _show_settings(update, MagicMock(), 12345, config)
+            await _show_settings(update, ctx, 12345, config)
 
         reply = update.message.reply_text.call_args[0][0]
         assert "$10.00" in reply
