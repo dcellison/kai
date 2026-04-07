@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kai.config import Config, UserConfig
+from kai.goose import GooseBackend
 from kai.pool import SubprocessPool
 
 
@@ -119,6 +120,100 @@ class TestInstanceCreation:
         assert instance.max_budget_usd == 5.0
         assert instance.timeout_seconds == 60
         assert instance.max_context_window == 100_000
+
+
+# ── Per-user backend/provider routing ──────────────────────────────
+
+
+class TestPerUserBackendRouting:
+    def test_user_gets_goose_when_global_is_claude(self):
+        """User with agent_backend=goose gets GooseBackend even when global is claude."""
+        user = UserConfig(
+            telegram_id=111,
+            name="alice",
+            agent_backend="goose",
+            goose_provider="openai",
+            model="gpt-5.4",
+        )
+        config = _make_config(user_configs={111: user})
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+        assert isinstance(instance, GooseBackend)
+        assert instance.provider == "openai"
+        assert instance.model == "gpt-5.4"
+
+    def test_user_without_backend_gets_global(self):
+        """User with no agent_backend gets the global backend (claude)."""
+        user = UserConfig(telegram_id=111, name="alice")
+        config = _make_config(user_configs={111: user})
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+        # Default global backend is claude -> ClaudeCodeBackend
+        assert not isinstance(instance, GooseBackend)
+        assert instance.provider == "anthropic"
+
+    def test_user_provider_overrides_global(self):
+        """User with goose_provider gets GooseBackend with that provider."""
+        user = UserConfig(
+            telegram_id=111,
+            name="alice",
+            agent_backend="goose",
+            goose_provider="google",
+            model="gemini-3-flash",
+        )
+        config = _make_config(
+            agent_backend="goose",
+            goose_provider="openai",
+            default_model="gpt-5.4",
+            user_configs={111: user},
+        )
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+        assert isinstance(instance, GooseBackend)
+        # User's provider overrides global
+        assert instance.provider == "google"
+        assert instance.model == "gemini-3-flash"
+
+    def test_model_default_cascade_cross_provider(self):
+        """User on different provider than global gets provider-specific default."""
+        user = UserConfig(
+            telegram_id=111,
+            name="alice",
+            agent_backend="goose",
+            goose_provider="openai",
+            # No model set - should get openai default, not global "sonnet"
+        )
+        config = _make_config(user_configs={111: user})
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+        # PROVIDER_DEFAULTS["openai"] = "gpt-5.4"
+        assert instance.model == "gpt-5.4"
+
+    @pytest.mark.asyncio
+    async def test_invalid_stored_model_on_provider_mismatch(self):
+        """DB has 'opus' but user is now on openai - falls back to provider default."""
+        user = UserConfig(
+            telegram_id=111,
+            name="alice",
+            agent_backend="goose",
+            goose_provider="openai",
+            model="gpt-5.4",
+        )
+        config = _make_config(user_configs={111: user})
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+        assert instance.model == "gpt-5.4"
+
+        # Simulate DB override with a model from a different provider
+        db_settings = {"model": "opus"}
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value=db_settings),
+            patch.object(instance, "restart", new_callable=AsyncMock),
+        ):
+            await pool._restore_workspace(111, instance)
+            # "opus" is invalid for openai - should be ignored, model stays at gpt-5.4
+            assert instance.model == "gpt-5.4"
 
 
 # ── Per-user actions ────────────────────────────────────────────────

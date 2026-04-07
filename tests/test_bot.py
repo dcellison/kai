@@ -910,6 +910,21 @@ class TestHandleModels:
         assert "Choose a model" in call[0][0]
         assert call[1]["reply_markup"] is not None
 
+    @pytest.mark.asyncio
+    async def test_open_ended_provider_shows_text(self):
+        """Open-ended provider (openrouter/ollama) shows text instead of keyboard."""
+        pool = _make_mock_claude(model="llama3", provider="ollama")
+        update = _make_update()
+        ctx = _make_context(claude=pool)
+        await handle_models(update, ctx)
+        call = update.message.reply_text.call_args
+        reply = call[0][0]
+        assert "Current model" in reply
+        assert "llama3" in reply
+        assert "/model" in reply
+        # No keyboard for open-ended providers
+        assert "reply_markup" not in call[1] or call[1].get("reply_markup") is None
+
 
 # ── handle_model ─────────────────────────────────────────────────────
 
