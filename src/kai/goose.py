@@ -327,7 +327,7 @@ class GooseBackend(AgentBackend):
         """
         try:
             await self._ensure_started()
-        except (FileNotFoundError, RuntimeError, TimeoutError) as exc:
+        except (OSError, RuntimeError, TimeoutError) as exc:
             yield StreamEvent(
                 text_so_far="",
                 done=True,
