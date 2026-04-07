@@ -228,6 +228,14 @@ class TestLoadConfigErrors:
         cfg = load_config()
         assert cfg.goose_provider == "openai"
 
+    def test_goose_without_provider_exits(self, monkeypatch):
+        """AGENT_BACKEND=goose without GOOSE_PROVIDER fails at startup."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("AGENT_BACKEND", "goose")
+        # GOOSE_PROVIDER not set - empty string is not in VALID_GOOSE_PROVIDERS
+        with pytest.raises(SystemExit, match=r"GOOSE_PROVIDER.*not valid"):
+            load_config()
+
 
 # ── Optional fields ──────────────────────────────────────────────────
 
