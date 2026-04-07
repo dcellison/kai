@@ -2123,6 +2123,22 @@ class TestApplyGooseConfig:
         assert "WARNING" in output
         assert "goose" in output.lower()
 
+    def test_no_warning_in_dry_run(self, tmp_path, capsys, monkeypatch):
+        """Dry run does not warn about missing goose binary."""
+        install_path = self._setup(tmp_path)
+        svc_home = tmp_path / "home" / "kai"
+        svc_home.mkdir(parents=True)
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        monkeypatch.setattr("shutil.which", lambda cmd: None)
+
+        uid = os.getuid()
+        gid = os.getgid()
+        _apply_goose_config("kai", install_path, uid, gid, dry_run=True)
+
+        output = capsys.readouterr().out
+        assert "WARNING" not in output
+        assert "DRY RUN" in output
+
     def test_no_warning_when_goose_on_path(self, tmp_path, capsys, monkeypatch):
         """No warning printed when goose binary exists on PATH."""
         install_path = self._setup(tmp_path)
