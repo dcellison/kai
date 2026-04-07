@@ -1600,6 +1600,11 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     pyproject_dst = install_path / "pyproject.toml"
     ws_claude_src = PROJECT_ROOT / "home" / ".claude"
     ws_claude_dst = install_path / "home" / ".claude"
+    # Config templates (e.g. goose-config.yaml) referenced by later
+    # install steps like _apply_goose_config(). Root-owned since these
+    # are static templates, not runtime data.
+    config_src = PROJECT_ROOT / "home" / "config"
+    config_dst = install_path / "home" / "config"
 
     # One-time: rename workspace/ to home/ at the install location.
     # The directory was renamed in the source tree; this migrates the
@@ -1622,6 +1627,8 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         print(f"[DRY RUN] Would copy: {pyproject_src} -> {pyproject_dst}")
         if ws_claude_src.is_dir():
             print(f"[DRY RUN] Would copy: {ws_claude_src} -> {ws_claude_dst}")
+        if config_src.is_dir():
+            print(f"[DRY RUN] Would copy: {config_src} -> {config_dst}")
         if identity_src.is_file():
             print(f"[DRY RUN] Would copy: {identity_src} -> {identity_dst}")
         elif ws_claude_src.is_dir():
@@ -1648,6 +1655,16 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         _set_ownership(ws_claude_dst, 0, 0, recursive=True)
         os.chown(ws_claude_dst, svc_uid, svc_gid)
         print(f"  Copied home config to {ws_claude_dst}")
+
+    # Copy home/config/ (config templates like goose-config.yaml). These
+    # are static templates referenced by later install steps - e.g.
+    # _apply_goose_config() reads the Goose extension config from here.
+    # Root-owned since they're installer input, not runtime output.
+    if config_src.is_dir():
+        config_dst.parent.mkdir(parents=True, exist_ok=True)
+        _copy_tree(config_src, config_dst)
+        _set_ownership(config_dst, 0, 0, recursive=True)
+        print(f"  Copied config templates to {config_dst}")
 
     # Copy home/IDENTITY.md (the editable identity file pointed to by the
     # home/.claude/CLAUDE.md symlink). Owned by the service user, not root,

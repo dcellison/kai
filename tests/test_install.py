@@ -2010,6 +2010,54 @@ class TestApplySource:
         assert "IDENTITY.md" in output
         assert "dangle" in output
 
+    def test_copies_home_config(self, tmp_path):
+        """home/config/ is copied to the install tree (e.g. goose-config.yaml)."""
+        src = tmp_path / "source"
+        (src / "src").mkdir(parents=True)
+        (src / "src" / "module.py").write_text("code")
+        (src / "pyproject.toml").write_text("[project]")
+        # Create the config template directory
+        config_dir = src / "home" / "config"
+        config_dir.mkdir(parents=True)
+        (config_dir / "goose-config.yaml").write_text("extensions: []")
+        install = tmp_path / "install"
+        install.mkdir()
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._copy_tree") as mock_copy,
+            patch("kai.install._set_ownership") as mock_own,
+            patch("shutil.copy2"),
+            patch("os.chown"),
+        ):
+            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+
+        # _copy_tree called twice: src/ and home/config/
+        assert mock_copy.call_count == 2
+        config_dst = install / "home" / "config"
+        config_call = mock_copy.call_args_list[1]
+        assert config_call[0][0] == config_dir
+        assert config_call[0][1] == config_dst
+
+        # _set_ownership called twice: src/ and home/config/
+        assert mock_own.call_count == 2
+        own_call = mock_own.call_args_list[1]
+        assert own_call[0] == (config_dst, 0, 0)
+        assert own_call[1].get("recursive") is True
+
+    def test_dry_run_includes_home_config(self, tmp_path, capsys):
+        """Dry run mentions home/config/ when it exists."""
+        src = tmp_path / "source"
+        config_dir = src / "home" / "config"
+        config_dir.mkdir(parents=True)
+        (config_dir / "goose-config.yaml").write_text("extensions: []")
+        with patch("kai.install.PROJECT_ROOT", src):
+            _apply_source(tmp_path / "install", svc_uid=1000, svc_gid=1000, dry_run=True)
+        output = capsys.readouterr().out
+        assert "home/config" in output
+        # Should not create the directory during dry run
+        assert not (tmp_path / "install" / "home" / "config").exists()
+
 
 # ── _apply_models ────────────────────────────────────────────────────
 
