@@ -43,6 +43,7 @@ _CONFIG_ENV_VARS = [
     "TOTP_LOCKOUT_ATTEMPTS",
     "TOTP_LOCKOUT_MINUTES",
     "AGENT_BACKEND",
+    "GOOSE_PROVIDER",
     "KAI_DATA_DIR",
     "KAI_INSTALL_DIR",
 ]
@@ -187,6 +188,35 @@ class TestLoadConfigErrors:
         monkeypatch.setenv("AGENT_BACKEND", "invalid")
         with pytest.raises(SystemExit, match="AGENT_BACKEND"):
             load_config()
+
+    def test_invalid_goose_provider(self, monkeypatch):
+        """GOOSE_PROVIDER with an unrecognized value raises SystemExit."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("AGENT_BACKEND", "goose")
+        monkeypatch.setenv("GOOSE_PROVIDER", "invalid")
+        with pytest.raises(SystemExit, match="GOOSE_PROVIDER"):
+            load_config()
+
+    def test_missing_goose_provider(self, monkeypatch):
+        """GOOSE_PROVIDER missing when backend=goose raises SystemExit."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("AGENT_BACKEND", "goose")
+        with pytest.raises(SystemExit, match="GOOSE_PROVIDER"):
+            load_config()
+
+    def test_goose_provider_ignored_for_claude(self, monkeypatch):
+        """GOOSE_PROVIDER is not validated when backend=claude."""
+        _set_required(monkeypatch)
+        cfg = load_config()
+        assert cfg.goose_provider == ""
+
+    def test_valid_goose_provider(self, monkeypatch):
+        """Valid GOOSE_PROVIDER is accepted and stored."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("AGENT_BACKEND", "goose")
+        monkeypatch.setenv("GOOSE_PROVIDER", "openai")
+        cfg = load_config()
+        assert cfg.goose_provider == "openai"
 
 
 # ── Optional fields ──────────────────────────────────────────────────

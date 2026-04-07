@@ -355,6 +355,31 @@ class TestHandshake:
         call_kwargs = mock_exec.call_args[1]
         assert call_kwargs["env"]["GOOSE_MODEL"] == "claude-opus-4-6"
 
+    @pytest.mark.asyncio
+    async def test_model_mapped_for_anthropic(self):
+        """Anthropic provider maps logical names to full model IDs."""
+        g = _make_goose(model="opus", goose_provider="anthropic")
+        proc = _make_mock_proc(_handshake_lines())
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await g._ensure_started()
+
+        call_kwargs = mock_exec.call_args[1]
+        assert call_kwargs["env"]["GOOSE_MODEL"] == "claude-opus-4-6"
+
+    @pytest.mark.asyncio
+    async def test_model_passthrough_for_non_anthropic(self):
+        """Non-Anthropic providers pass model value through unchanged."""
+        g = _make_goose(model="sonnet", goose_provider="openai")
+        proc = _make_mock_proc(_handshake_lines())
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await g._ensure_started()
+
+        call_kwargs = mock_exec.call_args[1]
+        # "sonnet" passed through as-is, not mapped to "claude-sonnet-4-6"
+        assert call_kwargs["env"]["GOOSE_MODEL"] == "sonnet"
+
 
 # ── Stream parsing ─────────────────────────────────────────────────
 

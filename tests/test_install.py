@@ -592,6 +592,59 @@ class TestCmdConfig:
         assert conf["env"]["GOOSE_PROVIDER"] == "anthropic"
         assert conf["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
 
+    def test_goose_ollama_no_api_key(self, tmp_path, monkeypatch):
+        """Selecting ollama provider skips the API key prompt."""
+        monkeypatch.chdir(tmp_path)
+        conf_path = tmp_path / "install.conf"
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+
+        existing = {"version": 1, "env": {"AGENT_BACKEND": "goose"}}
+        conf_path.write_text(json.dumps(existing))
+
+        # No API key input after "ollama" - the prompt is skipped.
+        inputs = iter(
+            [
+                "/opt/kai",  # install dir
+                "/var/lib/kai",  # data dir
+                "kai",  # service user
+                "darwin",  # platform
+                "fake-token",  # bot token
+                "12345",  # admin telegram ID
+                "admin",  # admin display name
+                "false",  # advanced user options
+                "polling",  # transport
+                "goose",  # agent backend
+                "ollama",  # goose provider (no key needed)
+                "sonnet",  # model
+                "120",  # timeout
+                "10.0",  # budget
+                "200000",  # max context window
+                "80",  # autocompact pct
+                "8080",  # port
+                "test-secret",  # webhook secret
+                "~/Projects",  # workspace base
+                "",  # allowed workspaces (empty)
+                "false",  # pr review enabled
+                "false",  # issue triage enabled
+                "",  # github notify chat id (empty)
+                "false",  # voice
+                "false",  # tts
+                "",  # claude user (empty)
+                "",  # perplexity key (empty)
+            ]
+        )
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        conf = json.loads((tmp_path / "install.conf").read_text())
+        assert conf["env"]["GOOSE_PROVIDER"] == "ollama"
+        # Ollama is local inference - no API key should be present
+        for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"):
+            assert key not in conf["env"]
+
     def test_reads_existing_defaults(self, tmp_path, monkeypatch, capsys):
         """Config subcommand uses existing install.conf values as defaults."""
         monkeypatch.chdir(tmp_path)
