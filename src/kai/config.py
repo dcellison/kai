@@ -47,6 +47,19 @@ VALID_MODELS = {"haiku", "sonnet", "opus"}
 # "goose" uses Goose ACP. Shared between load_config() and install.py.
 VALID_BACKENDS = {"claude", "goose"}
 
+# Valid Goose LLM providers. Shared between load_config() and install.py.
+VALID_GOOSE_PROVIDERS = {"anthropic", "openai", "google", "openrouter", "ollama"}
+
+# Maps each Goose provider to its API key environment variable name.
+# Used by install.py for prompting and by load_config() for validation.
+# Ollama is absent because it requires no API key (local inference).
+GOOSE_PROVIDER_KEY_VARS: dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+}
+
 # Maximum context window size in tokens. Claude's hard ceiling.
 # Shared between load_config() (env var validation) and
 # _load_user_configs() (users.yaml validation).
@@ -311,6 +324,11 @@ class Config:
     # Agent backend selection: "claude" (default) uses Claude Code CLI,
     # "goose" uses Goose ACP (Agent Client Protocol) as the agent harness.
     agent_backend: str = "claude"
+
+    # Goose LLM provider (only relevant when agent_backend="goose").
+    # Determines which API key env var Goose expects and whether Kai's
+    # logical model names ("sonnet", "opus") are translated to Anthropic IDs.
+    goose_provider: str = ""
 
     def get_workspace_config(self, workspace: Path) -> WorkspaceConfig | None:
         """
@@ -1110,6 +1128,17 @@ def load_config() -> Config:
             f"AGENT_BACKEND '{agent_backend}' is not valid (must be one of: {', '.join(sorted(VALID_BACKENDS))})"
         )
 
+    # Goose provider - only validated when agent_backend=goose.
+    # When backend is claude, the field stays empty (unused).
+    goose_provider = ""
+    if agent_backend == "goose":
+        goose_provider = os.environ.get("GOOSE_PROVIDER", "").strip().lower()
+        if goose_provider not in VALID_GOOSE_PROVIDERS:
+            raise SystemExit(
+                f"GOOSE_PROVIDER '{goose_provider}' is not valid "
+                f"(must be one of: {', '.join(sorted(VALID_GOOSE_PROVIDERS))})"
+            )
+
     # Per-workspace configuration. Loaded after ALLOWED_WORKSPACES so
     # YAML-defined workspaces can be merged into the allowed set.
     workspace_configs = _load_workspace_configs()
@@ -1244,4 +1273,5 @@ def load_config() -> Config:
         totp_lockout_attempts=totp_lockout_attempts,
         totp_lockout_minutes=totp_lockout_minutes,
         agent_backend=agent_backend,
+        goose_provider=goose_provider,
     )
