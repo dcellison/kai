@@ -356,23 +356,35 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ── Model selection ──────────────────────────────────────────────────
 
 
-def _get_user_models(pool: SubprocessPool, chat_id: int) -> dict[str, str] | None:
+def _get_user_models(pool: SubprocessPool, chat_id: int, config: Config) -> dict[str, str] | None:
     """Get the curated model dict for a user's provider, or None if open-ended.
 
     Returns the PROVIDER_MODELS entry for the user's effective provider.
     None means the provider accepts arbitrary model IDs (no keyboard).
+    Uses the running instance if available, otherwise derives the provider
+    from config so read-only commands don't create a subprocess as a side effect.
     """
-    instance = pool.get(chat_id)
-    if instance.provider in OPEN_ENDED_PROVIDERS:
+    instance = pool.get_if_exists(chat_id)
+    if instance:
+        provider = instance.provider
+    else:
+        # No running instance - derive from config cascade (same as _create_instance)
+        user_config = config.get_user_config(chat_id)
+        uc_backend = user_config.agent_backend if user_config and user_config.agent_backend else config.agent_backend
+        uc_provider = (
+            user_config.goose_provider if user_config and user_config.goose_provider else config.goose_provider
+        )
+        provider = get_effective_provider(uc_backend, uc_provider)
+    if provider in OPEN_ENDED_PROVIDERS:
         return None
-    models = PROVIDER_MODELS.get(instance.provider)
+    models = PROVIDER_MODELS.get(provider)
     if models is None:
         # Provider is not open-ended but has no curated list. This means
         # PROVIDER_MODELS is missing an entry for a valid provider -
         # programming oversight, not user error.
         log.warning(
             "Provider '%s' has no curated model list; falling back to text input",
-            instance.provider,
+            provider,
         )
     return models
 
@@ -392,7 +404,8 @@ async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     assert update.message is not None
     pool = _get_pool(context)
     chat_id = _chat_id(update)
-    models = _get_user_models(pool, chat_id)
+    config: Config = context.bot_data["config"]
+    models = _get_user_models(pool, chat_id, config)
 
     if models is None:
         # Open-ended provider - no keyboard, show current model
@@ -457,7 +470,7 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     await query.answer()
     await _switch_model(context, chat_id, model)
-    models = _get_user_models(pool, chat_id)
+    models = _get_user_models(pool, chat_id, config)
     display = models.get(model, model) if models else model
     await query.edit_message_text(
         f"Switched to {display}. Session restarted.",
@@ -471,9 +484,10 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     assert update.message is not None
     pool = _get_pool(context)
     chat_id = _chat_id(update)
+    config: Config = context.bot_data["config"]
 
     if not context.args:
-        models = _get_user_models(pool, chat_id)
+        models = _get_user_models(pool, chat_id, config)
         if models:
             opts = " | ".join(sorted(models.keys()))
             await update.message.reply_text(f"Usage: /model <{opts}>")
@@ -490,7 +504,7 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await _switch_model(context, chat_id, model)
-    models = _get_user_models(pool, chat_id)
+    models = _get_user_models(pool, chat_id, config)
     display = models.get(model, model) if models else model
     await update.message.reply_text(f"Model set to {display}. Session restarted.")
 
@@ -534,7 +548,7 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if field == "model":
         pool = _get_pool(context)
         if not value:
-            user_models = _get_user_models(pool, chat_id)
+            user_models = _get_user_models(pool, chat_id, config)
             if user_models:
                 opts = " | ".join(sorted(user_models.keys()))
                 await update.message.reply_text(f"Usage: /settings model <{opts}>")
@@ -553,7 +567,7 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # keyboard. _switch_model() handles DB write, instance update,
         # process restart, and session clear.
         await _switch_model(context, chat_id, model_key)
-        user_models = _get_user_models(pool, chat_id)
+        user_models = _get_user_models(pool, chat_id, config)
         display = user_models.get(model_key, model_key) if user_models else model_key
         await update.message.reply_text(f"Default model set to {display}. Session restarted.")
         return
@@ -1327,7 +1341,7 @@ async def _handle_workspace_config(
         pool = _get_pool(context)
         instance = pool.get(chat_id)
         if not value:
-            user_models = _get_user_models(pool, chat_id)
+            user_models = _get_user_models(pool, chat_id, config)
             if user_models:
                 opts = " | ".join(sorted(user_models.keys()))
                 await update.message.reply_text(f"Usage: /workspace config model <{opts}>")
