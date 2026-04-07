@@ -437,7 +437,7 @@ def _cmd_config() -> None:
         goose_api_key_var = GOOSE_PROVIDER_KEY_VARS.get(goose_provider, "")
         if goose_api_key_var:
             goose_api_key = _prompt(
-                f"{goose_api_key_var}",
+                goose_api_key_var,
                 existing_env.get(goose_api_key_var, ""),
                 required=True,
             )
