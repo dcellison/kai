@@ -5,15 +5,15 @@
 [![License](https://img.shields.io/github/license/dcellison/kai)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dcellison/kai?label=version)](https://github.com/dcellison/kai/releases)
 
-Kai is an AI agent, not a chatbot. It wraps persistent [Claude Code](https://docs.anthropic.com/en/docs/claude-code) processes running on your hardware and connects them to Telegram as a control surface. Shell, filesystem, git, web search, scheduling - the agent has real access to your system and can take real action on it. It reviews PRs when code is pushed, triages issues when they're opened, monitors conditions on a schedule, and operates across any project on your machine. Multiple users can share a single Kai instance, each with their own isolated subprocess, workspace, conversation history, and optional OS-level process separation.
+Kai is an AI agent, not a chatbot. It manages persistent agent subprocesses running on your hardware - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) by default, with [Goose](https://block.github.io/goose/) as an alternative backend - and connects them to Telegram as a control surface. Shell, filesystem, git, web search, scheduling - the agent has real access to your system and can take real action on it. It reviews PRs when code is pushed, triages issues when they're opened, monitors conditions on a schedule, and operates across any project on your machine. Multiple users can share a single Kai instance, each with their own isolated subprocess, workspace, conversation history, and optional OS-level process separation.
 
 For detailed guides on setup, architecture, and optional features, see the **[Wiki](https://github.com/dcellison/kai/wiki)**.
 
 ## Architecture
 
-Kai is two layers: an outer Python application that handles Telegram, HTTP, and scheduling, and one or more inner Claude Code subprocesses that do the thinking and acting. The outer process manages lifecycle, authentication, and transport. Each user gets their own inner subprocess with persistent state, tool access, and a working directory on your filesystem. A subprocess pool manages lazy creation and idle eviction so resource usage scales with active users, not registered ones.
+Kai is two layers: an outer Python application that handles Telegram, HTTP, and scheduling, and one or more inner agent subprocesses that do the thinking and acting. The outer process programs against an `AgentBackend` ABC (`backend.py`), so it manages lifecycle, authentication, and transport identically regardless of which backend is running. Claude Code is the default; Goose ACP is an alternative. Both follow the same lifecycle: one subprocess per user, lazy creation, idle eviction. Resource usage scales with active users, not registered ones.
 
-This is what separates Kai from API-wrapper bots that send text to a model endpoint and relay the response. Claude Code is a full agentic runtime - it reads files, runs shell commands, searches the web, writes and commits code, and maintains context across a session. Kai gives that runtime a durable home, a scheduling system, event-driven inputs, persistent memory, and a security model designed around the fact that it has all of this power.
+This is what separates Kai from API-wrapper bots that send text to a model endpoint and relay the response. The inner agent is a full agentic runtime - it reads files, runs shell commands, searches the web, writes and commits code, and maintains context across a session. Claude Code and Goose each bring their own model ecosystem. Kai gives the runtime a durable home, a scheduling system, event-driven inputs, persistent memory, and a security model designed around the fact that it has all of this power.
 
 Everything runs locally. Conversations never transit a relay server. Voice transcription and synthesis happen on-device. API keys are proxied through an internal service layer so they never appear in conversation context. There is no cloud component between you and your machine.
 
@@ -82,15 +82,15 @@ Foreign workspaces also get their own `.claude/MEMORY.md` injected alongside hom
 
 ### Scheduled jobs
 
-Reminders and recurring agent jobs with one-shot, daily, and interval schedules. Ask naturally ("remind me at 3pm") or use the HTTP API (`POST /api/schedule`). Agent jobs run as full Claude Code sessions - Kai can check conditions, search the web, run commands, and report back on a schedule. Auto-remove jobs support monitoring use cases where the agent watches for a condition and deactivates itself when it's met. See [Scheduling and Conditional Jobs](https://github.com/dcellison/kai/wiki/Scheduling-and-Conditional-Jobs).
+Reminders and recurring agent jobs with one-shot, daily, and interval schedules. Ask naturally ("remind me at 3pm") or use the HTTP API (`POST /api/schedule`). Agent jobs run as full agent sessions - Kai can check conditions, search the web, run commands, and report back on a schedule. Auto-remove jobs support monitoring use cases where the agent watches for a condition and deactivates itself when it's met. See [Scheduling and Conditional Jobs](https://github.com/dcellison/kai/wiki/Scheduling-and-Conditional-Jobs).
 
 ### PR Review Agent
 
-When code is pushed to a pull request, Kai automatically reviews it. A one-shot Claude subprocess analyzes the diff, checks for bugs, style issues, and spec compliance, and posts a review comment directly on the PR. If you push fixes, it reviews again - and checks its own prior comments so it doesn't nag about things you already addressed. See [PR Review Agent](https://github.com/dcellison/kai/wiki/PR-Review-Agent).
+When code is pushed to a pull request, Kai automatically reviews it. A one-shot agent subprocess analyzes the diff, checks for bugs, style issues, and spec compliance, and posts a review comment directly on the PR. If you push fixes, it reviews again - and checks its own prior comments so it doesn't nag about things you already addressed. See [PR Review Agent](https://github.com/dcellison/kai/wiki/PR-Review-Agent).
 
 ### Issue Triage Agent
 
-When a new issue is opened, Kai triages it automatically. A one-shot Claude subprocess reads the issue, applies labels (creating them if they don't exist), checks for duplicates and related issues, assigns it to a project board if appropriate, posts a triage summary comment, and sends you a Telegram notification. See [Issue Triage Agent](https://github.com/dcellison/kai/wiki/Issue-Triage-Agent).
+When a new issue is opened, Kai triages it automatically. A one-shot agent subprocess reads the issue, applies labels (creating them if they don't exist), checks for duplicates and related issues, assigns it to a project board if appropriate, posts a triage summary comment, and sends you a Telegram notification. See [Issue Triage Agent](https://github.com/dcellison/kai/wiki/Issue-Triage-Agent).
 
 Both agents are fire-and-forget background tasks that run independently of your chat session. They use separate Claude processes, so a review or triage can happen while you're mid-conversation. Opt-in via `PR_REVIEW_ENABLED` and `ISSUE_TRIAGE_ENABLED` in `.env`.
 
@@ -112,7 +112,7 @@ Responses stream into Telegram in real time, updating the message every 2 second
 
 ### Model switching
 
-Switch between Opus, Sonnet, and Haiku via `/models` (interactive picker) or `/model <name>` (direct). Changing models restarts the session.
+Switch models via `/models` (interactive picker) or `/model <name>` (direct). Available models depend on the configured backend: Claude Code offers Opus, Sonnet, and Haiku; Goose offers whatever the user's configured provider supports. Changing models restarts the session.
 
 ### Voice input
 
@@ -153,21 +153,25 @@ If interrupted mid-response, Kai notifies you on restart and asks you to resend 
 | `/github notify <chat_id>` | Route your GitHub notifications to a specific chat |
 | `/github reviews on\|off` | Enable or disable the PR review agent for you |
 | `/github triage on\|off` | Enable or disable the issue triage agent for you |
+| `/github add <owner/repo>` | Subscribe to a repo (auto-registers webhook if token set) |
+| `/github remove <owner/repo>` | Unsubscribe from a repo |
+| `/github token <token>` | Store GitHub PAT for auto-webhook registration |
 | `/voice` | Toggle voice responses on/off |
 | `/voice only` | Voice-only mode (no text) |
 | `/voice on` | Text + voice mode |
 | `/voice <name>` | Set voice |
 | `/voices` | Interactive voice picker |
 | `/stats` | Show session info, model, and cost |
-| `/jobs` | List active scheduled jobs |
-| `/canceljob <id>` | Cancel a scheduled job |
+| `/job` (or `/jobs`) | List scheduled jobs |
+| `/job info <id>` | Show job details |
+| `/job cancel <id>` | Cancel a scheduled job |
 | `/webhooks` | Show webhook server status |
 | `/help` | Show available commands |
 
 ## Requirements
 
 - Python 3.13+
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (default) or [Goose CLI](https://block.github.io/goose/) installed and authenticated
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - Your Telegram user ID (get it from [@userinfobot](https://t.me/userinfobot))
 
@@ -324,10 +328,12 @@ kai/
 ├── src/kai/                  # Source package
 │   ├── __init__.py           # Version
 │   ├── __main__.py           # python -m kai entry point
+│   ├── backend.py            # Agent backend ABC and shared context injection
 │   ├── main.py               # Async startup and shutdown
 │   ├── bot.py                # Telegram handlers, commands, message routing
 │   ├── claude.py             # Persistent Claude Code subprocess management
 │   ├── config.py             # Environment and per-workspace config loading
+│   ├── goose.py              # Goose ACP backend (JSON-RPC subprocess)
 │   ├── sessions.py           # SQLite session, job, and settings storage
 │   ├── cron.py               # Scheduled job execution (APScheduler)
 │   ├── webhook.py            # HTTP server: GitHub/generic webhooks, scheduling API
