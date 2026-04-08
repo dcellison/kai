@@ -2166,12 +2166,14 @@ class TestSavePrompt:
         assert call_order[1] == "kill"
 
     @pytest.mark.asyncio
-    async def test_shutdown_skips_save_prompt_when_lock_held(self):
-        """shutdown() skips _save_prompt() when _lock is held (stream in flight).
+    async def test_shutdown_waits_for_lock_then_saves(self):
+        """shutdown() waits for an active stream to finish, then saves.
 
-        If _send_locked() is mid-stream, the lock is held and _save_prompt()
-        would cause a concurrent stdout read. shutdown() should detect this
-        and skip the save, but still send SIGTERM/SIGKILL normally.
+        If _send_locked() is mid-stream, shutdown() blocks on lock
+        acquisition until the stream completes, then runs _save_prompt()
+        and terminates. This prevents the TOCTOU race where the old
+        _lock.locked() check could be stale by the time _save_prompt()
+        started reading stdout.
         """
         claude = _make_claude()
         mock_proc = MagicMock()
@@ -2179,21 +2181,33 @@ class TestSavePrompt:
         mock_proc.wait = AsyncMock()
         claude._proc = mock_proc
 
-        # Simulate an in-flight interaction by holding the lock
+        # Track ordering: lock release happens before save
+        call_order: list[str] = []
+        original_save = AsyncMock(side_effect=lambda **kw: call_order.append("save"))
+
+        # Hold the lock to simulate an in-flight stream
         await claude._lock.acquire()
 
-        try:
-            with (
-                patch.object(claude, "_save_prompt", new_callable=AsyncMock) as mock_save,
-                patch.object(claude, "_send_signal"),
-            ):
-                await claude.shutdown()
-        finally:
+        with (
+            patch.object(claude, "_save_prompt", new=original_save) as mock_save,
+            patch.object(claude, "_send_signal"),
+        ):
+            # Start shutdown in a task (it will block on the lock)
+            shutdown_task = asyncio.create_task(claude.shutdown())
+            # Let the event loop run - shutdown should be blocked
+            await asyncio.sleep(0)
+            assert not shutdown_task.done(), "shutdown should be waiting for the lock"
+
+            # Release the lock as if the stream finished
+            call_order.append("lock_released")
             claude._lock.release()
 
-        # _save_prompt must NOT be called when the lock is held
-        mock_save.assert_not_called()
-        # Process should still be cleaned up
+            # Let shutdown proceed
+            await asyncio.wait_for(shutdown_task, timeout=2)
+
+        # Save was called AFTER the lock was released
+        mock_save.assert_called_once()
+        assert call_order == ["lock_released", "save"]
         assert claude._proc is None
 
     @pytest.mark.asyncio
@@ -2226,18 +2240,20 @@ class TestSavePrompt:
         """Concurrent shutdown during an active stream does not raise readuntil errors.
 
         Simulates the real race: send() holds the lock and _send_locked()
-        reads stdout, then shutdown() fires from another task. The lock
-        guard in shutdown() should skip _save_prompt(), and the stream should
-        terminate cleanly via EOF when the process is killed.
+        reads stdout, then shutdown() fires from another task. shutdown()
+        blocks on the lock until the stream finishes. Since EOF triggers
+        _kill() inside _send_locked() (cleaning up _proc), shutdown()
+        finds _proc=None when it acquires the lock and skips save/terminate
+        (nothing left to do). The key assertion: no concurrent stdout
+        reads, no RuntimeError.
         """
         claude = _make_claude()
 
-        # Build a mock process whose stdout blocks, then returns EOF
-        # after shutdown sends SIGTERM.
+        # Build a mock process whose stdout blocks, then returns EOF.
         eof_event = asyncio.Event()
 
         async def slow_readline():
-            """Block until shutdown signals, then return EOF."""
+            """Block until signalled, then return EOF."""
             await eof_event.wait()
             return b""
 
@@ -2257,40 +2273,38 @@ class TestSavePrompt:
         claude._fresh_session = False
         claude._session_started_at = time.monotonic()
 
-        # Patch _ensure_started so send() skips launch
         with (
             patch.object(claude, "_ensure_started", new_callable=AsyncMock),
-            patch.object(claude, "_send_signal", side_effect=lambda s: eof_event.set()),
             patch.object(claude, "_save_prompt", new_callable=AsyncMock) as mock_save,
+            patch.object(claude, "_send_signal"),
         ):
-            # Start streaming via send() (which acquires the lock), not
-            # _send_locked() directly. send() holds self._lock for the
-            # entire duration of the stream.
+            # Start streaming via send() (which acquires the lock)
             async def do_stream():
                 async for _ in claude.send("hello", chat_id=123):
                     pass
 
             stream_task = asyncio.create_task(do_stream())
-            # Yield enough times for send() to advance through
-            # _ensure_started (AsyncMock - needs its own tick) and
-            # then acquire the lock.
             for _ in range(5):
                 await asyncio.sleep(0)
 
-            # Verify the lock is actually held before we call shutdown
             assert claude._lock.locked(), "Lock should be held by the stream task"
 
-            # Now shutdown - lock is held by the stream task
-            await claude.shutdown()
+            # Start shutdown - blocks on lock
+            shutdown_task = asyncio.create_task(claude.shutdown())
+            await asyncio.sleep(0)
+            assert not shutdown_task.done(), "shutdown should be waiting for the lock"
 
-            # The stream task should finish cleanly (EOF from signal)
-            try:
-                await asyncio.wait_for(stream_task, timeout=2)
-            except TimeoutError:
-                stream_task.cancel()
+            # End the stream by signalling EOF. _send_locked() will
+            # call _kill() which sets _proc=None, then release the lock.
+            eof_event.set()
 
-        # _save_prompt must have been skipped (lock was held)
+            await asyncio.wait_for(stream_task, timeout=2)
+            await asyncio.wait_for(shutdown_task, timeout=2)
+
+        # _save_prompt NOT called: the stream's EOF handler already
+        # killed the process, so shutdown() found _proc=None.
         mock_save.assert_not_called()
+        assert claude._proc is None
 
 
 # ── change_workspace ─────────────────────────────────────────────────

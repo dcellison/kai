@@ -762,61 +762,62 @@ class ClaudeCodeBackend(AgentBackend):
         """
         Gracefully shut down the Claude process.
 
+        Acquires the send lock for the entire sequence so that
+        _save_prompt() (which reads stdout) cannot overlap with a new
+        send() call's readline(). If a stream is in progress, we wait
+        for it to finish before proceeding.
+
         Sends SIGTERM first and waits up to 5 seconds for clean exit.
         Falls back to SIGKILL if the process doesn't terminate in time.
-        Called during bot shutdown from main.py.
 
-        Unlike the old implementation, this does NOT check returncode before
-        sending signals. When claude_user is set, self._proc tracks sudo,
-        not claude - if sudo exits from SIGTERM before claude does, the
-        returncode guard would skip the SIGKILL fallback, orphaning claude.
-        _send_signal() handles already-dead processes via OSError instead.
+        Unlike the old implementation, this does NOT check returncode
+        before sending signals. When claude_user is set, self._proc
+        tracks sudo, not claude - if sudo exits from SIGTERM before
+        claude does, the returncode guard would skip the SIGKILL
+        fallback, orphaning claude. _send_signal() handles
+        already-dead processes via OSError instead.
         """
-        if self._proc:
-            # Only save if no interaction is in flight. _save_prompt()
-            # reads stdout, which would conflict with the readline() in
-            # _send_locked() and violate StreamReader's single-reader
-            # invariant. _lock.locked() is a synchronous check - safe to
-            # call without awaiting, and avoids the deadlock that would
-            # occur if we tried to acquire (since _kill() is also called
-            # from within _send_locked on error paths).
-            #
-            # Note: there is a theoretical TOCTOU window between the
-            # check and _save_prompt()'s first await (drain at stdin
-            # write). In practice this is negligible because shutdown()
-            # runs during cleanup when new send() calls are not arriving.
-            if not self._lock.locked():
+        # Hold the lock through save + terminate so no send() can
+        # start a concurrent stdout read during _save_prompt().
+        # If a stream is in flight, this blocks until it finishes.
+        # Note: _kill() (called from _send_locked error paths) does
+        # NOT acquire _lock, so there is no deadlock risk.
+        async with self._lock:
+            if self._proc:
                 await self._save_prompt()
-            else:
-                log.info("Skipping save prompt - interaction in flight")
 
-            saved_pgid = self._pgid
+                saved_pgid = self._pgid
 
-            self._send_signal(signal.SIGTERM)
-            try:
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
-            except TimeoutError:
-                self._send_signal(signal.SIGKILL)
+                self._send_signal(signal.SIGTERM)
                 try:
                     await asyncio.wait_for(self._proc.wait(), timeout=5)
                 except TimeoutError:
-                    log.warning("Process did not exit after SIGKILL; abandoning")
-        else:
-            saved_pgid = None
+                    self._send_signal(signal.SIGKILL)
+                    try:
+                        await asyncio.wait_for(self._proc.wait(), timeout=5)
+                    except TimeoutError:
+                        log.warning("Process did not exit after SIGKILL; abandoning")
+            else:
+                saved_pgid = None
 
-        # Cancel stderr drain before clearing proc (same invariant as _kill:
-        # the drain task checks self._proc, so cancel it first).
-        if self._stderr_task:
-            self._stderr_task.cancel()
-            self._stderr_task = None
+            # Cancel stderr drain before clearing proc (same invariant
+            # as _kill: the drain task checks self._proc, so cancel it
+            # first).
+            if self._stderr_task:
+                self._stderr_task.cancel()
+                self._stderr_task = None
 
-        # Clean up state regardless of how (or whether) the process exited
-        self._proc = None
-        self._pgid = None
-        self._session_started_at = None
+            # Clean up state regardless of how (or whether) the process
+            # exited. Done inside the lock so any queued send() sees
+            # _proc=None and starts a fresh process via _ensure_started.
+            self._proc = None
+            self._pgid = None
+            self._session_started_at = None
 
         # Final cleanup: signal the saved process group one more time
-        # to catch any orphaned children that survived the initial signals.
+        # to catch any orphaned children that survived the initial
+        # signals. Done outside the lock since it touches no shared
+        # reader state.
         if saved_pgid is not None:
             try:
                 os.killpg(saved_pgid, signal.SIGKILL)
