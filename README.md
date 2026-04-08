@@ -74,7 +74,7 @@ Run `make config` to generate `users.yaml`, or create one manually from `users.e
 
 Three layers of persistent context give the agent continuity across sessions:
 
-1. **Auto-memory** - managed by Claude Code per-workspace. Project architecture and patterns.
+1. **Identity config** (`CLAUDE.md`) - voice, rules, API docs, and operational guidelines. Static, installed with the workspace.
 2. **Home memory** (`DATA_DIR/memory/MEMORY.md`) - personal memory, always injected regardless of current workspace. Proactively updated by Kai.
 3. **Conversation history** (`DATA_DIR/history/<chat_id>/`) - JSONL logs, one file per day per user. Searchable for past conversations.
 
