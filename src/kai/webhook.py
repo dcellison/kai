@@ -717,6 +717,19 @@ async def _process_github_event_for_user(
     user_config = config.get_user_config(chat_id)
     claude_user = user_config.os_user if user_config and user_config.os_user else config.claude_user
 
+    # Resolve per-user backend/provider for the review/triage agents.
+    # Same resolution logic as pool.py _create_instance: per-user
+    # config overrides global config.
+    if user_config and user_config.agent_backend:
+        agent_backend = user_config.agent_backend
+    else:
+        agent_backend = config.agent_backend
+
+    if user_config and user_config.goose_provider:
+        goose_provider = user_config.goose_provider
+    else:
+        goose_provider = config.goose_provider
+
     # ── PR review routing ────────────────────────────────────────
     # When PR review is enabled for this user, reviewable PR events
     # (opened, reopened, synchronize) are routed to the review pipeline
@@ -762,6 +775,8 @@ async def _process_github_event_for_user(
                     local_repo_path=local_repo_path,
                     spec_dir=request.app.get("spec_dir", "specs"),
                     notify_chat_id=target_chat_id,
+                    agent_backend=agent_backend,
+                    goose_provider=goose_provider,
                 )
             )
             _background_tasks.add(task)
@@ -806,6 +821,8 @@ async def _process_github_event_for_user(
                     webhook_secret=request.app["webhook_secret"],
                     claude_user=claude_user,
                     notify_chat_id=target_chat_id,
+                    agent_backend=agent_backend,
+                    goose_provider=goose_provider,
                 )
             )
             _background_tasks.add(task)

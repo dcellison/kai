@@ -1,20 +1,21 @@
 """
-Issue triage agent - one-shot Claude subprocess for automated issue triage.
+Issue triage agent - one-shot subprocess (Claude or Goose) for automated issue triage.
 
 Provides functionality to:
 1. Extract metadata from GitHub issue webhook payloads
 2. Search for related/duplicate issues via the GitHub CLI
 3. List available GitHub Projects for board assignment
 4. Construct boundary-delimited triage prompts (prompt injection prevention)
-5. Spawn a one-shot Claude subprocess in --print mode for analysis
+5. Spawn a one-shot LLM subprocess for analysis
 6. Parse structured JSON responses from Claude (with markdown fence stripping)
 7. Apply triage results: labels, project assignment, comments, notifications
 8. Orchestrate the full pipeline from webhook event to posted triage
 
 Follows the same fire-and-forget subprocess pattern established by the PR
-review agent (review.py). Each triage is a fresh Claude invocation with no
-persistent state. The Claude subprocess runs in --print mode (non-interactive,
-no tools, no streaming).
+review agent (review.py). Each triage is a fresh LLM invocation with no
+persistent state. The subprocess runs in one-shot mode: `claude --print`
+for Claude, `goose run -i -` for Goose (non-interactive, no tools, no
+streaming).
 
 Unlike the review agent (which returns free-form markdown), triage uses
 structured JSON output from Claude to drive automated actions (label
@@ -47,8 +48,49 @@ _TRIAGE_MODEL = "sonnet"
 # Per-triage budget cap in USD.
 _TRIAGE_BUDGET_USD = 1.0
 
-# Timeout for the Claude subprocess in seconds.
+# Timeout for the triage subprocess in seconds.
 _TRIAGE_TIMEOUT = 300
+
+# Mid-tier model per provider for Goose background agent tasks. Matches
+# the "sonnet" design decision for Claude - background tasks should not
+# burn frontier-tier tokens. Full provider-native model IDs are required
+# because `goose run --model` uses provider naming, not Claude aliases.
+#
+# NOTE: Kai stores Google's provider as "google" in VALID_GOOSE_PROVIDERS,
+# but Goose's --help lists it as "gemini-cli". This dict keys on Kai's
+# stored value ("google"). If Goose requires "gemini-cli", that is a
+# pre-existing config.py naming issue, not introduced by this change.
+_GOOSE_AGENT_MODELS: dict[str, str] = {
+    "anthropic": "claude-sonnet-4-6",
+    "openai": "gpt-5.4",
+    "google": "gemini-3-flash",
+}
+
+
+def _resolve_goose_model(goose_provider: str) -> str:
+    """Pick the triage model for a Goose provider.
+
+    Curated providers get a hardcoded mid-tier model (cost-effective
+    for background tasks). Open-ended providers (openrouter, ollama)
+    fall back to the GOOSE_MODEL env var, which is the user's
+    configured model. There is no safe default for those providers.
+
+    Raises RuntimeError if no model can be resolved (open-ended
+    provider with no GOOSE_MODEL set).
+    """
+    model = _GOOSE_AGENT_MODELS.get(goose_provider)
+    if model:
+        return model
+    # Open-ended provider: use whatever the user configured.
+    # GOOSE_MODEL is set in the process environment by the launcher.
+    model = os.environ.get("GOOSE_MODEL", "")
+    if not model:
+        raise RuntimeError(
+            f"No model configured for Goose provider '{goose_provider}'. "
+            f"Set GOOSE_MODEL in the environment or DEFAULT_MODEL in .env."
+        )
+    return model
+
 
 # Default colors for auto-created labels. Maps label name to a hex color
 # (without the # prefix). Unlisted labels get a neutral gray.
@@ -344,71 +386,120 @@ def build_triage_prompt(
 async def run_triage(
     prompt: str,
     claude_user: str | None = None,
+    agent_backend: str = "claude",
+    goose_provider: str = "",
 ) -> str:
     """
-    Spawn a one-shot Claude subprocess to perform the triage analysis.
+    Spawn a one-shot LLM subprocess to perform the triage analysis.
 
-    Uses `claude --print` mode which reads a prompt from stdin and writes
-    the response to stdout as plain text. No streaming, no tools, no
-    interactive session. Same pattern as run_review() in review.py.
+    Dispatches to either Claude (`claude --print`) or Goose
+    (`goose run -i -`) based on agent_backend. Both read from stdin
+    and write plain text to stdout. Same pattern as run_review()
+    in review.py.
 
     Args:
         prompt: The complete triage prompt (from build_triage_prompt).
         claude_user: Optional OS user to run Claude as (via sudo -u).
+            Ignored when agent_backend is "goose".
+        agent_backend: Which LLM backend to use ("claude" or "goose").
+        goose_provider: Goose provider name (e.g. "anthropic", "openai").
+            Only used when agent_backend is "goose".
 
     Returns:
-        The raw triage response text from Claude (expected to be JSON).
+        The raw triage response text from the LLM (expected to be JSON).
 
     Raises:
-        RuntimeError: If the Claude subprocess fails or times out.
+        RuntimeError: If the subprocess fails or times out.
     """
-    cmd = [
-        "claude",
-        "--print",
-        "--model",
-        _TRIAGE_MODEL,
-        "--max-budget-usd",
-        str(_TRIAGE_BUDGET_USD),
-    ]
+    if agent_backend == "goose":
+        # Goose one-shot mode: read prompt from stdin, write response
+        # to stdout. -q suppresses non-response output, --no-session
+        # avoids creating session files, --no-profile skips user
+        # config, --max-turns 1 prevents runaway tool loops.
+        model = _resolve_goose_model(goose_provider)
+        cmd = [
+            "goose",
+            "run",
+            "-i",
+            "-",
+            "--provider",
+            goose_provider,
+            "--model",
+            model,
+            "-q",
+            "--no-session",
+            "--no-profile",
+            "--max-turns",
+            "1",
+        ]
 
-    # Resolve self-sudo: skip sudo when claude_user matches the bot
-    # process user. Uses the resolved value for both the spawn command
-    # and the cleanup path below.
-    effective_user = resolve_claude_user(claude_user)
-
-    if effective_user:
-        cmd = ["sudo", "-u", effective_user, "--"] + cmd
-
-    # When spawned via sudo, start in a new process group so the
-    # entire tree (sudo + claude) can be killed via os.killpg().
-    # Without this, killing sudo orphans the claude Node.js process.
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=bool(effective_user),
-    )
-
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=prompt.encode()),
-            timeout=_TRIAGE_TIMEOUT,
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            # No start_new_session - Goose doesn't use sudo,
+            # so there is no parent/child process tree to manage.
         )
-    except TimeoutError:
-        # Kill the subprocess tree if it exceeds the timeout.
-        # When effective_user is set, start_new_session=True puts the
-        # process in a new group (PGID == PID). Kill the group so
-        # both sudo and its claude child die, preventing orphans.
-        if effective_user:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass  # Already dead
-        else:
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=prompt.encode()),
+                timeout=_TRIAGE_TIMEOUT,
+            )
+        except TimeoutError:
             proc.kill()
-        await proc.wait()
-        raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from None
+            await proc.wait()
+            raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from None
+    else:
+        # Claude one-shot mode: --print reads from stdin, writes to stdout.
+        cmd = [
+            "claude",
+            "--print",
+            "--model",
+            _TRIAGE_MODEL,
+            "--max-budget-usd",
+            str(_TRIAGE_BUDGET_USD),
+        ]
+
+        # Resolve self-sudo: skip sudo when claude_user matches the bot
+        # process user. Uses the resolved value for both the spawn command
+        # and the cleanup path below.
+        effective_user = resolve_claude_user(claude_user)
+
+        if effective_user:
+            cmd = ["sudo", "-u", effective_user, "--"] + cmd
+
+        # When spawned via sudo, start in a new process group so the
+        # entire tree (sudo + claude) can be killed via os.killpg().
+        # Without this, killing sudo orphans the claude Node.js process.
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=bool(effective_user),
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=prompt.encode()),
+                timeout=_TRIAGE_TIMEOUT,
+            )
+        except TimeoutError:
+            # Kill the subprocess tree if it exceeds the timeout.
+            # When effective_user is set, start_new_session=True puts the
+            # process in a new group (PGID == PID). Kill the group so
+            # both sudo and its claude child die, preventing orphans.
+            if effective_user:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # Already dead
+            else:
+                proc.kill()
+            await proc.wait()
+            raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from None
 
     if proc.returncode != 0:
         error = stderr.decode().strip()
@@ -771,6 +862,8 @@ async def triage_issue(
     webhook_secret: str,
     claude_user: str | None = None,
     notify_chat_id: int | None = None,
+    agent_backend: str = "claude",
+    goose_provider: str = "",
 ) -> None:
     """
     Full triage pipeline: analyze issue, apply labels, post results.
@@ -806,8 +899,13 @@ async def triage_issue(
         # Step 3: Build the triage prompt
         prompt = build_triage_prompt(metadata, related_issues, projects)
 
-        # Step 4: Run the Claude triage subprocess
-        raw_response = await run_triage(prompt, claude_user=claude_user)
+        # Step 4: Run the triage subprocess (Claude or Goose)
+        raw_response = await run_triage(
+            prompt,
+            claude_user=claude_user,
+            agent_backend=agent_backend,
+            goose_provider=goose_provider,
+        )
 
         if not raw_response.strip():
             log.warning("Empty triage output for %s#%d", metadata.repo, metadata.number)

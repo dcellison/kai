@@ -1,11 +1,11 @@
 """
-PR review agent - one-shot Claude subprocess for automated code review.
+PR review agent - one-shot subprocess (Claude or Goose) for automated code review.
 
 Provides functionality to:
 1. Fetch PR diffs and metadata via the GitHub CLI
 2. Construct boundary-delimited review prompts (prompt injection prevention)
 3. Resolve and load spec files from the local filesystem for compliance checking
-4. Spawn a one-shot Claude subprocess in --print mode for review
+4. Spawn a one-shot LLM subprocess for review
 5. Post review output as a GitHub PR comment via gh CLI
 6. Send review summaries to Telegram via the send-message API
 7. Orchestrate the full pipeline from webhook event to posted review
@@ -18,9 +18,10 @@ in context, so issues that were already raised and dismissed are not
 repeated. If the relevant code has materially changed, the agent may
 re-evaluate a prior finding.
 
-The Claude subprocess runs in --print mode (non-interactive, no tools, no
-streaming). The prompt goes in via stdin to handle large diffs without
-hitting shell argument length limits. Output is captured as plain text.
+The LLM subprocess runs in one-shot mode (non-interactive, no tools, no
+streaming): `claude --print` for Claude, `goose run -i -` for Goose.
+The prompt goes in via stdin to handle large diffs without hitting shell
+argument length limits. Output is captured as plain text.
 """
 
 import asyncio
@@ -54,11 +55,52 @@ _REVIEW_MODEL = "sonnet"
 # Sonnet reviews of typical PRs cost well under $0.50.
 _REVIEW_BUDGET_USD = 1.0
 
-# Timeout for the Claude subprocess in seconds. Sonnet 4.6+ uses extended
+# Timeout for the review subprocess in seconds. Sonnet 4.6+ uses extended
 # thinking, which can take significantly longer on large diffs with prior
 # review context. 15 minutes accommodates thinking-heavy reviews while
 # still catching genuinely stuck processes.
 _REVIEW_TIMEOUT = 900
+
+# Mid-tier model per provider for Goose background agent tasks. Matches
+# the "sonnet" design decision for Claude - background tasks should not
+# burn frontier-tier tokens. Full provider-native model IDs are required
+# because `goose run --model` uses provider naming, not Claude aliases.
+#
+# NOTE: Kai stores Google's provider as "google" in VALID_GOOSE_PROVIDERS,
+# but Goose's --help lists it as "gemini-cli". This dict keys on Kai's
+# stored value ("google"). If Goose requires "gemini-cli", that is a
+# pre-existing config.py naming issue, not introduced by this change.
+_GOOSE_AGENT_MODELS: dict[str, str] = {
+    "anthropic": "claude-sonnet-4-6",
+    "openai": "gpt-5.4",
+    "google": "gemini-3-flash",
+}
+
+
+def _resolve_goose_model(goose_provider: str) -> str:
+    """Pick the review model for a Goose provider.
+
+    Curated providers get a hardcoded mid-tier model (cost-effective
+    for background tasks). Open-ended providers (openrouter, ollama)
+    fall back to the GOOSE_MODEL env var, which is the user's
+    configured model. There is no safe default for those providers.
+
+    Raises RuntimeError if no model can be resolved (open-ended
+    provider with no GOOSE_MODEL set).
+    """
+    model = _GOOSE_AGENT_MODELS.get(goose_provider)
+    if model:
+        return model
+    # Open-ended provider: use whatever the user configured.
+    # GOOSE_MODEL is set in the process environment by the launcher.
+    model = os.environ.get("GOOSE_MODEL", "")
+    if not model:
+        raise RuntimeError(
+            f"No model configured for Goose provider '{goose_provider}'. "
+            f"Set GOOSE_MODEL in the environment or DEFAULT_MODEL in .env."
+        )
+    return model
+
 
 # Header prepended to every review comment on GitHub. Distinguishes
 # automated reviews from human comments. Per design decision #11.
@@ -612,75 +654,126 @@ async def fetch_pr_diff(repo: str, pr_number: int) -> str:
 async def run_review(
     prompt: str,
     claude_user: str | None = None,
+    agent_backend: str = "claude",
+    goose_provider: str = "",
 ) -> str:
     """
-    Spawn a one-shot Claude subprocess to perform the review.
+    Spawn a one-shot LLM subprocess to perform the review.
 
-    Uses `claude --print` mode which reads a prompt from stdin and writes
-    the response to stdout as plain text. No streaming, no tools, no
-    interactive session. The subprocess is completely independent from the
-    main chat session.
+    Dispatches to either Claude (`claude --print`) or Goose
+    (`goose run -i -`) based on agent_backend. Both read from stdin
+    and write plain text to stdout; the prompt and output handling
+    are identical regardless of backend.
 
-    When claude_user is set, the subprocess is spawned via sudo -u for
-    OS-level isolation, matching the pattern used by ClaudeCodeBackend.
+    Claude path: supports sudo -u for OS-level isolation, process
+    group kills for cleanup, and per-run budget caps.
+
+    Goose path: no sudo (Goose has no user isolation), simple
+    proc.kill() for cleanup, --max-turns 1 as the safety limit.
 
     Args:
         prompt: The complete review prompt (from build_review_prompt).
         claude_user: Optional OS user to run Claude as (via sudo -u).
+            Ignored when agent_backend is "goose".
+        agent_backend: Which LLM backend to use ("claude" or "goose").
+        goose_provider: Goose provider name (e.g. "anthropic", "openai").
+            Only used when agent_backend is "goose".
 
     Returns:
-        The review text output from Claude.
+        The review text output from the LLM.
 
     Raises:
-        RuntimeError: If the Claude subprocess fails or times out.
+        RuntimeError: If the subprocess fails or times out.
     """
-    cmd = [
-        "claude",
-        "--print",
-        "--model",
-        _REVIEW_MODEL,
-        "--max-budget-usd",
-        str(_REVIEW_BUDGET_USD),
-    ]
+    if agent_backend == "goose":
+        # Goose one-shot mode: read prompt from stdin, write response
+        # to stdout. -q suppresses non-response output, --no-session
+        # avoids creating session files, --no-profile skips user
+        # config, --max-turns 1 prevents runaway tool loops.
+        model = _resolve_goose_model(goose_provider)
+        cmd = [
+            "goose",
+            "run",
+            "-i",
+            "-",
+            "--provider",
+            goose_provider,
+            "--model",
+            model,
+            "-q",
+            "--no-session",
+            "--no-profile",
+            "--max-turns",
+            "1",
+        ]
 
-    # Resolve self-sudo: skip sudo when claude_user matches the bot
-    # process user. Uses the resolved value for both the spawn command
-    # and the cleanup path below.
-    effective_user = resolve_claude_user(claude_user)
-
-    if effective_user:
-        cmd = ["sudo", "-u", effective_user, "--"] + cmd
-
-    # When spawned via sudo, start in a new process group so the
-    # entire tree (sudo + claude) can be killed via os.killpg().
-    # Without this, killing sudo orphans the claude Node.js process.
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=bool(effective_user),
-    )
-
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=prompt.encode()),
-            timeout=_REVIEW_TIMEOUT,
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            # No start_new_session - Goose doesn't use sudo,
+            # so there is no parent/child process tree to manage.
         )
-    except TimeoutError:
-        # Kill the subprocess tree if it exceeds the timeout.
-        # When effective_user is set, start_new_session=True puts the
-        # process in a new group (PGID == PID). Kill the group so
-        # both sudo and its claude child die, preventing orphans.
-        if effective_user:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass  # Already dead
-        else:
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=prompt.encode()),
+                timeout=_REVIEW_TIMEOUT,
+            )
+        except TimeoutError:
             proc.kill()
-        await proc.wait()
-        raise RuntimeError(f"Review subprocess timed out after {_REVIEW_TIMEOUT}s") from None
+            await proc.wait()
+            raise RuntimeError(f"Review subprocess timed out after {_REVIEW_TIMEOUT}s") from None
+    else:
+        # Claude one-shot mode: --print reads from stdin, writes to stdout.
+        cmd = [
+            "claude",
+            "--print",
+            "--model",
+            _REVIEW_MODEL,
+            "--max-budget-usd",
+            str(_REVIEW_BUDGET_USD),
+        ]
+
+        # Resolve self-sudo: skip sudo when claude_user matches the bot
+        # process user. Uses the resolved value for both the spawn command
+        # and the cleanup path below.
+        effective_user = resolve_claude_user(claude_user)
+
+        if effective_user:
+            cmd = ["sudo", "-u", effective_user, "--"] + cmd
+
+        # When spawned via sudo, start in a new process group so the
+        # entire tree (sudo + claude) can be killed via os.killpg().
+        # Without this, killing sudo orphans the claude Node.js process.
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=bool(effective_user),
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=prompt.encode()),
+                timeout=_REVIEW_TIMEOUT,
+            )
+        except TimeoutError:
+            # Kill the subprocess tree if it exceeds the timeout.
+            # When effective_user is set, start_new_session=True puts the
+            # process in a new group (PGID == PID). Kill the group so
+            # both sudo and its claude child die, preventing orphans.
+            if effective_user:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # Already dead
+            else:
+                proc.kill()
+            await proc.wait()
+            raise RuntimeError(f"Review subprocess timed out after {_REVIEW_TIMEOUT}s") from None
 
     if proc.returncode != 0:
         error = stderr.decode().strip()
@@ -790,6 +883,8 @@ async def review_pr(
     local_repo_path: str | None = None,
     spec_dir: str = "specs",
     notify_chat_id: int | None = None,
+    agent_backend: str = "claude",
+    goose_provider: str = "",
 ) -> None:
     """
     Full review pipeline: fetch diff, build prompt, run review, post results.
@@ -849,8 +944,13 @@ async def review_pr(
             prior_comments=prior_comments,
         )
 
-        # Step 3: Run the Claude review subprocess
-        review_text = await run_review(prompt, claude_user=claude_user)
+        # Step 3: Run the review subprocess (Claude or Goose)
+        review_text = await run_review(
+            prompt,
+            claude_user=claude_user,
+            agent_backend=agent_backend,
+            goose_provider=goose_provider,
+        )
 
         if not review_text.strip():
             log.warning("Empty review output for %s#%d", metadata.repo, metadata.number)
