@@ -308,17 +308,26 @@ def main() -> None:
             # Register slash command menu in Telegram's bot command list
             await app.bot.set_my_commands(
                 [
+                    # Session
+                    BotCommand("stop", "Interrupt current response"),
+                    BotCommand("new", "Start a fresh session"),
+                    # Model
                     BotCommand("models", "Choose a model"),
                     BotCommand("model", "Switch model directly"),
-                    BotCommand("new", "Start a fresh session"),
+                    # Settings
+                    BotCommand("settings", "Show or change your settings"),
+                    # Workspace
                     BotCommand("workspace", "Switch working directory"),
                     BotCommand("workspaces", "List recent workspaces"),
-                    BotCommand("stop", "Interrupt current response"),
+                    # GitHub
+                    BotCommand("github", "Show GitHub settings"),
+                    # Voice
+                    BotCommand("voice", "Toggle voice or set voice name"),
+                    BotCommand("voices", "Choose a voice"),
+                    # Info
                     BotCommand("stats", "Show session info and cost"),
                     BotCommand("jobs", "List scheduled jobs"),
                     BotCommand("canceljob", "Cancel a scheduled job"),
-                    BotCommand("voice", "Toggle voice responses / set voice"),
-                    BotCommand("voices", "Choose a voice (inline buttons)"),
                     BotCommand("webhooks", "Show webhook server status"),
                     BotCommand("help", "Show available commands"),
                 ]

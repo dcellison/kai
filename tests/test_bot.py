@@ -4282,3 +4282,82 @@ class TestFieldAliases:
         assert _FIELD_ALIASES.get("model", "model") == "model"
         assert _FIELD_ALIASES.get("budget", "budget") == "budget"
         assert _FIELD_ALIASES.get("timeout", "timeout") == "timeout"
+
+
+# ── Command menu completeness ────────────────────────────────────────
+
+# Commands in the Telegram dropdown menu (set_my_commands in main.py).
+# Every command here must have a registered CommandHandler in create_bot().
+# Intentionally excluded from the menu:
+#   - start: Telegram convention, auto-triggered on first interaction
+#   - ws: alias for /workspace, would be redundant in the menu
+EXPECTED_MENU_COMMANDS = {
+    "canceljob",
+    "github",
+    "help",
+    "jobs",
+    "model",
+    "models",
+    "new",
+    "settings",
+    "stats",
+    "stop",
+    "voice",
+    "voices",
+    "webhooks",
+    "workspace",
+    "workspaces",
+}
+
+
+class TestCommandMenu:
+    """Tests that the Telegram command menu stays in sync with handlers."""
+
+    @pytest.fixture(autouse=True)
+    def _init_services(self, tmp_path):
+        """Initialize services before create_bot() (same as TestCreateBotTransportMode)."""
+        from kai import services
+
+        services.load_services(tmp_path / "nonexistent.yaml")
+
+    def test_every_menu_command_has_a_handler(self):
+        """Every command in EXPECTED_MENU_COMMANDS has a registered CommandHandler.
+
+        Catches the case where a command is added to the menu but the
+        handler registration is missing or renamed.
+        """
+        from telegram.ext import CommandHandler as CH
+
+        config = _make_config()
+        app = create_bot(config)
+
+        # Collect all command names from registered CommandHandlers
+        registered: set[str] = set()
+        for group_handlers in app.handlers.values():
+            for handler in group_handlers:
+                if isinstance(handler, CH):
+                    registered.update(handler.commands)
+
+        missing = EXPECTED_MENU_COMMANDS - registered
+        assert not missing, f"Menu commands without handlers: {missing}"
+
+    def test_menu_matches_expected_set(self):
+        """The set_my_commands list in main.py matches EXPECTED_MENU_COMMANDS.
+
+        Parses the actual source to extract BotCommand names, so the test
+        breaks if someone adds/removes a menu entry without updating the
+        expected set.
+        """
+        import re
+
+        main_py = Path(__file__).parent.parent / "src" / "kai" / "main.py"
+        source = main_py.read_text()
+
+        # Extract all BotCommand("name", ...) from the source
+        menu_commands = set(re.findall(r'BotCommand\("(\w+)"', source))
+
+        assert menu_commands == EXPECTED_MENU_COMMANDS, (
+            f"Menu drift detected. "
+            f"Added: {menu_commands - EXPECTED_MENU_COMMANDS}, "
+            f"Removed: {EXPECTED_MENU_COMMANDS - menu_commands}"
+        )
