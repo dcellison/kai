@@ -1162,10 +1162,7 @@ async def handle_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     # Unknown subcommand
     await update.message.reply_text(
-        "Usage:\n"
-        "/job - List all jobs\n"
-        "/job info <id> - Show job details\n"
-        "/job cancel <id> - Cancel a job"
+        "Usage:\n/job - List all jobs\n/job info <id> - Show job details\n/job cancel <id> - Cancel a job"
     )
 
 
