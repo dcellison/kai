@@ -34,6 +34,12 @@ users:
     # timeout: 300            # response timeout in seconds (max 600)
     # context_window: 200000  # context window in tokens (0 = default)
 
+    # Agent backend. Overrides the global AGENT_BACKEND from .env for
+    # this user only. Default is "claude" (Claude Code CLI). Set to
+    # "goose" to use Goose ACP with the specified provider.
+    # agent_backend: goose
+    # goose_provider: openai    # required when agent_backend is goose
+
     # GitHub notification settings. github_repos controls which repos
     # route events to this user. pr_review and issue_triage toggle
     # automated processing. github_notify_chat_id sends notifications
