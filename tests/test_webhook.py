@@ -1,6 +1,7 @@
 """Tests for webhook.py pure functions and GitHub event formatters."""
 
 import asyncio
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -2061,6 +2062,108 @@ class TestPerUserRouting:
         # Event goes to fallback admin (12345), not user 111
         call_args = app["telegram_bot"].send_message.call_args
         assert call_args[0][0] == 12345
+
+    @pytest.mark.asyncio
+    async def test_review_receives_user_backend(self, _clear_cooldowns, _mock_resolve_repo):
+        """Per-user agent_backend/goose_provider are passed to review_pr."""
+        base = self._make_user_config(111, repos=["owner/repo"])
+        # Frozen dataclass - use replace to set per-user backend override
+        user = dataclasses.replace(base, agent_backend="goose", goose_provider="openai")
+        config = self._make_config_with_users([user])
+        # Global defaults (should be overridden by per-user values)
+        config.agent_backend = "claude"
+        config.goose_provider = ""
+        app = _build_test_app(config=config)
+        payload = _make_pr_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with (
+            _mock_settings(pr_review=True, notify_chat_id=111),
+            patch("kai.webhook.review.review_pr", new_callable=AsyncMock) as mock_review,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+            await asyncio.sleep(0.01)
+            mock_review.assert_called_once()
+            assert mock_review.call_args[1]["agent_backend"] == "goose"
+            assert mock_review.call_args[1]["goose_provider"] == "openai"
+
+    @pytest.mark.asyncio
+    async def test_triage_receives_user_backend(self, _clear_cooldowns):
+        """Per-user agent_backend/goose_provider are passed to triage_issue."""
+        base = self._make_user_config(111, repos=["owner/repo"])
+        user = dataclasses.replace(base, agent_backend="goose", goose_provider="anthropic")
+        config = self._make_config_with_users([user])
+        config.agent_backend = "claude"
+        config.goose_provider = ""
+        app = _build_test_app(config=config)
+        payload = _make_issue_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with (
+            _mock_settings(issue_triage=True, notify_chat_id=111),
+            patch("kai.webhook.triage.triage_issue", new_callable=AsyncMock) as mock_triage,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "issues",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+            await asyncio.sleep(0.01)
+            mock_triage.assert_called_once()
+            assert mock_triage.call_args[1]["agent_backend"] == "goose"
+            assert mock_triage.call_args[1]["goose_provider"] == "anthropic"
+
+    @pytest.mark.asyncio
+    async def test_review_uses_global_backend_when_no_user_override(self, _clear_cooldowns, _mock_resolve_repo):
+        """Without per-user override, review_pr gets the global backend."""
+        user = self._make_user_config(111, repos=["owner/repo"])
+        # No agent_backend/goose_provider set on user - defaults are None
+        config = self._make_config_with_users([user])
+        config.agent_backend = "goose"
+        config.goose_provider = "google"
+        app = _build_test_app(config=config)
+        payload = _make_pr_payload("opened")
+        body = json.dumps(payload).encode()
+        sig = _sign_payload(payload)
+
+        with (
+            _mock_settings(pr_review=True, notify_chat_id=111),
+            patch("kai.webhook.review.review_pr", new_callable=AsyncMock) as mock_review,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/webhook/github",
+                    data=body,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-Hub-Signature-256": sig,
+                    },
+                )
+                assert resp.status == 200
+
+            await asyncio.sleep(0.01)
+            mock_review.assert_called_once()
+            # Falls back to global config values
+            assert mock_review.call_args[1]["agent_backend"] == "goose"
+            assert mock_review.call_args[1]["goose_provider"] == "google"
 
 
 # ── add_allowed_chat_id / remove_allowed_chat_id ────────────────────

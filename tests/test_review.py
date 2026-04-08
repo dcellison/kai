@@ -10,10 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kai.review import (
+    _GOOSE_AGENT_MODELS,
     _MAX_DIFF_CHARS,
     _MAX_PRIOR_COMMENTS_CHARS,
     _REVIEW_HEADER,
     PRMetadata,
+    _resolve_goose_model,
     build_review_prompt,
     extract_pr_metadata,
     fetch_pr_diff,
@@ -675,6 +677,174 @@ class TestRunReview:
         call_kwargs = mock_proc.communicate.call_args
         # The input kwarg contains the encoded prompt
         assert call_kwargs[1]["input"] == b"the review prompt"
+
+
+# ── run_review (Goose backend) ─────────────────────────────────────
+
+
+class TestRunReviewGoose:
+    """Tests for run_review() when agent_backend="goose"."""
+
+    @pytest.mark.asyncio
+    async def test_goose_command_structure(self):
+        """Goose backend builds the correct command with provider and model."""
+        mock_proc = _mock_process(stdout=b"review output")
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            result = await run_review(
+                "review prompt",
+                agent_backend="goose",
+                goose_provider="openai",
+            )
+
+        assert result == "review output"
+
+        # Verify the full Goose command structure
+        cmd = mock_exec.call_args[0]
+        assert cmd == (
+            "goose",
+            "run",
+            "-i",
+            "-",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4",
+            "-q",
+            "--no-session",
+            "--no-profile",
+            "--max-turns",
+            "1",
+        )
+
+    @pytest.mark.asyncio
+    async def test_anthropic_model_mapping(self):
+        """Anthropic provider maps to full claude-sonnet-4-6 model ID."""
+        mock_proc = _mock_process(stdout=b"output")
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review("prompt", agent_backend="goose", goose_provider="anthropic")
+
+        cmd = mock_exec.call_args[0]
+        assert "--model" in cmd
+        model_idx = cmd.index("--model")
+        assert cmd[model_idx + 1] == "claude-sonnet-4-6"
+
+    @pytest.mark.asyncio
+    async def test_successful_response_stripped(self):
+        """Goose output is returned with whitespace stripped."""
+        mock_proc = _mock_process(stdout=b"  review text with whitespace  \n")
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await run_review("prompt", agent_backend="goose", goose_provider="anthropic")
+
+        assert result == "review text with whitespace"
+
+    @pytest.mark.asyncio
+    async def test_timeout_kills_directly(self):
+        """Goose timeout calls proc.kill(), not os.killpg()."""
+        mock_proc = AsyncMock()
+        mock_proc.pid = 99999
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock()
+
+        with (
+            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
+            patch("kai.review.asyncio.wait_for", side_effect=TimeoutError()),
+            patch("kai.review.os.killpg") as mock_killpg,
+            pytest.raises(RuntimeError, match="timed out"),
+        ):
+            await run_review("prompt", agent_backend="goose", goose_provider="openai")
+
+        mock_proc.kill.assert_called_once()
+        mock_killpg.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_subprocess_failure(self):
+        """Non-zero exit from Goose subprocess raises RuntimeError."""
+        mock_proc = _mock_process(stderr=b"provider error", returncode=1)
+
+        with (
+            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
+            pytest.raises(RuntimeError, match=r"Review subprocess failed.*provider error"),
+        ):
+            await run_review("prompt", agent_backend="goose", goose_provider="openai")
+
+    @pytest.mark.asyncio
+    async def test_no_sudo_even_with_claude_user(self):
+        """Goose path never uses sudo, even when claude_user is set."""
+        mock_proc = _mock_process(stdout=b"output")
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review(
+                "prompt",
+                claude_user="kai",
+                agent_backend="goose",
+                goose_provider="anthropic",
+            )
+
+        cmd = mock_exec.call_args[0]
+        assert "sudo" not in cmd
+        assert cmd[0] == "goose"
+
+    @pytest.mark.asyncio
+    async def test_open_ended_provider_reads_env(self):
+        """Open-ended providers (ollama) use GOOSE_MODEL from env."""
+        mock_proc = _mock_process(stdout=b"output")
+
+        with (
+            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
+            patch.dict(os.environ, {"GOOSE_MODEL": "llama3.3:70b"}),
+        ):
+            await run_review("prompt", agent_backend="goose", goose_provider="ollama")
+
+        cmd = mock_exec.call_args[0]
+        model_idx = cmd.index("--model")
+        assert cmd[model_idx + 1] == "llama3.3:70b"
+
+    @pytest.mark.asyncio
+    async def test_open_ended_provider_no_model_raises(self):
+        """Open-ended provider with no GOOSE_MODEL raises RuntimeError."""
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            pytest.raises(RuntimeError, match="No model configured"),
+        ):
+            # Remove GOOSE_MODEL if it happens to be set in the test env
+            os.environ.pop("GOOSE_MODEL", None)
+            await run_review("prompt", agent_backend="goose", goose_provider="ollama")
+
+    @pytest.mark.asyncio
+    async def test_default_backend_is_claude(self):
+        """Calling run_review with no backend args still uses Claude."""
+        mock_proc = _mock_process(stdout=b"review output")
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review("prompt")
+
+        cmd = mock_exec.call_args[0]
+        assert cmd[0] == "claude"
+        assert "--print" in cmd
+
+
+class TestResolveGooseModelReview:
+    """Tests for _resolve_goose_model in review.py."""
+
+    def test_curated_providers(self):
+        """Each curated provider returns its hardcoded mid-tier model."""
+        for provider, expected_model in _GOOSE_AGENT_MODELS.items():
+            assert _resolve_goose_model(provider) == expected_model
+
+    def test_open_ended_provider_with_env(self):
+        """Open-ended provider reads GOOSE_MODEL from environment."""
+        with patch.dict(os.environ, {"GOOSE_MODEL": "custom-model"}):
+            assert _resolve_goose_model("openrouter") == "custom-model"
+
+    def test_open_ended_provider_no_env_raises(self):
+        """Open-ended provider without GOOSE_MODEL raises RuntimeError."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GOOSE_MODEL", None)
+            with pytest.raises(RuntimeError, match="No model configured"):
+                _resolve_goose_model("ollama")
 
 
 # ── post_review_comment ─────────────────────────────────────────────
