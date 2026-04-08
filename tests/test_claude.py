@@ -2301,8 +2301,10 @@ class TestSavePrompt:
             await asyncio.wait_for(stream_task, timeout=2)
             await asyncio.wait_for(shutdown_task, timeout=2)
 
-        # _save_prompt NOT called: the stream's EOF handler already
-        # killed the process, so shutdown() found _proc=None.
+        # _save_prompt NOT called: the stream's EOF handler calls
+        # _kill() which sets _proc=None synchronously before the
+        # coroutine yields, so shutdown() always finds _proc=None
+        # after acquiring the lock.
         mock_save.assert_not_called()
         assert claude._proc is None
 

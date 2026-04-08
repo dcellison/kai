@@ -798,8 +798,6 @@ class ClaudeCodeBackend(AgentBackend):
                         await asyncio.wait_for(self._proc.wait(), timeout=5)
                     except TimeoutError:
                         log.warning("Process did not exit after SIGKILL; abandoning")
-            else:
-                saved_pgid = None
 
             # Cancel stderr drain before clearing proc (same invariant
             # as _kill: the drain task checks self._proc, so cancel it
