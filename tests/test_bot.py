@@ -48,10 +48,10 @@ from kai.bot import (
     _workspace_config_suffix,
     _workspaces_keyboard,
     create_bot,
-    handle_canceljob,
     handle_document,
     handle_github,
     handle_help,
+    handle_job,
     handle_jobs,
     handle_message,
     handle_model,
@@ -782,13 +782,28 @@ class TestHandleStats:
 # ── handle_jobs ──────────────────────────────────────────────────────
 
 
-class TestHandleJobs:
+class TestHandleJob:
+    """Tests for the unified /job command and its subcommands."""
+
+    # ── /job (no args) and /job list ────────────────────────────────
+
     @pytest.mark.asyncio
-    async def test_no_jobs(self):
+    async def test_no_args_lists_jobs(self):
+        """/job with no args lists all jobs."""
         update = _make_update()
         ctx = _make_context()
         with patch("kai.bot.sessions.get_jobs", new_callable=AsyncMock, return_value=[]):
-            await handle_jobs(update, ctx)
+            await handle_job(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "No active" in reply
+
+    @pytest.mark.asyncio
+    async def test_list_subcommand(self):
+        """/job list is equivalent to /job with no args."""
+        update = _make_update()
+        ctx = _make_context(args=["list"])
+        with patch("kai.bot.sessions.get_jobs", new_callable=AsyncMock, return_value=[]):
+            await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "No active" in reply
 
@@ -807,7 +822,7 @@ class TestHandleJobs:
             }
         ]
         with patch("kai.bot.sessions.get_jobs", new_callable=AsyncMock, return_value=jobs):
-            await handle_jobs(update, ctx)
+            await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "2h" in reply
         assert "\U0001f916" in reply  # robot emoji for claude type
@@ -827,7 +842,7 @@ class TestHandleJobs:
             }
         ]
         with patch("kai.bot.sessions.get_jobs", new_callable=AsyncMock, return_value=jobs):
-            await handle_jobs(update, ctx)
+            await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "5m" in reply
         assert "\U0001f514" in reply  # bell emoji for reminder type
@@ -846,56 +861,152 @@ class TestHandleJobs:
             }
         ]
         with patch("kai.bot.sessions.get_jobs", new_callable=AsyncMock, return_value=jobs):
-            await handle_jobs(update, ctx)
+            await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "14:00" in reply
 
+    # ── /job info <id> ──────────────────────────────────────────────
 
-# ── handle_canceljob ─────────────────────────────────────────────────
-
-
-class TestHandleCancelJob:
     @pytest.mark.asyncio
-    async def test_no_args(self):
-        update = _make_update()
-        ctx = _make_context()
-        await handle_canceljob(update, ctx)
+    async def test_info_shows_job_details(self):
+        """/job info <id> shows full details for an owned job."""
+        update = _make_update(chat_id=12345)
+        ctx = _make_context(args=["info", "4"])
+        job = {
+            "id": 4,
+            "chat_id": 12345,
+            "name": "Weather report",
+            "job_type": "claude",
+            "prompt": "What is the weather today?",
+            "schedule_type": "daily",
+            "schedule_data": json.dumps({"times": ["08:00"]}),
+            "auto_remove": False,
+            "notify_on_check": False,
+        }
+        with patch("kai.bot.sessions.get_job_by_id", new_callable=AsyncMock, return_value=job):
+            await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
-        assert "Usage" in reply
+        assert "Job #4" in reply
+        assert "Weather report" in reply
+        assert "claude" in reply
+        assert "08:00" in reply
+        assert "What is the weather today?" in reply
 
     @pytest.mark.asyncio
-    async def test_non_numeric_arg(self):
+    async def test_info_not_found(self):
+        """/job info <id> returns not found for non-existent job."""
         update = _make_update()
-        ctx = _make_context(args=["abc"])
-        await handle_canceljob(update, ctx)
-        reply = update.message.reply_text.call_args[0][0]
-        assert "number" in reply.lower()
-
-    @pytest.mark.asyncio
-    async def test_job_not_found(self):
-        update = _make_update()
-        ctx = _make_context(args=["99"])
-        with patch("kai.bot.sessions.delete_job", new_callable=AsyncMock, return_value=False):
-            await handle_canceljob(update, ctx)
+        ctx = _make_context(args=["info", "999"])
+        with patch("kai.bot.sessions.get_job_by_id", new_callable=AsyncMock, return_value=None):
+            await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "not found" in reply.lower()
 
     @pytest.mark.asyncio
-    async def test_successful_deletion(self):
+    async def test_info_wrong_owner(self):
+        """/job info <id> returns not found for a job owned by another chat."""
+        update = _make_update(chat_id=12345)
+        ctx = _make_context(args=["info", "4"])
+        job = {
+            "id": 4,
+            "chat_id": 99999,  # Different owner
+            "name": "Secret",
+            "job_type": "claude",
+            "prompt": "hidden",
+            "schedule_type": "daily",
+            "schedule_data": json.dumps({"times": ["08:00"]}),
+            "auto_remove": False,
+            "notify_on_check": False,
+        }
+        with patch("kai.bot.sessions.get_job_by_id", new_callable=AsyncMock, return_value=job):
+            await handle_job(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "not found" in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_info_missing_id(self):
+        """/job info with no ID shows usage."""
+        update = _make_update()
+        ctx = _make_context(args=["info"])
+        await handle_job(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Usage" in reply
+
+    @pytest.mark.asyncio
+    async def test_info_non_numeric_id(self):
+        """/job info abc shows error."""
+        update = _make_update()
+        ctx = _make_context(args=["info", "abc"])
+        await handle_job(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "number" in reply.lower()
+
+    # ── /job cancel <id> ────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_cancel_successful(self):
         """Deletes from DB and removes APScheduler jobs."""
         update = _make_update()
-        # Mock the job queue with matching jobs
         mock_job = MagicMock()
         mock_job.name = "cron_5"
         mock_job.schedule_removal = MagicMock()
         jq = MagicMock()
         jq.jobs.return_value = [mock_job]
-        ctx = _make_context(args=["5"], job_queue=jq)
+        ctx = _make_context(args=["cancel", "5"], job_queue=jq)
         with patch("kai.bot.sessions.delete_job", new_callable=AsyncMock, return_value=True):
-            await handle_canceljob(update, ctx)
+            await handle_job(update, ctx)
         mock_job.schedule_removal.assert_called_once()
         reply = update.message.reply_text.call_args[0][0]
         assert "cancelled" in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_cancel_not_found(self):
+        update = _make_update()
+        ctx = _make_context(args=["cancel", "99"])
+        with patch("kai.bot.sessions.delete_job", new_callable=AsyncMock, return_value=False):
+            await handle_job(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "not found" in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_cancel_missing_id(self):
+        """/job cancel with no ID shows usage."""
+        update = _make_update()
+        ctx = _make_context(args=["cancel"])
+        await handle_job(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Usage" in reply
+
+    @pytest.mark.asyncio
+    async def test_cancel_non_numeric_id(self):
+        """/job cancel abc shows error."""
+        update = _make_update()
+        ctx = _make_context(args=["cancel", "abc"])
+        await handle_job(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "number" in reply.lower()
+
+    # ── Unknown subcommand ──────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_unknown_subcommand_shows_usage(self):
+        update = _make_update()
+        ctx = _make_context(args=["bogus"])
+        await handle_job(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Usage" in reply
+
+    # ── /jobs alias ─────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_jobs_alias_lists(self):
+        """/jobs delegates to the list logic."""
+        update = _make_update()
+        ctx = _make_context()
+        with patch("kai.bot.sessions.get_jobs", new_callable=AsyncMock, return_value=[]):
+            await handle_jobs(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "No active" in reply
 
 
 # ── handle_models ────────────────────────────────────────────────────
@@ -4291,11 +4402,11 @@ class TestFieldAliases:
 # Intentionally excluded from the menu:
 #   - start: Telegram convention, auto-triggered on first interaction
 #   - ws: alias for /workspace, would be redundant in the menu
+#   - jobs: alias for /job list, would be redundant in the menu
 EXPECTED_MENU_COMMANDS = {
-    "canceljob",
     "github",
     "help",
-    "jobs",
+    "job",
     "model",
     "models",
     "new",

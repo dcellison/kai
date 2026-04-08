@@ -326,8 +326,7 @@ def main() -> None:
                     BotCommand("voices", "Choose a voice"),
                     # Info
                     BotCommand("stats", "Show session info and cost"),
-                    BotCommand("jobs", "List scheduled jobs"),
-                    BotCommand("canceljob", "Cancel a scheduled job"),
+                    BotCommand("job", "Manage scheduled jobs"),
                     BotCommand("webhooks", "Show webhook server status"),
                     BotCommand("help", "Show available commands"),
                 ]

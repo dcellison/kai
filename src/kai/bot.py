@@ -1027,16 +1027,16 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-@_require_auth
-async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _list_jobs(update: Update, chat_id: int) -> None:
     """
-    Handle /jobs — list all active scheduled jobs with their schedules.
+    List all active scheduled jobs for a chat.
 
     Formats each job with an emoji tag (bell for reminders, robot for Claude
     jobs), the job ID, name, and a human-readable schedule description.
+    Shared by /job (list branch) and /jobs (alias).
     """
     assert update.message is not None
-    jobs = await sessions.get_jobs(_chat_id(update))
+    jobs = await sessions.get_jobs(chat_id)
     if not jobs:
         await update.message.reply_text("No active scheduled jobs.")
         return
@@ -1067,38 +1067,113 @@ async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text("Active jobs:\n" + "\n".join(lines))
 
 
-@_require_auth
-async def handle_canceljob(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle /canceljob <id> — permanently delete a scheduled job.
+def _format_schedule(job: dict) -> str:
+    """Format a job's schedule as a human-readable string."""
+    sched = job["schedule_type"]
+    data = json.loads(job["schedule_data"])
+    if sched == "once":
+        return f"once at {data.get('run_at', '?')}"
+    if sched == "interval":
+        secs = data.get("seconds", 0)
+        if secs >= 3600:
+            return f"every {secs // 3600}h"
+        if secs >= 60:
+            return f"every {secs // 60}m"
+        return f"every {secs}s"
+    if sched == "daily":
+        times = data.get("times", [])
+        return f"daily at {', '.join(times)} UTC" if times else "daily"
+    return sched
 
-    Removes the job from both the database and APScheduler's in-memory queue.
+
+@_require_auth
+async def handle_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /job - manage scheduled jobs.
+
+    Subcommands:
+        /job             - list all active jobs (same as /job list)
+        /job list        - list all active jobs
+        /job info <id>   - show details for a specific job
+        /job cancel <id> - cancel (delete) a job
     """
     assert update.message is not None
-    if not context.args:
-        await update.message.reply_text("Usage: /canceljob <id>")
+    chat_id = _chat_id(update)
+    args = context.args or []
+    subcommand = args[0].lower() if args else None
+
+    # No subcommand or "list": show all jobs
+    if subcommand is None or subcommand == "list":
+        await _list_jobs(update, chat_id)
         return
-    try:
-        job_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Job ID must be a number.")
+
+    if subcommand == "info":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /job info <id>")
+            return
+        try:
+            job_id = int(args[1])
+        except ValueError:
+            await update.message.reply_text("Job ID must be a number.")
+            return
+        job = await sessions.get_job_by_id(job_id)
+        # Ownership check: only show jobs belonging to this chat
+        if not job or job["chat_id"] != chat_id:
+            await update.message.reply_text(f"Job #{job_id} not found.")
+            return
+        auto_remove = "yes" if job["auto_remove"] else "no"
+        await update.message.reply_text(
+            f"Job #{job['id']} - {job['name']}\n"
+            f"Type: {job['job_type']}\n"
+            f"Schedule: {_format_schedule(job)}\n"
+            f"Auto-remove: {auto_remove}\n"
+            f"\n"
+            f"Prompt:\n"
+            f"{job['prompt']}"
+        )
         return
-    # Pass user's chat_id for ownership check - users can only cancel
-    # their own jobs (prevents cross-user job manipulation).
-    deleted = await sessions.delete_job(job_id, chat_id=_chat_id(update))
-    if not deleted:
-        await update.message.reply_text(f"Job #{job_id} not found.")
+
+    if subcommand == "cancel":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /job cancel <id>")
+            return
+        try:
+            job_id = int(args[1])
+        except ValueError:
+            await update.message.reply_text("Job ID must be a number.")
+            return
+        # Pass user's chat_id for ownership check - users can only cancel
+        # their own jobs (prevents cross-user job manipulation).
+        deleted = await sessions.delete_job(job_id, chat_id=chat_id)
+        if not deleted:
+            await update.message.reply_text(f"Job #{job_id} not found.")
+            return
+        # Remove from APScheduler's in-memory queue. Daily jobs with multiple
+        # times get suffixed names (cron_19_0, cron_19_1), so match both the
+        # exact name and any suffixed variants - same pattern as cron.py.
+        jq = context.application.job_queue
+        assert jq is not None
+        prefix = f"cron_{job_id}"
+        current = [j for j in jq.jobs() if j.name == prefix or (j.name and j.name.startswith(f"{prefix}_"))]
+        for j in current:
+            j.schedule_removal()
+        await update.message.reply_text(f"Job #{job_id} cancelled.")
         return
-    # Remove from APScheduler's in-memory queue. Daily jobs with multiple
-    # times get suffixed names (cron_19_0, cron_19_1), so match both the
-    # exact name and any suffixed variants — same pattern as cron.py.
-    jq = context.application.job_queue
-    assert jq is not None
-    prefix = f"cron_{job_id}"
-    current = [j for j in jq.jobs() if j.name == prefix or (j.name and j.name.startswith(f"{prefix}_"))]
-    for j in current:
-        j.schedule_removal()
-    await update.message.reply_text(f"Job #{job_id} cancelled.")
+
+    # Unknown subcommand
+    await update.message.reply_text(
+        "Usage:\n"
+        "/job - List all jobs\n"
+        "/job info <id> - Show job details\n"
+        "/job cancel <id> - Cancel a job"
+    )
+
+
+@_require_auth
+async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Alias for /job list. Kept for backward compatibility."""
+    assert update.message is not None
+    await _list_jobs(update, _chat_id(update))
 
 
 @_require_auth
@@ -2785,8 +2860,9 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/voices - Choose a voice (inline buttons)\n"
         "\n"
         "/stats - Show session info and cost\n"
-        "/jobs - List scheduled jobs\n"
-        "/canceljob <id> - Cancel a job\n"
+        "/job - List scheduled jobs\n"
+        "/job info <id> - Show job details\n"
+        "/job cancel <id> - Cancel a job\n"
         "/webhooks - Show webhook server status\n"
         "/help - This message"
     )
@@ -3178,7 +3254,7 @@ async def _check_totp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     the challenge prompt and returns False - the user must then type
     their code as a text message, which handle_message processes.
 
-    Informational commands (/stats, /help, /jobs, etc.) do NOT need
+    Informational commands (/stats, /help, /job, etc.) do NOT need
     this gate since they don't invoke Claude with user content.
     """
     if not await asyncio.to_thread(is_totp_configured):
@@ -3563,8 +3639,8 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
     app.add_handler(CommandHandler("model", handle_model))
     app.add_handler(CommandHandler("stats", handle_stats))
     app.add_handler(CommandHandler("help", handle_help))
+    app.add_handler(CommandHandler("job", handle_job))
     app.add_handler(CommandHandler("jobs", handle_jobs))
-    app.add_handler(CommandHandler("canceljob", handle_canceljob))
     app.add_handler(CommandHandler("settings", handle_settings))
     app.add_handler(CommandHandler("workspace", handle_workspace))
     app.add_handler(CommandHandler("ws", handle_workspace))
