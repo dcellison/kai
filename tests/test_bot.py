@@ -4320,11 +4320,12 @@ class TestCommandMenu:
 
         services.load_services(tmp_path / "nonexistent.yaml")
 
-    def test_every_menu_command_has_a_handler(self):
+    def test_every_expected_command_has_a_handler(self):
         """Every command in EXPECTED_MENU_COMMANDS has a registered CommandHandler.
 
-        Catches the case where a command is added to the menu but the
-        handler registration is missing or renamed.
+        Checks the hardcoded expected set against create_bot() registrations.
+        The companion test_menu_matches_expected_set bridges this set to the
+        actual set_my_commands source, so together they enforce full parity.
         """
         from telegram.ext import CommandHandler as CH
 
@@ -4344,17 +4345,25 @@ class TestCommandMenu:
     def test_menu_matches_expected_set(self):
         """The set_my_commands list in main.py matches EXPECTED_MENU_COMMANDS.
 
-        Parses the actual source to extract BotCommand names, so the test
-        breaks if someone adds/removes a menu entry without updating the
-        expected set.
+        Parses the actual source to extract BotCommand names from inside the
+        set_my_commands() call specifically, so the test breaks if someone
+        adds/removes a menu entry without updating the expected set.
         """
         import re
 
         main_py = Path(__file__).parent.parent / "src" / "kai" / "main.py"
         source = main_py.read_text()
 
-        # Extract all BotCommand("name", ...) from the source
-        menu_commands = set(re.findall(r'BotCommand\("(\w+)"', source))
+        # Scope to the set_my_commands(...) block so BotCommand references
+        # elsewhere in main.py (future defaults, comments, etc.) don't
+        # cause false positives.
+        match = re.search(
+            r"set_my_commands\(\s*\[(.+?)\]\s*\)",
+            source,
+            re.DOTALL,
+        )
+        assert match, "Could not find set_my_commands() call in main.py"
+        menu_commands = set(re.findall(r'BotCommand\("(\w+)"', match.group(1)))
 
         assert menu_commands == EXPECTED_MENU_COMMANDS, (
             f"Menu drift detected. "
