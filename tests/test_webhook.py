@@ -2096,7 +2096,7 @@ class TestPerUserRouting:
             await asyncio.sleep(0.01)
             mock_review.assert_called_once()
             assert mock_review.call_args[1]["agent_backend"] == "goose"
-            assert mock_review.call_args[1]["goose_provider"] == "openai"
+            assert mock_review.call_args[1]["provider"] == "openai"
 
     @pytest.mark.asyncio
     async def test_triage_receives_user_backend(self, _clear_cooldowns):
@@ -2129,7 +2129,7 @@ class TestPerUserRouting:
             await asyncio.sleep(0.01)
             mock_triage.assert_called_once()
             assert mock_triage.call_args[1]["agent_backend"] == "goose"
-            assert mock_triage.call_args[1]["goose_provider"] == "anthropic"
+            assert mock_triage.call_args[1]["provider"] == "anthropic"
 
     @pytest.mark.asyncio
     async def test_review_uses_global_backend_when_no_user_override(self, _clear_cooldowns, _mock_resolve_repo):
@@ -2163,7 +2163,7 @@ class TestPerUserRouting:
             mock_review.assert_called_once()
             # Falls back to global config values
             assert mock_review.call_args[1]["agent_backend"] == "goose"
-            assert mock_review.call_args[1]["goose_provider"] == "google"
+            assert mock_review.call_args[1]["provider"] == "google"
 
 
 # ── add_allowed_chat_id / remove_allowed_chat_id ────────────────────

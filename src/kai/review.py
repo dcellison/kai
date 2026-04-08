@@ -66,7 +66,7 @@ _REVIEW_TIMEOUT = 900
 # burn frontier-tier tokens. Full provider-native model IDs are required
 # because `goose run --model` uses provider naming, not Claude aliases.
 #
-# NOTE: Kai stores Google's provider as "google" in VALID_GOOSE_PROVIDERS,
+# NOTE: Kai stores Google's provider as "google" in VALID_PROVIDERS,
 # but Goose's --help lists it as "gemini-cli". This dict keys on Kai's
 # stored value ("google"). If Goose requires "gemini-cli", that is a
 # pre-existing config.py naming issue, not introduced by this change.
@@ -77,7 +77,7 @@ _GOOSE_AGENT_MODELS: dict[str, str] = {
 }
 
 
-def _resolve_goose_model(goose_provider: str) -> str:
+def _resolve_goose_model(provider: str) -> str:
     """Pick the review model for a Goose provider.
 
     Curated providers get a hardcoded mid-tier model (cost-effective
@@ -88,7 +88,7 @@ def _resolve_goose_model(goose_provider: str) -> str:
     Raises RuntimeError if no model can be resolved (open-ended
     provider with no GOOSE_MODEL set).
     """
-    model = _GOOSE_AGENT_MODELS.get(goose_provider)
+    model = _GOOSE_AGENT_MODELS.get(provider)
     if model:
         return model
     # Open-ended provider: use whatever the user configured.
@@ -96,7 +96,7 @@ def _resolve_goose_model(goose_provider: str) -> str:
     model = os.environ.get("GOOSE_MODEL", "")
     if not model:
         raise RuntimeError(
-            f"No model configured for Goose provider '{goose_provider}'. "
+            f"No model configured for Goose provider '{provider}'. "
             f"Set GOOSE_MODEL in the environment or DEFAULT_MODEL in .env."
         )
     return model
@@ -655,7 +655,7 @@ async def run_review(
     prompt: str,
     claude_user: str | None = None,
     agent_backend: str = "claude",
-    goose_provider: str = "",
+    provider: str = "",
 ) -> str:
     """
     Spawn a one-shot LLM subprocess to perform the review.
@@ -676,7 +676,7 @@ async def run_review(
         claude_user: Optional OS user to run Claude as (via sudo -u).
             Ignored when agent_backend is "goose".
         agent_backend: Which LLM backend to use ("claude" or "goose").
-        goose_provider: Goose provider name (e.g. "anthropic", "openai").
+        provider: LLM provider name (e.g. "anthropic", "openai").
             Only used when agent_backend is "goose".
 
     Returns:
@@ -686,22 +686,22 @@ async def run_review(
         RuntimeError: If the subprocess fails or times out.
     """
     if agent_backend == "goose":
-        if not goose_provider:
+        if not provider:
             raise ValueError(
-                "agent_backend is 'goose' but goose_provider is empty. Set GOOSE_PROVIDER in .env or per-user config."
+                "agent_backend is 'goose' but provider is empty. Set LLM_PROVIDER in .env or per-user config."
             )
         # Goose one-shot mode: read prompt from stdin, write response
         # to stdout. -q suppresses non-response output, --no-session
         # avoids creating session files, --no-profile skips user
         # config, --max-turns 1 prevents runaway tool loops.
-        model = _resolve_goose_model(goose_provider)
+        model = _resolve_goose_model(provider)
         cmd = [
             "goose",
             "run",
             "-i",
             "-",
             "--provider",
-            goose_provider,
+            provider,
             "--model",
             model,
             "-q",
@@ -888,7 +888,7 @@ async def review_pr(
     spec_dir: str = "specs",
     notify_chat_id: int | None = None,
     agent_backend: str = "claude",
-    goose_provider: str = "",
+    provider: str = "",
 ) -> None:
     """
     Full review pipeline: fetch diff, build prompt, run review, post results.
@@ -953,7 +953,7 @@ async def review_pr(
             prompt,
             claude_user=claude_user,
             agent_backend=agent_backend,
-            goose_provider=goose_provider,
+            provider=provider,
         )
 
         if not review_text.strip():

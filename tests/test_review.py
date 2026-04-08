@@ -694,7 +694,7 @@ class TestRunReviewGoose:
             result = await run_review(
                 "review prompt",
                 agent_backend="goose",
-                goose_provider="openai",
+                provider="openai",
             )
 
         assert result == "review output"
@@ -723,7 +723,7 @@ class TestRunReviewGoose:
         mock_proc = _mock_process(stdout=b"output")
 
         with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_review("prompt", agent_backend="goose", goose_provider="anthropic")
+            await run_review("prompt", agent_backend="goose", provider="anthropic")
 
         cmd = mock_exec.call_args[0]
         assert "--model" in cmd
@@ -736,7 +736,7 @@ class TestRunReviewGoose:
         mock_proc = _mock_process(stdout=b"  review text with whitespace  \n")
 
         with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
-            result = await run_review("prompt", agent_backend="goose", goose_provider="anthropic")
+            result = await run_review("prompt", agent_backend="goose", provider="anthropic")
 
         assert result == "review text with whitespace"
 
@@ -754,7 +754,7 @@ class TestRunReviewGoose:
             patch("kai.review.os.killpg") as mock_killpg,
             pytest.raises(RuntimeError, match="timed out"),
         ):
-            await run_review("prompt", agent_backend="goose", goose_provider="openai")
+            await run_review("prompt", agent_backend="goose", provider="openai")
 
         mock_proc.kill.assert_called_once()
         mock_killpg.assert_not_called()
@@ -768,7 +768,7 @@ class TestRunReviewGoose:
             patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
             pytest.raises(RuntimeError, match=r"Review subprocess failed.*provider error"),
         ):
-            await run_review("prompt", agent_backend="goose", goose_provider="openai")
+            await run_review("prompt", agent_backend="goose", provider="openai")
 
     @pytest.mark.asyncio
     async def test_no_sudo_even_with_claude_user(self):
@@ -780,7 +780,7 @@ class TestRunReviewGoose:
                 "prompt",
                 claude_user="kai",
                 agent_backend="goose",
-                goose_provider="anthropic",
+                provider="anthropic",
             )
 
         cmd = mock_exec.call_args[0]
@@ -796,7 +796,7 @@ class TestRunReviewGoose:
             patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
             patch.dict(os.environ, {"GOOSE_MODEL": "llama3.3:70b"}),
         ):
-            await run_review("prompt", agent_backend="goose", goose_provider="ollama")
+            await run_review("prompt", agent_backend="goose", provider="ollama")
 
         cmd = mock_exec.call_args[0]
         model_idx = cmd.index("--model")
@@ -811,7 +811,7 @@ class TestRunReviewGoose:
         ):
             # Remove GOOSE_MODEL if it happens to be set in the test env
             os.environ.pop("GOOSE_MODEL", None)
-            await run_review("prompt", agent_backend="goose", goose_provider="ollama")
+            await run_review("prompt", agent_backend="goose", provider="ollama")
 
     @pytest.mark.asyncio
     async def test_default_backend_is_claude(self):
@@ -826,10 +826,10 @@ class TestRunReviewGoose:
         assert "--print" in cmd
 
     @pytest.mark.asyncio
-    async def test_empty_goose_provider_raises(self):
+    async def test_empty_provider_raises(self):
         """Goose backend with empty provider raises ValueError early."""
-        with pytest.raises(ValueError, match="goose_provider is empty"):
-            await run_review("prompt", agent_backend="goose", goose_provider="")
+        with pytest.raises(ValueError, match="provider is empty"):
+            await run_review("prompt", agent_backend="goose", provider="")
 
 
 class TestResolveGooseModelReview:

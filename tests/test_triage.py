@@ -459,7 +459,7 @@ class TestRunTriageGoose:
             result = await run_triage(
                 "triage prompt",
                 agent_backend="goose",
-                goose_provider="openai",
+                provider="openai",
             )
 
         assert result == '{"labels": ["bug"]}'
@@ -488,7 +488,7 @@ class TestRunTriageGoose:
         mock_proc = _mock_subprocess(stdout='{"labels": []}')
 
         with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_triage("prompt", agent_backend="goose", goose_provider="anthropic")
+            await run_triage("prompt", agent_backend="goose", provider="anthropic")
 
         cmd = mock_exec.call_args[0]
         assert "--model" in cmd
@@ -501,7 +501,7 @@ class TestRunTriageGoose:
         mock_proc = _mock_subprocess(stdout='  {"labels": ["feature"]}  \n')
 
         with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc):
-            result = await run_triage("prompt", agent_backend="goose", goose_provider="anthropic")
+            result = await run_triage("prompt", agent_backend="goose", provider="anthropic")
 
         assert result == '{"labels": ["feature"]}'
 
@@ -519,7 +519,7 @@ class TestRunTriageGoose:
             patch("kai.triage.os.killpg") as mock_killpg,
             pytest.raises(RuntimeError, match="timed out"),
         ):
-            await run_triage("prompt", agent_backend="goose", goose_provider="openai")
+            await run_triage("prompt", agent_backend="goose", provider="openai")
 
         mock_proc.kill.assert_called_once()
         mock_killpg.assert_not_called()
@@ -533,7 +533,7 @@ class TestRunTriageGoose:
             patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc),
             pytest.raises(RuntimeError, match=r"Triage subprocess failed.*provider error"),
         ):
-            await run_triage("prompt", agent_backend="goose", goose_provider="openai")
+            await run_triage("prompt", agent_backend="goose", provider="openai")
 
     @pytest.mark.asyncio
     async def test_no_sudo_even_with_claude_user(self):
@@ -545,7 +545,7 @@ class TestRunTriageGoose:
                 "prompt",
                 claude_user="kai",
                 agent_backend="goose",
-                goose_provider="anthropic",
+                provider="anthropic",
             )
 
         cmd = mock_exec.call_args[0]
@@ -561,7 +561,7 @@ class TestRunTriageGoose:
             patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
             patch.dict(os.environ, {"GOOSE_MODEL": "llama3.3:70b"}),
         ):
-            await run_triage("prompt", agent_backend="goose", goose_provider="ollama")
+            await run_triage("prompt", agent_backend="goose", provider="ollama")
 
         cmd = mock_exec.call_args[0]
         model_idx = cmd.index("--model")
@@ -575,7 +575,7 @@ class TestRunTriageGoose:
             pytest.raises(RuntimeError, match="No model configured"),
         ):
             os.environ.pop("GOOSE_MODEL", None)
-            await run_triage("prompt", agent_backend="goose", goose_provider="ollama")
+            await run_triage("prompt", agent_backend="goose", provider="ollama")
 
     @pytest.mark.asyncio
     async def test_default_backend_is_claude(self):
@@ -590,10 +590,10 @@ class TestRunTriageGoose:
         assert "--print" in cmd
 
     @pytest.mark.asyncio
-    async def test_empty_goose_provider_raises(self):
+    async def test_empty_provider_raises(self):
         """Goose backend with empty provider raises ValueError early."""
-        with pytest.raises(ValueError, match="goose_provider is empty"):
-            await run_triage("prompt", agent_backend="goose", goose_provider="")
+        with pytest.raises(ValueError, match="provider is empty"):
+            await run_triage("prompt", agent_backend="goose", provider="")
 
 
 class TestResolveGooseModelTriage:
