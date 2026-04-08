@@ -1042,35 +1042,19 @@ async def _list_jobs(update: Update, chat_id: int) -> None:
         return
     lines = []
     for j in jobs:
-        sched = j["schedule_type"]
-        if sched == "once":
-            data = json.loads(j["schedule_data"])
-            detail = f"once at {data.get('run_at', '?')}"
-        elif sched == "interval":
-            data = json.loads(j["schedule_data"])
-            secs = data.get("seconds", 0)
-            # Format interval in the most readable unit
-            if secs >= 3600:
-                detail = f"every {secs // 3600}h"
-            elif secs >= 60:
-                detail = f"every {secs // 60}m"
-            else:
-                detail = f"every {secs}s"
-        elif sched == "daily":
-            data = json.loads(j["schedule_data"])
-            times = data.get("times", [])
-            detail = f"daily at {', '.join(times)} UTC" if times else "daily"
-        else:
-            detail = sched
         type_tag = "\U0001f514" if j["job_type"] == "reminder" else "\U0001f916"
-        lines.append(f"{type_tag} #{j['id']} {j['name']} ({detail})")
+        lines.append(f"{type_tag} #{j['id']} {j['name']} ({_format_schedule(j)})")
     await update.message.reply_text("Active jobs:\n" + "\n".join(lines))
 
 
 def _format_schedule(job: dict) -> str:
     """Format a job's schedule as a human-readable string."""
     sched = job["schedule_type"]
-    data = json.loads(job["schedule_data"])
+    try:
+        data = json.loads(job["schedule_data"])
+    except (json.JSONDecodeError, TypeError):
+        # Malformed schedule_data - fall back to raw schedule type name
+        return sched
     if sched == "once":
         return f"once at {data.get('run_at', '?')}"
     if sched == "interval":
