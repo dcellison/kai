@@ -773,9 +773,17 @@ class ClaudeCodeBackend(AgentBackend):
         _send_signal() handles already-dead processes via OSError instead.
         """
         if self._proc:
-            # Give the inner Claude a chance to save context before dying.
-            # Best-effort: timeout or failure skips silently.
-            await self._save_prompt()
+            # Only save if no interaction is in flight. _save_prompt()
+            # reads stdout, which would conflict with the readline() in
+            # _send_locked() and violate StreamReader's single-reader
+            # invariant. _lock.locked() is a synchronous check - safe to
+            # call without awaiting, and avoids the deadlock that would
+            # occur if we tried to acquire (since _kill() is also called
+            # from within _send_locked on error paths).
+            if not self._lock.locked():
+                await self._save_prompt()
+            else:
+                log.info("Skipping save prompt - interaction in flight")
 
             saved_pgid = self._pgid
 
