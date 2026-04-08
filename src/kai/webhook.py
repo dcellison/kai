@@ -776,7 +776,7 @@ async def _process_github_event_for_user(
                     spec_dir=request.app.get("spec_dir", "specs"),
                     notify_chat_id=target_chat_id,
                     agent_backend=agent_backend,
-                    goose_provider=provider,
+                    goose_provider=provider,  # TODO(#278): rename param to provider
                 )
             )
             _background_tasks.add(task)
@@ -822,7 +822,7 @@ async def _process_github_event_for_user(
                     claude_user=claude_user,
                     notify_chat_id=target_chat_id,
                     agent_backend=agent_backend,
-                    goose_provider=provider,
+                    goose_provider=provider,  # TODO(#278): rename param to provider
                 )
             )
             _background_tasks.add(task)

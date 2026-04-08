@@ -46,6 +46,8 @@ VALID_BACKENDS = {"claude", "goose"}
 # Valid LLM providers per backend. Claude always uses Anthropic
 # (hardcoded in get_effective_provider), so it has no entry here.
 # Backends that don't appear in this dict accept no provider config.
+# NOTE: Non-Claude entries in VALID_BACKENDS should have a matching
+# key here. Missing entries silently skip provider validation.
 VALID_PROVIDERS: dict[str, frozenset[str]] = {
     "goose": frozenset({"anthropic", "openai", "google", "openrouter", "ollama"}),
 }
