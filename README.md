@@ -92,7 +92,7 @@ When code is pushed to a pull request, Kai automatically reviews it. A one-shot 
 
 When a new issue is opened, Kai triages it automatically. A one-shot agent subprocess reads the issue, applies labels (creating them if they don't exist), checks for duplicates and related issues, assigns it to a project board if appropriate, posts a triage summary comment, and sends you a Telegram notification. See [Issue Triage Agent](https://github.com/dcellison/kai/wiki/Issue-Triage-Agent).
 
-Both agents are fire-and-forget background tasks that run independently of your chat session. They use separate Claude processes, so a review or triage can happen while you're mid-conversation. Opt-in via `PR_REVIEW_ENABLED` and `ISSUE_TRIAGE_ENABLED` in `.env`.
+Both agents are fire-and-forget background tasks that run independently of your chat session. They use separate agent processes, so a review or triage can happen while you're mid-conversation. Opt-in via `PR_REVIEW_ENABLED` and `ISSUE_TRIAGE_ENABLED` in `.env`.
 
 ### GitHub notification routing
 
@@ -155,7 +155,7 @@ If interrupted mid-response, Kai notifies you on restart and asks you to resend 
 | `/github triage on\|off` | Enable or disable the issue triage agent for you |
 | `/github add <owner/repo>` | Subscribe to a repo (auto-registers webhook if token set) |
 | `/github remove <owner/repo>` | Unsubscribe from a repo |
-| `/github token <token>` | Store GitHub PAT for auto-webhook registration |
+| `/github token <token>` | Store GitHub PAT for auto-webhook registration (delete the message after sending) |
 | `/voice` | Toggle voice responses on/off |
 | `/voice only` | Voice-only mode (no text) |
 | `/voice on` | Text + voice mode |
