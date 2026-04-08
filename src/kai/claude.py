@@ -782,6 +782,7 @@ class ClaudeCodeBackend(AgentBackend):
         # If a stream is in flight, this blocks until it finishes.
         # Note: _kill() (called from _send_locked error paths) does
         # NOT acquire _lock, so there is no deadlock risk.
+        saved_pgid = None
         async with self._lock:
             if self._proc:
                 await self._save_prompt()
