@@ -825,6 +825,12 @@ class TestRunReviewGoose:
         assert cmd[0] == "claude"
         assert "--print" in cmd
 
+    @pytest.mark.asyncio
+    async def test_empty_goose_provider_raises(self):
+        """Goose backend with empty provider raises ValueError early."""
+        with pytest.raises(ValueError, match="goose_provider is empty"):
+            await run_review("prompt", agent_backend="goose", goose_provider="")
+
 
 class TestResolveGooseModelReview:
     """Tests for _resolve_goose_model in review.py."""

@@ -412,6 +412,10 @@ async def run_triage(
         RuntimeError: If the subprocess fails or times out.
     """
     if agent_backend == "goose":
+        if not goose_provider:
+            raise ValueError(
+                "agent_backend is 'goose' but goose_provider is empty. Set GOOSE_PROVIDER in .env or per-user config."
+            )
         # Goose one-shot mode: read prompt from stdin, write response
         # to stdout. -q suppresses non-response output, --no-session
         # avoids creating session files, --no-profile skips user
