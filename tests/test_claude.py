@@ -2271,8 +2271,11 @@ class TestSavePrompt:
                     pass
 
             stream_task = asyncio.create_task(do_stream())
-            # Yield so the stream task acquires the lock and blocks on readline
-            await asyncio.sleep(0)
+            # Yield enough times for send() to advance through
+            # _ensure_started (AsyncMock - needs its own tick) and
+            # then acquire the lock.
+            for _ in range(5):
+                await asyncio.sleep(0)
 
             # Verify the lock is actually held before we call shutdown
             assert claude._lock.locked(), "Lock should be held by the stream task"
@@ -2283,10 +2286,8 @@ class TestSavePrompt:
             # The stream task should finish cleanly (EOF from signal)
             try:
                 await asyncio.wait_for(stream_task, timeout=2)
-            except (TimeoutError, Exception):
-                # Stream task may raise from mock limitations; the key
-                # assertion is that no readuntil error occurred
-                pass
+            except TimeoutError:
+                stream_task.cancel()
 
         # _save_prompt must have been skipped (lock was held)
         mock_save.assert_not_called()
