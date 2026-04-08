@@ -23,10 +23,10 @@ Giving an AI agent shell access is a real trust decision. Kai's approach is laye
 
 - **Telegram auth** - only explicitly whitelisted user IDs can interact. Unauthorized messages are silently dropped before reaching any handler.
 - **TOTP gate** (optional) - two-factor authentication via time-based one-time passwords. After a configurable idle timeout, Kai requires a 6-digit authenticator code before processing anything. The secret lives in a root-owned file (mode 0600) that the bot process cannot read directly; it verifies codes through narrowly-scoped sudoers rules. Even if someone compromises your Telegram account, they can't use your assistant without your authenticator device. Rate limiting with disk-persisted lockout protects against brute force.
-- **Process isolation** - authentication state lives in the bot's in-memory context, not in the filesystem or conversation history. The inner Claude process cannot read, manipulate, or bypass the auth gate.
+- **Process isolation** - authentication state lives in the bot's in-memory context, not in the filesystem or conversation history. The inner agent process cannot read, manipulate, or bypass the auth gate.
 - **Path confinement** - file exchange operations are restricted to the active workspace via `Path.relative_to()`. Traversal attempts are rejected. The send-file API also blocks access to history and memory directories.
-- **Service proxy** - external API keys live in server-side config (`services.yaml`) and are injected at request time. Claude calls APIs through a local proxy endpoint; the keys never enter the conversation. Per-service SSRF controls prevent services from being used as open HTTP proxies.
-- **Multi-user isolation** - each user's data is namespaced by chat ID: separate conversation history, workspace state, scheduled jobs, and file storage. When `os_user` is configured in `users.yaml`, the inner Claude subprocess runs as a dedicated OS account via `sudo -u`, creating a hard process-level boundary between users and between the bot and the AI.
+- **Service proxy** - external API keys live in server-side config (`services.yaml`) and are injected at request time. The agent calls APIs through a local proxy endpoint; the keys never enter the conversation. Per-service SSRF controls prevent services from being used as open HTTP proxies.
+- **Multi-user isolation** - each user's data is namespaced by chat ID: separate conversation history, workspace state, scheduled jobs, and file storage. When `os_user` is configured in `users.yaml`, the inner agent subprocess runs as a dedicated OS account via `sudo -u`, creating a hard process-level boundary between users and between the bot and the AI.
 
 Setup for TOTP requires the optional dependency group and root access:
 
@@ -62,9 +62,9 @@ users:
 
 Each user gets:
 
-- **Own Claude subprocess** - created lazily on first message, evicted after idle timeout (`CLAUDE_IDLE_TIMEOUT`, default 30 minutes). No shared conversation state.
+- **Own agent subprocess** - created lazily on first message, evicted after idle timeout (`CLAUDE_IDLE_TIMEOUT`, default 30 minutes). No shared conversation state.
 - **Isolated data** - conversation history, workspace settings, scheduled jobs, and file uploads are all namespaced by user. One user cannot see or affect another's state.
-- **Optional OS-level separation** - set `os_user` to run that user's Claude process as a dedicated system account via `sudo -u`. Requires a sudoers rule (the install script generates one automatically).
+- **Optional OS-level separation** - set `os_user` to run that user's agent process as a dedicated system account via `sudo -u`. Requires a sudoers rule (the install script generates one automatically).
 - **Per-user home workspace** - each user can have their own default workspace directory.
 - **Role-based routing** - admins receive unattributed webhook events (GitHub pushes, generic webhooks). Regular users interact only through Telegram messages.
 
@@ -338,12 +338,12 @@ kai/
 │   ├── cron.py               # Scheduled job execution (APScheduler)
 │   ├── webhook.py            # HTTP server: GitHub/generic webhooks, scheduling API
 │   ├── history.py            # Conversation history (read/write JSONL logs)
-│   ├── pool.py               # Per-user Claude subprocess pool (lazy creation, idle eviction)
+│   ├── pool.py               # Per-user agent subprocess pool (lazy creation, idle eviction)
 │   ├── locks.py              # Per-chat async locks and stop events
 │   ├── install.py            # Protected installation tooling
 │   ├── totp.py               # TOTP verification, rate limiting, and CLI
-│   ├── review.py             # PR review agent (one-shot Claude subprocess)
-│   ├── triage.py             # Issue triage agent (one-shot Claude subprocess)
+│   ├── review.py             # PR review agent (one-shot agent subprocess)
+│   ├── triage.py             # Issue triage agent (one-shot agent subprocess)
 │   ├── services.py           # External service proxy for third-party APIs
 │   ├── transcribe.py         # Voice message transcription (ffmpeg + whisper-cpp)
 │   ├── tts.py                # Text-to-speech synthesis (Piper TTS + ffmpeg)
@@ -394,7 +394,7 @@ This creates a split layout:
 
 The install module handles directory creation, source copying, venv setup, secret deployment, sudoers rules, data migration, service definition generation, and service lifecycle (stop/start). Use `--dry-run` to preview changes without applying them.
 
-The service user reads secrets via narrowly-scoped sudoers rules (`sudo cat` on specific files only). The inner Claude process cannot read secrets or modify source code.
+The service user reads secrets via narrowly-scoped sudoers rules (`sudo cat` on specific files only). The inner agent process cannot read secrets or modify source code.
 
 ## License
 
