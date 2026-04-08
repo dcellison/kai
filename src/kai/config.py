@@ -43,13 +43,18 @@ DATA_DIR = Path(os.environ.get("KAI_DATA_DIR") or str(PROJECT_ROOT))
 # "goose" uses Goose ACP. Shared between load_config() and install.py.
 VALID_BACKENDS = {"claude", "goose"}
 
-# Valid Goose LLM providers. Shared between load_config() and install.py.
-VALID_GOOSE_PROVIDERS = {"anthropic", "openai", "google", "openrouter", "ollama"}
+# Valid LLM providers per backend. Claude always uses Anthropic
+# (hardcoded in get_effective_provider), so it has no entry here.
+# Backends that don't appear in this dict accept no provider config.
+VALID_PROVIDERS: dict[str, frozenset[str]] = {
+    "goose": frozenset({"anthropic", "openai", "google", "openrouter", "ollama"}),
+}
 
-# Maps each Goose provider to its API key environment variable name.
-# Used by install.py for prompting the correct API key env var.
+# Maps LLM provider to its API key environment variable name.
+# Backend-agnostic - the API key for Anthropic is the same env var
+# regardless of which backend is using it.
 # Ollama is absent because it requires no API key (local inference).
-GOOSE_PROVIDER_KEY_VARS: dict[str, str] = {
+PROVIDER_KEY_VARS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
     "google": "GOOGLE_API_KEY",
@@ -100,15 +105,15 @@ OPEN_ENDED_PROVIDERS: frozenset[str] = frozenset({"openrouter", "ollama"})
 _ALL_CURATED_MODELS: frozenset[str] = frozenset(model for models in PROVIDER_MODELS.values() for model in models)
 
 
-def get_effective_provider(backend: str, goose_provider: str) -> str:
-    """Derive the effective provider from backend + goose_provider.
+def get_effective_provider(backend: str, llm_provider: str) -> str:
+    """Derive the effective provider from backend + llm_provider.
 
-    The Claude backend always uses Anthropic models. The Goose backend
-    uses whatever provider is configured.
+    The Claude backend always uses Anthropic models. All other
+    backends use whatever provider is configured.
     """
     if backend == "claude":
         return "anthropic"
-    return goose_provider
+    return llm_provider
 
 
 def validate_model_for_provider(model: str, provider: str) -> bool:
@@ -117,14 +122,14 @@ def validate_model_for_provider(model: str, provider: str) -> bool:
     Returns True if the provider is open-ended (accepts any model)
     or if the model is in the provider's curated list. Unknown providers
     (not in PROVIDER_MODELS or OPEN_ENDED_PROVIDERS) are accepted with
-    a warning - this catches the case where VALID_GOOSE_PROVIDERS gains
+    a warning - this catches the case where VALID_PROVIDERS gains
     a new entry but PROVIDER_MODELS was not updated to match.
     """
     if provider in OPEN_ENDED_PROVIDERS:
         return True
     models = PROVIDER_MODELS.get(provider)
     if models is None:
-        # Provider is valid (passed VALID_GOOSE_PROVIDERS check) but has
+        # Provider is valid (passed VALID_PROVIDERS check) but has
         # no curated model list and is not explicitly open-ended. This
         # is a programming oversight - log it so it's visible.
         if provider:
@@ -257,7 +262,7 @@ class UserConfig:
     # Per-user backend/provider override. Admin-controlled via users.yaml,
     # not user-configurable via /settings. None = use global config.
     agent_backend: str | None = None
-    goose_provider: str | None = None
+    llm_provider: str | None = None
     # GitHub notification routing fields. github_repos controls which
     # repos route webhook events to this user. pr_review and issue_triage
     # are tri-state: None = use global default, True/False = admin override.
@@ -406,10 +411,11 @@ class Config:
     # "goose" uses Goose ACP (Agent Client Protocol) as the agent harness.
     agent_backend: str = "claude"
 
-    # Goose LLM provider (only relevant when agent_backend="goose").
-    # Determines which API key env var Goose expects and whether Kai's
+    # LLM provider for non-Claude backends (e.g. Goose). Determines
+    # which API key env var the backend expects and whether Kai's
     # logical model names ("sonnet", "opus") are translated to Anthropic IDs.
-    goose_provider: str = ""
+    # Ignored when agent_backend="claude".
+    llm_provider: str = ""
 
     def get_workspace_config(self, workspace: Path) -> WorkspaceConfig | None:
         """
@@ -726,7 +732,7 @@ _VALID_ROLES = {"admin", "user"}
 
 def _load_user_configs(
     global_backend: str,
-    global_provider: str,
+    global_llm_provider: str,
 ) -> dict[int, UserConfig] | None:
     """
     Load per-user configs from users.yaml.
@@ -737,7 +743,7 @@ def _load_user_configs(
 
     Args:
         global_backend: The global agent_backend from env config.
-        global_provider: The global goose_provider from env config.
+        global_llm_provider: The global llm_provider from env config.
             Both are needed to cascade per-user model validation:
             a user's effective provider determines which models are valid.
 
@@ -882,31 +888,36 @@ def _load_user_configs(
                 )
             user_backend = backend_str
 
-        # Validate optional goose_provider (must be valid if set)
+        # Validate optional llm_provider (must be valid for the user's backend)
         user_provider: str | None = None
-        raw_provider = entry.get("goose_provider")
+        raw_provider = entry.get("llm_provider")
         if raw_provider is not None:
             provider_str = str(raw_provider).strip().lower()
-            if provider_str not in VALID_GOOSE_PROVIDERS:
+            # Validate against the user's effective backend. If the user
+            # has no explicit backend, validate against the global one.
+            eff_backend_for_val = user_backend or global_backend
+            valid = VALID_PROVIDERS.get(eff_backend_for_val)
+            if valid is not None and provider_str not in valid:
                 raise SystemExit(
-                    f"users.yaml: user '{name}' has invalid goose_provider '{provider_str}' "
-                    f"(must be one of: {', '.join(sorted(VALID_GOOSE_PROVIDERS))})"
+                    f"users.yaml: user '{name}' has invalid llm_provider "
+                    f"'{provider_str}' for backend '{eff_backend_for_val}' "
+                    f"(must be one of: {', '.join(sorted(valid))})"
                 )
             user_provider = provider_str
 
         # Resolve effective backend and provider for this user.
-        # Used for both the goose-without-provider check and model validation.
+        # Used for both the provider-required check and model validation.
         eff_backend = user_backend or global_backend
-        eff_provider_str = user_provider or global_provider
+        eff_provider_str = user_provider or global_llm_provider
         eff_provider = get_effective_provider(eff_backend, eff_provider_str)
 
-        # If user has goose backend but no provider can be resolved
-        # (neither user-level nor global), that's a fatal config error.
-        if eff_backend == "goose" and not eff_provider_str:
+        # If user's effective backend requires a provider but none can be
+        # resolved (neither user-level nor global), that's a fatal config error.
+        if eff_backend in VALID_PROVIDERS and not eff_provider_str:
             raise SystemExit(
-                f"users.yaml: user '{name}' has agent_backend='goose' but no "
-                f"goose_provider is configured (set it in users.yaml or as "
-                f"GOOSE_PROVIDER env var)"
+                f"users.yaml: user '{name}' has agent_backend='{eff_backend}' but no "
+                f"llm_provider is configured (set it in users.yaml or as "
+                f"LLM_PROVIDER env var)"
             )
 
         # Warn if user is on an open-ended provider with no model set.
@@ -1063,7 +1074,7 @@ def _load_user_configs(
             context_window=user_context_window,
             workspace_base=user_workspace_base,
             agent_backend=user_backend,
-            goose_provider=user_provider,
+            llm_provider=user_provider,
             github_repos=github_repos,
             github_notify_chat_id=github_notify_chat_id,
             pr_review=pr_review,
@@ -1277,15 +1288,17 @@ def load_config() -> Config:
             f"AGENT_BACKEND '{agent_backend}' is not valid (must be one of: {', '.join(sorted(VALID_BACKENDS))})"
         )
 
-    # Goose provider - only validated when agent_backend=goose.
-    # When backend is claude, the field stays empty (unused).
-    goose_provider = ""
-    if agent_backend == "goose":
-        goose_provider = os.environ.get("GOOSE_PROVIDER", "").strip().lower()
-        if goose_provider not in VALID_GOOSE_PROVIDERS:
+    # LLM provider - validated against the backend's supported set.
+    # Only required for non-Claude backends.
+    llm_provider = ""
+    valid_providers = VALID_PROVIDERS.get(agent_backend)
+    if valid_providers is not None:
+        llm_provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
+        if llm_provider not in valid_providers:
             raise SystemExit(
-                f"GOOSE_PROVIDER '{goose_provider}' is not valid "
-                f"(must be one of: {', '.join(sorted(VALID_GOOSE_PROVIDERS))})"
+                f"LLM_PROVIDER '{llm_provider}' is not valid for backend "
+                f"'{agent_backend}' (must be one of: "
+                f"{', '.join(sorted(valid_providers))})"
             )
 
     # Per-workspace configuration. Loaded after ALLOWED_WORKSPACES so
@@ -1302,7 +1315,7 @@ def load_config() -> Config:
     # Per-user configuration. If users.yaml exists, it is authoritative;
     # ALLOWED_USER_IDS is ignored. If users.yaml does not exist,
     # ALLOWED_USER_IDS works as before (backward-compatible).
-    user_configs = _load_user_configs(agent_backend, goose_provider)
+    user_configs = _load_user_configs(agent_backend, llm_provider)
     if user_configs is not None:
         if raw_ids:
             log.warning("ALLOWED_USER_IDS is set but users.yaml exists; using users.yaml")
@@ -1393,7 +1406,7 @@ def load_config() -> Config:
     # Validate DEFAULT_MODEL against the effective global provider.
     # Catches typos at startup instead of letting them propagate to
     # a confusing runtime failure.
-    global_provider = get_effective_provider(agent_backend, goose_provider)
+    global_provider = get_effective_provider(agent_backend, llm_provider)
     if not validate_model_for_provider(default_model, global_provider):
         valid = sorted(PROVIDER_MODELS.get(global_provider, {}).keys())
         raise SystemExit(
@@ -1434,5 +1447,5 @@ def load_config() -> Config:
         totp_lockout_attempts=totp_lockout_attempts,
         totp_lockout_minutes=totp_lockout_minutes,
         agent_backend=agent_backend,
-        goose_provider=goose_provider,
+        llm_provider=llm_provider,
     )

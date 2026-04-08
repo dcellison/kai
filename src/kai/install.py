@@ -39,14 +39,14 @@ from pathlib import Path
 import yaml
 
 from kai.config import (
-    GOOSE_PROVIDER_KEY_VARS,
     MAX_CONTEXT_CEILING,
     OPEN_ENDED_PROVIDERS,
     PROJECT_ROOT,
     PROVIDER_DEFAULTS,
+    PROVIDER_KEY_VARS,
     PROVIDER_MODELS,
     VALID_BACKENDS,
-    VALID_GOOSE_PROVIDERS,
+    VALID_PROVIDERS,
 )
 
 # Config file written by `config`, read by `apply`.
@@ -425,27 +425,28 @@ def _cmd_config() -> None:
         existing_env.get("AGENT_BACKEND", "claude"),
     )
 
-    # Goose-specific: provider and API key. The provider choice
+    # Non-Claude backends: provider and API key. The provider choice
     # determines which env var to prompt for (or none for ollama).
-    goose_provider = ""
-    goose_api_key_var = ""
-    goose_api_key = ""
-    if agent_backend == "goose":
-        goose_provider = _prompt_choice(
-            "Goose LLM provider",
-            sorted(VALID_GOOSE_PROVIDERS),
-            existing_env.get("GOOSE_PROVIDER", ""),
+    llm_provider = ""
+    llm_api_key_var = ""
+    llm_api_key = ""
+    valid_providers = VALID_PROVIDERS.get(agent_backend)
+    if valid_providers is not None:
+        llm_provider = _prompt_choice(
+            "LLM provider",
+            sorted(valid_providers),
+            existing_env.get("LLM_PROVIDER", ""),
         )
-        goose_api_key_var = GOOSE_PROVIDER_KEY_VARS.get(goose_provider, "")
-        if goose_api_key_var:
-            goose_api_key = _prompt(
-                goose_api_key_var,
-                existing_env.get(goose_api_key_var, ""),
+        llm_api_key_var = PROVIDER_KEY_VARS.get(llm_provider, "")
+        if llm_api_key_var:
+            llm_api_key = _prompt(
+                llm_api_key_var,
+                existing_env.get(llm_api_key_var, ""),
                 required=True,
             )
         else:
-            # Ollama: no API key needed (local inference)
-            print(f"  {goose_provider} does not require an API key.")
+            # Ollama, Copilot, etc.: no API key needed
+            print(f"  {llm_provider} does not require an API key.")
     print()
 
     # -- Claude --
@@ -454,7 +455,7 @@ def _cmd_config() -> None:
     # Only prompt for truly global Claude settings (autocompact).
     # Determine the effective provider for model choices. Claude
     # backend always uses Anthropic; Goose uses the selected provider.
-    eff_provider = "anthropic" if agent_backend == "claude" else goose_provider
+    eff_provider = "anthropic" if agent_backend == "claude" else llm_provider
 
     if users_yaml_exists:
         print("-- Claude --")
@@ -692,12 +693,12 @@ def _cmd_config() -> None:
     if agent_backend != "claude":
         env["AGENT_BACKEND"] = agent_backend
 
-    # Goose provider and API key. Written alongside the backend choice
+    # LLM provider and API key. Written alongside the backend choice
     # so they survive into /etc/kai/env and are not wiped on reinstall.
-    if goose_provider:
-        env["GOOSE_PROVIDER"] = goose_provider
-    if goose_api_key_var and goose_api_key:
-        env[goose_api_key_var] = goose_api_key
+    if llm_provider:
+        env["LLM_PROVIDER"] = llm_provider
+    if llm_api_key_var and llm_api_key:
+        env[llm_api_key_var] = llm_api_key
 
     # Deprecated per-user vars: only include without users.yaml
     # (legacy single-user mode). With users.yaml, these are noise.

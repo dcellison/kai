@@ -368,7 +368,7 @@ def _get_user_provider(pool: SubprocessPool, chat_id: int, config: Config) -> st
     # No running instance - derive from config cascade (same as _create_instance)
     user_config = config.get_user_config(chat_id)
     uc_backend = user_config.agent_backend if user_config and user_config.agent_backend else config.agent_backend
-    uc_provider = user_config.goose_provider if user_config and user_config.goose_provider else config.goose_provider
+    uc_provider = user_config.llm_provider if user_config and user_config.llm_provider else config.llm_provider
     return get_effective_provider(uc_backend, uc_provider)
 
 
@@ -801,7 +801,7 @@ def _revert_instance_field(pool: SubprocessPool, chat_id: int, field: str, confi
             # If the user's provider differs from the global provider, the
             # global default_model may be invalid for their provider.
             provider = instance.provider
-            effective_global = get_effective_provider(config.agent_backend, config.goose_provider)
+            effective_global = get_effective_provider(config.agent_backend, config.llm_provider)
             if provider == effective_global:
                 instance.model = config.default_model
             else:

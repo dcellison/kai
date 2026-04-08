@@ -112,9 +112,8 @@ class AgentBackend(ABC):
 
     Backend-specific attributes (NOT on the ABC) stay on the concrete
     class. For ClaudeCodeBackend these include: claude_user,
-    max_session_hours, autocompact_pct. For GooseBackend: goose_provider.
-    The pool never touches these directly; they are set at construction
-    by _create_instance().
+    max_session_hours, autocompact_pct. The pool never touches these
+    directly; they are set at construction by _create_instance().
     """
 
     # These are plain instance attributes, not abstract properties,

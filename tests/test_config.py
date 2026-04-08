@@ -44,7 +44,7 @@ _CONFIG_ENV_VARS = [
     "TOTP_LOCKOUT_ATTEMPTS",
     "TOTP_LOCKOUT_MINUTES",
     "AGENT_BACKEND",
-    "GOOSE_PROVIDER",
+    "LLM_PROVIDER",
     "KAI_DATA_DIR",
     "KAI_INSTALL_DIR",
 ]
@@ -190,50 +190,50 @@ class TestLoadConfigErrors:
         with pytest.raises(SystemExit, match="AGENT_BACKEND"):
             load_config()
 
-    def test_invalid_goose_provider(self, monkeypatch):
-        """GOOSE_PROVIDER with an unrecognized value raises SystemExit."""
+    def test_invalid_llm_provider(self, monkeypatch):
+        """LLM_PROVIDER with an unrecognized value raises SystemExit."""
         _set_required(monkeypatch)
         monkeypatch.setenv("AGENT_BACKEND", "goose")
-        monkeypatch.setenv("GOOSE_PROVIDER", "invalid")
-        with pytest.raises(SystemExit, match="GOOSE_PROVIDER"):
+        monkeypatch.setenv("LLM_PROVIDER", "invalid")
+        with pytest.raises(SystemExit, match="LLM_PROVIDER"):
             load_config()
 
-    def test_missing_goose_provider(self, monkeypatch):
-        """GOOSE_PROVIDER missing when backend=goose raises SystemExit."""
+    def test_missing_llm_provider(self, monkeypatch):
+        """LLM_PROVIDER missing when backend=goose raises SystemExit."""
         _set_required(monkeypatch)
         monkeypatch.setenv("AGENT_BACKEND", "goose")
-        with pytest.raises(SystemExit, match="GOOSE_PROVIDER"):
+        with pytest.raises(SystemExit, match="LLM_PROVIDER"):
             load_config()
 
-    def test_goose_provider_ignored_for_claude(self, monkeypatch):
-        """GOOSE_PROVIDER is not validated when backend=claude."""
+    def test_llm_provider_ignored_for_claude(self, monkeypatch):
+        """LLM_PROVIDER is not validated when backend=claude."""
         _set_required(monkeypatch)
         cfg = load_config()
-        assert cfg.goose_provider == ""
+        assert cfg.llm_provider == ""
 
-    def test_invalid_goose_provider_ignored_for_claude(self, monkeypatch):
-        """Even an invalid GOOSE_PROVIDER is ignored when backend=claude."""
+    def test_invalid_llm_provider_ignored_for_claude(self, monkeypatch):
+        """Even an invalid LLM_PROVIDER is ignored when backend=claude."""
         _set_required(monkeypatch)
-        monkeypatch.setenv("GOOSE_PROVIDER", "completelywrong")
+        monkeypatch.setenv("LLM_PROVIDER", "completelywrong")
         cfg = load_config()
-        assert cfg.goose_provider == ""
+        assert cfg.llm_provider == ""
 
-    def test_valid_goose_provider(self, monkeypatch):
-        """Valid GOOSE_PROVIDER is accepted and stored."""
+    def test_valid_llm_provider(self, monkeypatch):
+        """Valid LLM_PROVIDER is accepted and stored."""
         _set_required(monkeypatch)
         monkeypatch.setenv("AGENT_BACKEND", "goose")
-        monkeypatch.setenv("GOOSE_PROVIDER", "openai")
+        monkeypatch.setenv("LLM_PROVIDER", "openai")
         # DEFAULT_MODEL must be valid for the openai provider
         monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4")
         cfg = load_config()
-        assert cfg.goose_provider == "openai"
+        assert cfg.llm_provider == "openai"
 
     def test_goose_without_provider_exits(self, monkeypatch):
-        """AGENT_BACKEND=goose without GOOSE_PROVIDER fails at startup."""
+        """AGENT_BACKEND=goose without LLM_PROVIDER fails at startup."""
         _set_required(monkeypatch)
         monkeypatch.setenv("AGENT_BACKEND", "goose")
-        # GOOSE_PROVIDER not set - empty string is not in VALID_GOOSE_PROVIDERS
-        with pytest.raises(SystemExit, match=r"GOOSE_PROVIDER.*not valid"):
+        # LLM_PROVIDER not set - empty string is not in VALID_PROVIDERS["goose"]
+        with pytest.raises(SystemExit, match=r"LLM_PROVIDER.*not valid"):
             load_config()
 
 

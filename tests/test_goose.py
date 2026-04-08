@@ -345,7 +345,7 @@ class TestHandshake:
     @pytest.mark.asyncio
     async def test_model_env_var_set(self):
         """GOOSE_MODEL env var is set during startup."""
-        g = _make_goose(model="opus", goose_provider="anthropic")
+        g = _make_goose(model="opus", provider="anthropic")
         proc = _make_mock_proc(_handshake_lines())
 
         with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
@@ -357,7 +357,7 @@ class TestHandshake:
     @pytest.mark.asyncio
     async def test_model_passthrough_for_non_anthropic(self):
         """Non-Anthropic providers pass model value through unchanged."""
-        g = _make_goose(model="sonnet", goose_provider="openai")
+        g = _make_goose(model="sonnet", provider="openai")
         proc = _make_mock_proc(_handshake_lines())
 
         with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:

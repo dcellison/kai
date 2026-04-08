@@ -36,9 +36,9 @@ users:
 
     # Agent backend. Overrides the global AGENT_BACKEND from .env for
     # this user only. Default is "claude" (Claude Code CLI). Set to
-    # "goose" to use Goose ACP with the specified provider.
+    # "goose" to use Goose ACP with the specified LLM provider.
     # agent_backend: goose
-    # goose_provider: openai    # required when agent_backend is goose
+    # llm_provider: openai    # required for non-Claude backends
 
     # GitHub notification settings. github_repos controls which repos
     # route events to this user. pr_review and issue_triage toggle

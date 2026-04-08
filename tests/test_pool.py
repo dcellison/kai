@@ -132,7 +132,7 @@ class TestPerUserBackendRouting:
             telegram_id=111,
             name="alice",
             agent_backend="goose",
-            goose_provider="openai",
+            llm_provider="openai",
             model="gpt-5.4",
         )
         config = _make_config(user_configs={111: user})
@@ -153,17 +153,17 @@ class TestPerUserBackendRouting:
         assert instance.provider == "anthropic"
 
     def test_user_provider_overrides_global(self):
-        """User with goose_provider gets GooseBackend with that provider."""
+        """User with llm_provider gets GooseBackend with that provider."""
         user = UserConfig(
             telegram_id=111,
             name="alice",
             agent_backend="goose",
-            goose_provider="google",
+            llm_provider="google",
             model="gemini-3-flash",
         )
         config = _make_config(
             agent_backend="goose",
-            goose_provider="openai",
+            llm_provider="openai",
             default_model="gpt-5.4",
             user_configs={111: user},
         )
@@ -180,7 +180,7 @@ class TestPerUserBackendRouting:
             telegram_id=111,
             name="alice",
             agent_backend="goose",
-            goose_provider="openai",
+            llm_provider="openai",
             # No model set - should get openai default, not global "sonnet"
         )
         config = _make_config(user_configs={111: user})
@@ -196,7 +196,7 @@ class TestPerUserBackendRouting:
             telegram_id=111,
             name="alice",
             agent_backend="goose",
-            goose_provider="openai",
+            llm_provider="openai",
             model="gpt-5.4",
         )
         config = _make_config(user_configs={111: user})

@@ -45,7 +45,7 @@ class TestUserConfig:
         assert uc.pr_review is None
         assert uc.issue_triage is None
         assert uc.agent_backend is None
-        assert uc.goose_provider is None
+        assert uc.llm_provider is None
 
     def test_all_fields(self):
         """Full config with every field populated."""
@@ -66,7 +66,7 @@ class TestUserConfig:
             pr_review=True,
             issue_triage=False,
             agent_backend="goose",
-            goose_provider="openai",
+            llm_provider="openai",
         )
         assert uc.role == "admin"
         assert uc.github == "alice-dev"
@@ -81,7 +81,7 @@ class TestUserConfig:
         assert uc.pr_review is True
         assert uc.issue_triage is False
         assert uc.agent_backend == "goose"
-        assert uc.goose_provider == "openai"
+        assert uc.llm_provider == "openai"
 
     def test_frozen(self):
         """UserConfig is immutable."""
@@ -913,7 +913,7 @@ class TestLoadUserConfigs:
               - telegram_id: 111
                 name: alice
                 agent_backend: goose
-                goose_provider: openai
+                llm_provider: openai
                 model: gpt-5.4
             """,
         )
@@ -924,7 +924,7 @@ class TestLoadUserConfigs:
             configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].agent_backend == "goose"
-        assert configs[111].goose_provider == "openai"
+        assert configs[111].llm_provider == "openai"
         assert configs[111].model == "gpt-5.4"
 
     def test_invalid_agent_backend_exits(self, tmp_path):
@@ -945,21 +945,22 @@ class TestLoadUserConfigs:
         ):
             _load_user_configs("claude", "")
 
-    def test_invalid_goose_provider_exits(self, tmp_path):
-        """Invalid goose_provider causes SystemExit."""
+    def test_invalid_llm_provider_exits(self, tmp_path):
+        """Invalid llm_provider for the user's backend causes SystemExit."""
         self._write_yaml(
             tmp_path,
             """\
             users:
               - telegram_id: 111
                 name: alice
-                goose_provider: badprovider
+                agent_backend: goose
+                llm_provider: badprovider
             """,
         )
         with (
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
-            pytest.raises(SystemExit, match="invalid goose_provider"),
+            pytest.raises(SystemExit, match="invalid llm_provider"),
         ):
             _load_user_configs("claude", "")
 
@@ -978,12 +979,12 @@ class TestLoadUserConfigs:
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
             # Global provider is "" (empty), user has none set
-            pytest.raises(SystemExit, match="no goose_provider"),
+            pytest.raises(SystemExit, match="no llm_provider"),
         ):
             _load_user_configs("claude", "")
 
     def test_goose_backend_inherits_global_provider(self, tmp_path):
-        """User with goose backend inherits global goose_provider."""
+        """User with goose backend inherits global llm_provider."""
         self._write_yaml(
             tmp_path,
             """\
@@ -1003,7 +1004,7 @@ class TestLoadUserConfigs:
         assert configs is not None
         # User inherits global provider, no per-user override stored
         assert configs[111].agent_backend == "goose"
-        assert configs[111].goose_provider is None
+        assert configs[111].llm_provider is None
 
     def test_model_validated_against_user_provider(self, tmp_path):
         """Model invalid for user's effective provider is rejected."""
@@ -1014,7 +1015,7 @@ class TestLoadUserConfigs:
               - telegram_id: 111
                 name: alice
                 agent_backend: goose
-                goose_provider: openai
+                llm_provider: openai
                 model: opus
             """,
         )
@@ -1036,7 +1037,7 @@ class TestLoadUserConfigs:
               - telegram_id: 111
                 name: alice
                 agent_backend: goose
-                goose_provider: ollama
+                llm_provider: ollama
             """,
         )
         import logging

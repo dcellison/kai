@@ -100,7 +100,7 @@ class SubprocessPool:
 
         Resolution order for each setting:
         1. UserConfig from users.yaml (os_user, home_workspace, model,
-           budget, timeout, context_window, agent_backend, goose_provider)
+           budget, timeout, context_window, agent_backend, llm_provider)
         2. Global config defaults (from .env)
 
         Per-user DB overrides (set via /settings or /model) are applied
@@ -117,13 +117,13 @@ class SubprocessPool:
 
         # Per-user backend and provider, falling back to global config.
         backend = user.agent_backend if user and user.agent_backend else self._config.agent_backend
-        provider = user.goose_provider if user and user.goose_provider else self._config.goose_provider
+        provider = user.llm_provider if user and user.llm_provider else self._config.llm_provider
 
         # Per-user model. When the user's effective provider differs from
         # the global provider, the global default_model may not be valid.
         # Fall back to the provider's default model instead.
         effective_provider = get_effective_provider(backend, provider)
-        global_provider = get_effective_provider(self._config.agent_backend, self._config.goose_provider)
+        global_provider = get_effective_provider(self._config.agent_backend, self._config.llm_provider)
         if user and user.model:
             model = user.model
         elif effective_provider == global_provider:
@@ -176,7 +176,7 @@ class SubprocessPool:
                 services_info=self._services_info,
                 workspace_config=ws_config,
                 max_context_window=context_window,
-                goose_provider=provider,
+                provider=provider,
             )
 
         # os_user for sudo -u isolation. None = run as bot user.

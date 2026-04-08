@@ -2065,14 +2065,14 @@ class TestPerUserRouting:
 
     @pytest.mark.asyncio
     async def test_review_receives_user_backend(self, _clear_cooldowns, _mock_resolve_repo):
-        """Per-user agent_backend/goose_provider are passed to review_pr."""
+        """Per-user agent_backend/llm_provider are passed to review_pr."""
         base = self._make_user_config(111, repos=["owner/repo"])
         # Frozen dataclass - use replace to set per-user backend override
-        user = dataclasses.replace(base, agent_backend="goose", goose_provider="openai")
+        user = dataclasses.replace(base, agent_backend="goose", llm_provider="openai")
         config = self._make_config_with_users([user])
         # Global defaults (should be overridden by per-user values)
         config.agent_backend = "claude"
-        config.goose_provider = ""
+        config.llm_provider = ""
         app = _build_test_app(config=config)
         payload = _make_pr_payload("opened")
         body = json.dumps(payload).encode()
@@ -2100,12 +2100,12 @@ class TestPerUserRouting:
 
     @pytest.mark.asyncio
     async def test_triage_receives_user_backend(self, _clear_cooldowns):
-        """Per-user agent_backend/goose_provider are passed to triage_issue."""
+        """Per-user agent_backend/llm_provider are passed to triage_issue."""
         base = self._make_user_config(111, repos=["owner/repo"])
-        user = dataclasses.replace(base, agent_backend="goose", goose_provider="anthropic")
+        user = dataclasses.replace(base, agent_backend="goose", llm_provider="anthropic")
         config = self._make_config_with_users([user])
         config.agent_backend = "claude"
-        config.goose_provider = ""
+        config.llm_provider = ""
         app = _build_test_app(config=config)
         payload = _make_issue_payload("opened")
         body = json.dumps(payload).encode()
@@ -2135,10 +2135,10 @@ class TestPerUserRouting:
     async def test_review_uses_global_backend_when_no_user_override(self, _clear_cooldowns, _mock_resolve_repo):
         """Without per-user override, review_pr gets the global backend."""
         user = self._make_user_config(111, repos=["owner/repo"])
-        # No agent_backend/goose_provider set on user - defaults are None
+        # No agent_backend/llm_provider set on user - defaults are None
         config = self._make_config_with_users([user])
         config.agent_backend = "goose"
-        config.goose_provider = "google"
+        config.llm_provider = "google"
         app = _build_test_app(config=config)
         payload = _make_pr_payload("opened")
         body = json.dumps(payload).encode()

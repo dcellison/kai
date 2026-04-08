@@ -725,10 +725,10 @@ async def _process_github_event_for_user(
     else:
         agent_backend = config.agent_backend
 
-    if user_config and user_config.goose_provider:
-        goose_provider = user_config.goose_provider
+    if user_config and user_config.llm_provider:
+        provider = user_config.llm_provider
     else:
-        goose_provider = config.goose_provider
+        provider = config.llm_provider
 
     # ── PR review routing ────────────────────────────────────────
     # When PR review is enabled for this user, reviewable PR events
@@ -776,7 +776,7 @@ async def _process_github_event_for_user(
                     spec_dir=request.app.get("spec_dir", "specs"),
                     notify_chat_id=target_chat_id,
                     agent_backend=agent_backend,
-                    goose_provider=goose_provider,
+                    goose_provider=provider,
                 )
             )
             _background_tasks.add(task)
@@ -822,7 +822,7 @@ async def _process_github_event_for_user(
                     claude_user=claude_user,
                     notify_chat_id=target_chat_id,
                     agent_backend=agent_backend,
-                    goose_provider=goose_provider,
+                    goose_provider=provider,
                 )
             )
             _background_tasks.add(task)

@@ -589,7 +589,7 @@ class TestCmdConfig:
 
         conf = json.loads((tmp_path / "install.conf").read_text())
         assert conf["env"]["AGENT_BACKEND"] == "goose"
-        assert conf["env"]["GOOSE_PROVIDER"] == "anthropic"
+        assert conf["env"]["LLM_PROVIDER"] == "anthropic"
         assert conf["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
 
     def test_goose_ollama_no_api_key(self, tmp_path, monkeypatch):
@@ -640,7 +640,7 @@ class TestCmdConfig:
         _cmd_config()
 
         conf = json.loads((tmp_path / "install.conf").read_text())
-        assert conf["env"]["GOOSE_PROVIDER"] == "ollama"
+        assert conf["env"]["LLM_PROVIDER"] == "ollama"
         # Ollama is local inference - no API key should be present
         for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"):
             assert key not in conf["env"]
