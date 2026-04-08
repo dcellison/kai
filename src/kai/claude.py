@@ -788,7 +788,7 @@ class ClaudeCodeBackend(AgentBackend):
                 try:
                     await self._save_prompt()
                 except Exception:
-                    log.debug("save_prompt failed during shutdown; proceeding with termination")
+                    log.warning("save_prompt failed during shutdown; proceeding with termination", exc_info=True)
 
                 saved_pgid = self._pgid
 
