@@ -785,7 +785,10 @@ class ClaudeCodeBackend(AgentBackend):
         saved_pgid = None
         async with self._lock:
             if self._proc:
-                await self._save_prompt()
+                try:
+                    await self._save_prompt()
+                except Exception:
+                    log.debug("save_prompt failed during shutdown; proceeding with termination")
 
                 saved_pgid = self._pgid
 
