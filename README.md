@@ -43,7 +43,7 @@ For the full architecture, see [System Architecture](https://github.com/dcelliso
 
 Switch the agent between projects on your system with `/workspace <name>`. Names resolve relative to `WORKSPACE_BASE` (set in `.env`). Identity and memory carry over from the home workspace, so Kai retains full context regardless of what it's working on. Create new workspaces with `/workspace new <name>`. Absolute paths are not accepted - all workspaces must live under the configured base directory.
 
-Per-workspace configuration is supported via `workspaces.yaml` (or `/etc/kai/workspaces.yaml` for protected installations). Each workspace can override the Claude model, budget, timeout, environment variables, and system prompt. See `workspaces.example.yaml` for the full format.
+Per-workspace configuration is supported via `workspaces.yaml` (or `/etc/kai/workspaces.yaml` for protected installations). Each workspace can override the model, budget, timeout, environment variables, and system prompt. See `workspaces.example.yaml` for the full format.
 
 ### Multi-user
 
@@ -57,7 +57,7 @@ users:
     github: alice-dev     # routes GitHub events to this user
     os_user: alice        # subprocess runs as this OS account
     home_workspace: /home/alice/workspace
-    max_budget: 15.0      # ceiling for /budget command (CLAUDE_MAX_BUDGET_USD is the default)
+    max_budget: 15.0      # ceiling for /settings budget (CLAUDE_MAX_BUDGET_USD is the default)
 ```
 
 Each user gets:
@@ -74,11 +74,11 @@ Run `make config` to generate `users.yaml`, or create one manually from `users.e
 
 Three layers of persistent context give the agent continuity across sessions:
 
-1. **Identity config** (`CLAUDE.md`) - voice, rules, API docs, and operational guidelines. Static, installed with the workspace.
+1. **Identity** (`home/.claude/CLAUDE.md`) - voice, rules, and operational guidelines. Lives in the home workspace. When the agent switches to a foreign workspace, Kai injects it so behavior stays consistent. In the home workspace, the agent reads it natively.
 2. **Home memory** (`DATA_DIR/memory/MEMORY.md`) - personal memory, always injected regardless of current workspace. Proactively updated by Kai.
 3. **Conversation history** (`DATA_DIR/history/<chat_id>/`) - JSONL logs, one file per day per user. Searchable for past conversations.
 
-Foreign workspaces also get their own `.claude/MEMORY.md` injected alongside home memory. See [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture).
+Workspaces can also define a system prompt via `workspaces.yaml` for workspace-specific instructions. See [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture).
 
 ### Scheduled jobs
 
@@ -92,11 +92,11 @@ When code is pushed to a pull request, Kai automatically reviews it. A one-shot 
 
 When a new issue is opened, Kai triages it automatically. A one-shot agent subprocess reads the issue, applies labels (creating them if they don't exist), checks for duplicates and related issues, assigns it to a project board if appropriate, posts a triage summary comment, and sends you a Telegram notification. See [Issue Triage Agent](https://github.com/dcellison/kai/wiki/Issue-Triage-Agent).
 
-Both agents are fire-and-forget background tasks that run independently of your chat session. They use separate agent processes, so a review or triage can happen while you're mid-conversation. Opt-in via `PR_REVIEW_ENABLED` and `ISSUE_TRIAGE_ENABLED` in `.env`.
+Both agents are fire-and-forget background tasks that run independently of your chat session. They use separate agent processes, so a review or triage can happen while you're mid-conversation. Opt-in per-user via `/github reviews on` and `/github triage on`, or in `users.yaml`. The `PR_REVIEW_ENABLED` and `ISSUE_TRIAGE_ENABLED` env vars still work as global fallbacks.
 
 ### GitHub notification routing
 
-GitHub event notifications (pushes, PRs, issues, comments, reviews) can be routed to a separate Telegram group via `GITHUB_NOTIFY_CHAT_ID`, keeping your primary DM clean for conversation. Agent output (review comments, triage summaries) also routes to the group. See [GitHub Notification Routing](https://github.com/dcellison/kai/wiki/GitHub-Notification-Routing).
+GitHub event notifications (pushes, PRs, issues, comments, reviews) can be routed to a separate Telegram group via `/github notify <chat_id>` (or the deprecated `GITHUB_NOTIFY_CHAT_ID` env var as a global fallback), keeping your primary DM clean for conversation. Agent output (review comments, triage summaries) also routes to the group. See [GitHub Notification Routing](https://github.com/dcellison/kai/wiki/GitHub-Notification-Routing).
 
 ### Webhooks
 
@@ -137,7 +137,7 @@ If interrupted mid-response, Kai notifies you on restart and asks you to resend 
 | `/new` | Clear session and start fresh |
 | `/stop` | Interrupt a response mid-stream |
 | `/models` | Interactive model picker |
-| `/model <name>` | Switch model (`opus`, `sonnet`, `haiku`) |
+| `/model <name>` | Switch model (available models depend on backend) |
 | `/settings` | Show per-user settings (model, budget, timeout, context window) |
 | `/settings <field> <value>` | Change a setting (`model`, `budget`, `timeout`, `context`) |
 | `/settings reset [field]` | Clear all overrides, or one field |
@@ -195,8 +195,8 @@ cp .env.example .env
 | `CLAUDE_MODEL` | Deprecated* | `sonnet` | Default model. Set per-user in `users.yaml` or via `/settings model`. |
 | `CLAUDE_TIMEOUT_SECONDS` | Deprecated* | `120` | Per-message timeout. Set per-user in `users.yaml` or via `/settings timeout`. |
 | `CLAUDE_MAX_BUDGET_USD` | Deprecated* | `10.0` | Session budget cap. Set per-user in `users.yaml` or via `/settings budget`. |
-| `CLAUDE_MAX_CONTEXT_WINDOW` | Deprecated* | `0` | Context window size in tokens (0 = Claude Code default). Set per-user in `users.yaml` or via `/settings context`. |
-| `CLAUDE_AUTOCOMPACT_PCT` | No | `80` | Context compression threshold (%). When usage hits this, Claude compresses history. Can only lower the default (~83%), not raise it. |
+| `CLAUDE_MAX_CONTEXT_WINDOW` | Deprecated* | `0` | Context window size in tokens (0 = backend default). Set per-user in `users.yaml` or via `/settings context`. |
+| `CLAUDE_AUTOCOMPACT_PCT` | No | `80` | Context compression threshold %, Claude Code only. When usage hits this, Claude compresses history. Can only lower the default (~83%), not raise it. |
 | `CLAUDE_MAX_SESSION_HOURS` | No | `0` | Maximum session age in hours before recycling the subprocess (0 = no limit). Recommended: 4-8 on memory-constrained machines. |
 | `WORKSPACE_BASE` | Deprecated* | | Base directory for workspace name resolution. Set per-user in `users.yaml`. |
 | `ALLOWED_WORKSPACES` | Deprecated* | | Comma-separated extra workspace paths. Users now manage their own via `/workspace allow`. |
@@ -221,7 +221,7 @@ cp .env.example .env
 
 *Deprecated vars still work for backward compatibility when `users.yaml` is absent. When `users.yaml` is present, `users.yaml` wins and a warning is logged. Run `make config` to migrate.
 
-`CLAUDE_MAX_BUDGET_USD` limits how much work Claude can do in a single session via Claude Code's `--max-budget-usd` flag. On Pro/Max plans this is purely a runaway prevention mechanism (no per-token charges). The session resets on `/new`, model switch, or workspace switch.
+`CLAUDE_MAX_BUDGET_USD` limits spending in a single session. For Claude Code, this maps to the `--max-budget-usd` CLI flag (on Pro/Max plans, purely a runaway prevention mechanism). Goose does not currently enforce this limit. The session resets on `/new`, model switch, or workspace switch.
 
 ## Running
 
@@ -271,7 +271,7 @@ Create `~/Library/LaunchAgents/com.kai.bot.plist`:
 </plist>
 ```
 
-Replace `/path/to/kai` with your actual project path. The `PATH` must include directories for `claude`, `ffmpeg`, and any other tools Kai shells out to.
+Replace `/path/to/kai` with your actual project path. The `PATH` must include directories for `claude` (or `goose`, depending on your backend), `ffmpeg`, and any other tools Kai shells out to.
 
 ```bash
 launchctl load ~/Library/LaunchAgents/com.kai.bot.plist
@@ -351,7 +351,7 @@ kai/
 │   ├── telegram_utils.py     # Telegram-specific helper functions
 │   └── workspace_utils.py    # Workspace path resolution and validation
 ├── tests/                    # Test suite
-├── home/                     # Claude Code home workspace
+├── home/                     # Agent home workspace
 │   ├── .claude/              # Identity and memory template
 │   └── files/                # File exchange directory (created at runtime)
 ├── kai.db                    # SQLite database (gitignored, created at runtime)
