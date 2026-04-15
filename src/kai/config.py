@@ -1360,7 +1360,7 @@ def load_config() -> Config:
     if user_configs is not None:
         _deprecated_env_vars = {
             "CLAUDE_MODEL": "Renamed to DEFAULT_MODEL. Set per-user 'model' in users.yaml or use /settings model",
-            "CLAUDE_MAX_BUDGET_USD": "Renamed to BUDGET_CEILING. Set per-user 'max_budget' in users.yaml or use /settings budget",
+            "CLAUDE_MAX_BUDGET_USD": "Renamed to BUDGET_CEILING (global ceiling). Per-user defaults go in users.yaml 'max_budget'",
             "CLAUDE_TIMEOUT_SECONDS": "Set per-user 'timeout' in users.yaml or use /settings timeout",
             "CLAUDE_MAX_CONTEXT_WINDOW": "Set per-user 'context_window' in users.yaml or use /settings context",
             "CLAUDE_USER": "Set per-user 'os_user' in users.yaml",

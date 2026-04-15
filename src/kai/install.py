@@ -700,17 +700,21 @@ def _cmd_config() -> None:
     if llm_api_key_var and llm_api_key:
         env[llm_api_key_var] = llm_api_key
 
-    # Deprecated per-user vars: only include without users.yaml
-    # (legacy single-user mode). With users.yaml, these are noise.
     # Remove stale renamed keys if present - leaving both the old and
     # new key causes silent confusion (the deprecation warning is
     # suppressed when the new key exists).
     env.pop("CLAUDE_MODEL", None)
     env.pop("CLAUDE_MAX_BUDGET_USD", None)
+
+    # BUDGET_CEILING is global (not per-user), so always write it
+    # regardless of whether users.yaml exists.
+    env["BUDGET_CEILING"] = budget
+
+    # Deprecated per-user vars: only include without users.yaml
+    # (legacy single-user mode). With users.yaml, these are noise.
     if not users_yaml_exists:
         env["DEFAULT_MODEL"] = model
         env["CLAUDE_TIMEOUT_SECONDS"] = timeout
-        env["BUDGET_CEILING"] = budget
 
     # Context window tuning - only include if non-default.
     # Compare as int to handle inputs like "000" that pass validation.
