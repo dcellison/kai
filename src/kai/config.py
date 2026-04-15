@@ -240,9 +240,10 @@ class UserConfig:
         github: GitHub username for webhook actor routing.
         os_user: OS username for subprocess isolation (Phase 3).
         home_workspace: Per-user home workspace directory.
-        max_budget: Budget ceiling in USD. Serves double duty as both
-            the admin ceiling (user cannot exceed via /settings budget)
-            and the baseline default (used if user hasn't set their own).
+        max_budget: Default budget in USD for this user. Used as the
+            baseline when the user has not set their own via /settings
+            budget. Does NOT serve as a ceiling - the ceiling is
+            BUDGET_CEILING (global env var).
         model: Default model name (e.g., "opus", "sonnet", "haiku").
         timeout: Default timeout in seconds for Claude responses.
         context_window: Default context window size in tokens (0 = default).
@@ -297,7 +298,9 @@ class Config:
         allowed_user_ids: Set of Telegram user IDs permitted to interact with the bot (required)
         default_model: Default model name, provider-dependent (e.g. sonnet, gpt-5.4, gemini-3-flash)
         claude_timeout_seconds: Seconds before a Claude response is considered timed out
-        claude_max_budget_usd: Per-session spending cap in USD
+        budget_ceiling: Global budget ceiling in USD. Users cannot exceed
+            this via /settings budget. Also serves as the fallback default
+            for users without a per-user max_budget in users.yaml.
         claude_max_session_hours: Hours before the inner Claude process is recycled. Prevents
             unbounded V8 memory growth that can trigger macOS Jetsam kernel panics. 0 = no limit.
         claude_workspace: Working directory for the inner Claude Code process
@@ -330,7 +333,7 @@ class Config:
     # Claude Code process configuration
     default_model: str = "sonnet"
     claude_timeout_seconds: int = 120
-    claude_max_budget_usd: float = 10.0
+    budget_ceiling: float = 10.0
     claude_max_session_hours: float = 0  # 0 = no limit
     claude_idle_timeout: int = 1800  # seconds before idle subprocess eviction; 0 = no eviction
     claude_workspace: Path = field(default_factory=lambda: PROJECT_ROOT / "home")
@@ -1208,10 +1211,17 @@ def load_config() -> Config:
         claude_timeout_seconds = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "120"))
     except ValueError:
         raise SystemExit("CLAUDE_TIMEOUT_SECONDS must be an integer") from None
+    # Budget ceiling: new var takes precedence, fall back to old var
+    # for backward compat on upgrade (existing .env has old key name).
+    raw_ceiling = os.environ.get("BUDGET_CEILING", "").strip()
+    if not raw_ceiling:
+        raw_ceiling = os.environ.get("CLAUDE_MAX_BUDGET_USD", "").strip()
+    if not raw_ceiling:
+        raw_ceiling = "10.0"
     try:
-        claude_max_budget_usd = float(os.environ.get("CLAUDE_MAX_BUDGET_USD", "10.0"))
+        budget_ceiling = float(raw_ceiling)
     except ValueError:
-        raise SystemExit("CLAUDE_MAX_BUDGET_USD must be a number") from None
+        raise SystemExit("BUDGET_CEILING must be a number") from None
     try:
         claude_max_session_hours = float(os.environ.get("CLAUDE_MAX_SESSION_HOURS", "0"))
     except ValueError:
@@ -1350,7 +1360,7 @@ def load_config() -> Config:
     if user_configs is not None:
         _deprecated_env_vars = {
             "CLAUDE_MODEL": "Renamed to DEFAULT_MODEL. Set per-user 'model' in users.yaml or use /settings model",
-            "CLAUDE_MAX_BUDGET_USD": "Set per-user 'max_budget' in users.yaml or use /settings budget",
+            "CLAUDE_MAX_BUDGET_USD": "Renamed to BUDGET_CEILING. Set per-user 'max_budget' in users.yaml or use /settings budget",
             "CLAUDE_TIMEOUT_SECONDS": "Set per-user 'timeout' in users.yaml or use /settings timeout",
             "CLAUDE_MAX_CONTEXT_WINDOW": "Set per-user 'context_window' in users.yaml or use /settings context",
             "CLAUDE_USER": "Set per-user 'os_user' in users.yaml",
@@ -1423,7 +1433,7 @@ def load_config() -> Config:
         allowed_user_ids=allowed_ids,
         default_model=default_model,
         claude_timeout_seconds=claude_timeout_seconds,
-        claude_max_budget_usd=claude_max_budget_usd,
+        budget_ceiling=budget_ceiling,
         claude_max_session_hours=claude_max_session_hours,
         claude_idle_timeout=claude_idle_timeout,
         claude_max_context_window=claude_max_context_window,

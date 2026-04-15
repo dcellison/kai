@@ -20,7 +20,8 @@ _CONFIG_ENV_VARS = [
     "DEFAULT_MODEL",
     "CLAUDE_MODEL",
     "CLAUDE_TIMEOUT_SECONDS",
-    "CLAUDE_MAX_BUDGET_USD",
+    "BUDGET_CEILING",
+    "CLAUDE_MAX_BUDGET_USD",  # backward compat (renamed to BUDGET_CEILING)
     "CLAUDE_MAX_SESSION_HOURS",
     "CLAUDE_IDLE_TIMEOUT",
     "WEBHOOK_PORT",
@@ -85,7 +86,7 @@ class TestLoadConfigDefaults:
         config = load_config()
         assert config.default_model == "sonnet"
         assert config.claude_timeout_seconds == 120
-        assert config.claude_max_budget_usd == 10.0
+        assert config.budget_ceiling == 10.0
         assert config.claude_max_session_hours == 0
         assert config.webhook_port == 8080
         # Without TELEGRAM_WEBHOOK_URL, defaults to polling mode
@@ -730,7 +731,7 @@ def _mock_user_configs(monkeypatch):
 # for path vars because it always exists on both macOS and Linux.
 _DEPRECATED_VARS_WITH_VALUES = {
     "CLAUDE_MODEL": "sonnet",
-    "CLAUDE_MAX_BUDGET_USD": "10.0",
+    "CLAUDE_MAX_BUDGET_USD": "10.0",  # old name, still tested for deprecation warning
     "CLAUDE_TIMEOUT_SECONDS": "120",
     "CLAUDE_MAX_CONTEXT_WINDOW": "200000",
     "CLAUDE_USER": "kai",
@@ -916,7 +917,7 @@ class TestMinimalEnvWithUsersYaml:
         # Uses dataclass defaults when no env var is set
         assert config.default_model == "sonnet"
         assert config.claude_timeout_seconds == 120
-        assert config.claude_max_budget_usd == 10.0
+        assert config.budget_ceiling == 10.0
         assert config.claude_max_context_window == 0
         assert config.claude_user is None
         assert config.workspace_base is None
@@ -945,7 +946,7 @@ class TestMinimalEnvWithUsersYaml:
         assert config.user_configs[123].model == "opus"
 
     def test_per_user_budget_without_env(self, monkeypatch):
-        """Per-user budget from users.yaml works when CLAUDE_MAX_BUDGET_USD is unset."""
+        """Per-user budget from users.yaml works when BUDGET_CEILING is unset."""
         for var, val in _MINIMAL_GLOBAL_ENV.items():
             monkeypatch.setenv(var, val)
         user = UserConfig(telegram_id=123, name="testuser", max_budget=25.0)
@@ -954,7 +955,7 @@ class TestMinimalEnvWithUsersYaml:
             lambda *_a: {123: user},
         )
         config = load_config()
-        assert config.claude_max_budget_usd == 10.0  # dataclass default
+        assert config.budget_ceiling == 10.0  # dataclass default
         assert config.user_configs is not None
         assert config.user_configs[123].max_budget == 25.0
 
@@ -1099,13 +1100,28 @@ class TestLegacyEnvOnlyMode:
         """Full config from env vars works when users.yaml is absent."""
         _set_required(monkeypatch)
         monkeypatch.setenv("CLAUDE_MODEL", "opus")
-        monkeypatch.setenv("CLAUDE_MAX_BUDGET_USD", "25.0")
+        monkeypatch.setenv("BUDGET_CEILING", "25.0")
         monkeypatch.setenv("CLAUDE_TIMEOUT_SECONDS", "300")
         config = load_config()
         assert config.default_model == "opus"
-        assert config.claude_max_budget_usd == 25.0
+        assert config.budget_ceiling == 25.0
         assert config.claude_timeout_seconds == 300
         assert config.user_configs is None
+
+    def test_old_budget_env_var_backward_compat(self, monkeypatch):
+        """CLAUDE_MAX_BUDGET_USD still works as fallback when BUDGET_CEILING is not set."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_MAX_BUDGET_USD", "42.0")
+        config = load_config()
+        assert config.budget_ceiling == 42.0
+
+    def test_new_budget_env_var_takes_precedence(self, monkeypatch):
+        """BUDGET_CEILING wins over CLAUDE_MAX_BUDGET_USD when both are set."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("BUDGET_CEILING", "50.0")
+        monkeypatch.setenv("CLAUDE_MAX_BUDGET_USD", "25.0")
+        config = load_config()
+        assert config.budget_ceiling == 50.0
 
     def test_no_deprecation_warnings(self, monkeypatch, caplog):
         """No users.yaml deprecation warnings when users.yaml is absent."""

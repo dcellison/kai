@@ -30,7 +30,7 @@ def _make_config(**overrides) -> Config:
         "allowed_user_ids": {111, 222},
         "default_model": "sonnet",
         "claude_timeout_seconds": 30,
-        "claude_max_budget_usd": 1.0,
+        "budget_ceiling": 1.0,
         "claude_max_session_hours": 0,
         "claude_idle_timeout": 1800,
         "claude_workspace": Path("/home/workspace"),
@@ -110,7 +110,7 @@ class TestInstanceCreation:
         config = _make_config(
             user_configs={111: user},
             default_model="haiku",
-            claude_max_budget_usd=5.0,
+            budget_ceiling=5.0,
             claude_timeout_seconds=60,
             claude_max_context_window=100_000,
         )

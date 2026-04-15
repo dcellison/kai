@@ -599,15 +599,9 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except ValueError:
             await update.message.reply_text("Budget must be a positive number.")
             return
-        # Enforce ceiling: users.yaml max_budget or global default.
-        # 0 means "no admin ceiling" (e.g., CLAUDE_MAX_BUDGET_USD unset
-        # or explicitly 0). Only enforce when a positive ceiling exists.
-        user_config = config.get_user_config(chat_id)
-        ceiling = (
-            user_config.max_budget
-            if user_config and user_config.max_budget is not None
-            else config.claude_max_budget_usd
-        )
+        # Enforce ceiling: always from global config, never per-user.
+        # 0 means "no ceiling" (skip enforcement).
+        ceiling = config.budget_ceiling
         if ceiling and budget > ceiling:
             await update.message.reply_text(f"Budget cannot exceed ${ceiling:.2f} (admin limit).")
             return
@@ -710,11 +704,12 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
 
     # Budget - 0 means "unlimited" (consistent with the ceiling check
     # in the budget handler, where 0 = no ceiling).
+    # budget_ceiling doubles as the fallback default for unconfigured users
     yaml_budget = user_config.max_budget if user_config else None
     budget, budget_src = _resolve(
         "budget",
         yaml_budget,
-        config.claude_max_budget_usd,
+        config.budget_ceiling,
         lambda v: "unlimited" if float(v) == 0 else f"${float(v):.2f}",
     )
 
@@ -751,16 +746,6 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
         ctx_src = "global default"
     ctx_label = f"{ctx_val:,} tokens" if ctx_val > 0 else "not set (model default)"
 
-    # Budget ceiling - show when a positive ceiling exists so the user
-    # knows their limit before hitting it. Falls through to the global
-    # default when no users.yaml entry exists. 0 = no limit, suppress.
-    ceiling = (
-        user_config.max_budget
-        if user_config and user_config.max_budget is not None
-        else config.claude_max_budget_usd or None  # 0 means no limit
-    )
-    ceiling_line = f"\n\nBudget ceiling: ${ceiling:.2f} (admin)" if ceiling else ""
-
     # Provider info - always show so users know their configuration.
     # Uses the shared helper that checks the running instance first,
     # falling back to config cascade so new users see their provider
@@ -776,7 +761,6 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
         f"  Budget: {budget} ({budget_src})\n"
         f"  Timeout: {timeout} ({timeout_src})\n"
         f"  Context: {ctx_label} ({ctx_src})"
-        f"{ceiling_line}"
     )
 
 
@@ -817,9 +801,8 @@ def _revert_instance_field(pool: SubprocessPool, chat_id: int, field: str, confi
                     fallback = config.default_model
                 instance.model = fallback
     elif field == "budget":
-        instance.max_budget_usd = (
-            user.max_budget if user and user.max_budget is not None else config.claude_max_budget_usd
-        )
+        # budget_ceiling doubles as the fallback default for unconfigured users
+        instance.max_budget_usd = user.max_budget if user and user.max_budget is not None else config.budget_ceiling
     elif field == "timeout":
         instance.timeout_seconds = user.timeout if user and user.timeout is not None else config.claude_timeout_seconds
     elif field == "context_window":
@@ -1443,14 +1426,9 @@ async def _handle_workspace_config(
         except ValueError:
             await update.message.reply_text("Budget must be a positive number.")
             return
-        # Enforce ceiling: per-user max_budget from users.yaml, or the
-        # global claude_max_budget_usd as fallback. 0 = no ceiling.
-        user_config = config.get_user_config(chat_id)
-        ceiling = (
-            user_config.max_budget
-            if user_config and user_config.max_budget is not None
-            else config.claude_max_budget_usd
-        )
+        # Enforce ceiling: always from global config, never per-user.
+        # 0 means "no ceiling" (skip enforcement).
+        ceiling = config.budget_ceiling
         if ceiling and budget > ceiling:
             await update.message.reply_text(f"Budget cannot exceed ${ceiling:.2f} (admin limit).")
             return
@@ -1541,7 +1519,8 @@ async def _show_workspace_config(
         elif user_config and user_config.max_budget is not None:
             budget, budget_src = user_config.max_budget, "users.yaml"
         else:
-            budget, budget_src = config.claude_max_budget_usd, "global default"
+            # budget_ceiling doubles as the fallback default for unconfigured users
+            budget, budget_src = config.budget_ceiling, "global default"
         lines.append(f"  Budget: ${budget:.2f} ({budget_src})")
     except (ValueError, TypeError):
         lines.append("  Budget: (corrupted - reset with /workspace config reset budget)")

@@ -155,7 +155,8 @@ class SubprocessPool:
                 )
                 model = self._config.default_model
 
-        budget = user.max_budget if user and user.max_budget is not None else self._config.claude_max_budget_usd
+        # budget_ceiling doubles as the fallback default for unconfigured users
+        budget = user.max_budget if user and user.max_budget is not None else self._config.budget_ceiling
         timeout = user.timeout if user and user.timeout is not None else self._config.claude_timeout_seconds
         context_window = (
             user.context_window if user and user.context_window is not None else self._config.claude_max_context_window

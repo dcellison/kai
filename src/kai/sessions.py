@@ -713,11 +713,9 @@ async def resolve_user_defaults(
     yaml_model = raw_yaml_model.strip() if raw_yaml_model is not None else None
     model = db_model if db_model else yaml_model if yaml_model else config.default_model
 
-    # Budget: DB > users.yaml max_budget (as default, not ceiling) > env.
-    # max_budget in users.yaml serves double duty - it's both the admin
-    # ceiling AND the baseline default. If a user has max_budget=20 and
-    # hasn't set a /settings budget, they get $20. If they set /settings
-    # budget 15, they get $15. They cannot set above $20.
+    # Budget: DB > users.yaml max_budget (as default only) > global ceiling.
+    # max_budget in users.yaml is the admin-set baseline default, NOT a
+    # ceiling. The ceiling comes solely from BUDGET_CEILING (config.budget_ceiling).
     # Defensive try/except matches _restore_workspace and _show_settings.
     yaml_budget = user_config.max_budget if user_config and user_config.max_budget is not None else None
     try:
@@ -725,7 +723,8 @@ async def resolve_user_defaults(
     except (ValueError, TypeError):
         budget = None
     if budget is None:
-        budget = yaml_budget if yaml_budget is not None else config.claude_max_budget_usd
+        # budget_ceiling doubles as the fallback default for unconfigured users
+        budget = yaml_budget if yaml_budget is not None else config.budget_ceiling
 
     # Timeout: DB > users.yaml > env > 120
     yaml_timeout = user_config.timeout if user_config and user_config.timeout is not None else None

@@ -57,7 +57,7 @@ users:
     github: alice-dev     # routes GitHub events to this user
     os_user: alice        # subprocess runs as this OS account
     home_workspace: /home/alice/workspace
-    max_budget: 15.0      # ceiling for /settings budget (CLAUDE_MAX_BUDGET_USD is the default)
+    max_budget: 15.0      # default budget for this user (BUDGET_CEILING is the global ceiling)
 ```
 
 Each user gets:
@@ -194,7 +194,7 @@ cp .env.example .env
 | `ALLOWED_USER_IDS` | Deprecated* | | Comma-separated Telegram user IDs. Superseded by `users.yaml`; use `make config` instead. (*Still works if `users.yaml` absent.) |
 | `CLAUDE_MODEL` | Deprecated* | `sonnet` | Default model. Set per-user in `users.yaml` or via `/settings model`. |
 | `CLAUDE_TIMEOUT_SECONDS` | Deprecated* | `120` | Per-message timeout. Set per-user in `users.yaml` or via `/settings timeout`. |
-| `CLAUDE_MAX_BUDGET_USD` | Deprecated* | `10.0` | Session budget cap. Set per-user in `users.yaml` or via `/settings budget`. |
+| `BUDGET_CEILING` | No | `10.0` | Global budget ceiling in USD. Users cannot exceed this via `/settings budget`. Per-user defaults are set via `max_budget` in `users.yaml`. |
 | `CLAUDE_MAX_CONTEXT_WINDOW` | Deprecated* | `0` | Context window size in tokens (0 = backend default). Set per-user in `users.yaml` or via `/settings context`. |
 | `CLAUDE_AUTOCOMPACT_PCT` | No | `80` | Context compression threshold %, Claude Code only. When usage hits this, Claude compresses history. Can only lower the default (~83%), not raise it. |
 | `CLAUDE_MAX_SESSION_HOURS` | No | `0` | Maximum session age in hours before recycling the subprocess (0 = no limit). Recommended: 4-8 on memory-constrained machines. |
@@ -221,7 +221,7 @@ cp .env.example .env
 
 *Deprecated vars still work for backward compatibility when `users.yaml` is absent. When `users.yaml` is present, `users.yaml` wins and a warning is logged. Run `make config` to migrate.
 
-`CLAUDE_MAX_BUDGET_USD` limits spending in a single session. For Claude Code, this maps to the `--max-budget-usd` CLI flag (on Pro/Max plans, purely a runaway prevention mechanism). Goose does not currently enforce this limit. The session resets on `/new`, model switch, or workspace switch.
+`BUDGET_CEILING` limits spending in a single session. For Claude Code, this maps to the `--max-budget-usd` CLI flag (on Pro/Max plans, purely a runaway prevention mechanism). Goose does not currently enforce this limit. The session resets on `/new`, model switch, or workspace switch.
 
 ## Running
 

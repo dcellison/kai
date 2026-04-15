@@ -73,7 +73,7 @@ from kai.bot import (
     handle_workspace_callback,
     handle_workspaces,
 )
-from kai.config import PROVIDER_MODELS, Config
+from kai.config import PROVIDER_MODELS, Config, UserConfig
 from kai.tts import DEFAULT_VOICE, VOICES
 from kai.workspace_utils import is_workspace_allowed
 
@@ -3372,12 +3372,13 @@ class TestHandleWorkspaceConfig:
     # ── Budget ceiling enforcement ──────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_budget_ceiling_from_user_config(self):
-        """Budget exceeding per-user max_budget is rejected."""
-        from kai.config import UserConfig
-
+    async def test_budget_ceiling_from_global_config(self):
+        """Budget exceeding global budget_ceiling is rejected."""
+        # Ceiling comes from config.budget_ceiling, not per-user max_budget.
+        # User has max_budget=5 but global ceiling is 8; requesting 10
+        # should be rejected because 10 > 8 (global ceiling).
         user = UserConfig(telegram_id=12345, name="test", max_budget=5.0)
-        config = _make_config(user_configs={12345: user})
+        config = _make_config(budget_ceiling=8.0, user_configs={12345: user})
         update = _make_update(text="/workspace config budget 10")
         pool = _make_mock_claude()
         ctx = _make_context(config=config, pool=pool)
@@ -3386,11 +3387,28 @@ class TestHandleWorkspaceConfig:
         with self._patches(mock_sessions):
             await _handle_workspace_config(update, ctx, "config budget 10")
 
-        # Should reject - 10 exceeds per-user ceiling of 5
+        # Should reject - 10 exceeds global ceiling of 8
         mock_sessions.set_workspace_config_setting.assert_not_called()
         reply = update.message.reply_text.call_args[0][0]
-        assert "$5.00" in reply
+        assert "$8.00" in reply
         assert "admin limit" in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_budget_above_yaml_default_but_under_ceiling_allowed(self):
+        """Budget above per-user max_budget but under global ceiling succeeds."""
+        # User has max_budget=5 in users.yaml, but global ceiling is 20.
+        # Setting budget to 10 should succeed (above yaml default, under ceiling).
+        user = UserConfig(telegram_id=12345, name="test", max_budget=5.0)
+        config = _make_config(budget_ceiling=20.0, user_configs={12345: user})
+        update = _make_update(text="/workspace config budget 10")
+        pool = _make_mock_claude()
+        ctx = _make_context(config=config, pool=pool)
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await _handle_workspace_config(update, ctx, "config budget 10")
+
+        mock_sessions.set_workspace_config_setting.assert_called_once()
 
     # ── Invalid model rejected ──────────────────────────────────────
 
@@ -3519,11 +3537,9 @@ class TestHandleSettings:
 
     @pytest.mark.asyncio
     async def test_budget_exceeds_ceiling(self):
-        """/settings budget 999 is rejected when ceiling is lower."""
-        from kai.config import UserConfig
-
-        user = UserConfig(telegram_id=12345, name="test", max_budget=5.0)
-        config = _make_config(user_configs={12345: user})
+        """/settings budget 999 is rejected when global ceiling is lower."""
+        # Ceiling comes from config.budget_ceiling (global), not per-user
+        config = _make_config(budget_ceiling=25.0)
         update = _make_update(text="/settings budget 999")
         ctx = _make_context(config=config, args=["budget", "999"])
         mock_sessions = self._mock_sessions()
@@ -3533,7 +3549,7 @@ class TestHandleSettings:
 
         mock_sessions.set_user_setting.assert_not_called()
         reply = update.message.reply_text.call_args[0][0]
-        assert "$5.00" in reply
+        assert "$25.00" in reply
         assert "admin limit" in reply.lower()
 
     # ── 5b. Budget allowed when ceiling is zero (no limit) ──────────
@@ -3541,9 +3557,9 @@ class TestHandleSettings:
     @pytest.mark.asyncio
     async def test_budget_allowed_when_ceiling_zero(self):
         """/settings budget 50 succeeds when global ceiling is 0 (no limit)."""
-        # If CLAUDE_MAX_BUDGET_USD=0 and no users.yaml entry, 0 means
+        # If BUDGET_CEILING=0 and no users.yaml entry, 0 means
         # "no admin ceiling" - budget should be allowed, not rejected.
-        config = _make_config(claude_max_budget_usd=0.0)
+        config = _make_config(budget_ceiling=0.0)
         update = _make_update(text="/settings budget 50")
         pool = _make_mock_claude()
         pool.get_if_exists = MagicMock(return_value=MagicMock())
@@ -3793,7 +3809,7 @@ class TestHandleSettings:
             await handle_settings(update, ctx)
 
         assert instance.model == config.default_model
-        assert instance.max_budget_usd == config.claude_max_budget_usd
+        assert instance.max_budget_usd == config.budget_ceiling
         assert instance.timeout_seconds == config.claude_timeout_seconds
         assert instance.max_context_window == config.claude_max_context_window
 
@@ -3803,7 +3819,7 @@ class TestHandleSettings:
     async def test_show_settings_budget_zero_displays_unlimited(self):
         """Budget of $0.00 displays as 'unlimited', not '$0.00'."""
         update = _make_update(text="/settings")
-        config = _make_config(claude_max_budget_usd=0.0)
+        config = _make_config(budget_ceiling=0.0)
         ctx = _make_context(config=config)
         mock_sessions = self._mock_sessions()
 
@@ -3814,23 +3830,26 @@ class TestHandleSettings:
         assert "unlimited" in reply.lower()
         assert "$0.00" not in reply
 
-    # ── 20. Global budget ceiling visible in /settings ────────────
+    # ── 20. Ceiling enforced from global config, not per-user ────
 
     @pytest.mark.asyncio
-    async def test_show_settings_global_ceiling_visible(self):
-        """Users without a yaml entry see the global ceiling in /settings."""
-        update = _make_update(text="/settings")
-        # No user_configs - ceiling should fall through to global default
-        config = _make_config(claude_max_budget_usd=10.0)
-        ctx = _make_context(config=config)
+    async def test_ceiling_enforced_from_global_config(self):
+        """Ceiling comes from config.budget_ceiling, not per-user max_budget."""
+        # User has max_budget=15 in users.yaml, but global ceiling is 50.
+        # User should be able to set budget up to $50, not just $15.
+        user = UserConfig(telegram_id=12345, name="testuser", max_budget=15.0)
+        config = _make_config(budget_ceiling=50.0, user_configs={12345: user})
+        update = _make_update(text="/settings budget 40")
+        pool = _make_mock_claude()
+        pool.get_if_exists = MagicMock(return_value=MagicMock())
+        ctx = _make_context(config=config, pool=pool, args=["budget", "40"])
         mock_sessions = self._mock_sessions()
 
         with self._patches(mock_sessions):
-            await _show_settings(update, ctx, 12345, config)
+            await handle_settings(update, ctx)
 
-        reply = update.message.reply_text.call_args[0][0]
-        assert "$10.00" in reply
-        assert "ceiling" in reply.lower()
+        # Budget of $40 should succeed (under $50 ceiling, above $15 yaml default)
+        mock_sessions.set_user_setting.assert_called_once_with(12345, "budget", "40.0")
 
 
 # ── /github command ─────────────────────────────────────────────────

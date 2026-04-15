@@ -464,7 +464,7 @@ def _cmd_config() -> None:
         # Read DEFAULT_MODEL, falling back to CLAUDE_MODEL for backward compat
         model = existing_env.get("DEFAULT_MODEL", existing_env.get("CLAUDE_MODEL", ""))
         timeout = existing_env.get("CLAUDE_TIMEOUT_SECONDS", "")
-        budget = existing_env.get("CLAUDE_MAX_BUDGET_USD", "")
+        budget = existing_env.get("BUDGET_CEILING", existing_env.get("CLAUDE_MAX_BUDGET_USD", ""))
         max_context_window = existing_env.get("CLAUDE_MAX_CONTEXT_WINDOW", "")
     else:
         print("-- Claude --")
@@ -500,7 +500,7 @@ def _cmd_config() -> None:
         while True:
             budget = _prompt(
                 "Claude budget (USD)",
-                existing_env.get("CLAUDE_MAX_BUDGET_USD", "10.0"),
+                existing_env.get("BUDGET_CEILING", existing_env.get("CLAUDE_MAX_BUDGET_USD", "10.0")),
             )
             if _validate_positive_float(budget):
                 break
@@ -702,14 +702,15 @@ def _cmd_config() -> None:
 
     # Deprecated per-user vars: only include without users.yaml
     # (legacy single-user mode). With users.yaml, these are noise.
-    # Remove stale CLAUDE_MODEL if present - it was renamed to
-    # DEFAULT_MODEL and leaving both keys causes silent confusion
-    # (the deprecation warning is suppressed when DEFAULT_MODEL exists).
+    # Remove stale renamed keys if present - leaving both the old and
+    # new key causes silent confusion (the deprecation warning is
+    # suppressed when the new key exists).
     env.pop("CLAUDE_MODEL", None)
+    env.pop("CLAUDE_MAX_BUDGET_USD", None)
     if not users_yaml_exists:
         env["DEFAULT_MODEL"] = model
         env["CLAUDE_TIMEOUT_SECONDS"] = timeout
-        env["CLAUDE_MAX_BUDGET_USD"] = budget
+        env["BUDGET_CEILING"] = budget
 
     # Context window tuning - only include if non-default.
     # Compare as int to handle inputs like "000" that pass validation.
