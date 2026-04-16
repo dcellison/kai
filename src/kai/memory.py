@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -454,32 +455,76 @@ def add_structured(
 # ── Migration: seed from MEMORY.md topic files ────────────────────
 
 
-def _classify_source_file(filename: str) -> str | None:
-    """
-    Map a topic file name to its memory type, or None to skip.
+# Regex to extract markdown link targets: [anything](filename.md)
+_MD_LINK_RE = re.compile(r"\[.*?\]\(([^)]+\.md)\)")
 
-    Classification is deterministic by file name. The topic file structure
-    under /var/lib/kai/memory/ is already a hand-curated taxonomy, so file
-    name IS the type. New topic files added in the future must be added
-    to this mapping explicitly (do not default to "fact" for unknowns).
+
+def _discover_seed_files(memory_dir: Path) -> list[Path]:
+    """
+    Discover which files to seed by reading MEMORY.md's references.
+
+    MEMORY.md is the source of truth. It is always included (users may
+    keep all their memories directly in it). Any .md files it links to
+    via markdown references [Title](file.md) are also included. Files
+    in the directory that are NOT referenced in MEMORY.md are ignored;
+    their presence is not enough to justify seeding.
+
+    This replaces the old hardcoded filename mapping. Users with a flat
+    MEMORY.md (everything in one file) get their content seeded. Users
+    with an index-style MEMORY.md (pointers to topic files) get both
+    the index content and the referenced topic files seeded.
+
+    Args:
+        memory_dir: Path to the memory directory.
 
     Returns:
-        "fact" or "preference" for a file that should be seeded.
-        None for the MEMORY.md index, api-reference.md, or any unknown file.
+        Ordered list of paths to seed (MEMORY.md first, then referenced
+        files in the order they appear). Empty if MEMORY.md does not exist.
     """
-    mapping = {
-        "preferences.md": "preference",
-        "hard-lessons.md": "preference",
-        "user.md": "fact",
-        "projects.md": "fact",
-        "notes.md": "fact",
-        "planned-features.md": "fact",
-    }
-    # api-reference.md and MEMORY.md are intentionally absent from the
-    # mapping. api-reference.md is already in the system prompt (seeding
-    # would create duplicate matches). MEMORY.md is the index file
-    # (pointers, not content). mapping.get() returns None for both.
-    return mapping.get(filename)
+    memory_md = memory_dir / "MEMORY.md"
+    if not memory_md.exists():
+        return []
+
+    files: list[Path] = [memory_md]
+
+    # Extract markdown link targets from MEMORY.md
+    try:
+        text = memory_md.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        # If MEMORY.md itself is unreadable, return it anyway so the
+        # caller's per-file error handling counts it as a failure.
+        return files
+
+    seen = {"MEMORY.md"}  # Track seen filenames to avoid duplicates
+    for match in _MD_LINK_RE.finditer(text):
+        ref = match.group(1)
+        # Only follow references to files in the same directory (no
+        # path traversal). Skip self-references and duplicates.
+        if "/" in ref or ref in seen:
+            continue
+        seen.add(ref)
+        ref_path = memory_dir / ref
+        if ref_path.exists():
+            files.append(ref_path)
+
+    return files
+
+
+def _classify_memory_type(filename: str) -> str:
+    """
+    Classify a file's memory type by filename heuristics.
+
+    Returns "preference" for files whose names suggest behavioral rules
+    or user preferences. Returns "fact" for everything else. This is a
+    soft classification stored in metadata; it does not affect retrieval
+    or filtering today, but gives future consumers (like /memory command)
+    a useful grouping signal.
+    """
+    stem = Path(filename).stem.lower()
+    # Files about rules, lessons, or preferences are behavioral guidance
+    if any(kw in stem for kw in ("preference", "lesson")):
+        return "preference"
+    return "fact"
 
 
 def _parse_topic_file(path: Path) -> list[dict]:
@@ -619,15 +664,18 @@ def seed_from_memory_md(
     memory_dir: Path | None = None,
 ) -> dict[str, dict[str, int]]:
     """
-    One-time migration: seed Mem0 with content from topic files in
-    DATA_DIR/memory/.
+    One-time migration: seed Mem0 with content from memory files.
 
-    Iterates over user_ids, parses each topic file, classifies each entry
-    by source file (see _classify_source_file), and calls add_structured()
-    per entry. Deduplicates via pre-insert search so reruns and partial
-    failures are safe. Does NOT set any settings flag; the caller
-    (main.py) owns flag management so per-user completion can be tracked
-    atomically with the insert loop.
+    Discovers files to seed by reading MEMORY.md: the file itself is
+    always seeded (many users keep all memories there), and any .md files
+    it references via markdown links are also seeded. Files in the
+    directory that are not referenced are ignored.
+
+    Iterates over user_ids, parses each discovered file, classifies
+    entries by filename heuristic, and calls add_structured() per entry.
+    Deduplicates via pre-insert search so reruns and partial failures
+    are safe. Does NOT set any settings flag; the caller (main.py) owns
+    flag management so per-user completion can be tracked atomically.
 
     Args:
         user_ids: List of Telegram chat_ids as strings. Each user_id gets
@@ -655,19 +703,18 @@ def seed_from_memory_md(
         log.info("Memory directory %s does not exist; skipping seed", target_dir)
         return {uid: {"seeded": 0, "skipped": 0, "failed": 0} for uid in user_ids}
 
-    # Collect topic files to process, in a stable order so test output is
-    # deterministic. _classify_source_file returns None for files we skip
-    # (MEMORY.md index, api-reference.md, unknown files).
-    topic_files: list[tuple[Path, str]] = []
-    for path in sorted(target_dir.glob("*.md")):
-        memory_type = _classify_source_file(path.name)
-        if memory_type is not None:
-            topic_files.append((path, memory_type))
+    # Discover files to seed from MEMORY.md references. If MEMORY.md
+    # does not exist, there is nothing to seed.
+    seed_files = _discover_seed_files(target_dir)
+    if not seed_files:
+        log.info("No MEMORY.md found in %s; skipping seed", target_dir)
+        return {uid: {"seeded": 0, "skipped": 0, "failed": 0} for uid in user_ids}
 
     per_user_counts: dict[str, dict[str, int]] = {}
     for user_id in user_ids:
         counts = {"seeded": 0, "skipped": 0, "failed": 0}
-        for path, memory_type in topic_files:
+        for path in seed_files:
+            memory_type = _classify_memory_type(path.name)
             # Parse errors surface as empty entries lists; we still count
             # the individual parse failures via _parse_topic_file.
             try:

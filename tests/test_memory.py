@@ -868,36 +868,116 @@ class TestParseTopicFile:
         assert result[0]["heading"] == "Real Heading"
 
 
-# ── _classify_source_file() tests ─────────────────────────────────
+# ── _discover_seed_files() tests ─────────────────────────────────
 
 
-class TestClassifySourceFile:
-    """Tests for _classify_source_file() file-to-type mapping."""
+class TestDiscoverSeedFiles:
+    """Tests for _discover_seed_files() MEMORY.md reference discovery."""
 
-    def test_known_files(self):
-        """Known files map to their expected types."""
-        from kai.memory import _classify_source_file
+    def test_returns_memory_md_itself(self, tmp_path):
+        """MEMORY.md is always included as the first file."""
+        from kai.memory import _discover_seed_files
 
-        assert _classify_source_file("preferences.md") == "preference"
-        assert _classify_source_file("hard-lessons.md") == "preference"
-        assert _classify_source_file("user.md") == "fact"
-        assert _classify_source_file("projects.md") == "fact"
-        assert _classify_source_file("notes.md") == "fact"
-        assert _classify_source_file("planned-features.md") == "fact"
+        (tmp_path / "MEMORY.md").write_text("# Memory\n\n- Some fact\n")
 
-    def test_skip_files(self):
-        """MEMORY.md and api-reference.md return None (skip)."""
-        from kai.memory import _classify_source_file
+        result = _discover_seed_files(tmp_path)
+        assert len(result) == 1
+        assert result[0].name == "MEMORY.md"
 
-        assert _classify_source_file("MEMORY.md") is None
-        assert _classify_source_file("api-reference.md") is None
+    def test_follows_markdown_references(self, tmp_path):
+        """Files referenced via [Title](file.md) links are included."""
+        from kai.memory import _discover_seed_files
 
-    def test_unknown_files_return_none(self):
-        """Unknown files default to None (skip), not 'fact'."""
-        from kai.memory import _classify_source_file
+        (tmp_path / "MEMORY.md").write_text("# Memory\n\n## Index\n- [User](user.md)\n- [Prefs](preferences.md)\n")
+        (tmp_path / "user.md").write_text("# User\n\n- Timezone: EST\n")
+        (tmp_path / "preferences.md").write_text("# Prefs\n\n- Be concise\n")
 
-        assert _classify_source_file("random.md") is None
-        assert _classify_source_file("todo.md") is None
+        result = _discover_seed_files(tmp_path)
+        names = [p.name for p in result]
+        assert names[0] == "MEMORY.md"
+        assert "user.md" in names
+        assert "preferences.md" in names
+
+    def test_skips_nonexistent_references(self, tmp_path):
+        """References to files that don't exist are silently skipped."""
+        from kai.memory import _discover_seed_files
+
+        (tmp_path / "MEMORY.md").write_text("# Memory\n\n- [Ghost](ghost.md)\n- [Real](real.md)\n")
+        (tmp_path / "real.md").write_text("# Real\n\n- Content\n")
+        # ghost.md does not exist
+
+        result = _discover_seed_files(tmp_path)
+        names = [p.name for p in result]
+        assert "real.md" in names
+        assert "ghost.md" not in names
+
+    def test_ignores_unreferenced_files(self, tmp_path):
+        """Files in the directory but not linked from MEMORY.md are excluded."""
+        from kai.memory import _discover_seed_files
+
+        (tmp_path / "MEMORY.md").write_text("# Memory\n\n- [User](user.md)\n")
+        (tmp_path / "user.md").write_text("# User\n")
+        (tmp_path / "stray.md").write_text("# Stray\n\n- Orphaned content\n")
+
+        result = _discover_seed_files(tmp_path)
+        names = [p.name for p in result]
+        assert "stray.md" not in names
+
+    def test_no_memory_md_returns_empty(self, tmp_path):
+        """If MEMORY.md does not exist, returns empty list."""
+        from kai.memory import _discover_seed_files
+
+        (tmp_path / "random.md").write_text("# Random\n")
+
+        assert _discover_seed_files(tmp_path) == []
+
+    def test_rejects_path_traversal(self, tmp_path):
+        """References containing '/' are ignored (no directory traversal)."""
+        from kai.memory import _discover_seed_files
+
+        (tmp_path / "MEMORY.md").write_text("# Memory\n\n- [Evil](../etc/passwd.md)\n- [OK](safe.md)\n")
+        (tmp_path / "safe.md").write_text("# Safe\n")
+
+        result = _discover_seed_files(tmp_path)
+        names = [p.name for p in result]
+        assert "safe.md" in names
+        assert len(result) == 2  # MEMORY.md + safe.md
+
+    def test_deduplicates_references(self, tmp_path):
+        """Same file referenced twice is only included once."""
+        from kai.memory import _discover_seed_files
+
+        (tmp_path / "MEMORY.md").write_text("# Memory\n\n- [User](user.md) - facts\n- [Also user](user.md) - more\n")
+        (tmp_path / "user.md").write_text("# User\n")
+
+        result = _discover_seed_files(tmp_path)
+        names = [p.name for p in result]
+        assert names.count("user.md") == 1
+
+
+# ── _classify_memory_type() tests ────────────────────────────────
+
+
+class TestClassifyMemoryType:
+    """Tests for _classify_memory_type() filename heuristic."""
+
+    def test_preference_files(self):
+        """Files with 'preference' or 'lesson' in the name are 'preference'."""
+        from kai.memory import _classify_memory_type
+
+        assert _classify_memory_type("preferences.md") == "preference"
+        assert _classify_memory_type("hard-lessons.md") == "preference"
+
+    def test_fact_files(self):
+        """Everything else defaults to 'fact'."""
+        from kai.memory import _classify_memory_type
+
+        assert _classify_memory_type("user.md") == "fact"
+        assert _classify_memory_type("projects.md") == "fact"
+        assert _classify_memory_type("MEMORY.md") == "fact"
+        assert _classify_memory_type("notes.md") == "fact"
+        assert _classify_memory_type("api-reference.md") == "fact"
+        assert _classify_memory_type("random.md") == "fact"
 
 
 # ── _is_duplicate() tests ────────────────────────────────────────
@@ -941,14 +1021,14 @@ class TestSeedFromMemoryMd:
 
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("# Memory\n\n- [Prefs](preferences.md)\n")
         (memory_dir / "preferences.md").write_text("# Preferences\n\n- Item A\n- Item B\n- Item C\n")
 
-        counts = seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
+        seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
 
-        assert counts["123"]["seeded"] == 3
-        # Verify all calls used memory_type="preference" via metadata
-        for call in mock_mem.add.call_args_list:
-            assert call[1]["metadata"]["type"] == "preference"
+        # 3 from preferences.md + 0 content from MEMORY.md (only a link line)
+        pref_calls = [c for c in mock_mem.add.call_args_list if c[1]["metadata"]["type"] == "preference"]
+        assert len(pref_calls) == 3
 
     def test_parses_user_file_as_fact(self, tmp_path):
         """User file bullets are seeded with type='fact'."""
@@ -962,16 +1042,18 @@ class TestSeedFromMemoryMd:
 
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("# Memory\n\n- [User](user.md)\n")
         (memory_dir / "user.md").write_text("# User\n\n- Location: Canada\n- Timezone: EST\n")
 
-        counts = seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
+        seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
 
-        assert counts["123"]["seeded"] == 2
-        for call in mock_mem.add.call_args_list:
+        fact_calls = [c for c in mock_mem.add.call_args_list if c[1]["metadata"]["source_file"] == "user.md"]
+        assert len(fact_calls) == 2
+        for call in fact_calls:
             assert call[1]["metadata"]["type"] == "fact"
 
-    def test_skips_api_reference_file(self, tmp_path):
-        """api-reference.md is not seeded even when present."""
+    def test_seeds_memory_md_content_directly(self, tmp_path):
+        """MEMORY.md content (bullets, paragraphs) is seeded, not just used as index."""
         import kai.memory as mem_mod
         from kai.memory import seed_from_memory_md
 
@@ -982,60 +1064,73 @@ class TestSeedFromMemoryMd:
 
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
-        (memory_dir / "api-reference.md").write_text("# API\n\n- Endpoint A\n")
+        # Flat MEMORY.md with all content inline (common for most users)
+        (memory_dir / "MEMORY.md").write_text(
+            "# Memory\n\n## About Me\n\n- I live in Toronto\n- My timezone is EST\n\n## Preferences\n\n- Be concise\n"
+        )
+
+        counts = seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
+
+        assert counts["123"]["seeded"] == 3
+        stored_texts = [call[0][0] for call in mock_mem.add.call_args_list]
+        assert "I live in Toronto" in stored_texts
+        assert "Be concise" in stored_texts
+
+    def test_seeds_both_memory_md_and_referenced_files(self, tmp_path):
+        """Index-style MEMORY.md seeds its own content AND referenced files."""
+        import kai.memory as mem_mod
+        from kai.memory import seed_from_memory_md
+
+        mock_mem = MagicMock()
+        mock_mem.add.return_value = {"results": [{"id": "abc", "memory": "test"}]}
+        mock_mem.search.return_value = {"results": []}
+        mem_mod._memory = mock_mem
+
+        memory_dir = tmp_path / "memory"
+        memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text(
+            "# Memory\n\n- Important top-level fact\n\n## Index\n\n- [User](user.md)\n"
+        )
         (memory_dir / "user.md").write_text("# User\n\n- Location: Canada\n")
 
         counts = seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
 
-        # Only user.md should be seeded, not api-reference.md
+        # 2 from MEMORY.md (top-level fact + index link bullet) + 1 from user.md
+        assert counts["123"]["seeded"] == 3
+        source_files = [c[1]["metadata"]["source_file"] for c in mock_mem.add.call_args_list]
+        assert "MEMORY.md" in source_files
+        assert "user.md" in source_files
+
+    def test_unreferenced_files_not_seeded(self, tmp_path):
+        """Files in the directory but not linked from MEMORY.md are ignored."""
+        import kai.memory as mem_mod
+        from kai.memory import seed_from_memory_md
+
+        mock_mem = MagicMock()
+        mock_mem.add.return_value = {"results": [{"id": "abc", "memory": "test"}]}
+        mock_mem.search.return_value = {"results": []}
+        mem_mod._memory = mock_mem
+
+        memory_dir = tmp_path / "memory"
+        memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("# Memory\n\n- A fact\n")
+        (memory_dir / "stray.md").write_text("# Stray\n\n- Should be ignored\n")
+
+        counts = seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
+
+        # Only MEMORY.md content seeded, stray.md is unreferenced
         assert counts["123"]["seeded"] == 1
         for call in mock_mem.add.call_args_list:
-            assert call[1]["metadata"]["source_file"] != "api-reference.md"
-
-    def test_skips_memory_md_index(self, tmp_path):
-        """MEMORY.md index file is not seeded."""
-        import kai.memory as mem_mod
-        from kai.memory import seed_from_memory_md
-
-        mock_mem = MagicMock()
-        mock_mem.add.return_value = {"results": [{"id": "abc", "memory": "test"}]}
-        mock_mem.search.return_value = {"results": []}
-        mem_mod._memory = mock_mem
-
-        memory_dir = tmp_path / "memory"
-        memory_dir.mkdir()
-        (memory_dir / "MEMORY.md").write_text("# Memory\n\n- [User](user.md)\n")
-        (memory_dir / "user.md").write_text("# User\n\n- Location: Canada\n")
-
-        counts = seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
-
-        assert counts["123"]["seeded"] == 1
-
-    def test_skips_unknown_files(self, tmp_path):
-        """Files not in the classification mapping are ignored."""
-        import kai.memory as mem_mod
-        from kai.memory import seed_from_memory_md
-
-        mock_mem = MagicMock()
-        mock_mem.add.return_value = {"results": [{"id": "abc", "memory": "test"}]}
-        mock_mem.search.return_value = {"results": []}
-        mem_mod._memory = mock_mem
-
-        memory_dir = tmp_path / "memory"
-        memory_dir.mkdir()
-        (memory_dir / "random.md").write_text("# Random\n\n- Should be ignored\n")
-
-        counts = seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
-
-        assert counts["123"]["seeded"] == 0
-        mock_mem.add.assert_not_called()
+            assert call[1]["metadata"]["source_file"] != "stray.md"
 
     def test_is_idempotent_on_rerun(self, tmp_path):
         """Second run skips all entries via dedup (skipped == first run's seeded)."""
         import kai.memory as mem_mod
         from kai.memory import seed_from_memory_md
 
-        # Track stored memories to simulate search returning them on second run
+        # Track stored memories to simulate search returning them on second run.
+        # The mock format must match what the real Mem0 client returns so that
+        # search() can parse it into MemoryResult objects with .score.
         stored: list[dict] = []
         call_count = 0
 
@@ -1047,7 +1142,6 @@ class TestSeedFromMemoryMd:
             return {"results": [{"id": mem_id, "memory": content}]}
 
         def mock_search(query, **kwargs):
-            # Return the best match from stored memories (simulate high score for exact match)
             for s in stored:
                 if s["memory"] == query:
                     return {
@@ -1064,15 +1158,16 @@ class TestSeedFromMemoryMd:
 
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("# Memory\n\n- [User](user.md)\n")
         (memory_dir / "user.md").write_text("# User\n\n- Fact A\n- Fact B\n")
 
-        # First run: seeds everything
+        # First run: seeds everything (1 MEMORY.md link bullet + 2 from user.md)
         counts1 = seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
-        assert counts1["123"]["seeded"] == 2
+        assert counts1["123"]["seeded"] == 3
 
         # Second run: everything should be skipped via dedup
         counts2 = seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
-        assert counts2["123"]["skipped"] == 2
+        assert counts2["123"]["skipped"] == 3
         assert counts2["123"]["seeded"] == 0
 
     def test_multi_user_isolation(self, tmp_path):
@@ -1087,13 +1182,12 @@ class TestSeedFromMemoryMd:
 
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
-        (memory_dir / "user.md").write_text("# User\n\n- Fact A\n")
+        (memory_dir / "MEMORY.md").write_text("# Memory\n\n- A fact\n")
 
         counts = seed_from_memory_md(user_ids=["111", "222"], memory_dir=memory_dir)
 
         assert counts["111"]["seeded"] == 1
         assert counts["222"]["seeded"] == 1
-        # Two calls total - one per user
         assert mock_mem.add.call_count == 2
 
     def test_partial_failure_counts_failures(self, tmp_path):
@@ -1108,15 +1202,15 @@ class TestSeedFromMemoryMd:
 
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("# Memory\n\n- [User](user.md)\n- [Notes](notes.md)\n")
         (memory_dir / "user.md").write_text("# User\n\n- Fact A\n")
-
         # Create a notes.md that will fail to read by making it a directory
-        # (reading a directory raises OSError/IsADirectoryError)
         (memory_dir / "notes.md").mkdir()
 
         counts = seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
 
-        assert counts["123"]["seeded"] == 1  # user.md succeeded
+        # 2 link bullets from MEMORY.md + 1 from user.md = 3 seeded
+        assert counts["123"]["seeded"] == 3
         assert counts["123"]["failed"] == 1  # notes.md failed
 
     def test_unicode_decode_error_counts_as_failure(self, tmp_path):
@@ -1131,13 +1225,14 @@ class TestSeedFromMemoryMd:
 
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("# Memory\n\n- [User](user.md)\n- [Notes](notes.md)\n")
         (memory_dir / "user.md").write_text("# User\n\n- Fact A\n")
-        # Write raw bytes that are not valid UTF-8
         (memory_dir / "notes.md").write_bytes(b"\xff\xfe# Notes\n\n- Broken\n")
 
         counts = seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
 
-        assert counts["123"]["seeded"] == 1  # user.md succeeded
+        # 2 link bullets from MEMORY.md + 1 from user.md = 3 seeded
+        assert counts["123"]["seeded"] == 3
         assert counts["123"]["failed"] == 1  # notes.md failed (UnicodeDecodeError)
 
     def test_preserves_heading_context(self, tmp_path):
@@ -1152,12 +1247,14 @@ class TestSeedFromMemoryMd:
 
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("# Memory\n\n- [Prefs](preferences.md)\n")
         (memory_dir / "preferences.md").write_text("# Preferences\n\n## Communication\n\n- Be concise\n")
 
         seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
 
-        call_kwargs = mock_mem.add.call_args[1]
-        assert call_kwargs["metadata"]["heading"] == "Communication"
+        # Find the call for the preferences.md entry
+        pref_calls = [c for c in mock_mem.add.call_args_list if c[1]["metadata"]["source_file"] == "preferences.md"]
+        assert pref_calls[0][1]["metadata"]["heading"] == "Communication"
 
     def test_stores_source_file_metadata(self, tmp_path):
         """Every seeded memory has metadata['source_file'] set."""
@@ -1171,12 +1268,14 @@ class TestSeedFromMemoryMd:
 
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("# Memory\n\n- [User](user.md)\n")
         (memory_dir / "user.md").write_text("# User\n\n- Fact A\n")
 
         seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
 
-        call_kwargs = mock_mem.add.call_args[1]
-        assert call_kwargs["metadata"]["source_file"] == "user.md"
+        # Find the user.md call specifically
+        user_calls = [c for c in mock_mem.add.call_args_list if c[0][0] == "Fact A"]
+        assert user_calls[0][1]["metadata"]["source_file"] == "user.md"
 
     def test_stores_source_migration_tag(self, tmp_path):
         """Every seeded memory has metadata['source'] == 'memory_md_migration'."""
@@ -1190,12 +1289,14 @@ class TestSeedFromMemoryMd:
 
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("# Memory\n\n- [User](user.md)\n")
         (memory_dir / "user.md").write_text("# User\n\n- Fact A\n")
 
         seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
 
-        call_kwargs = mock_mem.add.call_args[1]
-        assert call_kwargs["metadata"]["source"] == "memory_md_migration"
+        # Check any call from user.md (skip MEMORY.md calls which have no content here)
+        user_calls = [c for c in mock_mem.add.call_args_list if c[1]["metadata"]["source_file"] == "user.md"]
+        assert user_calls[0][1]["metadata"]["source"] == "memory_md_migration"
 
     def test_stores_tag_from_file_stem(self, tmp_path):
         """Tags contain the file stem (e.g. 'preferences' for preferences.md)."""
@@ -1209,12 +1310,14 @@ class TestSeedFromMemoryMd:
 
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("# Memory\n\n- [Prefs](preferences.md)\n")
         (memory_dir / "preferences.md").write_text("# Preferences\n\n- Item A\n")
 
         seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
 
-        call_kwargs = mock_mem.add.call_args[1]
-        assert call_kwargs["metadata"]["tags"] == ["preferences"]
+        # Check the call from preferences.md specifically
+        pref_calls = [c for c in mock_mem.add.call_args_list if c[1]["metadata"]["source_file"] == "preferences.md"]
+        assert pref_calls[0][1]["metadata"]["tags"] == ["preferences"]
 
     def test_disabled_returns_zero_counts(self):
         """With memory disabled, returns all-zero counts without exceptions."""
@@ -1254,18 +1357,22 @@ class TestSeedFromMemoryMd:
 
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("# Memory\n\n- [Notes](notes.md)\n")
         (memory_dir / "notes.md").write_text(
             "# Notes\n\n- Real fact\n\n```\n- Not a fact\nAlso not a fact\n```\n\n- Another real fact\n"
         )
 
         counts = seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
 
-        assert counts["123"]["seeded"] == 2
-        # Verify the stored content
-        stored_texts = [call[0][0] for call in mock_mem.add.call_args_list]
-        assert "Real fact" in stored_texts
-        assert "Another real fact" in stored_texts
-        assert "Not a fact" not in stored_texts
+        # 1 link bullet from MEMORY.md + 2 real facts from notes.md = 3
+        assert counts["123"]["seeded"] == 3
+        # Verify the stored content from notes.md specifically
+        notes_texts = [
+            call[0][0] for call in mock_mem.add.call_args_list if call[1]["metadata"]["source_file"] == "notes.md"
+        ]
+        assert "Real fact" in notes_texts
+        assert "Another real fact" in notes_texts
+        assert "Not a fact" not in notes_texts
 
     def test_paragraphs_stored_when_not_bullets(self, tmp_path):
         """Non-bullet prose paragraphs are seeded as single memories."""
@@ -1279,13 +1386,19 @@ class TestSeedFromMemoryMd:
 
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("# Memory\n\n- [Lessons](hard-lessons.md)\n")
         (memory_dir / "hard-lessons.md").write_text(
             "# Hard Lessons\n\n## Never do X\n\nFirst line of lesson.\nSecond line of lesson.\n\n## Also bad\n\nAnother paragraph here.\n"
         )
 
         counts = seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
 
-        assert counts["123"]["seeded"] == 2
-        stored_texts = [call[0][0] for call in mock_mem.add.call_args_list]
-        assert "First line of lesson. Second line of lesson." in stored_texts
-        assert "Another paragraph here." in stored_texts
+        # 1 link bullet from MEMORY.md + 2 paragraphs from hard-lessons.md
+        assert counts["123"]["seeded"] == 3
+        lesson_texts = [
+            call[0][0]
+            for call in mock_mem.add.call_args_list
+            if call[1]["metadata"]["source_file"] == "hard-lessons.md"
+        ]
+        assert "First line of lesson. Second line of lesson." in lesson_texts
+        assert "Another paragraph here." in lesson_texts
