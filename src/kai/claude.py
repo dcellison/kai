@@ -376,6 +376,19 @@ class ClaudeCodeBackend(AgentBackend):
             )
             return
 
+        # Capture the user's original message text for memory search
+        # BEFORE session context is prepended. On fresh sessions,
+        # prepend_to_prompt adds CLAUDE.md + MEMORY.md + history + API
+        # docs (~10-20KB) which would dominate the embedding vector and
+        # make the first message's memory retrieval essentially random.
+        if isinstance(prompt, str):
+            search_query = prompt
+        else:
+            search_query = next(
+                (block["text"] for block in prompt if block.get("type") == "text"),
+                "",
+            )
+
         # Inject identity, memory, history, and API context on the
         # first message of a new session. Context injection logic lives
         # in backend.py as shared functions usable by any backend.
@@ -396,18 +409,9 @@ class ClaudeCodeBackend(AgentBackend):
         # when memory is disabled or no relevant memories found.
         # Skip entirely when chat_id is None - an empty-string user_id
         # would search across all users, which is a data isolation risk.
-        if chat_id is not None:
+        if chat_id is not None and search_query:
             from kai.memory import format_context as memory_format_context
 
-            # Extract text for the search query. For multimodal prompts
-            # (list of content blocks), use the first text block.
-            if isinstance(prompt, str):
-                search_query = prompt
-            else:
-                search_query = next(
-                    (block["text"] for block in prompt if block.get("type") == "text"),
-                    "",
-                )
             # token_budget is omitted - format_context uses the value
             # from the Config stored at init_memory() time. Awaited
             # because the search runs in an executor to avoid blocking.
