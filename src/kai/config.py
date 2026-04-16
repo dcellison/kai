@@ -422,6 +422,14 @@ class Config:
     # Ignored when agent_backend="claude".
     llm_provider: str = ""
 
+    # Semantic memory system (Mem0 + Qdrant + local embeddings).
+    # When enabled, every conversation is embedded and searchable.
+    # When disabled, all memory functions return empty results.
+    memory_enabled: bool = False
+    memory_search_limit: int = 10
+    memory_token_budget: int = 2000
+    memory_embedding_model: str = "all-MiniLM-L6-v2"
+
     def get_workspace_config(self, workspace: Path) -> WorkspaceConfig | None:
         """
         Get per-workspace config for a path, or None for global defaults.
@@ -1313,6 +1321,23 @@ def load_config() -> Config:
                 f"{', '.join(sorted(valid_providers))})"
             )
 
+    # Semantic memory system - parse env vars with the same validation
+    # pattern as other typed config fields (try/except, SystemExit on bad input).
+    memory_enabled = os.environ.get("MEMORY_ENABLED", "").lower() in ("1", "true", "yes")
+    try:
+        memory_search_limit = int(os.environ.get("MEMORY_SEARCH_LIMIT", "10"))
+        if memory_search_limit <= 0:
+            raise SystemExit("MEMORY_SEARCH_LIMIT must be a positive integer")
+    except ValueError:
+        raise SystemExit("MEMORY_SEARCH_LIMIT must be an integer") from None
+    try:
+        memory_token_budget = int(os.environ.get("MEMORY_TOKEN_BUDGET", "2000"))
+        if memory_token_budget <= 0:
+            raise SystemExit("MEMORY_TOKEN_BUDGET must be a positive integer")
+    except ValueError:
+        raise SystemExit("MEMORY_TOKEN_BUDGET must be an integer") from None
+    memory_embedding_model = os.environ.get("MEMORY_EMBEDDING_MODEL", "all-MiniLM-L6-v2").strip()
+
     # Per-workspace configuration. Loaded after ALLOWED_WORKSPACES so
     # YAML-defined workspaces can be merged into the allowed set.
     workspace_configs = _load_workspace_configs()
@@ -1460,4 +1485,8 @@ def load_config() -> Config:
         totp_lockout_minutes=totp_lockout_minutes,
         agent_backend=agent_backend,
         llm_provider=llm_provider,
+        memory_enabled=memory_enabled,
+        memory_search_limit=memory_search_limit,
+        memory_token_budget=memory_token_budget,
+        memory_embedding_model=memory_embedding_model,
     )
