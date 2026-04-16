@@ -1463,6 +1463,9 @@ class TestApplyMigrate:
         memory_dir.mkdir()
         (memory_dir / "MEMORY.md").write_text("existing personalized content")
 
+        # Mock chown - the ownership fix walks the memory tree unconditionally
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
         _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         assert (memory_dir / "MEMORY.md").read_text() == "existing personalized content"
@@ -1537,6 +1540,41 @@ class TestApplyMigrate:
         assert "Would migrate 1 uploaded file(s)" in output
         # Nothing should have been copied
         assert not (data_path / "files" / "photo.jpg").exists()
+
+    def test_memory_tree_ownership(self, tmp_path, monkeypatch):
+        """Chowns the entire memory/ tree so runtime-created subdirs get fixed."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+
+        # Simulate a memory tree with a qdrant subdirectory and files
+        # (as would exist after init_memory() has run at least once).
+        memory_dir = data_path / "memory"
+        memory_dir.mkdir()
+        qdrant_dir = memory_dir / "qdrant"
+        qdrant_dir.mkdir()
+        (qdrant_dir / "meta.json").write_text("{}")
+        (memory_dir / "MEMORY.md").write_text("# Memory")
+
+        chowned: list[tuple[str, int, int]] = []
+        monkeypatch.setattr(
+            "kai.install.os.chown",
+            lambda path, uid, gid: chowned.append((str(path), uid, gid)),
+        )
+
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
+
+        # Every directory and file in the memory tree should be chowned.
+        chowned_paths = {entry[0] for entry in chowned}
+        assert str(memory_dir) in chowned_paths
+        assert str(qdrant_dir) in chowned_paths
+        assert str(qdrant_dir / "meta.json") in chowned_paths
+        assert str(memory_dir / "MEMORY.md") in chowned_paths
+        # All entries should use the service user's uid/gid.
+        assert all(uid == 501 and gid == 20 for _, uid, gid in chowned)
 
 
 # ── Service lifecycle ────────────────────────────────────────────────
