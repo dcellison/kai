@@ -14,8 +14,6 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "aiohttp>=3.9.0",
     "pyyaml>=6.0",
-    "mem0ai>=0.1.0",
-    "sentence-transformers>=3.0.0",
 ]
 
 [project.scripts]
@@ -26,6 +24,10 @@ dev = [
     "ruff>=0.9.0",
     "pytest>=8.0",
     "pytest-asyncio>=0.24.0",
+]
+memory = [
+    "mem0ai>=2.0.0",
+    "sentence-transformers>=3.0.0",
 ]
 tts = [
     "piper-tts>=1.4.0",
