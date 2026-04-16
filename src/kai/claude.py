@@ -409,8 +409,9 @@ class ClaudeCodeBackend(AgentBackend):
                     "",
                 )
             # token_budget is omitted - format_context uses the value
-            # from the Config stored at init_memory() time.
-            memory_ctx = memory_format_context(
+            # from the Config stored at init_memory() time. Awaited
+            # because the search runs in an executor to avoid blocking.
+            memory_ctx = await memory_format_context(
                 search_query,
                 user_id=str(chat_id),
             )

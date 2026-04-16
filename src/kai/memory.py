@@ -244,7 +244,7 @@ def search(query: str, *, user_id: str, limit: int | None = None) -> list[Memory
         return []
 
 
-def format_context(
+async def format_context(
     query: str,
     *,
     user_id: str,
@@ -256,6 +256,11 @@ def format_context(
     Returns a formatted string ready to prepend to the user's message,
     or an empty string if no relevant memories are found or memory is
     disabled.
+
+    Async because the underlying Mem0 search (embedding computation +
+    Qdrant lookup) is CPU-bound (~50-100ms). Running it in an executor
+    keeps the asyncio event loop free for other users' messages, typing
+    indicators, and webhook handling.
 
     The header explicitly marks these as context, not instructions,
     to prevent the inner Claude from treating recalled memories as
@@ -276,8 +281,11 @@ def format_context(
     # there's room to filter by threshold and trim to budget. Use the
     # larger of the config limit and the overfetch constant so the user's
     # MEMORY_SEARCH_LIMIT setting is never silently ignored.
+    # search() is synchronous (Mem0 is sync) - offload to the default
+    # ThreadPoolExecutor to avoid blocking the event loop.
     fetch_limit = max(_config.memory_search_limit, _SEARCH_OVERFETCH)
-    results = search(query, user_id=user_id, limit=fetch_limit)
+    loop = asyncio.get_running_loop()
+    results = await loop.run_in_executor(None, lambda: search(query, user_id=user_id, limit=fetch_limit))
     if not results:
         return ""
 

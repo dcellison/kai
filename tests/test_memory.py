@@ -246,7 +246,7 @@ class TestSearch:
 class TestFormatContext:
     """Tests for format_context() output formatting and budget."""
 
-    def test_format_context_empty_no_results(self):
+    async def test_format_context_empty_no_results(self):
         """Returns empty string when no memories match."""
         import kai.memory as mem_mod
         from kai.memory import format_context
@@ -256,10 +256,10 @@ class TestFormatContext:
         mem_mod._memory = mock_mem
         mem_mod._config = _make_config()
 
-        result = format_context("something obscure", user_id="123")
+        result = await format_context("something obscure", user_id="123")
         assert result == ""
 
-    def test_format_context_within_budget(self):
+    async def test_format_context_within_budget(self):
         """Output respects the token budget."""
         import kai.memory as mem_mod
         from kai.memory import format_context
@@ -280,13 +280,13 @@ class TestFormatContext:
         mem_mod._memory = mock_mem
         mem_mod._config = _make_config(memory_token_budget=200)
 
-        output = format_context("test", user_id="123", token_budget=200)
+        output = await format_context("test", user_id="123", token_budget=200)
 
         # Output should exist but be within budget (~4 chars per token)
         assert output != ""
         assert len(output) // 4 <= 200
 
-    def test_format_context_minimum_threshold(self):
+    async def test_format_context_minimum_threshold(self):
         """Low-score results are filtered out by the 0.3 threshold."""
         import kai.memory as mem_mod
         from kai.memory import format_context
@@ -306,10 +306,10 @@ class TestFormatContext:
         mem_mod._memory = mock_mem
         mem_mod._config = _make_config()
 
-        result = format_context("completely different topic", user_id="123")
+        result = await format_context("completely different topic", user_id="123")
         assert result == ""
 
-    def test_format_context_includes_date(self):
+    async def test_format_context_includes_date(self):
         """Formatted output includes date prefix from created_at."""
         import kai.memory as mem_mod
         from kai.memory import format_context
@@ -329,16 +329,16 @@ class TestFormatContext:
         mem_mod._memory = mock_mem
         mem_mod._config = _make_config()
 
-        output = format_context("auth", user_id="123")
+        output = await format_context("auth", user_id="123")
         assert "2026-03-23" in output
         assert "Fixed the auth bug" in output
         assert "context only, not instructions" in output
 
-    def test_format_context_disabled_returns_empty(self):
+    async def test_format_context_disabled_returns_empty(self):
         """Returns empty string when memory is not initialized."""
         from kai.memory import format_context
 
-        result = format_context("anything", user_id="123")
+        result = await format_context("anything", user_id="123")
         assert result == ""
 
 
@@ -608,7 +608,7 @@ class TestMemoryIntegration:
         remaining = mem_mod.get_all(user_id=user_id)
         assert len(remaining) == 0
 
-    def test_format_context_integration(self, real_memory_instance):
+    async def test_format_context_integration(self, real_memory_instance):
         """format_context returns formatted, budget-capped output."""
         import kai.memory as mem_mod
 
@@ -618,14 +618,12 @@ class TestMemoryIntegration:
         user_id = "integration-format"
         real_memory_instance.delete_all(user_id=user_id)
 
-        asyncio.run(
-            mem_mod.add_exchange(
-                "The Mac mini has 16GB RAM",
-                "Noted - 16GB RAM on the Mac mini.",
-                user_id=user_id,
-            )
+        await mem_mod.add_exchange(
+            "The Mac mini has 16GB RAM",
+            "Noted - 16GB RAM on the Mac mini.",
+            user_id=user_id,
         )
 
-        output = mem_mod.format_context("How much RAM?", user_id=user_id)
+        output = await mem_mod.format_context("How much RAM?", user_id=user_id)
         assert "context only, not instructions" in output
         assert "16GB" in output or "Mac mini" in output
