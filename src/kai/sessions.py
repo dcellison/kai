@@ -477,6 +477,22 @@ async def delete_setting(key: str) -> None:
     await _get_db().commit()
 
 
+async def delete_settings_by_prefix(prefix: str) -> None:
+    """Remove all settings whose key starts with the given prefix.
+
+    Uses SQL LIKE with the prefix escaped for literal matching (no
+    wildcard characters in the prefix itself). No-op if no keys match.
+    """
+    # Escape any LIKE wildcards in the prefix so callers can pass
+    # arbitrary strings without accidental pattern matching.
+    escaped = prefix.replace("%", "\\%").replace("_", "\\_")
+    await _get_db().execute(
+        "DELETE FROM settings WHERE key LIKE ? ESCAPE '\\'",
+        (escaped + "%",),
+    )
+    await _get_db().commit()
+
+
 # ── Workspace config overrides ─────────────────────────────────────
 # Per-user-per-workspace settings stored in the generic settings table.
 # Keys are namespaced as ws_config:{chat_id}:{workspace_path}:{field}.

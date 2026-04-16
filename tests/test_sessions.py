@@ -280,6 +280,23 @@ class TestSettings:
         await sessions.delete_setting("key")
         assert await sessions.get_setting("key") is None
 
+    async def test_delete_settings_by_prefix(self, db):
+        """Removes all keys matching the prefix, leaves others intact."""
+        await sessions.set_setting("memory_seeded:111", "1")
+        await sessions.set_setting("memory_seeded:222", "1")
+        await sessions.set_setting("workspace:111", "/home")
+        await sessions.delete_settings_by_prefix("memory_seeded:")
+        # Prefixed keys gone
+        assert await sessions.get_setting("memory_seeded:111") is None
+        assert await sessions.get_setting("memory_seeded:222") is None
+        # Unrelated key untouched
+        assert await sessions.get_setting("workspace:111") == "/home"
+
+    async def test_delete_settings_by_prefix_noop_when_empty(self, db):
+        """No error when no keys match the prefix."""
+        await sessions.delete_settings_by_prefix("nonexistent:")
+        # Should not raise
+
 
 # ── Workspace config overrides ─────────────────────────────────────
 

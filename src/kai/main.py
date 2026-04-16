@@ -295,11 +295,9 @@ def main() -> None:
         # block (#317). These keys are never read or written anymore.
         # Safe to run on every startup; the DELETE is a no-op once clean.
         try:
-            db = sessions._get_db()
-            await db.execute("DELETE FROM settings WHERE key LIKE 'memory_seeded:%'")
-            await db.commit()
+            await sessions.delete_settings_by_prefix("memory_seeded:")
         except Exception:
-            pass  # Non-fatal; flags are harmless if cleanup fails
+            logging.warning("Could not clean up memory_seeded flags", exc_info=True)
 
         try:
             # Retry initialization if the network isn't ready yet (e.g. after a
