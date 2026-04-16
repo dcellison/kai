@@ -1336,7 +1336,7 @@ def load_config() -> Config:
             raise SystemExit("MEMORY_TOKEN_BUDGET must be a positive integer")
     except ValueError:
         raise SystemExit("MEMORY_TOKEN_BUDGET must be an integer") from None
-    memory_embedding_model = os.environ.get("MEMORY_EMBEDDING_MODEL", "all-MiniLM-L6-v2").strip()
+    memory_embedding_model = os.environ.get("MEMORY_EMBEDDING_MODEL", "all-MiniLM-L6-v2").strip() or "all-MiniLM-L6-v2"
 
     # Per-workspace configuration. Loaded after ALLOWED_WORKSPACES so
     # YAML-defined workspaces can be merged into the allowed set.

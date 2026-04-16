@@ -3528,8 +3528,16 @@ async def _handle_response(
             try:
                 from kai.memory import add_exchange
 
-                # Extract user text from prompt (may be str or list)
-                user_text = prompt if isinstance(prompt, str) else str(prompt)
+                # Extract user text from prompt. For multimodal prompts
+                # (image + text), pull the first text block rather than
+                # storing the Python repr of the list.
+                if isinstance(prompt, str):
+                    user_text = prompt
+                else:
+                    user_text = next(
+                        (block["text"] for block in prompt if block.get("type") == "text"),
+                        "",
+                    )
                 await add_exchange(
                     user_text=user_text,
                     assistant_text=final_text,

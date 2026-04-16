@@ -168,6 +168,9 @@ def init_memory(config: Config) -> None:
     # Mem0 v2.0.0 unconditionally creates an OpenAI LLM client at init
     # (line 343 of mem0/memory/main.py). We never use it (infer=False
     # for all Track 1 calls), but the client constructor requires a key.
+    # Uses setdefault to avoid overwriting a real key if one exists.
+    # TODO: Remove this workaround when Mem0 supports LLM-less init.
+    # Track upstream: https://github.com/mem0ai/mem0/issues
     os.environ.setdefault("OPENAI_API_KEY", "sk-dummy-not-used")
 
     # Deferred import: avoids loading PyTorch/sentence-transformers
@@ -263,8 +266,12 @@ def format_context(
 
     budget = token_budget if token_budget is not None else _config.memory_token_budget
 
-    # Overfetch so we have room to filter by threshold and trim to budget.
-    results = search(query, user_id=user_id, limit=_SEARCH_OVERFETCH)
+    # Fetch at least _SEARCH_OVERFETCH results (more than we'll use) so
+    # there's room to filter by threshold and trim to budget. Use the
+    # larger of the config limit and the overfetch constant so the user's
+    # MEMORY_SEARCH_LIMIT setting is never silently ignored.
+    fetch_limit = max(_config.memory_search_limit, _SEARCH_OVERFETCH)
+    results = search(query, user_id=user_id, limit=fetch_limit)
     if not results:
         return ""
 

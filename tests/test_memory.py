@@ -145,8 +145,8 @@ class TestInitMemory:
         assert is_enabled()
 
     @integration
-    def test_init_failure_graceful(self):
-        """If Mem0 raises during init, memory stays disabled."""
+    def test_init_failure_propagates(self):
+        """If Mem0 raises during init, the exception propagates and memory stays disabled."""
         from kai.memory import init_memory, is_enabled
 
         config = _make_config()
@@ -180,7 +180,7 @@ class TestInitMemory:
         _reset_memory_module()
 
         mock_memory = MagicMock()
-        mock_memory.embedding_model.model.get_sentence_embedding_dimension.return_value = 768
+        mock_memory.embedding_model.model.get_embedding_dimension.return_value = 768
 
         with (
             patch("kai.memory.DATA_DIR", tmp_path),

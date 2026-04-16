@@ -293,9 +293,15 @@ def main() -> None:
         if config.memory_enabled:
             try:
                 from kai.memory import init_memory
+                from kai.memory import is_enabled as memory_is_enabled
 
                 init_memory(config)
-                logging.info("Semantic memory system initialized")
+                # init_memory may silently disable memory (e.g. dimension
+                # mismatch) without raising. Check actual state.
+                if memory_is_enabled():
+                    logging.info("Semantic memory system initialized")
+                else:
+                    logging.warning("Semantic memory init completed but system is disabled")
             except Exception:
                 logging.warning("Could not initialize semantic memory", exc_info=True)
 
