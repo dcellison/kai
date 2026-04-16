@@ -1839,7 +1839,7 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
     # Uses a non-editable install (not -e) so the venv is self-contained
     # and doesn't depend on the source directory being writable.
     pip = str(venv_path / "bin" / "pip")
-    extras = "totp,tts"
+    extras = "memory,totp,tts"
     install_spec = f"{install_path}[{extras}]"
     subprocess.run(
         [pip, "install", install_spec],
