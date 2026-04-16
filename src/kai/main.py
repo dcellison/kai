@@ -289,7 +289,17 @@ def main() -> None:
         # The feedback loop where Track 1 ingests assistant hallucinations
         # and retrieval surfaces them as authoritative context needs to be
         # solved before this goes back on. MEMORY_ENABLED is ignored.
-        # See: https://github.com/dcellison/kai/issues/318
+        # See: https://github.com/dcellison/kai/issues/320
+
+        # Clean up orphaned memory_seeded flags from the removed seed
+        # block (#317). These keys are never read or written anymore.
+        # Safe to run on every startup; the DELETE is a no-op once clean.
+        try:
+            db = sessions._get_db()
+            await db.execute("DELETE FROM settings WHERE key LIKE 'memory_seeded:%'")
+            await db.commit()
+        except Exception:
+            pass  # Non-fatal; flags are harmless if cleanup fails
 
         try:
             # Retry initialization if the network isn't ready yet (e.g. after a

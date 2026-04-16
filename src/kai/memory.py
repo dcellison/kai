@@ -141,6 +141,10 @@ def init_memory(config: Config) -> None:
     """
     Initialize the Mem0 memory instance with Qdrant embedded storage.
 
+    NOTE: Not currently wired into the startup path. Mem0 is disabled
+    pending a redesign of the ingestion pipeline (see #320). All public
+    functions guard on _memory being None and degrade gracefully.
+
     Creates the Qdrant collection if it does not exist. Downloads the
     embedding model on first run (~80MB, cached in ~/.cache/huggingface/
     for subsequent runs).
