@@ -1448,11 +1448,11 @@ def _apply_migrate(data_path: Path, install_path: Path, svc_uid: int, svc_gid: i
     # or a prior install left stale ownership, those directories would be
     # root-owned and the service user could not write to them.
     memory_tree = data_path / "memory"
-    if memory_tree.is_dir() and not dry_run:
-        for root, _subdirs, fnames in os.walk(memory_tree):
-            os.chown(root, svc_uid, svc_gid)
-            for fname in fnames:
-                os.chown(os.path.join(root, fname), svc_uid, svc_gid)
+    if memory_tree.is_dir():
+        if dry_run:
+            print(f"[DRY RUN] Would set ownership on {memory_tree} ({svc_uid}:{svc_gid})")
+        else:
+            _set_ownership(memory_tree, svc_uid, svc_gid, recursive=True)
 
 
 def _cmd_apply() -> None:
