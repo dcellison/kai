@@ -14,6 +14,8 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "aiohttp>=3.9.0",
     "pyyaml>=6.0",
+    "mem0ai>=0.1.0",
+    "sentence-transformers>=3.0.0",
 ]
 
 [project.scripts]
