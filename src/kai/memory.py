@@ -600,7 +600,14 @@ def _is_duplicate(content: str, *, user_id: str, threshold: float = 0.9) -> bool
         True if a duplicate exists; False otherwise (including if the
         store is empty, memory is disabled, or the search itself failed).
     """
-    results = search(content, user_id=user_id, limit=1)
+    try:
+        results = search(content, user_id=user_id, limit=1)
+    except Exception:
+        # Search failure during dedup should not block seeding. Log and
+        # return False so the entry gets inserted (possible duplicate is
+        # better than a lost entry).
+        log.warning("Dedup search failed for '%s'", content[:60], exc_info=True)
+        return False
     if not results:
         return False
     return results[0].score >= threshold
@@ -665,9 +672,11 @@ def seed_from_memory_md(
             # the individual parse failures via _parse_topic_file.
             try:
                 entries = _parse_topic_file(path)
-            except OSError:
-                # File unreadable; count as one failure and move on to the
-                # next topic file. Do not abort the whole migration.
+            except (OSError, UnicodeDecodeError):
+                # File unreadable or not valid UTF-8; count as one failure
+                # and move on to the next topic file. UnicodeDecodeError is
+                # a ValueError subclass, not OSError, so it needs its own
+                # branch to maintain per-file isolation.
                 log.warning("Could not read %s during seed", path, exc_info=True)
                 counts["failed"] += 1
                 continue
