@@ -144,6 +144,7 @@ class TestInitMemory:
         assert qdrant_dir.is_dir()
         assert is_enabled()
 
+    @integration
     def test_init_failure_graceful(self):
         """If Mem0 raises during init, memory stays disabled."""
         from kai.memory import init_memory, is_enabled
