@@ -305,6 +305,55 @@ def main() -> None:
             except Exception:
                 logging.warning("Could not initialize semantic memory", exc_info=True)
 
+        # Seed Mem0 with existing MEMORY.md topic-file content on first startup
+        # after memory system install. Per-user flag: each user_id gets its own
+        # flag so later-added users trigger their own seed on next startup.
+        # Import is_enabled fresh here rather than relying on memory_is_enabled
+        # from the try block above, which is undefined if the import failed.
+        try:
+            from kai.memory import is_enabled as _memory_ready
+            from kai.memory import seed_from_memory_md
+
+            if config.memory_enabled and _memory_ready():
+                # Collect user_ids that still need seeding. Skip any user whose
+                # flag is already set (prior successful run for that user).
+                user_ids_to_seed: list[str] = []
+                for user_id_int in sorted(config.allowed_user_ids):
+                    flag_key = f"memory_seeded:{user_id_int}"
+                    if await sessions.get_setting(flag_key) is None:
+                        user_ids_to_seed.append(str(user_id_int))
+
+                if user_ids_to_seed:
+                    # Run the seed in a thread executor: the seed does synchronous
+                    # Qdrant I/O per entry and should not block the event loop for
+                    # the minute or two the first-run migration takes. Subsequent
+                    # runs are no-ops (dedup short-circuits), but we still offload
+                    # to keep the startup path non-blocking.
+                    loop = asyncio.get_running_loop()
+                    counts = await loop.run_in_executor(
+                        None,
+                        lambda: seed_from_memory_md(user_ids=user_ids_to_seed),
+                    )
+                    # Set the per-user flag ONLY for users whose seed had no
+                    # failures. Users with partial failures will retry on the
+                    # next startup, and dedup will skip the already-seeded entries.
+                    for user_id_str, user_counts in counts.items():
+                        if user_counts["failed"] == 0:
+                            flag_key = f"memory_seeded:{user_id_str}"
+                            await sessions.set_setting(flag_key, "1")
+                            logging.info("Memory seed flag set for user_id=%s", user_id_str)
+                        else:
+                            logging.warning(
+                                "Memory seed for user_id=%s had %d failures; flag NOT set, will retry on next startup",
+                                user_id_str,
+                                user_counts["failed"],
+                            )
+        except Exception:
+            # Migration failure is non-fatal. The bot runs without seed data;
+            # Track 1 exchange ingestion continues to populate the store.
+            # Also catches ImportError if mem0 is not installed.
+            logging.warning("Memory seed migration failed", exc_info=True)
+
         try:
             # Retry initialization if the network isn't ready yet (e.g. after a
             # power outage where DNS may take a while to come back).
