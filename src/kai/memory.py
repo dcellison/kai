@@ -551,13 +551,13 @@ def _parse_topic_file(path: Path) -> list[dict]:
             continue
 
         # Heading line: record as current_heading; do not seed as content.
-        # CommonMark requires "# " (hash + space) for headings. Bare "#foo"
-        # (e.g. issue references like #311) is NOT a heading and should be
-        # treated as paragraph text to avoid silently swallowing content.
-        if stripped.startswith("# ") or (len(stripped) > 1 and stripped[0] == "#" and stripped[1] == "#"):
+        # CommonMark requires a space after the hash(es) for all ATX heading
+        # levels: "# H1", "## H2", etc. Lines like #311 or ##cross-ref are
+        # NOT headings and must be treated as paragraph text.
+        heading_hashes = len(stripped) - len(stripped.lstrip("#"))
+        if 1 <= heading_hashes <= 6 and stripped[heading_hashes : heading_hashes + 1] == " ":
             flush_paragraph()
-            # Strip leading # characters and whitespace to get the heading text.
-            current_heading = stripped.lstrip("#").strip()
+            current_heading = stripped[heading_hashes:].strip()
             continue
 
         # Bullet line: flush any paragraph, then add this bullet as its own

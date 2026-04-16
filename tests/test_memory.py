@@ -851,18 +851,20 @@ class TestParseTopicFile:
         assert _parse_topic_file(f) == []
 
     def test_bare_hash_not_treated_as_heading(self, tmp_path):
-        """Lines like #311 or #hashtag are paragraph text, not headings."""
+        """Lines like #311, #hashtag, or ##cross-ref are paragraph text."""
         from kai.memory import _parse_topic_file
 
         f = tmp_path / "test.md"
-        f.write_text("# Real Heading\n\n#311 is an issue reference\n#hashtag\n")
+        # All ATX levels require a space: #, ##, ###, etc.
+        f.write_text("# Real Heading\n\n#311 is an issue reference\n#hashtag\n##nospace\n")
 
         result = _parse_topic_file(f)
-        # Both bare-hash lines should be joined into one paragraph candidate
+        # All three bare-hash lines should be joined into one paragraph
         assert len(result) == 1
         assert "#311 is an issue reference" in result[0]["content"]
         assert "#hashtag" in result[0]["content"]
-        # The real heading should be context, not content
+        assert "##nospace" in result[0]["content"]
+        # The real heading (with space) should be context, not content
         assert result[0]["heading"] == "Real Heading"
 
 
