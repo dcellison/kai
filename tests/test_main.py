@@ -400,6 +400,12 @@ class TestMemorySeedIntegration:
     exercising the seed integration path with mocked memory and session
     modules. The actual seed_from_memory_md() behavior is thoroughly
     tested in test_memory.py; these tests focus on the orchestration.
+
+    NOTE: These tests inline a copy of the seed block from _init_and_run()
+    rather than calling the function itself (which orchestrates the full
+    app lifecycle and is impractical to unit-test). If the production
+    seed block changes shape, these tests must be updated manually.
+    They verify the flag logic pattern, not the exact production code.
     """
 
     async def test_seed_runs_when_flag_absent(self):

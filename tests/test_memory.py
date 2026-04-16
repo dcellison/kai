@@ -850,6 +850,21 @@ class TestParseTopicFile:
 
         assert _parse_topic_file(f) == []
 
+    def test_bare_hash_not_treated_as_heading(self, tmp_path):
+        """Lines like #311 or #hashtag are paragraph text, not headings."""
+        from kai.memory import _parse_topic_file
+
+        f = tmp_path / "test.md"
+        f.write_text("# Real Heading\n\n#311 is an issue reference\n#hashtag\n")
+
+        result = _parse_topic_file(f)
+        # Both bare-hash lines should be joined into one paragraph candidate
+        assert len(result) == 1
+        assert "#311 is an issue reference" in result[0]["content"]
+        assert "#hashtag" in result[0]["content"]
+        # The real heading should be context, not content
+        assert result[0]["heading"] == "Real Heading"
+
 
 # ── _classify_source_file() tests ─────────────────────────────────
 
@@ -1163,6 +1178,23 @@ class TestSeedFromMemoryMd:
 
         assert counts["123"] == {"seeded": 0, "skipped": 0, "failed": 0}
         assert counts["456"] == {"seeded": 0, "skipped": 0, "failed": 0}
+
+    def test_missing_directory_returns_zero_counts(self, tmp_path):
+        """Non-existent memory directory returns zero counts, not an error."""
+        import kai.memory as mem_mod
+        from kai.memory import seed_from_memory_md
+
+        mock_mem = MagicMock()
+        mem_mod._memory = mock_mem
+
+        # Point to a directory that does not exist
+        missing_dir = tmp_path / "does_not_exist" / "memory"
+
+        counts = seed_from_memory_md(user_ids=["123"], memory_dir=missing_dir)
+
+        assert counts["123"] == {"seeded": 0, "skipped": 0, "failed": 0}
+        # No Mem0 calls should be made
+        mock_mem.add.assert_not_called()
 
     def test_code_blocks_not_stored(self, tmp_path):
         """Content inside fenced code blocks is not seeded."""

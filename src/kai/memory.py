@@ -475,11 +475,10 @@ def _classify_source_file(filename: str) -> str | None:
         "notes.md": "fact",
         "planned-features.md": "fact",
     }
-    # Explicit skip list. api-reference.md is already in the system prompt,
-    # so seeding it would create duplicate matches on every scheduling query.
-    # MEMORY.md is the index file: pointers, not content.
-    if filename in ("MEMORY.md", "api-reference.md"):
-        return None
+    # api-reference.md and MEMORY.md are intentionally absent from the
+    # mapping. api-reference.md is already in the system prompt (seeding
+    # would create duplicate matches). MEMORY.md is the index file
+    # (pointers, not content). mapping.get() returns None for both.
     return mapping.get(filename)
 
 
@@ -552,7 +551,10 @@ def _parse_topic_file(path: Path) -> list[dict]:
             continue
 
         # Heading line: record as current_heading; do not seed as content.
-        if stripped.startswith("#"):
+        # CommonMark requires "# " (hash + space) for headings. Bare "#foo"
+        # (e.g. issue references like #311) is NOT a heading and should be
+        # treated as paragraph text to avoid silently swallowing content.
+        if stripped.startswith("# ") or (len(stripped) > 1 and stripped[0] == "#" and stripped[1] == "#"):
             flush_paragraph()
             # Strip leading # characters and whitespace to get the heading text.
             current_heading = stripped.lstrip("#").strip()
@@ -638,6 +640,13 @@ def seed_from_memory_md(
         return {uid: {"seeded": 0, "skipped": 0, "failed": 0} for uid in user_ids}
 
     target_dir = memory_dir if memory_dir is not None else DATA_DIR / "memory"
+
+    # Guard: on first install before any memory files are written, the
+    # memory directory may not exist yet. Return zero counts so the caller
+    # treats this as "nothing to do" rather than an error.
+    if not target_dir.exists():
+        log.info("Memory directory %s does not exist; skipping seed", target_dir)
+        return {uid: {"seeded": 0, "skipped": 0, "failed": 0} for uid in user_ids}
 
     # Collect topic files to process, in a stable order so test output is
     # deterministic. _classify_source_file returns None for files we skip
