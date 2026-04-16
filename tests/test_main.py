@@ -1,11 +1,9 @@
 """
-Tests for main.py - setup_logging(), _bootstrap_memory(), _file_age/_file_cleanup_loop,
-and memory seed migration integration.
+Tests for main.py - setup_logging(), _bootstrap_memory(), _file_age/_file_cleanup_loop.
 
 The main() and _init_and_run() functions orchestrate the full application
 lifecycle and are impractical to unit test. The helper functions are
-testable in isolation. The memory seed tests verify the integration logic
-(flag checks, flag setting) using mocked memory and session modules.
+testable in isolation.
 """
 
 import asyncio
@@ -13,7 +11,7 @@ import logging
 from datetime import UTC, datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -387,161 +385,3 @@ class TestFileCleanupLoop:
         # Error was logged
         mock_log.assert_called()
         # Should not raise - error is counted, not propagated
-
-
-# ── Memory seed migration integration ──────────────────────────────
-
-
-class TestMemorySeedIntegration:
-    """
-    Tests for the memory seed migration block in _init_and_run().
-
-    These tests verify the flag-check/flag-set logic by directly
-    exercising the seed integration path with mocked memory and session
-    modules. The actual seed_from_memory_md() behavior is thoroughly
-    tested in test_memory.py; these tests focus on the orchestration.
-
-    NOTE: These tests inline a copy of the seed block from _init_and_run()
-    rather than calling the function itself (which orchestrates the full
-    app lifecycle and is impractical to unit-test). If the production
-    seed block changes shape, these tests must be updated manually.
-    They verify the flag logic pattern, not the exact production code.
-    """
-
-    async def test_seed_runs_when_flag_absent(self):
-        """When no memory_seeded flag exists, seed_from_memory_md is called."""
-        mock_seed = MagicMock(return_value={"123": {"seeded": 10, "skipped": 0, "failed": 0}})
-        mock_is_enabled = MagicMock(return_value=True)
-        mock_get_setting = AsyncMock(return_value=None)
-        mock_set_setting = AsyncMock()
-
-        with (
-            patch("kai.memory.is_enabled", mock_is_enabled),
-            patch("kai.memory.seed_from_memory_md", mock_seed),
-            patch("kai.sessions.get_setting", mock_get_setting),
-            patch("kai.sessions.set_setting", mock_set_setting),
-        ):
-            # Import fresh to get the patched modules
-            from kai.memory import is_enabled as _memory_ready
-            from kai.memory import seed_from_memory_md
-
-            # Simulate the seed block from main.py
-            memory_enabled = True
-            allowed_user_ids = {123}
-
-            if memory_enabled and _memory_ready():
-                from kai import sessions
-
-                user_ids_to_seed: list[str] = []
-                for user_id_int in sorted(allowed_user_ids):
-                    flag_key = f"memory_seeded:{user_id_int}"
-                    if await sessions.get_setting(flag_key) is None:
-                        user_ids_to_seed.append(str(user_id_int))
-
-                if user_ids_to_seed:
-                    loop = asyncio.get_running_loop()
-                    counts = await loop.run_in_executor(
-                        None,
-                        lambda: seed_from_memory_md(user_ids=user_ids_to_seed),
-                    )
-                    for user_id_str, user_counts in counts.items():
-                        if user_counts["failed"] == 0:
-                            flag_key = f"memory_seeded:{user_id_str}"
-                            await sessions.set_setting(flag_key, "1")
-
-        mock_seed.assert_called_once_with(user_ids=["123"])
-        mock_set_setting.assert_called_once_with("memory_seeded:123", "1")
-
-    async def test_seed_skipped_when_flag_present(self):
-        """When memory_seeded flag exists, seed_from_memory_md is NOT called."""
-        mock_seed = MagicMock()
-        mock_is_enabled = MagicMock(return_value=True)
-        # Flag already set - return a non-None value
-        mock_get_setting = AsyncMock(return_value="1")
-
-        with (
-            patch("kai.memory.is_enabled", mock_is_enabled),
-            patch("kai.memory.seed_from_memory_md", mock_seed),
-            patch("kai.sessions.get_setting", mock_get_setting),
-        ):
-            from kai.memory import is_enabled as _memory_ready
-            from kai.memory import seed_from_memory_md
-
-            memory_enabled = True
-            allowed_user_ids = {123}
-
-            if memory_enabled and _memory_ready():
-                from kai import sessions
-
-                user_ids_to_seed: list[str] = []
-                for user_id_int in sorted(allowed_user_ids):
-                    flag_key = f"memory_seeded:{user_id_int}"
-                    if await sessions.get_setting(flag_key) is None:
-                        user_ids_to_seed.append(str(user_id_int))
-
-                if user_ids_to_seed:
-                    seed_from_memory_md(user_ids=user_ids_to_seed)
-
-        mock_seed.assert_not_called()
-
-    async def test_seed_flag_not_set_on_failure(self):
-        """When seed reports failures, the flag is NOT set for that user."""
-        mock_seed = MagicMock(return_value={"123": {"seeded": 5, "skipped": 0, "failed": 2}})
-        mock_is_enabled = MagicMock(return_value=True)
-        mock_get_setting = AsyncMock(return_value=None)
-        mock_set_setting = AsyncMock()
-
-        with (
-            patch("kai.memory.is_enabled", mock_is_enabled),
-            patch("kai.memory.seed_from_memory_md", mock_seed),
-            patch("kai.sessions.get_setting", mock_get_setting),
-            patch("kai.sessions.set_setting", mock_set_setting),
-        ):
-            from kai.memory import is_enabled as _memory_ready
-            from kai.memory import seed_from_memory_md
-
-            memory_enabled = True
-            allowed_user_ids = {123}
-
-            if memory_enabled and _memory_ready():
-                from kai import sessions
-
-                user_ids_to_seed: list[str] = []
-                for user_id_int in sorted(allowed_user_ids):
-                    flag_key = f"memory_seeded:{user_id_int}"
-                    if await sessions.get_setting(flag_key) is None:
-                        user_ids_to_seed.append(str(user_id_int))
-
-                if user_ids_to_seed:
-                    loop = asyncio.get_running_loop()
-                    counts = await loop.run_in_executor(
-                        None,
-                        lambda: seed_from_memory_md(user_ids=user_ids_to_seed),
-                    )
-                    for user_id_str, user_counts in counts.items():
-                        if user_counts["failed"] == 0:
-                            flag_key = f"memory_seeded:{user_id_str}"
-                            await sessions.set_setting(flag_key, "1")
-
-        # Seed was called, but flag should NOT be set due to failures
-        mock_seed.assert_called_once()
-        mock_set_setting.assert_not_called()
-
-    async def test_seed_skips_when_memory_disabled(self):
-        """When memory is disabled, the seed path is never entered."""
-        mock_seed = MagicMock()
-        mock_is_enabled = MagicMock(return_value=False)
-
-        with (
-            patch("kai.memory.is_enabled", mock_is_enabled),
-            patch("kai.memory.seed_from_memory_md", mock_seed),
-        ):
-            from kai.memory import is_enabled as _memory_ready
-
-            memory_enabled = False
-
-            if memory_enabled and _memory_ready():
-                # This block should not execute
-                mock_seed(user_ids=["123"])
-
-        mock_seed.assert_not_called()
