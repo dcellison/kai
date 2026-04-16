@@ -900,6 +900,29 @@ class TestClassifySourceFile:
         assert _classify_source_file("todo.md") is None
 
 
+# ── _is_duplicate() tests ────────────────────────────────────────
+
+
+class TestIsDuplicate:
+    """Tests for _is_duplicate() dedup helper."""
+
+    def test_search_exception_returns_false(self):
+        """When search() raises, _is_duplicate returns False (insert, don't skip)."""
+        import kai.memory as mem_mod
+        from kai.memory import _is_duplicate
+
+        # Set _config so search() doesn't short-circuit on the None guard
+        mem_mod._config = _make_config()
+        # Mock _memory.search to raise inside search()
+        mock_mem = MagicMock()
+        mock_mem.search.side_effect = RuntimeError("qdrant connection refused")
+        mem_mod._memory = mock_mem
+
+        # Should return False (not a duplicate), not raise
+        result = _is_duplicate("some content", user_id="123")
+        assert result is False
+
+
 # ── seed_from_memory_md() tests ───────────────────────────────────
 
 
@@ -1095,6 +1118,27 @@ class TestSeedFromMemoryMd:
 
         assert counts["123"]["seeded"] == 1  # user.md succeeded
         assert counts["123"]["failed"] == 1  # notes.md failed
+
+    def test_unicode_decode_error_counts_as_failure(self, tmp_path):
+        """Non-UTF-8 files are caught and counted as failures, not crashes."""
+        import kai.memory as mem_mod
+        from kai.memory import seed_from_memory_md
+
+        mock_mem = MagicMock()
+        mock_mem.add.return_value = {"results": [{"id": "abc", "memory": "test"}]}
+        mock_mem.search.return_value = {"results": []}
+        mem_mod._memory = mock_mem
+
+        memory_dir = tmp_path / "memory"
+        memory_dir.mkdir()
+        (memory_dir / "user.md").write_text("# User\n\n- Fact A\n")
+        # Write raw bytes that are not valid UTF-8
+        (memory_dir / "notes.md").write_bytes(b"\xff\xfe# Notes\n\n- Broken\n")
+
+        counts = seed_from_memory_md(user_ids=["123"], memory_dir=memory_dir)
+
+        assert counts["123"]["seeded"] == 1  # user.md succeeded
+        assert counts["123"]["failed"] == 1  # notes.md failed (UnicodeDecodeError)
 
     def test_preserves_heading_context(self, tmp_path):
         """Headings are stored as metadata['heading'] on subsequent bullets."""
