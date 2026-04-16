@@ -3517,6 +3517,30 @@ async def _handle_response(
     final_text = final_response.text
     log_message(direction="assistant", chat_id=chat_id, text=final_text)
 
+    # Fire-and-forget: embed this exchange in semantic memory.
+    # Runs in a background task so it does not delay response delivery.
+    # Failures are logged but never propagate to the user.
+    from kai.memory import is_enabled as memory_is_enabled
+
+    if memory_is_enabled():
+
+        async def _ingest_memory() -> None:
+            try:
+                from kai.memory import add_exchange
+
+                # Extract user text from prompt (may be str or list)
+                user_text = prompt if isinstance(prompt, str) else str(prompt)
+                await add_exchange(
+                    user_text=user_text,
+                    assistant_text=final_text,
+                    user_id=str(chat_id),
+                    session_id=final_response.session_id,
+                )
+            except Exception:
+                log.warning("Memory ingestion failed", exc_info=True)
+
+        asyncio.create_task(_ingest_memory())  # noqa: RUF006
+
     # Voice-only mode: synthesize and send voice, fall back to text on failure
     if voice_only and final_text:
         voice_name = await sessions.get_setting(f"voice_name:{chat_id}") or DEFAULT_VOICE

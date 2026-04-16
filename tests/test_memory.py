@@ -550,9 +550,7 @@ class TestMemoryIntegration:
             ("What is for dinner?", "How about pasta with garlic bread?"),
         ]
         for user_text, assistant_text in exchanges:
-            asyncio.run(
-                mem_mod.add_exchange(user_text, assistant_text, user_id=user_id)
-            )
+            asyncio.run(mem_mod.add_exchange(user_text, assistant_text, user_id=user_id))
 
         # Search for deployment - should rank the deploy exchange first
         results = mem_mod.search("production deployment process", user_id=user_id)
@@ -598,9 +596,7 @@ class TestMemoryIntegration:
 
         # Add some exchanges
         for i in range(3):
-            asyncio.run(
-                mem_mod.add_exchange(f"Question {i}", f"Answer {i}", user_id=user_id)
-            )
+            asyncio.run(mem_mod.add_exchange(f"Question {i}", f"Answer {i}", user_id=user_id))
 
         # get_all should return them
         all_memories = mem_mod.get_all(user_id=user_id)

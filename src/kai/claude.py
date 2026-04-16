@@ -391,6 +391,32 @@ class ClaudeCodeBackend(AgentBackend):
             )
             prompt = prepend_to_prompt(prompt, session_ctx)
 
+        # Inject semantically relevant memories for this message.
+        # Runs on every message (~50-100ms). Returns empty string
+        # when memory is disabled or no relevant memories found.
+        # Skip entirely when chat_id is None - an empty-string user_id
+        # would search across all users, which is a data isolation risk.
+        if chat_id is not None:
+            from kai.memory import format_context as memory_format_context
+
+            # Extract text for the search query. For multimodal prompts
+            # (list of content blocks), use the first text block.
+            if isinstance(prompt, str):
+                search_query = prompt
+            else:
+                search_query = next(
+                    (block["text"] for block in prompt if block.get("type") == "text"),
+                    "",
+                )
+            # token_budget is omitted - format_context uses the value
+            # from the Config stored at init_memory() time.
+            memory_ctx = memory_format_context(
+                search_query,
+                user_id=str(chat_id),
+            )
+            if memory_ctx:
+                prompt = prepend_to_prompt(prompt, memory_ctx)
+
         # When in a foreign workspace, remind on every message to only
         # respond to what the user asks - workspace context (CLAUDE.md,
         # git branch, auto-memory) can otherwise trigger autonomous action.
