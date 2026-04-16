@@ -3538,6 +3538,9 @@ async def _handle_response(
                         (block["text"] for block in prompt if block.get("type") == "text"),
                         "",
                     )
+                # Skip image-only exchanges - no meaningful text to embed
+                if not user_text:
+                    return
                 await add_exchange(
                     user_text=user_text,
                     assistant_text=final_text,
