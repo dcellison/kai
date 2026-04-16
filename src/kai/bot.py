@@ -3522,7 +3522,7 @@ async def _handle_response(
     # Failures are logged but never propagate to the user.
     from kai.memory import is_enabled as memory_is_enabled
 
-    if memory_is_enabled():
+    if memory_is_enabled() and chat_id is not None:
 
         async def _ingest_memory() -> None:
             try:

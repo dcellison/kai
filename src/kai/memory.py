@@ -264,6 +264,12 @@ def format_context(
     if not is_enabled() or _config is None:
         return ""
 
+    # Empty queries (e.g. image-only prompts with no text) produce a
+    # non-zero embedding in sentence-transformers, returning arbitrary
+    # results that pass the relevance threshold. Skip entirely.
+    if not query.strip():
+        return ""
+
     budget = token_budget if token_budget is not None else _config.memory_token_budget
 
     # Fetch at least _SEARCH_OVERFETCH results (more than we'll use) so
