@@ -543,6 +543,17 @@ class ClaudeCodeBackend(AgentBackend):
                     # when nothing was accumulated (e.g., system-only responses).
                     result_text = event.get("result", "")
                     text = accumulated_text if accumulated_text else result_text
+                    # When the CLI signals an error but does not populate the
+                    # result field, the user sees the literal string "Error:
+                    # None" with no clue about the error class. Log the raw
+                    # event so the payload is captured for diagnosis (see
+                    # issue #326). The event is small (no model output, just
+                    # metadata) so logging it fully is cheap.
+                    if event.get("is_error") and not result_text:
+                        log.warning(
+                            "Result event with is_error=true has no result field; raw event: %s",
+                            event,
+                        )
                     response = AgentResponse(
                         success=not event.get("is_error", False),
                         text=text,
