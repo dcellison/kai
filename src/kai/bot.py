@@ -54,7 +54,7 @@ from telegram.ext import (
     filters,
 )
 
-from kai import github_api, services, sessions, webhook
+from kai import github_api, memory_command, services, sessions, webhook
 from kai.config import (
     DATA_DIR,
     MAX_CONTEXT_CEILING,
@@ -2845,6 +2845,12 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/github add <repo> - Watch a repo\n"
         "/github remove <repo> - Unwatch a repo\n"
         "\n"
+        "/memory - Browse remembered facts by tag\n"
+        "/memory search <q> - Semantic search over memories\n"
+        "/memory stats - Counts and confidence distribution\n"
+        "/memory forget <tag> - Delete all memories with a tag\n"
+        "/memory help - /memory subcommand reference\n"
+        "\n"
         "/voice - Toggle voice on/off\n"
         "/voice only - Voice only (no text)\n"
         "/voice on - Text + voice\n"
@@ -3705,12 +3711,14 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
     app.add_handler(CommandHandler("voices", handle_voices))
     app.add_handler(CommandHandler("webhooks", handle_webhooks))
     app.add_handler(CommandHandler("github", handle_github))
+    app.add_handler(CommandHandler("memory", memory_command.handle_memory_command))
     app.add_handler(CommandHandler("stop", handle_stop))
 
     # Callback query handlers for inline keyboards (pattern-matched)
     app.add_handler(CallbackQueryHandler(handle_model_callback, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(handle_voice_callback, pattern=r"^voice:"))
     app.add_handler(CallbackQueryHandler(handle_workspace_callback, pattern=r"^ws:"))
+    app.add_handler(CallbackQueryHandler(memory_command.handle_memory_callback, pattern=r"^mem:"))
 
     # Media handlers (must be before the catch-all text handler)
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
