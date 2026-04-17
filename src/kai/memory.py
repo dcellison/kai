@@ -572,11 +572,18 @@ async def submit_user_utterance(
         # process lifetime.
         return
 
-    pending = _pending_writes.get(user_id)
+    # Pop (not get) so the old entry leaves the dict atomically before
+    # any await. A concurrent _ingest_memory task for the same user
+    # (two messages in quick succession, both fire-and-forget) that
+    # wakes during the add_user_utterance await below would otherwise
+    # find the same PendingWrite still present and flush it a second
+    # time. Pop at the top closes the duplicate-flush window for both
+    # the correction-cue path and the flush-then-queue path.
+    pending = _pending_writes.pop(user_id, None)
     if _is_correction_cue(user_text):
         if pending is not None:
-            # Retraction path: drop M_n, do not queue M_{n+1}.
-            del _pending_writes[user_id]
+            # Retraction path: M_n was just removed by the pop above;
+            # M_{n+1} is a correction cue and intentionally not queued.
             log.debug(
                 "submit_user_utterance: dropped pending write for %s on correction cue",
                 user_id,

@@ -139,6 +139,22 @@ class TestBuildExtractionPayload:
         payload = _build_extraction_payload(prose, "agreed")
         assert "the USER: tag in that log format is wrong" in payload
 
+    def test_long_user_text_truncated(self):
+        """Round 6 review finding: user_text arrives from bot.py at full
+        length (the add_user_utterance cap only applies to that function's
+        local parameter, not the variable passed into _build_extraction_payload).
+        Long user pastes must be capped locally at memory._MAX_USER_CHARS
+        so per-call Haiku token cost stays bounded."""
+        from kai import memory
+
+        long_user = "u" * (memory._MAX_USER_CHARS + 500)
+        payload = _build_extraction_payload(long_user, "short reply")
+        assert long_user not in payload
+        assert "..." in payload
+        # The capped portion survives; the over-cap extension does not.
+        assert ("u" * memory._MAX_USER_CHARS) in payload
+        assert ("u" * (memory._MAX_USER_CHARS + 1)) not in payload
+
     def test_long_assistant_text_truncated(self):
         """Round 5 review finding: assistant_text arrives at full length
         from bot.py, so long tool output blows up the Haiku payload and

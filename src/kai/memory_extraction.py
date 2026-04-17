@@ -342,14 +342,19 @@ def _build_extraction_payload(user_text: str, assistant_text: str) -> str:
 
     The payload is delivered via stdin, not argv - see `_run_extractor`.
     """
-    # Cap assistant_text before role-label stripping. user_text is
-    # already capped by add_user_utterance at _MAX_USER_CHARS (2000),
-    # but assistant_text arrives from bot.py at full length and may
-    # include long tool output or code blocks. Truncating here bounds
-    # per-call Haiku token cost so the --max-budget-usd ceiling is a
-    # real guarantee, not an optimistic estimate. Confirmation quotes
-    # live in the user side, so truncating the assistant tail does not
-    # drop signal needed for confirmed_action fact extraction.
+    # Cap both sides before role-label stripping so per-call Haiku
+    # token cost stays bounded and --max-budget-usd is a real ceiling,
+    # not an optimistic estimate. Both caps are applied here, locally,
+    # and not inherited from callers: add_user_utterance truncates its
+    # OWN local parameter inside memory.py, but that mutation is scoped
+    # to that stack frame and never touches the user_text variable in
+    # bot.py or extract_and_store. So a 50k-char paste would flow
+    # straight into the Haiku payload unless truncated here. Confirmation
+    # quotes sit inside the user turn but are short by construction (the
+    # _CONFIRMATION_QUOTE_MIN_CHARS floor is 20 chars), so a 2000-char
+    # user cap preserves all realistic confirmation signal.
+    if len(user_text) > memory._MAX_USER_CHARS:
+        user_text = user_text[: memory._MAX_USER_CHARS] + "..."
     if len(assistant_text) > memory._MAX_ASSISTANT_CHARS:
         assistant_text = assistant_text[: memory._MAX_ASSISTANT_CHARS] + "..."
     safe_user = _strip_role_labels(user_text)

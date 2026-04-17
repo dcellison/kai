@@ -750,6 +750,59 @@ class TestSubmitUserUtterance:
         assert texts == ["User said: turn A", "User said: turn B"]
         assert mem_mod._pending_writes["u1"].user_text == "turn C"
 
+    def test_concurrent_submits_do_not_double_flush(self):
+        """Round 6 review finding #2: the old pending entry must leave
+        _pending_writes BEFORE the add_user_utterance await, so a second
+        submit task for the same user that wakes during the flush cannot
+        find the same PendingWrite and flush it a second time. Verified
+        by stubbing add_user_utterance with a coroutine that pauses on an
+        event while a second submit enters and inspects the dict state."""
+        import kai.memory as mem_mod
+        from kai.memory import submit_user_utterance
+
+        gate = asyncio.Event()
+        flush_started = asyncio.Event()
+        flush_args: list[str] = []
+
+        async def blocking_flush(*, user_text, user_id, session_id):
+            # Runs in place of the real add_user_utterance. Records the
+            # flushed text and blocks on `gate` so the second submit can
+            # race against it while the first is mid-await.
+            flush_args.append(user_text)
+            flush_started.set()
+            await gate.wait()
+
+        mem_mod._memory = MagicMock()  # keep memory "enabled" so submit runs
+
+        async def race() -> None:
+            with patch.object(mem_mod, "add_user_utterance", blocking_flush):
+                # Seed the pending entry (no flush yet - no prior pending).
+                await submit_user_utterance("pending-A", user_id="u1", session_id="s1")
+                # Task A triggers a flush of pending-A and blocks.
+                task_a = asyncio.create_task(submit_user_utterance("next-A", user_id="u1", session_id="s2"))
+                await flush_started.wait()
+                # Mid-flush invariant: the popped entry must be gone from
+                # the dict. If the code used .get(), pending-A would
+                # still be visible here and the next submit would re-flush
+                # it. The assertion is the teeth of the test - without
+                # pop(), this line fires.
+                current = mem_mod._pending_writes.get("u1")
+                assert current is None or current.user_text != "pending-A"
+                # Task B enters while A is still blocked. B sees no
+                # pending-A to flush, so its own flush_args entry (if any)
+                # must not be "pending-A".
+                task_b = asyncio.create_task(submit_user_utterance("next-B", user_id="u1", session_id="s3"))
+                await asyncio.sleep(0)
+                gate.set()
+                await task_a
+                await task_b
+
+        asyncio.run(race())
+
+        # Exactly one flush of pending-A. No duplicate even though two
+        # submits ran concurrently during the flush window.
+        assert flush_args.count("pending-A") == 1
+
     def test_multi_user_isolation(self):
         """User A's pending write is not affected by user B's correction.
         Per-user state must be keyed strictly on user_id."""
