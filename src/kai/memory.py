@@ -29,10 +29,14 @@ log = logging.getLogger(__name__)
 
 # ── Data classes ────────────────────────────────────────────────────
 
-# Minimum similarity score for a memory to be included in context.
-# Based on smoke testing: clearly relevant results score 0.7+,
-# loosely relevant ~0.35, noise below 0.3.
-_MIN_RELEVANCE_THRESHOLD = 0.3
+# Minimum similarity score for a memory to be included in context
+# was previously a hard-coded 0.3 here. Promoted to a config field as
+# part of spec 310: see `Config.memory_search_floor` (env var
+# MEMORY_SEARCH_FLOOR). Both `format_context` below and the
+# `/memory search` UI in `memory_command.py` read the same value at
+# query time so a config change applies everywhere Kai consults memory.
+# Background: based on smoke testing, clearly relevant results score
+# 0.7+, loosely relevant ~0.35, noise below 0.3.
 
 # Maximum length (chars) for the assistant portion of an ingested
 # exchange. Long tool outputs (file dumps, stack traces, large diffs)
@@ -410,7 +414,14 @@ async def format_context(
     # Weighting happens AFTER this filter (spec §5.3) so a downweighted
     # legacy row cannot survive on raw score, and a boosted extracted fact
     # cannot be rescued below threshold.
-    results = [r for r in results if r.score >= _MIN_RELEVANCE_THRESHOLD]
+    #
+    # Read the floor from config at every call (not at module import) so a
+    # `MEMORY_SEARCH_FLOOR` change applied via service restart takes effect
+    # consistently here AND in the `/memory search` UI; spec 310 §7.5
+    # documents the one-knob-two-paths decision. _config is non-None inside
+    # this branch because is_enabled() returned True above.
+    floor = _config.memory_search_floor
+    results = [r for r in results if r.score >= floor]
     if not results:
         return ""
 

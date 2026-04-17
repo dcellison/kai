@@ -34,12 +34,20 @@ _BASE_CONFIG = Config(
 
 
 def _make_config(*, enabled: bool = True, **overrides) -> Config:
-    """Build a Config with memory settings for testing."""
+    """Build a Config with memory settings for testing.
+
+    The memory_search_floor default mirrors the production default (0.3,
+    matching the prior hard-coded `_MIN_RELEVANCE_THRESHOLD` constant).
+    Tests that exercise the floor explicitly should pass a different
+    `memory_search_floor=...` override; everything else inherits 0.3 so
+    the existing threshold tests continue to assert the same behavior.
+    """
     defaults = {
         "memory_enabled": enabled,
         "memory_search_limit": 10,
         "memory_token_budget": 2000,
         "memory_embedding_model": "all-MiniLM-L6-v2",
+        "memory_search_floor": 0.3,
     }
     defaults.update(overrides)
     return replace(_BASE_CONFIG, **defaults)
@@ -443,7 +451,7 @@ class TestFormatContext:
         import kai.memory as mem_mod
         from kai.memory import format_context
 
-        # raw_score 0.25 < _MIN_RELEVANCE_THRESHOLD (0.3); boosting by 1.2
+        # raw_score 0.25 < memory_search_floor (0.3); boosting by 1.2
         # yields 0.30, but weighting happens AFTER the filter (§5.3) so this
         # row never reaches the walk. Result must be empty.
         mock_mem = MagicMock()
@@ -470,6 +478,44 @@ class TestFormatContext:
 
         result = await format_context("anything", user_id="123")
         assert result == ""
+
+    async def test_format_context_floor_from_config(self):
+        """The relevance floor is read from `config.memory_search_floor`,
+        not from a module-level constant. Spec 310 §7.5 requires the same
+        knob to govern both this path and the `/memory search` UI; this
+        test pins the read so a future refactor cannot reintroduce a
+        hard-coded constant without breaking it.
+
+        A row scoring 0.4 passes when the floor is 0.3 (default behavior)
+        but is filtered out when the floor is raised to 0.5 - verifying
+        the value is sourced from config at call time."""
+        import kai.memory as mem_mod
+        from kai.memory import format_context
+
+        # Single result whose score sits between the two test floors.
+        mock_mem = MagicMock()
+        mock_mem.search.return_value = {
+            "results": [
+                {
+                    "id": "mid",
+                    "memory": "Mid-confidence fact",
+                    "score": 0.4,
+                    "metadata": {"type": "fact", "source": "extracted"},
+                    "created_at": "2026-04-01T00:00:00",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+
+        # Floor at default 0.3: row passes.
+        mem_mod._config = _make_config(memory_search_floor=0.3)
+        out_low = await format_context("anything", user_id="123")
+        assert "Mid-confidence fact" in out_low
+
+        # Floor raised to 0.5: same row now filtered.
+        mem_mod._config = _make_config(memory_search_floor=0.5)
+        out_high = await format_context("anything", user_id="123")
+        assert out_high == ""
 
 
 class TestAddUserUtterance:

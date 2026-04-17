@@ -460,6 +460,19 @@ class Config:
     # an executor thread on a hung subprocess.
     memory_extraction_timeout_s: int = 10
 
+    # Minimum Mem0 similarity score for a memory to be returned by
+    # search-driven paths: both `format_context` (context injection
+    # at session start) and the `/memory search` UI surface in
+    # `memory_command.py`. Values below the floor are dropped before
+    # any ranking. Default 0.3 matches Mem0's built-in default and
+    # the prior hard-coded constant; raise toward 0.5+ to reduce
+    # false positives at the cost of recall. Spec 310 §7.5 documents
+    # the "one knob, two paths" decision: keeping the UI floor and
+    # the context-injection floor in lockstep prevents silent
+    # divergence between "what the user sees in /memory search" and
+    # "what Kai pulls into context" after a config change.
+    memory_search_floor: float = 0.3
+
     def get_workspace_config(self, workspace: Path) -> WorkspaceConfig | None:
         """
         Get per-workspace config for a path, or None for global defaults.
@@ -1400,6 +1413,21 @@ def load_config() -> Config:
     except ValueError:
         raise SystemExit("MEMORY_EXTRACTION_TIMEOUT_S must be an integer") from None
 
+    # Search relevance floor. Float in [0.0, 1.0]; default 0.3 matches
+    # Mem0's built-in default and the prior hard-coded constant. Same
+    # try/except pattern as the other memory_* numeric vars: bad input
+    # exits at startup rather than surfacing as a divide-by-zero or
+    # mysterious "no results" symptom at first query. Range is bounded
+    # at both ends because Mem0 cosine similarity is normalized to
+    # [0.0, 1.0]; a floor outside that range silently filters
+    # everything (>1.0) or nothing (<0.0), both of which are footguns.
+    try:
+        memory_search_floor = float(os.environ.get("MEMORY_SEARCH_FLOOR", "0.3"))
+        if memory_search_floor < 0.0 or memory_search_floor > 1.0:
+            raise SystemExit("MEMORY_SEARCH_FLOOR must be between 0.0 and 1.0")
+    except ValueError:
+        raise SystemExit("MEMORY_SEARCH_FLOOR must be a number") from None
+
     # Per-workspace configuration. Loaded after ALLOWED_WORKSPACES so
     # YAML-defined workspaces can be merged into the allowed set.
     workspace_configs = _load_workspace_configs()
@@ -1557,4 +1585,5 @@ def load_config() -> Config:
         memory_extraction_model=memory_extraction_model,
         memory_extraction_budget_usd=memory_extraction_budget_usd,
         memory_extraction_timeout_s=memory_extraction_timeout_s,
+        memory_search_floor=memory_search_floor,
     )

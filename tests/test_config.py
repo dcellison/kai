@@ -56,6 +56,7 @@ _CONFIG_ENV_VARS = [
     "MEMORY_EXTRACTION_MODEL",
     "MEMORY_EXTRACTION_BUDGET_USD",
     "MEMORY_EXTRACTION_TIMEOUT_S",
+    "MEMORY_SEARCH_FLOOR",
     "KAI_DATA_DIR",
     "KAI_INSTALL_DIR",
 ]
@@ -1256,4 +1257,64 @@ class TestMemoryExtractionConfig:
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_EXTRACTION_TIMEOUT_S", "not-an-int")
         with pytest.raises(SystemExit, match="must be an integer"):
+            load_config()
+
+
+# ── Memory search floor (spec 310 §7.5) ─────────────────────────────
+
+
+class TestMemorySearchFloor:
+    """The MEMORY_SEARCH_FLOOR env var: the relevance gate shared by
+    `format_context` (context injection) and the `/memory search` UI.
+    Range is closed on both ends because Mem0 cosine similarity is
+    normalized to [0.0, 1.0]; out-of-range values would silently
+    filter everything (>1.0) or nothing (<0.0)."""
+
+    def test_default_is_0_3(self, monkeypatch):
+        """Default matches Mem0's built-in default and the prior hard-coded
+        constant; this default must be stable so that not setting the env
+        var preserves pre-spec-310 behavior."""
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.memory_search_floor == 0.3
+
+    def test_override(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_SEARCH_FLOOR", "0.5")
+        config = load_config()
+        assert config.memory_search_floor == 0.5
+
+    def test_accepts_zero(self, monkeypatch):
+        """0.0 is the "include everything" boundary - valid and useful for
+        debugging recall problems where the floor is suspected to be too
+        aggressive."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_SEARCH_FLOOR", "0.0")
+        config = load_config()
+        assert config.memory_search_floor == 0.0
+
+    def test_accepts_one(self, monkeypatch):
+        """1.0 is the "exact match only" boundary; pathologically strict
+        but in-range, so accepted."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_SEARCH_FLOOR", "1.0")
+        config = load_config()
+        assert config.memory_search_floor == 1.0
+
+    def test_rejects_negative(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_SEARCH_FLOOR", "-0.1")
+        with pytest.raises(SystemExit, match=r"between 0\.0 and 1\.0"):
+            load_config()
+
+    def test_rejects_above_one(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_SEARCH_FLOOR", "1.5")
+        with pytest.raises(SystemExit, match=r"between 0\.0 and 1\.0"):
+            load_config()
+
+    def test_rejects_non_number(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_SEARCH_FLOOR", "high")
+        with pytest.raises(SystemExit, match="must be a number"):
             load_config()
