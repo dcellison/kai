@@ -126,10 +126,14 @@ def _cmd_purge(args: argparse.Namespace) -> int:
     source = args.source
     if source not in _KNOWN_SOURCES:
         # The allow-list exists precisely to catch typos before they
-        # silently delete zero rows. List accepted values so the
-        # operator can fix the invocation without re-reading --help.
+        # silently delete zero rows. Spell out accepted values directly
+        # rather than printing the sorted list - sorted({"", ...})
+        # renders as `['', ...]`, and a leading empty string in a repr
+        # list looks like a rendering artifact, not a valid input.
         print(
-            f"memory admin: unknown source {source!r}. Accepted values: {sorted(_KNOWN_SOURCES)!r}",
+            f"memory admin: unknown source {source!r}. "
+            "Accepted values: 'extracted', 'user_raw', "
+            "or '' (empty string = legacy rows with no source set).",
             file=sys.stderr,
         )
         return 2

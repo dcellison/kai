@@ -139,6 +139,31 @@ class TestBuildExtractionPayload:
         payload = _build_extraction_payload(prose, "agreed")
         assert "the USER: tag in that log format is wrong" in payload
 
+    def test_long_assistant_text_truncated(self):
+        """Round 5 review finding: assistant_text arrives at full length
+        from bot.py, so long tool output blows up the Haiku payload and
+        per-call cost. Truncation must match the memory._MAX_ASSISTANT_CHARS
+        cap (mirrors the user-side cap applied by add_user_utterance)."""
+        from kai import memory
+
+        # +500 chars over the cap so the test still passes if the cap is
+        # raised later, as long as it stays under len(long_assistant).
+        long_assistant = "x" * (memory._MAX_ASSISTANT_CHARS + 500)
+        payload = _build_extraction_payload("hi", long_assistant)
+        # Truncation marker present; full-length string absent.
+        assert long_assistant not in payload
+        assert "..." in payload
+        # Truncated portion is bounded: cap + ellipsis tail only.
+        assert ("x" * memory._MAX_ASSISTANT_CHARS) in payload
+        assert ("x" * (memory._MAX_ASSISTANT_CHARS + 1)) not in payload
+
+    def test_short_assistant_text_not_mangled(self):
+        """Regression guard: sub-cap assistant text must pass through
+        unchanged. No spurious ellipsis, no truncation."""
+        payload = _build_extraction_payload("hi", "short reply")
+        assert "ASSISTANT: short reply" in payload
+        assert "..." not in payload
+
 
 # ── _strip_role_labels ──────────────────────────────────────────────
 

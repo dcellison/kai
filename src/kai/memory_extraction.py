@@ -342,6 +342,16 @@ def _build_extraction_payload(user_text: str, assistant_text: str) -> str:
 
     The payload is delivered via stdin, not argv - see `_run_extractor`.
     """
+    # Cap assistant_text before role-label stripping. user_text is
+    # already capped by add_user_utterance at _MAX_USER_CHARS (2000),
+    # but assistant_text arrives from bot.py at full length and may
+    # include long tool output or code blocks. Truncating here bounds
+    # per-call Haiku token cost so the --max-budget-usd ceiling is a
+    # real guarantee, not an optimistic estimate. Confirmation quotes
+    # live in the user side, so truncating the assistant tail does not
+    # drop signal needed for confirmed_action fact extraction.
+    if len(assistant_text) > memory._MAX_ASSISTANT_CHARS:
+        assistant_text = assistant_text[: memory._MAX_ASSISTANT_CHARS] + "..."
     safe_user = _strip_role_labels(user_text)
     safe_assistant = _strip_role_labels(assistant_text)
     return f"Extract facts from this exchange.\n\nUSER: {safe_user}\n\nASSISTANT: {safe_assistant}"
@@ -665,9 +675,14 @@ async def extract_and_store(
             return 0
 
     sem = _get_semaphore(user_id)
-    start = time.monotonic()
     try:
         async with sem:
+            # Start the clock AFTER acquiring the per-user semaphore so
+            # `duration_ms` in the memory.extract: log line reflects
+            # actual extraction latency, not time spent queued behind a
+            # prior in-flight extraction for the same user. Under queued
+            # load the two are easy to confuse.
+            start = time.monotonic()
             payload = _build_extraction_payload(user_text, assistant_text)
             facts = await _run_extractor(payload, config)
             if not facts:

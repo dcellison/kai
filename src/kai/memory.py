@@ -35,9 +35,12 @@ log = logging.getLogger(__name__)
 _MIN_RELEVANCE_THRESHOLD = 0.3
 
 # Maximum length (chars) for the assistant portion of an ingested
-# exchange. Long tool outputs would dominate the embedding otherwise.
-# Retained for the existing assistant-side cap in legacy call sites
-# that have not yet been removed.
+# exchange. Long tool outputs (file dumps, stack traces, large diffs)
+# would otherwise dominate the embedding AND balloon the Haiku
+# extraction payload, pushing per-call token cost above the expected
+# $0.02-$0.03 envelope documented in config.memory_extraction_budget_usd.
+# Used by memory_extraction._build_extraction_payload; mirrors
+# _MAX_USER_CHARS on the assistant side.
 _MAX_ASSISTANT_CHARS = 1000
 
 # Maximum length (chars) for the user portion of a Track 1 ingestion.
