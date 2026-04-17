@@ -731,7 +731,11 @@ async def handle_memory_command(update: Update, context: ContextTypes.DEFAULT_TY
       search <query> → search (empty query falls through to help)
       forget <tag>   → forget-by-tag confirmation
     """
-    assert update.message is not None
+    # PTB CommandHandler guarantees a message is attached, but
+    # `python -O` strips asserts; use `if/raise` for `-O` safety.
+    # See `_chat_id` for the convention rationale.
+    if update.message is None:
+        raise ValueError("handle_memory_command: update.message is None")
     chat_id = _chat_id(update)
     config: Config = context.bot_data["config"]
 
@@ -803,7 +807,12 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
       fview             - cancel forget; return to fact view (same id)
       ftd <tag>         - forget by tag: do bulk delete
     """
-    assert update.callback_query is not None
+    # PTB CallbackQueryHandler guarantees both callback_query and
+    # query.data are present, but `python -O` strips asserts; use
+    # `if/raise` for `-O` safety. See `_chat_id` for the convention
+    # rationale.
+    if update.callback_query is None:
+        raise ValueError("handle_memory_callback: callback_query is None")
     query = update.callback_query
     config: Config = context.bot_data["config"]
     if not _is_authorized(config, _user_id(update)):
@@ -811,7 +820,8 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     chat_id = _chat_id(update)
-    assert query.data is not None
+    if query.data is None:
+        raise ValueError("handle_memory_callback: query.data is None")
     action = _decode_callback(query.data)
     if action is None:
         await query.answer()
@@ -1278,16 +1288,31 @@ async def _send_or_edit(
 
 
 def _chat_id(update: Update) -> int:
-    """Return the chat id, asserting non-None for type narrowing."""
+    """Return the chat id, narrowed from Optional via runtime guard.
+
+    `if/raise` rather than `assert`: PTB routing guarantees a chat
+    is present for both CommandHandler and CallbackQueryHandler
+    callbacks, but `python -O` strips assertions, so a future caller
+    wiring this helper from a non-routed path under optimized
+    bytecode would see `AttributeError` on the next access instead
+    of a meaningful contract violation. Matches the convention used
+    everywhere else in this module (_encode_callback, _send_or_edit,
+    _send_forget_tag_confirm).
+    """
     chat = update.effective_chat
-    assert chat is not None
+    if chat is None:
+        raise ValueError("_chat_id: effective_chat is None")
     return chat.id
 
 
 def _user_id(update: Update) -> int:
-    """Return the user id, asserting non-None for type narrowing."""
+    """Return the user id, narrowed from Optional via runtime guard.
+
+    See `_chat_id` for the `if/raise`-vs-`assert` rationale.
+    """
     user = update.effective_user
-    assert user is not None
+    if user is None:
+        raise ValueError("_user_id: effective_user is None")
     return user.id
 
 

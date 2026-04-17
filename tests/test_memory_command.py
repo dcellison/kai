@@ -870,6 +870,51 @@ class TestSendOrEditContract:
         await memory_command._send_or_edit(upd, "hello", None, edit=False)
         upd.effective_chat.send_message.assert_awaited_once()
 
+    def test_chat_id_helper_raises_when_effective_chat_is_none(self):
+        # Round-6 #1: `_chat_id` was an `assert`; converted to
+        # `if/raise` for `-O` safety. PTB routing guarantees a chat
+        # in normal handlers, but a future caller wiring this from a
+        # non-routed path would silently AttributeError under -O.
+        upd = MagicMock()
+        upd.effective_chat = None
+        with pytest.raises(ValueError, match="effective_chat is None"):
+            memory_command._chat_id(upd)
+
+    def test_user_id_helper_raises_when_effective_user_is_none(self):
+        # Round-6 #1: same conversion as `_chat_id`.
+        upd = MagicMock()
+        upd.effective_user = None
+        with pytest.raises(ValueError, match="effective_user is None"):
+            memory_command._user_id(upd)
+
+    @pytest.mark.asyncio
+    async def test_handle_memory_command_raises_without_message(self, monkeypatch):
+        # Round-6 #1: top-of-handler `assert update.message is not None`
+        # converted to `if/raise`. PTB CommandHandler guarantees a
+        # message in normal use, but the contract should hold under
+        # `python -O` too.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        upd = MagicMock()
+        upd.message = None
+        upd.effective_chat = MagicMock(id=100)
+        upd.effective_user = MagicMock(id=999)
+        ctx = MagicMock()
+        with pytest.raises(ValueError, match=r"update\.message is None"):
+            await memory_command.handle_memory_command(upd, ctx)
+
+    @pytest.mark.asyncio
+    async def test_handle_memory_callback_raises_without_callback_query(self):
+        # Audit-all-sites: while addressing the three sites the round-6
+        # review named, the same `assert` pattern was found at the top
+        # of `handle_memory_callback` (callback_query and query.data).
+        # Converted in the same sweep so a future round doesn't have
+        # to re-flag the same anti-pattern.
+        upd = MagicMock()
+        upd.callback_query = None
+        ctx = MagicMock()
+        with pytest.raises(ValueError, match="callback_query is None"):
+            await memory_command.handle_memory_callback(upd, ctx)
+
     @pytest.mark.asyncio
     async def test_send_path_raises_when_effective_chat_is_none(self):
         # Round-5 review #2: the fresh-send branch's None-guard on
