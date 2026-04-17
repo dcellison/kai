@@ -741,6 +741,44 @@ class TestScreenCache:
         assert 100 not in memory_command._screen_cache
 
 
+# ── _send_or_edit contract ─────────────────────────────────────────
+
+
+class TestSendOrEditContract:
+    """Spec 310 §7.3 dispatcher contract: edit=True requires a callback.
+
+    All `edit=True` callers today live in `handle_memory_callback`
+    where `update.callback_query` is guaranteed. The check exists to
+    surface contract violations from any future caller wiring up the
+    `_send_*` helpers from outside the callback path - silent no-op
+    is the worst failure mode here. `raise` rather than `assert` so
+    the gate survives `python -O`."""
+
+    @pytest.mark.asyncio
+    async def test_edit_without_callback_query_raises(self, update_factory):
+        # Build an update with no callback_query (text-message path).
+        upd = update_factory("hi")
+        with pytest.raises(ValueError, match="edit=True requires"):
+            await memory_command._send_or_edit(upd, "hello", None, edit=True)
+
+    @pytest.mark.asyncio
+    async def test_edit_with_callback_query_dispatches(self, update_factory):
+        # Sanity check that the contract gate is not too aggressive:
+        # the legitimate edit path still works when callback_query
+        # is set.
+        upd = update_factory(callback_data="mem:dash")
+        await memory_command._send_or_edit(upd, "hello", None, edit=True)
+        upd.callback_query.edit_message_text.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_path_does_not_require_callback_query(self, update_factory):
+        # edit=False is the fresh-send branch; callback_query may be
+        # absent. Must not trip the contract check.
+        upd = update_factory("hi")
+        await memory_command._send_or_edit(upd, "hello", None, edit=False)
+        upd.effective_chat.send_message.assert_awaited_once()
+
+
 # ── Callback dispatch (smoke tests for the verb table) ─────────────
 
 
@@ -851,6 +889,29 @@ class TestCallbackDispatch:
             lambda *, user_id, memory_id: True,
         )
         upd = update_factory(callback_data="mem:ftd:not_a_real_tag")
+        ctx = context_factory()
+        await memory_command.handle_memory_callback(upd, ctx)
+        toast = upd.callback_query.answer.call_args.args[0]
+        assert toast == memory_command._MSG_SESSION_EXPIRED
+
+    @pytest.mark.asyncio
+    async def test_tag_verb_rejects_unknown_tag(self, monkeypatch, update_factory, context_factory):
+        # Symmetric to test_ftd_rejects_unknown_tag: the read-only
+        # `tag` verb must also enforce _TAG_ENUM. A crafted callback
+        # `mem:tag:not_a_real_tag:0` would otherwise reach get_by_tag
+        # with an off-enum string.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        monkeypatch.setattr(
+            memory_command.memory,
+            "get_stats",
+            lambda *, user_id: _stats(extracted_count=0),
+        )
+
+        def boom(*, user_id, tag):
+            raise AssertionError(f"get_by_tag called with bogus tag {tag!r}")
+
+        monkeypatch.setattr(memory_command.memory, "get_by_tag", boom)
+        upd = update_factory(callback_data="mem:tag:not_a_real_tag:0")
         ctx = context_factory()
         await memory_command.handle_memory_callback(upd, ctx)
         toast = upd.callback_query.answer.call_args.args[0]

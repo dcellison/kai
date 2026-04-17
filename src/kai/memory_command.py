@@ -826,6 +826,14 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
                 await _send_dashboard(update, context, chat_id, edit=True)
                 return
             tag = args[0]
+            # Same _TAG_ENUM gate as the ftd verb and the /memory
+            # forget text path. Off-enum tags are safe today (Mem0
+            # returns empty), but accepting them here is inconsistent
+            # with the rest of the surface and a maintenance trap.
+            if tag not in _TAG_ENUM:
+                await query.answer(_MSG_SESSION_EXPIRED)
+                await _send_dashboard(update, context, chat_id, edit=True)
+                return
             try:
                 page = int(args[1])
             except ValueError:
@@ -1158,7 +1166,15 @@ async def _send_or_edit(
     `BadRequest: Message is not modified` is swallowed: it fires when
     a user double-taps a button and the second edit is identical to
     the first. Treating it as success keeps the UI stable.
+
+    Contract: when `edit=True`, `update.callback_query` must be set.
+    All callers today live in `handle_memory_callback` where that
+    invariant holds, but a future caller from outside the callback
+    path would otherwise hit a silent no-op (neither branch fires).
+    Raise loudly to surface the misuse instead.
     """
+    if edit and update.callback_query is None:
+        raise ValueError("_send_or_edit: edit=True requires update.callback_query")
     if edit and update.callback_query is not None:
         try:
             await update.callback_query.edit_message_text(text=text, reply_markup=keyboard)
