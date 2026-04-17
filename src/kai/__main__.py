@@ -14,6 +14,12 @@ elif len(sys.argv) > 1 and sys.argv[1] == "install":
     from kai.install import cli as install_cli
 
     install_cli(sys.argv[2:])
+elif len(sys.argv) > 1 and sys.argv[1] == "memory":
+    # Memory store administrative CLI (purge). Cheap to invoke: imports
+    # only memory + config, not the bot runtime.
+    from kai.memory_admin import cli as memory_cli
+
+    memory_cli(sys.argv[2:])
 else:
     # Default: start the Telegram bot
     from kai.main import main
