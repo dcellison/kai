@@ -3526,7 +3526,7 @@ async def _handle_response(
 
         async def _ingest_memory() -> None:
             try:
-                from kai.memory import add_exchange
+                from kai.memory import add_user_utterance
 
                 # Extract user text from prompt. For multimodal prompts
                 # (image + text), pull the first text block rather than
@@ -3541,9 +3541,12 @@ async def _handle_response(
                 # Skip image-only exchanges - no meaningful text to embed
                 if not user_text:
                     return
-                await add_exchange(
+                # Track 1: user-only raw embedding. The assistant reply is
+                # deliberately NOT stored here to prevent hallucinations
+                # from getting laundered into retrievable memory. Any
+                # assistant-derived facts come from Phase 2's extractor.
+                await add_user_utterance(
                     user_text=user_text,
-                    assistant_text=final_text,
                     user_id=str(chat_id),
                     session_id=final_response.session_id,
                 )

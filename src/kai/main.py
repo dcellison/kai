@@ -285,19 +285,19 @@ def main() -> None:
         except OSError:
             logging.warning("Could not bootstrap MEMORY.md", exc_info=True)
 
-        # Semantic memory (Mem0 + Qdrant) is disabled pending design work.
-        # The feedback loop where Track 1 ingests assistant hallucinations
-        # and retrieval surfaces them as authoritative context needs to be
-        # solved before this goes back on. MEMORY_ENABLED is ignored.
-        # See: https://github.com/dcellison/kai/issues/320
-
-        # Clean up orphaned memory_seeded flags from the removed seed
-        # block (#317). These keys are never read or written anymore.
-        # Safe to run on every startup; the DELETE is a no-op once clean.
+        # Semantic memory (Mem0 + Qdrant). init_memory() is the single
+        # entry point; it no-ops when MEMORY_ENABLED is False, so this
+        # call is safe to run unconditionally. Structural safeguards
+        # (user-only Track 1 embedding, source-weighted retrieval,
+        # scoped delete primitive) shipped alongside this re-enable in
+        # spec §320 / epic #306; Haiku extraction (Phase 2) is gated
+        # separately via MEMORY_EXTRACTION_ENABLED.
         try:
-            await sessions.delete_settings_by_prefix("memory_seeded:")
+            from kai.memory import init_memory
+
+            init_memory(config)
         except Exception:
-            logging.warning("Could not clean up memory_seeded flags", exc_info=True)
+            logging.warning("Could not initialize semantic memory", exc_info=True)
 
         try:
             # Retry initialization if the network isn't ready yet (e.g. after a
