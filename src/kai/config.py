@@ -447,9 +447,13 @@ class Config:
     memory_extraction_enabled: bool = False
     # Claude model name for extraction. Default is Haiku 4.5.
     memory_extraction_model: str = "claude-haiku-4-5-20251001"
-    # Per-call budget ceiling, passed via --max-budget-usd. Normal cost
-    # under Max is zero; this is a safety rail for the pay-per-token
-    # fallback path.
+    # Per-call budget ceiling, passed via --max-budget-usd. The
+    # subprocess bills pay-per-token at Haiku rates regardless of the
+    # operator's Max-plan status (observed ~$0.02-$0.03 per call, mostly
+    # cache-creation tokens). The 0.01 default is a strict safety rail
+    # and is intentionally insufficient for a single real extraction;
+    # operators enabling MEMORY_EXTRACTION_ENABLED should raise this to
+    # at least 0.05 after reading the expected cost.
     memory_extraction_budget_usd: float = 0.01
     # Timeout (seconds) for a single extraction subprocess. Haiku
     # typically finishes in 2-4s; 10s gives headroom without stranding

@@ -99,6 +99,23 @@ _EXTRACTOR_CWD = DATA_DIR / "memory" / "extractor_cwd"
 # short" is not an injection and should survive unchanged).
 _ROLE_LABEL_RE = re.compile(r"\n\s*(USER|ASSISTANT)\s*:", re.IGNORECASE)
 
+# Env vars forwarded to the extractor subprocess. Deliberately tight: the
+# parent's full environment is NOT inherited so secrets (DATABASE_URL,
+# GitHub tokens, webhook secrets, etc.) cannot reach the model if the
+# `--tools ""` boundary ever regresses. The vars below are the minimum
+# needed for the claude CLI to find its binary, read its config, and
+# authenticate on the pay-per-token fallback path. Vars absent from the
+# parent environment (ANTHROPIC_API_KEY when the operator is on Max-plan
+# OAuth, for example) are simply not forwarded - the subprocess behaves
+# as if the var is unset, matching the prior parent-inherit semantics.
+_SUBPROCESS_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "CLAUDE_CONFIG_DIR",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+)
+
 
 # ── JSON schema ──────────────────────────────────────────────────────
 
@@ -436,7 +453,12 @@ async def _run_extractor(payload_text: str, config: Config) -> list[dict]:
       disable all tools`). The extractor only reads stdin and writes JSON.
     - --no-session-persistence keeps ~/.claude/projects/ from growing a
       directory per extraction.
-    - --max-budget-usd is a safety rail; under Max the real cost is zero.
+    - --max-budget-usd is a strict safety rail. The extractor subprocess
+      bills pay-per-token at Haiku rates regardless of Max-plan status
+      (observed ~$0.02-$0.03 per call, dominated by cache-creation
+      tokens), so this ceiling is a real cost gate, not a "Max means
+      free" shortcut. See config.memory_extraction_budget_usd for the
+      default and the expected-cost caveat.
     - --permission-mode bypassPermissions is acceptable because
       --tools "" leaves nothing to permit or deny.
 
@@ -486,17 +508,8 @@ async def _run_extractor(payload_text: str, config: Config) -> list[dict]:
         # --system-prompt", which we always set. Leaving it in would
         # be a silent no-op that looks load-bearing to future readers.
     ]
-    # Build the allow-listed env. Absent keys (e.g. ANTHROPIC_API_KEY
-    # not set because the operator is on Max-plan OAuth) are simply not
-    # forwarded - the subprocess behaves as if the var is unset, which
-    # matches the parent-inherit semantics we had before for unset vars.
-    _SUBPROCESS_ENV_ALLOWLIST = (
-        "PATH",
-        "HOME",
-        "CLAUDE_CONFIG_DIR",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_BASE_URL",
-    )
+    # Build the allow-listed env (_SUBPROCESS_ENV_ALLOWLIST defined at
+    # module level). Absent keys are simply not forwarded.
     subprocess_env: dict[str, str] = {key: os.environ[key] for key in _SUBPROCESS_ENV_ALLOWLIST if key in os.environ}
 
     proc = await asyncio.create_subprocess_exec(
