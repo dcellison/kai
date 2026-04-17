@@ -545,14 +545,24 @@ class ClaudeCodeBackend(AgentBackend):
                     text = accumulated_text if accumulated_text else result_text
                     # When the CLI signals an error but does not populate the
                     # result field, the user sees the literal string "Error:
-                    # None" with no clue about the error class. Log the raw
-                    # event so the payload is captured for diagnosis (see
-                    # issue #326). The event is small (no model output, just
-                    # metadata) so logging it fully is cheap.
-                    if event.get("is_error") and not result_text:
+                    # None" with no clue about the error class. Log the known
+                    # safe metadata fields individually so diagnosis does not
+                    # depend on assumptions about the CLI's event schema: the
+                    # event could in principle gain new fields that contain
+                    # model output or user content, and logging the full dict
+                    # would silently leak them. Log `sorted(event.keys())`
+                    # rather than the full dict so that a schema addition is
+                    # visible (key name only, not value), and a follow-up can
+                    # opt-in to logging the new field once its shape is known.
+                    # See issue #326 for the paired UX fix.
+                    if event.get("is_error", False) and not result_text:
                         log.warning(
-                            "Result event with is_error=true has no result field; raw event: %s",
-                            event,
+                            "Result event with is_error=true has no result field; "
+                            "session=%s cost_usd=%s duration_ms=%s keys=%s",
+                            event.get("session_id"),
+                            event.get("total_cost_usd"),
+                            event.get("duration_ms"),
+                            sorted(event.keys()),
                         )
                     response = AgentResponse(
                         success=not event.get("is_error", False),
