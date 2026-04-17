@@ -585,8 +585,11 @@ def _cmd_config() -> None:
 
     # -- PR review agent --
     # pr_review_timeout_s and pr_review_budget_usd are global resource limits
-    # for the review subprocess, not per-user preferences - collect them even
-    # when users.yaml exists, same as PR_REVIEW_COOLDOWN.
+    # for the review subprocess, not per-user preferences. They are prompted
+    # unconditionally below (unlike pr_review_cooldown, which is only
+    # prompted when users.yaml is absent and pr_review is enabled) because
+    # any review can time out or hit budget regardless of how users are
+    # configured.
     if users_yaml_exists:
         print("-- PR review agent --")
         print("  PR review is now per-user. Set 'pr_review' in users.yaml")

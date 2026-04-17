@@ -518,6 +518,24 @@ class TestRunReview:
         assert "sonnet" in cmd
 
     @pytest.mark.asyncio
+    async def test_budget_argv_uses_fixed_point_for_small_values(self):
+        """
+        --max-budget-usd must be rendered as fixed-point, not scientific
+        notation. str(1e-5) yields '1e-05', which some numeric parsers
+        reject; using f'{budget:.4f}' keeps the argv stable.
+        """
+        mock_proc = _mock_process(stdout=b"ok")
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review("prompt", budget_usd=1e-4)
+
+        cmd = mock_exec.call_args[0]
+        budget_idx = cmd.index("--max-budget-usd")
+        budget_value = cmd[budget_idx + 1]
+        assert "e" not in budget_value.lower()
+        assert budget_value == "0.0001"
+
+    @pytest.mark.asyncio
     async def test_failure_raises(self):
         """Non-zero exit from Claude subprocess raises RuntimeError."""
         mock_proc = _mock_process(stderr=b"model not found", returncode=1)

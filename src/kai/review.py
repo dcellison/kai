@@ -737,13 +737,17 @@ async def run_review(
             raise RuntimeError(f"Review subprocess timed out after {timeout_s}s") from None
     else:
         # Claude one-shot mode: --print reads from stdin, writes to stdout.
+        # Format budget as fixed-point (f-string :.4f) rather than str() so
+        # very small values never render in scientific notation like
+        # "1e-05", which the Claude CLI's numeric parser may reject. Four
+        # fractional digits cover any realistic per-review ceiling.
         cmd = [
             "claude",
             "--print",
             "--model",
             _REVIEW_MODEL,
             "--max-budget-usd",
-            str(budget_usd),
+            f"{budget_usd:.4f}",
         ]
 
         # Resolve self-sudo: skip sudo when claude_user matches the bot
