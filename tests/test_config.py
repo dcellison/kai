@@ -50,6 +50,10 @@ _CONFIG_ENV_VARS = [
     "MEMORY_SEARCH_LIMIT",
     "MEMORY_TOKEN_BUDGET",
     "MEMORY_EMBEDDING_MODEL",
+    "MEMORY_EXTRACTION_ENABLED",
+    "MEMORY_EXTRACTION_MODEL",
+    "MEMORY_EXTRACTION_BUDGET_USD",
+    "MEMORY_EXTRACTION_TIMEOUT_S",
     "KAI_DATA_DIR",
     "KAI_INSTALL_DIR",
 ]
@@ -1134,3 +1138,76 @@ class TestLegacyEnvOnlyMode:
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             load_config()
         assert "deprecated" not in caplog.text.lower()
+
+
+# ── Memory extraction config (spec §6.4, §13.1) ─────────────────────
+
+
+class TestMemoryExtractionConfig:
+    """Four new env vars for Track 2 Haiku extraction. Defaults must
+    match spec §6.4 so operators who upgrade without touching env
+    files get the documented safety-rail behavior."""
+
+    def test_defaults_match_spec(self, monkeypatch):
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.memory_extraction_enabled is False
+        assert config.memory_extraction_model == "claude-haiku-4-5-20251001"
+        assert config.memory_extraction_budget_usd == 0.01
+        assert config.memory_extraction_timeout_s == 10
+
+    def test_enabled_from_env(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+        config = load_config()
+        assert config.memory_extraction_enabled is True
+
+    def test_model_override(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EXTRACTION_MODEL", "claude-haiku-4-5-20251001-custom")
+        config = load_config()
+        assert config.memory_extraction_model == "claude-haiku-4-5-20251001-custom"
+
+    def test_budget_override(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EXTRACTION_BUDGET_USD", "0.25")
+        config = load_config()
+        assert config.memory_extraction_budget_usd == 0.25
+
+    def test_timeout_override(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EXTRACTION_TIMEOUT_S", "30")
+        config = load_config()
+        assert config.memory_extraction_timeout_s == 30
+
+    def test_budget_rejects_negative(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EXTRACTION_BUDGET_USD", "-0.01")
+        with pytest.raises(SystemExit, match="non-negative"):
+            load_config()
+
+    def test_budget_rejects_non_number(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EXTRACTION_BUDGET_USD", "not-a-number")
+        with pytest.raises(SystemExit, match="must be a number"):
+            load_config()
+
+    def test_timeout_rejects_zero(self, monkeypatch):
+        """Timeout=0 would cancel the subprocess before it started;
+        rejected explicitly as a footgun."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EXTRACTION_TIMEOUT_S", "0")
+        with pytest.raises(SystemExit, match="positive integer"):
+            load_config()
+
+    def test_timeout_rejects_negative(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EXTRACTION_TIMEOUT_S", "-1")
+        with pytest.raises(SystemExit, match="positive integer"):
+            load_config()
+
+    def test_timeout_rejects_non_integer(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EXTRACTION_TIMEOUT_S", "not-an-int")
+        with pytest.raises(SystemExit, match="must be an integer"):
+            load_config()

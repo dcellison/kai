@@ -430,6 +430,22 @@ class Config:
     memory_token_budget: int = 2000
     memory_embedding_model: str = "all-MiniLM-L6-v2"
 
+    # Track 2 (Haiku extraction) config. Requires memory_enabled=True and
+    # a Claude backend. Default is False at Phase 2 ship so the self-
+    # reinforcing extraction loop has real-world observation time before
+    # the default flips. The kill switch is the same flag.
+    memory_extraction_enabled: bool = False
+    # Claude model name for extraction. Default is Haiku 4.5.
+    memory_extraction_model: str = "claude-haiku-4-5-20251001"
+    # Per-call budget ceiling, passed via --max-budget-usd. Normal cost
+    # under Max is zero; this is a safety rail for the pay-per-token
+    # fallback path.
+    memory_extraction_budget_usd: float = 0.01
+    # Timeout (seconds) for a single extraction subprocess. Haiku
+    # typically finishes in 2-4s; 10s gives headroom without stranding
+    # an executor thread on a hung subprocess.
+    memory_extraction_timeout_s: int = 10
+
     def get_workspace_config(self, workspace: Path) -> WorkspaceConfig | None:
         """
         Get per-workspace config for a path, or None for global defaults.
@@ -1338,6 +1354,26 @@ def load_config() -> Config:
         raise SystemExit("MEMORY_TOKEN_BUDGET must be an integer") from None
     memory_embedding_model = os.environ.get("MEMORY_EMBEDDING_MODEL", "all-MiniLM-L6-v2").strip() or "all-MiniLM-L6-v2"
 
+    # Track 2 Haiku extraction config. Same validation pattern as the
+    # other memory_* fields: try/except ValueError, SystemExit on bad
+    # input, and reject negatives explicitly on numeric fields.
+    memory_extraction_enabled = os.environ.get("MEMORY_EXTRACTION_ENABLED", "").lower() in ("1", "true", "yes")
+    memory_extraction_model = (
+        os.environ.get("MEMORY_EXTRACTION_MODEL", "claude-haiku-4-5-20251001").strip() or "claude-haiku-4-5-20251001"
+    )
+    try:
+        memory_extraction_budget_usd = float(os.environ.get("MEMORY_EXTRACTION_BUDGET_USD", "0.01"))
+        if memory_extraction_budget_usd < 0:
+            raise SystemExit("MEMORY_EXTRACTION_BUDGET_USD must be non-negative")
+    except ValueError:
+        raise SystemExit("MEMORY_EXTRACTION_BUDGET_USD must be a number") from None
+    try:
+        memory_extraction_timeout_s = int(os.environ.get("MEMORY_EXTRACTION_TIMEOUT_S", "10"))
+        if memory_extraction_timeout_s <= 0:
+            raise SystemExit("MEMORY_EXTRACTION_TIMEOUT_S must be a positive integer")
+    except ValueError:
+        raise SystemExit("MEMORY_EXTRACTION_TIMEOUT_S must be an integer") from None
+
     # Per-workspace configuration. Loaded after ALLOWED_WORKSPACES so
     # YAML-defined workspaces can be merged into the allowed set.
     workspace_configs = _load_workspace_configs()
@@ -1489,4 +1525,8 @@ def load_config() -> Config:
         memory_search_limit=memory_search_limit,
         memory_token_budget=memory_token_budget,
         memory_embedding_model=memory_embedding_model,
+        memory_extraction_enabled=memory_extraction_enabled,
+        memory_extraction_model=memory_extraction_model,
+        memory_extraction_budget_usd=memory_extraction_budget_usd,
+        memory_extraction_timeout_s=memory_extraction_timeout_s,
     )

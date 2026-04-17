@@ -3526,6 +3526,7 @@ async def _handle_response(
 
         async def _ingest_memory() -> None:
             try:
+                from kai import memory_extraction
                 from kai.memory import add_user_utterance
 
                 # Extract user text from prompt. For multimodal prompts
@@ -3550,6 +3551,28 @@ async def _handle_response(
                     user_id=str(chat_id),
                     session_id=final_response.session_id,
                 )
+
+                # Track 2: Haiku extraction. Runs only under the Claude
+                # backend and only when explicitly enabled. Fire-and-
+                # forget INSIDE the existing fire-and-forget task - the
+                # subprocess latency never blocks reply delivery.
+                #
+                # Backend check uses the same per-user fall-through
+                # pattern as bot.py:370 (user override wins, else global).
+                # A global-only check would miss users with a per-user
+                # override, so the explicit fall-through is mandatory here.
+                user_config = config.get_user_config(chat_id)
+                effective_backend = (
+                    user_config.agent_backend if user_config and user_config.agent_backend else config.agent_backend
+                )
+                if config.memory_extraction_enabled and effective_backend == "claude":
+                    await memory_extraction.extract_and_store(
+                        user_text=user_text,
+                        assistant_text=final_text,
+                        user_id=str(chat_id),
+                        session_id=final_response.session_id,
+                        config=config,
+                    )
             except Exception:
                 log.warning("Memory ingestion failed", exc_info=True)
 
