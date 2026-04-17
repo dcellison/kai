@@ -804,6 +804,41 @@ class TestSendOrEditContract:
         upd.effective_chat.send_message.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_fallback_send_clears_stale_keyboard(self, update_factory):
+        # When edit_message_text raises a non-"not modified"
+        # BadRequest (e.g., the original message was deleted), the
+        # function falls back to a fresh send. The stale message in
+        # chat would otherwise keep its inline keyboard, and a tap
+        # on those buttons would trigger ghost callbacks against
+        # state we have moved past. Strip the keyboard first.
+        from telegram.error import BadRequest
+
+        upd = update_factory(callback_data="mem:dash")
+        upd.callback_query.edit_message_text = AsyncMock(side_effect=BadRequest("Message deleted"))
+        upd.callback_query.edit_message_reply_markup = AsyncMock()
+        await memory_command._send_or_edit(upd, "hello", None, edit=True)
+        # Keyboard cleared on the original message before the
+        # replacement send, and a fresh message went out.
+        upd.callback_query.edit_message_reply_markup.assert_awaited_once()
+        upd.effective_chat.send_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_fallback_keyboard_clear_failure_is_swallowed(self, update_factory):
+        # The keyboard-clear is best-effort: the original message may
+        # be gone or immutable. If it raises BadRequest, swallow it
+        # and continue with the replacement send. Already on an
+        # error path; surfacing a second exception would mask the
+        # original.
+        from telegram.error import BadRequest
+
+        upd = update_factory(callback_data="mem:dash")
+        upd.callback_query.edit_message_text = AsyncMock(side_effect=BadRequest("Message deleted"))
+        upd.callback_query.edit_message_reply_markup = AsyncMock(side_effect=BadRequest("Message to edit not found"))
+        await memory_command._send_or_edit(upd, "hello", None, edit=True)
+        # Send still happened despite the keyboard-clear failure.
+        upd.effective_chat.send_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_send_forget_tag_confirm_raises_without_message(self, monkeypatch):
         # `_send_forget_tag_confirm` is only called from the text
         # command path where update.message is guaranteed. The check
@@ -991,6 +1026,37 @@ class TestCallbackDispatch:
         assert sorted(deleted) == ["a", "b"]
         toast = upd.callback_query.answer.call_args.args[0]
         assert toast == "Forgot 2 facts."
+
+    @pytest.mark.asyncio
+    async def test_send_failure_yields_single_query_failed_answer(self, monkeypatch, update_factory, context_factory):
+        # Regression for the double-answer bug. Round-3 code answered
+        # the query BEFORE _send_*; if the send raised, the outer
+        # except answered again with _MSG_QUERY_FAILED, which Telegram
+        # rejected as BadRequest. The fix is to defer query.answer()
+        # to AFTER the send, so the except path answers an
+        # unanswered query exactly once.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+
+        # Pick a verb whose Mem0 call is NOT wrapped in a per-helper
+        # try/except, so the exception escapes to the outer dispatch
+        # except. The `ftd` (forget-by-tag) verb calls get_by_tag
+        # directly inside the dispatcher, with no inner guard - if
+        # Mem0 is down, RuntimeError bubbles up to handle_memory_callback's
+        # except. Verbs like `dash` won't work here because
+        # _send_dashboard catches its own get_stats failure and renders
+        # an in-screen error instead of propagating.
+        def boom(*, user_id, tag):
+            raise RuntimeError("mem0 down")
+
+        monkeypatch.setattr(memory_command.memory, "get_by_tag", boom)
+        upd = update_factory(callback_data="mem:ftd:preference")
+        ctx = context_factory()
+        await memory_command.handle_memory_callback(upd, ctx)
+        # query.answer must have been called exactly once, with the
+        # _MSG_QUERY_FAILED toast - never a redundant pre-send answer.
+        assert upd.callback_query.answer.await_count == 1
+        toast = upd.callback_query.answer.call_args.args[0]
+        assert toast == memory_command._MSG_QUERY_FAILED
 
 
 # ── Tag enum drift guard ───────────────────────────────────────────

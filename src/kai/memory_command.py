@@ -821,27 +821,40 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
     verb = action.verb
     args = action.args
 
+    # Answer-after-send pattern: every branch performs its risky
+    # operation (Mem0 fetch, edit_message_text, etc.) BEFORE calling
+    # `query.answer()`. If the send raises, the outer `except`
+    # answers with _MSG_QUERY_FAILED on a still-unanswered query;
+    # answering twice would cause Telegram to reject the second call
+    # with BadRequest, raising an unhandled exception inside the
+    # error handler itself. The visual cost is the loading spinner
+    # persists slightly longer (until the send completes) - for
+    # typical Mem0 latencies this is invisible.
+    #
+    # The `help` verb is the one exception: it has no send, only an
+    # alert toast, so answer is the response.
     try:
         if verb == "dash":
-            await query.answer()
             await _send_dashboard(update, context, chat_id, edit=True)
+            await query.answer()
             return
         if verb == "stats":
-            await query.answer()
             await _send_stats(update, context, chat_id, edit=True)
+            await query.answer()
             return
         if verb == "help":
             # Search button on dashboard - there is no inline text
             # input in Telegram, so the best we can do is show the
             # help text in a transient toast and leave the dashboard
             # visible. Use a long-form alert so the user sees the
-            # full command syntax.
+            # full command syntax. No send to defer; the alert is
+            # the response.
             await query.answer(_HELP_TEXT, show_alert=True)
             return
         if verb == "tag":
             if len(args) < 2:
-                await query.answer(_MSG_SESSION_EXPIRED)
                 await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
                 return
             tag = args[0]
             # Same _TAG_ENUM gate as the ftd verb and the /memory
@@ -849,35 +862,35 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             # returns empty), but accepting them here is inconsistent
             # with the rest of the surface and a maintenance trap.
             if tag not in _TAG_ENUM:
-                await query.answer(_MSG_SESSION_EXPIRED)
                 await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
                 return
             try:
                 page = int(args[1])
             except ValueError:
                 page = 0
-            await query.answer()
             await _send_tag_view(update, context, chat_id, tag, page, edit=True)
+            await query.answer()
             return
         if verb == "fact":
             cache = _get_cache(chat_id)
             if cache is None or not args:
-                await query.answer(_MSG_SESSION_EXPIRED)
                 await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
                 return
             try:
                 idx = int(args[0])
             except ValueError:
-                await query.answer(_MSG_SESSION_EXPIRED)
                 await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
                 return
             if idx < 0 or idx >= len(cache.memory_ids):
-                await query.answer(_MSG_SESSION_EXPIRED)
                 await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
                 return
             memory_id = cache.memory_ids[idx]
-            await query.answer()
             await _send_fact_view(update, context, chat_id, memory_id)
+            await query.answer()
             return
         if verb == "fview":
             # Cancel button on the forget-fact confirmation: re-render
@@ -885,39 +898,38 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             # we transitioned to the confirm screen.
             cache = _get_cache(chat_id)
             if cache is None or not cache.memory_ids:
-                await query.answer(_MSG_SESSION_EXPIRED)
                 await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
                 return
             # The fact id is the only one in the cache when we're on
             # a fact view. (We overwrote the page-of-ids list when
             # navigating to the fact screen; see _send_fact_view.)
             memory_id = cache.memory_ids[0]
-            await query.answer()
             await _send_fact_view(update, context, chat_id, memory_id)
+            await query.answer()
             return
         if verb == "ffc":
             # Forget single fact: confirm step. The memory id lives
             # in the screen cache (set by _send_fact_view).
             cache = _get_cache(chat_id)
             if cache is None or not cache.memory_ids:
-                await query.answer(_MSG_SESSION_EXPIRED)
                 await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
                 return
-            await query.answer()
             await _send_forget_fact_confirm(update, context, chat_id, cache.memory_ids[0])
+            await query.answer()
             return
         if verb == "ffd":
             # Forget single fact: execute. Read id from cache, delete,
             # then return to the screen the fact was opened from.
             cache = _get_cache(chat_id)
             if cache is None or not cache.memory_ids:
-                await query.answer(_MSG_SESSION_EXPIRED)
                 await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
                 return
             memory_id = cache.memory_ids[0]
             return_to = cache.return_to
             ok = memory.delete_by_id(user_id=str(chat_id), memory_id=memory_id)
-            await query.answer("Forgotten." if ok else "Not found.")
             # Return to whatever screen the user was on before the
             # fact view. Tag view if known; otherwise dashboard.
             if return_to is not None and return_to[0] == "tag" and len(return_to[1]) >= 2:
@@ -929,13 +941,14 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
                 await _send_tag_view(update, context, chat_id, tag, page, edit=True)
             else:
                 await _send_dashboard(update, context, chat_id, edit=True)
+            await query.answer("Forgotten." if ok else "Not found.")
             return
         if verb == "ftd":
             # Forget by tag: execute. Tag is in the callback args
             # (not the cache) so the action survives a stale cache.
             if not args:
-                await query.answer(_MSG_SESSION_EXPIRED)
                 await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
                 return
             tag = args[0]
             # Validate even though the callback is one we generated:
@@ -944,19 +957,22 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             # Mirror the same _TAG_ENUM gate as the /memory forget
             # text path (see `if sub == "forget"` above).
             if tag not in _TAG_ENUM:
-                await query.answer(_MSG_SESSION_EXPIRED)
                 await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
                 return
             facts = memory.get_by_tag(user_id=str(chat_id), tag=tag)
             deleted = 0
             for fact in facts:
                 if memory.delete_by_id(user_id=str(chat_id), memory_id=fact.id):
                     deleted += 1
-            await query.answer(f"Forgot {deleted} facts.")
             await _send_dashboard(update, context, chat_id, edit=True)
+            await query.answer(f"Forgot {deleted} facts.")
             return
     except Exception as exc:
         # Spec §8: never let a Mem0 exception surface as a stack trace.
+        # Safe to call query.answer() here because the
+        # answer-after-send pattern above guarantees it has not been
+        # answered yet on any path that can reach this except.
         log.exception("memory callback %s failed: %s", verb, exc)
         await query.answer(_MSG_QUERY_FAILED)
         return
@@ -1210,6 +1226,17 @@ async def _send_or_edit(
             # Fall through to a fresh send if the edit failed for
             # another reason (e.g., the original message was deleted).
             log.warning("edit_message_text failed: %s; falling back to send", exc)
+            # Strip the inline keyboard from the original message
+            # before sending a replacement. Otherwise the stale
+            # message keeps its buttons in chat history and a tap
+            # would trigger a callback against state we have moved
+            # past, producing ghost navigation. Best-effort: this is
+            # already an error path, so swallow any BadRequest
+            # (the original message may be gone, immutable, etc.).
+            try:
+                await update.callback_query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest as kb_exc:
+                log.debug("clear stale keyboard failed (best-effort): %s", kb_exc)
             edit = False
 
     if not edit:
