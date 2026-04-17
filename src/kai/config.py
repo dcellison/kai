@@ -379,6 +379,16 @@ class Config:
     # Minimum seconds between reviews of the same PR. Absorbs force-push bursts
     # so rapid pushes to an open PR don't trigger a review for each one.
     pr_review_cooldown: int = 300
+    # Subprocess timeout for a single PR review, in seconds. Sonnet with
+    # extended thinking on a large diff with prior review context can take
+    # a long time; the default gives thinking-heavy reviews room while
+    # still terminating genuinely stuck processes.
+    pr_review_timeout_s: int = 900
+    # Hard USD ceiling for one PR review subprocess. Passed through to
+    # claude --max-budget-usd. Not a typical-run estimate - Sonnet reviews
+    # of normal PRs cost well under this. The ceiling is a safety limit
+    # against runaway invocations, not a cost target.
+    pr_review_budget_usd: float = 1.0
     # Deprecated: review agent now resolves repos via workspace config.
     # Kept for backwards compatibility with existing .env files; the value
     # is parsed but no longer used by webhook.py.
@@ -1267,6 +1277,18 @@ def load_config() -> Config:
         pr_review_cooldown = int(os.environ.get("PR_REVIEW_COOLDOWN", "300"))
     except ValueError:
         raise SystemExit("PR_REVIEW_COOLDOWN must be an integer") from None
+    try:
+        pr_review_timeout_s = int(os.environ.get("PR_REVIEW_TIMEOUT_S", "900"))
+        if pr_review_timeout_s <= 0:
+            raise SystemExit("PR_REVIEW_TIMEOUT_S must be a positive integer")
+    except ValueError:
+        raise SystemExit("PR_REVIEW_TIMEOUT_S must be an integer") from None
+    try:
+        pr_review_budget_usd = float(os.environ.get("PR_REVIEW_BUDGET_USD", "1.0"))
+        if pr_review_budget_usd <= 0:
+            raise SystemExit("PR_REVIEW_BUDGET_USD must be a positive number")
+    except ValueError:
+        raise SystemExit("PR_REVIEW_BUDGET_USD must be a number") from None
 
     # Issue triage agent config
     issue_triage_enabled = os.environ.get("ISSUE_TRIAGE_ENABLED", "").lower() in ("1", "true", "yes")
@@ -1473,6 +1495,8 @@ def load_config() -> Config:
         claude_user=os.environ.get("CLAUDE_USER") or None,
         pr_review_enabled=pr_review_enabled,
         pr_review_cooldown=pr_review_cooldown,
+        pr_review_timeout_s=pr_review_timeout_s,
+        pr_review_budget_usd=pr_review_budget_usd,
         github_repo=os.getenv("GITHUB_REPO", ""),
         spec_dir=os.getenv("SPEC_DIR", "specs"),
         issue_triage_enabled=issue_triage_enabled,

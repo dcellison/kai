@@ -777,6 +777,8 @@ async def _process_github_event_for_user(
                     notify_chat_id=target_chat_id,
                     agent_backend=agent_backend,
                     provider=provider,
+                    timeout_s=request.app["pr_review_timeout_s"],
+                    budget_usd=request.app["pr_review_budget_usd"],
                 )
             )
             _background_tasks.add(task)
@@ -1637,6 +1639,8 @@ async def start(telegram_app, config) -> None:
     # feature flags (pr_review, issue_triage) are resolved at event time
     # via sessions.resolve_github_settings(), not stored here.
     _app["pr_review_cooldown"] = config.pr_review_cooldown
+    _app["pr_review_timeout_s"] = config.pr_review_timeout_s
+    _app["pr_review_budget_usd"] = config.pr_review_budget_usd
     _app["webhook_port"] = config.webhook_port
     _app["claude_user"] = config.claude_user
 

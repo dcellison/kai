@@ -34,6 +34,8 @@ _CONFIG_ENV_VARS = [
     "FILE_RETENTION_DAYS",
     "PR_REVIEW_ENABLED",
     "PR_REVIEW_COOLDOWN",
+    "PR_REVIEW_TIMEOUT_S",
+    "PR_REVIEW_BUDGET_USD",
     "GITHUB_REPO",
     "SPEC_DIR",
     "ISSUE_TRIAGE_ENABLED",
@@ -595,6 +597,8 @@ class TestPRReviewConfig:
         config = load_config()
         assert config.pr_review_enabled is False
         assert config.pr_review_cooldown == 300
+        assert config.pr_review_timeout_s == 900
+        assert config.pr_review_budget_usd == 1.0
 
     def test_enabled_with_custom_cooldown(self, monkeypatch):
         """PR_REVIEW_ENABLED and PR_REVIEW_COOLDOWN are picked up from env."""
@@ -610,6 +614,48 @@ class TestPRReviewConfig:
         _set_required(monkeypatch)
         monkeypatch.setenv("PR_REVIEW_COOLDOWN", "not_a_number")
         with pytest.raises(SystemExit, match="PR_REVIEW_COOLDOWN"):
+            load_config()
+
+    def test_timeout_override(self, monkeypatch):
+        """PR_REVIEW_TIMEOUT_S parses to an int and reaches the Config."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("PR_REVIEW_TIMEOUT_S", "1800")
+        config = load_config()
+        assert config.pr_review_timeout_s == 1800
+
+    def test_timeout_rejects_non_integer(self, monkeypatch):
+        """Non-numeric PR_REVIEW_TIMEOUT_S raises SystemExit."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("PR_REVIEW_TIMEOUT_S", "twenty")
+        with pytest.raises(SystemExit, match="PR_REVIEW_TIMEOUT_S"):
+            load_config()
+
+    def test_timeout_rejects_non_positive(self, monkeypatch):
+        """Zero or negative PR_REVIEW_TIMEOUT_S raises SystemExit."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("PR_REVIEW_TIMEOUT_S", "0")
+        with pytest.raises(SystemExit, match="PR_REVIEW_TIMEOUT_S"):
+            load_config()
+
+    def test_budget_override(self, monkeypatch):
+        """PR_REVIEW_BUDGET_USD parses to a float and reaches the Config."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("PR_REVIEW_BUDGET_USD", "2.5")
+        config = load_config()
+        assert config.pr_review_budget_usd == 2.5
+
+    def test_budget_rejects_non_number(self, monkeypatch):
+        """Non-numeric PR_REVIEW_BUDGET_USD raises SystemExit."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("PR_REVIEW_BUDGET_USD", "cheap")
+        with pytest.raises(SystemExit, match="PR_REVIEW_BUDGET_USD"):
+            load_config()
+
+    def test_budget_rejects_non_positive(self, monkeypatch):
+        """Zero or negative PR_REVIEW_BUDGET_USD raises SystemExit."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("PR_REVIEW_BUDGET_USD", "-1.0")
+        with pytest.raises(SystemExit, match="PR_REVIEW_BUDGET_USD"):
             load_config()
 
     def test_github_repo_from_env(self, monkeypatch):
