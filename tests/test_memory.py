@@ -1411,6 +1411,40 @@ class TestAddStructured:
         assert result == "mem-uuid-123"
         assert isinstance(result, str)
 
+    def test_bare_dict_return_shape_yields_id(self):
+        """Some Mem0 versions return the memory dict directly instead of
+        wrapping it in `{"results": [...]}`. Round 7 review surfaced the
+        upstream concern: _store_facts relies on add_structured returning
+        truthy on success to count facts, so both shapes must resolve to
+        a non-None id. This test covers the bare-dict fallback branch."""
+        import kai.memory as mem_mod
+        from kai.memory import add_structured
+
+        mock_mem = MagicMock()
+        mock_mem.add.return_value = {"id": "mem-uuid-bare", "memory": "test"}
+        mem_mod._memory = mock_mem
+
+        result = add_structured("test", user_id="123")
+        assert result == "mem-uuid-bare"
+
+    def test_unexpected_return_shape_yields_none(self):
+        """Defensive: if a future Mem0 version returns something the
+        unwrap logic does not recognize (a list, a bare string, a
+        non-dict scalar), add_structured returns None rather than
+        crashing. _store_facts treats None as "not actually stored" and
+        simply under-counts in the log - never raises. Round 7 review
+        noted that silent miscounting would be the failure mode; this
+        test pins the current defensive behavior."""
+        import kai.memory as mem_mod
+        from kai.memory import add_structured
+
+        mock_mem = MagicMock()
+        mem_mod._memory = mock_mem
+
+        for unexpected in (None, [], "raw-string-id", 42):
+            mock_mem.add.return_value = unexpected
+            assert add_structured("test", user_id="123") is None
+
     def test_mem0_failure_returns_none_and_logs(self, caplog):
         """Mem0 add() exceptions are caught, logged, and return None."""
         import kai.memory as mem_mod
