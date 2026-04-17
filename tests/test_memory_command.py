@@ -169,6 +169,28 @@ class TestCallbackCodec:
             memory_command._encode_callback("x", "a" * 100)
 
 
+# ── Constants ───────────────────────────────────────────────────────
+
+
+class TestHelpTextLength:
+    """Round-7 #1 regression: `_HELP_TEXT` is used both in
+    `update.message.reply_text` (no length cap) AND in
+    `query.answer(_HELP_TEXT, show_alert=True)` from the dashboard's
+    Search button. The latter goes through Telegram's
+    `answerCallbackQuery` API, whose `text` field is capped at 200
+    chars. Exceeding the cap causes a 400 BadRequest, which the
+    outer except handler converts to "Memory query failed." -
+    confusing UX for what should be the help screen.
+    """
+
+    def test_help_text_under_telegram_callback_alert_limit(self):
+        # 200 is the Telegram-documented limit for
+        # answerCallbackQuery.text. If someone extends `_HELP_TEXT`
+        # and trips this assertion, either trim wording or split
+        # the dashboard help flow into its own shorter toast string.
+        assert len(memory_command._HELP_TEXT) <= 200
+
+
 # ── Display helpers ─────────────────────────────────────────────────
 
 
@@ -963,6 +985,24 @@ class TestSendOrEditContract:
         upd.callback_query.edit_message_reply_markup = AsyncMock(side_effect=BadRequest("Message to edit not found"))
         await memory_command._send_or_edit(upd, "hello", None, edit=True)
         # Send still happened despite the keyboard-clear failure.
+        upd.effective_chat.send_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_fallback_keyboard_clear_swallows_network_error(self, update_factory):
+        # Round-7 #2: the keyboard-clear catch was BadRequest-only.
+        # A transient NetworkError / TimedOut from PTB would escape
+        # and short-circuit the fresh send below, surfacing as
+        # "Memory query failed." for what should have been a successful
+        # re-render. Broadened to `except Exception` so the best-effort
+        # contract holds: cleanup failure does not abort the fallback
+        # send under any error class.
+        from telegram.error import BadRequest, NetworkError
+
+        upd = update_factory(callback_data="mem:dash")
+        upd.callback_query.edit_message_text = AsyncMock(side_effect=BadRequest("Message deleted"))
+        upd.callback_query.edit_message_reply_markup = AsyncMock(side_effect=NetworkError("connection reset"))
+        await memory_command._send_or_edit(upd, "hello", None, edit=True)
+        # Fresh send happened despite the NetworkError on cleanup.
         upd.effective_chat.send_message.assert_awaited_once()
 
     @pytest.mark.asyncio

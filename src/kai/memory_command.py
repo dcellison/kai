@@ -259,14 +259,20 @@ _MSG_QUERY_FAILED = "Memory query failed. Try again in a moment."
 _MSG_SESSION_EXPIRED = "Session expired, resyncing."
 _MSG_NO_SEARCH_RESULTS = "No matching memories found."
 
-# Help text - the static body shown for `/memory help` and for any
-# unrecognized subcommand (spec §5).
+# Help text - the static body shown for `/memory help`, for any
+# unrecognized subcommand (spec §5), AND in the dashboard's Search
+# button alert toast. The toast path passes this string to
+# `answerCallbackQuery`, whose `text` field is capped at 200 chars
+# by Telegram (see Bot API answerCallbackQuery docs). Keep this
+# string under 200; the alignment padding the prior version used
+# is invisible in Telegram's alert modal anyway since the modal
+# doesn't render with a monospace font.
 _HELP_TEXT = (
-    "/memory              Browse by tag\n"
-    "/memory search <q>   Semantic search\n"
-    "/memory stats        Counts and confidence distribution\n"
-    "/memory forget <tag> Delete all memories with a tag\n"
-    "/memory help         Show this help"
+    "/memory - Browse by tag\n"
+    "/memory search <q> - Semantic search\n"
+    "/memory stats - Counts and confidence distribution\n"
+    "/memory forget <tag> - Delete all memories with a tag\n"
+    "/memory help - Show this help"
 )
 
 
@@ -1256,11 +1262,18 @@ async def _send_or_edit(
             # message keeps its buttons in chat history and a tap
             # would trigger a callback against state we have moved
             # past, producing ghost navigation. Best-effort: this is
-            # already an error path, so swallow any BadRequest
-            # (the original message may be gone, immutable, etc.).
+            # already an error path; the contract is that cleanup
+            # failure must NOT abort the fallback send. Catch
+            # `Exception` rather than just BadRequest so a transient
+            # NetworkError / TimedOut from PTB cannot escape and
+            # short-circuit the fresh send below; the user would
+            # otherwise see "Memory query failed." for what should
+            # have been a successful re-render. The original message
+            # may be gone, immutable, or the network may be flaky -
+            # whatever the cause, the fresh send is what matters.
             try:
                 await update.callback_query.edit_message_reply_markup(reply_markup=None)
-            except BadRequest as kb_exc:
+            except Exception as kb_exc:
                 log.debug("clear stale keyboard failed (best-effort): %s", kb_exc)
             edit = False
 
