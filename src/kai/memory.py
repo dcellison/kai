@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from dataclasses import dataclass
 
 from kai.config import DATA_DIR, Config
@@ -80,6 +81,50 @@ _SOURCE_SHORT: dict[str, str] = {
 # handles larger stores correctly via the page-drain guard. See spec
 # §6.2 for the live-lock tradeoff documentation.
 _DELETE_PAGE_SIZE = 10_000
+
+# ── Phase 3: verification delay (spec §5.2) ─────────────────────────
+#
+# The verification window is a per-user state machine. When a user
+# turn arrives, its raw embedding is NOT flushed to Mem0 immediately.
+# It is held in `_pending_writes[user_id]` until the next user turn,
+# at which point:
+#   - if the next turn starts with a correction cue, the pending turn
+#     is dropped silently (the user is retracting);
+#   - otherwise, the pending turn is flushed to Mem0 and the current
+#     turn becomes the new pending write.
+#
+# The regex is taken verbatim from spec §5.2. It must match at the
+# start of the stripped string and stop at a word boundary so that a
+# message like "nope" matches but "nopeandgo" does not. The alternation
+# uses `that'?s?\s+wrong` to cover "that's wrong", "thats wrong", and
+# "that is wrong" at the cost of one extra group - cheaper than
+# enumerating explicit variants. re.IGNORECASE makes "NO," "No,"
+# and "no," all equivalent at the leading position.
+_CORRECTION_CUE_RE = re.compile(
+    r"^\s*(no|nope|wait|actually|that'?s?\s+wrong|forget|never\s+mind|ignore)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class _PendingWrite:
+    """One queued user turn awaiting verification on the next turn.
+
+    Mutable (not frozen): the queue is replaced by assignment in
+    `submit_user_utterance`, but the dataclass itself is not shared
+    between users - each _pending_writes entry gets its own instance.
+    """
+
+    user_text: str
+    session_id: str | None
+
+
+# Per-user pending-write queue. In-memory only by design: a bot restart
+# loses at most one turn per active user, which is acceptable per spec
+# §5.2 ("optional refinement, not a durability guarantee"). Key is the
+# user_id string as passed to `submit_user_utterance` so it lines up
+# with the ids used by `add_user_utterance` and the retrieval path.
+_pending_writes: dict[str, _PendingWrite] = {}
 
 
 @dataclass(frozen=True)
@@ -445,6 +490,137 @@ async def add_user_utterance(
         )
     except Exception:
         log.warning("Memory ingestion failed", exc_info=True)
+
+
+# ── Phase 3: verification-delay entry points (spec §5.2) ────────────
+
+
+def _is_correction_cue(text: str) -> bool:
+    """True when `text` starts with a retraction cue (see §5.2).
+
+    Matches the compiled `_CORRECTION_CUE_RE` anchored at the start.
+    Used by `submit_user_utterance` to decide whether to drop the
+    previous pending turn. A non-string input (defensive; the bot path
+    always passes str) returns False rather than raising, preserving
+    the never-raises posture of the memory layer.
+    """
+    if not isinstance(text, str):
+        return False
+    return _CORRECTION_CUE_RE.match(text) is not None
+
+
+async def submit_user_utterance(
+    user_text: str,
+    *,
+    user_id: str,
+    session_id: str | None = None,
+) -> None:
+    """Queue a user utterance behind the one-turn verification window.
+
+    Turn-entry replacement for `add_user_utterance`. The actual Mem0
+    write is deferred to the NEXT call (or to an explicit
+    `flush_pending`, e.g. from the session-end hook).
+
+    Semantics per spec §5.2, with one interpretation choice documented
+    below:
+      - If there is a previous pending turn M_n and the incoming turn
+        M_{n+1} matches `_CORRECTION_CUE_RE`, drop M_n silently and do
+        NOT queue M_{n+1}. The correction cue itself is a meta-comment,
+        not a fact worth retrieving ("No, that's wrong" offers nothing
+        downstream). This is the stricter of two valid readings of the
+        spec; the looser reading (still queue M_{n+1}) would flush
+        "No, that's wrong" to Mem0 whenever the turn after it is not
+        itself a correction. Rejected because it re-introduces exactly
+        the content pollution §5.2 is trying to prevent.
+      - Otherwise, flush the pending turn (if any) via the same
+        `add_user_utterance` primitive as Phase 1, then queue the
+        current turn as the new pending write.
+
+    Empty / whitespace-only `user_text` is treated like any other turn:
+    queued, potentially flushed on the next turn. Filtering is the
+    caller's responsibility - the Phase 2 `_ingest_memory` already
+    skips image-only exchanges with no text before reaching this call.
+
+    Never raises. The underlying `add_user_utterance` already swallows
+    Mem0 failures; this wrapper only adds dict mutations that cannot
+    themselves fail on well-formed inputs.
+    """
+    if _memory is None:
+        # Consistent with add_user_utterance: if memory is disabled,
+        # the call is a quiet no-op. Do NOT populate _pending_writes -
+        # it would leak unbounded if memory is never enabled in this
+        # process lifetime.
+        return
+
+    pending = _pending_writes.get(user_id)
+    if _is_correction_cue(user_text):
+        if pending is not None:
+            # Retraction path: drop M_n, do not queue M_{n+1}.
+            del _pending_writes[user_id]
+            log.debug(
+                "submit_user_utterance: dropped pending write for %s on correction cue",
+                user_id,
+            )
+        # If there was no pending write, a lone correction cue has
+        # nothing to retract. Still skip queueing - the cue itself is
+        # not useful as a retrievable memory.
+        return
+
+    # Non-correction turn: flush the previous pending write (if any),
+    # then make this turn the new pending write. Flush goes through
+    # `add_user_utterance` so the truncation and metadata contract
+    # stays identical to Phase 1.
+    if pending is not None:
+        await add_user_utterance(
+            user_text=pending.user_text,
+            user_id=user_id,
+            session_id=pending.session_id,
+        )
+    _pending_writes[user_id] = _PendingWrite(
+        user_text=user_text,
+        session_id=session_id,
+    )
+
+
+async def flush_pending(user_id: str) -> bool:
+    """Flush any pending write for `user_id`. Session-end hook.
+
+    Called from the session-end path in bot.py (see §6.3 P3). The
+    intuition: once the session ends, the "next turn" that would have
+    either confirmed or retracted the pending write is never coming.
+    Flushing preserves user data; dropping on session-end would lose
+    every utterance that happened to be the final turn of a session.
+
+    Returns True when a flush actually occurred (caller may want to
+    log or emit a metric); False when there was nothing pending.
+
+    Also safe to call when memory is disabled - the pending dict is
+    empty in that case and this is a no-op.
+    """
+    pending = _pending_writes.pop(user_id, None)
+    if pending is None:
+        return False
+    await add_user_utterance(
+        user_text=pending.user_text,
+        user_id=user_id,
+        session_id=pending.session_id,
+    )
+    return True
+
+
+def drop_pending(user_id: str) -> bool:
+    """Discard any pending write for `user_id` without flushing.
+
+    Not reached from normal turn handling (the correction-cue path in
+    `submit_user_utterance` does the drop inline). Exposed for:
+      - administrative commands that explicitly want to forget a
+        half-queued turn without storing it,
+      - tests that set up pending state and then want to reset
+        between scenarios.
+
+    Returns True if a pending write was present and dropped.
+    """
+    return _pending_writes.pop(user_id, None) is not None
 
 
 async def delete_by_source(user_id: str, source: str) -> int:

@@ -337,6 +337,38 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("Kai is ready. Send me a message.")
 
 
+async def _end_session(chat_id: int) -> None:
+    """
+    Session-end hook: flush any pending memory write, then clear the
+    session record.
+
+    Implements the Phase 3 session-end half of spec §6.3 P3. When
+    `memory_extraction_enabled` is off (the default through Phase 2
+    and Phase 3 ship), the flush call still runs but `flush_pending`
+    is a cheap dict-pop + no-op when there is nothing queued. The
+    memory check avoids importing the memory layer at all when it is
+    globally disabled, which also avoids loading Mem0's optional deps
+    on installs that do not have them.
+
+    Failures in the flush are logged at WARNING and never propagate:
+    session-clear MUST always proceed so the bot does not wedge. This
+    mirrors the try/except pattern around _ingest_memory.
+    """
+    from kai.memory import flush_pending
+    from kai.memory import is_enabled as memory_is_enabled
+
+    if memory_is_enabled():
+        try:
+            await flush_pending(str(chat_id))
+        except Exception:
+            # Never block a session clear on a memory hiccup. The
+            # pending dict entry (if any) has already been popped by
+            # flush_pending before the Mem0 write, so a crash here
+            # does not leave orphaned state.
+            log.warning("flush_pending failed during session end", exc_info=True)
+    await sessions.clear_session(chat_id)
+
+
 @_require_auth
 async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -349,7 +381,7 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chat_id = _chat_id(update)
     pool = _get_pool(context)
     await pool.restart(chat_id)
-    await sessions.clear_session(chat_id)
+    await _end_session(chat_id)
     await update.message.reply_text("Session cleared. Starting fresh.")
 
 
@@ -448,7 +480,7 @@ async def _switch_model(context: ContextTypes.DEFAULT_TYPE, chat_id: int, model:
     workspace = str(pool.get_workspace(chat_id))
     await sessions.delete_workspace_config_setting(chat_id, workspace, "model")
     await pool.restart(chat_id)
-    await sessions.clear_session(chat_id)
+    await _end_session(chat_id)
 
 
 async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -669,7 +701,7 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if instance:
             instance.max_context_window = ctx
             await pool.restart(chat_id)
-            await sessions.clear_session(chat_id)
+            await _end_session(chat_id)
             restarted = True
         label = f"{ctx:,} tokens" if ctx > 0 else "default"
         suffix = " Session restarted." if restarted else ""
@@ -843,7 +875,7 @@ async def _handle_settings_reset(
         # in-memory attributes would persist without this step.
         _revert_instance_field(pool, chat_id, db_field, config)
         await pool.restart(chat_id)
-        await sessions.clear_session(chat_id)
+        await _end_session(chat_id)
         await update.message.reply_text(f"Cleared {field} override. Using default. Session restarted.")
     else:
         await sessions.delete_all_user_settings(chat_id)
@@ -853,7 +885,7 @@ async def _handle_settings_reset(
         for f in ("model", "budget", "timeout", "context_window"):
             _revert_instance_field(pool, chat_id, f, config)
         await pool.restart(chat_id)
-        await sessions.clear_session(chat_id)
+        await _end_session(chat_id)
         await update.message.reply_text("All settings cleared. Using defaults. Session restarted.")
 
 
@@ -1235,7 +1267,7 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     await pool.change_workspace(chat_id, path, workspace_config=ws_config)
     # Per-user file confinement is handled at request time in webhook.py
     # via pool.get_workspace(chat_id), so no global update needed here.
-    await sessions.clear_session(chat_id)
+    await _end_session(chat_id)
 
     if path == home:
         await sessions.delete_setting(f"workspace:{chat_id}")
@@ -3527,7 +3559,7 @@ async def _handle_response(
         async def _ingest_memory() -> None:
             try:
                 from kai import memory_extraction
-                from kai.memory import add_user_utterance
+                from kai.memory import submit_user_utterance
 
                 # Extract user text from prompt. For multimodal prompts
                 # (image + text), pull the first text block rather than
@@ -3542,11 +3574,14 @@ async def _handle_response(
                 # Skip image-only exchanges - no meaningful text to embed
                 if not user_text:
                     return
-                # Track 1: user-only raw embedding. The assistant reply is
-                # deliberately NOT stored here to prevent hallucinations
-                # from getting laundered into retrievable memory. Any
-                # assistant-derived facts come from Phase 2's extractor.
-                await add_user_utterance(
+                # Track 1: user-only raw embedding, gated by the Phase 3
+                # verification window. `submit_user_utterance` queues the
+                # turn instead of flushing it immediately; the previous
+                # turn's queued write either flushes now (non-correction)
+                # or gets dropped (correction cue). The assistant reply
+                # is never stored here. Any assistant-derived facts come
+                # from Phase 2's extractor below.
+                await submit_user_utterance(
                     user_text=user_text,
                     user_id=str(chat_id),
                     session_id=final_response.session_id,

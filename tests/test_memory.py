@@ -51,6 +51,9 @@ def _reset_memory_module():
 
     mem_mod._memory = None
     mem_mod._config = None
+    # Phase 3: clear per-user pending-write state so verification-window
+    # tests start from a known-empty queue regardless of test order.
+    mem_mod._pending_writes.clear()
 
 
 # ── Fixtures ────────────────────────────────────────────────────────
@@ -560,6 +563,287 @@ class TestAddUserUtterance:
 
         # Should not raise
         asyncio.run(add_user_utterance("hello", user_id="123"))
+
+
+# ── Phase 3: verification-delay (spec §5.2) ─────────────────────────
+
+
+class TestCorrectionCueRegex:
+    """_is_correction_cue covers the spec §5.2 regex. These tests pin
+    the match surface so a future regex refactor cannot silently widen
+    or narrow retraction detection."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # Each of the 8 cue roots, standalone.
+            "no",
+            "nope",
+            "wait",
+            "actually",
+            "forget",
+            "ignore",
+            # Two-word cues.
+            "never mind",
+            "that's wrong",
+            "thats wrong",
+            # Real-world phrasings.
+            "No, that's wrong",
+            "actually, I meant Paris",
+            "Wait, let me rephrase",
+            "forget it",
+            "Never mind, use London",
+            "ignore that last part",
+            # Leading whitespace is fine.
+            "  no",
+            "\twait",
+        ],
+    )
+    def test_matches_expected_cues(self, text):
+        from kai.memory import _is_correction_cue
+
+        assert _is_correction_cue(text), f"expected match for {text!r}"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "yes please",
+            "sure",
+            "noise from the fan",  # substring "no" but word-boundary stops it
+            "nopeandgo",  # no word boundary after "nope"
+            "waiter",  # word-char follows "wait"
+            "actualization",  # word-char follows "actually"
+            "forgetting the point",  # word-char follows "forget"
+            "ignored the email",  # word-char follows "ignore"
+            "I think that's great",  # "that's" without " wrong"
+            "minding my business",  # "mind" without "never "
+        ],
+    )
+    def test_rejects_non_cues(self, text):
+        from kai.memory import _is_correction_cue
+
+        assert not _is_correction_cue(text), f"unexpected match for {text!r}"
+
+    def test_case_insensitive(self):
+        """All cues match regardless of case (user's shift key is
+        unreliable evidence of intent)."""
+        from kai.memory import _is_correction_cue
+
+        assert _is_correction_cue("NEVER MIND")
+        assert _is_correction_cue("Never Mind")
+        assert _is_correction_cue("NO")
+        assert _is_correction_cue("Actually")
+
+    def test_non_string_input_returns_false(self):
+        """Defensive: the bot path always passes str, but a mis-typed
+        caller should not crash the memory layer."""
+        from kai.memory import _is_correction_cue
+
+        assert _is_correction_cue(None) is False
+        assert _is_correction_cue(42) is False
+        assert _is_correction_cue([]) is False
+
+
+class TestSubmitUserUtterance:
+    """§5.2 one-turn verification window: turns are queued, then either
+    flushed on the next non-correction turn or dropped on a correction
+    cue. submit_user_utterance is the turn-entry API."""
+
+    def test_disabled_is_noop_and_no_pending(self):
+        """When memory is disabled, submit_user_utterance must not
+        populate _pending_writes (would leak unbounded on installs
+        that never enable memory)."""
+        import kai.memory as mem_mod
+        from kai.memory import submit_user_utterance
+
+        assert mem_mod._memory is None  # fixture guarantee
+        asyncio.run(submit_user_utterance("hello", user_id="u1"))
+        assert mem_mod._pending_writes == {}
+
+    def test_first_turn_queues_no_flush(self):
+        """The first turn from a user is queued only; no Mem0 write."""
+        import kai.memory as mem_mod
+        from kai.memory import submit_user_utterance
+
+        mock_mem = MagicMock()
+        mem_mod._memory = mock_mem
+
+        asyncio.run(submit_user_utterance("first turn", user_id="u1", session_id="s1"))
+
+        # The pending dict now holds this turn.
+        assert "u1" in mem_mod._pending_writes
+        assert mem_mod._pending_writes["u1"].user_text == "first turn"
+        assert mem_mod._pending_writes["u1"].session_id == "s1"
+        # And NOTHING was written to Mem0.
+        mock_mem.add.assert_not_called()
+
+    def test_second_non_correction_turn_flushes_previous(self):
+        """Previous pending turn flushes on the next non-correction turn."""
+        import kai.memory as mem_mod
+        from kai.memory import submit_user_utterance
+
+        mock_mem = MagicMock()
+        mem_mod._memory = mock_mem
+
+        asyncio.run(submit_user_utterance("first", user_id="u1", session_id="s1"))
+        asyncio.run(submit_user_utterance("second", user_id="u1", session_id="s2"))
+
+        # The first turn was flushed through add_user_utterance.
+        assert mock_mem.add.call_count == 1
+        stored_text = mock_mem.add.call_args[0][0]
+        assert stored_text == "User said: first"
+        # Session id on the flushed row comes from the PENDING turn
+        # (s1), not the current turn (s2) - proves the pending object
+        # carries its own session_id through to the write.
+        assert mock_mem.add.call_args[1]["metadata"]["session_id"] == "s1"
+        # And now the second turn is pending.
+        assert mem_mod._pending_writes["u1"].user_text == "second"
+        assert mem_mod._pending_writes["u1"].session_id == "s2"
+
+    def test_correction_cue_drops_previous_and_does_not_queue(self):
+        """Correction cue drops M_n without storing it AND does not
+        queue M_{n+1} (the cue itself is not a retrievable fact)."""
+        import kai.memory as mem_mod
+        from kai.memory import submit_user_utterance
+
+        mock_mem = MagicMock()
+        mem_mod._memory = mock_mem
+
+        asyncio.run(submit_user_utterance("I live in London", user_id="u1"))
+        asyncio.run(submit_user_utterance("Actually, I meant Paris", user_id="u1"))
+
+        # Previous turn was NOT written.
+        mock_mem.add.assert_not_called()
+        # And the cue itself did NOT get queued.
+        assert "u1" not in mem_mod._pending_writes
+
+    def test_correction_with_no_pending_is_silent(self):
+        """A lone correction cue (no previous pending turn) is a
+        no-op. Does not raise, does not store, does not queue."""
+        import kai.memory as mem_mod
+        from kai.memory import submit_user_utterance
+
+        mock_mem = MagicMock()
+        mem_mod._memory = mock_mem
+
+        asyncio.run(submit_user_utterance("no wait", user_id="u1"))
+
+        mock_mem.add.assert_not_called()
+        assert "u1" not in mem_mod._pending_writes
+
+    def test_three_turns_two_flushes(self):
+        """Three non-correction turns: first two flush, third is pending."""
+        import kai.memory as mem_mod
+        from kai.memory import submit_user_utterance
+
+        mock_mem = MagicMock()
+        mem_mod._memory = mock_mem
+
+        asyncio.run(submit_user_utterance("turn A", user_id="u1"))
+        asyncio.run(submit_user_utterance("turn B", user_id="u1"))
+        asyncio.run(submit_user_utterance("turn C", user_id="u1"))
+
+        # A and B were flushed (in order); C is pending.
+        assert mock_mem.add.call_count == 2
+        texts = [call[0][0] for call in mock_mem.add.call_args_list]
+        assert texts == ["User said: turn A", "User said: turn B"]
+        assert mem_mod._pending_writes["u1"].user_text == "turn C"
+
+    def test_multi_user_isolation(self):
+        """User A's pending write is not affected by user B's correction.
+        Per-user state must be keyed strictly on user_id."""
+        import kai.memory as mem_mod
+        from kai.memory import submit_user_utterance
+
+        mock_mem = MagicMock()
+        mem_mod._memory = mock_mem
+
+        asyncio.run(submit_user_utterance("A's fact", user_id="user-A"))
+        asyncio.run(submit_user_utterance("B's fact", user_id="user-B"))
+        # user-B retracts. user-A's pending write must survive.
+        asyncio.run(submit_user_utterance("never mind", user_id="user-B"))
+
+        # user-A still has a pending write; user-B does not.
+        assert mem_mod._pending_writes["user-A"].user_text == "A's fact"
+        assert "user-B" not in mem_mod._pending_writes
+        # Neither user had a flush yet (each has seen at most one
+        # non-correction turn followed by nothing or a correction).
+        mock_mem.add.assert_not_called()
+
+
+class TestFlushPending:
+    """flush_pending is the session-end hook. Must write pending rows
+    to Mem0 and return a useful boolean."""
+
+    def test_flush_writes_pending_and_returns_true(self):
+        import kai.memory as mem_mod
+        from kai.memory import flush_pending, submit_user_utterance
+
+        mock_mem = MagicMock()
+        mem_mod._memory = mock_mem
+
+        asyncio.run(submit_user_utterance("pending turn", user_id="u1", session_id="s1"))
+        result = asyncio.run(flush_pending("u1"))
+
+        assert result is True
+        assert mock_mem.add.call_count == 1
+        assert mock_mem.add.call_args[0][0] == "User said: pending turn"
+        # After flush, the dict entry is gone.
+        assert "u1" not in mem_mod._pending_writes
+
+    def test_flush_nothing_pending_returns_false(self):
+        """No pending write -> flush is a no-op returning False."""
+        import kai.memory as mem_mod
+        from kai.memory import flush_pending
+
+        mock_mem = MagicMock()
+        mem_mod._memory = mock_mem
+
+        result = asyncio.run(flush_pending("u1"))
+
+        assert result is False
+        mock_mem.add.assert_not_called()
+
+    def test_flush_one_user_leaves_others_untouched(self):
+        """Multi-user isolation on the session-end path."""
+        import kai.memory as mem_mod
+        from kai.memory import flush_pending, submit_user_utterance
+
+        mock_mem = MagicMock()
+        mem_mod._memory = mock_mem
+
+        asyncio.run(submit_user_utterance("A pending", user_id="A"))
+        asyncio.run(submit_user_utterance("B pending", user_id="B"))
+        result = asyncio.run(flush_pending("A"))
+
+        assert result is True
+        # A flushed, B still pending.
+        assert "A" not in mem_mod._pending_writes
+        assert mem_mod._pending_writes["B"].user_text == "B pending"
+
+
+class TestDropPending:
+    """drop_pending silently discards without writing. Administrative
+    and test helper; not called from the normal turn path."""
+
+    def test_drop_returns_true_when_pending(self):
+        import kai.memory as mem_mod
+        from kai.memory import drop_pending, submit_user_utterance
+
+        mock_mem = MagicMock()
+        mem_mod._memory = mock_mem
+
+        asyncio.run(submit_user_utterance("x", user_id="u1"))
+        assert drop_pending("u1") is True
+        assert "u1" not in mem_mod._pending_writes
+        # No write happened.
+        mock_mem.add.assert_not_called()
+
+    def test_drop_returns_false_when_empty(self):
+        from kai.memory import drop_pending
+
+        assert drop_pending("no-such-user") is False
 
 
 class TestGetAll:
