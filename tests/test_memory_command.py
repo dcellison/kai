@@ -463,6 +463,31 @@ class TestBuildForgetTagConfirm:
         assert confirm_btn.text == "confirm forget 38 facts"
         assert confirm_btn.callback_data == "mem:ftd:preference"
 
+    def test_singular_when_count_is_one(self):
+        # Round-5 review #3: count==1 used to render "1 facts" /
+        # "1 memories" / "confirm forget 1 facts". A tag with one
+        # surviving member is a real case (deletes whittle the
+        # count). Verify the singular form across all three sites
+        # (header, body, button) so a future edit can't regress
+        # any one of them in isolation.
+        text, kb = memory_command._build_forget_tag_confirm("preference", 1)
+        assert "Forget all 1 fact " in text
+        assert "1 memory." in text
+        assert "1 facts" not in text
+        assert "1 memories" not in text
+        confirm_btn = kb.inline_keyboard[0][0]
+        assert confirm_btn.text == "confirm forget 1 fact"
+
+    def test_plural_when_count_is_two(self):
+        # Boundary on the other side: count==2 must use the plural
+        # forms. Otherwise the singular branch would silently catch
+        # everything.
+        text, kb = memory_command._build_forget_tag_confirm("preference", 2)
+        assert "Forget all 2 facts " in text
+        assert "2 memories." in text
+        confirm_btn = kb.inline_keyboard[0][0]
+        assert confirm_btn.text == "confirm forget 2 facts"
+
 
 # ── Builder: search results ────────────────────────────────────────
 
@@ -705,6 +730,48 @@ class TestCommandDispatch:
         assert called["user_id"] == "100"  # chat_id stringified
 
     @pytest.mark.asyncio
+    async def test_search_filters_out_non_extracted_rows(self, monkeypatch, update_factory, context_factory):
+        # Spec §7.5 / round-5 review #1: every read path must scope to
+        # source=="extracted". `memory.search()` is a Mem0 vector
+        # lookup that spans all sources (Track 1 exchanges, legacy
+        # rows). Without a post-filter, a non-extracted row could
+        # surface in results, then fail get_by_id's source check on
+        # tap and render "no longer exists." for a row the user just
+        # saw. The filter lives in `_send_search` alongside the score
+        # floor.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+
+        # Build one extracted hit (kept) and one non-extracted hit
+        # (dropped). Both clear the score floor so only source
+        # decides. The legacy/Track-1 row uses the same MemoryResult
+        # shape Mem0 returns; the only difference is metadata.source.
+        extracted = _fact("e1", "kept", ["preference"], score=0.9)
+        non_extracted = MemoryResult(
+            id="t1",
+            text="dropped",
+            score=0.95,
+            memory_type="fact",
+            metadata={"source": "track1"},
+            created_at="2026-04-17T10:00:00",
+            updated_at="2026-04-17T10:00:00",
+        )
+
+        def fake_search(query, *, user_id, limit):
+            return [extracted, non_extracted]
+
+        monkeypatch.setattr(memory_command.memory, "search", fake_search)
+        upd = update_factory()
+        ctx = context_factory(args=["search", "anything"])
+        await memory_command.handle_memory_command(upd, ctx)
+
+        # The cache memory_ids list is populated from the filtered
+        # results - if the non-extracted row leaked through, "t1"
+        # would appear here. It must not.
+        cache = memory_command._get_cache(100)
+        assert cache is not None
+        assert cache.memory_ids == ["e1"]
+
+    @pytest.mark.asyncio
     async def test_forget_unknown_tag_rejected(self, monkeypatch, update_factory, context_factory):
         monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
         upd = update_factory()
@@ -802,6 +869,21 @@ class TestSendOrEditContract:
         upd = update_factory("hi")
         await memory_command._send_or_edit(upd, "hello", None, edit=False)
         upd.effective_chat.send_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_path_raises_when_effective_chat_is_none(self):
+        # Round-5 review #2: the fresh-send branch's None-guard on
+        # `effective_chat` was an `assert`, which `python -O` strips.
+        # Replaced with `if/raise` so the contract holds in optimized
+        # bytecode. This mirrors the same pattern used by
+        # `_encode_callback`, the `edit=True` guard above, and
+        # `_send_forget_tag_confirm`.
+        upd = MagicMock()
+        upd.effective_chat = None
+        upd.callback_query = None
+        upd.message = None
+        with pytest.raises(ValueError, match="effective_chat is None"):
+            await memory_command._send_or_edit(upd, "hello", None, edit=False)
 
     @pytest.mark.asyncio
     async def test_fallback_send_clears_stale_keyboard(self, update_factory):

@@ -692,9 +692,14 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
 
 def _build_forget_tag_confirm(tag: str, count: int) -> tuple[str, InlineKeyboardMarkup]:
     """Render the bulk forget-by-tag confirmation."""
+    # Singular vs plural noun. Without this, count==1 renders "1 facts"
+    # / "1 memories" / "confirm forget 1 facts". A tag with one
+    # surviving member is a real case (deletes whittle the count).
+    fact_word = "fact" if count == 1 else "facts"
+    memory_word = "memory" if count == 1 else "memories"
     text = (
-        f'Forget all {count} facts tagged "{tag}"?\n\n'
-        f"This will permanently remove {count} memories. Tags are "
+        f'Forget all {count} {fact_word} tagged "{tag}"?\n\n'
+        f"This will permanently remove {count} {memory_word}. Tags are "
         "independent, so a fact tagged [preference, constraint] will "
         "also be affected.\n\n"
         "This cannot be undone."
@@ -703,7 +708,7 @@ def _build_forget_tag_confirm(tag: str, count: int) -> tuple[str, InlineKeyboard
         [
             [
                 InlineKeyboardButton(
-                    f"confirm forget {count} facts",
+                    f"confirm forget {count} {fact_word}",
                     callback_data=_encode_callback("ftd", tag),
                 ),
                 InlineKeyboardButton("cancel", callback_data=_encode_callback("dash")),
@@ -1125,7 +1130,17 @@ async def _send_search(
         return
     # Apply the floor in the UI path the same way `format_context`
     # does (spec §7.5: one knob, two paths).
-    filtered = [r for r in results if r.score >= floor]
+    #
+    # Also enforce the source==extracted scope here. Every other read
+    # path in this module (`get_by_tag`, `get_by_id`) filters at the
+    # data layer, but `memory.search` is a Mem0 vector lookup that
+    # spans all sources (Track 1 exchanges, legacy rows). Without this
+    # post-filter, a search hit could surface a non-extracted row;
+    # tapping it would call `get_by_id`, fail the source check, and
+    # render "This memory no longer exists." for a row the user just
+    # saw - confusing and wrong. Filtering here keeps the UI honest:
+    # what the user sees in results is what they can act on.
+    filtered = [r for r in results if r.score >= floor and r.metadata.get("source") == "extracted"]
     text, kb, memory_ids = _build_search_results(query, filtered, floor)
     _set_cache(
         chat_id,
@@ -1243,7 +1258,14 @@ async def _send_or_edit(
         # Fresh send. Either initial /memory invocation or callback
         # branch with no message to edit (e.g., search invoked from
         # text command, not callback).
-        assert update.effective_chat is not None
+        #
+        # `if/raise` rather than `assert`: assert is stripped by
+        # `python -O` so the contract would be silently bypassed in a
+        # production launch using optimized bytecode. Every other
+        # defensive check in this module follows the same pattern;
+        # this branch was missed in the round-2 sweep.
+        if update.effective_chat is None:
+            raise ValueError("_send_or_edit: effective_chat is None on fresh send")
         await update.effective_chat.send_message(text=text, reply_markup=keyboard)
 
 
