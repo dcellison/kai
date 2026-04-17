@@ -141,15 +141,21 @@ def _cmd_purge(args: argparse.Namespace) -> int:
     source_label = "<legacy (source absent or empty)>" if source == "" else repr(source)
     plan = f"delete_by_source(user_id={user_id!r}, source={source_label})"
 
+    # Init happens before the dry-run branch so a misconfigured memory
+    # store (MEMORY_ENABLED=false, unreadable Qdrant dir, missing deps)
+    # surfaces on the dry-run too. Without this, an operator runs the
+    # CLI without --yes, sees a confident "would run ..." message, then
+    # re-runs with --yes and hits an init failure at exit 1. Catching
+    # it up front means the dry-run answer is also a smoke test.
+    if not _initialize_memory():
+        return 1
+
     if not args.yes:
         # Dry-run path. Exit 2 (distinct from 0 and 1) so automation can
         # tell "authorization missing" apart from "success" and "error".
         print(f"memory admin: would run {plan}")
         print("memory admin: re-run with --yes to execute.")
         return 2
-
-    if not _initialize_memory():
-        return 1
 
     from kai.memory import delete_by_source
 

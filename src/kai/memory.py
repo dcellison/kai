@@ -96,10 +96,17 @@ _DELETE_PAGE_SIZE = 10_000
 # The regex is taken verbatim from spec §5.2. It must match at the
 # start of the stripped string and stop at a word boundary so that a
 # message like "nope" matches but "nopeandgo" does not. The alternation
-# uses `that'?s?\s+wrong` to cover "that's wrong", "thats wrong", and
-# "that is wrong" at the cost of one extra group - cheaper than
-# enumerating explicit variants. re.IGNORECASE makes "NO," "No,"
-# and "no," all equivalent at the leading position.
+# `that'?s?\s+wrong` covers the contractions "that's wrong" and "thats
+# wrong" (and, as a curiosity, the bare "that wrong"). It deliberately
+# does NOT cover "that is wrong" - the `s?` and the space do not stack
+# into matching the word "is". Reviewers of PR #333 flagged that this
+# is a narrower match than a previous version of this comment claimed;
+# kept narrow to stay faithful to the verbatim spec text. Plausible
+# real-world alternatives like "no, that is wrong" or "actually, that
+# is wrong" match through the `no` and `actually` alternatives anyway,
+# so the only miss is a bare formal "that is wrong" with no prefix,
+# which is rare enough to accept.
+# re.IGNORECASE makes "NO," "No," and "no," equivalent at position 0.
 _CORRECTION_CUE_RE = re.compile(
     r"^\s*(no|nope|wait|actually|that'?s?\s+wrong|forget|never\s+mind|ignore)\b",
     re.IGNORECASE,
@@ -721,11 +728,28 @@ async def delete_by_source(user_id: str, source: str) -> int:
             except ValueError:
                 log.debug("delete_by_source: id %s already gone", row.get("id"))
 
-        # Termination: stop when the page was not full (we've seen the
-        # whole store) OR when this page had zero matches (further
-        # calls would return the same non-matching page, since
-        # get_all has no offset/cursor: see mem0/memory/main.py:1075).
-        if len(rows) < _DELETE_PAGE_SIZE or not matches:
+        # Termination, two separate conditions:
+        #   (a) page not full -> we've seen the whole store, stop.
+        #   (b) page full but no matches -> `get_all` has no offset, so
+        #       the next call returns the same rows; further iteration
+        #       would live-lock. Stop, but log explicitly that this
+        #       path can under-delete if matching rows sit past the
+        #       first _DELETE_PAGE_SIZE non-matching rows in Mem0's
+        #       internal order. Most relevant for the `--source ""`
+        #       (legacy purge) path where the non-matching proportion
+        #       can be high. See spec §6.2 and PR #333 review finding.
+        if len(rows) < _DELETE_PAGE_SIZE:
+            break
+        if not matches:
+            log.warning(
+                "delete_by_source: first full page had zero matches; "
+                "terminating to avoid live-lock. Possible incomplete "
+                "delete if matching rows exist past position %d in "
+                "Mem0's row order (user_id=%s, source=%r).",
+                _DELETE_PAGE_SIZE,
+                user_id,
+                source,
+            )
             break
         completed_pages += 1
         log.warning(

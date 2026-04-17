@@ -61,28 +61,43 @@ class TestBuildParser:
 
 
 class TestPurgeAuthorizationGate:
-    """Without --yes, the command must NOT touch the memory layer and
-    must exit with status 2."""
+    """Without --yes, the command exits 2 AFTER running memory init.
+    Running init in the dry-run path (PR #333 review finding #7) means
+    a misconfigured store surfaces as exit 1 during the dry-run - so
+    the operator does not get a confident 'would run...' message
+    followed by an init failure on the real invocation.
+    """
 
-    def test_no_yes_returns_2(self, capsys):
+    def test_no_yes_with_init_ok_returns_2(self, capsys):
         parser = memory_admin._build_parser()
         args = parser.parse_args(["purge", "12345", "--source", "extracted"])
-        with patch.object(memory_admin, "_initialize_memory") as init_mock:
+        with patch.object(memory_admin, "_initialize_memory", return_value=True) as init_mock:
             code = memory_admin._cmd_purge(args)
         assert code == 2
-        # Memory init MUST NOT run when the operator hasn't authorized.
-        init_mock.assert_not_called()
+        # Init DOES run now so the dry-run validates reachability.
+        init_mock.assert_called_once()
         out = capsys.readouterr().out
         assert "would run" in out
         assert "12345" in out
         assert "--yes" in out
+
+    def test_no_yes_with_init_failure_returns_1(self):
+        """Init failure in dry-run exits 1, not 2. Exit 1 takes
+        precedence over the 'authorization missing' exit so the
+        operator sees the real blocker first."""
+        parser = memory_admin._build_parser()
+        args = parser.parse_args(["purge", "12345", "--source", "extracted"])
+        with patch.object(memory_admin, "_initialize_memory", return_value=False):
+            code = memory_admin._cmd_purge(args)
+        assert code == 1
 
     def test_dry_run_labels_legacy_clearly(self, capsys):
         """Empty source must read as `<legacy ...>` in the plan, not as
         an ambiguous `''` that an operator might mistake for nothing."""
         parser = memory_admin._build_parser()
         args = parser.parse_args(["purge", "12345", "--source", ""])
-        code = memory_admin._cmd_purge(args)
+        with patch.object(memory_admin, "_initialize_memory", return_value=True):
+            code = memory_admin._cmd_purge(args)
         assert code == 2
         out = capsys.readouterr().out
         assert "legacy" in out

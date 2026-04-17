@@ -1041,6 +1041,38 @@ class TestDeleteBySource:
         # Exactly one call; the guard fires immediately on the non-matching page.
         assert mock_mem.get_all.call_count == 1
 
+    def test_delete_by_source_tail_miss_emits_explicit_warning(self, monkeypatch, caplog):
+        """PR #333 review finding #3. The live-lock termination path is
+        also a correctness-loss path: if matching rows exist PAST the
+        first _DELETE_PAGE_SIZE non-matching rows in Mem0's row order,
+        they are not deleted. Operators need to see an explicit log
+        line for this case; the generic page-drain warning is not
+        enough to distinguish 'completed normally' from 'terminated
+        early, possible tail miss'."""
+        import logging
+
+        import kai.memory as mem_mod
+        from kai.memory import delete_by_source
+
+        monkeypatch.setattr(mem_mod, "_DELETE_PAGE_SIZE", 4)
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {
+            "results": [{"id": f"u-{i}", "metadata": {"source": "user_raw"}} for i in range(4)]
+        }
+        mem_mod._memory = mock_mem
+
+        with caplog.at_level(logging.WARNING, logger="kai.memory"):
+            asyncio.run(delete_by_source("user-a", "extracted"))
+
+        # The warning must name the tail-miss specifically; a generic
+        # drain message would not help an operator diagnose an
+        # incomplete delete after the fact.
+        joined = "\n".join(r.message for r in caplog.records)
+        assert "Possible incomplete delete" in joined
+        assert "user-a" in joined
+        assert "'extracted'" in joined
+
 
 class TestGetStats:
     """Tests for get_stats()."""
