@@ -21,7 +21,7 @@ import asyncio
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from kai.config import DATA_DIR, Config
 
@@ -166,14 +166,54 @@ class MemoryResult:
     memory_type: str  # From metadata["type"]: "exchange", "fact", etc.
     metadata: dict  # Full metadata dict from Mem0
     created_at: str  # ISO timestamp
+    # ISO timestamp of the most recent update; equal to created_at for
+    # rows that have never been refreshed. Surfaced for the /memory tag
+    # view (spec 310 §6.2), which sorts newest-updated first so a fact
+    # bubbled up by re-extraction lands at the top of its tag list.
+    # Defaults to "" so callers and tests that don't pass it remain
+    # source-compatible with the pre-spec-310 dataclass shape.
+    updated_at: str = ""
 
 
 @dataclass(frozen=True)
 class MemoryStats:
-    """Memory statistics for a user."""
+    """Memory statistics for a user.
+
+    Two distinct totals coexist:
+      - `total_count` covers ALL rows for the user (every source). This
+        is the original semantics; left untouched so existing callers do
+        not see a behavior change.
+      - `extracted_count` and every other field below cover ONLY rows
+        with `metadata.source == "extracted"`. The /memory stats UI
+        (spec 310 §6.6) operates on this restricted view: tier badges
+        and cross-source aggregates would clutter the tuning dashboard,
+        and Track 1 / legacy rows have no tags or confidence to report
+        on anyway.
+
+    All extracted-only aggregate fields default to a "no extracted rows"
+    sentinel (None for min/median/max, 0 for counts, empty dict for the
+    grouped fields) so a caller that constructs `MemoryStats(total_count=0,
+    by_type={})` (the legacy two-arg form) still produces a valid value.
+    """
 
     total_count: int
     by_type: dict[str, int]  # {"exchange": 42, "fact": 3, ...}
+
+    # ── Extracted-only aggregates (spec 310 §6.6 / §7.2) ────────────
+    # Every field below is computed over rows with
+    # metadata.source == "extracted". Track 1 and legacy rows do not
+    # contribute. min/median/max are None when extracted_count == 0
+    # because picking 0.0 would be misleading (it is a valid score
+    # value, not "no data"). Counts default to 0 / empty dict.
+    extracted_count: int = 0
+    by_tag: dict[str, int] = field(default_factory=dict)
+    confidence_min: float | None = None
+    confidence_median: float | None = None
+    confidence_max: float | None = None
+    confidence_below_0_7: int = 0
+    confidence_below_0_6: int = 0
+    confirmation_quote_count: int = 0
+    by_prompt_version: dict[str, int] = field(default_factory=dict)
 
 
 # ── Singleton state ─────────────────────────────────────────────────
@@ -233,6 +273,9 @@ def _wrap_result(raw: dict) -> MemoryResult:
     score, created_at, updated_at, user_id, role.
     """
     metadata = raw.get("metadata") or {}
+    # Mem0 surfaces both created_at and updated_at on every row; both
+    # default to "" if the upstream payload does not have them, which
+    # keeps callers (and the tag-view sort) from having to None-check.
     return MemoryResult(
         id=raw.get("id", ""),
         text=raw.get("memory", ""),
@@ -240,6 +283,7 @@ def _wrap_result(raw: dict) -> MemoryResult:
         memory_type=metadata.get("type", "unknown"),
         metadata=metadata,
         created_at=raw.get("created_at", ""),
+        updated_at=raw.get("updated_at", ""),
     )
 
 
@@ -870,23 +914,159 @@ def add_structured(
     return None
 
 
-def get_all(*, user_id: str) -> list[MemoryResult]:
+def get_all(*, user_id: str, limit: int | None = 1000) -> list[MemoryResult]:
     """
     Get all memories for a user.
 
-    Returns empty list if disabled. Used for debugging and the
-    future /memory command.
+    Returns empty list if disabled. Used for debugging, the /memory
+    command surface (spec 310), and the per-source delete primitive.
+
+    Args:
+        user_id: Telegram chat_id as a string.
+        limit: Maximum rows to fetch (passed to Mem0 as top_k). Defaults
+            to 1000 to preserve the legacy bounded-memory behavior of
+            this function for non-/memory callers (e.g. delete_by_source
+            paginates explicitly and relies on this cap). Pass `None`
+            from the /memory dashboard and stats paths so the displayed
+            total is not silently truncated for users who have built up
+            more than 1000 extracted facts. When `limit=None`, Mem0 is
+            called with a top_k far above any realistic per-user count;
+            see spec 310 §7.2.1 for the cap-vs-pagination tradeoff and
+            the long-term plan to switch to true cursor pagination once
+            single users approach the new ceiling.
     """
     if _memory is None:
         return []
 
+    # Translate the public None -> internal "very large" top_k. Mem0
+    # itself does not accept None for top_k; a five-figure ceiling is
+    # well above any realistic single-user fact count and lets the
+    # /memory UI report a true total instead of silently flattening at
+    # 1000. Aligned with the spec §7.2.1 guidance ("100000").
+    effective_top_k = 100_000 if limit is None else limit
+
     try:
-        result = _memory.get_all(filters={"user_id": user_id}, top_k=1000)
+        result = _memory.get_all(filters={"user_id": user_id}, top_k=effective_top_k)
         raw_results = result.get("results", []) if isinstance(result, dict) else result
         return [_wrap_result(r) for r in raw_results]
     except Exception:
         log.warning("Memory get_all failed", exc_info=True)
         return []
+
+
+def get_by_tag(*, user_id: str, tag: str) -> list[MemoryResult]:
+    """Return all extracted facts for `user_id` carrying `tag`.
+
+    Used by the /memory tag drill-down (spec 310 §6.2). Filters
+    client-side because Mem0's `get_all` does not accept metadata
+    filters. Two filter clauses, both load-bearing:
+
+      - `metadata.source == "extracted"`: defends against rows from the
+        pre-#335 era (or any future additional source) leaking into the
+        extracted-only UI. If #335 ships first and no `user_raw` rows
+        remain in production, this clause is a no-op; keeping it anyway
+        means the UI contract does not need re-reasoning the next time
+        a second source is introduced. Spec 310 §7.2.
+      - `tag in metadata.tags`: the actual tag match. The `or []`
+        guards against a malformed row that lacks the tags list
+        entirely; such rows simply do not match any tag.
+
+    Sort: `updated_at` descending. A re-extracted fact bubbles to the
+    top of its tag list, which is the spec's intended drill-down
+    ordering (§6.2). Falls back to `created_at` for rows that are
+    missing `updated_at`; both default to "" in `_wrap_result` so the
+    sort is total-order stable rather than raising on None comparisons.
+
+    The full row set comes from `get_all(limit=None)` so a user with
+    thousands of extracted facts still gets a complete tag listing.
+    """
+    if _memory is None:
+        return []
+
+    rows = get_all(user_id=user_id, limit=None)
+    matches = [r for r in rows if r.metadata.get("source") == "extracted" and tag in (r.metadata.get("tags") or [])]
+    # Newest-updated first; created_at is the fallback for rows whose
+    # payload predates updated_at being recorded. String comparison on
+    # ISO-8601 timestamps is correct because the format is
+    # lexicographically sortable.
+    matches.sort(key=lambda r: r.updated_at or r.created_at, reverse=True)
+    return matches
+
+
+def delete_by_id(*, user_id: str, memory_id: str) -> bool:
+    """Delete a single memory after verifying ownership and source.
+
+    Used by the /memory forget flow (spec 310 §6.4). Mem0's `delete`
+    takes only a memory_id and does NOT scope by user_id (verified by
+    inspecting Mem0's `Memory.delete` source: it calls
+    `vector_store.get(vector_id=memory_id)` followed by an unscoped
+    `_delete_memory`). So the verify-before-delete is structurally
+    necessary, not redundant.
+
+    Two checks, both load-bearing:
+      - `row.user_id == user_id`: defends against malformed callback
+        data referencing a memory id that belongs to a different user.
+        With multi-user installs (project is public, multi-user) the
+        cost of a missed check is cross-user data deletion.
+      - `row.metadata.source == "extracted"`: the /memory UI is
+        documented to manage extracted memories only. Track 1 and
+        legacy rows are owned by the admin CLI path
+        (`memory_admin.py`); refusing to touch them here keeps the
+        per-surface ownership model honest.
+
+    Returns True if the row was deleted; False for not-found, ownership
+    mismatch, source mismatch, or a Mem0 ValueError on the delete (the
+    row already vanished between get and delete - rare race, treated as
+    "nothing to do" rather than an error).
+    """
+    if _memory is None:
+        return False
+
+    # Mem0's get returns None for missing rows (verified at
+    # mem0/memory/main.py: vector_store.get falls through to None and
+    # the function returns None). No exception handling needed for the
+    # not-found path.
+    try:
+        row = _memory.get(memory_id=memory_id)
+    except Exception:
+        log.warning("delete_by_id: get failed for %s", memory_id, exc_info=True)
+        return False
+    if row is None:
+        return False
+
+    # Mem0 promotes user_id out of the payload to a top-level key
+    # (verified at mem0/memory/main.py: get() copies promoted_payload_keys
+    # back onto the result dict). metadata is a dict of any leftover
+    # payload keys and may be absent entirely if the row carried no
+    # extra payload, so use .get with a default rather than indexing.
+    if row.get("user_id") != user_id:
+        log.warning(
+            "delete_by_id: ownership mismatch (memory_id=%s, requested_user=%s)",
+            memory_id,
+            user_id,
+        )
+        return False
+    if (row.get("metadata") or {}).get("source") != "extracted":
+        log.warning(
+            "delete_by_id: refusing non-extracted row (memory_id=%s, source=%r)",
+            memory_id,
+            (row.get("metadata") or {}).get("source"),
+        )
+        return False
+
+    try:
+        _memory.delete(memory_id=memory_id)
+    except ValueError:
+        # Row vanished between get and delete - extremely narrow race
+        # but cheaper to swallow than to surface as an error to the UI,
+        # which would render "delete failed" for a row the user already
+        # cannot see. Same posture as delete_by_source.
+        log.debug("delete_by_id: %s already gone", memory_id)
+        return False
+    except Exception:
+        log.warning("delete_by_id: delete failed for %s", memory_id, exc_info=True)
+        return False
+    return True
 
 
 def delete_all(*, user_id: str) -> None:
@@ -909,11 +1089,100 @@ def get_stats(*, user_id: str) -> MemoryStats:
     """
     Get memory statistics for a user.
 
-    Counts memories by type (exchange, fact, etc.). Returns zeroed
-    stats if disabled.
+    Returns two views in one call (spec 310 §6.6 / §7.2):
+      - All-rows view: `total_count` and `by_type` count every row for
+        the user regardless of source. Original semantics; preserved so
+        existing callers do not see a behavior change.
+      - Extracted-only view: every other field (`extracted_count`,
+        `by_tag`, confidence stats, prompt-version counts,
+        `confirmation_quote_count`) is computed over rows with
+        `metadata.source == "extracted"` only. Track 1 and legacy
+        rows have no tags or confidence to report on, so including
+        them would just add noise to the tuning dashboard.
+
+    `limit=None` so the totals are not silently truncated for users
+    with more than 1000 extracted facts; see spec 310 §7.2.1.
+
+    Confidence median uses the lower of the two middle values for an
+    even-count dataset (`statistics.median_low` semantics) per spec
+    §6.6: averaging two adjacent quantized values would produce a
+    synthetic number that no individual fact actually had, while
+    `median_low` preserves "values present in the data".
+
+    Returns zeroed stats if disabled (memories will be []).
     """
-    memories = get_all(user_id=user_id)
+    memories = get_all(user_id=user_id, limit=None)
+
+    # All-rows aggregates (legacy). Computed across every source.
     by_type: dict[str, int] = {}
     for m in memories:
         by_type[m.memory_type] = by_type.get(m.memory_type, 0) + 1
-    return MemoryStats(total_count=len(memories), by_type=by_type)
+
+    # Extracted-only aggregates. Build the filtered list once; every
+    # downstream metric reads from it.
+    extracted = [m for m in memories if m.metadata.get("source") == "extracted"]
+
+    by_tag: dict[str, int] = {}
+    by_prompt_version: dict[str, int] = {}
+    confidences: list[float] = []
+    confirmation_count = 0
+    for m in extracted:
+        # tags: 1 to 4 strings per spec 310 §4. A row with no tags list
+        # contributes to no tag bucket; the `or []` guard handles a
+        # malformed payload without raising.
+        for t in m.metadata.get("tags") or []:
+            by_tag[t] = by_tag.get(t, 0) + 1
+
+        # prompt_version: stored as a string; "" treated as a distinct
+        # bucket so a regression in extraction (forgetting to stamp the
+        # version) shows up rather than silently merging into other
+        # counts. Bucket key is the value itself.
+        pv = m.metadata.get("prompt_version", "")
+        by_prompt_version[pv] = by_prompt_version.get(pv, 0) + 1
+
+        # confidence: the schema enforces [0.5, 1.0], but a bad row
+        # could still surface a non-numeric value. Skip those rather
+        # than crashing the stats view; they would be visible elsewhere
+        # as a corrupt fact already.
+        c = m.metadata.get("confidence")
+        if isinstance(c, int | float):
+            confidences.append(float(c))
+
+        # confirmation_quote: spec §4 says present only when tags
+        # include confirmed_action. Counted by presence of the field
+        # rather than re-checking the tag, since the runtime invariant
+        # at memory_extraction._validate_facts already ties them.
+        if m.metadata.get("confirmation_quote"):
+            confirmation_count += 1
+
+    # Confidence min/median/max are None for an empty extracted set so
+    # the UI can render "n/a" rather than a misleading 0.0.
+    if confidences:
+        sorted_c = sorted(confidences)
+        confidence_min: float | None = sorted_c[0]
+        confidence_max: float | None = sorted_c[-1]
+        # statistics.median_low semantics: for an even count, pick the
+        # lower of the two middle values rather than averaging them.
+        # `(n - 1) // 2` indexes the lower middle for any n >= 1.
+        confidence_median: float | None = sorted_c[(len(sorted_c) - 1) // 2]
+    else:
+        confidence_min = None
+        confidence_median = None
+        confidence_max = None
+
+    confidence_below_0_7 = sum(1 for c in confidences if c < 0.7)
+    confidence_below_0_6 = sum(1 for c in confidences if c < 0.6)
+
+    return MemoryStats(
+        total_count=len(memories),
+        by_type=by_type,
+        extracted_count=len(extracted),
+        by_tag=by_tag,
+        confidence_min=confidence_min,
+        confidence_median=confidence_median,
+        confidence_max=confidence_max,
+        confidence_below_0_7=confidence_below_0_7,
+        confidence_below_0_6=confidence_below_0_6,
+        confirmation_quote_count=confirmation_count,
+        by_prompt_version=by_prompt_version,
+    )
