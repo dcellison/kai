@@ -51,14 +51,18 @@ _MAX_DIFF_CHARS = 100_000
 # Opus tokens. Sonnet is more than capable for code review.
 _REVIEW_MODEL = "sonnet"
 
-# Per-review budget cap in USD. A single review should never exceed this.
-# Sonnet reviews of typical PRs cost well under $0.50.
+# Default per-review budget cap in USD. Overridable via PR_REVIEW_BUDGET_USD
+# in config; the Config field is the runtime source of truth. Kept here as a
+# fallback default for direct run_review() callers (tests, scripts) that do
+# not thread config through. Sonnet reviews of typical PRs cost well under
+# $0.50, so 1.0 is a headroom ceiling rather than a typical cost.
 _REVIEW_BUDGET_USD = 1.0
 
-# Timeout for the review subprocess in seconds. Sonnet 4.6+ uses extended
-# thinking, which can take significantly longer on large diffs with prior
-# review context. 15 minutes accommodates thinking-heavy reviews while
-# still catching genuinely stuck processes.
+# Default subprocess timeout for a single review, in seconds. Overridable
+# via PR_REVIEW_TIMEOUT_S in config; same fallback rationale as the budget
+# default above. Sonnet 4.6+ uses extended thinking, which can take a long
+# time on large diffs with prior review context - 15 minutes accommodates
+# thinking-heavy reviews while still terminating genuinely stuck processes.
 _REVIEW_TIMEOUT = 900
 
 # Mid-tier model per provider for Goose background agent tasks. Matches
@@ -656,6 +660,8 @@ async def run_review(
     claude_user: str | None = None,
     agent_backend: str = "claude",
     provider: str = "",
+    timeout_s: int = _REVIEW_TIMEOUT,
+    budget_usd: float = _REVIEW_BUDGET_USD,
 ) -> str:
     """
     Spawn a one-shot LLM subprocess to perform the review.
@@ -723,21 +729,25 @@ async def run_review(
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(input=prompt.encode()),
-                timeout=_REVIEW_TIMEOUT,
+                timeout=timeout_s,
             )
         except TimeoutError:
             proc.kill()
             await proc.wait()
-            raise RuntimeError(f"Review subprocess timed out after {_REVIEW_TIMEOUT}s") from None
+            raise RuntimeError(f"Review subprocess timed out after {timeout_s}s") from None
     else:
         # Claude one-shot mode: --print reads from stdin, writes to stdout.
+        # Format budget as fixed-point (f-string :.4f) rather than str() so
+        # very small values never render in scientific notation like
+        # "1e-05", which the Claude CLI's numeric parser may reject. Four
+        # fractional digits cover any realistic per-review ceiling.
         cmd = [
             "claude",
             "--print",
             "--model",
             _REVIEW_MODEL,
             "--max-budget-usd",
-            str(_REVIEW_BUDGET_USD),
+            f"{budget_usd:.4f}",
         ]
 
         # Resolve self-sudo: skip sudo when claude_user matches the bot
@@ -762,7 +772,7 @@ async def run_review(
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(input=prompt.encode()),
-                timeout=_REVIEW_TIMEOUT,
+                timeout=timeout_s,
             )
         except TimeoutError:
             # Kill the subprocess tree if it exceeds the timeout.
@@ -777,7 +787,7 @@ async def run_review(
             else:
                 proc.kill()
             await proc.wait()
-            raise RuntimeError(f"Review subprocess timed out after {_REVIEW_TIMEOUT}s") from None
+            raise RuntimeError(f"Review subprocess timed out after {timeout_s}s") from None
 
     if proc.returncode != 0:
         error = stderr.decode().strip()
@@ -889,6 +899,8 @@ async def review_pr(
     notify_chat_id: int | None = None,
     agent_backend: str = "claude",
     provider: str = "",
+    timeout_s: int = _REVIEW_TIMEOUT,
+    budget_usd: float = _REVIEW_BUDGET_USD,
 ) -> None:
     """
     Full review pipeline: fetch diff, build prompt, run review, post results.
@@ -954,6 +966,8 @@ async def review_pr(
             claude_user=claude_user,
             agent_backend=agent_backend,
             provider=provider,
+            timeout_s=timeout_s,
+            budget_usd=budget_usd,
         )
 
         if not review_text.strip():

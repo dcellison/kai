@@ -584,6 +584,12 @@ def _cmd_config() -> None:
     print()
 
     # -- PR review agent --
+    # pr_review_timeout_s and pr_review_budget_usd are global resource limits
+    # for the review subprocess, not per-user preferences. They are prompted
+    # unconditionally below (unlike pr_review_cooldown, which is only
+    # prompted when users.yaml is absent and pr_review is enabled) because
+    # any review can time out or hit budget regardless of how users are
+    # configured.
     if users_yaml_exists:
         print("-- PR review agent --")
         print("  PR review is now per-user. Set 'pr_review' in users.yaml")
@@ -606,6 +612,25 @@ def _cmd_config() -> None:
                 if _validate_positive_int(pr_review_cooldown):
                     break
                 print("  Must be a positive integer.")
+
+    # Timeout + budget for the review subprocess. Always collectable: they
+    # apply to any review whether or not the global env flag is set.
+    while True:
+        pr_review_timeout_s = _prompt(
+            "Review subprocess timeout in seconds",
+            existing_env.get("PR_REVIEW_TIMEOUT_S", "900"),
+        )
+        if _validate_positive_int(pr_review_timeout_s):
+            break
+        print("  Must be a positive integer.")
+    while True:
+        pr_review_budget_usd = _prompt(
+            "Review subprocess USD budget ceiling",
+            existing_env.get("PR_REVIEW_BUDGET_USD", "1.0"),
+        )
+        if _validate_positive_float(pr_review_budget_usd):
+            break
+        print("  Must be a positive number.")
     print()
 
     # -- Issue triage agent --
@@ -757,6 +782,13 @@ def _cmd_config() -> None:
         # via users.yaml even when the global env var is unset.
         if pr_review_cooldown != "300":
             env["PR_REVIEW_COOLDOWN"] = pr_review_cooldown
+
+    # Review subprocess resource limits. Written in both branches because
+    # they apply globally to any review, regardless of users.yaml presence.
+    if pr_review_timeout_s != "900":
+        env["PR_REVIEW_TIMEOUT_S"] = pr_review_timeout_s
+    if pr_review_budget_usd != "1.0":
+        env["PR_REVIEW_BUDGET_USD"] = pr_review_budget_usd
 
     # Build and write install.conf
     conf = {

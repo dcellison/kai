@@ -452,6 +452,8 @@ class TestCmdConfig:
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces (empty)
                 "false",  # pr review enabled
+                "900",  # pr review timeout (seconds)
+                "1.0",  # pr review budget (USD)
                 "false",  # issue triage enabled
                 "",  # github notify chat id (empty)
                 "false",  # voice
@@ -514,6 +516,8 @@ class TestCmdConfig:
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces (empty)
                 "false",  # pr review enabled
+                "900",  # pr review timeout (seconds)
+                "1.0",  # pr review budget (USD)
                 "false",  # issue triage enabled
                 "",  # github notify chat id (empty)
                 "false",  # voice
@@ -575,6 +579,8 @@ class TestCmdConfig:
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces (empty)
                 "false",  # pr review enabled
+                "900",  # pr review timeout (seconds)
+                "1.0",  # pr review budget (USD)
                 "false",  # issue triage enabled
                 "",  # github notify chat id (empty)
                 "false",  # voice
@@ -627,6 +633,8 @@ class TestCmdConfig:
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces (empty)
                 "false",  # pr review enabled
+                "900",  # pr review timeout (seconds)
+                "1.0",  # pr review budget (USD)
                 "false",  # issue triage enabled
                 "",  # github notify chat id (empty)
                 "false",  # voice

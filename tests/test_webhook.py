@@ -406,6 +406,9 @@ def _build_test_app(
     app = web.Application()
     app["webhook_secret"] = _TEST_SECRET
     app["pr_review_cooldown"] = cooldown
+    # Review subprocess resource limits (defaults match config.py).
+    app["pr_review_timeout_s"] = 900
+    app["pr_review_budget_usd"] = 1.0
     # Config needed by review background tasks
     app["webhook_port"] = 8080
     app["claude_user"] = None
