@@ -14,8 +14,8 @@ Covers:
 
 Per spec §10.3, no real Mem0 instance is involved. The handler tests
 that drive `_send_*` swap `kai.memory.get_stats` / `get_by_tag` /
-`get_all` / `delete_by_id` / `search` for fakes via monkeypatch, and
-swap `kai.memory.is_enabled` to return True.
+`get_by_id` / `delete_by_id` / `search` for fakes via monkeypatch,
+and swap `kai.memory.is_enabled` to return True.
 """
 
 from __future__ import annotations
@@ -158,6 +158,15 @@ class TestCallbackCodec:
         encoded = memory_command._encode_callback("ftd", "confirmed_action")
         assert len(encoded.encode("utf-8")) <= 64
         assert encoded == "mem:ftd:confirmed_action"
+
+    def test_overlong_callback_raises(self):
+        # The 64-byte ceiling is enforced via `if/raise`, not assert,
+        # so the check survives `python -O` (which strips assertions).
+        # If it ever fires in real use it indicates a bug in the
+        # caller passing an unexpectedly long arg, not a runtime
+        # condition; raising loudly beats silent Telegram truncation.
+        with pytest.raises(ValueError, match="callback_data too long"):
+            memory_command._encode_callback("x", "a" * 100)
 
 
 # ── Display helpers ─────────────────────────────────────────────────
@@ -530,6 +539,24 @@ class TestBuildStats:
         # Prompt versions sorted desc by count
         assert text.index("v3") < text.index("v2")
 
+    def test_renders_n_a_for_missing_confidence(self):
+        # If the memory.py invariant ever breaks (extracted_count > 0
+        # but min/median/max are None), the stats screen must say
+        # "n/a" rather than "0.00". A real 0.00 confidence reading
+        # would be indistinguishable from a missing one otherwise.
+        stats = _stats(
+            extracted_count=5,
+            confidence_min=None,
+            confidence_median=None,
+            confidence_max=None,
+        )
+        text, _ = memory_command._build_stats(stats)
+        assert "min               n/a" in text
+        assert "median            n/a" in text
+        assert "max               n/a" in text
+        # And no spurious 0.00 leaking in from the confidence block.
+        assert "0.00" not in text
+
 
 # ── Subcommand parsing dispatch ────────────────────────────────────
 
@@ -798,6 +825,36 @@ class TestCallbackDispatch:
         assert deleted == ["mem-id-1"]
         toast = upd.callback_query.answer.call_args.args[0]
         assert toast == "Forgotten."
+
+    @pytest.mark.asyncio
+    async def test_ftd_rejects_unknown_tag(self, monkeypatch, update_factory, context_factory):
+        # A stale or crafted callback could carry an arbitrary tag
+        # string. The handler must validate against `_TAG_ENUM`
+        # before invoking get_by_tag/delete_by_id - mirrors the same
+        # gate as the /memory forget text path.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        monkeypatch.setattr(
+            memory_command.memory,
+            "get_stats",
+            lambda *, user_id: _stats(extracted_count=0),
+        )
+
+        # If validation fails to fire, get_by_tag would be invoked
+        # with the bogus tag - blow up loudly to surface the bug.
+        def boom(*, user_id, tag):
+            raise AssertionError(f"get_by_tag called with bogus tag {tag!r}")
+
+        monkeypatch.setattr(memory_command.memory, "get_by_tag", boom)
+        monkeypatch.setattr(
+            memory_command.memory,
+            "delete_by_id",
+            lambda *, user_id, memory_id: True,
+        )
+        upd = update_factory(callback_data="mem:ftd:not_a_real_tag")
+        ctx = context_factory()
+        await memory_command.handle_memory_callback(upd, ctx)
+        toast = upd.callback_query.answer.call_args.args[0]
+        assert toast == memory_command._MSG_SESSION_EXPIRED
 
     @pytest.mark.asyncio
     async def test_ftd_bulk_deletes_by_tag(self, monkeypatch, update_factory, context_factory):

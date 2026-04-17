@@ -126,10 +126,6 @@ class _ScreenCache:
     on dispatch. Storing the structured form (rather than a callback
     string) means the back-target representation can change without
     needing to reparse stale entries.
-
-    `message_id` is the id of the current screen message. Set when
-    the dashboard is first shown via `reply_text`; reused by every
-    edit thereafter so the chat stays clean.
     """
 
     screen: str
@@ -138,7 +134,6 @@ class _ScreenCache:
     page: int = 0
     query: str | None = None
     return_to: tuple[str, list[str]] | None = None
-    message_id: int | None = None
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -218,10 +213,14 @@ def _encode_callback(verb: str, *args: str) -> str:
     parts = [verb, *args]
     encoded = _CALLBACK_PREFIX + ":".join(parts)
     # Defensive ceiling. The longest legitimate callback in this
-    # module is `mem:ftgc:confirmed_action` at 24 bytes, well under
-    # the limit; an assertion firing here means a bug in the caller
-    # (probably an unexpected long arg) rather than legitimate data.
-    assert len(encoded.encode("utf-8")) <= 64, f"callback_data too long: {encoded!r}"
+    # module is `mem:ftd:confirmed_action` at 24 bytes, well under
+    # the limit; this firing means a bug in the caller (probably an
+    # unexpected long arg) rather than legitimate data. Use a real
+    # if/raise rather than `assert` so the check survives `python -O`,
+    # under which assertions are stripped and Telegram would silently
+    # truncate the over-limit callback.
+    if len(encoded.encode("utf-8")) > 64:
+        raise ValueError(f"callback_data too long: {encoded!r}")
     return encoded
 
 
@@ -318,19 +317,6 @@ def _bar(count: int, max_count: int, width: int = _BAR_WIDTH) -> str:
     return _BAR_CHAR * n
 
 
-def _avg_confidence(stats: MemoryStats) -> float | None:
-    """Return the dashboard-displayed average confidence, or None.
-
-    The dashboard summary line shows `avg X.XX, min X.XX`. We do not
-    persist the running average - instead, derive a usable proxy from
-    the median (which IS persisted) and clamp it for display. This
-    keeps the dashboard fast (no full-corpus walk) at the cost of
-    showing the median rather than a true mean. The label in the
-    builder reflects this distinction.
-    """
-    return stats.confidence_median
-
-
 # ── Builder: dashboard ──────────────────────────────────────────────
 
 
@@ -380,7 +366,7 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
     # Footer summary: median + min confidence. Spec §6.1 calls this
     # the "first-glance tuning signal." Median is the persisted value;
     # the spec mock-up labels it "avg" but median is more honest about
-    # what is shown - see _avg_confidence comment.
+    # what is shown.
     median = stats.confidence_median
     minv = stats.confidence_min
     if median is not None and minv is not None:
@@ -641,15 +627,22 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
         lines.append(f"  {tag.ljust(label_width)}  {count:>3}")
 
     # Confidence block. min/median/max are None when extracted_count
-    # is zero, but we already returned for that case above.
+    # is zero (we returned for that case above), so under current
+    # memory.py semantics they're always populated here. Render "n/a"
+    # rather than 0.00 if the invariant ever breaks: a misleading
+    # 0.00 looks like a real (very low) reading, while "n/a" is
+    # self-describing and makes the bug visible.
     lines.append("")
     lines.append("Confidence:")
-    minv = stats.confidence_min if stats.confidence_min is not None else 0.0
-    medv = stats.confidence_median if stats.confidence_median is not None else 0.0
-    maxv = stats.confidence_max if stats.confidence_max is not None else 0.0
-    lines.append(f"  min               {minv:.2f}")
-    lines.append(f"  median            {medv:.2f}")
-    lines.append(f"  max               {maxv:.2f}")
+    minv = stats.confidence_min
+    medv = stats.confidence_median
+    maxv = stats.confidence_max
+    min_str = f"{minv:.2f}" if minv is not None else "n/a"
+    med_str = f"{medv:.2f}" if medv is not None else "n/a"
+    max_str = f"{maxv:.2f}" if maxv is not None else "n/a"
+    lines.append(f"  min               {min_str}")
+    lines.append(f"  median            {med_str}")
+    lines.append(f"  max               {max_str}")
     # Below-threshold counts with parenthetical percentages.
     pct_07 = (stats.confidence_below_0_7 / stats.extracted_count) * 100
     pct_06 = (stats.confidence_below_0_6 / stats.extracted_count) * 100
@@ -919,6 +912,15 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
                 await _send_dashboard(update, context, chat_id, edit=True)
                 return
             tag = args[0]
+            # Validate even though the callback is one we generated:
+            # stale buttons, crafted callbacks, or version skew could
+            # smuggle an arbitrary string into get_by_tag/delete loop.
+            # Mirror the same _TAG_ENUM gate as the /memory forget
+            # text path (see `if sub == "forget"` above).
+            if tag not in _TAG_ENUM:
+                await query.answer(_MSG_SESSION_EXPIRED)
+                await _send_dashboard(update, context, chat_id, edit=True)
+                return
             facts = memory.get_by_tag(user_id=str(chat_id), tag=tag)
             deleted = 0
             for fact in facts:
@@ -952,14 +954,14 @@ async def _send_dashboard(
         stats = memory.get_stats(user_id=str(chat_id))
     except Exception as exc:
         log.exception("get_stats failed: %s", exc)
-        await _send_or_edit(update, context, chat_id, _MSG_QUERY_FAILED, None, edit=edit)
+        await _send_or_edit(update, _MSG_QUERY_FAILED, None, edit=edit)
         return
     text, kb = _build_dashboard(stats)
     # Reset the cache: dashboard is the root. memory_ids cleared so
     # any stale fact button taps (from a previous tag view) trip the
     # session-expired branch instead of resolving to a wrong fact.
     _set_cache(chat_id, _ScreenCache(screen="dashboard"))
-    await _send_or_edit(update, context, chat_id, text, kb, edit=edit)
+    await _send_or_edit(update, text, kb, edit=edit)
 
 
 async def _send_tag_view(
@@ -975,14 +977,14 @@ async def _send_tag_view(
         facts = memory.get_by_tag(user_id=str(chat_id), tag=tag)
     except Exception as exc:
         log.exception("get_by_tag(%s) failed: %s", tag, exc)
-        await _send_or_edit(update, context, chat_id, _MSG_QUERY_FAILED, None, edit=edit)
+        await _send_or_edit(update, _MSG_QUERY_FAILED, None, edit=edit)
         return
     text, kb, memory_ids, clamped_page, _total = _build_tag_view(tag, facts, page)
     _set_cache(
         chat_id,
         _ScreenCache(screen="tag", tag=tag, page=clamped_page, memory_ids=memory_ids),
     )
-    await _send_or_edit(update, context, chat_id, text, kb, edit=edit)
+    await _send_or_edit(update, text, kb, edit=edit)
 
 
 async def _send_fact_view(
@@ -993,11 +995,10 @@ async def _send_fact_view(
 ) -> None:
     """Open the fact detail view by id.
 
-    Loads the fact through `get_all` then filters by id (Mem0's
-    `get` API is not exposed by memory.py); for typical user fact
-    counts this is sub-millisecond. If the fact disappears between
-    cache write and click (race with a concurrent forget) the user
-    falls back to the dashboard.
+    Uses memory.get_by_id for an O(1) lookup with ownership + source
+    scoping baked in. Returns None covers all four "no such fact"
+    cases (missing, wrong user, non-extracted, fetch error); the UI
+    treats them identically.
     """
     cache = _get_cache(chat_id)
     return_to = cache.return_to if cache is not None else None
@@ -1013,16 +1014,12 @@ async def _send_fact_view(
         # back into a search is not a v1 requirement.
         return_to = None
 
-    try:
-        all_facts = memory.get_all(user_id=str(chat_id), limit=None)
-    except Exception as exc:
-        log.exception("get_all failed: %s", exc)
-        await _send_or_edit(update, None, chat_id, _MSG_QUERY_FAILED, None, edit=True)
-        return
-    fact = next((f for f in all_facts if f.id == memory_id), None)
+    fact = memory.get_by_id(user_id=str(chat_id), memory_id=memory_id)
     if fact is None:
-        # Race: fact deleted between cache write and tap.
-        await _send_or_edit(update, None, chat_id, "This memory no longer exists.", None, edit=True)
+        # Race: fact deleted between cache write and tap, or any of the
+        # other not-found conditions get_by_id collapses (wrong user,
+        # non-extracted source, Mem0 fetch error).
+        await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
     text, kb = _build_fact_view(fact, return_to)
     # Cache holds only this fact's id so the forget flow knows what to
@@ -1035,7 +1032,7 @@ async def _send_fact_view(
             return_to=return_to,
         ),
     )
-    await _send_or_edit(update, None, chat_id, text, kb, edit=True)
+    await _send_or_edit(update, text, kb, edit=True)
 
 
 async def _send_forget_fact_confirm(
@@ -1044,16 +1041,14 @@ async def _send_forget_fact_confirm(
     chat_id: int,
     memory_id: str,
 ) -> None:
-    """Render the forget-fact confirmation screen."""
-    try:
-        all_facts = memory.get_all(user_id=str(chat_id), limit=None)
-    except Exception as exc:
-        log.exception("get_all failed: %s", exc)
-        await _send_or_edit(update, None, chat_id, _MSG_QUERY_FAILED, None, edit=True)
-        return
-    fact = next((f for f in all_facts if f.id == memory_id), None)
+    """Render the forget-fact confirmation screen.
+
+    Uses memory.get_by_id for the same reason as _send_fact_view:
+    O(1) lookup with ownership/source scoping enforced once.
+    """
+    fact = memory.get_by_id(user_id=str(chat_id), memory_id=memory_id)
     if fact is None:
-        await _send_or_edit(update, None, chat_id, "This memory no longer exists.", None, edit=True)
+        await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
     text, kb = _build_forget_fact_confirm(fact)
     # Preserve cache so cancel returns to the same fact, and confirm
@@ -1068,7 +1063,7 @@ async def _send_forget_fact_confirm(
             return_to=return_to,
         ),
     )
-    await _send_or_edit(update, None, chat_id, text, kb, edit=True)
+    await _send_or_edit(update, text, kb, edit=True)
 
 
 async def _send_search(
@@ -1084,7 +1079,7 @@ async def _send_search(
         results = memory.search(query, user_id=str(chat_id), limit=_SEARCH_LIMIT)
     except Exception as exc:
         log.exception("search failed: %s", exc)
-        await _send_or_edit(update, context, chat_id, _MSG_QUERY_FAILED, None, edit=False)
+        await _send_or_edit(update, _MSG_QUERY_FAILED, None, edit=False)
         return
     # Apply the floor in the UI path the same way `format_context`
     # does (spec §7.5: one knob, two paths).
@@ -1098,7 +1093,7 @@ async def _send_search(
             query=query,
         ),
     )
-    await _send_or_edit(update, context, chat_id, text, kb, edit=False)
+    await _send_or_edit(update, text, kb, edit=False)
 
 
 async def _send_stats(
@@ -1112,13 +1107,13 @@ async def _send_stats(
         stats = memory.get_stats(user_id=str(chat_id))
     except Exception as exc:
         log.exception("get_stats failed: %s", exc)
-        await _send_or_edit(update, context, chat_id, _MSG_QUERY_FAILED, None, edit=edit)
+        await _send_or_edit(update, _MSG_QUERY_FAILED, None, edit=edit)
         return
     text, kb = _build_stats(stats)
     # Stats does not need fact-id state. Drop any prior cache so a
     # stale fact-id from a previous screen can't be used.
     _set_cache(chat_id, _ScreenCache(screen="stats"))
-    await _send_or_edit(update, context, chat_id, text, kb, edit=edit)
+    await _send_or_edit(update, text, kb, edit=edit)
 
 
 async def _send_forget_tag_confirm(
@@ -1140,7 +1135,7 @@ async def _send_forget_tag_confirm(
         await update.message.reply_text(f'No memories tagged "{tag}".')
         return
     text, kb = _build_forget_tag_confirm(tag, len(facts))
-    await _send_or_edit(update, context, chat_id, text, kb, edit=False)
+    await _send_or_edit(update, text, kb, edit=False)
 
 
 # ── I/O dispatch (send vs edit) ─────────────────────────────────────
@@ -1148,8 +1143,6 @@ async def _send_forget_tag_confirm(
 
 async def _send_or_edit(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE | None,
-    chat_id: int,
     text: str,
     keyboard: InlineKeyboardMarkup | None,
     edit: bool,
@@ -1166,7 +1159,6 @@ async def _send_or_edit(
     a user double-taps a button and the second edit is identical to
     the first. Treating it as success keeps the UI stable.
     """
-    cache = _get_cache(chat_id)
     if edit and update.callback_query is not None:
         try:
             await update.callback_query.edit_message_text(text=text, reply_markup=keyboard)
@@ -1183,9 +1175,7 @@ async def _send_or_edit(
         # branch with no message to edit (e.g., search invoked from
         # text command, not callback).
         assert update.effective_chat is not None
-        sent = await update.effective_chat.send_message(text=text, reply_markup=keyboard)
-        if cache is not None:
-            cache.message_id = sent.message_id
+        await update.effective_chat.send_message(text=text, reply_markup=keyboard)
 
 
 # ── Auth helpers (mirror bot.py) ────────────────────────────────────

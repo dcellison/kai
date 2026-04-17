@@ -993,46 +993,42 @@ def get_by_tag(*, user_id: str, tag: str) -> list[MemoryResult]:
     return matches
 
 
-def delete_by_id(*, user_id: str, memory_id: str) -> bool:
-    """Delete a single memory after verifying ownership and source.
+def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
+    """Fetch a single extracted memory by id, scoped to user.
 
-    Used by the /memory forget flow (spec 310 §6.4). Mem0's `delete`
-    takes only a memory_id and does NOT scope by user_id (verified by
-    inspecting Mem0's `Memory.delete` source: it calls
-    `vector_store.get(vector_id=memory_id)` followed by an unscoped
-    `_delete_memory`). So the verify-before-delete is structurally
-    necessary, not redundant.
+    Used by the /memory fact view and forget-fact confirmation
+    (spec 310 §6.3, §6.4). Replaces the old pattern of pulling
+    `get_all` and filtering in Python: O(1) Mem0 lookup vs O(n)
+    full-corpus walk per fact-view tap.
 
-    Two checks, both load-bearing:
-      - `row.user_id == user_id`: defends against malformed callback
-        data referencing a memory id that belongs to a different user.
-        With multi-user installs (project is public, multi-user) the
-        cost of a missed check is cross-user data deletion.
-      - `row.metadata.source == "extracted"`: the /memory UI is
-        documented to manage extracted memories only. Track 1 and
-        legacy rows are owned by the admin CLI path
-        (`memory_admin.py`); refusing to touch them here keeps the
-        per-surface ownership model honest.
+    Same ownership/source scoping as `delete_by_id` (which now
+    reuses this helper):
+      - Mem0's `get` does NOT scope by user_id, so we verify it
+        manually. With multi-user installs the cost of a missed
+        check is reading another user's memory.
+      - Track 1 / legacy rows are out of scope for /memory UI
+        surfaces; they belong to memory_admin.py. Hide them here
+        rather than letting the dashboard expose them.
 
-    Returns True if the row was deleted; False for not-found, ownership
-    mismatch, source mismatch, or a Mem0 ValueError on the delete (the
-    row already vanished between get and delete - rare race, treated as
-    "nothing to do" rather than an error).
+    Returns None for not-found, ownership mismatch, source mismatch,
+    or a Mem0 fetch failure. The fact-view caller treats all four
+    cases identically ("This memory no longer exists.") so collapsing
+    them is fine.
     """
     if _memory is None:
-        return False
+        return None
 
     # Mem0's get returns None for missing rows (verified at
     # mem0/memory/main.py: vector_store.get falls through to None and
     # the function returns None). No exception handling needed for the
-    # not-found path.
+    # not-found path itself - only for unexpected failures.
     try:
         row = _memory.get(memory_id=memory_id)
     except Exception:
-        log.warning("delete_by_id: get failed for %s", memory_id, exc_info=True)
-        return False
+        log.warning("get_by_id: get failed for %s", memory_id, exc_info=True)
+        return None
     if row is None:
-        return False
+        return None
 
     # Mem0 promotes user_id out of the payload to a top-level key
     # (verified at mem0/memory/main.py: get() copies promoted_payload_keys
@@ -1041,17 +1037,43 @@ def delete_by_id(*, user_id: str, memory_id: str) -> bool:
     # extra payload, so use .get with a default rather than indexing.
     if row.get("user_id") != user_id:
         log.warning(
-            "delete_by_id: ownership mismatch (memory_id=%s, requested_user=%s)",
+            "get_by_id: ownership mismatch (memory_id=%s, requested_user=%s)",
             memory_id,
             user_id,
         )
-        return False
+        return None
     if (row.get("metadata") or {}).get("source") != "extracted":
-        log.warning(
-            "delete_by_id: refusing non-extracted row (memory_id=%s, source=%r)",
-            memory_id,
-            (row.get("metadata") or {}).get("source"),
-        )
+        # Non-extracted rows are deliberately invisible to /memory.
+        # No log: this is a routine filter, not an anomaly.
+        return None
+
+    return _wrap_result(row)
+
+
+def delete_by_id(*, user_id: str, memory_id: str) -> bool:
+    """Delete a single memory after verifying ownership and source.
+
+    Used by the /memory forget flow (spec 310 §6.4). Mem0's `delete`
+    takes only a memory_id and does NOT scope by user_id (verified by
+    inspecting Mem0's `Memory.delete` source: it calls
+    `vector_store.get(vector_id=memory_id)` followed by an unscoped
+    `_delete_memory`). So the verify-before-delete is structurally
+    necessary, not redundant - we route through `get_by_id`, which
+    enforces the same ownership/source rules in one place.
+
+    Returns True if the row was deleted; False for not-found, ownership
+    mismatch, source mismatch (all collapsed in get_by_id), or a Mem0
+    ValueError on the delete (the row already vanished between get and
+    delete - rare race, treated as "nothing to do" rather than an
+    error).
+    """
+    if _memory is None:
+        return False
+
+    # Single source of truth for ownership + source scoping. If
+    # get_by_id returns None for any reason (missing, wrong user,
+    # non-extracted, fetch error) we refuse to delete.
+    if get_by_id(user_id=user_id, memory_id=memory_id) is None:
         return False
 
     try:

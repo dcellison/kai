@@ -1440,12 +1440,127 @@ class TestGetByTag:
         assert mock_mem.get_all.call_args.kwargs["top_k"] >= 100_000
 
 
+class TestGetById:
+    """Spec 310 §7.2 helper: ownership + source-scoped single fetch.
+
+    `get_by_id` is the single source of truth for "is this fact
+    addressable by /memory under this user?" - delete_by_id calls
+    it, and the fact-view / forget-fact-confirm screens call it
+    directly. The four not-found cases (missing, wrong user,
+    non-extracted, fetch error) all collapse to None; the UI treats
+    them identically."""
+
+    def test_disabled_returns_none(self):
+        from kai.memory import get_by_id
+
+        assert get_by_id(user_id="123", memory_id="abc") is None
+
+    def test_returns_none_when_row_missing(self):
+        import kai.memory as mem_mod
+        from kai.memory import get_by_id
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = None
+        mem_mod._memory = mock_mem
+
+        assert get_by_id(user_id="123", memory_id="missing") is None
+
+    def test_returns_none_on_user_mismatch(self):
+        """A memory_id that resolves to another user's row must not
+        leak through this fetch. Same blast radius rationale as
+        delete_by_id: cross-user data exposure on a multi-user install."""
+        import kai.memory as mem_mod
+        from kai.memory import get_by_id
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "abc",
+            "memory": "secret",
+            "user_id": "other-user",
+            "metadata": {"source": "extracted"},
+        }
+        mem_mod._memory = mock_mem
+
+        assert get_by_id(user_id="123", memory_id="abc") is None
+
+    def test_returns_none_on_non_extracted_source(self):
+        """Track 1 / legacy rows are intentionally invisible to
+        /memory UI surfaces - they belong to memory_admin.py."""
+        import kai.memory as mem_mod
+        from kai.memory import get_by_id
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "abc",
+            "memory": "raw exchange",
+            "user_id": "123",
+            "metadata": {"source": "user_raw"},
+        }
+        mem_mod._memory = mock_mem
+
+        assert get_by_id(user_id="123", memory_id="abc") is None
+
+    def test_returns_none_on_legacy_missing_source(self):
+        """Legacy rows with no source key are also invisible."""
+        import kai.memory as mem_mod
+        from kai.memory import get_by_id
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "abc",
+            "memory": "old",
+            "user_id": "123",
+            "metadata": {"type": "exchange"},
+        }
+        mem_mod._memory = mock_mem
+
+        assert get_by_id(user_id="123", memory_id="abc") is None
+
+    def test_returns_none_on_fetch_exception(self):
+        """An unexpected Mem0 failure during get must not raise to
+        the caller - the UI cannot do anything useful with a stack
+        trace, and "no such fact" is a survivable degradation."""
+        import kai.memory as mem_mod
+        from kai.memory import get_by_id
+
+        mock_mem = MagicMock()
+        mock_mem.get.side_effect = RuntimeError("vector store down")
+        mem_mod._memory = mock_mem
+
+        assert get_by_id(user_id="123", memory_id="abc") is None
+
+    def test_happy_path_wraps_result(self):
+        import kai.memory as mem_mod
+        from kai.memory import get_by_id
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "abc",
+            "memory": "user prefers tea",
+            "user_id": "123",
+            "metadata": {"source": "extracted", "type": "preference"},
+            "created_at": "2026-04-17T10:00:00Z",
+            "updated_at": "2026-04-17T11:00:00Z",
+        }
+        mem_mod._memory = mock_mem
+
+        result = get_by_id(user_id="123", memory_id="abc")
+        assert result is not None
+        assert result.id == "abc"
+        assert result.text == "user prefers tea"
+        assert result.memory_type == "preference"
+        assert result.metadata.get("source") == "extracted"
+        assert result.created_at == "2026-04-17T10:00:00Z"
+        assert result.updated_at == "2026-04-17T11:00:00Z"
+
+
 class TestDeleteById:
     """Spec 310 §7.2 helper: ownership + source-checked single delete.
 
-    Mem0's `delete(memory_id)` does NOT scope by user_id (verified by
-    inspecting Memory.delete in mem0/memory/main.py). So the
-    verify-before-delete is structurally necessary, not redundant."""
+    Now delegates ownership/source verification to get_by_id, so the
+    test suite below covers the delete-specific behavior (the actual
+    delete call, ValueError swallowing). The verify rules themselves
+    are exercised in TestGetById."""
 
     def test_disabled_returns_false(self):
         from kai.memory import delete_by_id
