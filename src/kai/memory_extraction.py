@@ -606,14 +606,21 @@ def _store_facts(
         # by the time _validate_facts has run.
         if "confirmation_quote" in fact:
             extra["confirmation_quote"] = fact["confirmation_quote"]
-        memory.add_structured(
+        # add_structured returns the Mem0 memory id on success and None
+        # when storage is disabled, the content is empty, or the underlying
+        # _memory.add() raises (it has an internal try/except). Treat None
+        # as "not actually stored" so the returned count matches reality -
+        # previously `stored` was incremented unconditionally, so a store
+        # that the backend rejected still showed up in the summary log.
+        memory_id = memory.add_structured(
             content,
             user_id=user_id,
             memory_type="fact",
             tags=fact.get("tags"),
             metadata=extra,
         )
-        stored += 1
+        if memory_id is not None:
+            stored += 1
     return stored
 
 
