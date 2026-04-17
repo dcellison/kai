@@ -544,6 +544,9 @@ class TestBuildStats:
         # but min/median/max are None), the stats screen must say
         # "n/a" rather than "0.00". A real 0.00 confidence reading
         # would be indistinguishable from a missing one otherwise.
+        # Below-threshold counts get the same n/a treatment in this
+        # state - rendering "0 (0.0%)" would read as "all facts
+        # scored above the threshold" rather than "no data".
         stats = _stats(
             extracted_count=5,
             confidence_min=None,
@@ -554,8 +557,30 @@ class TestBuildStats:
         assert "min               n/a" in text
         assert "median            n/a" in text
         assert "max               n/a" in text
-        # And no spurious 0.00 leaking in from the confidence block.
+        # Below-threshold rows fall back to (n/a) too.
+        assert "below 0.7           0  (n/a)" in text
+        assert "below 0.6           0  (n/a)" in text
+        # And no spurious 0.00 / (0.0%) leaking in from the
+        # confidence block.
         assert "0.00" not in text
+        assert "(0.0%)" not in text
+
+    def test_renders_percentages_when_confidence_present(self):
+        # Inverse of the n/a test: when confidence data is present,
+        # the below-threshold rows must still render as percentages
+        # (regression guard against the n/a fallback over-firing).
+        stats = _stats(
+            extracted_count=10,
+            confidence_min=0.5,
+            confidence_median=0.8,
+            confidence_max=0.95,
+            confidence_below_0_7=2,
+            confidence_below_0_6=1,
+        )
+        text, _ = memory_command._build_stats(stats)
+        assert "below 0.7           2  (20.0%)" in text
+        assert "below 0.6           1  (10.0%)" in text
+        assert "(n/a)" not in text
 
 
 # ── Subcommand parsing dispatch ────────────────────────────────────
@@ -777,6 +802,24 @@ class TestSendOrEditContract:
         upd = update_factory("hi")
         await memory_command._send_or_edit(upd, "hello", None, edit=False)
         upd.effective_chat.send_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_forget_tag_confirm_raises_without_message(self, monkeypatch):
+        # `_send_forget_tag_confirm` is only called from the text
+        # command path where update.message is guaranteed. The check
+        # is `if/raise` (not `assert`) so it survives `python -O`,
+        # consistent with the other contract gates in this module.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        monkeypatch.setattr(
+            memory_command.memory,
+            "get_by_tag",
+            lambda *, user_id, tag: [_fact("a", "x", ["preference"])],
+        )
+        upd = MagicMock()
+        upd.message = None
+        ctx = MagicMock()
+        with pytest.raises(ValueError, match=r"requires update\.message"):
+            await memory_command._send_forget_tag_confirm(upd, ctx, 100, "preference")
 
 
 # ── Callback dispatch (smoke tests for the verb table) ─────────────

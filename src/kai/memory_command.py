@@ -92,7 +92,13 @@ _SEARCH_LIMIT = 8
 _LIST_TRUNCATE_LEN = 80
 
 # Per-chat cache TTL in seconds (spec §7.4: "30 minutes"). Checked
-# lazily on every callback access.
+# lazily on every callback access. Note this is an *idle* timeout,
+# not an absolute session timeout: `_set_cache` resets `created_at`
+# on every write, so a user who keeps tapping buttons inside the
+# 30-minute window keeps the cache alive indefinitely. The semantics
+# match the user-facing "your screen state is forgotten after a
+# pause" intent of the spec; the implementation does not enforce a
+# hard ceiling on session duration.
 _CACHE_TTL_S = 30 * 60
 
 # Unicode block character for the dashboard bar chart (spec §6.1
@@ -643,11 +649,23 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
     lines.append(f"  min               {min_str}")
     lines.append(f"  median            {med_str}")
     lines.append(f"  max               {max_str}")
-    # Below-threshold counts with parenthetical percentages.
-    pct_07 = (stats.confidence_below_0_7 / stats.extracted_count) * 100
-    pct_06 = (stats.confidence_below_0_6 / stats.extracted_count) * 100
-    lines.append(f"  below 0.7         {stats.confidence_below_0_7:>3}  ({pct_07:.1f}%)")
-    lines.append(f"  below 0.6         {stats.confidence_below_0_6:>3}  ({pct_06:.1f}%)")
+    # Below-threshold counts with parenthetical percentages. When
+    # confidence values are missing entirely (min/median/max all
+    # None) the counts are necessarily 0, but rendering them as
+    # "0 (0.0%)" reads as "all facts scored above the threshold"
+    # rather than "no confidence data". Mirror the n/a fallback
+    # above so the row stays honest about the underlying state.
+    has_confidence = minv is not None or medv is not None or maxv is not None
+    if has_confidence:
+        pct_07 = (stats.confidence_below_0_7 / stats.extracted_count) * 100
+        pct_06 = (stats.confidence_below_0_6 / stats.extracted_count) * 100
+        below_07 = f"{stats.confidence_below_0_7:>3}  ({pct_07:.1f}%)"
+        below_06 = f"{stats.confidence_below_0_6:>3}  ({pct_06:.1f}%)"
+    else:
+        below_07 = f"{stats.confidence_below_0_7:>3}  (n/a)"
+        below_06 = f"{stats.confidence_below_0_6:>3}  (n/a)"
+    lines.append(f"  below 0.7         {below_07}")
+    lines.append(f"  below 0.6         {below_06}")
 
     lines.append("")
     lines.append(f"Confirmed actions:  {stats.confirmation_quote_count} with confirmation_quote")
@@ -1130,16 +1148,24 @@ async def _send_forget_tag_confirm(
     chat_id: int,
     tag: str,
 ) -> None:
-    """Render the forget-by-tag confirmation."""
+    """Render the forget-by-tag confirmation.
+
+    Called only from the /memory forget text path, where
+    `update.message` is guaranteed by python-telegram-bot's
+    routing. The contract check uses `if/raise` rather than
+    `assert` so it survives `python -O` (assertions are stripped),
+    matching the same hardening applied to `_send_or_edit` and
+    `_encode_callback`.
+    """
+    if update.message is None:
+        raise ValueError("_send_forget_tag_confirm: requires update.message")
     try:
         facts = memory.get_by_tag(user_id=str(chat_id), tag=tag)
     except Exception as exc:
         log.exception("get_by_tag(%s) failed: %s", tag, exc)
-        assert update.message is not None
         await update.message.reply_text(_MSG_QUERY_FAILED)
         return
     if not facts:
-        assert update.message is not None
         await update.message.reply_text(f'No memories tagged "{tag}".')
         return
     text, kb = _build_forget_tag_confirm(tag, len(facts))
