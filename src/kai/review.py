@@ -758,7 +758,7 @@ async def run_review(
         if effective_user:
             # -H sets HOME to the target user's pw entry. Without it, claude
             # reads OAuth creds from the caller's ~/.claude/.credentials.json
-            # and silently exits. See claude.py for the same fix.
+            # and silently exits.
             cmd = ["sudo", "-H", "-u", effective_user, "--"] + cmd
 
         # When spawned via sudo, start in a new process group so the
