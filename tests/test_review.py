@@ -615,7 +615,7 @@ class TestRunReview:
 
     @pytest.mark.asyncio
     async def test_with_claude_user(self):
-        """When claude_user is set, command is prefixed with sudo -u."""
+        """When claude_user is set, command is prefixed with sudo -H -u."""
         mock_proc = _mock_process(stdout=b"review output")
 
         with (
@@ -625,7 +625,7 @@ class TestRunReview:
             await run_review("prompt", claude_user="kai")
 
         cmd = mock_exec.call_args[0]
-        assert cmd[:4] == ("sudo", "-u", "kai", "--")
+        assert cmd[:5] == ("sudo", "-H", "-u", "kai", "--")
         assert "claude" in cmd
         assert "--print" in cmd
 

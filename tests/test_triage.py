@@ -430,18 +430,19 @@ class TestRunTriage:
 
     @pytest.mark.asyncio
     async def test_claude_user_sudo(self):
-        """When claude_user is set, command starts with sudo -u."""
+        """When claude_user is set, command starts with sudo -H -u."""
         mock_proc = _mock_subprocess(stdout='{"labels": []}')
 
         with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
             await run_triage("prompt", claude_user="testuser")
 
-        # First args should be sudo -u testuser --
+        # First args should be sudo -H -u testuser --
         args = mock_exec.call_args[0]
         assert args[0] == "sudo"
-        assert args[1] == "-u"
-        assert args[2] == "testuser"
-        assert args[3] == "--"
+        assert args[1] == "-H"
+        assert args[2] == "-u"
+        assert args[3] == "testuser"
+        assert args[4] == "--"
 
 
 # ── run_triage (Goose backend) ─────────────────────────────────────

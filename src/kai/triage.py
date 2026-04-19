@@ -472,7 +472,10 @@ async def run_triage(
         effective_user = resolve_claude_user(claude_user)
 
         if effective_user:
-            cmd = ["sudo", "-u", effective_user, "--"] + cmd
+            # -H sets HOME to the target user's pw entry. Without it, claude
+            # reads OAuth creds from the caller's ~/.claude/.credentials.json
+            # and silently exits. See claude.py for the same fix.
+            cmd = ["sudo", "-H", "-u", effective_user, "--"] + cmd
 
         # When spawned via sudo, start in a new process group so the
         # entire tree (sudo + claude) can be killed via os.killpg().
