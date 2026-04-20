@@ -1132,7 +1132,8 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
 
-        # Switching claude -> goose must drop extraction keys (bot.py:3609 silently ignores them on non-claude). MEMORY_EXTRACTION_TIMEOUT_S seeded so the cleanup pop is exercised.
+        # Switching claude -> goose must drop extraction keys: bot.py:3609 silently ignores them on non-claude.
+        # MEMORY_EXTRACTION_TIMEOUT_S seeded so the cleanup pop is exercised, not just defaulted away.
         existing = {
             "version": 1,
             "env": {

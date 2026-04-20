@@ -741,7 +741,7 @@ def _cmd_config() -> None:
                 # rebuilds wholesale on every reinstall.
                 while True:
                     memory_extraction_timeout_s = _prompt(
-                        "Per-extraction timeout in seconds (suggest 60 or higher)",
+                        "Per-extraction timeout in seconds",
                         existing_env.get("MEMORY_EXTRACTION_TIMEOUT_S", "10"),
                     )
                     if _validate_positive_int(memory_extraction_timeout_s):
