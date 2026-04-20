@@ -580,17 +580,69 @@ class TestEnsureUserMemory:
         # Same content, not the template.
         assert existing.read_text() == "already-captured user content"
 
-    def test_chat_id_none_is_noop(self, tmp_path, monkeypatch):
-        """chat_id=None does nothing - the dev/legacy path handles that case."""
+    def test_chat_id_none_seeds_legacy_path(self, tmp_path, monkeypatch):
+        """
+        chat_id=None bootstraps the legacy data_dir/memory/MEMORY.md
+        (no per-user subdir). This is the dev / no-users.yaml / memory-
+        disabled path, where the previously removed _bootstrap_memory
+        function used to create the directory + seed file. Without
+        this, a fresh `python -m kai` would have no memory_root at
+        all, and any inner Claude write attempt would FileNotFoundError
+        on the missing parent.
+        """
         data_dir = tmp_path / "data"
         project_root = tmp_path / "project"
+        example_dir = project_root / "home" / ".claude"
+        example_dir.mkdir(parents=True)
+        (example_dir / "MEMORY.md.example").write_text("# Memory\n\n## Dev\n")
+        monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
+
+        ensure_user_memory(None, data_dir)
+
+        legacy = data_dir / "memory" / "MEMORY.md"
+        assert legacy.is_file()
+        assert "Dev" in legacy.read_text()
+        # No per-user subdir was created (chat_id=None must not
+        # leak into a numeric subdirectory name).
+        assert list((data_dir / "memory").iterdir()) == [legacy]
+
+    def test_chat_id_none_idempotent(self, tmp_path, monkeypatch):
+        """
+        Repeated chat_id=None calls do not overwrite an existing
+        legacy MEMORY.md. Same idempotence contract as the per-user
+        branch - operators may have edited it between runs.
+        """
+        data_dir = tmp_path / "data"
+        project_root = tmp_path / "project"
+        example_dir = project_root / "home" / ".claude"
+        example_dir.mkdir(parents=True)
+        (example_dir / "MEMORY.md.example").write_text("FRESH_TEMPLATE")
+        monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
+
+        memory_dir = data_dir / "memory"
+        memory_dir.mkdir(parents=True)
+        legacy = memory_dir / "MEMORY.md"
+        legacy.write_text("operator-edited content")
+
+        ensure_user_memory(None, data_dir)
+
+        assert legacy.read_text() == "operator-edited content"
+
+    def test_chat_id_none_no_template_creates_placeholder(self, tmp_path, monkeypatch):
+        """
+        chat_id=None with no example template falls back to '# Memory\\n',
+        matching the per-user branch and the old _bootstrap_memory.
+        """
+        data_dir = tmp_path / "data"
+        project_root = tmp_path / "project"
+        # No example template exists.
         (project_root / "home" / ".claude").mkdir(parents=True)
         monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
 
         ensure_user_memory(None, data_dir)
 
-        # No memory/ directory was created.
-        assert not (data_dir / "memory").exists()
+        legacy = data_dir / "memory" / "MEMORY.md"
+        assert legacy.read_text() == "# Memory\n"
 
 
 class TestPerUserMemoryIsolation:

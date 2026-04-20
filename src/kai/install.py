@@ -1795,6 +1795,14 @@ def _apply_migrate(
                     print(f"[DRY RUN] Would copy {legacy_src_tree} -> {primary_dst}")
                 elif example_template.is_file():
                     print(f"[DRY RUN] Would seed {primary_dst} from {example_template}")
+                else:
+                    # Mirror the real branch's last-resort placeholder
+                    # below: when none of the source files exist (minimal
+                    # host, broken install tree), the real path writes
+                    # `# Memory\n` and prints "Created empty ...". Without
+                    # this `else` the dry-run prints nothing and the
+                    # operator sees a silent gap they cannot diagnose.
+                    print(f"[DRY RUN] Would create empty {primary_dst} (no template found)")
             else:
                 primary_dir.mkdir(parents=True, exist_ok=True)
                 if legacy_global.is_file():

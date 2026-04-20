@@ -388,20 +388,32 @@ def ensure_user_memory(chat_id: int | None, data_dir: Path) -> None:
       bootstrap does the whole job - mkdir + seed copy - inheriting
       the caller's ownership, which IS the writer. Good.
 
-    Intentionally no-ops when chat_id is None. That path reads and
-    writes `memory/MEMORY.md` directly (legacy global location) for
-    backends that never see a chat_id - dev harnesses, smoke scripts.
+    When chat_id is None (legacy/dev path - no users.yaml, no real
+    Telegram session), the function ensures `data_dir/memory/MEMORY.md`
+    exists with the same seed-or-placeholder semantics. This mirrors
+    the removed main._bootstrap_memory() so the legacy global path
+    continues to be writable from a fresh install where memory is
+    disabled and users.yaml is absent.
 
     Silent on OSError: a permissions issue creating per-user memory
     must not prevent the bot from answering a message. The read path
     in build_session_context already returns a placeholder string on
     missing files, so the downstream session still boots cleanly.
     """
+    # When chat_id is None we are on the legacy/dev path: there is no
+    # users.yaml to drive a per-user subdir, so the file lives at
+    # data_dir/memory/MEMORY.md. This mirrors the behavior of the
+    # removed main._bootstrap_memory() function so a fresh
+    # `python -m kai` (no users.yaml, no prior install, memory disabled)
+    # still has a writable memory_root for the inner Claude to update.
+    # Without this branch a write attempt from the subprocess would
+    # FileNotFoundError on the missing parent directory.
     if chat_id is None:
-        return
-
-    user_memory_dir = data_dir / "memory" / str(chat_id)
-    user_memory_file = user_memory_dir / "MEMORY.md"
+        user_memory_dir = data_dir / "memory"
+        user_memory_file = user_memory_dir / "MEMORY.md"
+    else:
+        user_memory_dir = data_dir / "memory" / str(chat_id)
+        user_memory_file = user_memory_dir / "MEMORY.md"
 
     try:
         user_memory_dir.mkdir(parents=True, exist_ok=True)
