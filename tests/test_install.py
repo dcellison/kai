@@ -1051,14 +1051,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
 
-        # Pre-seed install.conf with required fields plus memory tunables,
-        # then press Enter at every prompt so the wizard accepts each
-        # default. Required prompts without a default (bot token, webhook
-        # secret) would otherwise re-prompt forever against "" input.
-        # AGENT_BACKEND is seeded explicitly: the extraction-keys cleanup
-        # block pops MEMORY_EXTRACTION_* on non-claude backends, so this
-        # test would silently fail if the wizard's backend default ever
-        # changed away from "claude".
+        # AGENT_BACKEND seeded explicitly so the extraction-keys cleanup (non-claude pops them) doesn't depend on the wizard's implicit default.
         existing = {
             "version": 1,
             "install_dir": "/opt/kai",
@@ -1098,10 +1091,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
 
-        # Prior install had memory on with custom tunables. The wizard
-        # run below answers "false" to MEMORY_ENABLED. The output env
-        # must not retain any MEMORY_* keys - if it did, the daemon
-        # would silently keep memory live after the operator disabled it.
+        # Disabling memory must strip stale keys; otherwise the daemon keeps memory live after the operator opts out.
         existing = {
             "version": 1,
             "env": {
@@ -1130,9 +1120,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
 
-        # Simulate a prior claude+extraction install. The wizard run
-        # below switches to goose; the extraction keys must not survive
-        # since bot.py:3609 silently ignores them on non-claude backends.
+        # Switching claude -> goose must drop extraction keys (bot.py:3609 silently ignores them on non-claude).
         existing = {
             "version": 1,
             "env": {
