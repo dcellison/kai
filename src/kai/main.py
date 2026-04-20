@@ -302,6 +302,8 @@ def main() -> None:
                     BotCommand("model", "Switch model directly"),
                     # Settings
                     BotCommand("settings", "Show or change your settings"),
+                    # Memory
+                    BotCommand("memory", "Browse and manage remembered facts"),
                     # Workspace
                     BotCommand("workspace", "Switch working directory"),
                     BotCommand("workspaces", "List recent workspaces"),
