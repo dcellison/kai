@@ -1055,6 +1055,10 @@ class TestCmdConfig:
         # then press Enter at every prompt so the wizard accepts each
         # default. Required prompts without a default (bot token, webhook
         # secret) would otherwise re-prompt forever against "" input.
+        # AGENT_BACKEND is seeded explicitly: the extraction-keys cleanup
+        # block pops MEMORY_EXTRACTION_* on non-claude backends, so this
+        # test would silently fail if the wizard's backend default ever
+        # changed away from "claude".
         existing = {
             "version": 1,
             "install_dir": "/opt/kai",
@@ -1064,6 +1068,7 @@ class TestCmdConfig:
             "env": {
                 "TELEGRAM_BOT_TOKEN": "existing-token",
                 "WEBHOOK_SECRET": "existing-secret",
+                "AGENT_BACKEND": "claude",
                 "MEMORY_ENABLED": "true",
                 "MEMORY_EXTRACTION_ENABLED": "true",
                 "MEMORY_EXTRACTION_BUDGET_USD": "0.08",
@@ -1084,6 +1089,38 @@ class TestCmdConfig:
         assert env["MEMORY_EXTRACTION_ENABLED"] == "true"
         assert env["MEMORY_EXTRACTION_BUDGET_USD"] == "0.08"
         assert env["MEMORY_TOKEN_BUDGET"] == "4000"
+
+    def test_memory_toggle_off_drops_existing_keys(self, tmp_path, monkeypatch):
+        """Switching MEMORY_ENABLED true -> false strips stale MEMORY_* keys."""
+        monkeypatch.chdir(tmp_path)
+        conf_path = tmp_path / "install.conf"
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+
+        # Prior install had memory on with custom tunables. The wizard
+        # run below answers "false" to MEMORY_ENABLED. The output env
+        # must not retain any MEMORY_* keys - if it did, the daemon
+        # would silently keep memory live after the operator disabled it.
+        existing = {
+            "version": 1,
+            "env": {
+                "MEMORY_ENABLED": "true",
+                "MEMORY_EXTRACTION_ENABLED": "true",
+                "MEMORY_EXTRACTION_BUDGET_USD": "0.05",
+                "MEMORY_TOKEN_BUDGET": "3000",
+            },
+        }
+        conf_path.write_text(json.dumps(existing))
+
+        inputs = iter(self._base_inputs(["false"]))  # memory toggled off
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        env = json.loads(conf_path.read_text())["env"]
+        for key in env:
+            assert not key.startswith("MEMORY_"), f"stale memory key: {key}"
 
     def test_non_claude_backend_drops_stale_extraction_keys(self, tmp_path, monkeypatch):
         """Switching from claude to goose strips MEMORY_EXTRACTION_* keys."""
