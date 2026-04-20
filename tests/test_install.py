@@ -2361,6 +2361,73 @@ class TestApplyMigratePerUserMemory:
         # No per-user dirs created, no global file written.
         assert list((data_path / "memory").iterdir()) == []
 
+    def test_unknown_os_user_aborts_before_disk_mutation(self, tmp_path, monkeypatch):
+        """
+        A users.yaml entry naming an os_user that does not exist on
+        the host must raise ValueError BEFORE the migration block
+        creates, copies, or moves any MEMORY.md file. The earlier
+        implementation let pwd.getpwnam raise a bare KeyError after
+        the migration had already touched disk, leaving operators to
+        diagnose a half-applied state with no chat_id or path in the
+        traceback. The validation block now hoisted to the top of
+        _apply_migrate is the fix; this test guards against
+        regressions where someone moves the validation back below
+        the migration.
+        """
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        claude_dir = tmp_path / "src" / "home" / ".claude"
+        claude_dir.mkdir(parents=True)
+        # Source-tree MEMORY.md is what the legacy-copy branch would
+        # try to land at the primary user's destination if validation
+        # did not abort first.
+        (claude_dir / "MEMORY.md").write_text("would-be-leaked content")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "memory").mkdir()
+
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            "users:\n  - telegram_id: 4242\n    name: ghost\n    role: admin\n    os_user: nobody-by-this-name-12345\n"
+        )
+
+        # Force getpwnam to behave as it would for a missing user on
+        # any host: raise KeyError(name). pwd.getpwnam itself raises
+        # bare KeyError, no PermissionError, no ValueError.
+        monkeypatch.setattr(
+            "kai.install.pwd.getpwnam",
+            lambda name: (_ for _ in ()).throw(KeyError(name)),
+        )
+        # No-op chown: if validation did not abort and the test got
+        # this far, the ownership block would otherwise try to chown
+        # outside tmp_path on a CI box.
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        with pytest.raises(ValueError) as exc_info:
+            _apply_migrate(
+                data_path,
+                tmp_path / "install",
+                svc_uid=501,
+                svc_gid=20,
+                dry_run=False,
+                users_yaml_path=users_yaml,
+            )
+
+        # Error message must include the chat_id, the bad username,
+        # and the source path so the operator knows where to fix it.
+        msg = str(exc_info.value)
+        assert "4242" in msg
+        assert "nobody-by-this-name-12345" in msg
+        assert str(users_yaml) in msg
+
+        # Critical: no MEMORY.md was written under the primary's dir,
+        # because validation aborted before the migration block ran.
+        # Half-applied state (some files moved, some not, ownership
+        # still pending) is exactly the scenario this test guards.
+        assert not (data_path / "memory" / "4242").exists()
+        assert not (data_path / "memory" / "MEMORY.md").exists()
+
 
 # ── Service lifecycle ────────────────────────────────────────────────
 

@@ -407,6 +407,17 @@ class ClaudeCodeBackend(AgentBackend):
             # has a writable target and build_session_context reads a
             # real file rather than falling back to the "not yet
             # created" placeholder. See backend.ensure_user_memory().
+            #
+            # Retry limitation: this call is gated on _fresh_session,
+            # which the line above flips to False unconditionally. A
+            # transient OSError inside ensure_user_memory (logged as a
+            # warning, not raised) is therefore not retried on
+            # subsequent messages of the same session - the session
+            # would have to be rebuilt for another attempt. In
+            # practice the failure modes are persistent (permissions,
+            # missing parent dir), not transient, so this is
+            # acceptable; documenting it so future readers do not
+            # assume self-healing.
             ensure_user_memory(chat_id, DATA_DIR)
             session_ctx = build_session_context(
                 workspace=self.workspace,

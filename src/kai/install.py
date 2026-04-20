@@ -1752,6 +1752,30 @@ def _apply_migrate(
     legacy_src_tree = PROJECT_ROOT / "home" / ".claude" / "MEMORY.md"
     example_template = PROJECT_ROOT / "home" / ".claude" / "MEMORY.md.example"
 
+    # Resolve every os_user against the host's passwd database BEFORE
+    # touching disk. If users.yaml names an OS user that does not exist
+    # on this host (typo, new user listed before useradd, copy/paste
+    # from another machine), pwd.getpwnam raises bare KeyError(name)
+    # with no chat_id, no path, no hint. Hoist validation here so the
+    # install hard-fails with a clear message before the migration
+    # block creates, copies, or moves any MEMORY.md files. Surfacing
+    # the misconfiguration after disk mutation would leave operators
+    # diagnosing a half-applied state.
+    per_user_ids: dict[str, tuple[int, int]] = {}
+    for chat_id, os_user in memory_owners:
+        if os_user is None:
+            continue
+        try:
+            pwd_entry = pwd.getpwnam(os_user)
+        except KeyError as exc:
+            raise ValueError(
+                f"users.yaml entry chat_id={chat_id} names os_user "
+                f"{os_user!r}, which does not exist on this host. Source: "
+                f"{users_yaml_path}. Create the OS account or correct the "
+                f"users.yaml entry, then re-run sudo make install."
+            ) from exc
+        per_user_ids[str(chat_id)] = (pwd_entry.pw_uid, pwd_entry.pw_gid)
+
     # Resolve the primary operator's chat_id (first yaml entry). When
     # users.yaml is absent or empty (first-ever install, single-user
     # dev), leave memory/MEMORY.md alone - runtime code falls back to
@@ -1799,7 +1823,15 @@ def _apply_migrate(
             if user_dst.exists():
                 continue
             if dry_run:
-                print(f"[DRY RUN] Would seed {user_dst} from example template")
+                # Match the real branch below: the template may not ship
+                # with the install tree, in which case the real path
+                # writes a placeholder. Printing "from example template"
+                # unconditionally misleads operators on hosts where the
+                # template is missing.
+                if example_template.is_file():
+                    print(f"[DRY RUN] Would seed {user_dst} from example template")
+                else:
+                    print(f"[DRY RUN] Would create empty {user_dst} (no example template)")
                 continue
             user_dir.mkdir(parents=True, exist_ok=True)
             if example_template.is_file():
@@ -1866,17 +1898,10 @@ def _apply_migrate(
     # to the service-owned tier. Same for any stray file at the top level.
     memory_tree = data_path / "memory"
     if memory_tree.is_dir():
-        # Build a chat_id -> (uid, gid) map for users with an explicit
-        # os_user. pwd.getpwnam failures (username in users.yaml that
-        # does not exist on this host) are hard-failed: silently falling
-        # back to service ownership would recreate the #347 bug. Better
-        # to surface the misconfiguration now.
-        per_user_ids: dict[str, tuple[int, int]] = {}
-        for chat_id, os_user in memory_owners:
-            if os_user is None:
-                continue
-            pwd_entry = pwd.getpwnam(os_user)
-            per_user_ids[str(chat_id)] = (pwd_entry.pw_uid, pwd_entry.pw_gid)
+        # per_user_ids was built and validated at the top of this
+        # function, before any disk mutation. Reusing it here means a
+        # bad os_user has already aborted the install with a clear
+        # ValueError; we cannot reach this block in that state.
 
         if dry_run:
             print(f"[DRY RUN] Would set ownership on {memory_tree} (service + per-user)")

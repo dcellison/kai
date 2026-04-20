@@ -353,6 +353,15 @@ class GooseBackend(AgentBackend):
             # per-user MEMORY.md directory exists before building the
             # session context. See backend.ensure_user_memory() for
             # why this is a cheap, idempotent no-op in production.
+            #
+            # Retry limitation: this call is gated on _fresh_session,
+            # which the line above flips to False unconditionally. A
+            # transient OSError inside ensure_user_memory (logged as a
+            # warning, not raised) is not retried later in the same
+            # session. Failure modes here are persistent (permissions,
+            # missing parent dir), not transient, so this is
+            # acceptable; documenting it so future readers do not
+            # assume self-healing.
             ensure_user_memory(chat_id, DATA_DIR)
             session_ctx = build_session_context(
                 workspace=self.workspace,

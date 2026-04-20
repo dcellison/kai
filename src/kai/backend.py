@@ -366,16 +366,27 @@ def ensure_user_memory(chat_id: int | None, data_dir: Path) -> None:
 
     Idempotent and cheap: a stat, a possible mkdir, a possible copy2.
     Called on every send() path before build_session_context() so that
-    a user who appeared after install (e.g., a new entry in users.yaml
-    without a reinstall) still gets a writable memory surface on their
-    first message.
+    a user without a pre-created `memory/<chat_id>/` (single-user dev,
+    test runs, or any deployment where the inner Claude runs as the
+    same identity as the bot) still gets a writable memory surface on
+    their first message.
 
-    In production the install step (install.py ~line 1715) pre-creates
-    and chowns `memory/<chat_id>/` to that user's os_user, so mkdir
-    here is a no-op. For dev/test runs without a prior install, this
-    function does the whole job - mkdir + seed copy - inheriting the
-    caller's ownership. That matches the single-user dev case where
-    the bot process is the only identity in play.
+    Scope of what this function fixes - read carefully:
+
+    * Production multi-user (users.yaml entry has an explicit os_user
+      different from the service user): the install step (install.py
+      `_apply_migrate`) pre-creates and chowns `memory/<chat_id>/` to
+      the user's os_user. mkdir here is then a no-op (the dir already
+      exists), and the seed file is already in place. Good.
+    * A user added to users.yaml AFTER install with a distinct os_user:
+      lazy bootstrap is NOT enough. mkdir here runs as the bot/service
+      identity, so the new dir and file are service-owned. The inner
+      subprocess (sudo -H -u <os_user>) can read but not write them -
+      the same #347 regression. A reinstall (or a manual chown) is
+      required for that case.
+    * Dev / single-user / users without a distinct os_user: lazy
+      bootstrap does the whole job - mkdir + seed copy - inheriting
+      the caller's ownership, which IS the writer. Good.
 
     Intentionally no-ops when chat_id is None. That path reads and
     writes `memory/MEMORY.md` directly (legacy global location) for
