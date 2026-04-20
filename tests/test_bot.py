@@ -4426,6 +4426,7 @@ EXPECTED_MENU_COMMANDS = {
     "github",
     "help",
     "job",
+    "memory",
     "model",
     "models",
     "new",
