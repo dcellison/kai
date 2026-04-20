@@ -1194,6 +1194,76 @@ def _collect_os_users_from_yaml(users_yaml_path: str | Path) -> list[str]:
     return result
 
 
+def _collect_user_memory_owners(users_yaml_path: str | Path) -> list[tuple[int, str | None]]:
+    """
+    Read users.yaml and return (telegram_id, os_user) tuples.
+
+    Used by the install migration to know which `memory/<chat_id>/`
+    subdirectories to pre-create and which OS user each one should be
+    chowned to. An os_user of None means that user's inner Claude runs
+    as the service user - their memory subdir stays service-owned.
+
+    Mirrors the behavior of _collect_os_users_from_yaml: silently
+    returns [] on missing / empty / malformed-top-level files, raises
+    on true YAML parse errors, and hard-fails on a non-empty os_user
+    that fails _validate_os_user (same sudoers-injection rationale).
+
+    First-seen order is preserved so that callers who care about the
+    "primary operator" can take tuples[0] deterministically. Entries
+    with a non-int or missing telegram_id are skipped, not raised, to
+    match the loose validation elsewhere in this module (a bad yaml
+    surfaces later as a runtime failure with a clearer message).
+
+    Args:
+        users_yaml_path: Path to users.yaml (typically /etc/kai/users.yaml).
+
+    Returns:
+        List of (telegram_id, os_user_or_None) tuples in yaml order.
+
+    Raises:
+        ValueError: If any non-empty os_user value fails username validation.
+        yaml.YAMLError: If the file exists but cannot be parsed.
+    """
+    path = Path(users_yaml_path)
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+
+    if not text.strip():
+        return []
+
+    data = yaml.safe_load(text)
+    if not isinstance(data, dict):
+        return []
+
+    users = data.get("users")
+    if not isinstance(users, list):
+        return []
+
+    result: list[tuple[int, str | None]] = []
+    for entry in users:
+        if not isinstance(entry, dict):
+            continue
+        telegram_id = entry.get("telegram_id")
+        if not isinstance(telegram_id, int):
+            # Users without a valid telegram_id cannot map to a chat_id
+            # directory. Skip silently - config._load_user_configs will
+            # surface the real validation error at runtime.
+            continue
+        os_user_raw = entry.get("os_user")
+        os_user: str | None
+        if isinstance(os_user_raw, str) and os_user_raw.strip():
+            os_user = os_user_raw.strip()
+            if not _validate_os_user(os_user):
+                raise ValueError(f"Invalid os_user {os_user!r} in {path}: must match {_OS_USER_RE.pattern}")
+        else:
+            os_user = None
+        result.append((telegram_id, os_user))
+    return result
+
+
 def _generate_sudoers(
     service_user: str,
     claude_user: str | None = None,
@@ -1549,7 +1619,14 @@ def _start_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
     print(f"  Warning: service start failed ({' '.join(cmd[:2])}){hint}")
 
 
-def _apply_migrate(data_path: Path, install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
+def _apply_migrate(
+    data_path: Path,
+    install_path: Path,
+    svc_uid: int,
+    svc_gid: int,
+    dry_run: bool,
+    users_yaml_path: Path = Path("/etc/kai/users.yaml"),
+) -> None:
     """
     Migrate runtime data from the development directory to the data directory.
 
@@ -1564,6 +1641,11 @@ def _apply_migrate(data_path: Path, install_path: Path, svc_uid: int, svc_gid: i
         svc_uid: Numeric UID for file ownership.
         svc_gid: Numeric GID for file ownership.
         dry_run: If True, print actions without executing.
+        users_yaml_path: Path to the installed users.yaml. Defaults to
+            /etc/kai/users.yaml (the post-_apply_secrets location).
+            Parameterized so tests can supply a fixture path without
+            patching module globals; production callers always rely on
+            the default.
     """
     # -- Database migration --
     db_src = PROJECT_ROOT / "kai.db"
@@ -1645,21 +1727,87 @@ def _apply_migrate(data_path: Path, install_path: Path, svc_uid: int, svc_gid: i
             print("  History already migrated or no files to copy")
 
     # -- MEMORY.md migration --
-    # One-time: copy personal memory from the source tree
-    # (home/.claude/MEMORY.md, pre-DATA_DIR location) to DATA_DIR/memory/.
-    # If the file doesn't exist at the source location
-    # (common - it was never created on most installs), _bootstrap_memory()
-    # in main.py handles creation from the example template at startup.
-    memory_src = PROJECT_ROOT / "home" / ".claude" / "MEMORY.md"
-    memory_dst = data_path / "memory" / "MEMORY.md"
-    if memory_src.is_file() and not memory_dst.exists():
-        if dry_run:
-            print(f"[DRY RUN] Would copy MEMORY.md: {memory_src} -> {memory_dst}")
-        else:
-            (data_path / "memory").mkdir(parents=True, exist_ok=True)
-            shutil.copy2(memory_src, memory_dst)
-            os.chown(memory_dst, svc_uid, svc_gid)
-            print(f"  Migrated MEMORY.md to {memory_dst}")
+    # One-time: land personal memory at the per-user path
+    # DATA_DIR/memory/<chat_id>/MEMORY.md. The "primary operator"
+    # (first entry in users.yaml, typically an admin) gets any legacy
+    # content. Two legacy source locations are handled:
+    #   1) DATA_DIR/memory/MEMORY.md  - pre-#347 global location; the
+    #      common case on existing installs.
+    #   2) PROJECT_ROOT/home/.claude/MEMORY.md - pre-DATA_DIR location
+    #      from before the DATA_DIR migration shipped.
+    # Both are moved (not copied) so the global path cannot later read
+    # as stale state. If neither source exists, a per-user MEMORY.md
+    # is seeded from the home/.claude/MEMORY.md.example template so
+    # the inner Claude has a writable starting point on first message.
+    # Subsequent users in users.yaml get the template, not the legacy
+    # content, because one user's memory never belongs to another.
+    #
+    # This migration deliberately runs with users.yaml loaded from
+    # the resolved install path (post-_apply_secrets, default
+    # /etc/kai/users.yaml) so that all known operators get a seeded
+    # directory on the install where this code first lands.
+    memory_owners = _collect_user_memory_owners(users_yaml_path)
+    memory_root = data_path / "memory"
+    legacy_global = memory_root / "MEMORY.md"
+    legacy_src_tree = PROJECT_ROOT / "home" / ".claude" / "MEMORY.md"
+    example_template = PROJECT_ROOT / "home" / ".claude" / "MEMORY.md.example"
+
+    # Resolve the primary operator's chat_id (first yaml entry). When
+    # users.yaml is absent or empty (first-ever install, single-user
+    # dev), leave memory/MEMORY.md alone - runtime code falls back to
+    # that legacy path when chat_id is None. This keeps local `make
+    # run` workflows identical to pre-#347 behavior.
+    primary_chat_id: int | None = memory_owners[0][0] if memory_owners else None
+
+    if primary_chat_id is not None:
+        primary_dir = memory_root / str(primary_chat_id)
+        primary_dst = primary_dir / "MEMORY.md"
+
+        if not primary_dst.exists():
+            if dry_run:
+                if legacy_global.is_file():
+                    print(f"[DRY RUN] Would move {legacy_global} -> {primary_dst}")
+                elif legacy_src_tree.is_file():
+                    print(f"[DRY RUN] Would copy {legacy_src_tree} -> {primary_dst}")
+                elif example_template.is_file():
+                    print(f"[DRY RUN] Would seed {primary_dst} from {example_template}")
+            else:
+                primary_dir.mkdir(parents=True, exist_ok=True)
+                if legacy_global.is_file():
+                    # Move, not copy - the legacy global path must not
+                    # survive this migration, or a stale file will shadow
+                    # the per-user read once one user's subdir fills up.
+                    shutil.move(str(legacy_global), str(primary_dst))
+                    print(f"  Migrated MEMORY.md to {primary_dst}")
+                elif legacy_src_tree.is_file():
+                    shutil.copy2(legacy_src_tree, primary_dst)
+                    print(f"  Migrated MEMORY.md to {primary_dst}")
+                elif example_template.is_file():
+                    shutil.copy2(example_template, primary_dst)
+                    print(f"  Seeded {primary_dst} from example template")
+                else:
+                    # Last-resort placeholder so the file is writable.
+                    primary_dst.write_text("# Memory\n")
+                    print(f"  Created empty {primary_dst}")
+
+        # Seed every other known user from the example template. Skips
+        # the primary (handled above) and any user whose subdir already
+        # has a MEMORY.md (idempotent across reinstalls).
+        for chat_id, _os_user in memory_owners[1:]:
+            user_dir = memory_root / str(chat_id)
+            user_dst = user_dir / "MEMORY.md"
+            if user_dst.exists():
+                continue
+            if dry_run:
+                print(f"[DRY RUN] Would seed {user_dst} from example template")
+                continue
+            user_dir.mkdir(parents=True, exist_ok=True)
+            if example_template.is_file():
+                shutil.copy2(example_template, user_dst)
+                print(f"  Seeded {user_dst} from example template")
+            else:
+                user_dst.write_text("# Memory\n")
+                print(f"  Created empty {user_dst}")
 
     # -- Uploaded files migration --
     # One-time: copy user-uploaded files from the install tree
@@ -1702,17 +1850,50 @@ def _apply_migrate(data_path: Path, install_path: Path, svc_uid: int, svc_gid: i
             print("  Uploaded files already migrated or no files to copy")
 
     # -- Memory directory ownership --
-    # Ensure the entire memory/ tree is owned by the service user.
-    # Subdirectories like qdrant/ are created at runtime by init_memory(),
-    # but if the service was ever started as root (e.g., a manual test run)
-    # or a prior install left stale ownership, those directories would be
-    # root-owned and the service user could not write to them.
+    # Two ownership tiers in a single tree:
+    #   (a) Service-owned: memory/, memory/qdrant/, memory/mem0_history.db,
+    #       memory/extractor_cwd/, and any other kai-written artifacts.
+    #       Init_memory() creates qdrant/ and mem0_history.db at runtime
+    #       in the main process (service user), so they must be writable
+    #       by the service user.
+    #   (b) Per-user-owned: memory/<chat_id>/ subdirectories whose chat_id
+    #       maps to a users.yaml entry with an explicit os_user. The
+    #       inner Claude subprocess for that user runs via sudo -H -u
+    #       <os_user>, so MEMORY.md ownership must match or writes fail
+    #       with the #347 regression.
+    # Subdirectories whose chat_id does not appear in users.yaml (or whose
+    # user has no os_user - i.e., runs as the service user) fall through
+    # to the service-owned tier. Same for any stray file at the top level.
     memory_tree = data_path / "memory"
     if memory_tree.is_dir():
+        # Build a chat_id -> (uid, gid) map for users with an explicit
+        # os_user. pwd.getpwnam failures (username in users.yaml that
+        # does not exist on this host) are hard-failed: silently falling
+        # back to service ownership would recreate the #347 bug. Better
+        # to surface the misconfiguration now.
+        per_user_ids: dict[str, tuple[int, int]] = {}
+        for chat_id, os_user in memory_owners:
+            if os_user is None:
+                continue
+            pwd_entry = pwd.getpwnam(os_user)
+            per_user_ids[str(chat_id)] = (pwd_entry.pw_uid, pwd_entry.pw_gid)
+
         if dry_run:
-            print(f"[DRY RUN] Would set ownership on {memory_tree} ({svc_uid}:{svc_gid})")
+            print(f"[DRY RUN] Would set ownership on {memory_tree} (service + per-user)")
+            for name, (uid, gid) in per_user_ids.items():
+                print(f"[DRY RUN]   {memory_tree / name} -> ({uid}:{gid})")
         else:
-            _set_ownership(memory_tree, svc_uid, svc_gid, recursive=True)
+            # Top-level directory: service-owned so the service user
+            # can create new per-user subdirs on add-user flows.
+            _set_ownership(memory_tree, svc_uid, svc_gid, recursive=False)
+            for entry in memory_tree.iterdir():
+                if entry.is_dir() and entry.name in per_user_ids:
+                    uid, gid = per_user_ids[entry.name]
+                    _set_ownership(entry, uid, gid, recursive=True)
+                else:
+                    # qdrant/, mem0_history.db, extractor_cwd/, and any
+                    # memory/<chat_id>/ whose user has no os_user set.
+                    _set_ownership(entry, svc_uid, svc_gid, recursive=True)
 
 
 def _cmd_apply() -> None:

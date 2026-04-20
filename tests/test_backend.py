@@ -16,6 +16,7 @@ from kai.backend import (
     StreamEvent,
     build_foreign_workspace_reminder,
     build_session_context,
+    ensure_user_memory,
     get_workspace_system_prompt,
     prepend_to_prompt,
 )
@@ -423,3 +424,214 @@ class TestDataTypes:
         """ApiContext services_info defaults to empty list."""
         ctx = ApiContext(webhook_port=8080, webhook_secret="s")
         assert ctx.services_info == []
+
+
+# ── Per-user MEMORY.md (#347) ───────────────────────────────────────
+#
+# #347: MEMORY.md moved from a single global file at
+# DATA_DIR/memory/MEMORY.md to a per-user path at
+# DATA_DIR/memory/<chat_id>/MEMORY.md. The tests below cover the four
+# scoped behaviors called out in the issue's acceptance criteria:
+#
+#   (a) build_session_context reads the chat_id-scoped path when
+#       chat_id is set;
+#   (b) build_session_context falls back to the legacy global path
+#       when chat_id is None (dev / single-user harnesses);
+#   (c) ensure_user_memory seeds the per-user directory + file so a
+#       user added post-install has a writable starting point;
+#   (d) two chat_ids end up with independent files, so writes to one
+#       user's memory never surface in another user's context.
+
+
+class TestPerUserMemoryRead:
+    """build_session_context reads the chat_id-scoped MEMORY.md."""
+
+    def _api(self) -> ApiContext:
+        return ApiContext(webhook_port=8080, webhook_secret="s")
+
+    def test_reads_chat_scoped_path(self, tmp_path):
+        """Memory at memory/<chat_id>/MEMORY.md is read when chat_id is set."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+        user_memory_dir = data_dir / "memory" / "12345"
+        user_memory_dir.mkdir(parents=True)
+        (user_memory_dir / "MEMORY.md").write_text("Fact for user 12345.")
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=12345,
+                data_dir=data_dir,
+            )
+
+        assert "Fact for user 12345." in result
+        assert "persistent memory" in result
+
+    def test_ignores_legacy_global_when_chat_id_set(self, tmp_path):
+        """With chat_id set, the legacy global MEMORY.md is not read.
+
+        Prevents a half-migrated install (legacy file still present,
+        per-user dir empty) from silently leaking another user's notes.
+        """
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+        memory_root = data_dir / "memory"
+        memory_root.mkdir(parents=True)
+        # Legacy global content that must NOT leak:
+        (memory_root / "MEMORY.md").write_text("STALE GLOBAL DO NOT LEAK")
+        # Per-user dir exists but is empty (no MEMORY.md yet):
+        (memory_root / "99").mkdir()
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=99,
+                data_dir=data_dir,
+            )
+
+        assert "STALE GLOBAL DO NOT LEAK" not in result
+        # And the per-user read path reports "not yet created", matching
+        # the OSError branch in build_session_context.
+        assert "(not yet created)" in result
+
+    def test_none_chat_id_uses_legacy_path(self, tmp_path):
+        """chat_id=None falls back to the legacy global path (dev case)."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+        memory_root = data_dir / "memory"
+        memory_root.mkdir(parents=True)
+        (memory_root / "MEMORY.md").write_text("Dev-mode single-user content.")
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=None,
+                data_dir=data_dir,
+            )
+
+        assert "Dev-mode single-user content." in result
+
+
+class TestEnsureUserMemory:
+    """ensure_user_memory bootstraps the per-user directory + file."""
+
+    def test_seeds_from_example_template(self, tmp_path, monkeypatch):
+        """Creates memory/<chat_id>/MEMORY.md from the example template."""
+        data_dir = tmp_path / "data"
+        project_root = tmp_path / "project"
+        example_dir = project_root / "home" / ".claude"
+        example_dir.mkdir(parents=True)
+        (example_dir / "MEMORY.md.example").write_text("# Memory\n\n## About the User\n")
+
+        # ensure_user_memory reads PROJECT_ROOT module-level at call
+        # time, so patching backend.PROJECT_ROOT is sufficient.
+        monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
+
+        ensure_user_memory(42, data_dir)
+
+        target = data_dir / "memory" / "42" / "MEMORY.md"
+        assert target.is_file()
+        assert "About the User" in target.read_text()
+
+    def test_no_template_creates_placeholder(self, tmp_path, monkeypatch):
+        """Falls back to minimal '# Memory\\n' when no example template exists."""
+        data_dir = tmp_path / "data"
+        project_root = tmp_path / "project"
+        # No example file under home/.claude/.
+        (project_root / "home" / ".claude").mkdir(parents=True)
+
+        monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
+
+        ensure_user_memory(7, data_dir)
+
+        target = data_dir / "memory" / "7" / "MEMORY.md"
+        assert target.is_file()
+        assert target.read_text() == "# Memory\n"
+
+    def test_idempotent_does_not_overwrite(self, tmp_path, monkeypatch):
+        """Existing per-user MEMORY.md is preserved across repeated calls."""
+        data_dir = tmp_path / "data"
+        project_root = tmp_path / "project"
+        example_dir = project_root / "home" / ".claude"
+        example_dir.mkdir(parents=True)
+        (example_dir / "MEMORY.md.example").write_text("TEMPLATE")
+
+        monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
+
+        user_dir = data_dir / "memory" / "100"
+        user_dir.mkdir(parents=True)
+        existing = user_dir / "MEMORY.md"
+        existing.write_text("already-captured user content")
+
+        ensure_user_memory(100, data_dir)
+
+        # Same content, not the template.
+        assert existing.read_text() == "already-captured user content"
+
+    def test_chat_id_none_is_noop(self, tmp_path, monkeypatch):
+        """chat_id=None does nothing - the dev/legacy path handles that case."""
+        data_dir = tmp_path / "data"
+        project_root = tmp_path / "project"
+        (project_root / "home" / ".claude").mkdir(parents=True)
+        monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
+
+        ensure_user_memory(None, data_dir)
+
+        # No memory/ directory was created.
+        assert not (data_dir / "memory").exists()
+
+
+class TestPerUserMemoryIsolation:
+    """Writes to one user's MEMORY.md never appear in another user's context."""
+
+    def _api(self) -> ApiContext:
+        return ApiContext(webhook_port=8080, webhook_secret="s")
+
+    def test_two_users_independent_files(self, tmp_path):
+        """Two chat_ids get two distinct MEMORY.md files on disk, and
+        build_session_context routes each request to the correct file."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+
+        user_a = data_dir / "memory" / "1001"
+        user_b = data_dir / "memory" / "1002"
+        user_a.mkdir(parents=True)
+        user_b.mkdir(parents=True)
+        (user_a / "MEMORY.md").write_text("USER_A_SECRET")
+        (user_b / "MEMORY.md").write_text("USER_B_SECRET")
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result_a = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=1001,
+                data_dir=data_dir,
+            )
+            result_b = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=1002,
+                data_dir=data_dir,
+            )
+
+        assert "USER_A_SECRET" in result_a
+        assert "USER_B_SECRET" not in result_a
+        assert "USER_B_SECRET" in result_b
+        assert "USER_A_SECRET" not in result_b

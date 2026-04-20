@@ -34,6 +34,7 @@ from kai.backend import (
     StreamEvent,
     build_foreign_workspace_reminder,
     build_session_context,
+    ensure_user_memory,
     prepend_to_prompt,
 )
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file
@@ -348,6 +349,11 @@ class GooseBackend(AgentBackend):
         # lives in backend.py as shared functions.
         if self._fresh_session:
             self._fresh_session = False
+            # Mirror the ClaudeCodeBackend.send() path: ensure the
+            # per-user MEMORY.md directory exists before building the
+            # session context. See backend.ensure_user_memory() for
+            # why this is a cheap, idempotent no-op in production.
+            ensure_user_memory(chat_id, DATA_DIR)
             session_ctx = build_session_context(
                 workspace=self.workspace,
                 home_workspace=self.home_workspace,

@@ -35,7 +35,6 @@ The shutdown sequence (in the finally block) reverses this order:
 import asyncio
 import logging
 import re
-import shutil
 from datetime import UTC, datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -88,30 +87,6 @@ def setup_logging() -> None:
     # Silence noisy per-request HTTP logs and APScheduler tick logs
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
-
-
-def _bootstrap_memory() -> None:
-    """
-    Create MEMORY.md from the example template if it doesn't exist yet.
-
-    Called once at startup. Creates the DATA_DIR/memory/ directory and
-    copies MEMORY.md.example from the home workspace as a starting point.
-    After this one-time setup, the inner Claude maintains the file.
-    """
-    memory_dir = DATA_DIR / "memory"
-    memory_file = memory_dir / "MEMORY.md"
-    if memory_file.exists():
-        return
-
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    example = PROJECT_ROOT / "home" / ".claude" / "MEMORY.md.example"
-    if example.exists():
-        shutil.copy2(example, memory_file)
-        logging.info("Bootstrapped MEMORY.md from example template")
-    else:
-        # Create a minimal file so the inner Claude has something to write to
-        memory_file.write_text("# Memory\n")
-        logging.info("Created empty MEMORY.md (no example template found)")
 
 
 # ── File cleanup ─────────────────────────────────────────────────────
@@ -277,13 +252,10 @@ def main() -> None:
         # SubprocessPool. Each user's workspace is restored lazily on
         # their first message (in pool.send()). No startup restore needed.
 
-        # Bootstrap personal memory if it doesn't exist yet.
-        # Non-fatal: a permission or disk error here should not prevent
-        # the bot from starting. The memory layer is a nice-to-have.
-        try:
-            _bootstrap_memory()
-        except OSError:
-            logging.warning("Could not bootstrap MEMORY.md", exc_info=True)
+        # Personal MEMORY.md is now per-user under memory/<chat_id>/
+        # and is bootstrapped lazily by the backend on first session
+        # (backend.ensure_user_memory). No startup bootstrap is needed;
+        # that call is intentionally gone. See issue #347.
 
         # Semantic memory (Mem0 + Qdrant). init_memory() is the single
         # entry point; it no-ops when MEMORY_ENABLED is False, so this

@@ -28,6 +28,7 @@ from kai.install import (
     _cmd_config,
     _cmd_status,
     _collect_os_users_from_yaml,
+    _collect_user_memory_owners,
     _copy_tree,
     _file_checksum,
     _generate_env_file,
@@ -576,6 +577,85 @@ class TestCollectOsUsersFromYaml:
         )
         with pytest.raises(ValueError, match=str(path)):
             _collect_os_users_from_yaml(path)
+
+
+class TestCollectUserMemoryOwners:
+    """
+    Tests for the (telegram_id, os_user) loader used by the per-user
+    MEMORY.md migration in #347. Mirrors the structure of
+    TestCollectOsUsersFromYaml: same trust boundary, same validation
+    semantics, but returns tuples instead of just usernames.
+    """
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        assert _collect_user_memory_owners(tmp_path / "nope.yaml") == []
+
+    def test_empty_file_returns_empty(self, tmp_path):
+        path = tmp_path / "users.yaml"
+        path.write_text("", encoding="utf-8")
+        assert _collect_user_memory_owners(path) == []
+
+    def test_no_users_key_returns_empty(self, tmp_path):
+        path = tmp_path / "users.yaml"
+        path.write_text("other_key: 1\n", encoding="utf-8")
+        assert _collect_user_memory_owners(path) == []
+
+    def test_user_without_telegram_id_skipped(self, tmp_path):
+        """A user entry without an int telegram_id cannot map to a chat dir."""
+        path = tmp_path / "users.yaml"
+        path.write_text(
+            yaml.safe_dump({"users": [{"name": "anon"}, {"telegram_id": 42}]}),
+            encoding="utf-8",
+        )
+        assert _collect_user_memory_owners(path) == [(42, None)]
+
+    def test_user_without_os_user_returns_none(self, tmp_path):
+        """No os_user means the inner Claude runs as the service user."""
+        path = tmp_path / "users.yaml"
+        path.write_text(
+            yaml.safe_dump({"users": [{"telegram_id": 11, "name": "primary"}]}),
+            encoding="utf-8",
+        )
+        assert _collect_user_memory_owners(path) == [(11, None)]
+
+    def test_user_with_os_user_returns_tuple(self, tmp_path):
+        path = tmp_path / "users.yaml"
+        path.write_text(
+            yaml.safe_dump({"users": [{"telegram_id": 11, "os_user": "alpha"}]}),
+            encoding="utf-8",
+        )
+        assert _collect_user_memory_owners(path) == [(11, "alpha")]
+
+    def test_first_seen_order_preserved(self, tmp_path):
+        """The migration depends on tuples[0] being the primary operator."""
+        path = tmp_path / "users.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    "users": [
+                        {"telegram_id": 100, "os_user": "alpha"},
+                        {"telegram_id": 200, "os_user": "beta"},
+                        {"telegram_id": 300},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert _collect_user_memory_owners(path) == [
+            (100, "alpha"),
+            (200, "beta"),
+            (300, None),
+        ]
+
+    def test_invalid_os_user_raises(self, tmp_path):
+        """Same hard-fail as _collect_os_users_from_yaml: never silently skip."""
+        path = tmp_path / "users.yaml"
+        path.write_text(
+            yaml.safe_dump({"users": [{"telegram_id": 1, "os_user": "bad)user"}]}),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match=str(path)):
+            _collect_user_memory_owners(path)
 
 
 class TestGenerateSudoersValidation:
@@ -1773,6 +1853,19 @@ class TestSrcChecksum:
 
 
 class TestApplyMigrate:
+    @pytest.fixture(autouse=True)
+    def _isolate_users_yaml(self, monkeypatch):
+        """
+        Default the per-user MEMORY.md migration to a no-op for tests
+        that do not care about it. Without this fixture, _apply_migrate
+        falls through to its real default of /etc/kai/users.yaml, which
+        on a developer machine is a populated file that triggers
+        chown calls outside the tmp_path sandbox. Tests that DO care
+        about memory migration pass `users_yaml_path=` explicitly and
+        are unaffected by this stub.
+        """
+        monkeypatch.setattr("kai.install._collect_user_memory_owners", lambda _path: [])
+
     def test_copies_database(self, tmp_path, monkeypatch):
         """Copies kai.db from PROJECT_ROOT to data_path when destination doesn't exist."""
         # Set up source database
@@ -1953,50 +2046,6 @@ class TestApplyMigrate:
         output = capsys.readouterr().out
         assert "already migrated" in output
 
-    def test_copies_memory(self, tmp_path, monkeypatch, capsys):
-        """Copies MEMORY.md from home/.claude/ to data_path/memory/."""
-        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
-        claude_dir = tmp_path / "src" / "home" / ".claude"
-        claude_dir.mkdir(parents=True)
-        (claude_dir / "MEMORY.md").write_text("User prefers dry humor.")
-
-        data_path = tmp_path / "data"
-        data_path.mkdir()
-        (data_path / "logs").mkdir()
-        (data_path / "memory").mkdir()
-
-        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
-
-        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
-
-        memory_dst = data_path / "memory" / "MEMORY.md"
-        assert memory_dst.exists()
-        assert memory_dst.read_text() == "User prefers dry humor."
-        # Source preserved
-        assert (claude_dir / "MEMORY.md").exists()
-        assert "Migrated MEMORY.md" in capsys.readouterr().out
-
-    def test_memory_skips_existing(self, tmp_path, monkeypatch):
-        """Does not overwrite MEMORY.md that already exists at the destination."""
-        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
-        claude_dir = tmp_path / "src" / "home" / ".claude"
-        claude_dir.mkdir(parents=True)
-        (claude_dir / "MEMORY.md").write_text("old content")
-
-        data_path = tmp_path / "data"
-        data_path.mkdir()
-        (data_path / "logs").mkdir()
-        memory_dir = data_path / "memory"
-        memory_dir.mkdir()
-        (memory_dir / "MEMORY.md").write_text("existing personalized content")
-
-        # Mock chown - the ownership fix walks the memory tree unconditionally
-        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
-
-        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
-
-        assert (memory_dir / "MEMORY.md").read_text() == "existing personalized content"
-
     def test_copies_uploaded_files(self, tmp_path, monkeypatch):
         """Copies uploaded files from home/files/ to data_path/files/."""
         install_path = tmp_path / "install"
@@ -2102,6 +2151,215 @@ class TestApplyMigrate:
         assert str(memory_dir / "MEMORY.md") in chowned_paths
         # All entries should use the service user's uid/gid.
         assert all(uid == 501 and gid == 20 for _, uid, gid in chowned)
+
+
+# ── Per-user MEMORY.md migration ─────────────────────────────────────
+#
+# These tests intentionally live OUTSIDE TestApplyMigrate so that the
+# autouse `_isolate_users_yaml` fixture (which stubs
+# _collect_user_memory_owners to return []) does not apply. The tests
+# below need the real function to exercise the per-user migration path
+# end-to-end. Each test passes `users_yaml_path=` explicitly, isolated
+# under tmp_path, so nothing escapes the sandbox.
+
+
+class TestApplyMigratePerUserMemory:
+    def test_copies_memory_to_primary_chat_dir(self, tmp_path, monkeypatch, capsys):
+        """
+        Migration copies MEMORY.md from the legacy source-tree location
+        to the per-user directory of the first user in users.yaml (the
+        primary operator). Pre-#347 the destination was a single global
+        memory/MEMORY.md; the per-user split made that path unreachable
+        for non-service-user subprocesses.
+        """
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        claude_dir = tmp_path / "src" / "home" / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "MEMORY.md").write_text("User prefers dry humor.")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "memory").mkdir()
+
+        # Minimal users.yaml: one user, no os_user (runs as service user).
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 7777\n    name: primary\n    role: admin\n")
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        # The legacy source-tree file landed under memory/<chat_id>/.
+        memory_dst = data_path / "memory" / "7777" / "MEMORY.md"
+        assert memory_dst.exists()
+        assert memory_dst.read_text() == "User prefers dry humor."
+        # Source-tree backup preserved (move/copy semantics: source-tree
+        # legacy path is copied, not moved, so the backup survives).
+        assert (claude_dir / "MEMORY.md").exists()
+        # No stray file at the legacy global path.
+        assert not (data_path / "memory" / "MEMORY.md").exists()
+        assert "Migrated MEMORY.md" in capsys.readouterr().out
+
+    def test_moves_legacy_global_memory_to_primary(self, tmp_path, monkeypatch, capsys):
+        """
+        A pre-#347 install that already migrated to the global
+        memory/MEMORY.md gets that file MOVED into the primary user's
+        subdirectory. Move (not copy) is required: a stale global file
+        would shadow the per-user read once additional users join.
+        """
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        memory_dir = data_path / "memory"
+        memory_dir.mkdir()
+        legacy_global = memory_dir / "MEMORY.md"
+        legacy_global.write_text("operator notes from before #347")
+
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 8888\n    name: primary\n    role: admin\n")
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        primary_dst = memory_dir / "8888" / "MEMORY.md"
+        assert primary_dst.exists()
+        assert primary_dst.read_text() == "operator notes from before #347"
+        # Critical: legacy global MUST be gone (move, not copy) so a
+        # later read at memory/MEMORY.md cannot leak this content.
+        assert not legacy_global.exists()
+        assert "Migrated MEMORY.md" in capsys.readouterr().out
+
+    def test_memory_skips_existing_per_user(self, tmp_path, monkeypatch):
+        """
+        Does not overwrite a per-user MEMORY.md that already exists at
+        the destination. Idempotent across reinstalls.
+        """
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        claude_dir = tmp_path / "src" / "home" / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "MEMORY.md").write_text("legacy content from source tree")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        primary_dir = data_path / "memory" / "9999"
+        primary_dir.mkdir(parents=True)
+        existing = primary_dir / "MEMORY.md"
+        existing.write_text("existing personalized content")
+
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 9999\n    name: primary\n    role: admin\n")
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        assert existing.read_text() == "existing personalized content"
+
+    def test_seeds_additional_users_from_template(self, tmp_path, monkeypatch):
+        """
+        Users beyond the primary get a fresh MEMORY.md seeded from the
+        example template, never the legacy content. One operator's notes
+        must not become another's starting state.
+        """
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        claude_dir = tmp_path / "src" / "home" / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "MEMORY.md").write_text("PRIMARY_PRIVATE_NOTES")
+        (claude_dir / "MEMORY.md.example").write_text("# Memory\n\n## About the User\n")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "memory").mkdir()
+
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            "users:\n"
+            "  - telegram_id: 100\n"
+            "    name: primary\n"
+            "    role: admin\n"
+            "  - telegram_id: 200\n"
+            "    name: secondary\n"
+            "    role: user\n"
+        )
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        primary = (data_path / "memory" / "100" / "MEMORY.md").read_text()
+        secondary = (data_path / "memory" / "200" / "MEMORY.md").read_text()
+
+        # Primary inherits legacy content.
+        assert "PRIMARY_PRIVATE_NOTES" in primary
+        # Secondary gets template only - never the primary's content.
+        assert "PRIMARY_PRIVATE_NOTES" not in secondary
+        assert "About the User" in secondary
+
+    def test_memory_no_users_yaml_is_noop(self, tmp_path, monkeypatch):
+        """
+        With no users.yaml (first-ever install / single-user dev), the
+        memory migration is a no-op. Runtime falls back to the legacy
+        global path when chat_id is None, so leaving the legacy file
+        in place keeps `python -m kai` working unchanged.
+        """
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        claude_dir = tmp_path / "src" / "home" / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "MEMORY.md").write_text("dev content")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "memory").mkdir()
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=tmp_path / "does-not-exist.yaml",
+        )
+
+        # No per-user dirs created, no global file written.
+        assert list((data_path / "memory").iterdir()) == []
 
 
 # ── Service lifecycle ────────────────────────────────────────────────

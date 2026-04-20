@@ -15,12 +15,13 @@ prompt assembly that is identical across all backends.
 """
 
 import logging
+import shutil
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kai.config import WorkspaceConfig
+from kai.config import PROJECT_ROOT, WorkspaceConfig
 from kai.history import get_recent_history
 
 log = logging.getLogger(__name__)
@@ -223,7 +224,20 @@ def build_session_context(
     # so it survives make install. Available regardless of which
     # workspace the inner Claude is operating in. try/except guards
     # against race and permission errors (same pattern as identity).
-    memory_path = data_dir / "memory" / "MEMORY.md"
+    #
+    # Per-user scoping (#347): when chat_id is set, the file lives under
+    # memory/<chat_id>/MEMORY.md so each user has their own writable
+    # copy. The inner Claude subprocess runs as that user's os_user
+    # (via sudo -H -u), so ownership of the subdirectory is set to
+    # match. A non-service user cannot write the legacy single-global
+    # file, which was the bug this scoping fixes. Falls back to the
+    # legacy global path when chat_id is None (local-dev backends
+    # with no multi-user config) so nothing regresses on single-user
+    # setups that never hit the multi-user pool path.
+    if chat_id is not None:
+        memory_path = data_dir / "memory" / str(chat_id) / "MEMORY.md"
+    else:
+        memory_path = data_dir / "memory" / "MEMORY.md"
     try:
         memory = memory_path.read_text().strip()
         if memory:
@@ -344,6 +358,60 @@ def build_session_context(
     # No trailing \n\n here - prepend_to_prompt() adds the separator
     # between the context block and the user's message.
     return "\n\n".join(parts)
+
+
+def ensure_user_memory(chat_id: int | None, data_dir: Path) -> None:
+    """
+    Lazily create the per-user MEMORY.md directory and seed file.
+
+    Idempotent and cheap: a stat, a possible mkdir, a possible copy2.
+    Called on every send() path before build_session_context() so that
+    a user who appeared after install (e.g., a new entry in users.yaml
+    without a reinstall) still gets a writable memory surface on their
+    first message.
+
+    In production the install step (install.py ~line 1715) pre-creates
+    and chowns `memory/<chat_id>/` to that user's os_user, so mkdir
+    here is a no-op. For dev/test runs without a prior install, this
+    function does the whole job - mkdir + seed copy - inheriting the
+    caller's ownership. That matches the single-user dev case where
+    the bot process is the only identity in play.
+
+    Intentionally no-ops when chat_id is None. That path reads and
+    writes `memory/MEMORY.md` directly (legacy global location) for
+    backends that never see a chat_id - dev harnesses, smoke scripts.
+
+    Silent on OSError: a permissions issue creating per-user memory
+    must not prevent the bot from answering a message. The read path
+    in build_session_context already returns a placeholder string on
+    missing files, so the downstream session still boots cleanly.
+    """
+    if chat_id is None:
+        return
+
+    user_memory_dir = data_dir / "memory" / str(chat_id)
+    user_memory_file = user_memory_dir / "MEMORY.md"
+
+    try:
+        user_memory_dir.mkdir(parents=True, exist_ok=True)
+        if not user_memory_file.exists():
+            # Seed from the example template if one ships with the
+            # source tree. Copy2 preserves mode bits so a deliberately
+            # permissive example stays that way.
+            example = PROJECT_ROOT / "home" / ".claude" / "MEMORY.md.example"
+            if example.is_file():
+                shutil.copy2(example, user_memory_file)
+            else:
+                # No template available (unusual - only happens when the
+                # install tree is incomplete). Create a minimal placeholder
+                # so the subprocess has a writable file to edit.
+                user_memory_file.write_text("# Memory\n")
+    except OSError:
+        log.warning(
+            "ensure_user_memory: could not bootstrap %s",
+            user_memory_file,
+            exc_info=True,
+        )
 
 
 def build_foreign_workspace_reminder(workspace: Path, home_workspace: Path) -> str | None:
