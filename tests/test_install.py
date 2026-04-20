@@ -948,11 +948,7 @@ class TestCmdConfig:
 
     @staticmethod
     def _base_inputs(memory_block: list[str]) -> list[str]:
-        """Build a default input list with a configurable memory block.
-
-        Captures the wizard's prompt order so each memory test only needs
-        to vary the section under test. Mirrors test_writes_install_conf.
-        """
+        """Default wizard inputs with a swappable memory block."""
         return [
             "/opt/kai",  # install dir
             "/var/lib/kai",  # data dir

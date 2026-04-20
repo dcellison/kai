@@ -837,12 +837,14 @@ def _cmd_config() -> None:
     # Semantic memory: global env vars (per-user partitioning is runtime).
     # Toggling memory_enabled from true back to false correctly drops
     # MEMORY_* keys here, so the next /etc/kai/env reflects the new state.
+    # Numeric comparisons (not string) so "0.010" or "2000.0" are not
+    # treated as non-default and spuriously written.
     if memory_enabled:
         env["MEMORY_ENABLED"] = "true"
         if memory_extraction_enabled:
             env["MEMORY_EXTRACTION_ENABLED"] = "true"
-        if memory_extraction_budget_usd != "0.01":
-            env["MEMORY_EXTRACTION_BUDGET_USD"] = memory_extraction_budget_usd
+            if float(memory_extraction_budget_usd) != 0.01:
+                env["MEMORY_EXTRACTION_BUDGET_USD"] = memory_extraction_budget_usd
         if int(memory_token_budget) != 2000:
             env["MEMORY_TOKEN_BUDGET"] = memory_token_budget
 
