@@ -101,17 +101,6 @@ _LIST_TRUNCATE_LEN = 80
 # hard ceiling on session duration.
 _CACHE_TTL_S = 30 * 60
 
-# Unicode block character for the dashboard bar chart (spec §6.1
-# mock-up uses ▓). Plain text mode renders this fine on every
-# Telegram client.
-_BAR_CHAR = "\u2593"
-
-# Width of the dashboard bar chart in characters, scaled to the
-# largest tag count. Eight is wide enough to show contrast between
-# 38 and 5 without overflowing the typical phone screen.
-_BAR_WIDTH = 8
-
-
 # ── Per-chat navigation cache ───────────────────────────────────────
 
 
@@ -315,20 +304,6 @@ def _format_date(iso_str: str, with_time: bool = False) -> str:
     return iso_str[:10]
 
 
-def _bar(count: int, max_count: int, width: int = _BAR_WIDTH) -> str:
-    """Render a unicode-block bar of length proportional to count.
-
-    A bar is at least one block wide for any nonzero count so a tag
-    with a single fact is visually distinguishable from a tag with
-    zero facts (which is hidden from the dashboard anyway, but the
-    builder is also reused for stats).
-    """
-    if max_count <= 0 or count <= 0:
-        return ""
-    n = max(1, round((count / max_count) * width))
-    return _BAR_CHAR * n
-
-
 # ── Builder: dashboard ──────────────────────────────────────────────
 
 
@@ -360,23 +335,19 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
         # bypassed. Surface as empty rather than crashing.
         return _MSG_NO_FACTS, None
 
-    max_count = nonzero[0][1]
-    # Pad tag column to longest tag name so the count column is
-    # column-aligned without monospace assumptions (it'll still
-    # left-align in proportional fonts; alignment in monospace is
-    # the bonus).
-    label_width = max(len(tag) for tag, _ in nonzero)
-
+    # Per-tag counts are carried by the inline buttons below
+    # (`tag (count)` labels), so the dashboard text intentionally
+    # stops at the summary header and confidence footer. Per #351,
+    # rendering the same counts in both surfaces was redundant - the
+    # original spec §6.1 mock-up included a bar chart here, but
+    # operator feedback on real data showed the bars duplicated what
+    # the buttons already telegraph through the parenthesized counts.
     lines: list[str] = []
     summary = f"Memories: {stats.extracted_count} facts across {len(nonzero)} tags."
     lines.append(summary)
     lines.append("")
-    for tag, count in nonzero:
-        bar = _bar(count, max_count)
-        lines.append(f"  {tag.ljust(label_width)}  {count:>3}   {bar}")
-    lines.append("")
-    # Footer summary: median + min confidence. Spec §6.1 calls this
-    # the "first-glance tuning signal." Median is the persisted value;
+    # Footer line: median + min confidence. Spec §6.1 calls this the
+    # "first-glance tuning signal." Median is the persisted value;
     # the spec mock-up labels it "avg" but median is more honest about
     # what is shown.
     median = stats.confidence_median

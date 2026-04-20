@@ -225,20 +225,6 @@ class TestFormatDate:
         assert memory_command._format_date("2026-04-17", with_time=True) == "2026-04-17"
 
 
-class TestBar:
-    def test_zero_count_empty_bar(self):
-        assert memory_command._bar(0, 10) == ""
-
-    def test_max_count_full_width(self):
-        bar = memory_command._bar(10, 10, width=8)
-        assert bar == "\u2593" * 8
-
-    def test_nonzero_min_one_block(self):
-        # A single-fact tag should not render as an empty bar; users
-        # would lose the visual signal that the tag exists.
-        assert memory_command._bar(1, 100, width=8) == "\u2593"
-
-
 # ── Builder: dashboard ─────────────────────────────────────────────
 
 
@@ -257,14 +243,24 @@ class TestBuildDashboard:
         )
         text, kb = memory_command._build_dashboard(stats)
         assert "10 facts across 3 tags" in text
-        # Sort order: descending count. Use the leading-space prefix
-        # so the bare tag rows match without colliding with the
-        # "X facts across" wording in the summary header.
-        assert text.index("  preference") < text.index("  fact") < text.index("  decision")
         assert "median 0.86, min 0.52" in text
+        # Per #351 the dashboard text intentionally omits per-tag
+        # rows - counts live on the buttons. Two regression checks:
+        # (1) the bar-chart unicode block must be gone entirely; (2)
+        # the leading-space row prefix that the old per-tag rows used
+        # ("  preference" etc.) must not appear. Substring checks for
+        # bare tag names would false-match "facts" in the summary
+        # header, so we anchor on the row prefix instead.
+        assert "\u2593" not in text, "bar-chart character should not appear in dashboard text"
+        for tag in ("preference", "fact", "decision"):
+            assert f"  {tag}" not in text, f"per-tag row for {tag!r} should not appear in dashboard text"
         assert kb is not None
         # 3 tag rows + 1 footer row of (Search, Stats).
         assert len(kb.inline_keyboard) == 4
+        # Tag buttons carry the count in parens, ordered by descending
+        # count. Each button is in its own row (one row per tag).
+        tag_button_labels = [row[0].text for row in kb.inline_keyboard[:-1]]
+        assert tag_button_labels == ["preference (5)", "fact (3)", "decision (2)"]
         # Footer row holds the two utility buttons.
         footer = kb.inline_keyboard[-1]
         assert [btn.text for btn in footer] == ["Search", "Stats"]
