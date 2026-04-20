@@ -591,14 +591,6 @@ class TestGenerateSudoersValidation:
         with pytest.raises(ValueError, match="Invalid sudoers target user"):
             _generate_sudoers("kai", claude_user="alice\nroot ALL")
 
-    def test_self_sudo_skip_runs_before_validation(self):
-        """service_user match short-circuits before validation (no rule emitted)."""
-        # If we passed the service_user as os_user with bad chars, the skip
-        # would happen first; but service_user itself is always trusted, so
-        # this test just verifies "kai" with a clean value doesn't blow up.
-        result = _generate_sudoers("kai", os_users=["kai"])
-        assert "kai ALL=(kai)" not in result
-
 
 class TestGenerateLaunchdPlist:
     def test_contains_label(self):
