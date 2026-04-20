@@ -710,7 +710,9 @@ def _cmd_config() -> None:
     # (or memory_enabled=true itself) are written to the env dict below.
     memory_extraction_enabled = False
     memory_extraction_budget_usd = "0.01"
+    memory_extraction_timeout_s = "10"
     memory_token_budget = "2000"
+    memory_search_limit = "10"
     if memory_enabled:
         # Haiku extraction only fires when the active backend is Claude
         # (bot.py:3609 silently skips it otherwise - no startup error,
@@ -730,12 +732,40 @@ def _cmd_config() -> None:
                     if _validate_positive_float(memory_extraction_budget_usd):
                         break
                     print("  Must be a positive number.")
+                # Extraction timeout is the LLM-call hard cap inside
+                # memory_extraction.py:541. Default 10s is too aggressive
+                # for production - real extractions routinely take 20-30s
+                # and silently abort at the boundary (#345). Operators
+                # MUST be able to raise this without hand-editing the
+                # generated install.conf, which `sudo make install`
+                # rebuilds wholesale on every reinstall.
+                while True:
+                    memory_extraction_timeout_s = _prompt(
+                        "Per-extraction timeout in seconds (suggest 60 or higher)",
+                        existing_env.get("MEMORY_EXTRACTION_TIMEOUT_S", "10"),
+                    )
+                    if _validate_positive_int(memory_extraction_timeout_s):
+                        break
+                    print("  Must be a positive integer.")
         while True:
             memory_token_budget = _prompt(
                 "Memory context token budget per turn",
                 existing_env.get("MEMORY_TOKEN_BUDGET", "2000"),
             )
             if _validate_positive_int(memory_token_budget):
+                break
+            print("  Must be a positive integer.")
+        # Search limit caps the retrieval set returned from Mem0/Qdrant
+        # before the token-budget filter. Lower values reduce noise but
+        # may miss relevant facts; higher values pay an embedding-search
+        # cost per turn. Operator-tunable for the same reason as the
+        # token budget: workload-specific, regression class #345.
+        while True:
+            memory_search_limit = _prompt(
+                "Memory search result limit per query",
+                existing_env.get("MEMORY_SEARCH_LIMIT", "10"),
+            )
+            if _validate_positive_int(memory_search_limit):
                 break
             print("  Must be a positive integer.")
     print()
@@ -846,8 +876,20 @@ def _cmd_config() -> None:
             env["MEMORY_EXTRACTION_ENABLED"] = "true"
             if float(memory_extraction_budget_usd) != 0.01:
                 env["MEMORY_EXTRACTION_BUDGET_USD"] = memory_extraction_budget_usd
+            # Timeout written under the same gate as budget: both are
+            # extraction-only tunables. Numeric compare so "10" vs "10 "
+            # or "010" do not produce a spurious env entry equal to
+            # the dataclass default.
+            if int(memory_extraction_timeout_s) != 10:
+                env["MEMORY_EXTRACTION_TIMEOUT_S"] = memory_extraction_timeout_s
         if int(memory_token_budget) != 2000:
             env["MEMORY_TOKEN_BUDGET"] = memory_token_budget
+        # Search limit applies to retrieval (read path), not extraction
+        # (write path), so it sits outside the extraction guard but
+        # inside the memory_enabled guard. Disabling memory entirely
+        # naturally drops this key via the surrounding if.
+        if int(memory_search_limit) != 10:
+            env["MEMORY_SEARCH_LIMIT"] = memory_search_limit
 
     # Drop stale extraction keys when the backend isn't Claude. Mirrors
     # the CLAUDE_MODEL/CLAUDE_MAX_BUDGET_USD cleanup above: bot.py:3609
@@ -857,6 +899,7 @@ def _cmd_config() -> None:
     if agent_backend != "claude":
         env.pop("MEMORY_EXTRACTION_ENABLED", None)
         env.pop("MEMORY_EXTRACTION_BUDGET_USD", None)
+        env.pop("MEMORY_EXTRACTION_TIMEOUT_S", None)
 
     # Build and write install.conf
     conf = {
