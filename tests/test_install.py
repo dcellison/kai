@@ -1037,9 +1037,6 @@ class TestCmdConfig:
         _cmd_config()
 
         conf = json.loads((tmp_path / "install.conf").read_text())
-        # _generate_env_file is what _apply_secrets calls to render
-        # /etc/kai/env from the env dict. Round-tripping here proves the
-        # values reach the file the daemon actually reads at startup.
         rendered = _generate_env_file(conf["env"])
         assert 'MEMORY_ENABLED="true"' in rendered
         assert 'MEMORY_EXTRACTION_ENABLED="true"' in rendered
