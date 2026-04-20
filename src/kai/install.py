@@ -1735,10 +1735,13 @@ def _apply_migrate(
     #      common case on existing installs.
     #   2) PROJECT_ROOT/home/.claude/MEMORY.md - pre-DATA_DIR location
     #      from before the DATA_DIR migration shipped.
-    # Both are moved (not copied) so the global path cannot later read
-    # as stale state. If neither source exists, a per-user MEMORY.md
-    # is seeded from the home/.claude/MEMORY.md.example template so
-    # the inner Claude has a writable starting point on first message.
+    # legacy_global is moved (not copied) so the DATA_DIR global path
+    # cannot later read as stale state. legacy_src_tree is copied: it
+    # lives in a git-tracked directory and moving it would dirty the
+    # working tree on every install. If neither source exists, a
+    # per-user MEMORY.md is seeded from the home/.claude/MEMORY.md.example
+    # template so the inner Claude has a writable starting point on
+    # first message.
     # Subsequent users in users.yaml get the template, not the legacy
     # content, because one user's memory never belongs to another.
     #
