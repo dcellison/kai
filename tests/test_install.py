@@ -1085,6 +1085,73 @@ class TestCmdConfig:
         assert env["MEMORY_EXTRACTION_BUDGET_USD"] == "0.08"
         assert env["MEMORY_TOKEN_BUDGET"] == "4000"
 
+    def test_non_claude_backend_drops_stale_extraction_keys(self, tmp_path, monkeypatch):
+        """Switching from claude to goose strips MEMORY_EXTRACTION_* keys."""
+        monkeypatch.chdir(tmp_path)
+        conf_path = tmp_path / "install.conf"
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+
+        # Simulate a prior claude+extraction install. The wizard run
+        # below switches to goose; the extraction keys must not survive
+        # since bot.py:3609 silently ignores them on non-claude backends.
+        existing = {
+            "version": 1,
+            "env": {
+                "AGENT_BACKEND": "goose",
+                "MEMORY_ENABLED": "true",
+                "MEMORY_EXTRACTION_ENABLED": "true",
+                "MEMORY_EXTRACTION_BUDGET_USD": "0.05",
+            },
+        }
+        conf_path.write_text(json.dumps(existing))
+
+        inputs = iter(
+            [
+                "/opt/kai",  # install dir
+                "/var/lib/kai",  # data dir
+                "kai",  # service user
+                "darwin",  # platform
+                "fake-token",  # bot token
+                "12345",  # admin telegram ID
+                "admin",  # admin display name
+                "false",  # advanced user options
+                "polling",  # transport
+                "goose",  # agent backend (was claude)
+                "anthropic",  # goose provider
+                "sk-ant-test-key",  # API key
+                "sonnet",  # model
+                "120",  # timeout
+                "10.0",  # budget
+                "200000",  # max context window
+                "80",  # autocompact pct
+                "8080",  # port
+                "test-secret",  # webhook secret
+                "~/Projects",  # workspace base
+                "",  # allowed workspaces
+                "false",  # pr review enabled
+                "900",  # pr review timeout
+                "1.0",  # pr review budget
+                "false",  # issue triage
+                "",  # github notify chat id
+                "false",  # voice
+                "false",  # tts
+                "",  # claude user
+                "true",  # memory enabled (extraction prompt skipped: non-claude)
+                "2000",  # token budget
+                "",  # perplexity key
+            ]
+        )
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        env = json.loads(conf_path.read_text())["env"]
+        assert env["MEMORY_ENABLED"] == "true"
+        assert "MEMORY_EXTRACTION_ENABLED" not in env
+        assert "MEMORY_EXTRACTION_BUDGET_USD" not in env
+
 
 # ── Apply subcommand ─────────────────────────────────────────────────
 

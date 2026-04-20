@@ -712,9 +712,10 @@ def _cmd_config() -> None:
     memory_extraction_budget_usd = "0.01"
     memory_token_budget = "2000"
     if memory_enabled:
-        # Haiku extraction requires a Claude backend (config.py refuses
-        # to enable it otherwise). Skip the prompt for non-claude backends
-        # rather than offering an option the operator can't use.
+        # Haiku extraction only fires when the active backend is Claude
+        # (bot.py:3609 silently skips it otherwise - no startup error,
+        # no log line). Skip the prompt for non-claude backends rather
+        # than offer an option whose effect is invisible at runtime.
         if agent_backend == "claude":
             memory_extraction_enabled = _prompt_bool(
                 "Enable Haiku extraction (proactive memory writes)",
@@ -847,6 +848,15 @@ def _cmd_config() -> None:
                 env["MEMORY_EXTRACTION_BUDGET_USD"] = memory_extraction_budget_usd
         if int(memory_token_budget) != 2000:
             env["MEMORY_TOKEN_BUDGET"] = memory_token_budget
+
+    # Drop stale extraction keys when the backend isn't Claude. Mirrors
+    # the CLAUDE_MODEL/CLAUDE_MAX_BUDGET_USD cleanup above: bot.py:3609
+    # silently ignores these on non-claude backends, so leaving them in
+    # /etc/kai/env is misleading without effect. A user who flips backend
+    # from claude to goose should not see lingering extraction config.
+    if agent_backend != "claude":
+        env.pop("MEMORY_EXTRACTION_ENABLED", None)
+        env.pop("MEMORY_EXTRACTION_BUDGET_USD", None)
 
     # Build and write install.conf
     conf = {
