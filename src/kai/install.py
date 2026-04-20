@@ -34,6 +34,7 @@ import sys
 import tempfile
 import textwrap
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 import yaml
@@ -997,7 +998,73 @@ def _generate_users_yaml(
     return "\n".join(lines)
 
 
-def _generate_sudoers(service_user: str, claude_user: str | None = None) -> str:
+def _collect_os_users_from_yaml(users_yaml_path: str | Path) -> list[str]:
+    """
+    Read users.yaml and return distinct, non-empty os_user values.
+
+    The runtime (pool.py / claude.py) spawns the inner Claude as each user's
+    `os_user` via `sudo -u`. That requires a matching sudoers rule for every
+    distinct os_user. Without this loader, only the legacy single CLAUDE_USER
+    env var got a rule, and additional users had to be hand-added with visudo
+    only to be wiped by the next `make install`.
+
+    The reader is intentionally lightweight: it does not validate roles,
+    models, or providers (config._load_user_configs already does that at
+    runtime). Install only needs the os_user strings.
+
+    Behavior:
+        - Missing file → []   (first install: users.yaml may not exist yet)
+        - Empty / non-dict / no `users:` key → []
+        - Malformed YAML → raises (yaml.YAMLError); install should fail loudly
+          rather than silently emit no per-user rules
+        - Non-string / empty / whitespace-only os_user values are skipped
+        - Duplicate os_user values are deduplicated, preserving first-seen order
+
+    Args:
+        users_yaml_path: Path to users.yaml (typically /etc/kai/users.yaml).
+
+    Returns:
+        Ordered list of unique non-empty os_user strings.
+    """
+    path = Path(users_yaml_path)
+    if not path.exists():
+        return []
+
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        return []
+
+    data = yaml.safe_load(text)
+    if not isinstance(data, dict):
+        return []
+
+    users = data.get("users")
+    if not isinstance(users, list):
+        return []
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for entry in users:
+        if not isinstance(entry, dict):
+            continue
+        os_user = entry.get("os_user")
+        # PyYAML may parse "yes"/"no"/numeric os_user values as bool/int;
+        # only strings are valid OS usernames here.
+        if not isinstance(os_user, str):
+            continue
+        normalized = os_user.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def _generate_sudoers(
+    service_user: str,
+    claude_user: str | None = None,
+    os_users: Iterable[str] = (),
+) -> str:
     """
     Generate sudoers rules for the service user to read protected config files.
 
@@ -1009,12 +1076,17 @@ def _generate_sudoers(service_user: str, claude_user: str | None = None) -> str:
     Falls back to /bin/cat and /usr/bin/tee if the binaries aren't found
     in the current PATH (e.g., when running in a minimal environment).
 
-    When claude_user is set, an additional rule allows the service user to
-    run the claude binary as that user (for process isolation via sudo -u).
+    Per-user `(target_user) SETENV: NOPASSWD:` rules for the claude binary are
+    emitted for every distinct user in `os_users` and `claude_user` combined.
+    Users matching `service_user` are skipped (the runtime detects self-sudo
+    via resolve_claude_user() and spawns claude directly without sudo).
 
     Args:
         service_user: The OS username that runs the Kai service.
-        claude_user: Optional OS username for the inner Claude process.
+        claude_user: Optional OS username for the inner Claude process
+            (legacy single CLAUDE_USER env var path; kept for backwards compat).
+        os_users: Distinct os_user values from users.yaml. Combined with
+            claude_user; duplicates and self-sudo entries are dropped.
 
     Returns:
         The sudoers file contents as a string.
@@ -1036,17 +1108,30 @@ def _generate_sudoers(service_user: str, claude_user: str | None = None) -> str:
         {service_user} ALL=(root) NOPASSWD: {tee_path} /etc/kai/totp.attempts
     """)
 
-    # Allow running the claude binary as the CLAUDE_USER for process isolation.
-    # Resolve the actual binary location; fall back to the native installer's
-    # default path under the service user's home if claude is not on PATH
-    # (e.g., when running under sudo with a stripped environment).
-    if claude_user:
+    # Merge legacy claude_user with yaml-derived os_users. Order: legacy first
+    # so behavior is stable when only claude_user is set (existing installs).
+    # Drop self-sudo entries — pool.py uses resolve_claude_user() to skip the
+    # sudo wrapper entirely when the target matches the service user, so a
+    # rule would be dead code (and slightly misleading to future readers).
+    target_users: list[str] = []
+    seen: set[str] = set()
+    for candidate in (claude_user, *os_users):
+        if not candidate or candidate == service_user or candidate in seen:
+            continue
+        seen.add(candidate)
+        target_users.append(candidate)
+
+    if target_users:
+        # Resolve the actual binary location; fall back to the native installer's
+        # default path under the service user's home if claude is not on PATH
+        # (e.g., when running under sudo with a stripped environment).
         svc_home = _user_home(service_user)
         claude_bin = shutil.which("claude") or f"{svc_home}/.local/bin/claude"
         # SETENV: allows the service user to pass env vars (e.g.,
         # KAI_WEBHOOK_SECRET) through sudo to the claude process.
-        # Scoped to this rule only; cat/tee rules remain locked down.
-        rules += f"{service_user} ALL=({claude_user}) SETENV: NOPASSWD: {claude_bin}\n"
+        # Scoped to per-user rules only; cat/tee rules remain locked down.
+        for target in target_users:
+            rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {claude_bin}\n"
 
     return rules
 
@@ -2013,10 +2098,23 @@ def _apply_goose_config(
     print(f"  Deployed Goose config to {dst}")
 
 
-def _apply_sudoers(service_user: str, dry_run: bool, claude_user: str | None = None) -> None:
-    """Write sudoers rules for the service user to read protected config."""
+def _apply_sudoers(
+    service_user: str,
+    dry_run: bool,
+    claude_user: str | None = None,
+    users_yaml_path: str | Path = "/etc/kai/users.yaml",
+) -> None:
+    """
+    Write sudoers rules for the service user to read protected config.
+
+    Loads `users_yaml_path` (default /etc/kai/users.yaml) to discover every
+    distinct `os_user` the runtime may target via `sudo -u`, so each gets a
+    matching SETENV: NOPASSWD: rule. Without this, hand-added per-user rules
+    were silently wiped on every `sudo make install`. See issue #341.
+    """
     sudoers_path = Path("/etc/sudoers.d/kai")
-    sudoers_content = _generate_sudoers(service_user, claude_user)
+    os_users = _collect_os_users_from_yaml(users_yaml_path)
+    sudoers_content = _generate_sudoers(service_user, claude_user, os_users)
 
     if dry_run:
         print(f"[DRY RUN] Would write: {sudoers_path} (mode 0440)")
