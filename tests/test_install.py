@@ -543,6 +543,62 @@ class TestCollectOsUsersFromYaml:
         with pytest.raises(yaml.YAMLError):
             _collect_os_users_from_yaml(path)
 
+    # -- Security: validate os_user before sudoers write (PR #342 review) -
+
+    @pytest.mark.parametrize(
+        "bad_value",
+        [
+            "alice) NOPASSWD: ALL",  # closing-paren injection
+            "alice\nroot ALL=(ALL) NOPASSWD: ALL",  # newline injection
+            "alice ALL",  # whitespace
+            "alice;bob",  # semicolon
+            "alice=bob",  # equals
+            "alice/bob",  # slash
+            "alice@host",  # at-sign
+        ],
+    )
+    def test_invalid_os_user_raises(self, tmp_path, bad_value):
+        """Crafted os_user values that could inject sudoers directives must raise."""
+        path = tmp_path / "users.yaml"
+        path.write_text(
+            yaml.safe_dump({"users": [{"telegram_id": 1, "os_user": bad_value}]}),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="Invalid os_user"):
+            _collect_os_users_from_yaml(path)
+
+    def test_invalid_os_user_error_names_path(self, tmp_path):
+        """ValueError message includes the offending path so the operator can fix it."""
+        path = tmp_path / "users.yaml"
+        path.write_text(
+            yaml.safe_dump({"users": [{"telegram_id": 1, "os_user": "bad)user"}]}),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match=str(path)):
+            _collect_os_users_from_yaml(path)
+
+
+class TestGenerateSudoersValidation:
+    """Defense-in-depth: _generate_sudoers itself must reject bad targets."""
+
+    def test_invalid_os_user_in_os_users_raises(self):
+        """Bad os_users values must raise even if they bypass the loader."""
+        with pytest.raises(ValueError, match="Invalid sudoers target user"):
+            _generate_sudoers("kai", os_users=["alice) NOPASSWD: ALL"])
+
+    def test_invalid_claude_user_raises(self):
+        """Legacy CLAUDE_USER env var path must also be validated."""
+        with pytest.raises(ValueError, match="Invalid sudoers target user"):
+            _generate_sudoers("kai", claude_user="alice\nroot ALL")
+
+    def test_self_sudo_skip_runs_before_validation(self):
+        """service_user match short-circuits before validation (no rule emitted)."""
+        # If we passed the service_user as os_user with bad chars, the skip
+        # would happen first; but service_user itself is always trusted, so
+        # this test just verifies "kai" with a clean value doesn't blow up.
+        result = _generate_sudoers("kai", os_users=["kai"])
+        assert "kai ALL=(kai)" not in result
+
 
 class TestGenerateLaunchdPlist:
     def test_contains_label(self):

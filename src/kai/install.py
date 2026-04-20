@@ -1000,7 +1000,7 @@ def _generate_users_yaml(
 
 def _collect_os_users_from_yaml(users_yaml_path: str | Path) -> list[str]:
     """
-    Read users.yaml and return distinct, non-empty os_user values.
+    Read users.yaml and return distinct, validated os_user values.
 
     The runtime (pool.py / claude.py) spawns the inner Claude as each user's
     `os_user` via `sudo -u`. That requires a matching sudoers rule for every
@@ -1018,19 +1018,35 @@ def _collect_os_users_from_yaml(users_yaml_path: str | Path) -> list[str]:
         - Malformed YAML → raises (yaml.YAMLError); install should fail loudly
           rather than silently emit no per-user rules
         - Non-string / empty / whitespace-only os_user values are skipped
+        - Non-empty values that fail _validate_os_user (e.g. contain `)`,
+          newline, whitespace) raise ValueError. Without this check, a
+          crafted users.yaml could inject arbitrary sudoers directives —
+          /etc/sudoers.d files are loaded directly and visudo only validates
+          syntax, not authorial intent. Hard fail rather than silent skip
+          so the operator sees the bad entry rather than getting a
+          half-functional install.
         - Duplicate os_user values are deduplicated, preserving first-seen order
 
     Args:
         users_yaml_path: Path to users.yaml (typically /etc/kai/users.yaml).
 
     Returns:
-        Ordered list of unique non-empty os_user strings.
+        Ordered list of unique, validated os_user strings.
+
+    Raises:
+        ValueError: If any non-empty os_user value fails username validation.
+        yaml.YAMLError: If the file exists but cannot be parsed.
     """
     path = Path(users_yaml_path)
-    if not path.exists():
+
+    # try/except instead of exists() + read_text() avoids a TOCTOU race:
+    # the file could be deleted between the two calls. Functionally
+    # identical here (root-only install path), but the idiom is cleaner.
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return []
 
-    text = path.read_text(encoding="utf-8")
     if not text.strip():
         return []
 
@@ -1053,7 +1069,15 @@ def _collect_os_users_from_yaml(users_yaml_path: str | Path) -> list[str]:
         if not isinstance(os_user, str):
             continue
         normalized = os_user.strip()
-        if not normalized or normalized in seen:
+        # Empty / whitespace-only is treated as "no os_user set" (legitimate;
+        # that user runs as the service user). Skip without raising.
+        if not normalized:
+            continue
+        # Anything else must be a valid username before we let it near the
+        # sudoers writer. See the docstring above for the security rationale.
+        if not _validate_os_user(normalized):
+            raise ValueError(f"Invalid os_user {normalized!r} in {path}: must match {_OS_USER_RE.pattern}")
+        if normalized in seen:
             continue
         seen.add(normalized)
         result.append(normalized)
@@ -1113,11 +1137,20 @@ def _generate_sudoers(
     # Drop self-sudo entries — pool.py uses resolve_claude_user() to skip the
     # sudo wrapper entirely when the target matches the service user, so a
     # rule would be dead code (and slightly misleading to future readers).
+    #
+    # Defense-in-depth: validate every candidate before interpolating into
+    # the sudoers template. _collect_os_users_from_yaml already validates,
+    # but claude_user can come straight from the legacy CLAUDE_USER env var
+    # without going through that path. A `)` or newline in an unvalidated
+    # username would let an attacker with control of that env var inject
+    # arbitrary sudoers directives.
     target_users: list[str] = []
     seen: set[str] = set()
     for candidate in (claude_user, *os_users):
         if not candidate or candidate == service_user or candidate in seen:
             continue
+        if not _validate_os_user(candidate):
+            raise ValueError(f"Invalid sudoers target user {candidate!r}: must match {_OS_USER_RE.pattern}")
         seen.add(candidate)
         target_users.append(candidate)
 
@@ -2113,6 +2146,10 @@ def _apply_sudoers(
     were silently wiped on every `sudo make install`. See issue #341.
     """
     sudoers_path = Path("/etc/sudoers.d/kai")
+    # Load and validate users.yaml *before* the dry_run gate. Intentional:
+    # a malformed YAML file or invalid os_user value should abort even a
+    # dry run, since the operator's next step is `sudo make install` which
+    # would hit the same error with worse blast radius (partial install).
     os_users = _collect_os_users_from_yaml(users_yaml_path)
     sudoers_content = _generate_sudoers(service_user, claude_user, os_users)
 
