@@ -655,9 +655,15 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
             stats.by_prompt_version.items(),
             key=lambda item: (-item[1], item[0]),
         )
-        version_width = max(len(v) for v, _ in sorted_versions)
+        # Belt-and-suspenders: aggregation in memory.py already casts
+        # prompt_version to str, but a caller that constructs
+        # MemoryStats by a different path (tests do this directly,
+        # and a future admin endpoint might) would not be caught by
+        # that. Keep the renderer resilient on its own so a stray int
+        # key cannot reproduce the spec 338 TypeError.
+        version_width = max(len(str(v)) for v, _ in sorted_versions)
         for version, count in sorted_versions:
-            lines.append(f"  {version.ljust(version_width)}  {count:>3}")
+            lines.append(f"  {str(version).ljust(version_width)}  {count:>3}")
 
     text = "\n".join(lines)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("back", callback_data=_encode_callback("dash"))]])

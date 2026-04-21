@@ -38,7 +38,7 @@ log = logging.getLogger(__name__)
 # Stored in each fact's metadata so future cleanups can target specific
 # prompt revisions (delete_by_source can be extended, or a sibling
 # delete_by_prompt_version admin command can be added).
-_EXTRACTION_PROMPT_VERSION = 1
+_EXTRACTION_PROMPT_VERSION: str = "1"
 
 # Memory `type` values this module writes. Track 1 writes "exchange"
 # from memory.py; Track 2 writes "fact" from here. Any other type value

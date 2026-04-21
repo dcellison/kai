@@ -1155,11 +1155,19 @@ def get_stats(*, user_id: str) -> MemoryStats:
         for t in m.metadata.get("tags") or []:
             by_tag[t] = by_tag.get(t, 0) + 1
 
-        # prompt_version: stored as a string; "" treated as a distinct
-        # bucket so a regression in extraction (forgetting to stamp the
-        # version) shows up rather than silently merging into other
-        # counts. Bucket key is the value itself.
-        pv = m.metadata.get("prompt_version", "")
+        # prompt_version: bucketed as a string (the cast at the
+        # aggregation boundary handles legacy int rows). "" treated
+        # as a distinct bucket so a regression in extraction
+        # (forgetting to stamp the version) shows up rather than
+        # silently merging into other counts. Bucket key is the value
+        # itself, stringified.
+        #
+        # Cast defensively: legacy rows written before the write-side
+        # fix in spec 338 carry an int here, and the dict[str, int]
+        # annotation would be a lie without this. Stringifying at the
+        # aggregation boundary means any downstream consumer sees the
+        # documented shape.
+        pv = str(m.metadata.get("prompt_version", ""))
         by_prompt_version[pv] = by_prompt_version.get(pv, 0) + 1
 
         # confidence: the schema enforces [0.5, 1.0], but a bad row

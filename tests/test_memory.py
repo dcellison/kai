@@ -1904,6 +1904,48 @@ class TestGetStatsExtended:
         )
         assert stats.by_prompt_version == {"v3": 2, "v2": 1}
 
+    def test_by_prompt_version_normalizes_int_to_str(self):
+        # Spec 338 regression: the aggregation must cast prompt_version
+        # to str at the read boundary. Legacy rows on disk carry int
+        # (the original _EXTRACTION_PROMPT_VERSION was int 1) and
+        # post-fix rows carry str ("1"). Both must bucket together
+        # under the str key, otherwise the dict[str, int] annotation
+        # is a lie and downstream renderers crash on len(int).
+        stats = self._stats_with(
+            [
+                {
+                    "id": "1",
+                    "memory": "x",
+                    "score": 0.0,
+                    "metadata": {
+                        "source": "extracted",
+                        "tags": ["fact"],
+                        "confidence": 0.9,
+                        # Legacy int row - the shape every fact in
+                        # production has prior to the write-side fix.
+                        "prompt_version": 1,
+                    },
+                    "created_at": "",
+                },
+                {
+                    "id": "2",
+                    "memory": "y",
+                    "score": 0.0,
+                    "metadata": {
+                        "source": "extracted",
+                        "tags": ["fact"],
+                        "confidence": 0.9,
+                        # Post-fix str row - what new writes produce.
+                        "prompt_version": "1",
+                    },
+                    "created_at": "",
+                },
+            ]
+        )
+        # Single str-keyed bucket. Pre-fix the dict has mixed keys
+        # ({1: 1, "1": 1}) which fails this equality.
+        assert stats.by_prompt_version == {"1": 2}
+
     def test_empty_extracted_set_yields_none_confidence(self):
         """No extracted rows -> min/median/max are None (NOT 0.0) so
         the UI can render "n/a" rather than a misleading score."""

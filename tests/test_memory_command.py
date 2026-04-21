@@ -625,6 +625,27 @@ class TestBuildStats:
         assert "below 0.6           1  (10.0%)" in text
         assert "(n/a)" not in text
 
+    def test_renders_int_keyed_prompt_version_bucket(self):
+        # Spec 338 regression: legacy rows in Qdrant carry
+        # prompt_version as int because the original write side wrote
+        # _EXTRACTION_PROMPT_VERSION = 1 (int). A MemoryStats handed
+        # straight to the renderer (bypassing the aggregation cast in
+        # memory.py) can still surface int keys - tests construct
+        # MemoryStats directly, and a future admin endpoint might too.
+        # Pre-fix this raises TypeError("object of type 'int' has no
+        # len()") inside _build_stats; post-fix the renderer's str()
+        # wraps absorb the int key cleanly.
+        stats = _stats(
+            extracted_count=1,
+            # Helper annotation is dict[str, int]; the int key here is
+            # the load-bearing fixture - len("1") works, len(1) raises.
+            by_prompt_version={1: 1},  # type: ignore[dict-item]
+        )
+        text, _kb = memory_command._build_stats(stats)
+        assert "Prompt versions:" in text
+        # Stringified int appears as the version label.
+        assert "1" in text
+
 
 # ── Subcommand parsing dispatch ────────────────────────────────────
 
