@@ -378,12 +378,15 @@ def _cmd_config() -> None:
                     break
                 print("  Username may only contain letters, numbers, dots, hyphens, and underscores.")
 
-            # Default home_workspace to PROJECT_ROOT.
-            default_home = str(PROJECT_ROOT)
-            admin_home_workspace = _prompt("Home workspace", default_home) or None
-            if admin_home_workspace:
-                # Resolve to absolute path for consistency with config.py parsing.
-                admin_home_workspace = str(Path(admin_home_workspace).expanduser().resolve())
+            # No wizard prompt for home_workspace post-#353. The admin lands
+            # in DATA_DIR/home/<chat_id>/ like any other user; the per-user
+            # default is private to them. An admin who wants a path outside
+            # DATA_DIR (a clone of the dev tree, a synced volume, etc.) can
+            # add `home_workspace: /absolute/path` to their users.yaml entry
+            # by hand after install. Removing the prompt prevents the wizard
+            # from defaulting back to the shared PROJECT_ROOT directory the
+            # spec exists to eliminate.
+            admin_home_workspace = None
 
         # Write users.yaml to project root. _apply_secrets() copies it
         # to /etc/kai/users.yaml during 'make install'.
@@ -1264,6 +1267,69 @@ def _collect_user_memory_owners(users_yaml_path: str | Path) -> list[tuple[int, 
     return result
 
 
+def _collect_user_home_overrides(users_yaml_path: str | Path) -> dict[int, Path]:
+    """
+    Read users.yaml and return a chat_id -> home_workspace override mapping.
+
+    Used by the install migration to decide which `home/<chat_id>/`
+    subdirectories to skip pre-creating: a user who pinned an explicit
+    home_workspace path is opting out of the Kai-managed per-user
+    directory (#353), so the installer should not provision one for
+    them. Their override path is the operator's responsibility.
+
+    Only entries with a string `home_workspace` field are included.
+    Missing / null / empty / non-string values are silently skipped -
+    those users get the default per-user directory provisioned.
+
+    Mirrors the loose validation of _collect_user_memory_owners:
+    silent return on missing / empty / malformed-top-level files,
+    no exceptions for malformed individual entries.
+
+    Args:
+        users_yaml_path: Path to users.yaml (typically /etc/kai/users.yaml).
+
+    Returns:
+        Mapping of telegram_id (chat_id) to absolute Path of the override.
+        Empty dict if the file is missing, empty, or has no overrides.
+    """
+    path = Path(users_yaml_path)
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+
+    if not text.strip():
+        return {}
+
+    data = yaml.safe_load(text)
+    if not isinstance(data, dict):
+        return {}
+
+    users = data.get("users")
+    if not isinstance(users, list):
+        return {}
+
+    result: dict[int, Path] = {}
+    for entry in users:
+        if not isinstance(entry, dict):
+            continue
+        telegram_id = entry.get("telegram_id")
+        if not isinstance(telegram_id, int):
+            continue
+        home_ws_raw = entry.get("home_workspace")
+        if not isinstance(home_ws_raw, str):
+            continue
+        home_ws = home_ws_raw.strip()
+        if not home_ws:
+            continue
+        # expanduser on the install host is fine: paths in users.yaml
+        # are admin-authored and are expected to refer to the install
+        # host's filesystem. Same expansion as config.py's loader.
+        result[telegram_id] = Path(home_ws).expanduser().resolve()
+    return result
+
+
 def _generate_sudoers(
     service_user: str,
     claude_user: str | None = None,
@@ -1931,6 +1997,50 @@ def _apply_migrate(
                     # memory/<chat_id>/ whose user has no os_user set.
                     _set_ownership(entry, svc_uid, svc_gid, recursive=True)
 
+    # -- Per-user home workspace pre-creation (#353) --
+    # Mirror the per-user memory pattern above. For every users.yaml
+    # entry we pre-create DATA_DIR/home/<chat_id>/ so the inner Claude
+    # subprocess (sudo -H -u <os_user>) can write into it on first
+    # message. Users with an explicit home_workspace override are split:
+    #   * Override path under DATA_DIR (rare, but valid): provision the
+    #     override path itself, since it lives in our tree.
+    #   * Override path outside DATA_DIR: skip - the override is
+    #     operator-managed (a clone of the dev tree, a synced volume,
+    #     etc.). Provisioning here would chown a directory we do not own.
+    # Subdirectories whose chat_id has no os_user fall through to the
+    # service-owned tier, matching the memory tier-(a) rule above.
+    home_root = data_path / "home"
+    home_overrides = _collect_user_home_overrides(users_yaml_path)
+    if home_root.is_dir():
+        for chat_id, _os_user in memory_owners:
+            override = home_overrides.get(chat_id)
+            # Skip when the operator has pinned an absolute path outside
+            # DATA_DIR. is_relative_to is the cleanest way to test path
+            # containment; on PY 3.9+ it returns bool without raising.
+            if override is not None and not override.is_relative_to(data_path):
+                continue
+            user_dir = home_root / str(chat_id)
+            if user_dir.exists():
+                continue  # idempotent across reinstalls
+            if dry_run:
+                if str(chat_id) in per_user_ids:
+                    uid, gid = per_user_ids[str(chat_id)]
+                    print(f"[DRY RUN] Would create {user_dir} ({uid}:{gid})")
+                else:
+                    print(f"[DRY RUN] Would create {user_dir} ({svc_uid}:{svc_gid})")
+                continue
+            user_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
+            # mkdir does not always honor mode (it is masked by umask).
+            # Force the intended bits explicitly so the per-user dir
+            # ends up 0755 regardless of the install-time umask.
+            os.chmod(user_dir, 0o755)
+            if str(chat_id) in per_user_ids:
+                uid, gid = per_user_ids[str(chat_id)]
+                _set_ownership(user_dir, uid, gid, recursive=False)
+            else:
+                _set_ownership(user_dir, svc_uid, svc_gid, recursive=False)
+            print(f"  Created {user_dir}")
+
 
 def _cmd_apply() -> None:
     """
@@ -2125,6 +2235,11 @@ def _apply_directories(
         (data_path / "files", svc_uid, svc_gid, 0o755),
         (data_path / "history", svc_uid, svc_gid, 0o755),
         (data_path / "memory", svc_uid, svc_gid, 0o755),
+        # Per-user home root (#353). Top-level dir is service-owned so
+        # the bot can lazily create new home/<chat_id>/ subdirs at first
+        # message; per-user subdirs are pre-created and chowned in
+        # _apply_migrate when the user has a distinct os_user.
+        (data_path / "home", svc_uid, svc_gid, 0o755),
         (Path("/etc/kai"), 0, 0, 0o755),
     ]
 

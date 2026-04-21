@@ -800,7 +800,15 @@ class TestCmdConfig:
         assert data["users"][0]["role"] == "admin"
 
     def test_advanced_user_options(self, tmp_path, monkeypatch):
-        """Advanced path writes os_user and home_workspace, skips CLAUDE_USER."""
+        """
+        Advanced path writes os_user and skips CLAUDE_USER.
+
+        Post-#353: the wizard no longer prompts for home_workspace and
+        the admin's users.yaml entry does not carry that field - the
+        admin lands in DATA_DIR/home/<chat_id>/ like any other user.
+        See test_wizard_defaults_do_not_reintroduce_shared_home for the
+        regression guard.
+        """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
@@ -817,7 +825,7 @@ class TestCmdConfig:
                 "admin",  # admin display name
                 "true",  # advanced user options
                 "testuser",  # os_user
-                str(tmp_path),  # home_workspace
+                # no home_workspace prompt post-#353
                 "polling",  # transport
                 "claude",  # agent backend
                 "sonnet",  # model
@@ -845,17 +853,151 @@ class TestCmdConfig:
 
         _cmd_config()
 
-        # Verify users.yaml has os_user and home_workspace
+        # Verify users.yaml has os_user and (post-#353) NO home_workspace.
+        # The admin lands in DATA_DIR/home/<chat_id>/ like any other user;
+        # the field is absent from the wizard output by design.
         yaml_path = tmp_path / "users.yaml"
         assert yaml_path.exists()
         data = yaml.safe_load(yaml_path.read_text())
         entry = data["users"][0]
         assert entry["os_user"] == "testuser"
-        assert entry["home_workspace"] == str(tmp_path.resolve())
+        assert "home_workspace" not in entry, (
+            "Wizard regression: admin entry should not carry home_workspace post-#353. See _cmd_config in install.py."
+        )
 
         # CLAUDE_USER should not be in the env (skipped because os_user was set)
         conf = json.loads((tmp_path / "install.conf").read_text())
         assert "CLAUDE_USER" not in conf["env"]
+
+    def test_wizard_defaults_do_not_reintroduce_shared_home(self, tmp_path, monkeypatch):
+        """
+        Regression guard for spec #353.
+
+        Prior to #353, the wizard defaulted home_workspace to a shared
+        PROJECT_ROOT/home directory. That shared default was the source
+        of the multi-user privacy hazard the spec exists to fix. This
+        test pins the post-#353 behavior across BOTH wizard paths:
+
+        1. The non-advanced path (advanced=false) must not emit a
+           home_workspace key into the admin's users.yaml entry.
+        2. The advanced path (advanced=true, no explicit home_workspace
+           prompt) must also not emit one.
+        3. The generated env must not carry a CLAUDE_WORKSPACE override
+           (the env var that pre-#353 wired the shared global home).
+
+        If any future change re-introduces a global default home, one
+        of these three assertions will fail.
+        """
+        # ---- Path 1: non-advanced wizard ----
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+
+        inputs_basic = iter(
+            [
+                "/opt/kai",  # install dir
+                "/var/lib/kai",  # data dir
+                "kai",  # service user
+                "darwin",  # platform
+                "fake-token",  # bot token
+                "12345",  # admin telegram ID
+                "admin",  # admin display name
+                "false",  # advanced user options -> no os_user, no home prompt
+                "polling",  # transport
+                "claude",  # agent backend
+                "sonnet",  # model
+                "120",  # timeout
+                "10.0",  # budget
+                "200000",  # max context window
+                "80",  # autocompact pct
+                "8080",  # port
+                "test-secret",  # webhook secret
+                "~/Projects",  # workspace base
+                "",  # allowed workspaces
+                "false",  # pr review enabled
+                "900",  # pr review timeout
+                "1.0",  # pr review budget
+                "false",  # issue triage enabled
+                "",  # github notify chat id
+                "false",  # voice
+                "false",  # tts
+                "",  # claude user (empty)
+                "false",  # memory enabled
+                "",  # perplexity key (empty)
+            ]
+        )
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs_basic))
+        _cmd_config()
+
+        yaml_path = tmp_path / "users.yaml"
+        data = yaml.safe_load(yaml_path.read_text())
+        basic_entry = data["users"][0]
+        assert "home_workspace" not in basic_entry, (
+            "Regression: non-advanced wizard re-introduced a shared home_workspace default. "
+            "Spec #353 requires per-user homes under DATA_DIR/home/<chat_id>/."
+        )
+
+        conf = json.loads((tmp_path / "install.conf").read_text())
+        # CLAUDE_WORKSPACE was the legacy env that wired a global home;
+        # pinning it absent ensures the wizard never re-emits the var.
+        assert "CLAUDE_WORKSPACE" not in conf["env"], (
+            "Regression: wizard wrote CLAUDE_WORKSPACE env. Spec #353 removed the global home field; "
+            "pool.py + bot.py now resolve home per chat_id."
+        )
+
+        # ---- Path 2: advanced wizard (admin chooses os_user) ----
+        # Re-run the wizard from a clean tmp dir to verify the advanced
+        # path also stays clean. We use a sibling dir so monkeypatched
+        # PROJECT_ROOT and INSTALL_CONF point somewhere fresh.
+        adv_root = tmp_path / "adv"
+        adv_root.mkdir()
+        monkeypatch.chdir(adv_root)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", adv_root / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", adv_root)
+
+        inputs_advanced = iter(
+            [
+                "/opt/kai",
+                "/var/lib/kai",
+                "kai",
+                "darwin",
+                "fake-token",
+                "12345",
+                "admin",
+                "true",  # advanced -> os_user prompt
+                "testuser",  # os_user (no home_workspace prompt should follow)
+                "polling",
+                "claude",
+                "sonnet",
+                "120",
+                "10.0",
+                "200000",
+                "80",
+                "8080",
+                "test-secret",
+                "~/Projects",
+                "",
+                "false",
+                "900",
+                "1.0",
+                "false",
+                "",
+                "false",
+                "false",
+                "false",  # memory enabled
+                "",  # perplexity key
+            ]
+        )
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs_advanced))
+        _cmd_config()
+
+        adv_data = yaml.safe_load((adv_root / "users.yaml").read_text())
+        adv_entry = adv_data["users"][0]
+        assert "home_workspace" not in adv_entry, (
+            "Regression: advanced wizard re-introduced home_workspace. The wizard removed the prompt "
+            "in spec #353; an admin who needs a custom path must hand-edit users.yaml."
+        )
 
     def test_goose_backend_writes_env(self, tmp_path, monkeypatch):
         """Selecting goose backend writes AGENT_BACKEND to env."""

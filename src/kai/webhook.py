@@ -221,9 +221,13 @@ async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str 
     # Extract just the repo name from "owner/repo"
     repo_name = repo_full_name.split("/")[-1]
 
-    # 1. Home workspace - the workspace parent is the repo root.
-    # app["workspace"] is the workspace subdirectory (e.g., /opt/kai/workspace),
-    # so .parent gives the repo root (e.g., /opt/kai/).
+    # 1. Home workspace - parent of the active workspace.
+    # app["workspace"] is None at startup post-#353 (no global default),
+    # populated by update_workspace() on the first `/workspace` switch.
+    # When set, .parent gives the repo root candidate, e.g. workspace
+    # /Users/kai/Projects/kai/home → parent /Users/kai/Projects/kai
+    # → name "kai" matches a webhook for dcellison/kai. Steps 2-4 cover
+    # the cold-start case (no switch yet).
     workspace = app.get("workspace")
     if workspace:
         home_path = Path(workspace).parent
@@ -1623,10 +1627,16 @@ async def start(telegram_app, config) -> None:
     # Prevents prompt injection from routing messages to arbitrary users.
     _app["allowed_user_ids"] = config.allowed_user_ids
 
-    # Store workspace path for send-file path confinement (fallback when
-    # pool is not available). Phase 3 uses pool.get_workspace(chat_id)
-    # for per-user confinement at request time.
-    _app["workspace"] = str(config.claude_workspace)
+    # Initialize workspace slot to None. Per-user confinement for the
+    # send-file endpoint comes from pool.get_workspace(chat_id) at
+    # request time; there is no longer a shared global workspace to
+    # fall back on (#353 removed it). The slot is subsequently
+    # overwritten by update_workspace() on `/workspace` switch, which
+    # remains load-bearing for send-file path containment post-switch.
+    # When the pool is unavailable AND no switch has happened, the
+    # fallback at line 1417 returns 403 - acceptable because the pool
+    # is always present in production when send-file fires.
+    _app["workspace"] = None
 
     # Store config for GitHub actor routing in _handle_github()
     _app["config"] = config

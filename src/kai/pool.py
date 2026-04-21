@@ -20,7 +20,7 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from kai import sessions
-from kai.backend import AgentBackend, StreamEvent
+from kai.backend import AgentBackend, StreamEvent, resolve_home_workspace
 from kai.claude import ClaudeCodeBackend
 from kai.config import (
     OPEN_ENDED_PROVIDERS,
@@ -108,10 +108,11 @@ class SubprocessPool:
         """
         user = self._config.get_user_config(chat_id)
 
-        # Determine the user's home workspace
-        workspace = self._config.claude_workspace
-        if user and user.home_workspace:
-            workspace = user.home_workspace
+        # Resolve through the single backend.resolve_home_workspace
+        # helper: users.yaml override first, else DATA_DIR/home/<chat_id>/.
+        # The old global home field on Config was removed by #353 because
+        # it pointed every unconfigured user at a shared directory.
+        workspace = resolve_home_workspace(chat_id, self._config)
 
         ws_config = self._config.get_workspace_config(workspace)
 
@@ -161,7 +162,11 @@ class SubprocessPool:
         context_window = (
             user.context_window if user and user.context_window is not None else self._config.claude_max_context_window
         )
-        home_ws = user.home_workspace if user else self._config.claude_workspace
+        # home_ws is what the backend treats as "home" for the foreign-
+        # workspace reminder. Same resolution as the workspace above so
+        # the two cannot drift; pre-#353 this took a different path that
+        # could disagree with the active workspace for unconfigured users.
+        home_ws = resolve_home_workspace(chat_id, self._config)
 
         # Backend selection: "goose" uses Goose ACP, anything else
         # (including the default "claude") uses Claude Code CLI.
@@ -423,9 +428,16 @@ class SubprocessPool:
         instance.model = model
 
     def get_workspace(self, chat_id: int) -> Path:
-        """Get the active workspace for a user."""
+        """
+        Get the active workspace for a user.
+
+        When no backend instance exists yet (user has not sent their
+        first message in this process lifetime) we resolve the per-user
+        home directory rather than the removed global default. This
+        matches what _build_backend would do on first send().
+        """
         instance = self.get_if_exists(chat_id)
-        return instance.workspace if instance else self._config.claude_workspace
+        return instance.workspace if instance else resolve_home_workspace(chat_id, self._config)
 
     def is_alive(self, chat_id: int) -> bool:
         """True if this user's subprocess is running."""

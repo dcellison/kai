@@ -24,7 +24,21 @@ from kai.pool import SubprocessPool
 
 
 def _make_config(**overrides) -> Config:
-    """Create a Config for pool tests."""
+    """
+    Create a Config for pool tests.
+
+    `claude_workspace=` is accepted as a back-compat alias for pre-#353
+    tests that wanted a specific home directory for the default test
+    chat. It translates to a UserConfig home_workspace override for
+    chat IDs 111 and 222 (the test fixture's two default users), since
+    Config no longer has a global claude_workspace field. Tests that
+    pass their own `user_configs` win over the back-compat translation.
+    """
+    legacy_home = overrides.pop("claude_workspace", None)
+    if legacy_home is not None and "user_configs" not in overrides:
+        overrides["user_configs"] = {
+            cid: UserConfig(telegram_id=cid, name=f"u{cid}", home_workspace=legacy_home) for cid in (111, 222)
+        }
     defaults: dict = {
         "telegram_bot_token": "test",
         "allowed_user_ids": {111, 222},
@@ -33,7 +47,6 @@ def _make_config(**overrides) -> Config:
         "budget_ceiling": 1.0,
         "claude_max_session_hours": 0,
         "claude_idle_timeout": 1800,
-        "claude_workspace": Path("/home/workspace"),
         "webhook_port": 8080,
         "webhook_secret": "secret",
     }
@@ -75,13 +88,23 @@ class TestInstanceCreation:
         assert instance.claude_user == "alice_os"
         assert instance.workspace == ws
 
-    def test_get_falls_back_to_defaults(self):
-        """User not in users.yaml gets global defaults."""
+    def test_get_falls_back_to_defaults(self, tmp_path, monkeypatch):
+        """
+        User not in users.yaml gets global defaults plus the per-user
+        DATA_DIR/home/<chat_id>/ landing directory (#353). The shared
+        global home was removed; the new fallback is keyed by chat_id.
+        """
+        # Point the resolver at a tmp DATA_DIR so the test does not
+        # touch the host's real /var/lib/kai or PROJECT_ROOT tree.
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
         config = _make_config(claude_user=None)
         pool = SubprocessPool(config=config, services_info=[])
         instance = pool.get(999)
         assert instance.claude_user is None
-        assert instance.workspace == Path("/home/workspace")
+        # Per-user landing directory under the patched DATA_DIR.
+        assert instance.workspace == tmp_path / "home" / "999"
+        # ensure_user_home is idempotent and creates the dir on resolve.
+        assert (tmp_path / "home" / "999").is_dir()
 
     def test_create_uses_user_config_settings(self, tmp_path):
         """User with model/timeout/budget/context_window in users.yaml gets those values."""
@@ -307,10 +330,17 @@ class TestPropertyAccessors:
         ):
             assert await pool.get_effective_model(999) == "opus"
 
-    def test_get_workspace_no_instance(self):
-        """get_workspace returns global default when no instance exists."""
+    def test_get_workspace_no_instance(self, tmp_path, monkeypatch):
+        """
+        get_workspace returns the per-user default when no instance exists.
+
+        Post-#353 the fallback resolves through resolve_home_workspace
+        instead of the removed global Config field, landing the user in
+        DATA_DIR/home/<chat_id>/.
+        """
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
         pool = SubprocessPool(config=_make_config(), services_info=[])
-        assert pool.get_workspace(999) == Path("/home/workspace")
+        assert pool.get_workspace(999) == tmp_path / "home" / "999"
 
     def test_is_alive_no_instance(self):
         """is_alive returns False when no instance exists."""

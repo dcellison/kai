@@ -303,7 +303,6 @@ class Config:
             for users without a per-user max_budget in users.yaml.
         claude_max_session_hours: Hours before the inner Claude process is recycled. Prevents
             unbounded V8 memory growth that can trigger macOS Jetsam kernel panics. 0 = no limit.
-        claude_workspace: Working directory for the inner Claude Code process
         session_db_path: Path to the SQLite database for sessions, jobs, and settings
         webhook_port: Port for the local aiohttp server (webhooks + scheduling API)
         webhook_secret: HMAC secret for verifying incoming webhook payloads
@@ -336,7 +335,6 @@ class Config:
     budget_ceiling: float = 10.0
     claude_max_session_hours: float = 0  # 0 = no limit
     claude_idle_timeout: int = 1800  # seconds before idle subprocess eviction; 0 = no eviction
-    claude_workspace: Path = field(default_factory=lambda: PROJECT_ROOT / "home")
 
     # Context window tuning. Both settings help control token usage and
     # reduce cache invalidation pressure on the inner Claude process.
@@ -901,7 +899,7 @@ def _load_user_configs(
         # Validate home_workspace. Warn but don't skip the user if
         # the directory doesn't exist - it may be on an unmounted drive
         # or not yet created. The user keeps access; the workspace
-        # falls back to the global default at runtime.
+        # falls back to the per-user default at runtime.
         home_workspace = entry.get("home_workspace")
         if home_workspace is not None:
             # Guard against empty strings: Path("").resolve() silently
@@ -912,8 +910,13 @@ def _load_user_configs(
             else:
                 home_workspace = Path(home_workspace_str).expanduser().resolve()
                 if not home_workspace.is_dir():
+                    # Null it out and let the runtime resolver
+                    # (backend.resolve_home_workspace) fall through to
+                    # DATA_DIR/home/<chat_id>/. There is no longer a
+                    # shared "global default" directory - that was the
+                    # multi-user privacy hazard #353 removed.
                     log.warning(
-                        "users.yaml: home_workspace not found for %s: %s; using global default",
+                        "users.yaml: home_workspace not found for %s: %s; falling back to per-user default",
                         name,
                         home_workspace,
                     )

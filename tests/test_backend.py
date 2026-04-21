@@ -16,11 +16,13 @@ from kai.backend import (
     StreamEvent,
     build_foreign_workspace_reminder,
     build_session_context,
+    ensure_user_home,
     ensure_user_memory,
     get_workspace_system_prompt,
     prepend_to_prompt,
+    resolve_home_workspace,
 )
-from kai.config import WorkspaceConfig
+from kai.config import Config, UserConfig, WorkspaceConfig
 
 # ── Test build_session_context ──────────────────────────────────────
 
@@ -321,18 +323,141 @@ class TestBuildForeignWorkspaceReminder:
 
     def test_home_workspace_returns_none(self):
         """No reminder when workspace == home_workspace."""
-        ws = Path("/opt/kai/home")
+        # Path string is illustrative - the assertion compares via Path
+        # equality and never touches the filesystem. Using the new
+        # per-user shape from #353 keeps the test aligned with reality.
+        ws = Path("/var/lib/kai/home/12345")
         assert build_foreign_workspace_reminder(ws, ws) is None
 
     def test_foreign_workspace_returns_reminder(self):
         """Reminder string returned when in a foreign workspace."""
         result = build_foreign_workspace_reminder(
             Path("/home/user/project"),
-            Path("/opt/kai/home"),
+            Path("/var/lib/kai/home/12345"),
         )
         assert result is not None
         assert "IMPORTANT" in result
         assert "Respond ONLY" in result
+
+
+# ── Test ensure_user_home / resolve_home_workspace (#353) ───────────
+
+
+class TestEnsureUserHome:
+    """
+    Tests for the per-user home workspace bootstrap.
+
+    Mirrors TestEnsureUserMemory shape since the two helpers are
+    intentionally parallel (#353 reuses the #347 pattern).
+    """
+
+    def test_creates_directory(self, tmp_path):
+        """First call materializes home/<chat_id>/ under data_dir."""
+        result = ensure_user_home(12345, tmp_path)
+        assert result == tmp_path / "home" / "12345"
+        assert result.is_dir()
+
+    def test_is_idempotent(self, tmp_path):
+        """
+        Repeated calls must not raise or rewrite content. The user owns
+        the directory after first creation; clobbering it would lose
+        user-authored files (cloned repos, notes, etc.).
+        """
+        first = ensure_user_home(12345, tmp_path)
+        # Drop a sentinel so we can verify the second call leaves it alone.
+        sentinel = first / "userfile.txt"
+        sentinel.write_text("user content")
+
+        second = ensure_user_home(12345, tmp_path)
+        assert second == first
+        assert sentinel.read_text() == "user content"
+
+    def test_handles_none_chat_id(self, tmp_path):
+        """
+        chat_id=None routes to the fixed "anon" subdirectory used by
+        admin-less startup paths (tests, health checks). Returning None
+        would force defensive None-checks at every call site.
+        """
+        result = ensure_user_home(None, tmp_path)
+        assert result == tmp_path / "home" / "anon"
+        assert result.is_dir()
+
+    def test_directory_is_0755(self, tmp_path):
+        """
+        Mode 0755 matches the memory pattern (#347): isolation comes
+        from per-user chown at install time, not from mode bits. Other
+        users on the host can list and traverse but cannot write.
+        """
+        import stat
+
+        result = ensure_user_home(99, tmp_path)
+        # Mask off file-type bits; we only care about the permission bits.
+        mode = stat.S_IMODE(result.stat().st_mode)
+        # umask may strip group/other write bits but never adds them, so
+        # we assert the upper bound is 0o755 and owner has full access.
+        assert mode & 0o700 == 0o700, f"owner bits not full rwx: {oct(mode)}"
+        assert mode & 0o022 == 0, f"group/other write set: {oct(mode)}"
+
+
+class TestResolveHomeWorkspace:
+    """
+    Tests for the public resolver used by pool.py and bot.py.
+
+    The resolver is the single source of truth for "where does this
+    user's home live?" - both call sites must go through it so the
+    answer cannot drift between session init and `/workspace home`.
+    """
+
+    def _config(self, user_configs=None) -> Config:
+        """Build a minimal Config with optional user_configs dict."""
+        return Config(
+            telegram_bot_token="test",
+            allowed_user_ids={1},
+            user_configs=user_configs,
+        )
+
+    def test_prefers_users_yaml(self, tmp_path, monkeypatch):
+        """
+        When users.yaml sets home_workspace, that path is returned
+        verbatim. ensure_user_home is NOT called - the operator's
+        choice wins outright.
+        """
+        explicit = tmp_path / "explicit"
+        explicit.mkdir()
+        config = self._config(
+            user_configs={42: UserConfig(telegram_id=42, name="u", home_workspace=explicit)},
+        )
+        # Patch DATA_DIR so a bug that falls through to ensure_user_home
+        # would create a sibling directory we can detect (and fail on).
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path / "data")
+
+        result = resolve_home_workspace(42, config)
+        assert result == explicit
+        # Bug guard: DATA_DIR/home/42 must NOT have been created.
+        assert not (tmp_path / "data" / "home" / "42").exists()
+
+    def test_falls_back_to_data_dir(self, tmp_path, monkeypatch):
+        """
+        When no users.yaml override exists, the resolver lands the user
+        in DATA_DIR/home/<chat_id>/ via ensure_user_home (which creates
+        the directory as a side effect).
+        """
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+        config = self._config()
+        result = resolve_home_workspace(42, config)
+        assert result == tmp_path / "home" / "42"
+        assert result.is_dir()
+
+    def test_anon_when_chat_id_none(self, tmp_path, monkeypatch):
+        """
+        chat_id=None happens in admin-less startup paths. Return the
+        fixed anon subdir so callers always get a concrete Path back.
+        """
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+        config = self._config()
+        result = resolve_home_workspace(None, config)
+        assert result == tmp_path / "home" / "anon"
+        assert result.is_dir()
 
 
 # ── Test prepend_to_prompt ──────────────────────────────────────────

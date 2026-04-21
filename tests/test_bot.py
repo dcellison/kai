@@ -281,11 +281,26 @@ def _make_config(**overrides) -> Config:
     Accepts any Config field as a keyword override. Used by both the pure
     function tests (workspace_base, allowed_workspaces) and the handler
     tests (tts_enabled, voice_enabled, webhook_secret, etc.).
+
+    `claude_workspace=` is accepted as a back-compat alias for pre-#353
+    tests that wanted a specific home directory. Config no longer has
+    that field; instead the value is wired into a UserConfig override
+    for chat 12345 (the default chat_id used by _make_update) so that
+    bot.resolve_home_workspace returns the requested path. Tests that
+    pass their own `user_configs` win over the back-compat translation.
     """
+    legacy_home = overrides.pop("claude_workspace", None)
+    if legacy_home is not None and "user_configs" not in overrides:
+        overrides["user_configs"] = {
+            12345: UserConfig(
+                telegram_id=12345,
+                name="test",
+                home_workspace=legacy_home,
+            ),
+        }
     defaults: dict = {
         "telegram_bot_token": "test-token",
         "allowed_user_ids": {1},
-        "claude_workspace": Path("/home/workspace"),
         "workspace_base": None,
         "allowed_workspaces": [],
         "webhook_secret": "test-secret",
@@ -1360,6 +1375,49 @@ class TestHandleWorkspace:
         ):
             await handle_workspace(update, ctx)
         claude.change_workspace.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_workspace_home_lands_in_per_user_directory(self, tmp_path, monkeypatch):
+        """
+        Spec 353 acceptance: `/workspace home` for a user with no
+        users.yaml home_workspace override must land in DATA_DIR/home/<chat_id>/,
+        NOT in a shared global directory.
+
+        This is the multi-user privacy guarantee. We patch backend.DATA_DIR
+        to tmp_path so resolve_home_workspace creates a per-user directory
+        under the test root, then capture the path passed to
+        Claude.change_workspace and assert it matches that user's slot.
+        """
+        # Point backend.DATA_DIR at the test root so ensure_user_home
+        # creates the per-user dir under tmp_path rather than /var/lib/kai.
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+
+        # No claude_workspace= override -> no UserConfig.home_workspace,
+        # so resolve_home_workspace must fall through to ensure_user_home.
+        config = _make_config()
+        claude = _make_mock_claude(workspace=Path("/other"))
+        # _make_update defaults to chat_id=12345; the per-user home
+        # directory therefore lands at tmp_path/home/12345.
+        update = _make_update()
+        ctx = _make_context(claude=claude, config=config, args=["home"])
+        with (
+            _mock_resolve(),
+            patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
+            patch("kai.bot.sessions.delete_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
+            patch("kai.bot.webhook.update_workspace"),
+        ):
+            await handle_workspace(update, ctx)
+
+        # Assert change_workspace was passed the per-user directory.
+        # Positional arg 0 is chat_id; positional arg 1 is the target Path.
+        claude.change_workspace.assert_called_once()
+        call_args = claude.change_workspace.call_args
+        target_path = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs["workspace"]
+        expected = tmp_path / "home" / "12345"
+        assert target_path == expected, f"Expected {expected}, got {target_path}"
+        # The directory must actually exist (ensure_user_home creates it).
+        assert expected.is_dir()
 
     @pytest.mark.asyncio
     async def test_absolute_path_rejected(self):

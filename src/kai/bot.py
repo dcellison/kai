@@ -55,6 +55,7 @@ from telegram.ext import (
 )
 
 from kai import github_api, memory_command, services, sessions, webhook
+from kai.backend import resolve_home_workspace
 from kai.config import (
     DATA_DIR,
     MAX_CONTEXT_CEILING,
@@ -1259,7 +1260,10 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     """
     pool = _get_pool(context)
     config: Config = context.bot_data["config"]
-    home = config.claude_workspace
+    # "home" for this user is per-user post-#353. Same resolver pool.py
+    # uses, so the equality check below matches the directory the user
+    # would land in on `/workspace home` or session restart.
+    home = resolve_home_workspace(chat_id, config)
 
     # Layer DB overrides (from /workspace config) on top of YAML baseline.
     yaml_config = config.get_workspace_config(path)
@@ -1288,7 +1292,9 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     assert update.message is not None
     pool = _get_pool(context)
     config: Config = context.bot_data["config"]
-    home = config.claude_workspace
+    # Per-user resolution: this is what `/workspace home` would route to
+    # for THIS user, not a shared default.
+    home = resolve_home_workspace(_chat_id(update), config)
 
     if path == pool.get_workspace(_chat_id(update)):
         await update.message.reply_text("Already in that workspace.")
@@ -1749,7 +1755,9 @@ async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     history = await sessions.get_workspace_history(chat_id)
     pool = _get_pool(context)
     current = str(pool.get_workspace(chat_id))
-    home = str(config.claude_workspace)
+    # Per-user home for the listing's "Home" pin and the empty-state
+    # short-circuit below.
+    home = str(resolve_home_workspace(chat_id, config))
 
     if not history and not allowed and current == home:
         await update.message.reply_text("No workspace history yet.\nUse /workspace new <name> to create one.")
@@ -1778,7 +1786,9 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
     assert query.data is not None
     data = query.data.removeprefix("ws:")
     pool = _get_pool(context)
-    home = config.claude_workspace
+    # Per-user resolution: the "Home" keyboard button maps to THIS user's
+    # home directory, not a shared one.
+    home = resolve_home_workspace(chat_id, config)
 
     # Resolve per-user workspace access for this user
     base, allowed = await sessions.resolve_workspace_access(chat_id, config)
@@ -2031,7 +2041,9 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat_id = _chat_id(update)
     pool = _get_pool(context)
     config: Config = context.bot_data["config"]
-    home = config.claude_workspace
+    # Per-user `/workspace home` destination. The user-visible fix for
+    # #353: prior to this, "home" was a shared directory.
+    home = resolve_home_workspace(chat_id, config)
 
     # Resolve per-user workspace access (workspace_base + allowed list)
     base, allowed = await sessions.resolve_workspace_access(chat_id, config)
