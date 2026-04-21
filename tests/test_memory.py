@@ -159,9 +159,6 @@ class TestInitMemory:
         this test fails fast on CI and on dev machines alike, before
         the heavier integration tests hit the RuntimeError.
         """
-        import os
-        from pathlib import Path
-
         mem0_dir_env = os.environ.get("MEM0_DIR", "")
         assert mem0_dir_env, "MEM0_DIR must be set by conftest.py"
 
