@@ -1155,19 +1155,21 @@ def get_stats(*, user_id: str) -> MemoryStats:
         for t in m.metadata.get("tags") or []:
             by_tag[t] = by_tag.get(t, 0) + 1
 
-        # prompt_version: bucketed as a string (the cast at the
-        # aggregation boundary handles legacy int rows). "" treated
-        # as a distinct bucket so a regression in extraction
-        # (forgetting to stamp the version) shows up rather than
-        # silently merging into other counts. Bucket key is the value
-        # itself, stringified.
+        # prompt_version: bucketed as a string. The cast handles
+        # legacy rows whose metadata stores prompt_version as a
+        # non-string value (older revisions of the extraction code
+        # wrote an int); without the cast the dict[str, int]
+        # annotation would be a lie and downstream renderers would
+        # crash on len(int).
         #
-        # Cast defensively: legacy rows written before the write-side
-        # fix in spec 338 carry an int here, and the dict[str, int]
-        # annotation would be a lie without this. Stringifying at the
-        # aggregation boundary means any downstream consumer sees the
-        # documented shape.
-        pv = str(m.metadata.get("prompt_version", ""))
+        # The `... or ""` guard collapses both absent keys and
+        # null-valued keys into the same empty-string sentinel
+        # bucket. Without it, str(None) would create a literal
+        # "None" bucket that looks like a real version label.
+        # Empty-string bucket is itself meaningful: it surfaces a
+        # regression in extraction (forgetting to stamp the version)
+        # rather than silently merging into other counts.
+        pv = str(m.metadata.get("prompt_version") or "")
         by_prompt_version[pv] = by_prompt_version.get(pv, 0) + 1
 
         # confidence: the schema enforces [0.5, 1.0], but a bad row

@@ -651,16 +651,22 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
         lines.append("")
         lines.append("Prompt versions:")
         # Sort by count desc, version asc for ties - deterministic.
+        # The tiebreaker key is wrapped in str() because dict keys
+        # may be mixed-type when a caller constructs MemoryStats
+        # directly (bypassing the aggregation cast in memory.py);
+        # Python 3 raises TypeError on int<->str comparison, so the
+        # cast here must happen before the sort runs - it cannot be
+        # deferred to the formatting step below.
         sorted_versions = sorted(
             stats.by_prompt_version.items(),
-            key=lambda item: (-item[1], item[0]),
+            key=lambda item: (-item[1], str(item[0])),
         )
-        # Belt-and-suspenders: aggregation in memory.py already casts
-        # prompt_version to str, but a caller that constructs
-        # MemoryStats by a different path (tests do this directly,
-        # and a future admin endpoint might) would not be caught by
-        # that. Keep the renderer resilient on its own so a stray int
-        # key cannot reproduce the spec 338 TypeError.
+        # Aggregation in memory.py already casts prompt_version to
+        # str, but a caller that constructs MemoryStats by a
+        # different path (tests do this directly, and a future admin
+        # endpoint might) bypasses that guarantee. Wrapping len()
+        # and ljust() in str() keeps the renderer resilient on its
+        # own so a stray int key cannot raise TypeError here.
         version_width = max(len(str(v)) for v, _ in sorted_versions)
         for version, count in sorted_versions:
             lines.append(f"  {str(version).ljust(version_width)}  {count:>3}")

@@ -1905,12 +1905,13 @@ class TestGetStatsExtended:
         assert stats.by_prompt_version == {"v3": 2, "v2": 1}
 
     def test_by_prompt_version_normalizes_int_to_str(self):
-        # Spec 338 regression: the aggregation must cast prompt_version
-        # to str at the read boundary. Legacy rows on disk carry int
-        # (the original _EXTRACTION_PROMPT_VERSION was int 1) and
-        # post-fix rows carry str ("1"). Both must bucket together
-        # under the str key, otherwise the dict[str, int] annotation
-        # is a lie and downstream renderers crash on len(int).
+        # The aggregation must cast prompt_version to str at the
+        # read boundary so that rows whose metadata stores the
+        # version as an int (older revisions of the extraction code
+        # wrote ints) bucket together with rows that store it as a
+        # str. Without the cast, the dict ends up with mixed-type
+        # keys, the dict[str, int] annotation becomes a lie, and
+        # downstream renderers crash on len(int).
         stats = self._stats_with(
             [
                 {
@@ -1921,8 +1922,8 @@ class TestGetStatsExtended:
                         "source": "extracted",
                         "tags": ["fact"],
                         "confidence": 0.9,
-                        # Legacy int row - the shape every fact in
-                        # production has prior to the write-side fix.
+                        # Int-typed row - the shape produced by
+                        # older extraction code that wrote int 1.
                         "prompt_version": 1,
                     },
                     "created_at": "",
@@ -1935,16 +1936,58 @@ class TestGetStatsExtended:
                         "source": "extracted",
                         "tags": ["fact"],
                         "confidence": 0.9,
-                        # Post-fix str row - what new writes produce.
+                        # Str-typed row - what current writes produce.
                         "prompt_version": "1",
                     },
                     "created_at": "",
                 },
             ]
         )
-        # Single str-keyed bucket. Pre-fix the dict has mixed keys
-        # ({1: 1, "1": 1}) which fails this equality.
+        # Single str-keyed bucket. Without the cast the dict has
+        # mixed keys ({1: 1, "1": 1}) and this equality fails.
         assert stats.by_prompt_version == {"1": 2}
+
+    def test_by_prompt_version_collapses_null_with_missing(self):
+        # A metadata dict that explicitly stores prompt_version=None
+        # must bucket together with rows that have no prompt_version
+        # key at all - both indicate "version not stamped" and
+        # surface the same way in the stats view. Without the
+        # `... or ""` guard the cast turns None into the literal
+        # string "None", producing a phantom bucket that looks like
+        # a real version label.
+        stats = self._stats_with(
+            [
+                {
+                    "id": "1",
+                    "memory": "x",
+                    "score": 0.0,
+                    "metadata": {
+                        "source": "extracted",
+                        "tags": ["fact"],
+                        "confidence": 0.9,
+                        # Explicit None - key present, value null.
+                        "prompt_version": None,
+                    },
+                    "created_at": "",
+                },
+                {
+                    "id": "2",
+                    "memory": "y",
+                    "score": 0.0,
+                    "metadata": {
+                        "source": "extracted",
+                        "tags": ["fact"],
+                        "confidence": 0.9,
+                        # Key absent entirely - no prompt_version.
+                    },
+                    "created_at": "",
+                },
+            ]
+        )
+        # Both rows bucket under the empty-string sentinel; no
+        # spurious "None" bucket appears.
+        assert stats.by_prompt_version == {"": 2}
+        assert "None" not in stats.by_prompt_version
 
     def test_empty_extracted_set_yields_none_confidence(self):
         """No extracted rows -> min/median/max are None (NOT 0.0) so

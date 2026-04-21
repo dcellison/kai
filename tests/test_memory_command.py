@@ -626,25 +626,43 @@ class TestBuildStats:
         assert "(n/a)" not in text
 
     def test_renders_int_keyed_prompt_version_bucket(self):
-        # Spec 338 regression: legacy rows in Qdrant carry
-        # prompt_version as int because the original write side wrote
-        # _EXTRACTION_PROMPT_VERSION = 1 (int). A MemoryStats handed
-        # straight to the renderer (bypassing the aggregation cast in
-        # memory.py) can still surface int keys - tests construct
-        # MemoryStats directly, and a future admin endpoint might too.
-        # Pre-fix this raises TypeError("object of type 'int' has no
-        # len()") inside _build_stats; post-fix the renderer's str()
-        # wraps absorb the int key cleanly.
+        # The renderer must tolerate int keys in by_prompt_version.
+        # A MemoryStats handed straight to the renderer (bypassing
+        # the aggregation cast in memory.py) can surface non-string
+        # keys; tests construct MemoryStats directly, and any caller
+        # that does the same bypasses the cast. Without the str()
+        # wraps in _build_stats, len(int) raises TypeError and the
+        # stats view becomes unreachable.
         stats = _stats(
             extracted_count=1,
-            # Helper annotation is dict[str, int]; the int key here is
-            # the load-bearing fixture - len("1") works, len(1) raises.
+            # Helper annotation is dict[str, int]; the int key here
+            # is the load-bearing fixture - len("1") works on the
+            # un-fixed renderer, len(1) raises.
             by_prompt_version={1: 1},  # type: ignore[dict-item]
         )
         text, _kb = memory_command._build_stats(stats)
         assert "Prompt versions:" in text
         # Stringified int appears as the version label.
         assert "1" in text
+
+    def test_renders_mixed_int_str_keyed_prompt_versions(self):
+        # The sort comparator must tolerate dicts with mixed int/str
+        # keys - Python 3 raises TypeError on int<->str comparison,
+        # so the tiebreaker key must wrap item[0] in str() *before*
+        # the sort runs. A single-key fixture cannot exercise this
+        # path because sort never compares; need at least two keys
+        # of different types and equal counts to force the
+        # tiebreaker to fire.
+        stats = _stats(
+            extracted_count=2,
+            # Equal counts force the int<->str tiebreaker comparison.
+            by_prompt_version={1: 1, "2": 1},  # type: ignore[dict-item]
+        )
+        text, _kb = memory_command._build_stats(stats)
+        assert "Prompt versions:" in text
+        # Both buckets render without raising; presence is enough.
+        assert "1" in text
+        assert "2" in text
 
 
 # ── Subcommand parsing dispatch ────────────────────────────────────
