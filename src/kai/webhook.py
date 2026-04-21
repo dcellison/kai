@@ -206,10 +206,9 @@ async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str 
     Matches the repo part of the full name (e.g., "kai" from "dcellison/kai")
     against known workspace locations. Checks in priority order:
 
-    1. Home workspace (derived from app["workspace"] parent)
-    2. WORKSPACE_BASE children
-    3. ALLOWED_WORKSPACES entries
-    4. workspace_history entries from the database
+    1. WORKSPACE_BASE children
+    2. ALLOWED_WORKSPACES entries
+    3. workspace_history entries from the database
 
     Args:
         repo_full_name: Full GitHub repo name (e.g., "dcellison/kai").
@@ -221,32 +220,19 @@ async def _resolve_local_repo(repo_full_name: str, app: web.Application) -> str 
     # Extract just the repo name from "owner/repo"
     repo_name = repo_full_name.split("/")[-1]
 
-    # 1. Home workspace - parent of the active workspace.
-    # app["workspace"] is None at startup post-#353 (no global default),
-    # populated by update_workspace() on the first `/workspace` switch.
-    # When set, .parent gives the repo root candidate, e.g. workspace
-    # /Users/kai/Projects/kai/home → parent /Users/kai/Projects/kai
-    # → name "kai" matches a webhook for dcellison/kai. Steps 2-4 cover
-    # the cold-start case (no switch yet).
-    workspace = app.get("workspace")
-    if workspace:
-        home_path = Path(workspace).parent
-        if home_path.name == repo_name and home_path.is_dir():
-            return str(home_path)
-
-    # 2. WORKSPACE_BASE - scan immediate children for matching dir name
+    # 1. WORKSPACE_BASE - scan immediate children for matching dir name
     workspace_base = app.get("workspace_base")
     if workspace_base:
         candidate = Path(workspace_base) / repo_name
         if candidate.is_dir():
             return str(candidate)
 
-    # 3. ALLOWED_WORKSPACES - check each entry's directory name
+    # 2. ALLOWED_WORKSPACES - check each entry's directory name
     for allowed in app.get("allowed_workspaces", []):
         if Path(allowed).name == repo_name and Path(allowed).is_dir():
             return str(allowed)
 
-    # 4. workspace_history - search all users' history since webhook
+    # 3. workspace_history - search all users' history since webhook
     # routing has no user context (server-to-server GitHub payload)
     history_paths = await sessions.get_all_workspace_paths(limit=50)
     for path_str in history_paths:
@@ -1410,17 +1396,14 @@ async def _handle_send_file(request: web.Request) -> web.Response:
     path = Path(file_path).resolve()
 
     # Confine to the requesting user's workspace to prevent path traversal.
-    # Uses Path.relative_to() which raises ValueError on escape. With
-    # per-user subprocesses (Phase 3), each user has their own workspace
-    # resolved from the pool. Falls back to the global workspace setting
-    # for backward compatibility.
+    # Uses Path.relative_to() which raises ValueError on escape. Each user
+    # has their own per-user home workspace resolved from the pool (#353).
+    # When the pool is unavailable (transient startup state) we refuse the
+    # request rather than opening a global fallback path.
     pool = request.app.get("pool")
-    if pool:
-        workspace = str(pool.get_workspace(chat_id))
-    else:
-        workspace = request.app.get("workspace")
-    if not workspace:
+    if pool is None:
         return web.json_response({"error": "No workspace configured"}, status=403)
+    workspace = str(pool.get_workspace(chat_id))
     # Allow files from either the workspace or DATA_DIR/files/.
     # DATA_DIR/files/ is where uploaded files now live (PR #145).
     # Confinement to DATA_DIR/"files" (not all of DATA_DIR) is deliberate;
@@ -1627,17 +1610,6 @@ async def start(telegram_app, config) -> None:
     # Prevents prompt injection from routing messages to arbitrary users.
     _app["allowed_user_ids"] = config.allowed_user_ids
 
-    # Initialize workspace slot to None. Per-user confinement for the
-    # send-file endpoint comes from pool.get_workspace(chat_id) at
-    # request time; there is no longer a shared global workspace to
-    # fall back on (#353 removed it). The slot is subsequently
-    # overwritten by update_workspace() on `/workspace` switch, which
-    # remains load-bearing for send-file path containment post-switch.
-    # When the pool is unavailable AND no switch has happened, the
-    # fallback at line 1417 returns 403 - acceptable because the pool
-    # is always present in production when send-file fires.
-    _app["workspace"] = None
-
     # Store config for GitHub actor routing in _handle_github()
     _app["config"] = config
 
@@ -1805,27 +1777,6 @@ async def stop() -> None:
 def is_running() -> bool:
     """True if the webhook server is currently running."""
     return _runner is not None
-
-
-def update_workspace(workspace: str) -> None:
-    """
-    Update the workspace path used by the send-file endpoint's confinement check.
-
-    Called by _do_switch_workspace in bot.py whenever the user switches workspaces,
-    and by main.py after startup if a non-default workspace was restored from the
-    settings table. Without this, the confinement check keeps using the initial
-    home workspace path set at startup, causing send-file to return 403 for any
-    file in the current (switched) workspace.
-
-    The server must already be running when this is called - callers in main.py
-    should invoke this after webhook.start(), not before, since start() sets the
-    path from config and would overwrite an earlier call.
-
-    Args:
-        workspace: Absolute path string of the new current workspace.
-    """
-    if _app is not None:
-        _app["workspace"] = workspace
 
 
 def add_allowed_chat_id(chat_id: int) -> None:

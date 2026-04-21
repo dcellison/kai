@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 
-import kai.webhook as webhook_mod
 from kai import sessions
 from kai.services import ServiceResponse
 from kai.webhook import (
@@ -25,7 +24,6 @@ from kai.webhook import (
     _handle_telegram_update,
     _handle_update_job,
     _resolve_chat_id,
-    update_workspace,
 )
 
 
@@ -323,12 +321,17 @@ class TestUpdateJob:
 @pytest.fixture
 def send_file_request(tmp_path):
     """Create a mock request for the send-file endpoint with workspace confinement."""
+    # Post-#353 send-file resolves the workspace via pool.get_workspace(chat_id)
+    # rather than a global app["workspace"] slot. The fixture supplies a mock
+    # pool whose get_workspace() returns tmp_path so path confinement passes.
+    mock_pool = MagicMock()
+    mock_pool.get_workspace = MagicMock(return_value=tmp_path)
     request = MagicMock(spec=web.Request)
     request.app = {
         "webhook_secret": "test-secret",
         "telegram_bot": AsyncMock(),
         "chat_id": 123,
-        "workspace": str(tmp_path),
+        "pool": mock_pool,
     }
     request.headers = {"X-Webhook-Secret": "test-secret"}
     return request
@@ -475,28 +478,6 @@ class TestSendMessage:
         send_message_request.app["telegram_bot"].send_message = AsyncMock(side_effect=RuntimeError("Boom"))
         resp = await _handle_send_message(send_message_request)
         assert resp.status == 500
-
-
-# ── update_workspace() ──────────────────────────────────────────────
-
-
-class TestUpdateWorkspace:
-    def test_updates_app_workspace(self, monkeypatch):
-        """update_workspace() changes the path stored in the live aiohttp app dict."""
-        # Simulate a running server by setting _app to a real Application instance
-        app = web.Application()
-        app["workspace"] = "/original/workspace"
-        monkeypatch.setattr(webhook_mod, "_app", app)
-
-        update_workspace("/switched/workspace")
-
-        assert app["workspace"] == "/switched/workspace"
-
-    def test_no_op_when_server_not_running(self, monkeypatch):
-        """update_workspace() is a no-op (no exception) when the server hasn't started."""
-        monkeypatch.setattr(webhook_mod, "_app", None)
-        # Should not raise
-        update_workspace("/any/path")
 
 
 # ── POST /webhook/telegram ─────────────────────────────────────────

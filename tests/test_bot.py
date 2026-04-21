@@ -1371,7 +1371,6 @@ class TestHandleWorkspace:
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.delete_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
-            patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace(update, ctx)
         claude.change_workspace.assert_called_once()
@@ -1405,7 +1404,6 @@ class TestHandleWorkspace:
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.delete_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
-            patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace(update, ctx)
 
@@ -1486,7 +1484,6 @@ class TestHandleWorkspace:
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
-            patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace(update, ctx)
         # Directory should have been created
@@ -1510,7 +1507,6 @@ class TestHandleWorkspace:
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
-            patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace(update, ctx)
         # Warning about git init failure was sent
@@ -1535,7 +1531,6 @@ class TestHandleWorkspace:
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
-            patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace(update, ctx)
         # Should switch to the workspace, not show "Usage: /workspace new <name>"
@@ -1566,7 +1561,6 @@ class TestHandleWorkspace:
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
-            patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace(update, ctx)
         claude.change_workspace.assert_called_once()
@@ -1586,7 +1580,6 @@ class TestHandleWorkspace:
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
-            patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace(update, ctx)
         claude.change_workspace.assert_called_once()
@@ -1698,7 +1691,6 @@ class TestHandleWorkspaceCallback:
             patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
             patch("kai.bot.sessions.delete_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
-            patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace_callback(update, ctx)
         claude.change_workspace.assert_called_once()
@@ -1720,7 +1712,6 @@ class TestHandleWorkspaceCallback:
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
-            patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace_callback(update, ctx)
         claude.change_workspace.assert_called_once()
@@ -1770,7 +1761,6 @@ class TestHandleWorkspaceCallback:
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
-            patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace_callback(update, ctx)
         claude.change_workspace.assert_called_once()
@@ -2083,7 +2073,6 @@ class TestWorkspaceSubcommandRouting:
             patch("kai.bot.sessions.set_setting", new_callable=AsyncMock),
             patch("kai.bot.sessions.upsert_workspace_history", new_callable=AsyncMock),
             patch("kai.bot.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
-            patch("kai.bot.webhook.update_workspace"),
         ):
             await handle_workspace(update, ctx)
         claude.change_workspace.assert_called_once()

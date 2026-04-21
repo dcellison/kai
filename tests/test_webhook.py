@@ -412,10 +412,10 @@ def _build_test_app(
     # Config needed by review background tasks
     app["webhook_port"] = 8080
     app["claude_user"] = None
-    # Workspace config for review agent repo resolution. The workspace
-    # path parent name ("repo") matches the test payload repo name so
-    # _resolve_local_repo() finds it via the home workspace check.
-    app["workspace"] = "/home/user/repo/workspace"
+    # Workspace config for review agent repo resolution. Tests that need
+    # _resolve_local_repo() to return a specific path populate workspace_base
+    # or allowed_workspaces; the default is empty so _mock_resolve_repo is
+    # used for routing tests that don't care about the resolution result.
     app["workspace_base"] = None
     app["allowed_workspaces"] = []
     app["spec_dir"] = "specs"
@@ -697,23 +697,6 @@ class TestResolveLocalRepo:
     """Tests for workspace-aware repo resolution."""
 
     @pytest.mark.asyncio
-    async def test_home_workspace(self, tmp_path):
-        """Resolves via home workspace when parent dir name matches repo."""
-        # Create a directory structure like /tmp/.../kai/workspace
-        repo_dir = tmp_path / "kai"
-        repo_dir.mkdir()
-        workspace_dir = repo_dir / "workspace"
-        workspace_dir.mkdir()
-
-        app = web.Application()
-        app["workspace"] = str(workspace_dir)
-        app["workspace_base"] = None
-        app["allowed_workspaces"] = []
-
-        result = await _resolve_local_repo("dcellison/kai", app)
-        assert result == str(repo_dir)
-
-    @pytest.mark.asyncio
     async def test_workspace_base(self, tmp_path):
         """Resolves via WORKSPACE_BASE when a child dir matches repo name."""
         # Create ~/Projects/anvil/ structure
@@ -721,7 +704,6 @@ class TestResolveLocalRepo:
         anvil_dir.mkdir()
 
         app = web.Application()
-        app["workspace"] = "/nonexistent/workspace"
         app["workspace_base"] = str(tmp_path)
         app["allowed_workspaces"] = []
 
@@ -735,7 +717,6 @@ class TestResolveLocalRepo:
         myrepo.mkdir()
 
         app = web.Application()
-        app["workspace"] = "/nonexistent/workspace"
         app["workspace_base"] = None
         app["allowed_workspaces"] = [str(myrepo)]
 
@@ -749,7 +730,6 @@ class TestResolveLocalRepo:
         history_repo.mkdir()
 
         app = web.Application()
-        app["workspace"] = "/nonexistent/workspace"
         app["workspace_base"] = None
         app["allowed_workspaces"] = []
 
@@ -762,32 +742,9 @@ class TestResolveLocalRepo:
         assert result == str(history_repo)
 
     @pytest.mark.asyncio
-    async def test_priority_order(self, tmp_path):
-        """Home workspace wins over workspace_base."""
-        # Both home and base have a matching "kai" directory
-        home_repo = tmp_path / "home" / "kai"
-        home_repo.mkdir(parents=True)
-        home_workspace = home_repo / "workspace"
-        home_workspace.mkdir()
-
-        base_dir = tmp_path / "base"
-        base_kai = base_dir / "kai"
-        base_kai.mkdir(parents=True)
-
-        app = web.Application()
-        app["workspace"] = str(home_workspace)
-        app["workspace_base"] = str(base_dir)
-        app["allowed_workspaces"] = []
-
-        result = await _resolve_local_repo("dcellison/kai", app)
-        # Home workspace should win
-        assert result == str(home_repo)
-
-    @pytest.mark.asyncio
     async def test_no_match(self, tmp_path):
         """Returns None when no workspace matches the repo."""
         app = web.Application()
-        app["workspace"] = str(tmp_path / "unrelated" / "workspace")
         app["workspace_base"] = str(tmp_path)
         app["allowed_workspaces"] = []
 
@@ -803,7 +760,6 @@ class TestResolveLocalRepo:
     async def test_nonexistent_dir_skipped(self, tmp_path):
         """History entries pointing to deleted directories are skipped."""
         app = web.Application()
-        app["workspace"] = "/nonexistent/workspace"
         app["workspace_base"] = None
         app["allowed_workspaces"] = []
 
@@ -822,7 +778,6 @@ class TestResolveLocalRepo:
         other_user_repo.mkdir()
 
         app = web.Application()
-        app["workspace"] = "/nonexistent/workspace"
         app["workspace_base"] = None
         app["allowed_workspaces"] = []
 
