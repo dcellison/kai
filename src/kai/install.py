@@ -2029,6 +2029,14 @@ def _apply_migrate(
     # chown here would mask the real bug rather than fix it.
     if not dry_run:
         home_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        # mkdir's mode= is masked by umask. Under the production
+        # service umask of 0o027 the directory ends up 0o750, which
+        # blocks group traversal: a distinct-os_user subprocess that
+        # is not in the service group cannot enter home_root to reach
+        # its own per-user slot, even though that slot has correct
+        # 0o755 mode. Force the bits explicitly - same pattern as
+        # ensure_user_home and the user_dir.chmod two lines below.
+        os.chmod(home_root, 0o755)
     for chat_id, _os_user in memory_owners:
         override = home_overrides.get(chat_id)
         # Case 3: override pinned outside DATA_DIR - operator-managed,

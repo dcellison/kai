@@ -2699,7 +2699,18 @@ class TestApplyMigratePerUserHome:
 
         Pre-fix: the block was guarded by `if home_root.is_dir():`
         which silently skipped everything when the parent was absent.
+
+        Round 2 review fix: home_root must end up at exactly 0o755,
+        not whatever the umask leaves behind. mkdir(mode=0o755) is
+        masked by the process umask; under the production service
+        umask of 0o027 this would leave home_root at 0o750, blocking
+        group traversal for distinct-os_user subprocesses. We set a
+        hostile umask inside the test to prove the explicit chmod
+        survives it.
         """
+        import os as _os
+        import stat
+
         data_path = self._setup(tmp_path, monkeypatch)
         # Note: _setup does NOT create data_path/home. The defensive
         # mkdir in _apply_migrate must create it.
@@ -2711,18 +2722,32 @@ class TestApplyMigratePerUserHome:
             "users:\n  - telegram_id: 8888\n    name: u\n    role: admin\n",
         )
 
-        _apply_migrate(
-            data_path,
-            tmp_path / "install",
-            svc_uid=501,
-            svc_gid=20,
-            dry_run=False,
-            users_yaml_path=users_yaml,
-        )
+        # Hostile umask matches the production service launchd config.
+        # Without the explicit os.chmod after mkdir, home_root would
+        # come out as 0o750 here.
+        prev_umask = _os.umask(0o027)
+        try:
+            _apply_migrate(
+                data_path,
+                tmp_path / "install",
+                svc_uid=501,
+                svc_gid=20,
+                dry_run=False,
+                users_yaml_path=users_yaml,
+            )
+        finally:
+            _os.umask(prev_umask)
 
         # Both the parent home/ and the per-user slot exist.
-        assert (data_path / "home").is_dir()
-        assert (data_path / "home" / "8888").is_dir()
+        home_root = data_path / "home"
+        assert home_root.is_dir()
+        assert (home_root / "8888").is_dir()
+        # Both at exactly 0o755 (group/other read+traverse, no write).
+        assert stat.S_IMODE(home_root.stat().st_mode) == 0o755, (
+            f"home_root mode {oct(stat.S_IMODE(home_root.stat().st_mode))} - "
+            "umask masked the mkdir mode and explicit chmod did not run"
+        )
+        assert stat.S_IMODE((home_root / "8888").stat().st_mode) == 0o755
 
 
 # ── Service lifecycle ────────────────────────────────────────────────
