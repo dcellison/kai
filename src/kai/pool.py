@@ -166,6 +166,18 @@ class SubprocessPool:
         # workspace reminder. Same resolution as the workspace above so
         # the two cannot drift; pre-#353 this took a different path that
         # could disagree with the active workspace for unconfigured users.
+        #
+        # This is a deliberate second call to resolve_home_workspace and
+        # NOT an alias for `workspace`: workspace is the INITIAL landing
+        # directory and can be overridden (DB /workspace switch, a
+        # per-user workspace_config pinning a non-home path, etc.) but
+        # home_ws is always the canonical per-user home the backend
+        # uses to detect "foreign workspace" and inject the identity
+        # reminder. If we wrote `home_ws = workspace` the reminder
+        # injection would silently break the moment a user pins a
+        # non-home default. The redundant stat/mkdir inside
+        # ensure_user_home is cheap (idempotent mkdir + chmod); the
+        # clarity of two separate resolution calls is worth it.
         home_ws = resolve_home_workspace(chat_id, self._config)
 
         # Backend selection: "goose" uses Goose ACP, anything else
