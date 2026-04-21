@@ -142,6 +142,46 @@ class TestInitMemory:
         assert not is_enabled()
 
     @integration
+    def test_mem0_telemetry_path_is_isolated(self):
+        """Mem0's hardcoded telemetry Qdrant path must live under the
+        test-only MEM0_DIR set by conftest, never under $HOME/.mem0.
+
+        Regression guard for issue #357. Mem0 opens a second Qdrant
+        local-mode client at $MEM0_DIR/migrations_qdrant for its own
+        telemetry/migration tracking, with the path resolved at module
+        import time (mem0/memory/setup.py:8). If MEM0_DIR is not set
+        before any `import mem0` runs, that path freezes to the
+        production default $HOME/.mem0 and collides with the running
+        production service's portalocker lock - making the entire
+        TestMemoryIntegration suite unrunnable on a dev machine.
+
+        If a future refactor removes the conftest-level env override,
+        this test fails fast on CI and on dev machines alike, before
+        the heavier integration tests hit the RuntimeError.
+        """
+        import os
+        from pathlib import Path
+
+        mem0_dir_env = os.environ.get("MEM0_DIR", "")
+        assert mem0_dir_env, "MEM0_DIR must be set by conftest.py"
+
+        # Must not be the production default - catches a regression
+        # where someone replaces tempfile.mkdtemp with a literal
+        # path that happens to land on the user's home dir.
+        assert Path(mem0_dir_env).resolve() != (Path.home() / ".mem0").resolve()
+
+        # Cross-check against mem0's own resolved constant. This is
+        # the load-bearing freeze-detector: if MEM0_DIR was set
+        # AFTER mem0 was imported, mem0_resolved is frozen to the
+        # wrong value (the production default) and this assertion
+        # fires. The other two assertions only catch coarser
+        # breakage (env unset, env pointing at home) - this one
+        # catches the subtle ordering bug that motivated the fix.
+        from mem0.memory.setup import mem0_dir as mem0_resolved
+
+        assert Path(mem0_resolved).resolve() == Path(mem0_dir_env).resolve()
+
+    @integration
     def test_init_creates_qdrant_dir(self, tmp_path):
         """init_memory() creates the Qdrant storage directory."""
         from kai.memory import init_memory, is_enabled
