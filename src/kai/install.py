@@ -1999,47 +1999,67 @@ def _apply_migrate(
 
     # -- Per-user home workspace pre-creation (#353) --
     # Mirror the per-user memory pattern above. For every users.yaml
-    # entry we pre-create DATA_DIR/home/<chat_id>/ so the inner Claude
-    # subprocess (sudo -H -u <os_user>) can write into it on first
-    # message. Users with an explicit home_workspace override are split:
-    #   * Override path under DATA_DIR (rare, but valid): provision the
-    #     override path itself, since it lives in our tree.
-    #   * Override path outside DATA_DIR: skip - the override is
-    #     operator-managed (a clone of the dev tree, a synced volume,
-    #     etc.). Provisioning here would chown a directory we do not own.
+    # entry we pre-create the directory the inner Claude subprocess
+    # (sudo -H -u <os_user>) will write into on first message. Three
+    # cases, all handled below:
+    #   1. No override: create DATA_DIR/home/<chat_id>/.
+    #   2. Override path under DATA_DIR (rare, but valid): create the
+    #      override path itself, since it lives in our tree and
+    #      resolve_home_workspace() will route the user there at
+    #      runtime. Creating DATA_DIR/home/<chat_id>/ instead would
+    #      leave the actual runtime directory un-provisioned and the
+    #      user's first write would fail.
+    #   3. Override path outside DATA_DIR: skip entirely - the override
+    #      is operator-managed (a clone of the dev tree, a synced
+    #      volume, etc.). Provisioning here would chown a directory we
+    #      do not own.
     # Subdirectories whose chat_id has no os_user fall through to the
     # service-owned tier, matching the memory tier-(a) rule above.
     home_root = data_path / "home"
     home_overrides = _collect_user_home_overrides(users_yaml_path)
-    if home_root.is_dir():
-        for chat_id, _os_user in memory_owners:
-            override = home_overrides.get(chat_id)
-            # Skip when the operator has pinned an absolute path outside
-            # DATA_DIR. is_relative_to is the cleanest way to test path
-            # containment; on PY 3.9+ it returns bool without raising.
-            if override is not None and not override.is_relative_to(data_path):
-                continue
-            user_dir = home_root / str(chat_id)
-            if user_dir.exists():
-                continue  # idempotent across reinstalls
-            if dry_run:
-                if str(chat_id) in per_user_ids:
-                    uid, gid = per_user_ids[str(chat_id)]
-                    print(f"[DRY RUN] Would create {user_dir} ({uid}:{gid})")
-                else:
-                    print(f"[DRY RUN] Would create {user_dir} ({svc_uid}:{svc_gid})")
-                continue
-            user_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
-            # mkdir does not always honor mode (it is masked by umask).
-            # Force the intended bits explicitly so the per-user dir
-            # ends up 0755 regardless of the install-time umask.
-            os.chmod(user_dir, 0o755)
+    # Defensive: `_apply_directories` already creates home_root with
+    # the right ownership, but we cannot assume ordering (future
+    # refactors could split these steps). A missing home_root here
+    # would otherwise silently skip every per-user provisioning step
+    # and leave the installer reporting success while subsequent
+    # first-messages crash. mkdir(exist_ok=True) is cheap and
+    # idempotent. We deliberately do NOT chown home_root in this
+    # fallback path: if _apply_directories ran (the normal case)
+    # ownership is already correct, and if it did not run a defensive
+    # chown here would mask the real bug rather than fix it.
+    if not dry_run:
+        home_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+    for chat_id, _os_user in memory_owners:
+        override = home_overrides.get(chat_id)
+        # Case 3: override pinned outside DATA_DIR - operator-managed,
+        # skip. is_relative_to is the cleanest way to test path
+        # containment; on Python 3.9+ it returns bool without raising.
+        if override is not None and not override.is_relative_to(data_path):
+            continue
+        # Case 2: override under DATA_DIR - provision THAT path, since
+        # resolve_home_workspace returns it verbatim at runtime. Case
+        # 1: no override - provision the per-user default slot.
+        user_dir = override if override is not None else home_root / str(chat_id)
+        if user_dir.exists():
+            continue  # idempotent across reinstalls
+        if dry_run:
             if str(chat_id) in per_user_ids:
                 uid, gid = per_user_ids[str(chat_id)]
-                _set_ownership(user_dir, uid, gid, recursive=False)
+                print(f"[DRY RUN] Would create {user_dir} ({uid}:{gid})")
             else:
-                _set_ownership(user_dir, svc_uid, svc_gid, recursive=False)
-            print(f"  Created {user_dir}")
+                print(f"[DRY RUN] Would create {user_dir} ({svc_uid}:{svc_gid})")
+            continue
+        user_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
+        # mkdir does not always honor mode (it is masked by umask).
+        # Force the intended bits explicitly so the per-user dir
+        # ends up 0755 regardless of the install-time umask.
+        os.chmod(user_dir, 0o755)
+        if str(chat_id) in per_user_ids:
+            uid, gid = per_user_ids[str(chat_id)]
+            _set_ownership(user_dir, uid, gid, recursive=False)
+        else:
+            _set_ownership(user_dir, svc_uid, svc_gid, recursive=False)
+        print(f"  Created {user_dir}")
 
 
 def _cmd_apply() -> None:

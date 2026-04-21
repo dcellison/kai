@@ -382,21 +382,33 @@ class TestEnsureUserHome:
         assert result == tmp_path / "home" / "anon"
         assert result.is_dir()
 
-    def test_directory_is_0755(self, tmp_path):
+    def test_directory_mode_is_exactly_0755(self, tmp_path):
         """
-        Mode 0755 matches the memory pattern (#347): isolation comes
-        from per-user chown at install time, not from mode bits. Other
-        users on the host can list and traverse but cannot write.
+        Mode must be EXACTLY 0o755 after ensure_user_home, regardless
+        of the process umask. The umask on a hardened service is
+        commonly 0o027, which would mask mkdir(mode=0o755) down to
+        0o750 - blocking group traversal and breaking the inner
+        subprocess when sudo -u targets a different identity. The
+        helper must chmod explicitly after mkdir to force the intended
+        bits; this test fails loudly if that chmod is ever removed.
+
+        A weaker assertion (mode & 0o022 == 0) would accept 0o750 and
+        silently mask a regression of exactly this kind.
         """
+        # Set a hostile umask to simulate the production service config
+        # (umask 0o027 on the launchd plist). Without the explicit chmod
+        # in ensure_user_home, mkdir(mode=0o755) would return 0o750 here.
+        import os as _os
         import stat
 
-        result = ensure_user_home(99, tmp_path)
-        # Mask off file-type bits; we only care about the permission bits.
+        prev_umask = _os.umask(0o027)
+        try:
+            result = ensure_user_home(99, tmp_path)
+        finally:
+            _os.umask(prev_umask)
+
         mode = stat.S_IMODE(result.stat().st_mode)
-        # umask may strip group/other write bits but never adds them, so
-        # we assert the upper bound is 0o755 and owner has full access.
-        assert mode & 0o700 == 0o700, f"owner bits not full rwx: {oct(mode)}"
-        assert mode & 0o022 == 0, f"group/other write set: {oct(mode)}"
+        assert mode == 0o755, f"expected 0o755, got {oct(mode)}"
 
 
 class TestResolveHomeWorkspace:
@@ -416,46 +428,47 @@ class TestResolveHomeWorkspace:
             user_configs=user_configs,
         )
 
-    def test_prefers_users_yaml(self, tmp_path, monkeypatch):
+    def test_prefers_users_yaml(self, tmp_path):
         """
         When users.yaml sets home_workspace, that path is returned
         verbatim. ensure_user_home is NOT called - the operator's
         choice wins outright.
+
+        Passing data_dir= explicitly (rather than monkeypatching
+        kai.backend.DATA_DIR) means a test that forgets the arg gets
+        a real production DATA_DIR path, which is caught loudly rather
+        than silently writing there.
         """
         explicit = tmp_path / "explicit"
         explicit.mkdir()
         config = self._config(
             user_configs={42: UserConfig(telegram_id=42, name="u", home_workspace=explicit)},
         )
-        # Patch DATA_DIR so a bug that falls through to ensure_user_home
-        # would create a sibling directory we can detect (and fail on).
-        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path / "data")
+        data_dir = tmp_path / "data"
 
-        result = resolve_home_workspace(42, config)
+        result = resolve_home_workspace(42, config, data_dir=data_dir)
         assert result == explicit
-        # Bug guard: DATA_DIR/home/42 must NOT have been created.
-        assert not (tmp_path / "data" / "home" / "42").exists()
+        # Bug guard: data_dir/home/42 must NOT have been created.
+        assert not (data_dir / "home" / "42").exists()
 
-    def test_falls_back_to_data_dir(self, tmp_path, monkeypatch):
+    def test_falls_back_to_data_dir(self, tmp_path):
         """
         When no users.yaml override exists, the resolver lands the user
-        in DATA_DIR/home/<chat_id>/ via ensure_user_home (which creates
+        in data_dir/home/<chat_id>/ via ensure_user_home (which creates
         the directory as a side effect).
         """
-        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
         config = self._config()
-        result = resolve_home_workspace(42, config)
+        result = resolve_home_workspace(42, config, data_dir=tmp_path)
         assert result == tmp_path / "home" / "42"
         assert result.is_dir()
 
-    def test_anon_when_chat_id_none(self, tmp_path, monkeypatch):
+    def test_anon_when_chat_id_none(self, tmp_path):
         """
         chat_id=None happens in admin-less startup paths. Return the
         fixed anon subdir so callers always get a concrete Path back.
         """
-        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
         config = self._config()
-        result = resolve_home_workspace(None, config)
+        result = resolve_home_workspace(None, config, data_dir=tmp_path)
         assert result == tmp_path / "home" / "anon"
         assert result.is_dir()
 

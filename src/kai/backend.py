@@ -15,6 +15,7 @@ prompt assembly that is identical across all backends.
 """
 
 import logging
+import os
 import shutil
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
@@ -498,17 +499,28 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
     # but dev paths and the tests go straight through lazy bootstrap).
     # exist_ok=True means this is safe to call on every session init.
     path.mkdir(parents=True, exist_ok=True, mode=0o755)
+    # mkdir's mode= argument is masked by the process umask, so on a
+    # service configured with umask 0o027 the directory can end up 0o750
+    # instead of 0o755. That blocks group traversal and can break the
+    # inner subprocess when sudo -u targets a different identity. Force
+    # the intended bits explicitly - this is the same pattern install.py
+    # `_apply_migrate` uses after its mkdir calls. Idempotent on reuse.
+    os.chmod(path, 0o755)
     return path
 
 
-def resolve_home_workspace(chat_id: int | None, config: Config) -> Path:
+def resolve_home_workspace(
+    chat_id: int | None,
+    config: Config,
+    data_dir: Path | None = None,
+) -> Path:
     """
     Return the user's home workspace path.
 
     Resolution order:
     1. `user.home_workspace` from users.yaml when set (admin override,
        returned as-is with no second-guessing).
-    2. `DATA_DIR/home/<chat_id>/`, auto-created via ensure_user_home().
+    2. `<data_dir>/home/<chat_id>/`, auto-created via ensure_user_home().
 
     All call sites (pool.py session init / get_workspace fallback,
     bot.py `/workspace home` handler and workspace listings) MUST go
@@ -521,6 +533,17 @@ def resolve_home_workspace(chat_id: int | None, config: Config) -> Path:
     Passing `config` (not just its admin home field) keeps the
     resolution decision local: the caller does not need to know whether
     to prefer users.yaml or the per-user default.
+
+    The `data_dir` parameter is exposed for tests that want to thread a
+    tmp_path in cleanly (beats monkeypatching the module attribute,
+    because a test that forgets the patch would silently write to the
+    real `/var/lib/kai`). When None, we resolve from the module-level
+    DATA_DIR at CALL time (not definition time): a `data_dir=DATA_DIR`
+    default would freeze the value at import, defeating the
+    `monkeypatch.setattr("kai.backend.DATA_DIR", ...)` pattern that
+    pool.py and bot.py tests still depend on. The underlying
+    ensure_user_home already takes data_dir as a parameter; this
+    mirrors that signature.
     """
     # Admin-authored override from users.yaml wins outright. No check
     # that the path exists - the config-load validator (config.py
@@ -532,9 +555,13 @@ def resolve_home_workspace(chat_id: int | None, config: Config) -> Path:
         return user.home_workspace
 
     # No users.yaml override: use the per-user Kai-managed directory
-    # under DATA_DIR. ensure_user_home is idempotent so calling it on
-    # every resolution is cheap.
-    return ensure_user_home(chat_id, DATA_DIR)
+    # under data_dir. Resolve DATA_DIR from the module here (not as a
+    # default arg value) so monkeypatching `kai.backend.DATA_DIR` in
+    # tests still flows through. ensure_user_home is idempotent so
+    # calling it on every resolution is cheap.
+    if data_dir is None:
+        data_dir = DATA_DIR
+    return ensure_user_home(chat_id, data_dir)
 
 
 def build_foreign_workspace_reminder(workspace: Path, home_workspace: Path) -> str | None:

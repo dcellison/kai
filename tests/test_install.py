@@ -2571,6 +2571,160 @@ class TestApplyMigratePerUserMemory:
         assert not (data_path / "memory" / "MEMORY.md").exists()
 
 
+class TestApplyMigratePerUserHome:
+    """
+    Tests for the per-user home workspace provisioning in _apply_migrate
+    (#353). Mirrors TestApplyMigratePerUserMemory shape; the install-time
+    block is a pure file-system effect (mkdir + chown + chmod), so these
+    tests exercise the directory layout that gets produced.
+    """
+
+    def _write_users_yaml(self, path: Path, body: str) -> None:
+        path.write_text(body)
+
+    def _setup(self, tmp_path, monkeypatch) -> Path:
+        """Common scaffolding: project root, data dirs, no-op chown."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "memory").mkdir()
+        # chown is a no-op in tests: we are not root, and the test is
+        # only checking which paths got created, not their ownership.
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+        return data_path
+
+    def test_no_override_creates_home_chat_id_dir(self, tmp_path, monkeypatch):
+        """
+        Case 1 (default): a user with no users.yaml home_workspace lands
+        in DATA_DIR/home/<chat_id>/. This is the spec #353 default.
+        """
+        data_path = self._setup(tmp_path, monkeypatch)
+        users_yaml = tmp_path / "users.yaml"
+        self._write_users_yaml(
+            users_yaml,
+            "users:\n  - telegram_id: 5555\n    name: u\n    role: admin\n",
+        )
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        assert (data_path / "home" / "5555").is_dir()
+
+    def test_override_under_data_dir_provisions_override_path(self, tmp_path, monkeypatch):
+        """
+        Case 2 (W2 review fix): when home_workspace is set to a path
+        INSIDE DATA_DIR, the installer must create THAT path (the one
+        runtime resolve_home_workspace returns), NOT the default
+        DATA_DIR/home/<chat_id>/ slot.
+
+        Pre-fix bug: installer always created home/<chat_id>/, leaving
+        the actual override path un-provisioned. First runtime write to
+        the override would crash. This test pins the corrected behavior.
+        """
+        data_path = self._setup(tmp_path, monkeypatch)
+        # Override path lives under data_path/custom_workspace/.
+        override = data_path / "custom_workspace"
+        users_yaml = tmp_path / "users.yaml"
+        self._write_users_yaml(
+            users_yaml,
+            (f"users:\n  - telegram_id: 6666\n    name: u\n    role: admin\n    home_workspace: {override}\n"),
+        )
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        # The override path itself was created.
+        assert override.is_dir(), f"Override path {override} not provisioned"
+        # The default slot must NOT be created - it is never used at
+        # runtime when an override is set, so creating it would leave a
+        # dead directory under DATA_DIR.
+        assert not (data_path / "home" / "6666").exists(), (
+            "Default per-user slot should not be created when override is set"
+        )
+
+    def test_override_outside_data_dir_skips_provisioning(self, tmp_path, monkeypatch):
+        """
+        Case 3: when home_workspace points OUTSIDE DATA_DIR, the
+        installer must skip the entry entirely. The override is
+        operator-managed (a clone of a dev tree, a synced volume, etc.)
+        and we have no business chowning it.
+        """
+        data_path = self._setup(tmp_path, monkeypatch)
+        # Path outside data_path: a sibling under tmp_path.
+        external = tmp_path / "external_home"
+        external.mkdir()
+        users_yaml = tmp_path / "users.yaml"
+        self._write_users_yaml(
+            users_yaml,
+            (f"users:\n  - telegram_id: 7777\n    name: u\n    role: admin\n    home_workspace: {external}\n"),
+        )
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        # Default slot must NOT be created (we honored the override).
+        assert not (data_path / "home" / "7777").exists()
+        # External path must be left strictly alone (we did not chmod
+        # or otherwise touch it - verify it is still empty).
+        assert external.is_dir()
+        assert list(external.iterdir()) == []
+
+    def test_creates_home_root_when_missing(self, tmp_path, monkeypatch):
+        """
+        W3 review fix: if data_path/home/ does not exist when the
+        per-user block runs (e.g., a future refactor splits
+        _apply_directories from _apply_migrate), the block must still
+        provision per-user dirs rather than silently no-op'ing. The
+        defensive home_root.mkdir guarantees this.
+
+        Pre-fix: the block was guarded by `if home_root.is_dir():`
+        which silently skipped everything when the parent was absent.
+        """
+        data_path = self._setup(tmp_path, monkeypatch)
+        # Note: _setup does NOT create data_path/home. The defensive
+        # mkdir in _apply_migrate must create it.
+        assert not (data_path / "home").exists()
+
+        users_yaml = tmp_path / "users.yaml"
+        self._write_users_yaml(
+            users_yaml,
+            "users:\n  - telegram_id: 8888\n    name: u\n    role: admin\n",
+        )
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        # Both the parent home/ and the per-user slot exist.
+        assert (data_path / "home").is_dir()
+        assert (data_path / "home" / "8888").is_dir()
+
+
 # ── Service lifecycle ────────────────────────────────────────────────
 
 
