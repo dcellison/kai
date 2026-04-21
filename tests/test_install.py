@@ -2749,6 +2749,71 @@ class TestApplyMigratePerUserHome:
         )
         assert stat.S_IMODE((home_root / "8888").stat().st_mode) == 0o755
 
+    def test_override_resolves_through_data_path_symlink(self, tmp_path, monkeypatch):
+        """
+        Round 3 review fix: when DATA_DIR traverses a symlink (the
+        macOS case where /var/lib is a symlink to /private/var/lib),
+        the override-containment check must resolve both sides.
+
+        Pre-fix: `_collect_user_home_overrides` calls `Path.resolve()`
+        on every override but `_apply_migrate` compared the resolved
+        override against an unresolved data_path. An operator who
+        wrote `home_workspace: /private/var/lib/kai/custom` against a
+        `data_path` of `/var/lib/kai` would get is_relative_to=False
+        and the entry would silently fall through to Case 3 (skip).
+        First-write under a distinct os_user would then crash.
+
+        This test pins the symlink case by creating a symlink that
+        points at the real data_path and passing the symlink as the
+        installer's data_path argument. Without `data_path.resolve()`
+        the override (already resolved through the symlink) compares
+        as external and the test fails.
+        """
+        # Real data_path lives under tmp_path/real_data; the installer
+        # is invoked with a symlink at tmp_path/data_link that points
+        # at it. This mirrors the macOS /var/lib -> /private/var/lib
+        # situation that triggered the round-3 review finding.
+        real_data = tmp_path / "real_data"
+        real_data.mkdir()
+        (real_data / "logs").mkdir()
+        (real_data / "memory").mkdir()
+        data_link = tmp_path / "data_link"
+        data_link.symlink_to(real_data)
+
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        # Override path written against the REAL location (post-resolve
+        # form), simulating an operator who already canonicalized in
+        # users.yaml. _collect_user_home_overrides will resolve() it
+        # again to the same value.
+        override_real = real_data / "custom_workspace"
+        users_yaml = tmp_path / "users.yaml"
+        self._write_users_yaml(
+            users_yaml,
+            (f"users:\n  - telegram_id: 9999\n    name: u\n    role: admin\n    home_workspace: {override_real}\n"),
+        )
+
+        # Pass the symlinked path as data_path - this is what the
+        # round-3 bug needed to surface.
+        _apply_migrate(
+            data_link,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        # The override path under the REAL data dir was provisioned -
+        # proves the symlink-aware containment check classified it as
+        # internal (Case 2) instead of external (Case 3).
+        assert override_real.is_dir(), (
+            "Override under symlinked DATA_DIR was not provisioned - "
+            "is_relative_to comparison did not resolve data_path"
+        )
+
 
 # ── Service lifecycle ────────────────────────────────────────────────
 

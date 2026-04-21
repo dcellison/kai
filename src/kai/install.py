@@ -2037,12 +2037,21 @@ def _apply_migrate(
         # 0o755 mode. Force the bits explicitly - same pattern as
         # ensure_user_home and the user_dir.chmod two lines below.
         os.chmod(home_root, 0o755)
+    # Resolve data_path once for the symlink-safe containment check
+    # below. _collect_user_home_overrides canonicalizes each override
+    # via Path.resolve(); comparing against an unresolved data_path
+    # would mis-classify legitimately-internal overrides as external on
+    # any host where DATA_DIR traverses a symlink (e.g., macOS where
+    # /var/lib is a symlink to /private/var/lib). Resolving both sides
+    # makes is_relative_to a true containment test rather than a
+    # string-prefix comparison.
+    data_path_resolved = data_path.resolve()
     for chat_id, _os_user in memory_owners:
         override = home_overrides.get(chat_id)
         # Case 3: override pinned outside DATA_DIR - operator-managed,
         # skip. is_relative_to is the cleanest way to test path
         # containment; on Python 3.9+ it returns bool without raising.
-        if override is not None and not override.is_relative_to(data_path):
+        if override is not None and not override.is_relative_to(data_path_resolved):
             continue
         # Case 2: override under DATA_DIR - provision THAT path, since
         # resolve_home_workspace returns it verbatim at runtime. Case
