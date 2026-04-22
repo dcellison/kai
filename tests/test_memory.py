@@ -637,7 +637,7 @@ _RECALL_UNIFORM_FIELDS = {
 }
 
 
-def _parse_recall_log(caplog) -> dict:
+def _parse_recall_log(caplog) -> dict[str, object]:
     """
     Find the single memory.recall record in caplog and return its
     parsed JSON payload.

@@ -291,7 +291,7 @@ _RECALL_REASON_ALL_BELOW_FLOOR = "all_below_floor"
 _RECALL_REASON_BUDGET_EXHAUSTED = "budget_exhausted"
 
 
-def _base_recall_payload(user_id: str, query: str) -> dict:
+def _base_recall_payload(user_id: str, query: str) -> dict[str, object]:
     """
     Build a memory.recall payload with all uniform-shape fields set.
 
@@ -325,7 +325,7 @@ def _base_recall_payload(user_id: str, query: str) -> dict:
     }
 
 
-def _emit_recall_log(payload: dict) -> None:
+def _emit_recall_log(payload: dict[str, object]) -> None:
     """
     Write a single memory.recall log line as compact JSON.
 
