@@ -265,8 +265,12 @@ def _truncate(s: str, n: int) -> str:
 
     Used by the memory.recall logging path to render both the query
     text and per-hit snippets as a single line of human-readable JSON.
-    Newline rewriting must happen BEFORE truncation so that a CR/LF
-    landing exactly at position n - 1 cannot leak past the cap.
+    Sanitize-first is the canonical idiom: it makes "no control
+    characters in the output" an invariant of this function regardless
+    of any future change to the truncation step. The length cap itself
+    holds with either ordering, since `\n` and `\r` are single chars
+    replaced 1-for-1 with spaces; the choice is structural, not
+    length-correctness.
 
     No ellipsis: the truncation length is a known constant, and the
     eval harness consuming these log lines treats the snippet as a
@@ -527,6 +531,21 @@ async def format_context(
     # ThreadPoolExecutor to avoid blocking the event loop.
     fetch_limit = max(_config.memory_search_limit, _SEARCH_OVERFETCH)
     payload["fetch_limit"] = fetch_limit
+
+    # Read the floor from config at every call (not at module import) so a
+    # `MEMORY_SEARCH_FLOOR` change applied via service restart takes effect
+    # consistently here AND in the `/memory search` UI. _config is non-None
+    # inside this branch because is_enabled() returned True above.
+    #
+    # Captured BEFORE the search call so post-search short-circuit log
+    # lines (no_results, all_below_floor) carry the real floor value in
+    # their payload rather than the 0.0 sentinel that
+    # _base_recall_payload sets, matching how budget_tokens and
+    # fetch_limit are populated up-front. The actual filter step using
+    # `floor` happens later, after the search returns results to filter.
+    floor = _config.memory_search_floor
+    payload["floor"] = floor
+
     loop = asyncio.get_running_loop()
     # latency_ms scopes ONLY the run_in_executor search call: the
     # ranking and formatting that follow are deterministic, microsecond
@@ -544,14 +563,9 @@ async def format_context(
     # Quality gate: drop low-relevance noise before any ranking adjustment.
     # Weighting happens AFTER this filter so a downweighted legacy row
     # cannot survive on raw score, and a boosted extracted fact cannot
-    # be rescued below threshold.
-    #
-    # Read the floor from config at every call (not at module import) so a
-    # `MEMORY_SEARCH_FLOOR` change applied via service restart takes effect
-    # consistently here AND in the `/memory search` UI. _config is non-None
-    # inside this branch because is_enabled() returned True above.
-    floor = _config.memory_search_floor
-    payload["floor"] = floor
+    # be rescued below threshold. `floor` was read from _config above
+    # so the all_below_floor short-circuit log line carries the real
+    # threshold rather than a sentinel.
     results = [r for r in results if r.score >= floor]
     payload["hits_after_floor"] = len(results)
     if not results:

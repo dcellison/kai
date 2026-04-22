@@ -865,6 +865,22 @@ class TestRecallLogging:
         assert payload["returned_empty"] is True
         assert payload["reason"] == reason
 
+        # Floor is read from _config BEFORE the search call (not at the
+        # filter site), so post-search short-circuits carry the real
+        # threshold. disabled and empty_query short-circuit earlier and
+        # keep the 0.0 sentinel from _base_recall_payload. Locks in the
+        # eval-harness contract that "operator can recover the floor in
+        # effect for any no_results / all_below_floor / budget_exhausted
+        # log line" without re-running search.
+        if reason in ("no_results", "all_below_floor", "budget_exhausted"):
+            assert payload["floor"] == 0.3, (
+                f"post-search short-circuit {reason} must carry real floor; got {payload['floor']}"
+            )
+        else:
+            assert payload["floor"] == 0.0, (
+                f"pre-search short-circuit {reason} should keep 0.0 sentinel; got {payload['floor']}"
+            )
+
     async def test_memory_recall_log_snippet_and_query_truncated_and_sanitized(self, caplog):
         """Both the query field and per-hit snippets honor the 80-char
         truncation cap and rewrite \\n and \\r into single spaces. The
