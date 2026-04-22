@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -596,13 +597,18 @@ class TestFormatContext:
         assert "User said:" not in output
 
         # Every per-line tag must be `(fact)`. Walk the body lines (skip
-        # the header) and look for the source short tag in each.
+        # the header) and look for the source short tag in each. The
+        # regex matches the per-line prefix shape exactly — `(fact)` with
+        # an optional `YYYY-MM-DD, ` date prefix — rather than searching
+        # for the bare substring `"fact)"`, which a memory text could
+        # theoretically contain (e.g. a stored fact about "a known fact)").
+        # The seeded data here is controlled, but the precise form keeps
+        # the test honest if future seed text drifts.
+        tag_re = re.compile(r"\((?:\d{4}-\d{2}-\d{2}, )?fact\)")
         body_lines = [ln for ln in output.splitlines()[1:] if ln.strip()]
         assert body_lines, "expected non-empty body"
         for line in body_lines:
-            # The per-line shape is `- (YYYY-MM-DD, fact) <text>`. We only
-            # assert the source-short part; the date is exercised separately.
-            assert "fact)" in line, f"non-(fact) tag on line: {line!r}"
+            assert tag_re.search(line), f"non-(fact) tag on line: {line!r}"
             assert "(user)" not in line
 
 
@@ -1799,7 +1805,17 @@ class TestMemoryIntegration:
         assert len(remaining) == 0
 
     async def test_format_context_integration(self, real_memory_instance):
-        """format_context returns formatted, budget-capped output."""
+        """format_context returns formatted, budget-capped output.
+
+        Note: the test method itself is `async def` because `format_context`
+        is async (it awaits Mem0's executor wrapper). `add_structured`,
+        however, is intentionally **synchronous** — it wraps a single
+        Mem0 `.add()` call with `infer=False` and does no I/O of its own
+        worth offloading. If `add_structured` is ever made async, this
+        call site silently returns a coroutine without awaiting it; the
+        test would still pass but no row would be stored. Pinning the
+        sync contract in this docstring so a future signature change has
+        a paper trail."""
         import kai.memory as mem_mod
 
         mem_mod._memory = real_memory_instance
@@ -1808,6 +1824,7 @@ class TestMemoryIntegration:
         user_id = "integration-format"
         real_memory_instance.delete_all(user_id=user_id)
 
+        # Sync call - see docstring above. Not awaited.
         mem_mod.add_structured(
             "The Mac mini has 16GB RAM",
             user_id=user_id,

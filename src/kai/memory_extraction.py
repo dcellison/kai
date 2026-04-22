@@ -56,8 +56,9 @@ _CONFIRMATION_QUOTE_MIN_CHARS = 20
 # removed Track 1 (which used to share this cap), so a per-module local
 # constant is now the cleanest arrangement. Mirrors the assistant-side
 # `memory._MAX_ASSISTANT_CHARS` cap; that one stays in memory.py because
-# it is referenced from `_build_extraction_payload` below alongside
-# legacy comment context, and was never part of the Track 1 symbol set.
+# `_build_extraction_payload` in this module reads it alongside legacy
+# comment context tied to memory.py, and it was never part of the
+# Track 1 symbol set so leaving it where it is avoids unrelated churn.
 # 2000 chars keeps the embedding focused on semantic core: users do
 # occasionally paste long content (logs, code, error traces) and an
 # uncapped paste would dominate the per-call Haiku token cost.
