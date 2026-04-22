@@ -14,7 +14,9 @@
     "precision_at_1": 0.68,
     "precision_at_3": 0.81,
     "precision_at_5": 0.83,
-    "precision_at_lines_used": 0.77,
+    "recall_at_1": 0.68,
+    "recall_at_3": 0.81,
+    "recall_at_5": 0.83,
     "mrr": 0.74,
     "fraction_in_prompt": 0.77,
     "latency_p50_ms": 43,
@@ -24,14 +26,12 @@
     "preferences": {
       "precision_at_k": {"1": 0.71, "3": 0.84, "5": 0.86},
       "recall_at_k": {"1": 0.71, "3": 0.84, "5": 0.86},
-      "precision_at_lines_used": 0.79,
       "mrr": 0.78,
       "fraction_in_prompt": 0.79
     },
     "infra": {
       "precision_at_k": {"1": 0.62, "3": 0.75, "5": 0.78},
       "recall_at_k": {"1": 0.62, "3": 0.75, "5": 0.78},
-      "precision_at_lines_used": 0.72,
       "mrr": 0.69,
       "fraction_in_prompt": 0.72
     }

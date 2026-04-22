@@ -184,7 +184,6 @@ class Metrics:
     n_drift: int
     precision_at_k: dict[int, float]
     recall_at_k: dict[int, float]
-    precision_at_lines_used: float
     mrr: float
     fraction_in_prompt: float
     latency_p50_ms: float
@@ -346,21 +345,17 @@ def score_probes(results: list[ProbeResult]) -> dict[str, Any]:
     """Compute aggregate metrics over a list of ProbeResult.
 
     Pure function: takes scored per-probe outcomes (rank, lines_used,
-    in_prompt) and returns the metrics dict. Test #1 exercises this
-    directly with hand-constructed inputs, including a mix of scored-
-    hit, scored-miss, and drift probes, asserting that drift probes
-    are excluded from BOTH numerator and denominator. The caller is
-    responsible for filtering out drift probes before invoking this
-    function; that contract is enforced by the type signature
-    (drift probes don't produce a ProbeResult at all).
+    in_prompt) and returns the metrics dict. The harness's drift-
+    detection step filters drifted probes out before they reach this
+    function; the type signature does NOT enforce that contract (any
+    list[ProbeResult] type-checks), so the caller is responsible.
 
     For the single-answer case (each probe has exactly one expected
     fact), recall@K equals precision@K. They are reported separately
     so a future multi-answer probe format can diverge without
-    reshaping the output. fraction_in_prompt differs from precision
-    @lines_used: in_prompt is computed per probe against that probe's
-    actual lines_used (varies with budget exhaustion), whereas
-    precision@K uses a fixed K across all probes.
+    reshaping the output. fraction_in_prompt is the per-probe variant:
+    each probe is checked against its own lines_used (varies with
+    budget exhaustion), whereas precision@K uses a fixed K.
     """
     n = len(results)
     if n == 0:
@@ -372,7 +367,6 @@ def score_probes(results: list[ProbeResult]) -> dict[str, Any]:
         return {
             "precision_at_k": {k: 0.0 for k in _K_VALUES},
             "recall_at_k": {k: 0.0 for k in _K_VALUES},
-            "precision_at_lines_used": 0.0,
             "mrr": 0.0,
             "fraction_in_prompt": 0.0,
         }
@@ -389,11 +383,13 @@ def score_probes(results: list[ProbeResult]) -> dict[str, Any]:
         precision_at_k[k] = hits_in_top_k / n
         recall_at_k[k] = hits_in_top_k / n
 
-    # precision_at_lines_used is the per-probe variant: uses each
-    # probe's own lines_used as the K. A probe whose lines_used was
-    # zero (header-only output, never observed in practice but
-    # possible if budget < header tokens) cannot have an in-prompt
-    # hit, which falls out naturally from the rank <= 0 check.
+    # fraction_in_prompt: per-probe variant where K = each probe's
+    # actual lines_used (the slice the agent saw). Computed from
+    # ProbeResult.in_prompt which was set in _run_one_probe as
+    # `rank is not None and rank <= lines_used`. A probe whose
+    # lines_used was zero (header-only output, possible if budget <
+    # header tokens) cannot have an in-prompt hit, which falls out
+    # naturally from the rank <= 0 check at probe-execution time.
     in_prompt_count = sum(1 for r in results if r.in_prompt)
 
     # MRR: mean of 1/rank, treating misses as 0. The miss-as-zero
@@ -405,7 +401,6 @@ def score_probes(results: list[ProbeResult]) -> dict[str, Any]:
     return {
         "precision_at_k": precision_at_k,
         "recall_at_k": recall_at_k,
-        "precision_at_lines_used": in_prompt_count / n,
         "mrr": mrr_sum / n,
         "fraction_in_prompt": in_prompt_count / n,
     }
@@ -471,7 +466,6 @@ def aggregate_metrics(
         n_drift=n_drift,
         precision_at_k=base["precision_at_k"],
         recall_at_k=base["recall_at_k"],
-        precision_at_lines_used=base["precision_at_lines_used"],
         mrr=base["mrr"],
         fraction_in_prompt=base["fraction_in_prompt"],
         latency_p50_ms=_percentile(latencies, 50),
@@ -626,15 +620,21 @@ def _detach_capture(capture: _RecallLogCapture) -> None:
         logger.setLevel(capture._saved_level)
 
 
-async def evaluate(probes: list[Probe], user_id: str) -> Metrics:
-    """Run drift detection + scoring for one configuration.
+async def _score_against_store(
+    scored: list[Probe],
+    drifted: list[Probe],
+    tags_by_id: dict[str, tuple[str, ...]],
+    user_id: str,
+) -> Metrics:
+    """Run probes through the live store and aggregate metrics.
 
-    The configuration is whatever is currently loaded into
-    `kai.memory` module state - this function does NOT mutate that
-    state. The sweep loop layers config mutation on top by calling
-    `evaluate` once per grid point inside its own try/finally.
+    Split out from `evaluate` so the sweep loop can pre-compute drift
+    once at sweep entry and reuse it across every grid point: drift
+    state (which expected_fact_ids resolve via get_by_id) does not
+    depend on the floor / extracted_weight / overfetch knobs that the
+    sweep mutates, so re-running detect_drift per grid point would
+    issue grid_size * len(probes) get_by_id calls for no new signal.
     """
-    scored, drifted, tags_by_id = detect_drift(probes, user_id)
     capture = _attach_capture()
     try:
         results = await _run_probes(scored, user_id, capture, tags_by_id)
@@ -644,7 +644,24 @@ async def evaluate(probes: list[Probe], user_id: str) -> Metrics:
         # runs in a long-lived process (Python REPL, future test
         # suite) would stack capture handlers.
         _detach_capture(capture)
-    return aggregate_metrics(results, n_probes=len(probes), n_drift=len(drifted))
+    return aggregate_metrics(
+        results,
+        n_probes=len(scored) + len(drifted),
+        n_drift=len(drifted),
+    )
+
+
+async def evaluate(probes: list[Probe], user_id: str) -> Metrics:
+    """Run drift detection + scoring for one configuration.
+
+    The configuration is whatever is currently loaded into
+    `kai.memory` module state - this function does NOT mutate that
+    state. The sweep loop calls `_score_against_store` directly with
+    pre-computed drift to avoid redundant get_by_id calls per grid
+    point; single-config callers go through this wrapper.
+    """
+    scored, drifted, tags_by_id = detect_drift(probes, user_id)
+    return await _score_against_store(scored, drifted, tags_by_id, user_id)
 
 
 # ── Sweep mode ─────────────────────────────────────────────────────
@@ -705,6 +722,14 @@ async def run_sweep(
     saved_weights: dict[str, float] = dict(_mem._SOURCE_WEIGHTS)
     saved_overfetch: int = _mem._SEARCH_OVERFETCH
 
+    # Drift detection is independent of the swept knobs: get_by_id
+    # consults Mem0 row presence and source filtering, neither of
+    # which the floor/weight/overfetch grid touches. Computing once
+    # at sweep entry collapses grid_size * len(probes) get_by_id
+    # calls down to len(probes) total. The store is assumed stable
+    # across the sweep (which runs in minutes, not hours).
+    scored, drifted, tags_by_id = detect_drift(probes, user_id)
+
     out: list[tuple[ConfigOverride, Metrics]] = []
     try:
         for i, override in enumerate(grid, start=1):
@@ -722,7 +747,7 @@ async def run_sweep(
             # object is also passed to other modules at init time, but
             # those modules cache nothing, so a rebind here is sufficient.
             _mem._config = dataclasses.replace(saved_config, memory_search_floor=override.floor)
-            metrics = await evaluate(probes, user_id)
+            metrics = await _score_against_store(scored, drifted, tags_by_id, user_id)
             out.append((override, metrics))
     finally:
         # Restore from snapshot regardless of whether the loop ran to
@@ -798,7 +823,6 @@ def _metrics_to_dict(m: Metrics, *, include_by_tag: bool = True) -> dict[str, An
         # what jq will see anyway.
         "precision_at_k": {str(k): round(v, 4) for k, v in m.precision_at_k.items()},
         "recall_at_k": {str(k): round(v, 4) for k, v in m.recall_at_k.items()},
-        "precision_at_lines_used": round(m.precision_at_lines_used, 4),
         "mrr": round(m.mrr, 4),
         "fraction_in_prompt": round(m.fraction_in_prompt, 4),
         "latency_p50_ms": round(m.latency_p50_ms, 1),
@@ -809,7 +833,6 @@ def _metrics_to_dict(m: Metrics, *, include_by_tag: bool = True) -> dict[str, An
             tag: {
                 "precision_at_k": {str(k): round(v, 4) for k, v in vals["precision_at_k"].items()},
                 "recall_at_k": {str(k): round(v, 4) for k, v in vals["recall_at_k"].items()},
-                "precision_at_lines_used": round(vals["precision_at_lines_used"], 4),
                 "mrr": round(vals["mrr"], 4),
                 "fraction_in_prompt": round(vals["fraction_in_prompt"], 4),
             }
@@ -830,11 +853,10 @@ def _render_single_metrics(m: Metrics) -> str:
         f"Probes: {m.n_probes} total, {m.n_scored} scored, {m.n_drift} drifted",
         "",
         "Precision @K:",
-        *[f"  K={k}: {m.precision_at_k[k]:.3f}" for k in _K_VALUES],
-        f"  K=lines_used (per probe): {m.precision_at_lines_used:.3f}",
+        *[f"  K={k}: {m.precision_at_k.get(k, 0.0):.3f}" for k in _K_VALUES],
         "",
         "Recall @K (single-answer = precision):",
-        *[f"  K={k}: {m.recall_at_k[k]:.3f}" for k in _K_VALUES],
+        *[f"  K={k}: {m.recall_at_k.get(k, 0.0):.3f}" for k in _K_VALUES],
         "",
         f"MRR: {m.mrr:.3f}",
         f"fraction_in_prompt: {m.fraction_in_prompt:.3f}",
@@ -843,15 +865,10 @@ def _render_single_metrics(m: Metrics) -> str:
     ]
     if m.by_tag:
         lines.append("")
-        lines.append("Per-tag (precision@5 / fraction_in_prompt / probe count):")
+        lines.append("Per-tag (precision@5 / fraction_in_prompt):")
         for tag, vals in m.by_tag.items():
             p5 = vals["precision_at_k"].get(5, 0.0)
             fip = vals["fraction_in_prompt"]
-            # Per-tag probe count: count of probes whose expected
-            # fact carries this tag. Recovered from the by_tag dict's
-            # presence rather than re-walking results, since by_tag
-            # is computed from the same buckets and we trust the
-            # math above.
             lines.append(f"  {tag}: p@5={p5:.3f} in_prompt={fip:.3f}")
     return "\n".join(lines)
 
@@ -877,9 +894,14 @@ def _render_sweep_table(sweep_results: list[tuple[ConfigOverride, Metrics]]) -> 
     sep = "-" * len(header)
     rows = []
     for cfg, m in sorted_results:
+        # `.get(k, 0.0)` defends against _K_VALUES drifting out from
+        # under this renderer; matches the pattern in pareto_frontier.
+        p1 = m.precision_at_k.get(1, 0.0)
+        p3 = m.precision_at_k.get(3, 0.0)
+        p5 = m.precision_at_k.get(5, 0.0)
         rows.append(
             f"{cfg.floor:>6.2f} {cfg.extracted_weight:>6.2f} {cfg.overfetch:>5d}  "
-            f"{m.precision_at_k[1]:>6.3f} {m.precision_at_k[3]:>6.3f} {m.precision_at_k[5]:>6.3f}  "
+            f"{p1:>6.3f} {p3:>6.3f} {p5:>6.3f}  "
             f"{m.mrr:>6.3f} {m.fraction_in_prompt:>6.3f}  "
             f"{m.latency_p50_ms:>5.0f} {m.latency_p95_ms:>5.0f}"
         )
@@ -997,10 +1019,12 @@ def _build_baseline_json(
             "overfetch": cfg.overfetch,
         },
         "metrics": {
-            "precision_at_1": round(metrics.precision_at_k[1], 4),
-            "precision_at_3": round(metrics.precision_at_k[3], 4),
-            "precision_at_5": round(metrics.precision_at_k[5], 4),
-            "precision_at_lines_used": round(metrics.precision_at_lines_used, 4),
+            "precision_at_1": round(metrics.precision_at_k.get(1, 0.0), 4),
+            "precision_at_3": round(metrics.precision_at_k.get(3, 0.0), 4),
+            "precision_at_5": round(metrics.precision_at_k.get(5, 0.0), 4),
+            "recall_at_1": round(metrics.recall_at_k.get(1, 0.0), 4),
+            "recall_at_3": round(metrics.recall_at_k.get(3, 0.0), 4),
+            "recall_at_5": round(metrics.recall_at_k.get(5, 0.0), 4),
             "mrr": round(metrics.mrr, 4),
             "fraction_in_prompt": round(metrics.fraction_in_prompt, 4),
             "latency_p50_ms": round(metrics.latency_p50_ms, 1),

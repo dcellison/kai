@@ -302,13 +302,16 @@ class TestSweepRestoration:
         original_weights = dict(mem_mod._SOURCE_WEIGHTS)
         original_overfetch = mem_mod._SEARCH_OVERFETCH
 
-        # `evaluate` is patched to raise on the second call, mid-sweep.
-        # The first call completes normally; the second raises and the
-        # exception propagates out. The try/finally inside run_sweep
-        # must still restore the original state.
+        # The sweep loop now calls `_score_against_store` per grid
+        # point (drift is hoisted to a single call at sweep entry, so
+        # we also stub `detect_drift` to a no-op tuple). The stub is
+        # patched to raise on the second call, mid-sweep. The first
+        # call completes normally; the second raises and the exception
+        # propagates out. The try/finally inside run_sweep must still
+        # restore the original module state.
         call_count = {"n": 0}
 
-        async def faulty_evaluate(probes, user_id):
+        async def faulty_score(scored, drifted, tags_by_id, user_id):
             call_count["n"] += 1
             if call_count["n"] == 2:
                 raise RuntimeError("simulated mid-sweep failure")
@@ -320,7 +323,6 @@ class TestSweepRestoration:
                 n_drift=0,
                 precision_at_k={1: 0.0, 3: 0.0, 5: 0.0},
                 recall_at_k={1: 0.0, 3: 0.0, 5: 0.0},
-                precision_at_lines_used=0.0,
                 mrr=0.0,
                 fraction_in_prompt=0.0,
                 latency_p50_ms=0.0,
@@ -332,7 +334,11 @@ class TestSweepRestoration:
             ConfigOverride(floor=0.40, extracted_weight=2.0, overfetch=30),
         ]
         with (
-            patch("kai.eval.retrieval.evaluate", side_effect=faulty_evaluate),
+            patch(
+                "kai.eval.retrieval.detect_drift",
+                return_value=([Probe(question="q", expected_fact_id="id")], [], {"id": ()}),
+            ),
+            patch("kai.eval.retrieval._score_against_store", side_effect=faulty_score),
             pytest.raises(RuntimeError, match="simulated mid-sweep failure"),
         ):
             asyncio.run(
@@ -468,7 +474,6 @@ class TestDriftDetection:
                 n_drift=0,
                 precision_at_k={1: p5, 3: p5, 5: p5},
                 recall_at_k={1: p5, 3: p5, 5: p5},
-                precision_at_lines_used=p5,
                 mrr=p5,
                 fraction_in_prompt=p5,
                 latency_p50_ms=lat,
