@@ -325,7 +325,9 @@ Important constraints:
   not have two proposed facts both update the same existing fact.
 - A confirmed_action fact is always "new" (a confirmation is a fresh
   observation about reality, even if the wording paraphrases an existing
-  fact). Never emit "skip_redundant" for a confirmed_action.
+  fact). Never emit "skip_redundant" or "update_of" for a confirmed_action;
+  always store it as a separate "new" fact so the timestamp record stays
+  intact.
 """
 
 
@@ -446,6 +448,16 @@ def _render_candidate_line(cand: MemoryResult) -> str:
     extraction in `_validate_facts`. The stored text (`cand.text`) is
     already bounded to 500 chars by the extractor schema, so no further
     truncation is needed here.
+
+    `cand.text` is run through `_strip_role_labels` for the same reason
+    `user_text`/`assistant_text` are: a fact in the store could contain
+    embedded USER:/ASSISTANT: markers (an earlier extraction's payload
+    was sanitized, but a stored fact's *content* is not - if a future
+    backend or ingestion path lets through such a string, rendering it
+    raw into the EXISTING FACTS block would be a second-order injection
+    vector). The attack chain is two steps (compromise the store, then
+    exploit retrieval) so the practical risk is low; this is structural
+    defense-in-depth against the store growing into that vector.
     """
     source = _render_candidate_source(cand.metadata or {})
     conf_raw = (cand.metadata or {}).get("confidence")
@@ -456,7 +468,7 @@ def _render_candidate_line(cand: MemoryResult) -> str:
         conf = f"{conf_raw:g}"
     else:
         conf = "n/a"
-    return f"[{cand.id}] (source={source}, conf={conf}) {cand.text}"
+    return f"[{cand.id}] (source={source}, conf={conf}) {_strip_role_labels(cand.text)}"
 
 
 def _emit_intent_log(
@@ -669,12 +681,24 @@ def _validate_facts(
                 )
                 continue
 
-        # Rule 4: confirmed_action facts cannot be skip_redundant. A
+        # Rule 4: confirmed_action facts cannot be consolidated. A
         # confirmation is a fresh observation about reality even if it
-        # paraphrases an existing fact - the timestamp matters.
+        # paraphrases an existing fact - the timestamp matters, so the
+        # confirmation must land as its own row.
+        #
+        # `skip_redundant` would drop the confirmation entirely; `update_of`
+        # would replace the prior confirmation in place, erasing the
+        # timestamp distinction (and silently destroying the original
+        # confirmation's row id). Both cases are blocked here even though
+        # the prompt instructs Haiku to use "new" for confirmed_action -
+        # this is a defense-in-depth gate against the model disobeying
+        # that instruction (the confirmation-quote rules below would not
+        # catch it: an `update_of` confirmation with a valid quote would
+        # otherwise pass all five rules and silently replace the prior
+        # confirmation).
         tags = fact.get("tags") or []
-        if intent == "skip_redundant" and "confirmed_action" in tags:
-            log.debug("_validate_facts: rejecting skip_redundant on confirmed_action fact")
+        if intent in ("skip_redundant", "update_of") and "confirmed_action" in tags:
+            log.debug("_validate_facts: rejecting %s on confirmed_action fact", intent)
             continue
 
         # Rule 5: existing-id uniqueness across the batch. Pre-counted
