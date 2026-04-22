@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 from dataclasses import replace
@@ -673,8 +674,6 @@ class TestRecallLogging:
     async def test_memory_recall_log_success_has_all_fields(self, caplog):
         """Success path emits one memory.recall line with every uniform field
         and no reason key."""
-        import logging
-
         import kai.memory as mem_mod
         from kai.memory import format_context
 
@@ -750,9 +749,12 @@ class TestRecallLogging:
             assert isinstance(hit["snippet"], str)
 
         # Post-sort order: extracted (1.2x weight) outranks legacy (0.6x)
-        # at any comparable raw score, so the extracted hit must come
-        # first in the hits array even though Mem0 returned them with
-        # the higher raw score on the extracted entry by coincidence.
+        # by adjusted score, so the extracted hit must come first in
+        # the hits array even though Mem0 returned legacy with the
+        # higher raw score (0.95 vs 0.90). This is the assertion that
+        # would fail if `_source_weight` ever stopped applying its
+        # multiplier; the mock is built so raw ordering and adjusted
+        # ordering disagree.
         assert payload["hits"][0]["source"] == "extracted"
         assert payload["hits"][1]["source"] == ""
 
@@ -780,8 +782,6 @@ class TestRecallLogging:
         with the uniform schema, returned_empty=True, and the expected
         reason value. Parametrized so a regression that collapses two
         paths to the same reason value fails loudly."""
-        import logging
-
         import kai.memory as mem_mod
         from kai.memory import format_context
 
@@ -862,8 +862,6 @@ class TestRecallLogging:
         eval harness treats snippets as fingerprints and parses log
         lines as single-line JSON; either escape leaking through
         breaks both contracts at once."""
-        import logging
-
         import kai.memory as mem_mod
         from kai.memory import format_context
 
