@@ -43,6 +43,13 @@ home/.claude/*
 !home/config
 home/config/*
 !home/config/goose-config.yaml
+# Evaluation harness: committed examples show the schema; real
+# baselines and probe sets contain per-operator data (conversation
+# fragments, IDs specific to that store) and must stay gitignored.
+!home/evals
+home/evals/*
+!home/evals/retrieval-baseline.example.json
+!home/evals/probes.example.jsonl
 
 # OS / IDE
 .DS_Store
