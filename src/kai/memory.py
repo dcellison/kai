@@ -278,10 +278,12 @@ def _truncate(s: str, n: int) -> str:
 
 # Reasons surfaced in the `reason` field of a memory.recall log line.
 # Each maps 1:1 to a short-circuit return site in format_context.
-# Centralized here so test_memory.py's parametrized short-circuit
-# test can import the same set without re-typing magic strings, and
-# so a typo in any single emit site is caught by the type checker
-# rather than silently producing a unique third reason value.
+# Centralized as named constants so a typo at any single emit site
+# (e.g. `_RECALL_REASON_DISBALED`) raises NameError at first call
+# rather than silently emitting an off-by-one-letter reason that the
+# eval harness would treat as a brand-new short-circuit category.
+# A bare-string assignment like `payload["reason"] = "disbaled"`
+# would not surface anywhere short of someone reading the logs.
 _RECALL_REASON_DISABLED = "disabled"
 _RECALL_REASON_EMPTY_QUERY = "empty_query"
 _RECALL_REASON_NO_RESULTS = "no_results"
