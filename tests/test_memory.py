@@ -823,8 +823,16 @@ class TestRecallLogging:
             mock.search.return_value = {
                 "results": [
                     {
-                        "id": "big",
-                        "memory": "x" * 10000,  # huge text overflows any small budget
+                        "id": "any",
+                        # The header alone (~70 chars / ~17 tokens via
+                        # _estimate_tokens) already exceeds budget=10
+                        # below, so the for-loop's first iteration
+                        # `if used_tokens + line_tokens > budget: break`
+                        # fires regardless of memory text. Any non-empty
+                        # text triggers the same path; the content
+                        # itself is not what's load-bearing here, the
+                        # header's own token cost is.
+                        "memory": "any text suffices",
                         "score": 0.9,
                         "metadata": {"type": "fact", "source": "extracted"},
                         "created_at": "2026-04-01T00:00:00",
@@ -832,7 +840,8 @@ class TestRecallLogging:
                 ]
             }
             mem_mod._memory = mock
-            # Tiny budget so the single (header + line) cannot fit.
+            # Budget set below the header's own token cost so no line
+            # can ever be appended; len(lines) <= 1 then short-circuits.
             mem_mod._config = _make_config(memory_token_budget=10)
             query = "anything"
         else:
