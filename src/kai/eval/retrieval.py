@@ -1119,9 +1119,17 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 "probe_count": len(probes),
                 "sweep": [
                     {
+                        # `legacy_weight` is fixed across the sweep
+                        # (the grid only varies floor/extracted_weight/
+                        # overfetch) but is included here so each per-
+                        # row config block matches the shape of the
+                        # single-config baseline's `config` envelope.
+                        # A downstream parser can read both file types
+                        # uniformly without a special case.
                         "config": {
                             "floor": cfg.floor,
                             "extracted_weight": cfg.extracted_weight,
+                            "legacy_weight": _PRODUCTION_LEGACY_WEIGHT,
                             "overfetch": cfg.overfetch,
                         },
                         "metrics": _metrics_to_dict(m, include_by_tag=False),
