@@ -160,7 +160,8 @@ class TestBuildExtractionPayload:
         """Round 5 review finding: assistant_text arrives at full length
         from bot.py, so long tool output blows up the Haiku payload and
         per-call cost. Truncation must match the memory._MAX_ASSISTANT_CHARS
-        cap (mirrors the user-side cap applied by add_user_utterance)."""
+        cap (mirrors the user-side cap applied earlier in
+        _build_extraction_payload)."""
         from kai import memory
 
         # +500 chars over the cap so the test still passes if the cap is

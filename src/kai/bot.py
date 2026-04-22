@@ -341,14 +341,13 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _end_session(chat_id: int) -> None:
     """Session-end hook: clear the session record.
 
-    Spec 360 removed the Track 1 verification-window flush that used to
-    run here. Track 2 extraction (`memory_extraction.extract_and_store`)
+    The previous Track 1 verification-window flush that used to run
+    here is gone. Track 2 extraction (`memory_extraction.extract_and_store`)
     is fire-and-forget per turn and has no end-of-session drain step,
     so the only thing left to do at session end is the session-state
     cleanup itself. Kept as a thin wrapper rather than inlining the
-    `sessions.clear_session` call at every site so future session-end
-    hooks (typing-indicator drain, metric emission, etc.) have a
-    natural home.
+    `sessions.clear_session` call because it has multiple call sites
+    (grep `_end_session(`); inlining would touch every one.
     """
     await sessions.clear_session(chat_id)
 
