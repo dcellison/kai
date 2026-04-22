@@ -41,6 +41,26 @@ from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude
 log = logging.getLogger(__name__)
 
 
+# Persistent structural delimiter for the current user message. Spec
+# 360 §1.2 / §3.3: when retrieval blocks contain quote-shaped lines
+# that mimic real user input (legacy `User said:` rows or sufficiently
+# user-voiced extracted facts), the inner agent can fail to recognize
+# the trailing user text as the actual message. This marker is the
+# one structural signal that says "the message below this line is
+# the real one — respond to it." Module-level so tests can import
+# and assert against it without string duplication.
+#
+# Bracket-label format chosen to match the visual shape of the other
+# context blocks (`[Recent conversations ...]`, `[Your persistent
+# memory ...]`, `[Relevant memories ...]`) without colliding with any
+# of them — a retrieval row could in principle contain any of those
+# header strings verbatim, but cannot accidentally produce this exact
+# label. NOT gated by a feature flag: spec §5.1 requires the marker
+# to be a permanent fixture so prompt shape is consistent
+# session-to-session.
+USER_MESSAGE_MARKER = "[User's current message - respond to this:]"
+
+
 # ── Claude Code backend ─────────────────────────────────────────────
 
 
@@ -393,6 +413,23 @@ class ClaudeCodeBackend(AgentBackend):
                 (block["text"] for block in prompt if block.get("type") == "text"),
                 "",
             )
+
+        # Persistent structural delimiter for the current user message.
+        # Prepended FIRST in the chain so subsequent prepends (session,
+        # memory, reminder) stack ABOVE it in the assembled prompt,
+        # leaving the marker as the closest prefix to the user's
+        # actual text.
+        #
+        # This ordering is load-bearing and the most common way to
+        # break the spec 360 fix: `prepend_to_prompt` is a pure
+        # prefix-prepend, so calling it for the marker LAST in the
+        # chain would put the marker at the TOP of the assembled
+        # prompt — the exact opposite of the invariant. The order of
+        # the prepends below is the inverse of the final reading
+        # order. See spec 360 §3.3 and `tests/test_claude.py::
+        # test_delimiter_is_closest_prefix_to_user_text` for the
+        # regression test that catches the inverted form.
+        prompt = prepend_to_prompt(prompt, USER_MESSAGE_MARKER)
 
         # Inject identity, memory, history, and API context on the
         # first message of a new session. Context injection logic lives

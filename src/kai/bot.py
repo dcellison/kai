@@ -339,34 +339,17 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def _end_session(chat_id: int) -> None:
+    """Session-end hook: clear the session record.
+
+    Spec 360 removed the Track 1 verification-window flush that used to
+    run here. Track 2 extraction (`memory_extraction.extract_and_store`)
+    is fire-and-forget per turn and has no end-of-session drain step,
+    so the only thing left to do at session end is the session-state
+    cleanup itself. Kept as a thin wrapper rather than inlining the
+    `sessions.clear_session` call at every site so future session-end
+    hooks (typing-indicator drain, metric emission, etc.) have a
+    natural home.
     """
-    Session-end hook: flush any pending memory write, then clear the
-    session record.
-
-    Implements the Phase 3 session-end half of spec §6.3 P3. When
-    `memory_extraction_enabled` is off (the default through Phase 2
-    and Phase 3 ship), the flush call still runs but `flush_pending`
-    is a cheap dict-pop + no-op when there is nothing queued. The
-    memory check avoids importing the memory layer at all when it is
-    globally disabled, which also avoids loading Mem0's optional deps
-    on installs that do not have them.
-
-    Failures in the flush are logged at WARNING and never propagate:
-    session-clear MUST always proceed so the bot does not wedge. This
-    mirrors the try/except pattern around _ingest_memory.
-    """
-    from kai.memory import flush_pending
-    from kai.memory import is_enabled as memory_is_enabled
-
-    if memory_is_enabled():
-        try:
-            await flush_pending(str(chat_id))
-        except Exception:
-            # Never block a session clear on a memory hiccup. The
-            # pending dict entry (if any) has already been popped by
-            # flush_pending before the Mem0 write, so a crash here
-            # does not leave orphaned state.
-            log.warning("flush_pending failed during session end", exc_info=True)
     await sessions.clear_session(chat_id)
 
 
@@ -3577,7 +3560,6 @@ async def _handle_response(
         async def _ingest_memory() -> None:
             try:
                 from kai import memory_extraction
-                from kai.memory import submit_user_utterance
 
                 # Extract user text from prompt. For multimodal prompts
                 # (image + text), pull the first text block rather than
@@ -3589,26 +3571,22 @@ async def _handle_response(
                         (block["text"] for block in prompt if block.get("type") == "text"),
                         "",
                     )
-                # Skip image-only exchanges - no meaningful text to embed
+                # Skip image-only exchanges - no meaningful text to embed.
                 if not user_text:
                     return
-                # Track 1: user-only raw embedding, gated by the Phase 3
-                # verification window. `submit_user_utterance` queues the
-                # turn instead of flushing it immediately; the previous
-                # turn's queued write either flushes now (non-correction)
-                # or gets dropped (correction cue). The assistant reply
-                # is never stored here. Any assistant-derived facts come
-                # from Phase 2's extractor below.
-                await submit_user_utterance(
-                    user_text=user_text,
-                    user_id=str(chat_id),
-                    session_id=final_response.session_id,
-                )
 
                 # Track 2: Haiku extraction. Runs only under the Claude
                 # backend and only when explicitly enabled. Fire-and-
                 # forget INSIDE the existing fire-and-forget task - the
                 # subprocess latency never blocks reply delivery.
+                #
+                # Spec 360 removed the previous Track 1 raw-user write
+                # that used to run alongside this call. The verbatim
+                # user storage was producing retrieval blocks dense
+                # with `User said:` lines that mimicked real user input
+                # and confused the inner agent on memory-adjacent
+                # topics. Extracted facts (Track 2) remain the only
+                # write path.
                 #
                 # Backend check uses the same per-user fall-through
                 # pattern as bot.py:370 (user override wins, else global).

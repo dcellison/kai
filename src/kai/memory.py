@@ -3,10 +3,14 @@ Semantic memory layer for Kai.
 
 Wraps Mem0 with local Qdrant embedded storage and HuggingFace embeddings.
 Provides two core capabilities:
-1. Automatic ingestion: every conversation exchange is embedded and stored
-   (Track 1, infer=False, no LLM needed, ~50ms per exchange)
-2. Semantic retrieval: search past conversations by meaning, inject relevant
-   context into each message before it reaches the agent backend
+1. Structured ingestion: callers (currently Track 2 Haiku extraction in
+   memory_extraction.py) use `add_structured` with infer=False to embed
+   pre-extracted facts. No LLM call inside Mem0; ~50ms per write.
+   Spec 360 removed the older Track 1 raw-user ingestion path; see
+   the spec for context on why verbatim user storage was deprecated.
+2. Semantic retrieval: search past conversations by meaning, inject
+   relevant context into each message before it reaches the agent
+   backend.
 
 The module follows Kai's singleton pattern (same as sessions.py): call
 init_memory() once at startup, then use the module-level functions.
@@ -20,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 from dataclasses import dataclass, field
 
 from kai.config import DATA_DIR, Config
@@ -40,18 +43,15 @@ log = logging.getLogger(__name__)
 
 # Maximum length (chars) for the assistant portion of an ingested
 # exchange. Long tool outputs (file dumps, stack traces, large diffs)
-# would otherwise dominate the embedding AND balloon the Haiku
-# extraction payload, pushing per-call token cost above the expected
-# $0.02-$0.03 envelope documented in config.memory_extraction_budget_usd.
-# Used by memory_extraction._build_extraction_payload; mirrors
-# _MAX_USER_CHARS on the assistant side.
+# would otherwise dominate the Haiku extraction payload, pushing
+# per-call token cost above the expected $0.02-$0.03 envelope
+# documented in config.memory_extraction_budget_usd. Used by
+# memory_extraction._build_extraction_payload. The user-side
+# counterpart lives next to its sole consumer in memory_extraction.py;
+# kept here on the assistant side because moving it would be churn
+# unrelated to spec 360, which removed only the Track 1 user-side
+# symbol set.
 _MAX_ASSISTANT_CHARS = 1000
-
-# Maximum length (chars) for the user portion of a Track 1 ingestion.
-# Mirrors _MAX_ASSISTANT_CHARS on the user side (spec §6.2). Users do
-# occasionally paste long content (logs, code, error traces); truncating
-# keeps the embedding focused on the semantic core.
-_MAX_USER_CHARS = 2000
 
 # Fetch more results than needed from search so we can trim to the
 # token budget after filtering by threshold.
@@ -61,12 +61,15 @@ _SEARCH_OVERFETCH = 20
 # filter and only for ranking. Provenance affects ordering among results
 # that passed the quality gate; it never rescues sub-threshold matches.
 # See spec §5.3 for the rationale. Keys:
-#   extracted - Tier 1 Haiku-filtered facts (highest signal)
-#   user_raw  - Tier 0 user utterances (safe but noisier)
+#   extracted - Tier 1 Haiku-filtered facts (the only source written by
+#               the live system after spec 360)
 #   ""        - legacy or unset source (downweighted for future cleanup)
+# Any other source value found on a row in production fall through to
+# the unknown-source default (`_UNKNOWN_SOURCE_WEIGHT`), which maps to
+# the empty-string bucket. Such rows remain rankable, just not
+# preferentially boosted.
 _SOURCE_WEIGHTS: dict[str, float] = {
     "extracted": 1.2,
-    "user_raw": 1.0,
     "": 0.6,
 }
 
@@ -92,9 +95,12 @@ def _source_weight(r: MemoryResult) -> float:
 
 # Short provenance tags used in the per-line injection header.
 # See spec §5.4: `- (YYYY-MM-DD, <source_short>) <text>`.
+# Any source value not listed here (legacy rows from production stores
+# written under earlier code paths) falls through the .get() default
+# below to "legacy", which is the correct retrieval-time label now
+# that "extracted" is the only source being written.
 _SOURCE_SHORT: dict[str, str] = {
     "extracted": "fact",
-    "user_raw": "user",
     "": "legacy",
 }
 
@@ -103,57 +109,6 @@ _SOURCE_SHORT: dict[str, str] = {
 # handles larger stores correctly via the page-drain guard. See spec
 # §6.2 for the live-lock tradeoff documentation.
 _DELETE_PAGE_SIZE = 10_000
-
-# ── Phase 3: verification delay (spec §5.2) ─────────────────────────
-#
-# The verification window is a per-user state machine. When a user
-# turn arrives, its raw embedding is NOT flushed to Mem0 immediately.
-# It is held in `_pending_writes[user_id]` until the next user turn,
-# at which point:
-#   - if the next turn starts with a correction cue, the pending turn
-#     is dropped silently (the user is retracting);
-#   - otherwise, the pending turn is flushed to Mem0 and the current
-#     turn becomes the new pending write.
-#
-# The regex is taken verbatim from spec §5.2. It must match at the
-# start of the stripped string and stop at a word boundary so that a
-# message like "nope" matches but "nopeandgo" does not. The alternation
-# `that'?s?\s+wrong` covers the contractions "that's wrong" and "thats
-# wrong" (and, as a curiosity, the bare "that wrong"). It deliberately
-# does NOT cover "that is wrong" - the `s?` and the space do not stack
-# into matching the word "is". Reviewers of PR #333 flagged that this
-# is a narrower match than a previous version of this comment claimed;
-# kept narrow to stay faithful to the verbatim spec text. Plausible
-# real-world alternatives like "no, that is wrong" or "actually, that
-# is wrong" match through the `no` and `actually` alternatives anyway,
-# so the only miss is a bare formal "that is wrong" with no prefix,
-# which is rare enough to accept.
-# re.IGNORECASE makes "NO," "No," and "no," equivalent at position 0.
-_CORRECTION_CUE_RE = re.compile(
-    r"^\s*(no|nope|wait|actually|that'?s?\s+wrong|forget|never\s+mind|ignore)\b",
-    re.IGNORECASE,
-)
-
-
-@dataclass
-class _PendingWrite:
-    """One queued user turn awaiting verification on the next turn.
-
-    Mutable (not frozen): the queue is replaced by assignment in
-    `submit_user_utterance`, but the dataclass itself is not shared
-    between users - each _pending_writes entry gets its own instance.
-    """
-
-    user_text: str
-    session_id: str | None
-
-
-# Per-user pending-write queue. In-memory only by design: a bot restart
-# loses at most one turn per active user, which is acceptable per spec
-# §5.2 ("optional refinement, not a durability guarantee"). Key is the
-# user_id string as passed to `submit_user_utterance` so it lines up
-# with the ids used by `add_user_utterance` and the retrieval path.
-_pending_writes: dict[str, _PendingWrite] = {}
 
 
 @dataclass(frozen=True)
@@ -302,9 +257,11 @@ def init_memory(config: Config) -> None:
     Called from main.py at startup. No-ops when config.memory_enabled
     is False; all public functions guard on _memory being None and
     degrade gracefully when init is skipped or fails. The per-source
-    safeguards (user-only embedding, source-weighted retrieval, scoped
-    delete primitive) were added as part of the memory-haiku-extraction
-    work (spec §320 / epic #306).
+    safeguards (source-weighted retrieval, scoped delete primitive)
+    were added as part of the memory-haiku-extraction work (spec §320
+    / epic #306). Spec 360 then removed the Track 1 raw-user
+    ingestion path; the only writer in the live system is Track 2's
+    Haiku extraction via `add_structured`.
 
     Creates the Qdrant collection if it does not exist. Downloads the
     embedding model on first run (~80MB, cached in ~/.cache/huggingface/
@@ -314,8 +271,8 @@ def init_memory(config: Config) -> None:
     even though we only use infer=False (no LLM extraction). To satisfy
     the OpenAI client constructor, we set a dummy OPENAI_API_KEY in the
     process environment if one is not already present. The key is never
-    sent to any API - all Track 1 calls use infer=False, which skips
-    the LLM entirely.
+    sent to any API - every write goes through `add_structured` with
+    infer=False, which skips the LLM entirely.
 
     Args:
         config: Application config with memory settings.
@@ -332,8 +289,9 @@ def init_memory(config: Config) -> None:
 
     # Mem0 v2.0.0 unconditionally creates an OpenAI LLM client at init
     # (line 343 of mem0/memory/main.py). We never use it (infer=False
-    # for all Track 1 calls), but the client constructor requires a key.
-    # Uses setdefault to avoid overwriting a real key if one exists.
+    # on every add via add_structured), but the client constructor
+    # requires a key. Uses setdefault to avoid overwriting a real key
+    # if one exists.
     # TODO: Remove this workaround when Mem0 supports LLM-less init.
     # Track upstream: https://github.com/mem0ai/mem0/issues
     os.environ.setdefault("OPENAI_API_KEY", "sk-dummy-not-used")
@@ -510,201 +468,6 @@ async def format_context(
     return "\n".join(lines)
 
 
-async def add_user_utterance(
-    user_text: str,
-    *,
-    user_id: str,
-    session_id: str | None = None,
-) -> None:
-    """
-    Embed a USER utterance as a raw memory (no LLM extraction).
-
-    Track 1 primitive (spec §6.2). Stores only user-originated text; the
-    assistant's reply is NEVER embedded here. This is the structural
-    safeguard against the v1 feedback loop where assistant hallucinations
-    got laundered into retrievable memory. The extractor (Phase 2) is
-    responsible for any assistant-derived facts.
-
-    Uses Mem0 infer=False: embeds the text and stores it with metadata,
-    no LLM call. Fast (~50ms) and free. Called from a background asyncio
-    task so it never blocks response delivery.
-
-    Truncates user_text at _MAX_USER_CHARS (2000) to keep the embedding
-    focused on semantic core rather than long pasted content (logs, code,
-    error dumps). Mirrors the existing assistant-side cap.
-    """
-    if _memory is None:
-        return
-
-    if len(user_text) > _MAX_USER_CHARS:
-        user_text = user_text[:_MAX_USER_CHARS] + "..."
-
-    # Prefix for retrieval clarity: without it, the stored embedding is
-    # just the raw user text, which can read as an instruction when later
-    # surfaced as context. Matching "User said: ..." makes the provenance
-    # explicit in the embedded text itself.
-    text = f"User said: {user_text}"
-
-    # Mem0's add() is synchronous - run in an executor to avoid blocking
-    # the asyncio event loop. The default ThreadPoolExecutor is fine for
-    # this short-lived I/O-bound operation.
-    loop = asyncio.get_running_loop()
-    try:
-        await loop.run_in_executor(
-            None,
-            lambda: _memory.add(
-                text,
-                user_id=user_id,
-                infer=False,
-                metadata={
-                    "source": "user_raw",
-                    "type": "exchange",
-                    "session_id": session_id or "",
-                },
-            ),
-        )
-    except Exception:
-        log.warning("Memory ingestion failed", exc_info=True)
-
-
-# ── Phase 3: verification-delay entry points (spec §5.2) ────────────
-
-
-def _is_correction_cue(text: str) -> bool:
-    """True when `text` starts with a retraction cue (see §5.2).
-
-    Matches the compiled `_CORRECTION_CUE_RE` anchored at the start.
-    Used by `submit_user_utterance` to decide whether to drop the
-    previous pending turn. A non-string input (defensive; the bot path
-    always passes str) returns False rather than raising, preserving
-    the never-raises posture of the memory layer.
-    """
-    if not isinstance(text, str):
-        return False
-    return _CORRECTION_CUE_RE.match(text) is not None
-
-
-async def submit_user_utterance(
-    user_text: str,
-    *,
-    user_id: str,
-    session_id: str | None = None,
-) -> None:
-    """Queue a user utterance behind the one-turn verification window.
-
-    Turn-entry replacement for `add_user_utterance`. The actual Mem0
-    write is deferred to the NEXT call (or to an explicit
-    `flush_pending`, e.g. from the session-end hook).
-
-    Semantics per spec §5.2, with one interpretation choice documented
-    below:
-      - If there is a previous pending turn M_n and the incoming turn
-        M_{n+1} matches `_CORRECTION_CUE_RE`, drop M_n silently and do
-        NOT queue M_{n+1}. The correction cue itself is a meta-comment,
-        not a fact worth retrieving ("No, that's wrong" offers nothing
-        downstream). This is the stricter of two valid readings of the
-        spec; the looser reading (still queue M_{n+1}) would flush
-        "No, that's wrong" to Mem0 whenever the turn after it is not
-        itself a correction. Rejected because it re-introduces exactly
-        the content pollution §5.2 is trying to prevent.
-      - Otherwise, flush the pending turn (if any) via the same
-        `add_user_utterance` primitive as Phase 1, then queue the
-        current turn as the new pending write.
-
-    Empty / whitespace-only `user_text` is treated like any other turn:
-    queued, potentially flushed on the next turn. Filtering is the
-    caller's responsibility - the Phase 2 `_ingest_memory` already
-    skips image-only exchanges with no text before reaching this call.
-
-    Never raises. The underlying `add_user_utterance` already swallows
-    Mem0 failures; this wrapper only adds dict mutations that cannot
-    themselves fail on well-formed inputs.
-    """
-    if _memory is None:
-        # Consistent with add_user_utterance: if memory is disabled,
-        # the call is a quiet no-op. Do NOT populate _pending_writes -
-        # it would leak unbounded if memory is never enabled in this
-        # process lifetime.
-        return
-
-    # Pop (not get) so the old entry leaves the dict atomically before
-    # any await. A concurrent _ingest_memory task for the same user
-    # (two messages in quick succession, both fire-and-forget) that
-    # wakes during the add_user_utterance await below would otherwise
-    # find the same PendingWrite still present and flush it a second
-    # time. Pop at the top closes the duplicate-flush window for both
-    # the correction-cue path and the flush-then-queue path.
-    pending = _pending_writes.pop(user_id, None)
-    if _is_correction_cue(user_text):
-        if pending is not None:
-            # Retraction path: M_n was just removed by the pop above;
-            # M_{n+1} is a correction cue and intentionally not queued.
-            log.debug(
-                "submit_user_utterance: dropped pending write for %s on correction cue",
-                user_id,
-            )
-        # If there was no pending write, a lone correction cue has
-        # nothing to retract. Still skip queueing - the cue itself is
-        # not useful as a retrievable memory.
-        return
-
-    # Non-correction turn: flush the previous pending write (if any),
-    # then make this turn the new pending write. Flush goes through
-    # `add_user_utterance` so the truncation and metadata contract
-    # stays identical to Phase 1.
-    if pending is not None:
-        await add_user_utterance(
-            user_text=pending.user_text,
-            user_id=user_id,
-            session_id=pending.session_id,
-        )
-    _pending_writes[user_id] = _PendingWrite(
-        user_text=user_text,
-        session_id=session_id,
-    )
-
-
-async def flush_pending(user_id: str) -> bool:
-    """Flush any pending write for `user_id`. Session-end hook.
-
-    Called from the session-end path in bot.py (see §6.3 P3). The
-    intuition: once the session ends, the "next turn" that would have
-    either confirmed or retracted the pending write is never coming.
-    Flushing preserves user data; dropping on session-end would lose
-    every utterance that happened to be the final turn of a session.
-
-    Returns True when a flush actually occurred (caller may want to
-    log or emit a metric); False when there was nothing pending.
-
-    Also safe to call when memory is disabled - the pending dict is
-    empty in that case and this is a no-op.
-    """
-    pending = _pending_writes.pop(user_id, None)
-    if pending is None:
-        return False
-    await add_user_utterance(
-        user_text=pending.user_text,
-        user_id=user_id,
-        session_id=pending.session_id,
-    )
-    return True
-
-
-def drop_pending(user_id: str) -> bool:
-    """Discard any pending write for `user_id` without flushing.
-
-    Not reached from normal turn handling (the correction-cue path in
-    `submit_user_utterance` does the drop inline). Exposed for:
-      - administrative commands that explicitly want to forget a
-        half-queued turn without storing it,
-      - tests that set up pending state and then want to reset
-        between scenarios.
-
-    Returns True if a pending write was present and dropped.
-    """
-    return _pending_writes.pop(user_id, None) is not None
-
-
 async def delete_by_source(user_id: str, source: str) -> int:
     """
     Delete every memory for `user_id` whose metadata source matches `source`.
@@ -718,7 +481,8 @@ async def delete_by_source(user_id: str, source: str) -> int:
         Rows with a non-empty source are never matched by this branch.
 
     Used by the backout path (spec §16) so "nuke contaminated extracted
-    facts" does not also wipe user_raw history. Groundwork for a future
+    facts" does not also wipe rows of any other (legacy) source still
+    present from earlier code paths. Groundwork for a future
     `/memory purge <source>` admin command.
 
     Implementation notes (do NOT "simplify"; see spec §6.2):
@@ -961,12 +725,13 @@ def get_by_tag(*, user_id: str, tag: str) -> list[MemoryResult]:
     client-side because Mem0's `get_all` does not accept metadata
     filters. Two filter clauses, both load-bearing:
 
-      - `metadata.source == "extracted"`: defends against rows from the
-        pre-#335 era (or any future additional source) leaking into the
-        extracted-only UI. If #335 ships first and no `user_raw` rows
-        remain in production, this clause is a no-op; keeping it anyway
-        means the UI contract does not need re-reasoning the next time
-        a second source is introduced. Spec 310 §7.2.
+      - `metadata.source == "extracted"`: defends against rows from
+        any other (legacy or future-additional) source leaking into
+        the extracted-only UI. With spec 360 landed, the only writer
+        is Track 2 extraction so the clause is largely a no-op in
+        production stores; keeping it means the UI contract does not
+        need re-reasoning the next time a second source is introduced.
+        Spec 310 §7.2.
       - `tag in metadata.tags`: the actual tag match. The `or []`
         guards against a malformed row that lacks the tags list
         entirely; such rows simply do not match any tag.
