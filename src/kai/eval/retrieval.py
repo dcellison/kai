@@ -406,8 +406,13 @@ def score_probes(results: list[ProbeResult]) -> dict[str, Any]:
     }
 
 
-def _percentile(values: list[float], pct: float) -> float:
-    """Return the requested percentile from values (0-100 scale).
+def _percentile(values: list[float], pct: int) -> float:
+    """Return the requested percentile from values (1-99 integer scale).
+
+    `pct` is `int` not `float` so a fractional percentile (e.g. 50.9)
+    cannot be silently truncated to the 50th by `int(pct) - 1`. The
+    only callers today are `_percentile(latencies, 50)` and `(_, 95)`,
+    so narrowing the contract costs nothing and removes the footgun.
 
     Uses statistics.quantiles for the standard linear-interpolation
     estimate. Returns 0.0 on empty input rather than raising so the
@@ -419,13 +424,12 @@ def _percentile(values: list[float], pct: float) -> float:
         return 0.0
     if len(values) == 1:
         return float(values[0])
-    # n=100 partitions plus boundary fix-up gives us linear-interp
-    # percentile lookup at any integer percentage. quantiles returns
-    # the 99 cut points for n=100, so index `pct - 1` is the
-    # requested percentile (1-indexed math collapses to the simple
-    # subtraction).
+    # n=100 partitions gives 99 cut points (quantiles returns n-1
+    # cuts for n partitions), so index `pct - 1` is the requested
+    # 1-indexed percentile. clamp() defends against pct == 0 or
+    # pct >= 100, which would index out of the cuts list.
     cuts = statistics.quantiles(values, n=100)
-    idx = int(pct) - 1
+    idx = pct - 1
     idx = max(0, min(idx, len(cuts) - 1))
     return float(cuts[idx])
 
