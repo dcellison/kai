@@ -12,6 +12,7 @@ when mem0ai is not installed (CI without the [memory] extra).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 from dataclasses import replace
@@ -617,7 +618,7 @@ class TestFormatContext:
 
 # Every uniform-shape field that must appear on every memory.recall log
 # line, regardless of which return site emitted it. `reason` is
-# deliberately excluded — it is the one non-uniform field, present only
+# deliberately excluded; it is the one non-uniform field, present only
 # on short-circuit lines and absent on success.
 _RECALL_UNIFORM_FIELDS = {
     "user_id",
@@ -643,15 +644,20 @@ def _parse_recall_log(caplog) -> dict:
     Asserts exactly one record so tests catch any future regression
     that double-emits or fails to emit. The "memory.recall " prefix
     is stripped before json.loads.
-    """
-    recall_records = [r for r in caplog.records if r.message.startswith("memory.recall ")]
-    assert len(recall_records) == 1, (
-        f"expected exactly one memory.recall log, got {len(recall_records)}: {[r.message for r in recall_records]}"
-    )
-    blob = recall_records[0].message[len("memory.recall ") :]
-    import json as _json
 
-    return _json.loads(blob)
+    Reads each record via `getMessage()` rather than the `.message`
+    attribute. `LogRecord.message` is set as a side effect of
+    `Formatter.format()`; pytest caplog populates it in practice but
+    `getMessage()` is the documented stable API and renders the
+    formatted message directly from the args, so it works whether or
+    not a formatter has run on the record yet.
+    """
+    recall_records = [r for r in caplog.records if r.getMessage().startswith("memory.recall ")]
+    assert len(recall_records) == 1, (
+        f"expected exactly one memory.recall log, got {len(recall_records)}: {[r.getMessage() for r in recall_records]}"
+    )
+    blob = recall_records[0].getMessage()[len("memory.recall ") :]
+    return json.loads(blob)
 
 
 class TestRecallLogging:
@@ -672,23 +678,32 @@ class TestRecallLogging:
         import kai.memory as mem_mod
         from kai.memory import format_context
 
-        # Two results, both above the default 0.3 floor, one extracted
-        # and one legacy. Exercises the success path including the hits
-        # array, source weighting, and lines_used accounting.
+        # Two results, both above the default 0.3 floor, with raw scores
+        # arranged so ONLY the source weighting can flip them: the legacy
+        # row has the higher raw score (0.95), the extracted row the
+        # lower (0.90). Adjusted scores are 0.95 * 0.6 = 0.57 (legacy)
+        # and 0.90 * 1.2 = 1.08 (extracted), so the extracted entry must
+        # come first in post-sort order. If `_source_weight` were
+        # disabled or returned 1.0 for every source, the assertion below
+        # on `payload["hits"][0]["source"]` would fail because raw
+        # ordering would put legacy first. The original arrangement
+        # (extracted=0.9, legacy=0.7) had the same expected output under
+        # both raw and adjusted ordering and would not have caught a
+        # weighting regression.
         mock_mem = MagicMock()
         mock_mem.search.return_value = {
             "results": [
                 {
                     "id": "a",
                     "memory": "User prefers Celsius",
-                    "score": 0.9,
+                    "score": 0.90,
                     "metadata": {"type": "fact", "source": "extracted"},
                     "created_at": "2026-04-01T10:00:00",
                 },
                 {
                     "id": "b",
                     "memory": "User said something old",
-                    "score": 0.7,
+                    "score": 0.95,
                     # No source key -> legacy bucket; tests that a missing
                     # source resolves to "" in the per-hit object.
                     "metadata": {"type": "exchange"},

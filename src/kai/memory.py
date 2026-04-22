@@ -303,7 +303,7 @@ def _base_recall_payload(user_id: str, query: str) -> dict:
 
     `returned_empty` defaults to True; the success path flips it to
     False just before emit. `reason` is the one non-uniform field:
-    present only on short-circuit lines, omitted on success — so it's
+    present only on short-circuit lines, omitted on success, so it's
     not in the base payload. Real query and user_id are always
     populated; they are never sentineled.
     """
@@ -568,7 +568,7 @@ async def format_context(
     # final ranking order, even if budget cuts the prompt short below.
     # The eval harness uses the prefix slice `hits[:lines_used]` for
     # "what the agent actually saw" and `hits[lines_used:]` for
-    # "survived ranking but lost to budget" — distinguishing these two
+    # "survived ranking but lost to budget"; distinguishing these two
     # is what makes precision/recall scoring accurate.
     payload["hits"] = [
         {
