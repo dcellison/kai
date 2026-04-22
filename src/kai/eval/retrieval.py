@@ -704,11 +704,12 @@ async def run_sweep(
     `_config` (replaced via dataclasses.replace because Config is
     frozen), `_SOURCE_WEIGHTS["extracted"]` (mutated in place; dict
     is not frozen), and `_SEARCH_OVERFETCH` (replaced via setattr on
-    the module). Restoration in `try/finally` per iteration defends
-    against a probe raising mid-sweep; the OUTER try/finally restores
-    once at the very end, ensuring a SIGINT during a long sweep does
-    not leave the process with mutated module state if a future caller
-    keeps the process alive after the sweep.
+    the module). A single `try/finally` wraps the entire grid loop
+    and restores all three from the entry-time snapshot in `finally`.
+    Any exception from any iteration (a probe raising mid-sweep, a
+    SIGINT) unwinds through the outer finally before propagating, so
+    the module is left in its pre-sweep state regardless of how the
+    loop exits.
 
     Note on the snapshot vs read-back tradeoff: we snapshot the
     originals at sweep entry and restore from the snapshot, rather
