@@ -1226,12 +1226,13 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
 
-        # Memory on, extraction on, custom budget + timeout + token budget + search limit.
+        # Memory on, extraction on, custom budget + timeout + consolidation candidates + token budget + search limit.
         memory_block = [
             "true",  # memory enabled
             "true",  # extraction enabled (claude backend)
             "0.05",  # extraction budget USD
             "60",  # extraction timeout seconds (#345)
+            "5",  # consolidation candidates (non-default, exercises emission branch)
             "3000",  # token budget
             "20",  # search limit (#345)
         ]
@@ -1246,6 +1247,7 @@ class TestCmdConfig:
         assert env["MEMORY_EXTRACTION_ENABLED"] == "true"
         assert env["MEMORY_EXTRACTION_BUDGET_USD"] == "0.05"
         assert env["MEMORY_EXTRACTION_TIMEOUT_S"] == "60"
+        assert env["MEMORY_CONSOLIDATION_CANDIDATES_N"] == "5"
         assert env["MEMORY_TOKEN_BUDGET"] == "3000"
         assert env["MEMORY_SEARCH_LIMIT"] == "20"
 
@@ -1256,7 +1258,8 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
 
-        memory_block = ["true", "true", "0.07", "45", "2500", "15"]
+        # Inputs in wizard order: enabled, ext enabled, budget, timeout, consolidation, token budget, search limit.
+        memory_block = ["true", "true", "0.07", "45", "4", "2500", "15"]
         inputs = iter(self._base_inputs(memory_block))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
 
@@ -1268,6 +1271,7 @@ class TestCmdConfig:
         assert 'MEMORY_EXTRACTION_ENABLED="true"' in rendered
         assert 'MEMORY_EXTRACTION_BUDGET_USD="0.07"' in rendered
         assert 'MEMORY_EXTRACTION_TIMEOUT_S="45"' in rendered
+        assert 'MEMORY_CONSOLIDATION_CANDIDATES_N="4"' in rendered
         assert 'MEMORY_TOKEN_BUDGET="2500"' in rendered
         assert 'MEMORY_SEARCH_LIMIT="15"' in rendered
 
@@ -1416,13 +1420,14 @@ class TestCmdConfig:
         assert "MEMORY_EXTRACTION_TIMEOUT_S" not in env
 
     def test_extraction_disabled_skips_timeout_prompt(self, tmp_path, monkeypatch):
-        """Extraction off must skip the budget AND timeout prompts; search limit still asked.
+        """Extraction off must skip the budget, timeout, AND consolidation prompts; search limit still asked.
 
-        Regression guard for the off-by-one trap: timeout sits inside the
-        extraction-enabled branch, so disabling extraction must consume
-        exactly two fewer prompts (budget + timeout). If the gating drifts,
-        the input iterator desynchronises and the wizard reads search limit
-        as if it were the timeout - the assertion below catches that.
+        Regression guard for the off-by-one trap: timeout and consolidation
+        sit inside the extraction-enabled branch, so disabling extraction
+        must consume exactly three fewer prompts (budget + timeout +
+        consolidation candidates). If the gating drifts, the input iterator
+        desynchronises and the wizard reads search limit as if it were one
+        of the extraction-only prompts - the assertion below catches that.
         """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")

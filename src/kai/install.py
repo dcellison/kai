@@ -214,6 +214,19 @@ def _validate_positive_int(value: str) -> bool:
         return False
 
 
+def _validate_non_negative_int(value: str) -> bool:
+    """Check that a string is a non-negative integer (zero allowed).
+
+    Used for fields where 0 is a meaningful kill-switch value, not an
+    invalid input. Distinct from `_validate_positive_int` so the
+    operator-facing error message can reflect the actual constraint.
+    """
+    try:
+        return int(value) >= 0
+    except ValueError:
+        return False
+
+
 def _validate_chat_id(value: str) -> bool:
     """Check that a string is a valid Telegram chat ID (any non-zero integer)."""
     try:
@@ -714,6 +727,7 @@ def _cmd_config() -> None:
     memory_extraction_enabled = False
     memory_extraction_budget_usd = "0.01"
     memory_extraction_timeout_s = "10"
+    memory_consolidation_candidates_n = "8"
     memory_token_budget = "2000"
     memory_search_limit = "10"
     if memory_enabled:
@@ -750,6 +764,21 @@ def _cmd_config() -> None:
                     if _validate_positive_int(memory_extraction_timeout_s):
                         break
                     print("  Must be a positive integer.")
+                # Consolidation candidate count. Zero is a valid
+                # kill-switch value (extractor falls back to all-`new`
+                # output and the EXISTING FACTS data block is omitted),
+                # so use the non-negative validator instead of the
+                # positive-only one. Sits inside the extraction guard
+                # because consolidation is only meaningful when the
+                # Haiku extractor runs.
+                while True:
+                    memory_consolidation_candidates_n = _prompt(
+                        "Consolidation candidate count (0 disables consolidation)",
+                        existing_env.get("MEMORY_CONSOLIDATION_CANDIDATES_N", "8"),
+                    )
+                    if _validate_non_negative_int(memory_consolidation_candidates_n):
+                        break
+                    print("  Must be a non-negative integer (0 to disable consolidation).")
         while True:
             memory_token_budget = _prompt(
                 "Memory context token budget per turn",
@@ -885,6 +914,13 @@ def _cmd_config() -> None:
             # the dataclass default.
             if int(memory_extraction_timeout_s) != 10:
                 env["MEMORY_EXTRACTION_TIMEOUT_S"] = memory_extraction_timeout_s
+            # Consolidation candidate count. Same gate as the other
+            # extraction tunables because the field is only consulted
+            # by the Haiku extraction path; numeric compare so "08" or
+            # "8 " do not produce a spurious entry equal to the
+            # dataclass default.
+            if int(memory_consolidation_candidates_n) != 8:
+                env["MEMORY_CONSOLIDATION_CANDIDATES_N"] = memory_consolidation_candidates_n
         if int(memory_token_budget) != 2000:
             env["MEMORY_TOKEN_BUDGET"] = memory_token_budget
         # Search limit applies to retrieval (read path), not extraction
@@ -903,6 +939,7 @@ def _cmd_config() -> None:
         env.pop("MEMORY_EXTRACTION_ENABLED", None)
         env.pop("MEMORY_EXTRACTION_BUDGET_USD", None)
         env.pop("MEMORY_EXTRACTION_TIMEOUT_S", None)
+        env.pop("MEMORY_CONSOLIDATION_CANDIDATES_N", None)
 
     # Build and write install.conf
     conf = {

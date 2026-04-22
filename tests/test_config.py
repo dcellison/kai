@@ -56,6 +56,7 @@ _CONFIG_ENV_VARS = [
     "MEMORY_EXTRACTION_MODEL",
     "MEMORY_EXTRACTION_BUDGET_USD",
     "MEMORY_EXTRACTION_TIMEOUT_S",
+    "MEMORY_CONSOLIDATION_CANDIDATES_N",
     "MEMORY_SEARCH_FLOOR",
     "KAI_DATA_DIR",
     "KAI_INSTALL_DIR",
@@ -1256,6 +1257,42 @@ class TestMemoryExtractionConfig:
     def test_timeout_rejects_non_integer(self, monkeypatch):
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_EXTRACTION_TIMEOUT_S", "not-an-int")
+        with pytest.raises(SystemExit, match="must be an integer"):
+            load_config()
+
+    def test_consolidation_candidates_default_is_8(self, monkeypatch):
+        """Default chosen by the consolidation design: large enough to surface
+        paraphrase-equivalent prior facts (top-k semantic search), small enough
+        to keep the EXISTING FACTS prompt block bounded under typical assistant
+        replies. Default must stay stable so unset = production behavior."""
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.memory_consolidation_candidates_n == 8
+
+    def test_consolidation_candidates_override(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_CONSOLIDATION_CANDIDATES_N", "12")
+        config = load_config()
+        assert config.memory_consolidation_candidates_n == 12
+
+    def test_consolidation_candidates_accepts_zero(self, monkeypatch):
+        """Zero is the documented kill switch: skip the candidate-fetch step
+        entirely and run the extractor with no EXISTING FACTS block. This
+        rolls back to pre-consolidation behavior without redeploying."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_CONSOLIDATION_CANDIDATES_N", "0")
+        config = load_config()
+        assert config.memory_consolidation_candidates_n == 0
+
+    def test_consolidation_candidates_rejects_negative(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_CONSOLIDATION_CANDIDATES_N", "-1")
+        with pytest.raises(SystemExit, match="non-negative integer"):
+            load_config()
+
+    def test_consolidation_candidates_rejects_non_integer(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_CONSOLIDATION_CANDIDATES_N", "not-an-int")
         with pytest.raises(SystemExit, match="must be an integer"):
             load_config()
 

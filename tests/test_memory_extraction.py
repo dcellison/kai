@@ -23,13 +23,21 @@ import pytest
 
 from kai import memory_extraction
 from kai.config import Config
+from kai.memory import MemoryResult
 from kai.memory_extraction import (
     _CONFIRMATION_QUOTE_MIN_CHARS,
     _EXTRACTION_PROMPT_VERSION,
+    _EXTRACTION_SYSTEM_PROMPT,
+    _FACT_SCHEMA,
     _GENERIC_CONFIRMATION_RE,
     _build_extraction_payload,
+    _capped_assistant,
+    _emit_intent_log,
     _get_semaphore,
     _is_duplicate,
+    _render_candidate_line,
+    _render_candidate_source,
+    _store_facts,
     _strip_role_labels,
     _validate_facts,
     extract_and_store,
@@ -46,13 +54,20 @@ _BASE_CONFIG = Config(
 
 
 def _cfg(**overrides) -> Config:
-    """Build a Config with extraction settings toggled for tests."""
+    """Build a Config with extraction settings toggled for tests.
+
+    `memory_consolidation_candidates_n` defaults to 0 (the documented
+    kill-switch value) so existing pre-consolidation tests do not need
+    to mock `memory.search` for the candidate-fetch path. Tests that
+    exercise consolidation explicitly pass `_cfg(memory_consolidation_candidates_n=8)`.
+    """
     defaults = {
         "memory_enabled": True,
         "memory_extraction_enabled": True,
         "memory_extraction_model": "claude-haiku-4-5-20251001",
         "memory_extraction_budget_usd": 0.01,
         "memory_extraction_timeout_s": 10,
+        "memory_consolidation_candidates_n": 0,
     }
     defaults.update(overrides)
     return replace(_BASE_CONFIG, **defaults)
@@ -156,24 +171,22 @@ class TestBuildExtractionPayload:
         assert ("u" * _MAX_USER_CHARS) in payload
         assert ("u" * (_MAX_USER_CHARS + 1)) not in payload
 
-    def test_long_assistant_text_truncated(self):
-        """Round 5 review finding: assistant_text arrives at full length
-        from bot.py, so long tool output blows up the Haiku payload and
-        per-call cost. Truncation must match the memory._MAX_ASSISTANT_CHARS
-        cap (mirrors the user-side cap applied earlier in
-        _build_extraction_payload)."""
+    def test_long_assistant_text_passthrough_when_pre_capped(self):
+        """Spec 367 moved the assistant-side cap out of
+        `_build_extraction_payload` and into `_capped_assistant`, so the
+        candidate-set fetch and the payload's ASSISTANT segment see
+        identical input. The payload builder no longer truncates: that
+        is the caller's responsibility now (`extract_and_store` calls
+        `_capped_assistant` once, before both the search query and the
+        payload build). This test pins that contract: the builder
+        passes assistant text through unchanged. The truncation
+        behavior itself is covered by TestCappedAssistant below."""
         from kai import memory
 
-        # +500 chars over the cap so the test still passes if the cap is
-        # raised later, as long as it stays under len(long_assistant).
         long_assistant = "x" * (memory._MAX_ASSISTANT_CHARS + 500)
         payload = _build_extraction_payload("hi", long_assistant)
-        # Truncation marker present; full-length string absent.
-        assert long_assistant not in payload
-        assert "..." in payload
-        # Truncated portion is bounded: cap + ellipsis tail only.
-        assert ("x" * memory._MAX_ASSISTANT_CHARS) in payload
-        assert ("x" * (memory._MAX_ASSISTANT_CHARS + 1)) not in payload
+        # Builder no longer truncates; the full string survives.
+        assert long_assistant in payload
 
     def test_short_assistant_text_not_mangled(self):
         """Regression guard: sub-cap assistant text must pass through
@@ -230,8 +243,15 @@ class TestValidateFacts:
     the validator."""
 
     def test_valid_non_confirmed_action_fact_passes(self):
-        facts = [{"content": "User prefers Celsius", "tags": ["preference"], "confidence": 0.9}]
-        assert _validate_facts(facts) == facts
+        facts = [
+            {
+                "content": "User prefers Celsius",
+                "tags": ["preference"],
+                "confidence": 0.9,
+                "intent": "new",
+            }
+        ]
+        assert _validate_facts(facts, set(), "u-test") == facts
 
     def test_valid_confirmed_action_fact_passes(self):
         quote = "I see PR #299 is merged, thanks"
@@ -242,9 +262,10 @@ class TestValidateFacts:
                 "tags": ["confirmed_action"],
                 "confidence": 0.7,
                 "confirmation_quote": quote,
+                "intent": "new",
             }
         ]
-        assert _validate_facts(facts) == facts
+        assert _validate_facts(facts, set(), "u-test") == facts
 
     def test_confirmed_action_without_quote_rejected(self):
         facts = [
@@ -252,9 +273,10 @@ class TestValidateFacts:
                 "content": "User confirmed something",
                 "tags": ["confirmed_action"],
                 "confidence": 0.7,
+                "intent": "new",
             }
         ]
-        assert _validate_facts(facts) == []
+        assert _validate_facts(facts, set(), "u-test") == []
 
     def test_confirmed_action_with_short_quote_rejected(self):
         """A quote shorter than _CONFIRMATION_QUOTE_MIN_CHARS (20) is
@@ -265,9 +287,10 @@ class TestValidateFacts:
                 "tags": ["confirmed_action"],
                 "confidence": 0.7,
                 "confirmation_quote": "too short",
+                "intent": "new",
             }
         ]
-        assert _validate_facts(facts) == []
+        assert _validate_facts(facts, set(), "u-test") == []
 
     @pytest.mark.parametrize(
         "quote",
@@ -303,9 +326,10 @@ class TestValidateFacts:
                 "tags": ["confirmed_action"],
                 "confidence": 0.7,
                 "confirmation_quote": quote,
+                "intent": "new",
             }
         ]
-        assert _validate_facts(facts_bare) == [], f"{quote!r} should be rejected"
+        assert _validate_facts(facts_bare, set(), "u-test") == [], f"{quote!r} should be rejected"
         assert padded  # silence unused-var; padded is the name-only form
 
     def test_regex_fullmatch_behavior_only_rejects_pure_generic(self):
@@ -326,19 +350,20 @@ class TestValidateFacts:
                 "tags": ["preference"],
                 "confidence": 0.9,
                 "confirmation_quote": "I told you I prefer Celsius, you know",
+                "intent": "new",
             }
         ]
-        assert _validate_facts(facts) == []
+        assert _validate_facts(facts, set(), "u-test") == []
 
     def test_non_dict_fact_skipped(self):
         """Defensive: schema guarantees dicts but a future
         subprocess-response change should not crash the loop."""
-        assert _validate_facts([None, "string", 42]) == []
+        assert _validate_facts([None, "string", 42], set(), "u-test") == []
 
     def test_mixed_batch_keeps_valid_drops_invalid(self):
-        good = {"content": "X", "tags": ["preference"], "confidence": 0.9}
-        bad = {"content": "Y", "tags": ["confirmed_action"], "confidence": 0.8}
-        result = _validate_facts([good, bad])
+        good = {"content": "X", "tags": ["preference"], "confidence": 0.9, "intent": "new"}
+        bad = {"content": "Y", "tags": ["confirmed_action"], "confidence": 0.8, "intent": "new"}
+        result = _validate_facts([good, bad], set(), "u-test")
         assert result == [good]
 
 
@@ -597,6 +622,7 @@ class TestExtractAndStoreOutcomes:
             "content": "User prefers Celsius",
             "tags": ["preference"],
             "confidence": 0.9,
+            "intent": "new",
         }
 
         async def _fake_exec(*args, **kwargs):
@@ -635,7 +661,7 @@ class TestExtractAndStoreOutcomes:
         the full batch without any per-fact short-circuit."""
         monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: False)
 
-        facts = [{"content": f"Fact {i}", "tags": ["fact"], "confidence": 0.8} for i in range(5)]
+        facts = [{"content": f"Fact {i}", "tags": ["fact"], "confidence": 0.8, "intent": "new"} for i in range(5)]
 
         async def _fake_exec(*args, **kwargs):
             return _make_proc(stdout=json.dumps({"facts": facts}).encode())
@@ -726,6 +752,7 @@ class TestExtractAndStoreOutcomes:
                         "content": "User prefers metric units",
                         "tags": ["preference"],
                         "confidence": 0.9,
+                        "intent": "new",
                     }
                 ]
             },
@@ -905,8 +932,18 @@ class TestStoreFactsDedup:
     @pytest.mark.asyncio
     async def test_duplicate_fact_skipped(self, monkeypatch):
         facts = [
-            {"content": "User prefers Celsius", "tags": ["preference"], "confidence": 0.9},
-            {"content": "User lives in Boston", "tags": ["location"], "confidence": 0.9},
+            {
+                "content": "User prefers Celsius",
+                "tags": ["preference"],
+                "confidence": 0.9,
+                "intent": "new",
+            },
+            {
+                "content": "User lives in Boston",
+                "tags": ["location"],
+                "confidence": 0.9,
+                "intent": "new",
+            },
         ]
 
         async def _fake_exec(*args, **kwargs):
@@ -949,3 +986,1009 @@ class TestConfigFallback:
         monkeypatch.setattr("kai.config.load_config", _boom)
         n = await extract_and_store("u", "a", user_id="u1", config=None)
         assert n == 0
+
+
+# ── Spec 367: consolidation ─────────────────────────────────────────
+
+
+def _candidate(
+    *,
+    id: str = "11111111-1111-1111-1111-111111111111",
+    text: str = "Stored fact text",
+    metadata: dict | None = None,
+) -> MemoryResult:
+    """Build a MemoryResult shaped like a real Mem0 search hit.
+
+    Defaults to a UUID-shaped id, the documented `extracted` source,
+    and a non-`None` confidence so candidate-rendering tests stay
+    focused on whatever they are actually exercising. Tests that care
+    about source/confidence sentinels override `metadata` explicitly.
+    """
+    md = {"source": "extracted", "confidence": 0.85}
+    if metadata is not None:
+        md.update(metadata)
+    return MemoryResult(
+        id=id,
+        text=text,
+        score=0.7,
+        memory_type="fact",
+        metadata=md,
+        created_at="2026-04-22T00:00:00Z",
+        updated_at="2026-04-22T00:00:00Z",
+    )
+
+
+# ── _capped_assistant ───────────────────────────────────────────────
+
+
+class TestCappedAssistant:
+    """Spec 367 §Candidate-set selection: the assistant cap moved out
+    of `_build_extraction_payload` into `_capped_assistant` so the
+    candidate-fetch query and the payload's ASSISTANT segment see
+    byte-identical input. Tests here pin the cap behavior in isolation
+    so a future refactor can verify the helper alone."""
+
+    def test_short_text_passthrough(self):
+        from kai import memory
+
+        text = "x" * (memory._MAX_ASSISTANT_CHARS - 100)
+        assert _capped_assistant(text) == text
+        assert "..." not in _capped_assistant(text)
+
+    def test_at_cap_no_truncation(self):
+        """Boundary: a string exactly the cap length must not get an
+        ellipsis tacked on. Off-by-one here would silently inflate every
+        max-length payload."""
+        from kai import memory
+
+        text = "x" * memory._MAX_ASSISTANT_CHARS
+        assert _capped_assistant(text) == text
+
+    def test_over_cap_truncated_with_ellipsis(self):
+        from kai import memory
+
+        text = "x" * (memory._MAX_ASSISTANT_CHARS + 500)
+        out = _capped_assistant(text)
+        assert out.endswith("...")
+        # Length is the cap plus the three-char ellipsis tail.
+        assert len(out) == memory._MAX_ASSISTANT_CHARS + 3
+
+
+# ── _render_candidate_source ────────────────────────────────────────
+
+
+class TestRenderCandidateSource:
+    """Spec 367 §Candidate payload shape: None and empty-string source
+    values collapse to the `unknown` sentinel rather than rendering as
+    `(source=, ...)` (visually broken) or `(source=None, ...)` (Python
+    repr leak). Pinning each branch separately so future changes to
+    the collapse rules show up as test failures, not silent renderings."""
+
+    def test_extracted_source_renders_verbatim(self):
+        assert _render_candidate_source({"source": "extracted"}) == "extracted"
+
+    def test_none_source_collapses_to_unknown(self):
+        assert _render_candidate_source({"source": None}) == "unknown"
+
+    def test_empty_string_source_collapses_to_unknown(self):
+        assert _render_candidate_source({"source": ""}) == "unknown"
+
+    def test_missing_source_collapses_to_unknown(self):
+        assert _render_candidate_source({}) == "unknown"
+
+
+# ── _render_candidate_line ──────────────────────────────────────────
+
+
+class TestRenderCandidateLine:
+    """Pinning the bracketed-id format the extractor prompt tells Haiku
+    to cite back: `[{id}] (source=..., conf=...) {content}`. Any change
+    to the bracket shape means the prompt instructions must change too."""
+
+    def test_full_render_with_known_fields(self):
+        cand = _candidate(
+            id="55acddee-c1a2-44ef-97b2-9f76880b3fff",
+            text="Kai's DATA_DIR is /var/lib/kai/.",
+            metadata={"source": "extracted", "confidence": 0.9},
+        )
+        line = _render_candidate_line(cand)
+        assert (
+            line
+            == "[55acddee-c1a2-44ef-97b2-9f76880b3fff] (source=extracted, conf=0.9) Kai's DATA_DIR is /var/lib/kai/."
+        )
+
+    def test_none_confidence_renders_n_a(self):
+        cand = _candidate(metadata={"source": "extracted", "confidence": None})
+        line = _render_candidate_line(cand)
+        assert "conf=n/a" in line
+
+    def test_none_source_renders_unknown(self):
+        cand = _candidate(metadata={"source": None, "confidence": 0.85})
+        line = _render_candidate_line(cand)
+        assert "source=unknown" in line
+
+    def test_id_brackets_present(self):
+        """The `[{id}]` bracket format is what the extractor prompt
+        instructs Haiku to cite back. If brackets disappear, the
+        extractor's id-citation contract silently breaks."""
+        cand = _candidate(id="abc-123")
+        assert _render_candidate_line(cand).startswith("[abc-123] ")
+
+
+# ── _emit_intent_log ────────────────────────────────────────────────
+
+
+class TestEmitIntentLog:
+    """Spec 367 §Logging: the centralizing helper. JSON shape and
+    log-level wiring are the two things that downstream parsers and
+    operator dashboards depend on; both are pinned here."""
+
+    def test_emits_all_six_documented_fields(self, caplog):
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            _emit_intent_log(
+                user_id="u1",
+                intent="new",
+                original_intent=None,
+                new_id="mem-1",
+                replaced_id=None,
+                outcome="stored",
+            )
+        # Find the JSON body in the formatted record.
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        json_part = record.getMessage().split("memory.consolidate.intent ", 1)[1]
+        payload = json.loads(json_part)
+        # All six fields present (no field omission across any call).
+        assert set(payload) == {"user_id", "intent", "original_intent", "new_id", "replaced_id", "outcome"}
+        assert payload["user_id"] == "u1"
+        assert payload["intent"] == "new"
+        assert payload["original_intent"] is None
+        assert payload["new_id"] == "mem-1"
+        assert payload["replaced_id"] is None
+        assert payload["outcome"] == "stored"
+
+    def test_default_level_is_info(self, caplog):
+        with caplog.at_level("DEBUG", logger="kai.memory_extraction"):
+            _emit_intent_log(
+                user_id="u1",
+                intent="new",
+                original_intent=None,
+                new_id="m1",
+                replaced_id=None,
+                outcome="stored",
+            )
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        assert record.levelname == "INFO"
+
+    def test_warning_level_override(self, caplog):
+        """The only documented level override is WARNING for the
+        `add_failed_after_delete` outcome. Pin the override path so a
+        future refactor that drops the `level` parameter regresses
+        loudly."""
+        import logging as _logging
+
+        with caplog.at_level("DEBUG", logger="kai.memory_extraction"):
+            _emit_intent_log(
+                user_id="u1",
+                intent="update_of",
+                original_intent=None,
+                new_id=None,
+                replaced_id="cited-id",
+                outcome="add_failed_after_delete",
+                level=_logging.WARNING,
+            )
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        assert record.levelname == "WARNING"
+
+    def test_compact_json_separators(self, caplog):
+        """Matching `_emit_recall_log`'s wire format. A space after the
+        `:` would break downstream parsers that expect compact form."""
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            _emit_intent_log(
+                user_id="u1",
+                intent="new",
+                original_intent=None,
+                new_id="m1",
+                replaced_id=None,
+                outcome="stored",
+            )
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        json_part = record.getMessage().split("memory.consolidate.intent ", 1)[1]
+        # Compact form: no space after `:` or `,`. A regular json.dumps
+        # without separators would produce `"user_id": "u1"` with a
+        # space - verifying its absence pins the wire format.
+        assert ": " not in json_part
+        assert ", " not in json_part
+
+
+# ── _validate_facts: consolidation rules ────────────────────────────
+
+
+class TestValidateFactsConsolidation:
+    """Spec 367 §Validation: rules 1-5. Rule 3 emits a structured log
+    line; rules 1, 2, 4, 5 are DEBUG-only. Each rule has its own test
+    plus a regression for the rule-3 vs rule-others log-emission split."""
+
+    def test_rule1_unknown_intent_rejected(self):
+        """Rule 1 defense-in-depth against a future schema regression."""
+        facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "merge"}]
+        assert _validate_facts(facts, set(), "u1") == []
+
+    def test_rule1_missing_intent_rejected(self):
+        facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9}]
+        assert _validate_facts(facts, set(), "u1") == []
+
+    def test_rule2_new_with_existing_id_rejected(self):
+        facts = [
+            {
+                "content": "x",
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "new",
+                "existing_id": "stray-id",
+            }
+        ]
+        assert _validate_facts(facts, {"stray-id"}, "u1") == []
+
+    def test_rule3_update_of_missing_id_rejected_silently(self, caplog):
+        facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "update_of"}]
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            assert _validate_facts(facts, set(), "u1") == []
+        # Missing id is a schema-shape violation, NOT a real
+        # classification decision - so no consolidate.intent line.
+        assert not any("memory.consolidate.intent" in r.getMessage() for r in caplog.records)
+
+    def test_rule3_hallucinated_update_of_emits_log(self, caplog):
+        """Rule 3 IS the structured-log exception. Hallucinated id is a
+        real classification decision the model made, so it must surface
+        in the consolidate.intent stream with the original intent
+        preserved for failure-mode tracking."""
+        facts = [
+            {
+                "content": "x",
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "update_of",
+                "existing_id": "fabricated-id",
+            }
+        ]
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            assert _validate_facts(facts, {"real-id"}, "u1") == []
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        json_part = record.getMessage().split("memory.consolidate.intent ", 1)[1]
+        payload = json.loads(json_part)
+        assert payload["intent"] == "hallucinated_id"
+        assert payload["original_intent"] == "update_of"
+        assert payload["outcome"] == "dropped"
+        assert payload["user_id"] == "u1"
+        assert payload["new_id"] is None
+        assert payload["replaced_id"] is None
+
+    def test_rule3_hallucinated_skip_redundant_preserves_original_intent(self, caplog):
+        facts = [
+            {
+                "content": "x",
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "skip_redundant",
+                "existing_id": "fabricated-id",
+            }
+        ]
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            _validate_facts(facts, {"real-id"}, "u1")
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
+        assert payload["original_intent"] == "skip_redundant"
+
+    def test_rule4_skip_redundant_on_confirmed_action_dropped_silently(self, caplog):
+        facts = [
+            {
+                "content": "x",
+                "tags": ["confirmed_action"],
+                "confidence": 0.7,
+                "confirmation_quote": "I see PR #299 is merged, thanks",
+                "intent": "skip_redundant",
+                "existing_id": "real-id",
+            }
+        ]
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            assert _validate_facts(facts, {"real-id"}, "u1") == []
+        # Rule 4 is DEBUG-only, no consolidate.intent.
+        assert not any("memory.consolidate.intent" in r.getMessage() for r in caplog.records)
+
+    def test_rule5_duplicate_existing_id_drops_both_silently(self, caplog):
+        facts = [
+            {
+                "content": "first",
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "update_of",
+                "existing_id": "shared-id",
+            },
+            {
+                "content": "second",
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "update_of",
+                "existing_id": "shared-id",
+            },
+        ]
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            assert _validate_facts(facts, {"shared-id"}, "u1") == []
+        # Rule 5 is DEBUG-only AND deliberately avoids double-logging
+        # the pair: zero consolidate.intent lines, not two.
+        assert not any("memory.consolidate.intent" in r.getMessage() for r in caplog.records)
+
+    def test_rule5_unique_existing_id_passes(self):
+        """Corner: a fact that cites an id no other batch fact cites
+        must pass rule 5 - the dedup is across the batch, not against
+        itself."""
+        facts = [
+            {
+                "content": "x",
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "update_of",
+                "existing_id": "unique-id",
+            }
+        ]
+        result = _validate_facts(facts, {"unique-id"}, "u1")
+        assert len(result) == 1
+
+    def test_empty_candidate_set_drops_non_new_via_rule3(self, caplog):
+        """The kill-switch / empty-candidate-set path: ANY non-`new`
+        intent is rule-3 rejected because the candidate id set is
+        empty."""
+        facts = [
+            {
+                "content": "x",
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "update_of",
+                "existing_id": "anything",
+            }
+        ]
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            assert _validate_facts(facts, set(), "u1") == []
+        # Rule 3 fires (the model decided update_of, we couldn't anchor it).
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
+        assert payload["intent"] == "hallucinated_id"
+        assert payload["original_intent"] == "update_of"
+
+    def test_user_id_threaded_into_log_line(self, caplog):
+        """The whole reason `user_id` is plumbed through `_validate_facts`
+        is so rule-3's log line carries it. Verify the user_id arg is
+        what shows up in the emitted JSON."""
+        facts = [
+            {
+                "content": "x",
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "update_of",
+                "existing_id": "fake",
+            }
+        ]
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            _validate_facts(facts, {"real-id"}, "user-12345")
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
+        assert payload["user_id"] == "user-12345"
+
+
+# ── _build_extraction_payload: candidate block ──────────────────────
+
+
+class TestBuildPayloadCandidates:
+    """Spec 367 §Candidate payload shape: the EXISTING FACTS block sits
+    between the instruction line and the USER segment, is omitted when
+    candidates is empty, and renders one line per candidate in input
+    order."""
+
+    def test_empty_candidates_omits_existing_facts_block(self):
+        payload = _build_extraction_payload("hi", "hello", [])
+        assert "EXISTING FACTS" not in payload
+        # Sanity: payload still ends with the USER/ASSISTANT turns.
+        assert "USER: hi" in payload
+        assert "ASSISTANT: hello" in payload
+
+    def test_none_candidates_omits_existing_facts_block(self):
+        """Backwards-compat: passing None (or omitting the arg entirely)
+        must collapse to the empty-block case."""
+        payload = _build_extraction_payload("hi", "hello", None)
+        assert "EXISTING FACTS" not in payload
+
+    def test_candidates_render_in_input_order(self):
+        cands = [
+            _candidate(id="aaa", text="first fact"),
+            _candidate(id="bbb", text="second fact"),
+            _candidate(id="ccc", text="third fact"),
+        ]
+        payload = _build_extraction_payload("u", "a", cands)
+        # Header appears.
+        assert "EXISTING FACTS FOR THIS USER" in payload
+        # Each id appears in the rendered payload, and the relative
+        # order is preserved (aaa before bbb before ccc).
+        idx_a = payload.index("[aaa]")
+        idx_b = payload.index("[bbb]")
+        idx_c = payload.index("[ccc]")
+        assert idx_a < idx_b < idx_c
+
+    def test_candidate_block_sits_before_user_turn(self):
+        """The CONSOLIDATION prompt section instructs the model to read
+        EXISTING FACTS first then the exchange. If the block landed
+        AFTER the USER/ASSISTANT segments, the model's reading order
+        would invert the spec's intent."""
+        cands = [_candidate(id="x")]
+        payload = _build_extraction_payload("u", "a", cands)
+        assert payload.index("EXISTING FACTS") < payload.index("USER: u")
+
+
+# ── _store_facts: branching on intent ───────────────────────────────
+
+
+class TestStoreFactsIntent:
+    """Spec 367 §Storage layer changes: the branch table. Each test
+    exercises one intent + one outcome combination and asserts the
+    `_emit_intent_log` shape via caplog. Storage calls themselves are
+    monkeypatched to keep the tests free of Mem0/Qdrant."""
+
+    def test_new_with_no_duplicate_stored(self, monkeypatch, caplog):
+        monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: False)
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda *a, **kw: "new-id-1",
+        )
+        facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "new"}]
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            stored, replaced, skipped = _store_facts(facts, user_id="u1", session_id="s1")
+        assert (stored, replaced, skipped) == (1, 0, 0)
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
+        assert payload["intent"] == "new"
+        assert payload["new_id"] == "new-id-1"
+        assert payload["replaced_id"] is None
+        assert payload["outcome"] == "stored"
+
+    def test_new_with_duplicate_dropped(self, monkeypatch, caplog):
+        monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
+        # _is_duplicate path: search returns a high-score hit.
+        fake = MagicMock()
+        fake.score = 0.95
+        monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [fake])
+        # add_structured must NOT be called.
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda *a, **kw: pytest.fail("add_structured should not run on duplicate"),
+        )
+        facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "new"}]
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            stored, _, _ = _store_facts(facts, user_id="u1", session_id="s1")
+        assert stored == 0
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
+        assert payload["intent"] == "new"
+        assert payload["outcome"] == "dropped"
+
+    def test_update_of_happy_path(self, monkeypatch, caplog):
+        """Delete-then-add both succeed. _is_duplicate must NOT run for
+        the update_of branch (consolidation already happened upstream)."""
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.is_enabled",
+            lambda: pytest.fail("is_duplicate must not run on update_of"),
+        )
+        delete_calls: list = []
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.delete_by_id",
+            lambda *, user_id, memory_id: delete_calls.append((user_id, memory_id)) or True,
+        )
+        add_calls: list = []
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda content, **kw: add_calls.append((content, kw)) or "new-id",
+        )
+        facts = [
+            {
+                "content": "updated value",
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "update_of",
+                "existing_id": "old-id",
+            }
+        ]
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            stored, replaced, skipped = _store_facts(facts, user_id="u1", session_id="s1")
+        # Delete and add both ran; outcome is `stored`.
+        assert delete_calls == [("u1", "old-id")]
+        assert len(add_calls) == 1
+        assert (stored, replaced, skipped) == (1, 1, 0)
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
+        assert payload["intent"] == "update_of"
+        assert payload["new_id"] == "new-id"
+        assert payload["replaced_id"] == "old-id"
+        assert payload["outcome"] == "stored"
+
+    def test_update_of_delete_failed_added_anyway(self, monkeypatch, caplog):
+        """delete_by_id returns False (cited row already gone). The add
+        still ran; outcome string downgrades to flag the
+        already-vanished row."""
+        monkeypatch.setattr("kai.memory_extraction.memory.delete_by_id", lambda **kw: False)
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda *a, **kw: "new-id",
+        )
+        facts = [
+            {
+                "content": "x",
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "update_of",
+                "existing_id": "ghost-id",
+            }
+        ]
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            stored, replaced, _ = _store_facts(facts, user_id="u1", session_id="s1")
+        # The new fact landed; replaced is still incremented because the
+        # update_of intent succeeded structurally.
+        assert (stored, replaced) == (1, 1)
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
+        assert payload["outcome"] == "delete_failed_added_anyway"
+
+    def test_update_of_add_failed_after_delete_logs_warning(self, monkeypatch, caplog):
+        """Worst case: delete succeeded, add returned None. Old fact
+        gone, new fact lost. Logged at WARNING because the operator
+        cares about a recurring spike of this outcome."""
+        monkeypatch.setattr("kai.memory_extraction.memory.delete_by_id", lambda **kw: True)
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda *a, **kw: None,
+        )
+        facts = [
+            {
+                "content": "x",
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "update_of",
+                "existing_id": "old-id",
+            }
+        ]
+        with caplog.at_level("DEBUG", logger="kai.memory_extraction"):
+            stored, replaced, _ = _store_facts(facts, user_id="u1", session_id="s1")
+        assert (stored, replaced) == (0, 0)
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        assert record.levelname == "WARNING"
+        payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
+        assert payload["outcome"] == "add_failed_after_delete"
+        assert payload["new_id"] is None
+        assert payload["replaced_id"] == "old-id"
+
+    def test_skip_redundant_no_storage_call(self, monkeypatch, caplog):
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.delete_by_id",
+            lambda **kw: pytest.fail("delete must not run on skip_redundant"),
+        )
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda *a, **kw: pytest.fail("add must not run on skip_redundant"),
+        )
+        facts = [
+            {
+                "content": "x",
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "skip_redundant",
+                "existing_id": "kept-id",
+            }
+        ]
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            stored, replaced, skipped = _store_facts(facts, user_id="u1", session_id="s1")
+        assert (stored, replaced, skipped) == (0, 0, 1)
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
+        assert payload["intent"] == "skip_redundant"
+        assert payload["replaced_id"] == "kept-id"
+        assert payload["outcome"] == "skipped"
+
+
+# ── extract_and_store: end-to-end consolidation ─────────────────────
+
+
+class TestExtractAndStoreConsolidation:
+    """Spec 367 §extract_and_store plumbing: the outer pipeline. These
+    tests turn consolidation ON via `_cfg(memory_consolidation_candidates_n=8)`,
+    monkeypatch `memory.search` to seed candidates, and assert that the
+    storage calls hit the right intent branches."""
+
+    @pytest.mark.asyncio
+    async def test_two_fact_batch_one_new_one_update(self, monkeypatch, caplog):
+        cand = _candidate(id="cand-1", text="old value")
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.search",
+            lambda *a, **kw: [cand],
+        )
+        monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: False)
+        delete_calls: list = []
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.delete_by_id",
+            lambda *, user_id, memory_id: delete_calls.append(memory_id) or True,
+        )
+        add_calls: list = []
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda content, **kw: add_calls.append(content) or "new-id",
+        )
+        envelope = {
+            "structured_output": {
+                "facts": [
+                    {
+                        "content": "totally new fact",
+                        "tags": ["fact"],
+                        "confidence": 0.9,
+                        "intent": "new",
+                    },
+                    {
+                        "content": "new value",
+                        "tags": ["fact"],
+                        "confidence": 0.9,
+                        "intent": "update_of",
+                        "existing_id": "cand-1",
+                    },
+                ]
+            }
+        }
+
+        async def _fake_exec(*args, **kwargs):
+            return _make_proc(stdout=json.dumps(envelope).encode())
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            n = await extract_and_store(
+                "u",
+                "a",
+                user_id="u1",
+                config=_cfg(memory_consolidation_candidates_n=8),
+            )
+        # Two storage calls: one new, one update (delete-then-add).
+        assert n == 2
+        assert delete_calls == ["cand-1"]
+        assert len(add_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_skip_redundant_does_not_store(self, monkeypatch, caplog):
+        cand = _candidate(id="cand-1", text="adequate existing")
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.search",
+            lambda *a, **kw: [cand],
+        )
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda *a, **kw: pytest.fail("add must not run for skip_redundant"),
+        )
+        envelope = {
+            "structured_output": {
+                "facts": [
+                    {
+                        "content": "redundant paraphrase",
+                        "tags": ["fact"],
+                        "confidence": 0.9,
+                        "intent": "skip_redundant",
+                        "existing_id": "cand-1",
+                    }
+                ]
+            }
+        }
+
+        async def _fake_exec(*args, **kwargs):
+            return _make_proc(stdout=json.dumps(envelope).encode())
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+        n = await extract_and_store(
+            "u",
+            "a",
+            user_id="u1",
+            config=_cfg(memory_consolidation_candidates_n=8),
+        )
+        assert n == 0
+
+    @pytest.mark.asyncio
+    async def test_hallucinated_id_dropped_with_log(self, monkeypatch, caplog):
+        cand = _candidate(id="real-id")
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.search",
+            lambda *a, **kw: [cand],
+        )
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda *a, **kw: pytest.fail("add must not run for hallucinated id"),
+        )
+        envelope = {
+            "structured_output": {
+                "facts": [
+                    {
+                        "content": "x",
+                        "tags": ["fact"],
+                        "confidence": 0.9,
+                        "intent": "update_of",
+                        "existing_id": "fabricated-id",
+                    }
+                ]
+            }
+        }
+
+        async def _fake_exec(*args, **kwargs):
+            return _make_proc(stdout=json.dumps(envelope).encode())
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            n = await extract_and_store(
+                "u",
+                "a",
+                user_id="u1",
+                config=_cfg(memory_consolidation_candidates_n=8),
+            )
+        assert n == 0
+        # Hallucinated-id rule-3 log should be present, with the
+        # original_intent preserved.
+        intent_records = [r for r in caplog.records if "memory.consolidate.intent" in r.getMessage()]
+        assert len(intent_records) == 1
+        payload = json.loads(intent_records[0].getMessage().split("memory.consolidate.intent ", 1)[1])
+        assert payload["intent"] == "hallucinated_id"
+        assert payload["original_intent"] == "update_of"
+
+    @pytest.mark.asyncio
+    async def test_candidates_log_emitted_once_with_ids(self, monkeypatch, caplog):
+        cands = [_candidate(id="a"), _candidate(id="b")]
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.search",
+            lambda *a, **kw: cands,
+        )
+
+        async def _fake_exec(*args, **kwargs):
+            return _make_proc(stdout=b'{"facts": []}')
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            await extract_and_store(
+                "u",
+                "a",
+                user_id="u1",
+                config=_cfg(memory_consolidation_candidates_n=8),
+            )
+        cand_records = [r for r in caplog.records if "memory.consolidate.candidates" in r.getMessage()]
+        assert len(cand_records) == 1
+        json_part = cand_records[0].getMessage().split("memory.consolidate.candidates ", 1)[1]
+        payload = json.loads(json_part)
+        assert payload["user_id"] == "u1"
+        assert payload["n_candidates"] == 2
+        assert payload["candidate_ids"] == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_search_failure_falls_back_to_empty_candidates(self, monkeypatch, caplog):
+        """Match `_is_duplicate`'s search-failure posture: a broken
+        store does not strand extraction."""
+
+        def _boom(*a, **kw):
+            raise RuntimeError("qdrant down")
+
+        monkeypatch.setattr("kai.memory_extraction.memory.search", _boom)
+
+        async def _fake_exec(*args, **kwargs):
+            return _make_proc(stdout=b'{"facts": []}')
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            n = await extract_and_store(
+                "u",
+                "a",
+                user_id="u1",
+                config=_cfg(memory_consolidation_candidates_n=8),
+            )
+        assert n == 0
+        # The candidates log line should still emit, with n=0 and
+        # candidate_ids=[]. The empty-candidates branch is structurally
+        # identical to the kill-switch branch from here on.
+        cand_records = [r for r in caplog.records if "memory.consolidate.candidates" in r.getMessage()]
+        payload = json.loads(cand_records[0].getMessage().split("memory.consolidate.candidates ", 1)[1])
+        assert payload["n_candidates"] == 0
+        assert payload["candidate_ids"] == []
+
+
+# ── Kill switch: n_candidates == 0 ──────────────────────────────────
+
+
+class TestConsolidationKillSwitch:
+    """Spec 367 §Kill switch behavior: setting
+    `memory_consolidation_candidates_n=0` MUST behave end-to-end as
+    pre-spec extraction. This is the rollback path the operator uses
+    if consolidation misbehaves in production."""
+
+    def test_consolidation_prompt_section_retained_in_system_prompt(self):
+        """Even with the kill switch on, the CONSOLIDATION section
+        stays in the system prompt - it tells the model `intent: "new"`
+        is the right choice when no EXISTING FACTS block is present.
+        Removing the section would leave the model without guidance for
+        the empty-block case."""
+        assert "CONSOLIDATION:" in _EXTRACTION_SYSTEM_PROMPT
+        assert "When no EXISTING FACTS block is present" in _EXTRACTION_SYSTEM_PROMPT
+
+    @pytest.mark.asyncio
+    async def test_n_zero_skips_search_call(self, monkeypatch):
+        """The candidate-fetch path is skipped entirely when n=0;
+        memory.search MUST NOT be invoked."""
+
+        def _fail_search(*a, **kw):
+            pytest.fail("memory.search must not run when n_candidates == 0")
+
+        monkeypatch.setattr("kai.memory_extraction.memory.search", _fail_search)
+
+        async def _fake_exec(*args, **kwargs):
+            return _make_proc(stdout=b'{"facts": []}')
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+        await extract_and_store(
+            "u",
+            "a",
+            user_id="u1",
+            config=_cfg(memory_consolidation_candidates_n=0),
+        )
+
+    @pytest.mark.asyncio
+    async def test_n_zero_omits_existing_facts_block_from_payload(self, monkeypatch):
+        captured: dict = {}
+
+        async def _fake_exec(*args, **kwargs):
+            async def _comm(input):
+                captured["stdin"] = input.decode("utf-8")
+                return (b'{"facts": []}', b"")
+
+            proc = _make_proc()
+            proc.communicate = _comm
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+        await extract_and_store(
+            "u",
+            "a",
+            user_id="u1",
+            config=_cfg(memory_consolidation_candidates_n=0),
+        )
+        assert "EXISTING FACTS" not in captured["stdin"]
+
+    @pytest.mark.asyncio
+    async def test_n_zero_new_fact_stored_as_today(self, monkeypatch):
+        monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: False)
+        stored: list = []
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda content, **kw: stored.append(content) or "id",
+        )
+        envelope = {
+            "facts": [
+                {"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "new"},
+            ]
+        }
+
+        async def _fake_exec(*args, **kwargs):
+            return _make_proc(stdout=json.dumps(envelope).encode())
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+        n = await extract_and_store(
+            "u",
+            "a",
+            user_id="u1",
+            config=_cfg(memory_consolidation_candidates_n=0),
+        )
+        assert n == 1
+        assert stored == ["x"]
+
+    @pytest.mark.asyncio
+    async def test_n_zero_drops_non_new_intent_via_rule3(self, monkeypatch, caplog):
+        """With an empty candidate set, ANY non-`new` intent fails
+        rule 3. The model SHOULD emit `new` (per the CONSOLIDATION
+        prompt instructions), but if it doesn't, the validator drops
+        the fact and the operator gets a hallucinated_id log line."""
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda *a, **kw: pytest.fail("add must not run for hallucinated id"),
+        )
+        envelope = {
+            "facts": [
+                {
+                    "content": "x",
+                    "tags": ["fact"],
+                    "confidence": 0.9,
+                    "intent": "update_of",
+                    "existing_id": "anything",
+                }
+            ]
+        }
+
+        async def _fake_exec(*args, **kwargs):
+            return _make_proc(stdout=json.dumps(envelope).encode())
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            n = await extract_and_store(
+                "u",
+                "a",
+                user_id="u1",
+                config=_cfg(memory_consolidation_candidates_n=0),
+            )
+        assert n == 0
+        intent_records = [r for r in caplog.records if "memory.consolidate.intent" in r.getMessage()]
+        assert len(intent_records) == 1
+        payload = json.loads(intent_records[0].getMessage().split("memory.consolidate.intent ", 1)[1])
+        assert payload["intent"] == "hallucinated_id"
+        assert payload["original_intent"] == "update_of"
+
+
+# ── Schema: intent + existing_id properties ─────────────────────────
+
+
+class TestFactSchemaConsolidation:
+    """Spec 367 §Schema changes: the schema is the first line of defense
+    at the CLI boundary. Pin the new properties so a future schema edit
+    that drops them produces an obvious test failure rather than a
+    silent regression in the structured-output contract with Haiku."""
+
+    def test_intent_property_present_with_enum(self):
+        items = _FACT_SCHEMA["properties"]["facts"]["items"]
+        assert "intent" in items["properties"]
+        intent = items["properties"]["intent"]
+        assert intent["type"] == "string"
+        assert set(intent["enum"]) == {"new", "update_of", "skip_redundant"}
+
+    def test_existing_id_property_present_with_length_bounds(self):
+        items = _FACT_SCHEMA["properties"]["facts"]["items"]
+        assert "existing_id" in items["properties"]
+        eid = items["properties"]["existing_id"]
+        assert eid["type"] == "string"
+        assert eid["minLength"] == 1
+        assert eid["maxLength"] == 64
+
+    def test_intent_is_required(self):
+        items = _FACT_SCHEMA["properties"]["facts"]["items"]
+        assert "intent" in items["required"]
+
+    def test_additional_properties_still_closed(self):
+        """The schema is closed by design - Haiku must not be able to
+        smuggle extra fields through. Pin this so a future contributor
+        does not accidentally relax it while adding a property."""
+        items = _FACT_SCHEMA["properties"]["facts"]["items"]
+        assert items["additionalProperties"] is False
+        assert _FACT_SCHEMA["additionalProperties"] is False
+
+
+# ── Cost / latency regression ───────────────────────────────────────
+
+
+class TestPayloadSizeBound:
+    """Spec 367 §Cost / latency regression: with all caps at their
+    documented maxes, the rendered payload stays under 8000 chars
+    before prompt-template overhead. A future change that lifts a cap
+    without noticing should break this test."""
+
+    def test_max_payload_under_bound(self):
+        from kai import memory
+        from kai.memory_extraction import _MAX_USER_CHARS
+
+        # 8 candidates each at the schema's 500-char cap.
+        cands = [
+            _candidate(id=f"id-{i}", text="z" * 500, metadata={"source": "extracted", "confidence": 0.9})
+            for i in range(8)
+        ]
+        user_text = "u" * _MAX_USER_CHARS
+        assistant_text = _capped_assistant("a" * memory._MAX_ASSISTANT_CHARS)
+        payload = _build_extraction_payload(user_text, assistant_text, cands)
+        # 8 * ~600 (candidate line) + 2000 (user) + 1000 (assistant) +
+        # template overhead ~< 200 = roughly 8000 ceiling.
+        assert len(payload) < 8000

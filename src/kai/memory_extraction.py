@@ -29,6 +29,7 @@ from collections import OrderedDict
 
 from kai import memory
 from kai.config import DATA_DIR, Config
+from kai.memory import MemoryResult
 
 log = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ log = logging.getLogger(__name__)
 # Stored in each fact's metadata so future cleanups can target specific
 # prompt revisions (delete_by_source can be extended, or a sibling
 # delete_by_prompt_version admin command can be added).
-_EXTRACTION_PROMPT_VERSION: str = "1"
+_EXTRACTION_PROMPT_VERSION: str = "2"
 
 # Memory `type` values this module writes. Track 1 writes "exchange"
 # from memory.py; Track 2 writes "fact" from here. Any other type value
@@ -182,8 +183,28 @@ _FACT_SCHEMA: dict = {
                         "minLength": 20,
                         "maxLength": 500,
                     },
+                    # Consolidation control fields. The conditional rule
+                    # (existing_id present iff intent in (update_of,
+                    # skip_redundant)) is enforced in Python by
+                    # _validate_facts, NOT in JSON Schema, for the same
+                    # reason the confirmed_action / confirmation_quote
+                    # rule lives there: the if/then/else support in
+                    # `claude --print --json-schema` is undocumented and
+                    # a too-strict schema risks silently dropping valid
+                    # facts at the CLI boundary. The 64-char ceiling on
+                    # existing_id comfortably bounds Mem0 UUIDs (~36
+                    # chars) without forbidding a future id-shape change.
+                    "intent": {
+                        "type": "string",
+                        "enum": ["new", "update_of", "skip_redundant"],
+                    },
+                    "existing_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64,
+                    },
                 },
-                "required": ["content", "tags", "confidence"],
+                "required": ["content", "tags", "confidence", "intent"],
                 "additionalProperties": False,
             },
             "maxItems": 5,
@@ -267,6 +288,44 @@ FORMAT each fact as:
   confirms the action, minimum 20 characters, and must reference
   the action specifically (not a generic "thanks"). If no such
   quote exists, do not emit the fact.
+
+CONSOLIDATION:
+You will sometimes receive an EXISTING FACTS block before the USER/ASSISTANT
+exchange. Each existing fact is shown with its id in square brackets,
+provenance, and confidence. For each fact you are about to emit, choose one
+of three intents:
+
+- "new": the proposed fact is genuinely net-new information. Use this when
+  no existing fact covers the same underlying claim, even paraphrased.
+  Most facts are new; do not over-eagerly tie facts to existing ids.
+  When no EXISTING FACTS block is present, "new" is always the correct
+  intent.
+
+- "update_of": the proposed fact ASSERTS THE SAME UNDERLYING CLAIM as an
+  existing fact, but with a value that differs (a path changed, a tunable
+  was retuned, a project name was renamed) OR with strictly more specific
+  information (a confirmed timestamp where there was a vague reference).
+  Cite the existing id in `existing_id`. The new fact will REPLACE the
+  cited fact. Use this conservatively: only when one fact rendering the
+  other obsolete is clearly correct.
+
+- "skip_redundant": the proposed fact is a paraphrase of an existing fact
+  with no new information and no contradictory value. Cite the existing id
+  in `existing_id`. The new fact will NOT be stored. Prefer this over
+  "update_of" when the existing fact is already adequate; only use
+  "update_of" when the new wording carries information the old wording
+  lacks.
+
+Important constraints:
+- existing_id MUST be one of the ids shown in the EXISTING FACTS block.
+  Do NOT invent ids. If no EXISTING FACTS block is present, or if no
+  existing fact matches, use intent "new".
+- Each existing id may be referenced by AT MOST ONE proposed fact in this
+  batch. Do not split a single update across two proposed facts, and do
+  not have two proposed facts both update the same existing fact.
+- A confirmed_action fact is always "new" (a confirmation is a fresh
+  observation about reality, even if the wording paraphrases an existing
+  fact). Never emit "skip_redundant" for a confirmed_action.
 """
 
 
@@ -337,7 +396,111 @@ def _strip_role_labels(text: str) -> str:
     return _ROLE_LABEL_RE.sub("\n[role label stripped] ", text)
 
 
-def _build_extraction_payload(user_text: str, assistant_text: str) -> str:
+def _capped_assistant(text: str) -> str:
+    """
+    Apply the assistant-side truncation cap used by Haiku extraction.
+
+    The cap constant lives on `memory._MAX_ASSISTANT_CHARS` because the
+    whole-text length is computed once per extraction and consumed by
+    BOTH the candidate-set fetch (which embeds this string to search
+    for related existing facts) AND the extractor payload (which shows
+    this string to Haiku as the ASSISTANT segment). If the two sites
+    capped independently, a future divergence - a 50KB paste fetched
+    against the full text while the payload sees only the first 1KB -
+    would silently produce candidate sets that do not match what the
+    extractor actually reads. Centralizing the cap here is structural
+    defense against that class of drift.
+    """
+    if len(text) > memory._MAX_ASSISTANT_CHARS:
+        return text[: memory._MAX_ASSISTANT_CHARS] + "..."
+    return text
+
+
+def _render_candidate_source(metadata: dict) -> str:
+    """
+    Render a candidate's `metadata.source` value for the Haiku payload.
+
+    Collapses None and empty string to the `unknown` sentinel for the
+    same reason the candidate's `confidence` field collapses missing
+    values to `n/a`: legacy rows from pre-#361 code paths occasionally
+    carry either shape, neither of which carries useful provenance
+    signal for the extractor, and the raw renderings would be either
+    visually broken (`source=`) or a Python repr leak (`source=None`).
+    A single `unknown` sentinel keeps the payload line shape uniform.
+    """
+    raw = metadata.get("source")
+    if raw is None or raw == "":
+        return "unknown"
+    return str(raw)
+
+
+def _render_candidate_line(cand: MemoryResult) -> str:
+    """
+    Render one candidate fact as a single EXISTING FACTS line.
+
+    Format is documented in the CONSOLIDATION section of the extractor
+    prompt: `[{id}] (source={source}, conf={confidence}) {content}`. The
+    id is cited back verbatim by the extractor in `update_of` /
+    `skip_redundant`, so any change to the bracket shape must be
+    reflected in the prompt's instructions and in the rule-3 id
+    extraction in `_validate_facts`. The stored text (`cand.text`) is
+    already bounded to 500 chars by the extractor schema, so no further
+    truncation is needed here.
+    """
+    source = _render_candidate_source(cand.metadata or {})
+    conf_raw = (cand.metadata or {}).get("confidence")
+    # Match the `n/a` sentinel the prompt documents. Keep the numeric
+    # rendering short (`0.85`, not `0.8500000000001`) so a batch of 8
+    # candidates does not balloon the payload with float artifacts.
+    if isinstance(conf_raw, (int, float)):
+        conf = f"{conf_raw:g}"
+    else:
+        conf = "n/a"
+    return f"[{cand.id}] (source={source}, conf={conf}) {cand.text}"
+
+
+def _emit_intent_log(
+    *,
+    user_id: str,
+    intent: str,
+    original_intent: str | None,
+    new_id: str | None,
+    replaced_id: str | None,
+    outcome: str,
+    level: int = logging.INFO,
+) -> None:
+    """
+    Single emit site for `memory.consolidate.intent` log lines.
+
+    Every consolidation-intent emission - from validation rule 3 in
+    `_validate_facts`, and from every branch in `_store_facts` - routes
+    through here so the JSON schema cannot drift between sites. Mirrors
+    the `_base_recall_payload` + `_emit_recall_log` pair in memory.py.
+
+    `level` defaults to INFO; the only override in the current design
+    is WARNING for the `add_failed_after_delete` outcome, where the old
+    fact was deleted but the new one never landed.
+
+    JSON compact separators (`,:`) match the `_emit_recall_log` convention
+    so downstream parsers see the same wire format across every
+    structured log line in the memory subsystem.
+    """
+    payload = {
+        "user_id": user_id,
+        "intent": intent,
+        "original_intent": original_intent,
+        "new_id": new_id,
+        "replaced_id": replaced_id,
+        "outcome": outcome,
+    }
+    log.log(level, "memory.consolidate.intent %s", json.dumps(payload, separators=(",", ":")))
+
+
+def _build_extraction_payload(
+    user_text: str,
+    assistant_text: str,
+    candidates: list[MemoryResult] | None = None,
+) -> str:
     """
     Format the exchange as a single user message for the extractor.
 
@@ -351,46 +514,115 @@ def _build_extraction_payload(user_text: str, assistant_text: str) -> str:
     crafted user message could inject a fake assistant turn and a fake
     user confirmation that extraction would happily accept.
 
+    The optional `candidates` list is rendered as the EXISTING FACTS
+    block between the "Extract facts from this exchange." line and the
+    USER segment. Empty or None `candidates` omits the block entirely;
+    the CONSOLIDATION section of the system prompt tells Haiku to emit
+    `intent: "new"` in that case. The block is omitted rather than
+    rendered as an empty header so a model looking at a brand-new user
+    sees a payload identical to the pre-consolidation shape.
+
     The payload is delivered via stdin, not argv - see `_run_extractor`.
     """
-    # Cap both sides before role-label stripping so per-call Haiku
-    # token cost stays bounded and --max-budget-usd is a real ceiling,
-    # not an optimistic estimate. Both caps are applied here, locally,
-    # because user_text and assistant_text arrive at full length from
-    # bot.py: a 50k-char paste would flow straight into the Haiku
-    # payload unless truncated at this boundary. Confirmation quotes
-    # sit inside the user turn but are short by construction (the
-    # _CONFIRMATION_QUOTE_MIN_CHARS floor is 20 chars), so a 2000-char
-    # user cap preserves all realistic confirmation signal.
+    # Cap the user side locally; the assistant side was capped by the
+    # caller via `_capped_assistant` so both the candidate-set fetch
+    # and this payload saw identical input. Capping here, inline, would
+    # reintroduce the divergence risk documented on `_capped_assistant`.
+    # Confirmation quotes sit inside the user turn but are short by
+    # construction (the _CONFIRMATION_QUOTE_MIN_CHARS floor is 20
+    # chars), so a 2000-char user cap preserves all realistic
+    # confirmation signal.
     if len(user_text) > _MAX_USER_CHARS:
         user_text = user_text[:_MAX_USER_CHARS] + "..."
-    if len(assistant_text) > memory._MAX_ASSISTANT_CHARS:
-        assistant_text = assistant_text[: memory._MAX_ASSISTANT_CHARS] + "..."
     safe_user = _strip_role_labels(user_text)
     safe_assistant = _strip_role_labels(assistant_text)
-    return f"Extract facts from this exchange.\n\nUSER: {safe_user}\n\nASSISTANT: {safe_assistant}"
+    # The EXISTING FACTS block sits between the instruction line and
+    # the USER turn. Its header is omitted when there are no
+    # candidates so the payload shape exactly matches pre-spec
+    # extraction on brand-new users (where no facts yet exist) and on
+    # the kill-switch path (n_candidates == 0). The prompt's
+    # CONSOLIDATION section handles that branch by mandating
+    # intent: "new" when the block is absent.
+    candidate_block = ""
+    if candidates:
+        lines = "\n".join(_render_candidate_line(c) for c in candidates)
+        candidate_block = "EXISTING FACTS FOR THIS USER (most semantically related first):\n" + lines + "\n\n"
+    return f"Extract facts from this exchange.\n\n{candidate_block}USER: {safe_user}\n\nASSISTANT: {safe_assistant}"
 
 
-def _validate_facts(facts: list[dict]) -> list[dict]:
+_CONSOLIDATION_INTENTS: frozenset[str] = frozenset({"new", "update_of", "skip_redundant"})
+
+
+def _validate_facts(
+    facts: list[dict],
+    candidate_ids: set[str],
+    user_id: str,
+) -> list[dict]:
     """
-    Drop facts that violate the confirmation-quote rules.
+    Drop facts that violate confirmation-quote or consolidation rules.
 
     The CLI's JSON Schema validation already constrains property names,
-    tag enum, and primitive types. This function enforces the two
-    cross-field rules JSON Schema does NOT express cleanly (see §8):
+    tag enum, and primitive types. This function enforces the cross-field
+    and batch-internal rules JSON Schema does NOT express cleanly:
 
-      1. If tags includes "confirmed_action": confirmation_quote MUST
+    Confirmation-quote rules (existed pre-consolidation; unchanged):
+      A. If tags includes "confirmed_action": confirmation_quote MUST
          be present, >=_CONFIRMATION_QUOTE_MIN_CHARS (20), and MUST NOT
-         fullmatch _GENERIC_CONFIRMATION_RE. Laundered "thanks"-style
-         confirmations are rejected here even if Haiku emitted them.
-      2. If tags does NOT include "confirmed_action": confirmation_quote
-         MUST be absent entirely. Defends against the model smuggling
-         a quote onto a non-confirmation fact (where it would be
-         semantically meaningless but still stored).
+         fullmatch _GENERIC_CONFIRMATION_RE.
+      B. If tags does NOT include "confirmed_action": confirmation_quote
+         MUST be absent entirely.
 
-    Rejected facts are dropped silently (DEBUG log only). Not raising
-    preserves the "never raises" contract of the outer `extract_and_store`.
+    Consolidation rules (new):
+      1. `intent` is present and is one of the three enum values.
+         Defense-in-depth against schema regression; the schema already
+         enforces this, but a future too-permissive schema edit would
+         silently drop into the `_store_facts` branch table where an
+         unknown intent would be skipped without explanation.
+      2. `intent == "new"`: `existing_id` MUST be absent.
+      3. `intent in ("update_of", "skip_redundant")`: `existing_id` MUST
+         be present, non-empty, and MUST appear in `candidate_ids`.
+         Hallucinated ids are dropped AND emit a `memory.consolidate.intent`
+         log line with `intent="hallucinated_id"` and `original_intent`
+         set to the pre-rewrite intent value, so the operational signal
+         (Haiku producing ids that do not exist) is preserved. This is
+         the ONE rule that emits a structured log line; the others are
+         DEBUG-only because they represent schema-shape violations or
+         batch-internal inconsistencies, not real classification decisions.
+      4. `intent == "skip_redundant"`: tags MUST NOT include
+         `confirmed_action`. A confirmation is a fresh observation about
+         reality even if the wording paraphrases an existing fact.
+      5. Existing-id uniqueness within the batch: if two proposed facts
+         cite the same `existing_id`, BOTH are dropped. The failure
+         mode being defended against is the extractor emitting two
+         partial updates that each capture half of what should have
+         been one fact; picking one would silently lose the other half,
+         and storing both would leave the cited fact orphaned twice.
+         Refusing both forces the next exchange to re-extract a clean
+         single update.
+
+    Rules apply in order; first violation wins. `user_id` is required
+    because rule 3's `_emit_intent_log` carries `user_id` in its
+    uniform schema; threading it through here keeps detection and
+    emission co-located rather than splitting the two across modules.
+
+    Rejected facts are dropped silently (DEBUG log) for rules 1, 2, 4,
+    5 and confirmation-quote rules. Rule 3 emits the structured log
+    line documented above.
     """
+    # Pre-pass: count existing_id citations across the batch so rule 5
+    # (uniqueness) can be evaluated without two passes through the per-
+    # fact loop. A fact's id is only counted when intent is non-`new`,
+    # so a stray existing_id on a `new` fact does not poison the count
+    # for a legitimate update or skip elsewhere in the batch.
+    citation_counts: dict[str, int] = {}
+    for fact in facts:
+        if not isinstance(fact, dict):
+            continue
+        intent = fact.get("intent")
+        existing_id = fact.get("existing_id")
+        if intent in ("update_of", "skip_redundant") and isinstance(existing_id, str) and existing_id:
+            citation_counts[existing_id] = citation_counts.get(existing_id, 0) + 1
+
     validated: list[dict] = []
     for fact in facts:
         # Defensive isinstance check: the CLI schema guarantees a dict
@@ -399,7 +631,69 @@ def _validate_facts(facts: list[dict]) -> list[dict]:
         if not isinstance(fact, dict):
             log.debug("_validate_facts: skipping non-dict entry %r", fact)
             continue
+
+        # Rule 1: intent enum membership. Defense-in-depth against a
+        # future schema regression; on the happy path the schema
+        # already enforced this at the CLI boundary.
+        intent = fact.get("intent")
+        if intent not in _CONSOLIDATION_INTENTS:
+            log.debug("_validate_facts: rejecting fact with bad intent %r", intent)
+            continue
+
+        existing_id = fact.get("existing_id")
+
+        # Rule 2: `new` MUST NOT carry an existing_id. The control field
+        # is meaningless on a new fact and would only confuse downstream
+        # parsers reading the intent log.
+        if intent == "new" and existing_id is not None:
+            log.debug("_validate_facts: rejecting `new` fact with existing_id %r", existing_id)
+            continue
+
+        # Rule 3: non-`new` intents MUST cite an id present in the
+        # candidate set. Hallucinated ids are operationally interesting
+        # so they go through _emit_intent_log; rule-1/2/4/5 violations
+        # are not (they are schema-shape or batch-shape problems, not
+        # the model genuinely deciding to update or skip something).
+        if intent in ("update_of", "skip_redundant"):
+            if not isinstance(existing_id, str) or not existing_id:
+                log.debug("_validate_facts: rejecting %s fact missing existing_id", intent)
+                continue
+            if existing_id not in candidate_ids:
+                _emit_intent_log(
+                    user_id=user_id,
+                    intent="hallucinated_id",
+                    original_intent=intent,
+                    new_id=None,
+                    replaced_id=None,
+                    outcome="dropped",
+                )
+                continue
+
+        # Rule 4: confirmed_action facts cannot be skip_redundant. A
+        # confirmation is a fresh observation about reality even if it
+        # paraphrases an existing fact - the timestamp matters.
         tags = fact.get("tags") or []
+        if intent == "skip_redundant" and "confirmed_action" in tags:
+            log.debug("_validate_facts: rejecting skip_redundant on confirmed_action fact")
+            continue
+
+        # Rule 5: existing-id uniqueness across the batch. Pre-counted
+        # above so this check is O(1) per fact. Only non-`new` facts
+        # are subject to the rule because a `new` fact without an
+        # existing_id has nothing to clash on.
+        if intent in ("update_of", "skip_redundant") and citation_counts.get(existing_id, 0) > 1:
+            log.debug(
+                "_validate_facts: rejecting %s fact citing duplicated existing_id %r in batch",
+                intent,
+                existing_id,
+            )
+            continue
+
+        # Confirmation-quote rules (preserved from the pre-consolidation
+        # validator). These run AFTER the consolidation rules so a
+        # fact that hits both classes of rejection is rejected for the
+        # most-specific reason (consolidation rule wins, which is the
+        # one the operator can act on).
         quote = fact.get("confirmation_quote")
         if "confirmed_action" in tags:
             if not isinstance(quote, str) or len(quote) < _CONFIRMATION_QUOTE_MIN_CHARS:
@@ -415,6 +709,7 @@ def _validate_facts(facts: list[dict]) -> list[dict]:
             if quote is not None:
                 log.debug("_validate_facts: rejecting non-confirmed_action fact with quote")
                 continue
+
         validated.append(fact)
     return validated
 
@@ -455,7 +750,13 @@ def _is_duplicate(content: str, user_id: str, threshold: float = 0.9) -> bool:
 # ── Subprocess wiring ───────────────────────────────────────────────
 
 
-async def _run_extractor(payload_text: str, config: Config) -> list[dict]:
+async def _run_extractor(
+    payload_text: str,
+    config: Config,
+    *,
+    candidate_ids: set[str],
+    user_id: str,
+) -> list[dict]:
     """
     Spawn `claude --print` with the extractor prompt and parse the JSON.
 
@@ -595,7 +896,7 @@ async def _run_extractor(payload_text: str, config: Config) -> list[dict]:
         facts_raw = structured.get("facts")
     else:
         facts_raw = parsed.get("facts")
-    return _validate_facts(facts_raw or [])
+    return _validate_facts(facts_raw or [], candidate_ids, user_id)
 
 
 def _store_facts(
@@ -603,23 +904,54 @@ def _store_facts(
     *,
     user_id: str,
     session_id: str | None,
-) -> int:
+) -> tuple[int, int, int]:
     """
-    Persist validated facts via memory.add_structured, skipping dupes.
+    Persist validated facts via memory.add_structured, branching on intent.
 
-    Returns the count actually stored. Dedup is per-fact: a single
-    duplicate does not abort the batch. Metadata includes the fact's
-    tags, confidence, prompt version, source provenance ("extracted"),
-    and the session it came from.
+    Returns `(stored, replaced, skipped)`:
+    - `stored`: facts that actually landed in the store. Sums `new`-with-add
+      and `update_of` outcomes whose `add_structured` succeeded
+      (`stored` and `delete_failed_added_anyway` outcomes both count).
+      The `add_failed_after_delete` outcome does NOT increment because
+      nothing landed.
+    - `replaced`: facts that took the `update_of` path AND landed
+      (whether or not the delete leg succeeded). The legitimate `update`
+      flow regardless of delete outcome.
+    - `skipped`: facts the extractor classified as `skip_redundant`.
+      No storage call, but we record the decision for the summary log.
+
+    Each intent branch emits exactly one `memory.consolidate.intent`
+    line via `_emit_intent_log`. The `intent="new"` branch keeps the
+    existing `_is_duplicate` defense-in-depth gate against the case
+    where the extractor returns `new` for a near-verbatim duplicate
+    (the candidate set is capped at N=8, so the extractor may not see
+    the duplicating fact). `update_of` skips `_is_duplicate` because
+    consolidation already happened upstream at the extractor layer.
+
+    Mem0 exposes no atomic replace primitive: `update_of` is implemented
+    as `delete_by_id` followed by `add_structured`. The race window is
+    bounded by the per-user `asyncio.Semaphore(1)` already held by
+    `extract_and_store`, so concurrent retrievals for the SAME user
+    during this window can briefly see neither the old nor the new
+    fact; concurrent retrievals for OTHER users are unaffected. A
+    delete-success-add-failure leaves the old fact gone and the new one
+    lost; the operator-facing signal is the WARNING-level
+    `add_failed_after_delete` outcome on `_emit_intent_log`.
     """
     stored = 0
+    replaced = 0
+    skipped = 0
+
     for fact in facts:
         content = fact.get("content")
         if not isinstance(content, str) or not content.strip():
             continue
-        if _is_duplicate(content, user_id):
-            log.debug("_store_facts: skipping duplicate %r", content[:80])
-            continue
+
+        intent = fact.get("intent")
+        existing_id = fact.get("existing_id")
+
+        # Build the metadata bundle once; the same shape applies to
+        # both the `new` and `update_of` branches that call add_structured.
         extra: dict = {
             "source": "extracted",
             "confidence": fact.get("confidence"),
@@ -630,12 +962,89 @@ def _store_facts(
         # by the time _validate_facts has run.
         if "confirmation_quote" in fact:
             extra["confirmation_quote"] = fact["confirmation_quote"]
+
+        if intent == "skip_redundant":
+            # No storage call. The intent log is the only side effect
+            # for this branch; replaced_id carries the cited id so a
+            # log analyst can see which existing fact was preserved.
+            _emit_intent_log(
+                user_id=user_id,
+                intent="skip_redundant",
+                original_intent=None,
+                new_id=None,
+                replaced_id=existing_id,
+                outcome="skipped",
+            )
+            skipped += 1
+            continue
+
+        if intent == "update_of":
+            # delete-then-add. delete_by_id returns False for not-found
+            # (the cited row already vanished between candidate fetch
+            # and store) - that's not a hard error: we still want to
+            # add the new fact, but the outcome string downgrades from
+            # `stored` to `delete_failed_added_anyway` so the log carries
+            # the operational signal.
+            delete_ok = memory.delete_by_id(user_id=user_id, memory_id=existing_id)
+            memory_id = memory.add_structured(
+                content,
+                user_id=user_id,
+                memory_type="fact",
+                tags=fact.get("tags"),
+                metadata=extra,
+            )
+            if memory_id is None:
+                # Worst case: old fact gone (if delete succeeded), new
+                # fact lost. Logged at WARNING because the operator
+                # cares: the next exchange will need to re-extract this
+                # fact, and a recurring spike of this outcome means
+                # Mem0 add is failing systematically.
+                _emit_intent_log(
+                    user_id=user_id,
+                    intent="update_of",
+                    original_intent=None,
+                    new_id=None,
+                    replaced_id=existing_id,
+                    outcome="add_failed_after_delete",
+                    level=logging.WARNING,
+                )
+                continue
+            outcome = "stored" if delete_ok else "delete_failed_added_anyway"
+            _emit_intent_log(
+                user_id=user_id,
+                intent="update_of",
+                original_intent=None,
+                new_id=memory_id,
+                replaced_id=existing_id,
+                outcome=outcome,
+            )
+            stored += 1
+            replaced += 1
+            continue
+
+        # intent == "new" (rule-1 already rejected anything else, but
+        # the explicit comparison here keeps the branch-table shape
+        # symmetric and means a future intent value with no handler
+        # falls through to a no-op rather than silently joining `new`).
+        if intent != "new":
+            continue
+
+        if _is_duplicate(content, user_id):
+            log.debug("_store_facts: skipping duplicate %r", content[:80])
+            _emit_intent_log(
+                user_id=user_id,
+                intent="new",
+                original_intent=None,
+                new_id=None,
+                replaced_id=None,
+                outcome="dropped",
+            )
+            continue
+
         # add_structured returns the Mem0 memory id on success and None
         # when storage is disabled, the content is empty, or the underlying
         # _memory.add() raises (it has an internal try/except). Treat None
-        # as "not actually stored" so the returned count matches reality -
-        # previously `stored` was incremented unconditionally, so a store
-        # that the backend rejected still showed up in the summary log.
+        # as "not actually stored" so the returned count matches reality.
         memory_id = memory.add_structured(
             content,
             user_id=user_id,
@@ -644,8 +1053,28 @@ def _store_facts(
             metadata=extra,
         )
         if memory_id is not None:
+            _emit_intent_log(
+                user_id=user_id,
+                intent="new",
+                original_intent=None,
+                new_id=memory_id,
+                replaced_id=None,
+                outcome="stored",
+            )
             stored += 1
-    return stored
+        else:
+            # Storage disabled or backend rejected. Surface as a `dropped`
+            # outcome rather than `stored` so the summary log matches
+            # what actually landed.
+            _emit_intent_log(
+                user_id=user_id,
+                intent="new",
+                original_intent=None,
+                new_id=None,
+                replaced_id=None,
+                outcome="dropped",
+            )
+    return stored, replaced, skipped
 
 
 # ── Public API ──────────────────────────────────────────────────────
@@ -697,12 +1126,65 @@ async def extract_and_store(
             # prior in-flight extraction for the same user. Under queued
             # load the two are easy to confuse.
             start = time.monotonic()
-            payload = _build_extraction_payload(user_text, assistant_text)
-            facts = await _run_extractor(payload, config)
+            # Apply the assistant cap ONCE up front so the candidate
+            # fetch and the payload's ASSISTANT segment see byte-
+            # identical input. See `_capped_assistant` for the
+            # divergence failure mode this guards against.
+            assistant_capped = _capped_assistant(assistant_text)
+            # Fetch the candidate set off the event loop (memory.search
+            # is sync). Skipped entirely when consolidation is disabled
+            # via the kill switch (n == 0); skipped silently when the
+            # search call raises so a broken store never strands
+            # extraction.
+            candidates: list[MemoryResult] = []
+            n_candidates = config.memory_consolidation_candidates_n
+            if n_candidates > 0:
+                loop = asyncio.get_running_loop()
+                try:
+                    candidates = await loop.run_in_executor(
+                        None,
+                        lambda: memory.search(
+                            assistant_capped,
+                            user_id=user_id,
+                            limit=n_candidates,
+                        ),
+                    )
+                except Exception:
+                    # Match `_is_duplicate`'s search-failure posture: a
+                    # broken store does not strand extraction. The
+                    # candidate list stays empty and the extractor
+                    # falls back to the all-`new` branch via the
+                    # CONSOLIDATION prompt.
+                    log.debug("extract_and_store: candidate fetch failed", exc_info=True)
+                    candidates = []
+            candidate_id_set: set[str] = {c.id for c in candidates}
+            # Emit the candidate-set log line exactly once per
+            # extraction call, AFTER the fetch and BEFORE the
+            # subprocess spawn. Always emitted (even when empty) so
+            # downstream parsers see a fixed-shape JSON record per
+            # extraction without branching on field presence.
+            log.info(
+                "memory.consolidate.candidates %s",
+                json.dumps(
+                    {
+                        "user_id": user_id,
+                        "n_candidates": len(candidates),
+                        "candidate_ids": [c.id for c in candidates],
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+            payload = _build_extraction_payload(user_text, assistant_capped, candidates)
+            facts = await _run_extractor(
+                payload,
+                config,
+                candidate_ids=candidate_id_set,
+                user_id=user_id,
+            )
             if not facts:
                 duration_ms = int((time.monotonic() - start) * 1000)
                 log.info(
-                    "memory.extract: user_id=%s duration_ms=%d facts=0",
+                    "memory.extract: user_id=%s duration_ms=%d facts=0 replaced=0 skipped=0",
                     user_id,
                     duration_ms,
                 )
@@ -711,7 +1193,7 @@ async def extract_and_store(
             # _store_facts is sync (memory.add_structured is sync). Run
             # it off the event loop to avoid blocking while Mem0 embeds
             # each fact.
-            stored = await loop.run_in_executor(
+            stored, replaced, skipped = await loop.run_in_executor(
                 None,
                 lambda: _store_facts(facts, user_id=user_id, session_id=session_id),
             )
@@ -744,10 +1226,12 @@ async def extract_and_store(
         return 0
     duration_ms = int((time.monotonic() - start) * 1000)
     log.info(
-        "memory.extract: user_id=%s duration_ms=%d facts=%d",
+        "memory.extract: user_id=%s duration_ms=%d facts=%d replaced=%d skipped=%d",
         user_id,
         duration_ms,
         stored,
+        replaced,
+        skipped,
     )
     return stored
 
@@ -759,6 +1243,7 @@ async def extract_and_store(
 __all__ = [
     "_ALLOWED_TYPES",
     "_CONFIRMATION_QUOTE_MIN_CHARS",
+    "_CONSOLIDATION_INTENTS",
     "_EXTRACTION_PROMPT_VERSION",
     "_EXTRACTION_SYSTEM_PROMPT",
     "_EXTRACTOR_CWD",
@@ -767,9 +1252,13 @@ __all__ = [
     "_ROLE_LABEL_RE",
     "_SEMAPHORE_CAP",
     "_build_extraction_payload",
+    "_capped_assistant",
+    "_emit_intent_log",
     "_get_semaphore",
     "_is_duplicate",
     "_per_user_semaphores",
+    "_render_candidate_line",
+    "_render_candidate_source",
     "_run_extractor",
     "_store_facts",
     "_strip_role_labels",

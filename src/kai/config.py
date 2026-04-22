@@ -458,6 +458,22 @@ class Config:
     # an executor thread on a hung subprocess.
     memory_extraction_timeout_s: int = 10
 
+    # Number of existing facts surfaced to the extractor per call as
+    # consolidation candidates (intent: update_of / skip_redundant).
+    # Selected by semantic similarity to the assistant payload, capped
+    # at this value. Set to 0 to disable consolidation entirely: the
+    # candidate fetch is skipped, the EXISTING FACTS data block is
+    # omitted from the Haiku payload, and the extractor falls back to
+    # always emitting intent="new" (anchored by the CONSOLIDATION
+    # prompt section, which is retained even when the data block is
+    # empty). Storage then uses the existing _is_duplicate semantics.
+    # Tradeoff: each candidate adds ~50-100 chars to the Haiku payload
+    # and contributes to per-call cache-creation tokens. Default 8 is
+    # 2x the per-call fact cap (5), which gives the model enough to
+    # find 1-2 update targets per proposed fact without doubling the
+    # per-call cost.
+    memory_consolidation_candidates_n: int = 8
+
     # Minimum Mem0 similarity score for a memory to be returned by
     # search-driven paths: both `format_context` (context injection
     # at session start) and the `/memory search` UI surface in
@@ -1415,6 +1431,16 @@ def load_config() -> Config:
             raise SystemExit("MEMORY_EXTRACTION_TIMEOUT_S must be a positive integer")
     except ValueError:
         raise SystemExit("MEMORY_EXTRACTION_TIMEOUT_S must be an integer") from None
+    # Consolidation candidate count. Zero is a valid kill-switch value
+    # (consolidation disabled, extractor falls back to all-`new`); only
+    # negatives are rejected. Same try/except pattern as the other
+    # memory_* numeric vars.
+    try:
+        memory_consolidation_candidates_n = int(os.environ.get("MEMORY_CONSOLIDATION_CANDIDATES_N", "8"))
+        if memory_consolidation_candidates_n < 0:
+            raise SystemExit("MEMORY_CONSOLIDATION_CANDIDATES_N must be a non-negative integer")
+    except ValueError:
+        raise SystemExit("MEMORY_CONSOLIDATION_CANDIDATES_N must be an integer") from None
 
     # Search relevance floor. Float in [0.0, 1.0]; default 0.3 matches
     # Mem0's built-in default and the prior hard-coded constant. Same
@@ -1588,5 +1614,6 @@ def load_config() -> Config:
         memory_extraction_model=memory_extraction_model,
         memory_extraction_budget_usd=memory_extraction_budget_usd,
         memory_extraction_timeout_s=memory_extraction_timeout_s,
+        memory_consolidation_candidates_n=memory_consolidation_candidates_n,
         memory_search_floor=memory_search_floor,
     )
