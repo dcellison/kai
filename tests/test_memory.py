@@ -612,6 +612,286 @@ class TestFormatContext:
             assert "(user)" not in line
 
 
+# ── memory.recall logging ───────────────────────────────────────────
+
+
+# Every uniform-shape field that must appear on every memory.recall log
+# line, regardless of which return site emitted it. `reason` is
+# deliberately excluded — it is the one non-uniform field, present only
+# on short-circuit lines and absent on success.
+_RECALL_UNIFORM_FIELDS = {
+    "user_id",
+    "query_len",
+    "query",
+    "fetch_limit",
+    "hits_raw",
+    "hits_after_floor",
+    "floor",
+    "latency_ms",
+    "returned_empty",
+    "lines_used",
+    "budget_tokens",
+    "hits",
+}
+
+
+def _parse_recall_log(caplog) -> dict:
+    """
+    Find the single memory.recall record in caplog and return its
+    parsed JSON payload.
+
+    Asserts exactly one record so tests catch any future regression
+    that double-emits or fails to emit. The "memory.recall " prefix
+    is stripped before json.loads.
+    """
+    recall_records = [r for r in caplog.records if r.message.startswith("memory.recall ")]
+    assert len(recall_records) == 1, (
+        f"expected exactly one memory.recall log, got {len(recall_records)}: {[r.message for r in recall_records]}"
+    )
+    blob = recall_records[0].message[len("memory.recall ") :]
+    import json as _json
+
+    return _json.loads(blob)
+
+
+class TestRecallLogging:
+    """
+    Tests for the memory.recall structured log emit in format_context.
+
+    The log line is the contract surface for the retrieval eval harness;
+    schema regressions here would silently break downstream precision and
+    recall scoring, so each shape and field invariant is asserted
+    explicitly rather than spot-checked.
+    """
+
+    async def test_memory_recall_log_success_has_all_fields(self, caplog):
+        """Success path emits one memory.recall line with every uniform field
+        and no reason key."""
+        import logging
+
+        import kai.memory as mem_mod
+        from kai.memory import format_context
+
+        # Two results, both above the default 0.3 floor, one extracted
+        # and one legacy. Exercises the success path including the hits
+        # array, source weighting, and lines_used accounting.
+        mock_mem = MagicMock()
+        mock_mem.search.return_value = {
+            "results": [
+                {
+                    "id": "a",
+                    "memory": "User prefers Celsius",
+                    "score": 0.9,
+                    "metadata": {"type": "fact", "source": "extracted"},
+                    "created_at": "2026-04-01T10:00:00",
+                },
+                {
+                    "id": "b",
+                    "memory": "User said something old",
+                    "score": 0.7,
+                    # No source key -> legacy bucket; tests that a missing
+                    # source resolves to "" in the per-hit object.
+                    "metadata": {"type": "exchange"},
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+        mem_mod._config = _make_config(memory_token_budget=2000)
+
+        with caplog.at_level(logging.INFO, logger="kai.memory"):
+            output = await format_context("temperature units", user_id="42")
+
+        assert output != ""
+
+        payload = _parse_recall_log(caplog)
+
+        # Uniform-shape fields must all be present on success.
+        missing = _RECALL_UNIFORM_FIELDS - set(payload.keys())
+        assert not missing, f"missing uniform fields on success: {missing}"
+
+        # `reason` is the one non-uniform field; success paths must omit it.
+        assert "reason" not in payload, "success log must not carry a reason"
+
+        # Spot-check field types and values.
+        assert payload["user_id"] == "42"
+        assert payload["query"] == "temperature units"
+        assert payload["query_len"] == len("temperature units")
+        assert payload["returned_empty"] is False
+        assert payload["hits_raw"] == 2
+        assert payload["hits_after_floor"] == 2
+        assert payload["lines_used"] == 2
+        assert payload["floor"] == 0.3
+        assert payload["budget_tokens"] == 2000
+        assert payload["fetch_limit"] >= 10  # at least the configured search limit
+        assert payload["latency_ms"] >= 0  # wall-time, can be 0 for mocked instant search
+        assert isinstance(payload["hits"], list) and len(payload["hits"]) == 2
+
+        # Per-hit shape: source, score, adj, snippet.
+        for hit in payload["hits"]:
+            assert set(hit.keys()) == {"source", "score", "adj", "snippet"}
+            assert isinstance(hit["score"], float)
+            assert isinstance(hit["adj"], float)
+            assert isinstance(hit["snippet"], str)
+
+        # Post-sort order: extracted (1.2x weight) outranks legacy (0.6x)
+        # at any comparable raw score, so the extracted hit must come
+        # first in the hits array even though Mem0 returned them with
+        # the higher raw score on the extracted entry by coincidence.
+        assert payload["hits"][0]["source"] == "extracted"
+        assert payload["hits"][1]["source"] == ""
+
+    @pytest.mark.parametrize(
+        "reason,setup",
+        [
+            # disabled: _memory is None or _config is None. Easiest to
+            # leave both at their reset defaults via the autouse fixture.
+            ("disabled", "disabled"),
+            # empty_query: passes a whitespace-only string after init.
+            ("empty_query", "empty_query"),
+            # no_results: search returns []. Exercises the post-search
+            # short-circuit before the floor filter.
+            ("no_results", "no_results"),
+            # all_below_floor: search returns one result whose raw score
+            # sits beneath the configured floor.
+            ("all_below_floor", "all_below_floor"),
+            # budget_exhausted: results pass the floor but no formatted
+            # line fits the configured budget.
+            ("budget_exhausted", "budget_exhausted"),
+        ],
+    )
+    async def test_memory_recall_log_uniform_shape_on_short_circuit(self, caplog, reason, setup):
+        """Each short-circuit return emits exactly one memory.recall line
+        with the uniform schema, returned_empty=True, and the expected
+        reason value. Parametrized so a regression that collapses two
+        paths to the same reason value fails loudly."""
+        import logging
+
+        import kai.memory as mem_mod
+        from kai.memory import format_context
+
+        # Setup per case. Each branch leaves the module state in the
+        # exact shape needed to trigger one and only one short-circuit.
+        if setup == "disabled":
+            # Default state from the autouse fixture: _memory and
+            # _config are both None.
+            query = "anything"
+        elif setup == "empty_query":
+            mem_mod._memory = MagicMock()
+            mem_mod._config = _make_config()
+            query = "   "  # whitespace-only, hits the strip() guard
+        elif setup == "no_results":
+            mock = MagicMock()
+            mock.search.return_value = {"results": []}
+            mem_mod._memory = mock
+            mem_mod._config = _make_config()
+            query = "anything"
+        elif setup == "all_below_floor":
+            mock = MagicMock()
+            mock.search.return_value = {
+                "results": [
+                    {
+                        "id": "low",
+                        "memory": "barely related",
+                        "score": 0.1,
+                        "metadata": {"type": "exchange"},
+                        "created_at": "2026-04-01T00:00:00",
+                    }
+                ]
+            }
+            mem_mod._memory = mock
+            # Floor at 0.3 (default in _make_config); the 0.1 score is below it.
+            mem_mod._config = _make_config()
+            query = "anything"
+        elif setup == "budget_exhausted":
+            mock = MagicMock()
+            mock.search.return_value = {
+                "results": [
+                    {
+                        "id": "big",
+                        "memory": "x" * 10000,  # huge text overflows any small budget
+                        "score": 0.9,
+                        "metadata": {"type": "fact", "source": "extracted"},
+                        "created_at": "2026-04-01T00:00:00",
+                    }
+                ]
+            }
+            mem_mod._memory = mock
+            # Tiny budget so the single (header + line) cannot fit.
+            mem_mod._config = _make_config(memory_token_budget=10)
+            query = "anything"
+        else:
+            raise AssertionError(f"unhandled setup: {setup}")
+
+        with caplog.at_level(logging.INFO, logger="kai.memory"):
+            output = await format_context(query, user_id="99")
+
+        assert output == "", f"short-circuit case {reason} unexpectedly returned non-empty"
+
+        payload = _parse_recall_log(caplog)
+
+        # Uniform-shape fields all present on every short-circuit line.
+        missing = _RECALL_UNIFORM_FIELDS - set(payload.keys())
+        assert not missing, f"missing uniform fields on {reason}: {missing}"
+
+        # Always-real fields: user_id and query_len use real values
+        # (no sentineling), even when other fields are sentineled.
+        assert payload["user_id"] == "99"
+        assert payload["query_len"] == len(query)
+        assert payload["returned_empty"] is True
+        assert payload["reason"] == reason
+
+    async def test_memory_recall_log_snippet_and_query_truncated_and_sanitized(self, caplog):
+        """Both the query field and per-hit snippets honor the 80-char
+        truncation cap and rewrite \\n and \\r into single spaces. The
+        eval harness treats snippets as fingerprints and parses log
+        lines as single-line JSON; either escape leaking through
+        breaks both contracts at once."""
+        import logging
+
+        import kai.memory as mem_mod
+        from kai.memory import format_context
+
+        # Long memory text that contains both \n and \r. The text is
+        # well over 80 chars so truncation is exercised.
+        long_text = "Line one of stored memory\nLine two with newline\rAnd a CR plus more padding text " * 5
+        mock_mem = MagicMock()
+        mock_mem.search.return_value = {
+            "results": [
+                {
+                    "id": "long",
+                    "memory": long_text,
+                    "score": 0.9,
+                    "metadata": {"type": "fact", "source": "extracted"},
+                    "created_at": "2026-04-01T00:00:00",
+                }
+            ]
+        }
+        mem_mod._memory = mock_mem
+        mem_mod._config = _make_config(memory_token_budget=2000)
+
+        # Query also contains both escapes and exceeds 80 chars so the
+        # query-field path is exercised on the same call.
+        long_query = "what do I prefer for editing\nplus a newline\rand carriage return then a long tail" * 3
+
+        with caplog.at_level(logging.INFO, logger="kai.memory"):
+            await format_context(long_query, user_id="7")
+
+        payload = _parse_recall_log(caplog)
+
+        # Query field must be capped and free of newlines / CRs.
+        assert len(payload["query"]) <= 80
+        assert "\n" not in payload["query"]
+        assert "\r" not in payload["query"]
+
+        # Every snippet must be capped and free of newlines / CRs.
+        assert payload["hits"], "expected at least one hit"
+        for hit in payload["hits"]:
+            assert len(hit["snippet"]) <= 80
+            assert "\n" not in hit["snippet"]
+            assert "\r" not in hit["snippet"]
+
+
 class TestGetAll:
     """Tests for get_all() retrieval."""
 
