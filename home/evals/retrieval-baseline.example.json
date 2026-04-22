@@ -24,14 +24,22 @@
   },
   "by_tag": {
     "preferences": {
-      "precision_at_k": {"1": 0.71, "3": 0.84, "5": 0.86},
-      "recall_at_k": {"1": 0.71, "3": 0.84, "5": 0.86},
+      "precision_at_1": 0.71,
+      "precision_at_3": 0.84,
+      "precision_at_5": 0.86,
+      "recall_at_1": 0.71,
+      "recall_at_3": 0.84,
+      "recall_at_5": 0.86,
       "mrr": 0.78,
       "fraction_in_prompt": 0.79
     },
     "infra": {
-      "precision_at_k": {"1": 0.62, "3": 0.75, "5": 0.78},
-      "recall_at_k": {"1": 0.62, "3": 0.75, "5": 0.78},
+      "precision_at_1": 0.62,
+      "precision_at_3": 0.75,
+      "precision_at_5": 0.78,
+      "recall_at_1": 0.62,
+      "recall_at_3": 0.75,
+      "recall_at_5": 0.78,
       "mrr": 0.69,
       "fraction_in_prompt": 0.72
     }

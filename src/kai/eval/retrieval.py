@@ -994,6 +994,35 @@ def _initialize_memory() -> bool:
         return False
 
 
+def _flatten_score_block(
+    precision_at_k: dict[int, float],
+    recall_at_k: dict[int, float],
+    mrr: float,
+    fraction_in_prompt: float,
+) -> dict[str, Any]:
+    """Render a metrics block with flat keys (precision_at_1, etc.).
+
+    Used by `_build_baseline_json` for both the top-level `metrics`
+    block and each `by_tag` entry, so a jq script diffing two
+    baselines can use the same metric path under both scopes
+    (`.metrics.precision_at_5` and `.by_tag.<tag>.precision_at_5`).
+    The sweep-mode JSON output uses the nested `precision_at_k` shape
+    via `_metrics_to_dict` instead, because per-row table data is
+    consumed differently (iterate K values) and never compared key-
+    for-key against another baseline.
+    """
+    return {
+        "precision_at_1": round(precision_at_k.get(1, 0.0), 4),
+        "precision_at_3": round(precision_at_k.get(3, 0.0), 4),
+        "precision_at_5": round(precision_at_k.get(5, 0.0), 4),
+        "recall_at_1": round(recall_at_k.get(1, 0.0), 4),
+        "recall_at_3": round(recall_at_k.get(3, 0.0), 4),
+        "recall_at_5": round(recall_at_k.get(5, 0.0), 4),
+        "mrr": round(mrr, 4),
+        "fraction_in_prompt": round(fraction_in_prompt, 4),
+    }
+
+
 def _build_baseline_json(
     probes: list[Probe],
     metrics: Metrics,
@@ -1005,7 +1034,19 @@ def _build_baseline_json(
     `probe_set_hash` makes a baseline file meaningful only against its
     specific probe set; comparing baselines across probe sets would
     silently produce noise that looks like quality drift.
+
+    Top-level `metrics` and each `by_tag` entry share the flat key
+    shape via `_flatten_score_block`, so cross-scope diffs use the
+    same path for the same metric.
     """
+    metrics_block = _flatten_score_block(
+        metrics.precision_at_k,
+        metrics.recall_at_k,
+        metrics.mrr,
+        metrics.fraction_in_prompt,
+    )
+    metrics_block["latency_p50_ms"] = round(metrics.latency_p50_ms, 1)
+    metrics_block["latency_p95_ms"] = round(metrics.latency_p95_ms, 1)
     return {
         "version": _BASELINE_SCHEMA_VERSION,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1018,19 +1059,16 @@ def _build_baseline_json(
             "legacy_weight": _PRODUCTION_LEGACY_WEIGHT,
             "overfetch": cfg.overfetch,
         },
-        "metrics": {
-            "precision_at_1": round(metrics.precision_at_k.get(1, 0.0), 4),
-            "precision_at_3": round(metrics.precision_at_k.get(3, 0.0), 4),
-            "precision_at_5": round(metrics.precision_at_k.get(5, 0.0), 4),
-            "recall_at_1": round(metrics.recall_at_k.get(1, 0.0), 4),
-            "recall_at_3": round(metrics.recall_at_k.get(3, 0.0), 4),
-            "recall_at_5": round(metrics.recall_at_k.get(5, 0.0), 4),
-            "mrr": round(metrics.mrr, 4),
-            "fraction_in_prompt": round(metrics.fraction_in_prompt, 4),
-            "latency_p50_ms": round(metrics.latency_p50_ms, 1),
-            "latency_p95_ms": round(metrics.latency_p95_ms, 1),
+        "metrics": metrics_block,
+        "by_tag": {
+            tag: _flatten_score_block(
+                vals["precision_at_k"],
+                vals["recall_at_k"],
+                vals["mrr"],
+                vals["fraction_in_prompt"],
+            )
+            for tag, vals in metrics.by_tag.items()
         },
-        "by_tag": _metrics_to_dict(metrics, include_by_tag=True)["by_tag"],
     }
 
 
