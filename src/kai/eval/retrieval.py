@@ -1117,6 +1117,15 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "probe_set_hash": probe_set_hash(probes),
                 "probe_count": len(probes),
+                # Hoist drift_count to the envelope. Every per-row
+                # Metrics carries the same n_drift (drift detection
+                # runs once before the grid loop, not per config),
+                # so the value belongs at the top alongside
+                # probe_count, mirroring the single-config baseline
+                # written by _build_baseline_json. A downstream
+                # parser can read drift_count off either file shape
+                # without descending into the per-row metrics.
+                "drift_count": next((m.n_drift for _, m in sweep_results), 0),
                 "sweep": [
                     {
                         # `legacy_weight` is fixed across the sweep
