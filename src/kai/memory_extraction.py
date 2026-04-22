@@ -985,6 +985,17 @@ def _store_facts(
             # add the new fact, but the outcome string downgrades from
             # `stored` to `delete_failed_added_anyway` so the log carries
             # the operational signal.
+            #
+            # We deliberately do NOT run `_is_duplicate` against the new
+            # content here. Reasoning: the extractor already decided this
+            # is a consolidation-of-existing, having seen the top-N
+            # candidate window. If the new content happens to near-match
+            # a *different* fact outside that window, it can land
+            # un-deduped. At N=8 (2x the per-call fact cap) the case is
+            # vanishingly rare; if a duplicate spike appears in
+            # production, raise N rather than re-introducing the
+            # _is_duplicate gate here (which would silently drop the
+            # consolidation and leave the stale fact in place).
             delete_ok = memory.delete_by_id(user_id=user_id, memory_id=existing_id)
             memory_id = memory.add_structured(
                 content,
@@ -1031,13 +1042,17 @@ def _store_facts(
 
         if _is_duplicate(content, user_id):
             log.debug("_store_facts: skipping duplicate %r", content[:80])
+            # `dropped_duplicate`: dedup gate fired correctly. Healthy
+            # signal at volume - distinguished from `dropped_backend`
+            # (below) so a dashboard alert on backend failure does not
+            # also fire on benign deduplication.
             _emit_intent_log(
                 user_id=user_id,
                 intent="new",
                 original_intent=None,
                 new_id=None,
                 replaced_id=None,
-                outcome="dropped",
+                outcome="dropped_duplicate",
             )
             continue
 
@@ -1063,16 +1078,19 @@ def _store_facts(
             )
             stored += 1
         else:
-            # Storage disabled or backend rejected. Surface as a `dropped`
-            # outcome rather than `stored` so the summary log matches
-            # what actually landed.
+            # `dropped_backend`: storage disabled OR backend swallowed
+            # the call (Mem0 add() has an internal try/except that turns
+            # exceptions into None). Operationally serious - a recurring
+            # spike here means the store is sick and extractions are
+            # being lost. Distinguished from `dropped_duplicate` so the
+            # alert is actionable.
             _emit_intent_log(
                 user_id=user_id,
                 intent="new",
                 original_intent=None,
                 new_id=None,
                 replaced_id=None,
-                outcome="dropped",
+                outcome="dropped_backend",
             )
     return stored, replaced, skipped
 
@@ -1157,6 +1175,14 @@ async def extract_and_store(
                     # CONSOLIDATION prompt.
                     log.debug("extract_and_store: candidate fetch failed", exc_info=True)
                     candidates = []
+                # Defensive: a future Mem0 mock or an edge in the live
+                # backend could `return None` instead of raising on a
+                # search miss. Without this guard the comprehension
+                # below would TypeError and bubble to the outer
+                # except-block, silently losing the entire extraction.
+                # `or []` collapses both None and a falsy empty result
+                # to the documented contract (a list).
+                candidates = candidates or []
             candidate_id_set: set[str] = {c.id for c in candidates}
             # Emit the candidate-set log line exactly once per
             # extraction call, AFTER the fetch and BEFORE the

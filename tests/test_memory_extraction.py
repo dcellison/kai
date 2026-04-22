@@ -1467,7 +1467,37 @@ class TestStoreFactsIntent:
         record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
         payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
         assert payload["intent"] == "new"
-        assert payload["outcome"] == "dropped"
+        # The dedup path emits `dropped_duplicate` (NOT bare `dropped`)
+        # so a dashboard alert on backend failure does not also fire on
+        # benign deduplication. See the parallel `dropped_backend` case
+        # below: the two outcomes share an intent but are otherwise
+        # operationally distinct.
+        assert payload["outcome"] == "dropped_duplicate"
+
+    def test_new_with_backend_failure_dropped(self, monkeypatch, caplog):
+        """add_structured returning None must surface as `dropped_backend`,
+        NOT `dropped_duplicate`. Splitting these two outcomes is what makes
+        a dashboard alert on store-health actionable - bare `dropped` would
+        aggregate healthy dedup with sick-backend signals."""
+        monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
+        # _is_duplicate's search returns no hits; we proceed to add_structured.
+        monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [])
+        # add_structured returns None - the documented "storage disabled
+        # OR Mem0's internal try/except swallowed an exception" outcome.
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda *a, **kw: None,
+        )
+        facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "new"}]
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            stored, replaced, skipped = _store_facts(facts, user_id="u1", session_id="s1")
+        # Nothing actually landed - all three counters must be zero.
+        assert (stored, replaced, skipped) == (0, 0, 0)
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
+        assert payload["intent"] == "new"
+        assert payload["outcome"] == "dropped_backend"
+        assert payload["new_id"] is None
 
     def test_update_of_happy_path(self, monkeypatch, caplog):
         """Delete-then-add both succeed. _is_duplicate must NOT run for
@@ -1793,6 +1823,39 @@ class TestExtractAndStoreConsolidation:
         # The candidates log line should still emit, with n=0 and
         # candidate_ids=[]. The empty-candidates branch is structurally
         # identical to the kill-switch branch from here on.
+        cand_records = [r for r in caplog.records if "memory.consolidate.candidates" in r.getMessage()]
+        payload = json.loads(cand_records[0].getMessage().split("memory.consolidate.candidates ", 1)[1])
+        assert payload["n_candidates"] == 0
+        assert payload["candidate_ids"] == []
+
+    @pytest.mark.asyncio
+    async def test_search_returning_none_is_treated_as_empty(self, monkeypatch, caplog):
+        """Defensive guard: if `memory.search` returns None (rather than
+        raising), the comprehension `{c.id for c in candidates}` would
+        TypeError and the failure would bubble to the outer except-block,
+        silently dropping the entire extraction. The `candidates = candidates
+        or []` guard collapses None to the documented contract (a list).
+
+        Regression for the second warning on PR #368: a future Mem0 mock
+        or backend edge could plausibly return None, and we want the
+        candidates branch to behave the same as the search-failure
+        branch above."""
+        monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: None)
+
+        async def _fake_exec(*args, **kwargs):
+            return _make_proc(stdout=b'{"facts": []}')
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            n = await extract_and_store(
+                "u",
+                "a",
+                user_id="u1",
+                config=_cfg(memory_consolidation_candidates_n=8),
+            )
+        # No TypeError raised; extraction completes normally.
+        assert n == 0
         cand_records = [r for r in caplog.records if "memory.consolidate.candidates" in r.getMessage()]
         payload = json.loads(cand_records[0].getMessage().split("memory.consolidate.candidates ", 1)[1])
         assert payload["n_candidates"] == 0
