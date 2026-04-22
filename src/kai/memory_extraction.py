@@ -52,13 +52,11 @@ _ALLOWED_TYPES: frozenset[str] = frozenset({"exchange", "fact"})
 _CONFIRMATION_QUOTE_MIN_CHARS = 20
 
 # Maximum length (chars) for the user portion of the Haiku payload.
-# Lives here (the only consumer) rather than in memory.py: spec 360
-# removed Track 1 (which used to share this cap), so a per-module local
-# constant is now the cleanest arrangement. Mirrors the assistant-side
-# `memory._MAX_ASSISTANT_CHARS` cap; that one stays in memory.py because
-# `_build_extraction_payload` in this module reads it alongside legacy
-# comment context tied to memory.py, and it was never part of the
-# Track 1 symbol set so leaving it where it is avoids unrelated churn.
+# Lives here next to its sole consumer (`_build_extraction_payload`
+# below) rather than in memory.py; spec 360 removed Track 1, which was
+# the only other reader, so a per-module local is the cleanest home now.
+# The assistant-side counterpart `memory._MAX_ASSISTANT_CHARS` stays in
+# memory.py because moving it would be churn unrelated to spec 360.
 # 2000 chars keeps the embedding focused on semantic core: users do
 # occasionally paste long content (logs, code, error traces) and an
 # uncapped paste would dominate the per-call Haiku token cost.

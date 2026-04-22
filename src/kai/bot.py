@@ -3589,9 +3589,10 @@ async def _handle_response(
                 # write path.
                 #
                 # Backend check uses the same per-user fall-through
-                # pattern as bot.py:370 (user override wins, else global).
-                # A global-only check would miss users with a per-user
-                # override, so the explicit fall-through is mandatory here.
+                # pattern as `_get_user_provider` (user override wins,
+                # else global). A global-only check would miss users
+                # with a per-user override, so the explicit fall-through
+                # is mandatory here.
                 user_config = config.get_user_config(chat_id)
                 effective_backend = (
                     user_config.agent_backend if user_config and user_config.agent_backend else config.agent_backend
