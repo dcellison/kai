@@ -597,8 +597,16 @@ async def format_context(
     # "what the agent actually saw" and `hits[lines_used:]` for
     # "survived ranking but lost to budget"; distinguishing these two
     # is what makes precision/recall scoring accurate.
+    # `id` is the Mem0 row identifier (MemoryResult.id, required field
+    # at line 120). Carried in the per-hit object so a downstream parser
+    # can match a probe's expected_fact_id against the actual hit
+    # without re-issuing get_by_id per hit or fragile snippet-substring
+    # matching (snippet is truncated to 80 chars and not unique).
+    # Without this field, precision/recall scoring against a known
+    # expected_fact_id has no honest way to identify which hit corresponds.
     payload["hits"] = [
         {
+            "id": r.id,
             "source": (r.metadata.get("source") if r.metadata else None) or "",
             "score": round(r.score, 4),
             "adj": round(r.score * w, 4),

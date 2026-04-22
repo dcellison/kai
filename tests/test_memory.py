@@ -741,12 +741,24 @@ class TestRecallLogging:
         assert payload["latency_ms"] >= 0  # wall-time, can be 0 for mocked instant search
         assert isinstance(payload["hits"], list) and len(payload["hits"]) == 2
 
-        # Per-hit shape: source, score, adj, snippet.
+        # Per-hit shape: id, source, score, adj, snippet. `id` was added
+        # so a downstream consumer (the retrieval eval harness) can
+        # match a probe's expected_fact_id against the actual hit. The
+        # mock returns rows with ids "a" and "b"; the assertion below
+        # locks in the ID-passthrough contract.
         for hit in payload["hits"]:
-            assert set(hit.keys()) == {"source", "score", "adj", "snippet"}
+            assert set(hit.keys()) == {"id", "source", "score", "adj", "snippet"}
+            assert isinstance(hit["id"], str)
             assert isinstance(hit["score"], float)
             assert isinstance(hit["adj"], float)
             assert isinstance(hit["snippet"], str)
+
+        # Per-hit `id` passes through from MemoryResult.id. The mocked
+        # search returned rows with ids "a" (extracted) and "b" (legacy);
+        # both must appear in the payload's hits array. Asserting on the
+        # set rather than ordered list keeps this independent of the
+        # adjusted-score sort assertion below.
+        assert {hit["id"] for hit in payload["hits"]} == {"a", "b"}
 
         # Post-sort order: extracted (1.2x weight) outranks legacy (0.6x)
         # by adjusted score, so the extracted hit must come first in
