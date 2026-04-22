@@ -946,7 +946,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         type=Path,
-        help="Write a baseline JSON file matching the *.example.json schema.",
+        help=(
+            "Write results to a JSON file. Without --sweep: a single-config "
+            "baseline matching retrieval-baseline.example.json. With --sweep: "
+            "a sweep envelope (version, generated_at, probe_set_hash, "
+            "probe_count, drift_count, sweep[]) with one row per grid point; "
+            "this shape does NOT match the baseline example schema."
+        ),
     )
     # Sweep grid override flags. Each takes one or more values; if not
     # supplied, the default grid in the constants above is used.
@@ -1110,9 +1116,11 @@ async def _run_cli(args: argparse.Namespace) -> int:
         print(_render_sweep_table(sweep_results))
         if args.output:
             # Sweep output mode: write a JSON file containing every
-            # config + metrics tuple plus the frontier subset, so a
-            # downstream consumer can re-render either view without
-            # re-running the sweep.
+            # config + metrics tuple. The Pareto frontier is not
+            # serialized separately because it is cheaply re-derivable
+            # from `sweep` via `pareto_frontier()`; a downstream
+            # consumer that wants the frontier view runs that one
+            # function rather than parsing a redundant sub-array.
             payload = {
                 "version": _BASELINE_SCHEMA_VERSION,
                 "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
