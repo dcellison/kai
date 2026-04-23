@@ -146,8 +146,11 @@ _DEFAULT_GEN_TIMEOUT_S = 120
 
 
 # Default concurrency for the per-probe Semaphore. Each probe slot
-# runs both arms sequentially plus the judge call (3 subprocesses
-# total), so 4 in flight means up to 12 simultaneous claude processes.
+# runs both arms plus the judge call sequentially (gen-A awaited,
+# then gen-B awaited, then judge awaited), so a slot is only ever
+# tying up ONE claude subprocess at a time. N in flight therefore
+# means up to N simultaneous claude processes, NOT 3N; the second
+# subprocess in a slot cannot start until the first has returned.
 # Higher concurrency hits rate limits on Anthropic's API and burns
 # laptop fans without speeding up the wall-clock meaningfully.
 _DEFAULT_MAX_CONCURRENCY = 4
@@ -961,18 +964,19 @@ async def _run_all_probes(
     Concurrency model: the Semaphore caps how many probes are mid-
     flight at any time. Each acquired slot runs both gen arms plus the
     judge call sequentially (see `_run_one_probe`), so a Semaphore
-    capacity of N translates to up to 3N concurrent claude subprocesses.
-    The default cap (4) is a tradeoff between throughput and
+    capacity of N translates to up to N concurrent claude subprocesses;
+    the second subprocess in a slot cannot start until the first has
+    returned. The default cap (4) is a tradeoff between throughput and
     Anthropic-side rate-limit headroom; operators on a tight budget
     can drop it to 1 for fully serial execution.
 
     Per-probe RNG note: each probe gets its own seeded `random.Random`
-    derived from (run_seed, probe_index). This keeps arm assignment
+    derived from (run_seed, expected_fact_id). This keeps arm assignment
     deterministic per probe regardless of the order in which probes
     finish (gather completes in launch order, but completion order in
     a Semaphore-bounded pool is non-deterministic). A single shared
-    RNG would couple the assignment to scheduling order — flaky and
-    undebuggable.
+    RNG would couple the assignment to scheduling order, which is
+    flaky and undebuggable.
 
     cwd is set up once at run start (idempotent mkdir) so the per-
     probe subprocess calls do not re-stat the directory each time.
@@ -987,19 +991,18 @@ async def _run_all_probes(
 
     sem = asyncio.Semaphore(config.max_concurrency)
 
-    async def _run_under_semaphore(probe: Probe, probe_index: int) -> ProbeOutcome:
+    async def _run_under_semaphore(probe: Probe) -> ProbeOutcome:
         # Per-probe RNG seeded from (run_seed, expected_fact_id), NOT
-        # (run_seed, probe_index). The probe_index here is the position
-        # in the scored subset, which changes whenever a different probe
-        # in the file drifts. Seeding off the positional index would
-        # silently break the "same probe set + user pair -> same arm
-        # assignments" guarantee promised by _resolve_seed: an earlier
-        # probe drifting between two runs would shift every subsequent
-        # probe's seed, flipping arm letters and making per-probe
-        # comparison across runs meaningless. expected_fact_id is the
-        # stable per-probe identity that survives drift (drifted probes
-        # are excluded from this loop entirely; surviving probes keep
-        # their own ID regardless of what their neighbors did).
+        # from any positional index. expected_fact_id is the stable
+        # per-probe identity that survives drift; seeding off the
+        # loop position would silently break the "same probe set +
+        # user pair -> same arm assignments" guarantee promised by
+        # _resolve_seed (an earlier probe drifting between two runs
+        # would shift every subsequent probe's seed, flipping arm
+        # letters and making per-probe comparison across runs
+        # meaningless). Drifted probes are excluded from this loop
+        # entirely; surviving probes keep their own ID regardless of
+        # what their neighbors did.
         h = hashlib.sha256()
         h.update(config.seed.encode("utf-8"))
         h.update(probe.expected_fact_id.encode("utf-8"))
@@ -1075,7 +1078,7 @@ async def _run_all_probes(
                     cost_usd={"A": None, "B": None, "judge": None},
                 )
 
-    tasks = [_run_under_semaphore(p, i) for i, p in enumerate(probes)]
+    tasks = [_run_under_semaphore(p) for p in probes]
     return await asyncio.gather(*tasks)
 
 
@@ -1369,10 +1372,16 @@ def _render_summary(output: dict[str, Any]) -> str:
             lines.append(f"  {tag}: {vals['memory_wins']}/{vals['memory_loses']}/{vals['tie']}/{vals['both_wrong']}")
     # Surface latency stats if any probe ran subprocesses; skip if
     # everything drifted (zero latencies would be misleading).
+    # Exclude judge_error too: a timed-out judge call records the full
+    # _DEFAULT_JUDGE_TIMEOUT_S (60s) as its latency, which would
+    # ceiling-shift the reported p50/max away from real happy-path
+    # judge performance. An operator tuning the timeout or comparing
+    # judge models needs the no-failure number; the failure count is
+    # already visible under outcomes["judge_error"].
     judge_latencies = [
         p["latency_ms"]["judge"]
         for p in output.get("per_probe", [])
-        if p["judge_choice"] not in {"drift", "generation_error"}
+        if p["judge_choice"] not in {"drift", "generation_error", "judge_error"}
     ]
     if judge_latencies:
         lines.append("")
