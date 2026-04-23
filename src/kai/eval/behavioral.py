@@ -520,7 +520,14 @@ async def _run_subprocess(
         # at the caller, which knows which subprocess this was.
         return -1, b"", b"", elapsed_ms
     elapsed_ms = (loop.time() - start) * 1000.0
-    rc = proc.returncode or 0
+    # After communicate() returns, returncode is always set (the
+    # process has terminated). The explicit None-check defends only
+    # against a future asyncio change to that contract; phrasing it
+    # this way (rather than `or 0`) makes the intent unambiguous,
+    # since `or 0` could read as "coerce a 0 exit code to 0" rather
+    # than "treat unset as 0", and a negative exit code from a SIGNAL
+    # death must pass through untouched.
+    rc = proc.returncode if proc.returncode is not None else 0
     if rc != 0:
         # Surface the subprocess's own diagnostic on a clean failure.
         # Without this, the caller buckets the probe as
@@ -1565,9 +1572,8 @@ def _resolve_ground_truth(
 
     Synchronous because get_by_id is synchronous; declaring this `async`
     would be misleading (no awaits) and would block the event loop for
-    the same ~234ms anyway. Matches the synchronous shape of
-    `_capture_claude_cli_version`. The caller invokes it directly
-    (no await) before launching the per-probe gather.
+    the same ~234ms anyway. The caller invokes it directly (no await)
+    before launching the per-probe gather.
     """
     from kai import memory as _mem
 
