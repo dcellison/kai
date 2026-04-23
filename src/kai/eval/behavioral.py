@@ -466,7 +466,12 @@ async def _run_subprocess(
     by the loop's monotonic clock so it is unaffected by NTP jumps or
     timezone changes during a long-running sweep.
     """
-    loop = asyncio.get_event_loop()
+    # get_running_loop, not get_event_loop: the latter emits a
+    # DeprecationWarning in Python 3.10+ when called from inside a
+    # coroutine, and this function is only ever called from an async
+    # context. Same loop object either way; the explicit form just
+    # documents the requirement.
+    loop = asyncio.get_running_loop()
     start = loop.time()
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -1230,11 +1235,12 @@ def _capture_claude_cli_version() -> str:
 def _outcome_to_per_probe_dict(outcome: ProbeOutcome, *, probe_id: int) -> dict[str, Any]:
     """Serialize one ProbeOutcome as the per_probe[] row in the JSON output.
 
-    `probe_id` is the 1-indexed position in the probes file. Carried
-    explicitly rather than derived inside the function so the caller
-    can decide whether to include drifted-probe rows in the same
-    sequence (current choice: yes, with their judge_choice="drift"
-    sentinel) or interleave them differently.
+    `probe_id` is the 1-indexed position in the source probes file.
+    Carried explicitly rather than derived from the outcomes list index
+    because outcomes are stored as `scored + drift` concatenated; using
+    the iteration index would mis-label any middle-of-file probe that
+    drifted (it would falsely claim end-of-file position). The caller
+    must look up the source-file position via expected_fact_id.
     """
     return {
         "probe_id": probe_id,
@@ -1274,6 +1280,12 @@ def build_output_json(
     rates = _compute_rates(counts)
     by_tag = _aggregate_by_tag(outcomes)
     examples = _pick_qualitative_examples(outcomes)
+    # Build a stable {expected_fact_id -> 1-indexed source-file position}
+    # map from the ORIGINAL probes list. probe_id needs to identify the
+    # row in the operator's probe file, not the position in `outcomes`
+    # (which is `scored + drift` concatenated; a middle-of-file probe
+    # that drifts would otherwise get an incorrect end-of-file probe_id).
+    source_position_by_fact_id = {p.expected_fact_id: i + 1 for i, p in enumerate(probes)}
     return {
         "version": _OUTPUT_SCHEMA_VERSION,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1290,7 +1302,10 @@ def build_output_json(
         **rates,
         "by_tag": by_tag,
         "qualitative_examples": examples,
-        "per_probe": [_outcome_to_per_probe_dict(o, probe_id=i + 1) for i, o in enumerate(outcomes)],
+        "per_probe": [
+            _outcome_to_per_probe_dict(o, probe_id=source_position_by_fact_id[o.probe.expected_fact_id])
+            for o in outcomes
+        ],
     }
 
 
@@ -1450,7 +1465,7 @@ def _initialize_memory() -> bool:
         return False
 
 
-async def _resolve_ground_truth(
+def _resolve_ground_truth(
     *,
     scored_probes: list[Probe],
     overrides: dict[str, str],
@@ -1469,6 +1484,12 @@ async def _resolve_ground_truth(
     against Layer 1's API. At 26 probes and Layer 1's measured p50=9ms
     per get_by_id, the overhead is ~234ms, which is dominated by a
     single subprocess call. Acceptable.
+
+    Synchronous because get_by_id is synchronous; declaring this `async`
+    would be misleading (no awaits) and would block the event loop for
+    the same ~234ms anyway. Matches the synchronous shape of
+    `_capture_claude_cli_version`. The caller invokes it directly
+    (no await) before launching the per-probe gather.
     """
     from kai import memory as _mem
 
@@ -1517,7 +1538,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
     # taking precedence. Done before launching subprocesses so a
     # configuration error (e.g. embedder regression deleting facts
     # mid-run) surfaces here rather than as 26 silent generation errors.
-    ground_truth_by_id = await _resolve_ground_truth(
+    ground_truth_by_id = _resolve_ground_truth(
         scored_probes=scored_probes,
         overrides=overrides,
         user_id=args.user_id,

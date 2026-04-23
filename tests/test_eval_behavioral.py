@@ -835,9 +835,9 @@ class TestOutputWriteFailure:
                 ),
             ]
 
-        async def fake_resolve_ground_truth(**kwargs):
-            return {"f1": "gold"}
-
+        # _resolve_ground_truth is a sync function (no awaits inside;
+        # see its docstring). Mock it as a plain return_value so the
+        # caller's non-await call site works correctly.
         with (
             patch.object(behavioral, "_initialize_memory", return_value=True),
             patch.object(
@@ -850,7 +850,7 @@ class TestOutputWriteFailure:
                 ),
             ),
             patch.object(behavioral, "_run_all_probes", new=fake_run_all_probes),
-            patch.object(behavioral, "_resolve_ground_truth", new=fake_resolve_ground_truth),
+            patch.object(behavioral, "_resolve_ground_truth", return_value={"f1": "gold"}),
             patch.object(behavioral, "_capture_claude_cli_version", return_value="2.1.118"),
         ):
             exit_code = asyncio.run(behavioral._run_cli(args))
@@ -858,3 +858,54 @@ class TestOutputWriteFailure:
         # Write to a directory raises IsADirectoryError -> caught as
         # OSError -> exit 1 with the summary already printed.
         assert exit_code == 1
+
+
+class TestProbeIdMatchesSourcePosition:
+    """per_probe[].probe_id reflects position in the source probes file,
+    not position in the (scored + drift) concatenated outcomes list.
+
+    This matters because outcomes are stored as `scored_outcomes +
+    drift_outcomes`, which is NOT the same order as the probes file
+    when any middle-of-file probe drifts. Using the iteration index
+    would falsely label a drifted probe with the wrong source line,
+    breaking any downstream tooling that round-trips probe_id back to
+    the input file (e.g. failure-bisection scripts or cluster heat
+    maps that assume probe_id == row number).
+    """
+
+    def test_drifted_middle_probe_keeps_source_position(self):
+        # Three probes in source-file order. f2 drifts; the outcomes
+        # list ends up as [f1_scored, f3_scored, f2_drift]. Iteration
+        # index would assign probe_id = 1, 2, 3, which is wrong for
+        # f3 and f2. The fix keys probe_id off expected_fact_id ->
+        # source position.
+        probes = [
+            Probe(question="q1", expected_fact_id="f1"),
+            Probe(question="q2", expected_fact_id="f2"),
+            Probe(question="q3", expected_fact_id="f3"),
+        ]
+        outcomes = [
+            _make_outcome(probe=probes[0], memory_outcome="memory_wins"),
+            _make_outcome(probe=probes[2], memory_outcome="memory_loses"),
+            _make_drift_outcome(probes[1], ()),
+        ]
+        config = _make_config()
+
+        output = behavioral.build_output_json(
+            probes=probes,
+            outcomes=outcomes,
+            drift_count=1,
+            config=config,
+            claude_cli_version="2.1.118",
+        )
+
+        # The per_probe rows preserve outcomes-list ORDER (scored then
+        # drift) but each row's probe_id is the SOURCE-FILE position.
+        per_probe = output["per_probe"]
+        assert len(per_probe) == 3
+        assert per_probe[0]["expected_fact_id"] == "f1"
+        assert per_probe[0]["probe_id"] == 1
+        assert per_probe[1]["expected_fact_id"] == "f3"
+        assert per_probe[1]["probe_id"] == 3  # NOT 2
+        assert per_probe[2]["expected_fact_id"] == "f2"
+        assert per_probe[2]["probe_id"] == 2  # NOT 3
