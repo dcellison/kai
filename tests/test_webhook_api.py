@@ -2615,3 +2615,24 @@ class TestMemoryDeleteAll:
         resp = await _handle_memory_delete_all(mock_request)
 
         assert resp.status == 401
+
+    async def test_returns_500_when_delete_all_raises(self, mock_request):
+        """Unexpected exception in delete_all() -> clean 500 JSON.
+
+        Same defense-in-depth pattern as the search and stats handlers
+        (added in the prior review round). delete_all() catches its own
+        internal errors today but the handler-level guard makes the 500
+        contract structural rather than primitive-dependent.
+        """
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"confirm": self._CONFIRM})
+
+        with (
+            patch("kai.memory.is_enabled", return_value=True),
+            patch("kai.memory.delete_all", side_effect=RuntimeError("boom")),
+        ):
+            resp = await _handle_memory_delete_all(mock_request)
+
+        assert resp.status == 500
+        body = json.loads(resp.body.decode())
+        assert body == {"error": "Memory delete failed"}

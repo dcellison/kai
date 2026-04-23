@@ -1792,7 +1792,19 @@ async def _handle_memory_delete_all(request: web.Request) -> web.Response:
         return _memory_disabled_response()
 
     user_id = str(chat_id)
-    memory.delete_all(user_id=user_id)
+    # Defense-in-depth guard, matching the pattern used in
+    # _handle_memory_search and _handle_memory_stats. delete_all()
+    # catches its own internal errors today (memory.py:1066-1069), so
+    # this try/except mostly never fires - but if a future refactor
+    # ever lets an exception escape (or if the call raises before
+    # reaching the inner try, e.g. on a TypeError from a bad argument
+    # shape), the handler still returns a clean 500 JSON body instead
+    # of an aiohttp HTML 500 page.
+    try:
+        memory.delete_all(user_id=user_id)
+    except Exception:
+        log.exception("memory.delete_all failed for chat %d", chat_id)
+        return web.json_response({"error": "Memory delete failed"}, status=500)
 
     log.info("Deleted all memories for chat %d via API", chat_id)
     return web.json_response({"status": "deleted"})
