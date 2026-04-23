@@ -1,0 +1,675 @@
+"""Tests for the Layer 2 behavioral A/B eval harness (kai.eval.behavioral).
+
+Ten tests covering the harness's load-bearing seams, organized by concern:
+
+1. TestArmPromptIsolation - byte-level guarantee that memory-on and
+   memory-off arms differ in EXACTLY one place (the memory block).
+   This is the test that defends the entire hypothesis: if the two arms
+   diverge in any other way (whitespace, ordering, system context),
+   every metric the harness produces is invalidated.
+2. TestJudgePromptRendering - snapshot the rendered judge user payload
+   so a future template tweak that silently re-orders fields or drops
+   a separator breaks loudly here rather than corrupting verdicts.
+3. TestJudgeOutputParsingValid - all four `choice` strings parse and
+   roll up correctly through the structured-output envelope.
+4. TestJudgeOutputParsingMalformed - every malformed shape (bad JSON,
+   wrong type, is_error, missing fields, invalid enum) returns None,
+   which the caller buckets as judge_error.
+5. TestAnonymizationDeterministic - same seed -> same letter sequence;
+   different seeds -> divergent sequences. Both directions matter:
+   determinism is for debuggability, divergence is for non-pathological
+   coverage of A and B positions.
+6. TestRollupOutcome - the eight-cell truth table mapping
+   (judge_choice, memory_arm_letter) to memory_outcome.
+7. TestSubprocessTimeout - end-to-end through _run_one_probe with the
+   subprocess mocked to mimic the timeout return shape; verifies the
+   probe lands in generation_error AND the judge call is skipped (cost
+   discipline).
+8. TestDriftExclusion - drift outcomes do not contribute to the
+   win/loss/tie/both_wrong rate denominators; the divide-by-zero guard
+   on a fully-error run produces 0% rates rather than crashing.
+9. TestSubprocessExplicitCwd - locks the cwd= argument is passed
+   explicitly to asyncio.create_subprocess_exec, preventing a future
+   refactor from accidentally inheriting the harness's cwd (which would
+   leak home/.claude/CLAUDE.md into both arms).
+10. TestGeneratorEmptySystemPrompt - locks --system-prompt is followed
+    by literally "" (not omitted), so the CLI's default system prompt
+    cannot leak into the generator and confound the A/B measurement.
+
+Every subprocess call is mocked. No real claude binary is invoked. The
+arm-isolation test mocks format_context; the timeout test mocks the
+shared _run_subprocess; the cwd test mocks asyncio.create_subprocess_exec
+at the lowest level so we can introspect what kwargs were actually
+forwarded.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from kai.eval import behavioral
+from kai.eval.behavioral import (
+    BehavioralConfig,
+    ProbeOutcome,
+    _aggregate_outcomes,
+    _arm_letter_for_memory,
+    _build_gen_cmd,
+    _build_judge_cmd,
+    _compute_rates,
+    _make_drift_outcome,
+    _parse_judge_stdout,
+    _render_judge_user_payload,
+    _resolve_seed,
+    _rollup_outcome,
+    _run_subprocess,
+    build_arm_prompt,
+)
+from kai.eval.retrieval import Probe
+
+# ── Shared helpers ──────────────────────────────────────────────────
+
+
+def _make_config(**overrides) -> BehavioralConfig:
+    """Construct a BehavioralConfig with stable defaults.
+
+    Tests that only care about one field (e.g. gen_timeout_s) override
+    that field and let the rest match production defaults. Keeps each
+    test focused on the one knob it is exercising.
+    """
+    base: dict = {
+        "judge_model": "claude-haiku-4-5-20251001",
+        "judge_budget_usd": 0.05,
+        "judge_timeout_s": 60,
+        "gen_model": "sonnet",
+        "gen_budget_usd": 0.10,
+        "gen_timeout_s": 120,
+        "seed": "0123456789abcdef",
+        "max_concurrency": 4,
+    }
+    base.update(overrides)
+    return BehavioralConfig(**base)
+
+
+def _make_outcome(*, probe: Probe, memory_outcome: str) -> ProbeOutcome:
+    """Construct a synthetic ProbeOutcome for aggregation tests.
+
+    The aggregation paths only read `memory_outcome` and `tags`, so the
+    other fields can carry placeholder values. Keeping this helper here
+    (rather than importing the production constructor) means a future
+    refactor of ProbeOutcome's required fields surfaces in this single
+    place rather than in every aggregation test.
+    """
+    return ProbeOutcome(
+        probe=probe,
+        tags=(),
+        memory_arm_letter="A",
+        responses={"A": "ra", "B": "rb"},
+        judge_choice="A_wins" if memory_outcome == "memory_wins" else "B_wins",
+        judge_reasoning="reason",
+        memory_outcome=memory_outcome,
+        latency_ms={"A": 1.0, "B": 1.0, "judge": 1.0},
+        cost_usd={"A": None, "B": None, "judge": 0.001},
+    )
+
+
+# ── Test 1: A/B isolation guarantee ────────────────────────────────
+
+
+class TestArmPromptIsolation:
+    """Byte-level isolation between memory-on and memory-off arms.
+
+    The hypothesis "memory helps" is only meaningful if the two arms
+    differ in EXACTLY one place: presence vs absence of the memory
+    block. This test class is the regression guard against any future
+    refactor that adds a stray newline, system-prompt fragment, or
+    history snippet to one arm but not the other.
+    """
+
+    def test_arm_prompts_differ_only_in_memory_block(self):
+        # Mock format_context to return a known memory block. Patching
+        # at the module level (kai.memory.format_context) works because
+        # build_arm_prompt does a function-local `from kai.memory import
+        # format_context` that re-resolves the attribute on each call.
+        memory_block = "[Relevant memories]\n- the user's favorite color is blue"
+        question = "What's my favorite color?"
+
+        with patch("kai.memory.format_context", new=AsyncMock(return_value=memory_block)):
+            arm_on = asyncio.run(build_arm_prompt(question, "user-1", memory_enabled=True))
+            arm_off = asyncio.run(build_arm_prompt(question, "user-1", memory_enabled=False))
+
+        # Memory-off arm is the bare question, no decoration.
+        assert arm_off == question
+
+        # Memory-on arm exactly equals the production join helper's
+        # output. Comparing against the helper (rather than a hand-
+        # rolled string) means a future change to the join separator
+        # propagates into the test automatically — what we are locking
+        # is "both arms go through the same join", NOT a specific
+        # separator value.
+        from kai.backend import prepend_to_prompt
+
+        expected_on = prepend_to_prompt(question, memory_block)
+        assert arm_on == expected_on
+
+    def test_arm_on_with_empty_memory_equals_arm_off(self):
+        # When format_context returns the empty string (no relevant
+        # memories), the production path skips prepend_to_prompt and
+        # both arms collapse to the bare question. This matches the
+        # bot's runtime behavior and avoids a confound where the arms
+        # would differ only by leading whitespace.
+        question = "What's my favorite color?"
+        with patch("kai.memory.format_context", new=AsyncMock(return_value="")):
+            arm_on = asyncio.run(build_arm_prompt(question, "user-1", memory_enabled=True))
+            arm_off = asyncio.run(build_arm_prompt(question, "user-1", memory_enabled=False))
+        assert arm_on == arm_off == question
+
+
+# ── Test 2: Judge prompt rendering ─────────────────────────────────
+
+
+class TestJudgePromptRendering:
+    """Snapshot the rendered judge user payload against template drift.
+
+    The judge prompt's structure (field order, separators, header
+    casing) is load-bearing: prompt-caching across calls only fires if
+    the rubric portion is byte-identical, and a silent reordering would
+    invalidate the bias mitigations baked into the rubric.
+    """
+
+    def test_judge_prompt_renders_correctly(self):
+        rendered = _render_judge_user_payload(
+            question="What's my favorite color?",
+            ground_truth_text="The user's favorite color is blue.",
+            response_a="Your favorite color is blue.",
+            response_b="I don't have that information.",
+        )
+        # Snapshot the exact rendering. If a future PR changes a header
+        # or the field order, this test breaks loudly so the change can
+        # be evaluated against the rubric's bias-mitigation design.
+        assert rendered == (
+            "USER QUESTION:\n"
+            "What's my favorite color?\n"
+            "\n"
+            "GROUND-TRUTH FACT (what the operator has previously told the assistant):\n"
+            "The user's favorite color is blue.\n"
+            "\n"
+            "RESPONSE A:\n"
+            "Your favorite color is blue.\n"
+            "\n"
+            "RESPONSE B:\n"
+            "I don't have that information."
+        )
+
+
+# ── Test 3: Judge output parsing (valid choices) ───────────────────
+
+
+class TestJudgeOutputParsingValid:
+    """All four valid `choice` strings parse via the structured envelope."""
+
+    @pytest.mark.parametrize("choice", ["A_wins", "B_wins", "tie", "both_wrong"])
+    def test_parse_valid_choices(self, choice: str):
+        # Build the envelope shape that `claude --print --output-format
+        # json --json-schema ...` produces: outer dict with structured
+        # output nested, plus the cost field used by _extract_judge_cost.
+        envelope = {
+            "is_error": False,
+            "structured_output": {"choice": choice, "reasoning": "test reasoning"},
+            "total_cost_usd": 0.001,
+        }
+        parsed = _parse_judge_stdout(json.dumps(envelope).encode("utf-8"))
+        assert parsed is not None
+        assert parsed[0] == choice
+        assert parsed[1] == "test reasoning"
+
+    def test_envelope_without_is_error_field(self):
+        # Older CLI versions omit `is_error` entirely on success.
+        # Parser must treat missing-key as not-error, not as failure.
+        envelope = {
+            "structured_output": {"choice": "tie", "reasoning": "equiv"},
+        }
+        parsed = _parse_judge_stdout(json.dumps(envelope).encode("utf-8"))
+        assert parsed == ("tie", "equiv")
+
+
+# ── Test 4: Judge output parsing (malformed) ───────────────────────
+
+
+class TestJudgeOutputParsingMalformed:
+    """Every malformed shape returns None (caller buckets as judge_error).
+
+    Defense-in-depth: the JSON schema passed to claude --json-schema
+    should already enforce the choice enum at the CLI side, but a
+    future schema-validator regression must not leak invalid choices
+    into the rollup. Each test below exercises one failure mode the
+    parser handles in its 5-step chain.
+    """
+
+    def test_invalid_json(self):
+        # Garbage stdout (model went off the rails despite --json-schema).
+        assert _parse_judge_stdout(b"not json at all") is None
+
+    def test_empty_bytes(self):
+        # Subprocess produced no output (broken pipe, killed early).
+        assert _parse_judge_stdout(b"") is None
+
+    def test_top_level_not_dict(self):
+        # CLI envelope is always a dict; an array means the schema
+        # enforcement skipped or the wrong stream was captured.
+        assert _parse_judge_stdout(b'["a", "b"]') is None
+
+    def test_is_error_true(self):
+        # CLI exits 0 with is_error=true on budget-cap mid-retry.
+        # Treat as failure rather than partial-success-with-noise.
+        env = {
+            "is_error": True,
+            "structured_output": {"choice": "A_wins", "reasoning": "x"},
+        }
+        assert _parse_judge_stdout(json.dumps(env).encode("utf-8")) is None
+
+    def test_missing_structured_output(self):
+        # Top-level envelope present but the nested payload is missing.
+        env = {"total_cost_usd": 0.001}
+        assert _parse_judge_stdout(json.dumps(env).encode("utf-8")) is None
+
+    def test_structured_output_not_dict(self):
+        # structured_output is the key the CLI nests the validated
+        # payload under. If it shows up as a string or list, the schema
+        # was bypassed entirely — bucket as failure.
+        env = {"structured_output": "A_wins"}
+        assert _parse_judge_stdout(json.dumps(env).encode("utf-8")) is None
+
+    def test_invalid_choice_value(self):
+        # Choice outside the four-string enum.
+        env = {"structured_output": {"choice": "MAYBE_A", "reasoning": "x"}}
+        assert _parse_judge_stdout(json.dumps(env).encode("utf-8")) is None
+
+    def test_missing_reasoning(self):
+        # Schema requires both `choice` and `reasoning`; missing
+        # reasoning is a schema violation we must not silently accept.
+        env = {"structured_output": {"choice": "A_wins"}}
+        assert _parse_judge_stdout(json.dumps(env).encode("utf-8")) is None
+
+
+# ── Test 5: Anonymization is deterministic with seed ───────────────
+
+
+class TestAnonymizationDeterministic:
+    """Same seed produces the same arm-letter sequence; different seeds diverge.
+
+    Determinism matters for debugging ("why did probe 17 swing from
+    win to loss between two runs?"); divergence across seeds matters
+    so the harness does not develop a systematic preference for arm A
+    at any position across all of an operator's runs.
+    """
+
+    def test_same_seed_produces_same_sequence(self):
+        # Two RNGs seeded identically must emit the same letter
+        # sequence over a long enough draw to catch a per-call drift.
+        rng1 = random.Random(0xDEADBEEF)
+        rng2 = random.Random(0xDEADBEEF)
+        letters1 = [_arm_letter_for_memory(rng1) for _ in range(50)]
+        letters2 = [_arm_letter_for_memory(rng2) for _ in range(50)]
+        assert letters1 == letters2
+
+    def test_seed_produces_both_letters(self):
+        # Sanity: the coin is not stuck on one side. A fixed seed
+        # might happen to draw all-A or all-B over a small N, so we
+        # use 50 draws — vanishingly small probability of all-same
+        # for a fair coin.
+        rng = random.Random(0xDEADBEEF)
+        letters = [_arm_letter_for_memory(rng) for _ in range(50)]
+        assert "A" in letters
+        assert "B" in letters
+
+    def test_different_seeds_diverge(self):
+        # Two distinct seeds should not produce identical sequences;
+        # if they do, something is wrong with the RNG plumbing (e.g.
+        # silently shared global state).
+        rng1 = random.Random(1)
+        rng2 = random.Random(2)
+        letters1 = [_arm_letter_for_memory(rng1) for _ in range(50)]
+        letters2 = [_arm_letter_for_memory(rng2) for _ in range(50)]
+        assert letters1 != letters2
+
+    def test_resolve_seed_deterministic_across_calls(self):
+        # _resolve_seed itself must be a pure function of probes +
+        # user_id; calling it twice returns the same hex.
+        probes = [
+            Probe(question="q1", expected_fact_id="f1"),
+            Probe(question="q2", expected_fact_id="f2"),
+        ]
+        s1 = _resolve_seed(cli_seed=None, probes=probes, user_id="user-1")
+        s2 = _resolve_seed(cli_seed=None, probes=probes, user_id="user-1")
+        assert s1 == s2
+
+    def test_resolve_seed_cli_override_wins(self):
+        # When the operator passes --seed, that value is used
+        # verbatim and the hash-of-(probes,user_id) is ignored.
+        probes = [Probe(question="q1", expected_fact_id="f1")]
+        s = _resolve_seed(cli_seed="abc123", probes=probes, user_id="user-1")
+        assert s == "abc123"
+
+    def test_resolve_seed_changes_with_user(self):
+        # Different operator -> different shuffle, even on the same
+        # probe set. Ensures the harness does not bake in a single
+        # preference across all users.
+        probes = [Probe(question="q1", expected_fact_id="f1")]
+        s_a = _resolve_seed(cli_seed=None, probes=probes, user_id="user-a")
+        s_b = _resolve_seed(cli_seed=None, probes=probes, user_id="user-b")
+        assert s_a != s_b
+
+
+# ── Test 6: Per-probe rollup truth table ───────────────────────────
+
+
+class TestRollupOutcome:
+    """Truth table: judge_choice + memory_arm_letter -> memory_outcome.
+
+    All eight combinations of the four scoring choices crossed with the
+    two arm letters. The two error states are tested separately because
+    they bypass the A/B mapping (no information about memory wins or
+    loses when one arm could not produce a clean response).
+    """
+
+    @pytest.mark.parametrize(
+        "choice,letter,expected",
+        [
+            ("A_wins", "A", "memory_wins"),
+            ("A_wins", "B", "memory_loses"),
+            ("B_wins", "A", "memory_loses"),
+            ("B_wins", "B", "memory_wins"),
+            ("tie", "A", "tie"),
+            ("tie", "B", "tie"),
+            ("both_wrong", "A", "both_wrong"),
+            ("both_wrong", "B", "both_wrong"),
+        ],
+    )
+    def test_rollup_truth_table(self, choice: str, letter: str, expected: str):
+        assert _rollup_outcome(judge_choice=choice, memory_arm_letter=letter) == expected
+
+    @pytest.mark.parametrize("err", ["judge_error", "generation_error"])
+    @pytest.mark.parametrize("letter", ["A", "B"])
+    def test_error_states_pass_through(self, err: str, letter: str):
+        # Error states must pass through unchanged regardless of which
+        # arm carried memory — the arm letter has no scoring
+        # significance when an arm is broken.
+        assert _rollup_outcome(judge_choice=err, memory_arm_letter=letter) == err
+
+
+# ── Test 7: Subprocess timeout buckets as generation_error ─────────
+
+
+class TestSubprocessTimeout:
+    """Generator subprocess timeout -> probe lands in generation_error.
+
+    Verifies the cost-saving short-circuit also fires: when both arms
+    fail, the judge call is skipped (no point spending money to score
+    nothing against nothing).
+    """
+
+    def test_subprocess_timeout_buckets_as_generation_error(self):
+        # Mock _run_subprocess to mimic the timeout return shape:
+        # rc=-1, empty stdout/stderr, recorded latency. Mocking at this
+        # level avoids depending on a real `sleep` binary or a real
+        # asyncio timeout — the behavior under test is the bucketing
+        # logic, not the timeout mechanics themselves (those are
+        # exercised by the cwd test below which mocks one level deeper).
+        async def fake_run_subprocess(*, cmd, stdin_payload, timeout_s, cwd, env):
+            # Returns the exact tuple shape _run_subprocess returns on
+            # asyncio.wait_for raising TimeoutError. The latency_ms
+            # value is arbitrary; we just check it propagates.
+            return -1, b"", b"", 50.0
+
+        cfg = _make_config(gen_timeout_s=1)
+
+        with (
+            patch.object(behavioral, "_run_subprocess", new=fake_run_subprocess),
+            patch("kai.memory.format_context", new=AsyncMock(return_value="mem block")),
+        ):
+            outcome = asyncio.run(
+                behavioral._run_one_probe(
+                    probe=Probe(question="q", expected_fact_id="f1"),
+                    tags=("tag1",),
+                    user_id="u1",
+                    config=cfg,
+                    rng=random.Random(1),
+                    ground_truth_text="gold",
+                    cwd=Path("/tmp"),
+                    env={},
+                )
+            )
+
+        # Both arms broken -> generation_error rollup, raw judge_choice
+        # also generation_error (judge call was skipped).
+        assert outcome.memory_outcome == "generation_error"
+        assert outcome.judge_choice == "generation_error"
+
+        # Per-arm latencies are still recorded so the operator can see
+        # which side timed out. Judge latency is zero because the call
+        # was short-circuited (cost discipline).
+        assert outcome.latency_ms["A"] == 50.0
+        assert outcome.latency_ms["B"] == 50.0
+        assert outcome.latency_ms["judge"] == 0.0
+
+    def test_one_arm_failure_also_buckets_as_generation_error(self):
+        # If only one arm fails (e.g. transient rate-limit on B), the
+        # probe is still unscorable — the judge needs both responses.
+        # Toggle return between None and a real response by tracking
+        # call count.
+        call_count = {"n": 0}
+
+        async def fake_run_subprocess(*, cmd, stdin_payload, timeout_s, cwd, env):
+            call_count["n"] += 1
+            # First call (arm A): clean text response.
+            # Second call (arm B): timeout shape.
+            # No third call expected — judge must be skipped.
+            if call_count["n"] == 1:
+                return 0, b"good response from arm A", b"", 100.0
+            return -1, b"", b"", 50.0
+
+        cfg = _make_config()
+
+        with (
+            patch.object(behavioral, "_run_subprocess", new=fake_run_subprocess),
+            patch("kai.memory.format_context", new=AsyncMock(return_value="mem")),
+        ):
+            outcome = asyncio.run(
+                behavioral._run_one_probe(
+                    probe=Probe(question="q", expected_fact_id="f1"),
+                    tags=(),
+                    user_id="u1",
+                    config=cfg,
+                    rng=random.Random(1),
+                    ground_truth_text="gold",
+                    cwd=Path("/tmp"),
+                    env={},
+                )
+            )
+        assert outcome.memory_outcome == "generation_error"
+        # Exactly two subprocess calls: gen-A and gen-B. No judge call.
+        assert call_count["n"] == 2
+
+
+# ── Test 8: Drift bucket excluded from rates ───────────────────────
+
+
+class TestDriftExclusion:
+    """Drift outcomes do not contribute to win/loss/tie/both_wrong rates."""
+
+    def test_drift_excluded_from_aggregation(self):
+        probe = Probe(question="q", expected_fact_id="f1")
+        outcomes = [
+            _make_outcome(probe=probe, memory_outcome="memory_wins"),
+            _make_outcome(probe=probe, memory_outcome="memory_wins"),
+            _make_outcome(probe=probe, memory_outcome="memory_loses"),
+            _make_drift_outcome(probe, ()),
+            _make_drift_outcome(probe, ()),
+        ]
+        counts = _aggregate_outcomes(outcomes)
+
+        # Drift not counted into any bucket; the wins/loses tallies
+        # reflect only the scorable outcomes.
+        assert counts["memory_wins"] == 2
+        assert counts["memory_loses"] == 1
+        assert "drift" not in counts
+
+        # Denominator is scorable = 2+1+0+0 = 3, NOT 5. If drift were
+        # included, win_rate would be 40% instead of the correct 66.67%.
+        rates = _compute_rates(counts)
+        assert rates["win_rate_pct"] == round(100.0 * 2 / 3, 2)
+        assert rates["loss_rate_pct"] == round(100.0 * 1 / 3, 2)
+
+    def test_all_errors_no_div_by_zero(self):
+        # Fully-error run: the max(scorable, 1) guard kicks in. Rates
+        # emit as 0.0 so downstream parsers do not crash; the failure
+        # mode is surfaced through the visible error counts in the
+        # bucket dict.
+        counts = {b: 0 for b in behavioral._OUTCOME_BUCKETS}
+        counts["judge_error"] = 5
+        counts["generation_error"] = 3
+        rates = _compute_rates(counts)
+        assert rates["win_rate_pct"] == 0.0
+        assert rates["loss_rate_pct"] == 0.0
+        assert rates["tie_rate_pct"] == 0.0
+        assert rates["both_wrong_rate_pct"] == 0.0
+
+    def test_tie_and_both_wrong_reported_separately(self):
+        # Combining tie and both_wrong would hide the distinction
+        # between "memory had no effect" (tie: both responses used the
+        # fact) and "memory failure mode" (both_wrong: NEITHER used it).
+        probe = Probe(question="q", expected_fact_id="f1")
+        outcomes = [
+            _make_outcome(probe=probe, memory_outcome="tie"),
+            _make_outcome(probe=probe, memory_outcome="tie"),
+            _make_outcome(probe=probe, memory_outcome="both_wrong"),
+        ]
+        counts = _aggregate_outcomes(outcomes)
+        assert counts["tie"] == 2
+        assert counts["both_wrong"] == 1
+        rates = _compute_rates(counts)
+        assert rates["tie_rate_pct"] == round(100.0 * 2 / 3, 2)
+        assert rates["both_wrong_rate_pct"] == round(100.0 * 1 / 3, 2)
+
+
+# ── Test 9: Subprocess uses explicit cwd ───────────────────────────
+
+
+class TestSubprocessExplicitCwd:
+    """The cwd= kwarg is passed explicitly to create_subprocess_exec.
+
+    Without an explicit cwd, claude --print walks up from the harness's
+    cwd and picks up home/.claude/CLAUDE.md (Kai's bot identity:
+    voice rules, persona, scheduling API docs). The judge would then
+    filter every verdict through Kai's persona, and the generator would
+    receive bot-voice priming. Both confound the spec's minimal-prompt
+    measurement. This test locks the parameter plumbing so a future
+    refactor cannot quietly drop the cwd= argument.
+    """
+
+    def test_subprocess_passes_explicit_cwd_string(self):
+        # Capture the kwargs forwarded to create_subprocess_exec.
+        captured: dict = {}
+
+        async def fake_communicate(input):
+            # Return a valid envelope so _run_subprocess does not
+            # bucket as failure on this path; the assertion is on the
+            # call's cwd argument, not the parsed result.
+            return (
+                b'{"is_error": false, "structured_output": {"choice": "tie", "reasoning": "x"}}',
+                b"",
+            )
+
+        async def fake_exec(*cmd, **kwargs):
+            captured.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = fake_communicate
+            proc.returncode = 0
+            return proc
+
+        cwd = Path("/some/explicit/path")
+        with patch("asyncio.create_subprocess_exec", new=fake_exec):
+            asyncio.run(
+                _run_subprocess(
+                    cmd=["claude", "--print"],
+                    stdin_payload="x",
+                    timeout_s=10,
+                    cwd=cwd,
+                    env={},
+                )
+            )
+
+        # cwd must be passed as str(Path), not Path itself, matching
+        # the extractor's pattern. If this assertion ever fails, the
+        # subprocess call is inheriting the harness's cwd implicitly,
+        # which means home/.claude/CLAUDE.md is leaking into both arms.
+        assert "cwd" in captured
+        assert captured["cwd"] == str(cwd)
+
+
+# ── Test 10: Generator passes empty system prompt ──────────────────
+
+
+class TestGeneratorEmptySystemPrompt:
+    """The generator passes --system-prompt with a literal empty string.
+
+    Omitting the flag would let the CLI's default system prompt confound
+    the A/B measurement (a different default between two CLI versions
+    would silently change generator behavior). Passing "" replaces the
+    default with literally nothing. Some CLI default context still flows
+    (~340 tokens at CLI 2.1.118), but it is identical between arms in
+    one run; cross-run drift in that residual is detectable via the
+    claude_cli_version field captured in the output JSON.
+    """
+
+    def test_generator_passes_empty_system_prompt(self):
+        cfg = _make_config()
+        cmd = _build_gen_cmd(cfg)
+        # Locate the --system-prompt flag and verify its argument is "".
+        assert "--system-prompt" in cmd, "Generator must pass --system-prompt explicitly"
+        idx = cmd.index("--system-prompt")
+        assert cmd[idx + 1] == "", (
+            "Generator must pass --system-prompt with a literal empty "
+            "string. Omitting the flag would let the CLI's default "
+            "system prompt confound the A/B measurement."
+        )
+
+    def test_generator_uses_text_output_format(self):
+        # Generator emits free-form text for the judge to read; locks
+        # the design choice that --output-format=text (no JSON envelope,
+        # which is why generator cost is None in the output JSON).
+        cmd = _build_gen_cmd(_make_config())
+        assert "--output-format" in cmd
+        assert cmd[cmd.index("--output-format") + 1] == "text"
+        # Generator does NOT pass --json-schema (it would be ignored
+        # with text format anyway, but its presence would suggest a
+        # design confusion).
+        assert "--json-schema" not in cmd
+
+    def test_judge_uses_json_output_format(self):
+        # Symmetric assertion on the judge side: locks the parsing
+        # chain's input shape. _parse_judge_stdout depends on the
+        # structured_output envelope, which only exists with
+        # --output-format=json + --json-schema.
+        cmd = _build_judge_cmd(_make_config())
+        assert "--output-format" in cmd
+        assert cmd[cmd.index("--output-format") + 1] == "json"
+        assert "--json-schema" in cmd
+
+    def test_both_subprocesses_disable_tools_and_persistence(self):
+        # Defense in depth: both subprocesses must run with tools
+        # disabled and session persistence off. A regression in either
+        # would hand the model the parent's full env (via tool calls)
+        # or leak state across runs.
+        for cmd in [_build_gen_cmd(_make_config()), _build_judge_cmd(_make_config())]:
+            assert "--tools" in cmd
+            assert cmd[cmd.index("--tools") + 1] == ""
+            assert "--no-session-persistence" in cmd
+            assert "--permission-mode" in cmd
+            assert cmd[cmd.index("--permission-mode") + 1] == "bypassPermissions"
