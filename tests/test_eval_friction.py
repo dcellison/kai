@@ -117,8 +117,10 @@ def _make_aggregates(rates: dict[str, dict[str, float]]) -> list[BucketAggregate
     """Build a BucketAggregate list from a {bucket: {signal: rate}} mapping.
 
     Sets user_turns_in_bucket=100 so the per-100 rate equals the
-    literal rate input; the classifier reads only the rate field for
-    its band math, so the count / user_turns choice here is cosmetic.
+    literal rate input; classifier-focused tests read only the rate
+    field, but `count` is rounded (not truncated) so any future
+    JSON-output test that asserts on the count field sees the
+    arithmetically consistent value (rate=2.7 -> count=3, not 2).
     Missing (bucket, family) cells default to 0.0.
     """
     out: list[BucketAggregate] = []
@@ -129,7 +131,7 @@ def _make_aggregates(rates: dict[str, dict[str, float]]) -> list[BucketAggregate
                 BucketAggregate(
                     bucket_label=bucket,
                     signal_family=family,
-                    count=int(rate),
+                    count=round(rate),
                     user_turns_in_bucket=100,
                     rate_per_100_user_turns=rate,
                 )
