@@ -295,16 +295,16 @@ class BehavioralConfig:
     # arg) so it surfaces in the output JSON automatically alongside
     # seed and max_concurrency, making each saved run self-describing.
     pollution_lines: int = 0
-    # Snapshot of load_config().data_dir captured once at run start.
-    # Threaded through BehavioralConfig (rather than re-loaded inside
+    # Snapshot of kai.config.DATA_DIR captured once at run start.
+    # Threaded through BehavioralConfig (rather than re-imported inside
     # _run_all_probes) so the memory snapshot read by init_memory and
     # the history snapshot read by _load_user_history_messages share a
-    # single source of truth. If KAI_DATA_DIR were ever to change
-    # between two load_config() calls (subprocess wrapper rewriting
-    # the env mid-run, fixture cleanup racing the eval), the two
-    # snapshots could diverge silently. Default points at the dev tree
-    # so test fixtures that build a config without invoking the CLI
-    # still get a sensible path.
+    # single source of truth. DATA_DIR is a module-level constant
+    # evaluated at import time from KAI_DATA_DIR; storing it on config
+    # makes the binding visible at the call sites instead of relying
+    # on every reader to re-import. Default points at the dev tree so
+    # test fixtures that build a config without invoking the CLI still
+    # get a sensible path.
     data_dir: Path = Path(".")
 
 
@@ -1906,15 +1906,19 @@ def _initialize_memory() -> Path | None:
     directory, and history DB settings consistent with the bot
     runtime. Errors print to stderr and the caller exits with status 1.
 
-    Returns the loaded `data_dir` (rather than a bool) so the caller
-    can populate BehavioralConfig.data_dir from the SAME load_config()
-    call that drove init_memory. Without this, _run_all_probes would
-    have to re-load the config to find the history snapshot root,
-    risking divergence if the env changed between calls. None signals
+    Returns the active `DATA_DIR` (rather than a bool) so the caller
+    can populate BehavioralConfig.data_dir from the SAME process's
+    view of the env. `DATA_DIR` is a module-level constant in
+    kai.config (NOT a field on the Config dataclass returned by
+    load_config), evaluated once at import time from the
+    KAI_DATA_DIR env var. Because the eval CLI sets KAI_DATA_DIR
+    BEFORE the Python process starts, that one-shot read is
+    correct; rebinding it post-import would not propagate to
+    callers that have already imported the constant. None signals
     failure (init exception, memory disabled).
     """
     try:
-        from kai.config import load_config
+        from kai.config import DATA_DIR, load_config
         from kai.memory import init_memory, is_enabled
 
         config = load_config()
@@ -1925,7 +1929,7 @@ def _initialize_memory() -> Path | None:
                 file=sys.stderr,
             )
             return None
-        return config.data_dir
+        return DATA_DIR
     except Exception as e:
         print(f"eval: init failed: {e}", file=sys.stderr)
         return None

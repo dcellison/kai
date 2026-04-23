@@ -1256,3 +1256,63 @@ class TestPollutionInjection:
             )
         assert arm_off == question
         assert "should-not-appear" not in arm_off
+
+
+class TestInitializeMemoryDataDirContract:
+    """`_initialize_memory` returns the live DATA_DIR, not a Config attr.
+
+    Regression guard for a bug shipped in the synthetic-pollution PR:
+    the function originally returned `load_config().data_dir`, but
+    `Config` is a dataclass with no `data_dir` field; DATA_DIR is a
+    module-level constant in kai.config. The bug was masked in tests
+    because every behavioral test that exercises _initialize_memory
+    mocks it with `return_value=tmp_path`, so the real attribute access
+    never ran. This class is the integration-style check that the
+    function's import contract still holds against the actual
+    kai.config module.
+    """
+
+    def test_kai_config_exposes_data_dir_constant(self):
+        # Import contract: kai.config.DATA_DIR is a Path. If a future
+        # config refactor renames or removes it, the import inside
+        # _initialize_memory raises ImportError at run time and the
+        # whole eval CLI fails to launch. This one-line assertion
+        # catches that earlier than the broken-CLI symptom.
+        from kai.config import DATA_DIR
+
+        assert isinstance(DATA_DIR, Path)
+
+    def test_initialize_memory_returns_path_when_memory_enabled(self, tmp_path: Path, monkeypatch):
+        # End-to-end through _initialize_memory with the heavy init
+        # mocked but the actual import path exercised. The previous
+        # bug shipped because every test in the suite stubbed
+        # _initialize_memory itself; this test stubs only its
+        # collaborators (init_memory, is_enabled) so the function's
+        # own body, including `return DATA_DIR`, runs under test.
+        # If the function tries to access a non-existent attr (the
+        # exact bug we shipped), it lands in the except branch and
+        # returns None, which the assertion catches loudly.
+        from kai import config as _cfg
+
+        monkeypatch.setattr(_cfg, "DATA_DIR", tmp_path)
+        with (
+            patch.object(_cfg, "load_config", return_value=MagicMock()),
+            patch("kai.memory.init_memory"),
+            patch("kai.memory.is_enabled", return_value=True),
+        ):
+            result = behavioral._initialize_memory()
+        assert result == tmp_path
+
+    def test_initialize_memory_returns_none_when_memory_disabled(self, monkeypatch):
+        # The disabled-path is the other live branch; locked to keep
+        # the bool-vs-Path return-type contract honest after the
+        # type change from `bool` to `Path | None`.
+        from kai import config as _cfg
+
+        with (
+            patch.object(_cfg, "load_config", return_value=MagicMock()),
+            patch("kai.memory.init_memory"),
+            patch("kai.memory.is_enabled", return_value=False),
+        ):
+            result = behavioral._initialize_memory()
+        assert result is None
