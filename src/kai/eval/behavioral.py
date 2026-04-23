@@ -207,21 +207,12 @@ Output ONLY a single JSON object on one line, no prose:
 {"choice": "A_wins"|"B_wins"|"tie"|"both_wrong", "reasoning": "<one sentence, max 30 words>"}"""
 
 
-# Per-probe stdin template. The system slot above is the rubric (cached
-# across calls); this is the only thing that varies per probe. Keeping
-# them split means the judge sees identical rubric text for every probe,
-# which is the only way the prompt-caching path actually amortizes.
-_JUDGE_USER_TEMPLATE = """USER QUESTION:
-{question}
-
-GROUND-TRUTH FACT (what the operator has previously told the assistant):
-{ground_truth_text}
-
-RESPONSE A:
-{response_a}
-
-RESPONSE B:
-{response_b}"""
+# The per-probe stdin payload is built by string concatenation in
+# `_render_judge_user_payload` rather than from a `{...}` template,
+# so that response_a / response_b (model-generated text) cannot
+# trigger str.format substitution or KeyError. The system slot above
+# carries the rubric and is cached across calls; only the per-probe
+# payload varies, which is what makes the CLI's prompt cache amortize.
 
 
 # Bucket names used in the output JSON's `outcomes` block. Defined as
@@ -360,6 +351,13 @@ def _build_judge_cmd(config: BehavioralConfig) -> list[str]:
     defaults to Haiku here regardless of MEMORY_EXTRACTION_MODEL,
     because the judge is conceptually a separate role from the
     extractor and operators may want to tune them independently.
+
+    Flag verification: every flag in the vector below was confirmed
+    present in `claude --help` for CLI 2.1.118 before this code shipped.
+    A missing flag would NOT raise — claude --print silently treats
+    unknown options as argv and the subprocess would bucket every
+    probe as judge_error with no diagnostic. Re-run the verification
+    if upgrading the CLI past 2.x.
     """
     return [
         "claude",
@@ -522,22 +520,31 @@ def _render_judge_user_payload(
 ) -> str:
     """Render the per-probe stdin payload for the judge.
 
-    Pure function so test 2 can snapshot the exact rendering and pin
-    against drift. Substitutions are str.format-style; question and
-    ground_truth_text are operator-supplied free text but the prompt
-    template owns no `{...}` placeholders other than the four named
-    fields, so a question containing curly braces does not need
-    pre-escaping (str.format treats unmatched `{` as literal only when
-    using vformat with a custom formatter; here we use the safer
-    str.format with named kwargs and accept that a question with
-    `{response_a}` in it would substitute itself — an edge case no
-    real probe will hit).
+    Pure function so the snapshot test can pin the rendering against
+    drift. Built via string concatenation rather than str.format()
+    because response_a / response_b are MODEL-GENERATED text and
+    str.format walks the template looking for `{name}` placeholders.
+    A response containing literal `{response_b}` would silently
+    substitute the other arm into itself, producing a corrupted
+    judge prompt; `{anything_else}` would raise KeyError mid-format
+    and crash the probe with no signal that a real bug occurred. Both
+    failure modes are reachable by adversarial memory content. The
+    concatenation form has no template substitution at all, so the
+    risk is eliminated by construction rather than by trusting that
+    no probe will ever hit the edge case.
     """
-    return _JUDGE_USER_TEMPLATE.format(
-        question=question,
-        ground_truth_text=ground_truth_text,
-        response_a=response_a,
-        response_b=response_b,
+    return (
+        "USER QUESTION:\n"
+        + question
+        + "\n\n"
+        + "GROUND-TRUTH FACT (what the operator has previously told the assistant):\n"
+        + ground_truth_text
+        + "\n\n"
+        + "RESPONSE A:\n"
+        + response_a
+        + "\n\n"
+        + "RESPONSE B:\n"
+        + response_b
     )
 
 
@@ -969,13 +976,21 @@ async def _run_all_probes(
     sem = asyncio.Semaphore(config.max_concurrency)
 
     async def _run_under_semaphore(probe: Probe, probe_index: int) -> ProbeOutcome:
-        # Per-probe RNG seeded from (run_seed, probe_index) so the arm
-        # assignment for probe N is invariant under both run order and
-        # the order in which other probes happen to finish. Hashing
-        # combines the two values without bias toward either.
+        # Per-probe RNG seeded from (run_seed, expected_fact_id), NOT
+        # (run_seed, probe_index). The probe_index here is the position
+        # in the scored subset, which changes whenever a different probe
+        # in the file drifts. Seeding off the positional index would
+        # silently break the "same probe set + user pair -> same arm
+        # assignments" guarantee promised by _resolve_seed: an earlier
+        # probe drifting between two runs would shift every subsequent
+        # probe's seed, flipping arm letters and making per-probe
+        # comparison across runs meaningless. expected_fact_id is the
+        # stable per-probe identity that survives drift (drifted probes
+        # are excluded from this loop entirely; surviving probes keep
+        # their own ID regardless of what their neighbors did).
         h = hashlib.sha256()
         h.update(config.seed.encode("utf-8"))
-        h.update(str(probe_index).encode("utf-8"))
+        h.update(probe.expected_fact_id.encode("utf-8"))
         rng = random.Random(int(h.hexdigest()[:16], 16))
 
         tags = tags_by_id.get(probe.expected_fact_id, ())
@@ -991,6 +1006,23 @@ async def _run_all_probes(
         # only checks fact existence, not content.
         if not gt:
             gt = probe.notes
+        # Surface the unrecoverable case to the operator: an empty
+        # gold field means the judge will produce a verdict that lands
+        # in a real outcome bucket (memory_wins / loses / tie /
+        # both_wrong) but is unreliable because there is nothing to
+        # compare the responses against. detect_drift cannot catch
+        # this — it only checks fact existence — so the warning here
+        # is the only signal the operator gets that the bucket count
+        # is contaminated. No fallback to a synthetic outcome bucket
+        # because there is no honest one to choose; the operator must
+        # decide whether to fix the probe or accept the noise.
+        if not gt:
+            log.warning(
+                "probe expected_fact_id=%s has empty gold-fact (no ground_truth_text "
+                "override, fact.text empty, probe.notes empty); judge verdict will "
+                "be unreliable",
+                probe.expected_fact_id,
+            )
 
         async with sem:
             try:
@@ -1549,7 +1581,18 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
     print(_render_summary(output))
     if args.output:
-        args.output.write_text(json.dumps(output, indent=2), encoding="utf-8")
+        # The summary above is already on stdout, so the operator sees
+        # the run's results even if persistence fails. The exit code
+        # flips to 1 so a wrapper script can detect the partial-success
+        # state (results computed, but the JSON file was not written:
+        # full disk, unwritable path, permissions). This runs after all
+        # 78 subprocess calls — losing a full run's worth of data to
+        # an unhandled OSError would be a bad-day failure mode.
+        try:
+            args.output.write_text(json.dumps(output, indent=2), encoding="utf-8")
+        except OSError as e:
+            print(f"\neval: failed to write {args.output}: {e}", file=sys.stderr)
+            return 1
         print(f"\nWrote {args.output}", file=sys.stderr)
     return 0
 
