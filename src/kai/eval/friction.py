@@ -765,7 +765,7 @@ def _detect_preference_correction(
     records: list[HistoryRecord],
     data_dir: Path,
     *,
-    facts: list,
+    facts: list[Any],
 ) -> list[FrictionEvent]:
     """Signal 3: preference corrections (raw + known-fact overlap).
 
@@ -869,7 +869,9 @@ def _detect_repeated_fact(records: list[HistoryRecord], data_dir: Path) -> list[
     # Cache shingles only for fact-shape user records; non-fact-shape
     # priors don't qualify as a comparison target (the prior record
     # must itself be a fact-shape match), so there's no point building
-    # their shingle sets.
+    # their shingle sets. Bounded by the lookback window (see eviction
+    # below), so peak memory is O(_REPEAT_LOOKBACK) entries regardless
+    # of total history length.
     shingle_cache: dict[int, set[str]] = {}
     events: list[FrictionEvent] = []
     for pos, idx in enumerate(user_indices):
@@ -877,6 +879,13 @@ def _detect_repeated_fact(records: list[HistoryRecord], data_dir: Path) -> list[
         if not _FACT_SHAPE_RE.search(record.text):
             continue
         shingle_cache[idx] = _shingles(record.text)
+        # Evict the entry that just fell out of the lookback window;
+        # nothing later in the loop can read it. Without this the cache
+        # grows unbounded across a long history, even though only the
+        # last _REPEAT_LOOKBACK entries are ever touched.
+        evict_pos = pos - _REPEAT_LOOKBACK - 1
+        if evict_pos >= 0:
+            shingle_cache.pop(user_indices[evict_pos], None)
         # Walk priors most-recent-first; break on the first qualifying
         # match so the cited prior is the closest in time.
         start = max(0, pos - _REPEAT_LOOKBACK)
@@ -905,7 +914,7 @@ def detect_events(
     records: list[HistoryRecord],
     data_dir: Path,
     *,
-    facts: list,
+    facts: list[Any],
 ) -> list[FrictionEvent]:
     """Run all four signal detectors and concatenate their event lists.
 
@@ -1204,7 +1213,7 @@ def _initialize_memory_local() -> MemoryInitResult:
         return MemoryInitResult(MemoryAvailability.ERROR, str(e))
 
 
-def _load_facts_for_user(user_id: str, memory_state: MemoryInitResult) -> list:
+def _load_facts_for_user(user_id: str, memory_state: MemoryInitResult) -> list[Any]:
     """Cache `get_by_tag(tag='preference')` once per run; empty list otherwise.
 
     A non-ENABLED memory state degrades stage 3b to a no-op (every
@@ -1508,9 +1517,12 @@ def _atomic_write(path: Path, content: str) -> None:
     except Exception:
         # Best-effort cleanup of the temp file on any write failure;
         # leaving it would accumulate stale .tmp files in the output
-        # directory across repeated failed runs. Also close the raw fd
-        # defensively in case os.fdopen itself raised before taking
-        # ownership - otherwise the descriptor leaks.
+        # directory across repeated failed runs. The os.close(fd) call
+        # covers the narrow window where os.fdopen raised before taking
+        # ownership of the raw fd from mkstemp; in the common case
+        # (os.fdopen succeeded, the with-block already closed the fd,
+        # then os.replace failed) this os.close is a no-op that raises
+        # EBADF, which the inner OSError handler intentionally swallows.
         try:
             os.close(fd)
         except OSError:
