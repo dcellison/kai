@@ -700,11 +700,11 @@ def _arm_letter_for_memory(rng: random.Random) -> str:
     """Coin-flip the arm letter ("A" or "B") that carries memory.
 
     Pulled into a function so tests can patch the RNG and assert that
-    a fixed seed produces a fixed sequence. random.choice is biased
-    toward the first element when the seed is small, but the bias is
-    well below 1% for our 16-hex-digit (64-bit) seeds and over 26
-    probes — far smaller than the natural variance in a 26-probe
-    eval. Documented for completeness; not worth working around.
+    a fixed seed produces a fixed sequence. The coin is fair: Python's
+    random.choice on a 2-element sequence reduces to one Mersenne-
+    Twister call and returns each element with exactly 0.5 probability,
+    independent of seed magnitude. Per-probe skew in the win-rate is
+    not attributable to this function.
     """
     return rng.choice(("A", "B"))
 
@@ -1445,6 +1445,27 @@ def _render_summary(output: dict[str, Any]) -> str:
 # ── CLI ────────────────────────────────────────────────────────────
 
 
+def _positive_int(raw: str) -> int:
+    """argparse `type=` callable that rejects non-positive integers.
+
+    Used for --max-concurrency. asyncio.Semaphore(0) starts with an
+    internal counter of zero and the first acquire() blocks forever
+    because no task can ever release a slot that was never held; the
+    harness would hang silently with no diagnostic. Catching the bad
+    value at parse time turns the hang into a one-line argparse error
+    before any subprocess is launched. asyncio.Semaphore(-1) raises
+    on construction so it is caught later, but rejecting at the
+    boundary is cleaner and gives both cases the same error path.
+    """
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected integer, got {raw!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1 (got {value})")
+    return value
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Top-level argparse for `python -m kai.eval.behavioral`."""
     parser = argparse.ArgumentParser(
@@ -1512,7 +1533,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-concurrency",
-        type=int,
+        type=_positive_int,
         default=_DEFAULT_MAX_CONCURRENCY,
         help=(
             f"Maximum probes in flight simultaneously; subprocesses "

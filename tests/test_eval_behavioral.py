@@ -45,6 +45,7 @@ forwarded.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import random
@@ -64,6 +65,7 @@ from kai.eval.behavioral import (
     _compute_rates,
     _make_drift_outcome,
     _parse_judge_stdout,
+    _positive_int,
     _render_judge_user_payload,
     _resolve_seed,
     _rollup_outcome,
@@ -920,3 +922,29 @@ class TestProbeIdMatchesSourcePosition:
         assert per_probe[1]["probe_id"] == 3  # NOT 2
         assert per_probe[2]["expected_fact_id"] == "f2"
         assert per_probe[2]["probe_id"] == 2  # NOT 3
+
+
+class TestPositiveIntCLIArg:
+    """`--max-concurrency` rejects non-positive values at parse time.
+
+    Without the guard, `--max-concurrency 0` builds an
+    asyncio.Semaphore(0) whose first acquire() blocks forever (no
+    task can ever release a slot it never held). The harness would
+    hang silently with no diagnostic; an operator who fat-fingered
+    a zero would only see "no output" until they killed the process.
+    Catching the bad value at the argparse boundary turns the hang
+    into a one-line ArgumentTypeError before any subprocess starts.
+    """
+
+    @pytest.mark.parametrize("bad", ["0", "-1", "-100"])
+    def test_rejects_non_positive(self, bad: str):
+        with pytest.raises(argparse.ArgumentTypeError, match=r"must be >= 1"):
+            _positive_int(bad)
+
+    def test_rejects_non_integer(self):
+        with pytest.raises(argparse.ArgumentTypeError, match=r"expected integer"):
+            _positive_int("four")
+
+    @pytest.mark.parametrize("good,expected", [("1", 1), ("4", 4), ("128", 128)])
+    def test_accepts_positive(self, good: str, expected: int):
+        assert _positive_int(good) == expected
