@@ -688,7 +688,13 @@ def _resolve_seed(*, cli_seed: str | None, probes: list[Probe], user_id: str) ->
     shuffle (useful when bisecting "did the swing come from the
     seed change or from a real measurement change?").
     """
-    if cli_seed:
+    # `is not None` rather than truthy: argparse's contract is that an
+    # absent --seed flag yields None, so that is the only value that
+    # should fall through to the hash default. An empty string from
+    # `--seed ""` is unusual but unambiguous as an explicit override
+    # and is honored as such; the hash branch only fires when no flag
+    # was passed at all.
+    if cli_seed is not None:
         return cli_seed
     h = hashlib.sha256()
     h.update(probe_set_hash(probes).encode("utf-8"))

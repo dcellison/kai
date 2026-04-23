@@ -394,6 +394,17 @@ class TestAnonymizationDeterministic:
         s = _resolve_seed(cli_seed="abc123", probes=probes, user_id="user-1")
         assert s == "abc123"
 
+    def test_resolve_seed_empty_string_is_explicit_override(self):
+        # `--seed ""` is an unusual but unambiguous explicit override:
+        # argparse only yields None when the flag is absent, so any
+        # string the operator passes (including "") must be honored
+        # verbatim rather than silently falling through to the hash
+        # default. Locks the round-9 contract change from a truthy
+        # guard (`if cli_seed:`) to an explicit None-check.
+        probes = [Probe(question="q1", expected_fact_id="f1")]
+        s = _resolve_seed(cli_seed="", probes=probes, user_id="user-1")
+        assert s == ""
+
     def test_resolve_seed_changes_with_user(self):
         # Different operator -> different shuffle, even on the same
         # probe set. Ensures the harness does not bake in a single
