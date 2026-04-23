@@ -655,6 +655,26 @@ class TestKnownFactOverlap:
         events = _detect_preference_correction([self._correction_record(tmp_path)], tmp_path, facts=[fact])
         assert events[0].metadata["known_fact_overlap"] is False
 
+    def test_fact_with_empty_created_at_excluded(self, tmp_path: Path):
+        # Third of the three mandated exclusion paths: empty-string
+        # created_at. Production handles this via `if not value: return
+        # None` in _parse_fact_created_at, which collapses both None and
+        # "" to the same exclusion path. We assert the empty case
+        # explicitly so a future refactor that swaps the falsy check for
+        # `if value is None` cannot silently regress: the unparseable
+        # test would still pass (independent try/except branch) and the
+        # after-correction test would still pass (never reaches the
+        # empty-string branch), making this the only guard against the
+        # None-vs-falsy slip.
+        fact = _FakeFact(
+            id="f1",
+            text="user prefers postgres docker container deployment",
+            created_at="",
+        )
+        events = _detect_preference_correction([self._correction_record(tmp_path)], tmp_path, facts=[fact])
+        assert events[0].metadata["known_fact_overlap"] is False
+        assert events[0].metadata["overlapping_fact_ids"] == ()
+
     def test_multiple_overlapping_facts_all_in_overlapping_fact_ids(self, tmp_path: Path):
         # Two facts both overlap and both predate the correction; both
         # IDs must appear in the metadata tuple (no first-match break).
