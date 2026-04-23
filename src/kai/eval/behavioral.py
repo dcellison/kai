@@ -563,32 +563,41 @@ def _render_judge_user_payload(
     )
 
 
-def _parse_judge_stdout(stdout: bytes) -> tuple[str, str] | None:
-    """Parse the claude --output-format json envelope and extract (choice, reasoning).
+def _decode_judge_envelope(stdout: bytes) -> dict | None:
+    """Decode the claude --output-format json envelope to a dict.
 
-    Returns None on any parsing failure; the caller buckets None as
-    `judge_error`. Same parsing chain as the extractor's
-    `kai.memory_extraction._run_extractor:892-911`:
-
-    1. Top-level JSON parse (json.loads on stdout). Fails -> None.
-    2. Top-level dict has `is_error: true` -> None. The CLI can exit
-       0 with is_error set when a budget cap was hit mid-retry; we
-       treat that as failure rather than partial-success-with-noise.
-    3. Schema-validated payload nests under `structured_output` (this
-       is what `--json-schema` produces, not at the top level —
-       discovered by the extractor in spec 320 §13.2 step 5). Missing
-       key or wrong shape -> None.
-    4. `choice` not in the four-string enum -> None. The schema's
-       enum should already enforce this at the CLI side, but the
-       harness defends in depth: future schema-validator regressions
-       must not leak invalid choices into the rollup.
+    Single source of truth for the judge-stdout JSON parse; both the
+    choice extractor and the cost extractor build on this. Returns
+    None on JSONDecodeError or when the top-level value is not a dict
+    (claude can emit a JSON list under some error paths). The caller
+    decides what an empty/None envelope means for the bucket choice.
     """
     try:
         envelope = json.loads(stdout)
     except json.JSONDecodeError:
         return None
-    if not isinstance(envelope, dict):
-        return None
+    return envelope if isinstance(envelope, dict) else None
+
+
+def _extract_judge_choice(envelope: dict) -> tuple[str, str] | None:
+    """Validate envelope contents and extract (choice, reasoning).
+
+    Returns None on any contents-level failure (is_error sentinel,
+    missing structured_output, invalid enum, missing reasoning).
+    Caller buckets None as `judge_error`.
+
+    1. `is_error: true` -> None. The CLI can exit 0 with is_error set
+       when a budget cap was hit mid-retry; we treat that as failure
+       rather than partial-success-with-noise.
+    2. Schema-validated payload nests under `structured_output` (this
+       is what `--json-schema` produces, not at the top level;
+       discovered by the extractor's smoke test for spec 320 §13.2
+       step 5). Missing key or wrong shape -> None.
+    3. `choice` not in the four-string enum -> None. The schema's
+       enum should already enforce this at the CLI side, but the
+       harness defends in depth: future schema-validator regressions
+       must not leak invalid choices into the rollup.
+    """
     if envelope.get("is_error") is True:
         return None
     structured = envelope.get("structured_output")
@@ -603,21 +612,32 @@ def _parse_judge_stdout(stdout: bytes) -> tuple[str, str] | None:
     return choice, reasoning
 
 
-def _extract_judge_cost_usd(stdout: bytes) -> float | None:
-    """Pull the judge's per-call cost from the JSON envelope.
+def _parse_judge_stdout(stdout: bytes) -> tuple[str, str] | None:
+    """Convenience wrapper: decode envelope + extract (choice, reasoning).
 
-    Returns None if the envelope cannot be parsed or the cost field
-    is missing. The extractor uses `total_cost_usd` at the envelope
-    top level (verified via the smoke test referenced in
+    Used by the test suite (which passes raw bytes) and as a single
+    call point when the caller does not also need the cost field.
+    Production's `_run_one_judge` bypasses this and decodes the
+    envelope once so the cost extractor can reuse it; see that
+    function for the rationale on avoiding the duplicate decode.
+    """
+    envelope = _decode_judge_envelope(stdout)
+    if envelope is None:
+        return None
+    return _extract_judge_choice(envelope)
+
+
+def _extract_judge_cost_usd(envelope: dict) -> float | None:
+    """Pull the judge's per-call cost from an already-decoded envelope.
+
+    Takes a dict (not raw bytes) so callers that already decoded the
+    envelope for the choice extractor do not pay for a second
+    json.loads. Returns None if `total_cost_usd` is missing or not
+    numeric. The extractor uses `total_cost_usd` at the envelope top
+    level (verified via the smoke test referenced in
     memory_extraction's spec 320 §13.2). Different from the generator
     case where text-format output has no cost field at all.
     """
-    try:
-        envelope = json.loads(stdout)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(envelope, dict):
-        return None
     cost = envelope.get("total_cost_usd")
     return float(cost) if isinstance(cost, (int, float)) else None
 
@@ -813,8 +833,18 @@ async def _run_one_judge(
     )
     if rc != 0:
         return None, elapsed_ms, None
-    parsed = _parse_judge_stdout(stdout)
-    cost = _extract_judge_cost_usd(stdout)
+    # Decode the envelope once and feed it to BOTH the choice extractor
+    # and the cost extractor; previously each function called
+    # json.loads(stdout) independently, doubling the parse work per
+    # judge call. Cost is still recorded when the envelope is
+    # well-formed JSON but the contents fail validation (e.g.
+    # is_error=True or invalid choice enum) so that operator-side
+    # accounting stays accurate even on bucketed-as-judge_error probes.
+    envelope = _decode_judge_envelope(stdout)
+    if envelope is None:
+        return None, elapsed_ms, None
+    cost = _extract_judge_cost_usd(envelope)
+    parsed = _extract_judge_choice(envelope)
     if parsed is None:
         return None, elapsed_ms, cost
     return parsed, elapsed_ms, cost
@@ -1462,8 +1492,10 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=_DEFAULT_MAX_CONCURRENCY,
         help=(
-            f"Maximum probes in flight; each probe runs 3 subprocesses "
-            f"sequentially (default: {_DEFAULT_MAX_CONCURRENCY})."
+            f"Maximum probes in flight simultaneously; subprocesses "
+            f"within a probe run sequentially, so this is also the cap "
+            f"on concurrent claude subprocesses "
+            f"(default: {_DEFAULT_MAX_CONCURRENCY})."
         ),
     )
     return parser
