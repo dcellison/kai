@@ -295,6 +295,17 @@ class BehavioralConfig:
     # arg) so it surfaces in the output JSON automatically alongside
     # seed and max_concurrency, making each saved run self-describing.
     pollution_lines: int = 0
+    # Snapshot of load_config().data_dir captured once at run start.
+    # Threaded through BehavioralConfig (rather than re-loaded inside
+    # _run_all_probes) so the memory snapshot read by init_memory and
+    # the history snapshot read by _load_user_history_messages share a
+    # single source of truth. If KAI_DATA_DIR were ever to change
+    # between two load_config() calls (subprocess wrapper rewriting
+    # the env mid-run, fixture cleanup racing the eval), the two
+    # snapshots could diverge silently. Default points at the dev tree
+    # so test fixtures that build a config without invoking the CLI
+    # still get a sensible path.
+    data_dir: Path = Path(".")
 
 
 @dataclass
@@ -818,6 +829,17 @@ def _load_user_history_messages(user_id: str, data_dir: Path) -> list[str]:
     after a power-loss restart) rather than failing the whole load.
     The bot's own history reader follows the same convention.
     """
+    # Path-traversal guard: user_id flows in from --user-id with no
+    # validation upstream, and we are about to use it as a path
+    # component under data_dir. A value like "../../etc" would escape
+    # the history root entirely. Path(user_id).name strips any
+    # directory parts and any platform-specific separators; equality
+    # against the input means user_id is exactly one segment, no
+    # slashes, no parent refs. Eval-only operator-run code, so the
+    # guard is consistent with _positive_int / _non_negative_int rather
+    # than a security boundary.
+    if Path(user_id).name != user_id or user_id in ("", ".", ".."):
+        raise ValueError(f"invalid user_id for history path: {user_id!r}")
     history_dir = data_dir / "history" / user_id
     if not history_dir.is_dir():
         return []
@@ -873,9 +895,19 @@ def _sample_pollution_for_probe(
     """
     if n <= 0 or not history:
         return []
+    # Domain-separated SHA256 update: each field is followed by a NUL
+    # delimiter so concatenation cannot collide. Without delimiters,
+    # ("ab", "cde", "pollution") and ("abc", "de", "pollution") feed
+    # the same bytes into the hash and would draw identical samples.
+    # NUL is the conventional choice because it cannot appear in the
+    # UTF-8 encoding of any of these fields (base_seed is hex chars,
+    # expected_fact_id is the upstream UUID/string, neither of which
+    # contains a literal 0 byte).
     h = hashlib.sha256()
     h.update(base_seed.encode("utf-8"))
+    h.update(b"\x00")
     h.update(expected_fact_id.encode("utf-8"))
+    h.update(b"\x00")
     h.update(b"pollution")
     rng = random.Random(int(h.hexdigest()[:16], 16))
     return rng.sample(history, min(n, len(history)))
@@ -1263,18 +1295,16 @@ async def _run_all_probes(
     # the data_dir path to surface in the operator-facing message.
     pollution_history: list[str] = []
     if config.pollution_lines > 0:
-        # Late import to keep the module's startup cost off the
-        # critical path for the (common) no-pollution invocation;
-        # load_config touches the env, the .env file, and the SQLite
-        # config table, none of which the no-pollution path needs.
-        from kai.config import load_config
-
-        data_dir = load_config().data_dir
-        pollution_history = _load_user_history_messages(user_id, data_dir)
+        # data_dir was captured once into BehavioralConfig at run start
+        # (in _run_cli) so the history snapshot here uses exactly the
+        # same root that init_memory used for the memory snapshot. A
+        # second load_config() here would re-read the env and could
+        # diverge if KAI_DATA_DIR were rewritten mid-run by a wrapper.
+        pollution_history = _load_user_history_messages(user_id, config.data_dir)
         if not pollution_history:
             print(
                 f"eval: --pollution-lines={config.pollution_lines} requested but "
-                f"no user history found at {data_dir}/history/{user_id}/; "
+                f"no user history found at {config.data_dir}/history/{user_id}/; "
                 f"injection will be a no-op",
                 file=sys.stderr,
             )
@@ -1860,21 +1890,28 @@ def _build_parser() -> argparse.ArgumentParser:
             f"block of the memory-on arm. Used to test whether removing "
             f"raw-utterance pollution mattered more than adding semantic "
             f"retrieval (the open Layer 2 hypothesis). Defaults to "
-            f"{_DEFAULT_POLLUTION_LINES} (no injection); set to 0 for the "
-            f"clean A/B baseline. The memory-off arm is never polluted, "
-            f"by design; pollution is a property of the memory-on prompt."
+            f"{_DEFAULT_POLLUTION_LINES} (no injection). The memory-off arm "
+            f"is never polluted, by design; pollution is a property of "
+            f"the memory-on prompt."
         ),
     )
     return parser
 
 
-def _initialize_memory() -> bool:
-    """Load config and call init_memory(); return True on success.
+def _initialize_memory() -> Path | None:
+    """Load config and call init_memory(); return data_dir on success.
 
     Mirrors Layer 1's discipline. The harness runs against the live
     store, so the same init path keeps embedding model, Qdrant
     directory, and history DB settings consistent with the bot
     runtime. Errors print to stderr and the caller exits with status 1.
+
+    Returns the loaded `data_dir` (rather than a bool) so the caller
+    can populate BehavioralConfig.data_dir from the SAME load_config()
+    call that drove init_memory. Without this, _run_all_probes would
+    have to re-load the config to find the history snapshot root,
+    risking divergence if the env changed between calls. None signals
+    failure (init exception, memory disabled).
     """
     try:
         from kai.config import load_config
@@ -1887,11 +1924,11 @@ def _initialize_memory() -> bool:
                 "eval: memory is not enabled. Set MEMORY_ENABLED=true and verify the store is readable.",
                 file=sys.stderr,
             )
-            return False
-        return True
+            return None
+        return config.data_dir
     except Exception as e:
         print(f"eval: init failed: {e}", file=sys.stderr)
-        return False
+        return None
 
 
 def _resolve_ground_truth(
@@ -1955,7 +1992,8 @@ async def _run_cli(args: argparse.Namespace) -> int:
         print(f"eval: no probes loaded from {args.probes}", file=sys.stderr)
         return 2
 
-    if not _initialize_memory():
+    data_dir = _initialize_memory()
+    if data_dir is None:
         return 1
 
     # Drift detection + tag mapping — reuses Layer 1's helper so the
@@ -1984,6 +2022,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
         seed=_resolve_seed(cli_seed=args.seed, probes=probes, user_id=args.user_id),
         max_concurrency=args.max_concurrency,
         pollution_lines=args.pollution_lines,
+        data_dir=data_dir,
     )
 
     claude_cli_version = _capture_claude_cli_version()

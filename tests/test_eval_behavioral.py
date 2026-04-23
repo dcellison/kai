@@ -868,7 +868,7 @@ class TestOutputWriteFailure:
         # see its docstring). Mock it as a plain return_value so the
         # caller's non-await call site works correctly.
         with (
-            patch.object(behavioral, "_initialize_memory", return_value=True),
+            patch.object(behavioral, "_initialize_memory", return_value=tmp_path),
             patch.object(
                 behavioral,
                 "detect_drift",
@@ -1070,13 +1070,33 @@ class TestPollutionInjection:
         ab_seed_int = int(ab_h.hexdigest()[:16], 16)
 
         # The pollution RNG seeding (mirrors _sample_pollution_for_probe).
+        # NUL delimiters between fields prevent concatenation collisions;
+        # the A/B side intentionally does not use them because changing
+        # that would shift every recorded baseline's arm assignments.
         poll_h = hashlib.sha256()
         poll_h.update(base_seed.encode("utf-8"))
+        poll_h.update(b"\x00")
         poll_h.update(fact_id.encode("utf-8"))
+        poll_h.update(b"\x00")
         poll_h.update(b"pollution")
         poll_seed_int = int(poll_h.hexdigest()[:16], 16)
 
         assert ab_seed_int != poll_seed_int
+
+    def test_sample_no_collision_under_concatenation_ambiguity(self):
+        # Domain-separation guard: without NUL delimiters between fields,
+        # SHA256.update() is purely concatenative, so (seed="ab",
+        # fact_id="cde") and (seed="abc", fact_id="de") would draw the
+        # same pollution sample because both feed b"abcde" + b"pollution"
+        # into the hash. The delimiter byte makes those two cases
+        # distinguishable. Without this property, two probes whose IDs
+        # happen to share a string boundary with a different seed could
+        # silently get identical pollution sets, breaking the per-probe
+        # determinism property the rest of this class locks down.
+        history = [f"msg-{i}" for i in range(40)]
+        sample_a = _sample_pollution_for_probe(history, 5, base_seed="ab", expected_fact_id="cde")
+        sample_b = _sample_pollution_for_probe(history, 5, base_seed="abc", expected_fact_id="de")
+        assert sample_a != sample_b
 
     def test_sample_returns_all_when_n_exceeds_history(self):
         # When n >= len(history), sampling returns the full history
@@ -1093,6 +1113,18 @@ class TestPollutionInjection:
         # The helper returns [] and the CLI emits a stderr warning;
         # nothing raises.
         assert _load_user_history_messages("does-not-exist", tmp_path) == []
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["../etc", "../../etc/passwd", "foo/bar", "", ".", "..", "/abs/path"],
+    )
+    def test_load_history_rejects_path_traversal(self, tmp_path: Path, bad: str):
+        # Defense-in-depth against an operator passing --user-id with a
+        # traversal payload (or accidentally with an empty/dot value
+        # that would resolve to data_dir/history itself, returning every
+        # user's messages). The helper raises before touching disk.
+        with pytest.raises(ValueError, match="invalid user_id"):
+            _load_user_history_messages(bad, tmp_path)
 
     def test_load_history_filters_to_user_role_and_truncates(self, tmp_path: Path):
         # End-to-end through the JSONL parser: round-trip a synthetic
