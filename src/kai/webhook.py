@@ -1541,7 +1541,17 @@ async def _handle_memory_add(request: web.Request) -> web.Response:
         return web.json_response({"error": "Missing required field: content"}, status=400)
     content = content.strip()
 
-    memory_type = payload.get("memory_type", "fact")
+    # Two-step handling: collapse explicit None to the default first, then
+    # type-check. This makes `{"memory_type": null}` behave the same as
+    # omitting the field entirely (both fall back to "fact"), matching the
+    # lenient None handling used for `tags` and `metadata` below.
+    # `payload.get("memory_type", "fact")` alone would only apply the
+    # default when the key is ABSENT - an explicit null would slip through
+    # and fail isinstance, surprising callers who reasonably expect null
+    # and missing-key to be equivalent in JSON.
+    memory_type = payload.get("memory_type")
+    if memory_type is None:
+        memory_type = "fact"
     if not isinstance(memory_type, str):
         return web.json_response({"error": "memory_type must be a string"}, status=400)
 
@@ -1793,7 +1803,7 @@ async def _handle_memory_delete_all(request: web.Request) -> web.Response:
     # _resolve_chat_id call on requests we will reject anyway.
     if payload.get("confirm") != _DELETE_ALL_CONFIRM_TOKEN:
         return web.json_response(
-            {"error": (f'Missing or incorrect confirm field; expected "{_DELETE_ALL_CONFIRM_TOKEN}"')},
+            {"error": f'Missing or incorrect confirm field; expected "{_DELETE_ALL_CONFIRM_TOKEN}"'},
             status=400,
         )
 

@@ -2209,6 +2209,27 @@ class TestMemoryAdd:
         body = json.loads(resp.body.decode())
         assert "memory_type" in body["error"]
 
+    async def test_treats_null_memory_type_as_default(self, mock_request):
+        """memory_type: null falls back to "fact" rather than 400.
+
+        Matches the lenient None handling already used for tags and
+        metadata (None is equivalent to omitting the field). Pinning
+        the contract so a future "simplify" that switches back to
+        `payload.get("memory_type", "fact")` and rejects explicit
+        nulls would fail this test.
+        """
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"content": "x", "memory_type": None})
+
+        with (
+            patch("kai.memory.is_enabled", return_value=True),
+            patch("kai.memory.add_structured", return_value="id-1") as mock_add,
+        ):
+            resp = await _handle_memory_add(mock_request)
+
+        assert resp.status == 200
+        assert mock_add.call_args.kwargs["memory_type"] == "fact"
+
     async def test_returns_400_on_non_list_tags(self, mock_request):
         """tags must be a list when provided (not a string or dict)."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
