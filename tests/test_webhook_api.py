@@ -2159,6 +2159,67 @@ class TestMemoryAdd:
         assert resp.status == 403
         mock_add.assert_not_called()
 
+    async def test_returns_400_on_non_string_content(self, mock_request):
+        """Non-string content (number, bool, list, etc.) -> 400, not 500.
+
+        Without the isinstance guard at the API boundary, a JSON number
+        or null reaching .strip() would raise AttributeError and escape
+        to aiohttp as an unstyled 500. This test pins the contract that
+        the handler always returns a clean 400 with a JSON error body.
+        """
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"content": 123})
+
+        resp = await _handle_memory_add(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "content" in body["error"]
+
+    async def test_returns_400_on_non_string_memory_type(self, mock_request):
+        """memory_type must be a string when provided."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"content": "x", "memory_type": 42})
+
+        resp = await _handle_memory_add(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "memory_type" in body["error"]
+
+    async def test_returns_400_on_non_list_tags(self, mock_request):
+        """tags must be a list when provided (not a string or dict)."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"content": "x", "tags": "single-tag"})
+
+        resp = await _handle_memory_add(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "tags" in body["error"]
+
+    async def test_returns_400_on_tags_with_non_string_element(self, mock_request):
+        """All tag elements must be strings; mixed-type list -> 400."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"content": "x", "tags": ["ok", 42]})
+
+        resp = await _handle_memory_add(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "tags" in body["error"]
+
+    async def test_returns_400_on_non_dict_metadata(self, mock_request):
+        """metadata must be a JSON object when provided."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"content": "x", "metadata": ["a", "b"]})
+
+        resp = await _handle_memory_add(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "metadata" in body["error"]
+
 
 class TestMemorySearch:
     """POST /api/memory/search"""
@@ -2273,6 +2334,86 @@ class TestMemorySearch:
 
         assert mock_search.call_args.kwargs["limit"] is None
 
+    async def test_returns_400_on_non_string_query(self, mock_request):
+        """Non-string query (number, bool, list, etc.) -> 400.
+
+        Same isinstance-before-.strip() guard as content in the add
+        handler. Pinning the contract so a future refactor can't
+        regress to the AttributeError-escapes-as-500 failure mode.
+        """
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"query": 42})
+
+        resp = await _handle_memory_search(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "query" in body["error"]
+
+    async def test_returns_400_on_non_int_limit(self, mock_request):
+        """`limit` must be an int when provided; string -> 400."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"query": "x", "limit": "five"})
+
+        resp = await _handle_memory_search(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "limit" in body["error"]
+
+    async def test_returns_400_on_zero_limit(self, mock_request):
+        """`limit` must be positive; 0 -> 400."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"query": "x", "limit": 0})
+
+        resp = await _handle_memory_search(mock_request)
+
+        assert resp.status == 400
+
+    async def test_returns_400_on_negative_limit(self, mock_request):
+        """Negative `limit` -> 400."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"query": "x", "limit": -3})
+
+        resp = await _handle_memory_search(mock_request)
+
+        assert resp.status == 400
+
+    async def test_returns_400_on_bool_limit(self, mock_request):
+        """`limit: true` rejected: bool is an int subclass in Python.
+
+        Without the explicit isinstance(limit, bool) short-circuit,
+        `{"limit": true}` would pass `isinstance(limit, int)` and be
+        treated as `limit=1`, silently truncating results. This test
+        is the contract that this Python-specific footgun stays closed.
+        """
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"query": "x", "limit": True})
+
+        resp = await _handle_memory_search(mock_request)
+
+        assert resp.status == 400
+
+    async def test_returns_500_when_search_raises(self, mock_request):
+        """Unexpected exception in search() -> clean 500 JSON, not aiohttp 500 page.
+
+        Defense-in-depth: search() catches its own exceptions today, but
+        the handler still wraps to ensure the 500 contract is structural
+        rather than dependent on the primitive's internal behavior.
+        """
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"query": "x"})
+
+        with (
+            patch("kai.memory.is_enabled", return_value=True),
+            patch("kai.memory.search", side_effect=RuntimeError("boom")),
+        ):
+            resp = await _handle_memory_search(mock_request)
+
+        assert resp.status == 500
+        body = json.loads(resp.body.decode())
+        assert body == {"error": "Memory search failed"}
+
 
 class TestMemoryStats:
     """GET /api/memory/stats"""
@@ -2377,6 +2518,26 @@ class TestMemoryStats:
 
         assert resp.status == 403
         mock_get_stats.assert_not_called()
+
+    async def test_returns_500_when_get_stats_raises(self, mock_request):
+        """Unexpected exception in get_stats() -> clean 500 JSON.
+
+        get_stats() doesn't catch its own exceptions today (the
+        aggregation could raise on a malformed row), so this guard is
+        the actual error contract, not just defense-in-depth.
+        """
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {}
+
+        with (
+            patch("kai.memory.is_enabled", return_value=True),
+            patch("kai.memory.get_stats", side_effect=RuntimeError("boom")),
+        ):
+            resp = await _handle_memory_stats(mock_request)
+
+        assert resp.status == 500
+        body = json.loads(resp.body.decode())
+        assert body == {"error": "Memory stats failed"}
 
 
 class TestMemoryDeleteAll:

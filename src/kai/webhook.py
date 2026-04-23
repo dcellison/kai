@@ -1529,9 +1529,29 @@ async def _handle_memory_add(request: web.Request) -> web.Response:
     # this ordering, a caller debugging a missing-field bug while memory
     # happens to be disabled would chase a 503 red herring instead of
     # seeing the real 400.
-    content = payload.get("content", "").strip()
-    if not content:
+    #
+    # isinstance(...) guards before .strip() / iteration are deliberate.
+    # JSON delivers numbers, booleans, lists, nulls, and dicts; calling
+    # `.strip()` on a number raises AttributeError that escapes to
+    # aiohttp as a framework 500 with no clean error body. Same logic
+    # for the optional-field checks below: validate at the API boundary
+    # so the 400 surface stays the contract that callers actually see.
+    content = payload.get("content")
+    if not isinstance(content, str) or not content.strip():
         return web.json_response({"error": "Missing required field: content"}, status=400)
+    content = content.strip()
+
+    memory_type = payload.get("memory_type", "fact")
+    if not isinstance(memory_type, str):
+        return web.json_response({"error": "memory_type must be a string"}, status=400)
+
+    tags = payload.get("tags")
+    if tags is not None and (not isinstance(tags, list) or not all(isinstance(t, str) for t in tags)):
+        return web.json_response({"error": "tags must be a list of strings"}, status=400)
+
+    metadata = payload.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return web.json_response({"error": "metadata must be a JSON object"}, status=400)
 
     try:
         chat_id = _resolve_chat_id(request, payload)
@@ -1552,9 +1572,9 @@ async def _handle_memory_add(request: web.Request) -> web.Response:
     memory_id = memory.add_structured(
         content,
         user_id=user_id,
-        memory_type=payload.get("memory_type", "fact"),
-        tags=payload.get("tags"),
-        metadata=payload.get("metadata"),
+        memory_type=memory_type,
+        tags=tags,
+        metadata=metadata,
     )
 
     if memory_id is None:
@@ -1599,9 +1619,22 @@ async def _handle_memory_search(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
 
-    query = payload.get("query", "").strip()
-    if not query:
+    # Same isinstance-before-.strip() rationale as _handle_memory_add:
+    # a non-string `query` from JSON would raise AttributeError on .strip()
+    # and escape to aiohttp.
+    query = payload.get("query")
+    if not isinstance(query, str) or not query.strip():
         return web.json_response({"error": "Missing required field: query"}, status=400)
+    query = query.strip()
+
+    # Optional `limit`: must be a positive int when provided. The
+    # `isinstance(limit, bool)` short-circuit is load-bearing because
+    # bool is a subclass of int in Python (`isinstance(True, int)` is
+    # True), so without the bool check `{"limit": true}` would be
+    # accepted as `limit=1` and silently truncate results to one row.
+    limit = payload.get("limit")
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        return web.json_response({"error": "limit must be a positive integer"}, status=400)
 
     try:
         chat_id = _resolve_chat_id(request, payload)
@@ -1619,9 +1652,16 @@ async def _handle_memory_search(request: web.Request) -> web.Response:
         return _memory_disabled_response()
 
     user_id = str(chat_id)
-    limit = payload.get("limit")
 
-    results = memory.search(query, user_id=user_id, limit=limit)
+    # search() catches its own exceptions and returns [] today, so this
+    # try/except is defense-in-depth: if a future refactor ever lets
+    # an exception escape, the handler still returns a clean 500 JSON
+    # body instead of letting aiohttp render an HTML 500 page.
+    try:
+        results = memory.search(query, user_id=user_id, limit=limit)
+    except Exception:
+        log.exception("memory.search failed for chat %d", chat_id)
+        return web.json_response({"error": "Memory search failed"}, status=500)
 
     # asdict() flattens each frozen dataclass to a plain dict. Every
     # value inside MemoryResult.metadata is JSON-native because Mem0
@@ -1674,7 +1714,16 @@ async def _handle_memory_stats(request: web.Request) -> web.Response:
         return _memory_disabled_response()
 
     user_id = str(chat_id)
-    stats = memory.get_stats(user_id=user_id)
+
+    # get_stats() doesn't have its own try/except; aggregation errors on
+    # malformed rows could surface here. Defense-in-depth guard so the
+    # handler returns a clean 500 JSON body rather than an aiohttp HTML
+    # 500 page if the primitive ever raises.
+    try:
+        stats = memory.get_stats(user_id=user_id)
+    except Exception:
+        log.exception("memory.get_stats failed for chat %d", chat_id)
+        return web.json_response({"error": "Memory stats failed"}, status=500)
 
     # asdict() preserves None for the optional confidence_* fields, which
     # become JSON null on the wire. The IDENTITY.md "Memory System"
