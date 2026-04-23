@@ -495,6 +495,13 @@ async def _run_subprocess(
             timeout=timeout_s,
         )
     except TimeoutError:
+        # Catches asyncio.wait_for's timeout. Safe because pyproject.toml
+        # pins requires-python = ">=3.13", and asyncio.TimeoutError has
+        # been an alias for the builtin TimeoutError since 3.11. On any
+        # earlier interpreter (which we do not support) the two classes
+        # are distinct and this clause would never fire, leaving the
+        # subprocess running. Anyone backporting must change this to
+        # `except asyncio.TimeoutError:`.
         # Kill and reap so the subprocess does not become a zombie if
         # the harness keeps running. wait() after kill() is mandatory:
         # without it, asyncio's child-watcher leaks the PID until next
@@ -1048,7 +1055,14 @@ async def _run_all_probes(
                 # run. The harness is meant to produce a result for
                 # every probe; one bad probe should not lose the
                 # other 25.
-                log.warning("probe %d raised: %s", probe_index, e)
+                # Log by expected_fact_id (the stable cross-run probe
+                # identifier) rather than probe_index. probe_index is
+                # the loop index over the drift-FILTERED scored subset,
+                # so it does not map cleanly back to the source probes
+                # file when any probe drifts. expected_fact_id is also
+                # the same key the JSON output uses, so an operator can
+                # grep this warning straight against per_probe[].
+                log.warning("probe %s raised: %s", probe.expected_fact_id, e)
                 return ProbeOutcome(
                     probe=probe,
                     tags=tags,
@@ -1291,7 +1305,14 @@ def build_output_json(
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "probe_set_hash": probe_set_hash(probes),
         "probe_count": len(probes),
-        "scored_count": sum(counts.values()),
+        # `attempted_count` is every probe that had a generation
+        # subprocess launched, NOT just probes that received a
+        # win/loss/tie/both_wrong verdict. It includes judge_error and
+        # generation_error buckets, so attempted = probe_count - drift.
+        # An operator comparing two runs with very different error
+        # counts should look at the per-bucket numbers under `outcomes`
+        # rather than treat this as a verdict count.
+        "attempted_count": sum(counts.values()),
         "drift_count": drift_count,
         "claude_cli_version": claude_cli_version,
         "judge_model": config.judge_model,
@@ -1321,7 +1342,7 @@ def _render_summary(output: dict[str, Any]) -> str:
     """
     counts = output["outcomes"]
     lines = [
-        f"Probes: {output['probe_count']} total, {output['scored_count']} scored, {output['drift_count']} drifted",
+        f"Probes: {output['probe_count']} total, {output['attempted_count']} attempted, {output['drift_count']} drifted",
         f"Claude CLI: {output['claude_cli_version']}",
         f"Models: gen={output['gen_model']}, judge={output['judge_model']}",
         f"Seed: {output['seed']} (max_concurrency={output['max_concurrency']})",
