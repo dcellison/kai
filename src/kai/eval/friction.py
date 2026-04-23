@@ -338,7 +338,7 @@ class HistoryRecord:
     direction: str
     chat_id: int
     text: str
-    media: dict | None
+    media: dict[str, Any] | None
     source_path: str
     line_no: int
 
@@ -1265,7 +1265,7 @@ def _redact_text(text: str) -> str:
     return out[:_SNIPPET_MAX_CHARS]
 
 
-def _build_event_payload(event: FrictionEvent, *, include_snippets: bool) -> dict:
+def _build_event_payload(event: FrictionEvent, *, include_snippets: bool) -> dict[str, Any]:
     """Produce the JSON-serializable dict for one event.
 
     `metadata=dict(event.metadata)` is the load-bearing conversion from
@@ -1287,7 +1287,7 @@ def _build_event_payload(event: FrictionEvent, *, include_snippets: bool) -> dic
     }
 
 
-def _build_bucket_payload(records: list[HistoryRecord]) -> list[dict]:
+def _build_bucket_payload(records: list[HistoryRecord]) -> list[dict[str, Any]]:
     """Per-bucket volume rows for the JSON `buckets` block.
 
     `messages_total` counts every record (user + assistant + media);
@@ -1302,7 +1302,7 @@ def _build_bucket_payload(records: list[HistoryRecord]) -> list[dict]:
         messages_total[bucket] += 1
         if record.direction == "user":
             user_turns[bucket] += 1
-    payload: list[dict] = []
+    payload: list[dict[str, Any]] = []
     for bucket in _BUCKETS:
         payload.append(
             {
@@ -1376,7 +1376,7 @@ def _build_report(
     trend: TrendSummary,
     memory_state: MemoryInitResult,
     sample_cutoff_utc: datetime | None,
-) -> dict:
+) -> dict[str, Any]:
     """Produce the top-level JSON report dict.
 
     Events are sorted by `(timestamp_utc, message_id)` so the JSON is
@@ -1441,12 +1441,12 @@ def _json_default(obj: Any) -> Any:
     raise TypeError(f"unserializable: {type(obj).__name__}")
 
 
-def _render_json(report: dict) -> str:
+def _render_json(report: dict[str, Any]) -> str:
     """Serialize the report dict; pretty-printed for human review."""
     return json.dumps(report, indent=2, ensure_ascii=False, default=_json_default)
 
 
-def _render_markdown(report: dict, trend: TrendSummary) -> str:
+def _render_markdown(report: dict[str, Any], trend: TrendSummary) -> str:
     """Build the redacted markdown summary suitable for paste-into-issue.
 
     Always redacts surface text regardless of `--include-snippets` (the
