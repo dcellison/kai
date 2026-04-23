@@ -1569,22 +1569,36 @@ async def _handle_memory_add(request: web.Request) -> web.Response:
     # int -> str at the memory boundary; do NOT remove the cast.
     user_id = str(chat_id)
 
-    memory_id = memory.add_structured(
-        content,
-        user_id=user_id,
-        memory_type=memory_type,
-        tags=tags,
-        metadata=metadata,
-    )
+    # Defense-in-depth guard, matching the pattern used in the other
+    # three memory handlers. add_structured catches its own internal
+    # exceptions and returns None (which the None-check below maps to
+    # 500), but if the call raises BEFORE reaching that internal try
+    # (init failure, bad argument shape, network error during connection
+    # setup), the exception would otherwise escape to aiohttp as an HTML
+    # 500. The wider guard collapses both failure modes into the same
+    # clean 500 JSON body.
+    try:
+        memory_id = memory.add_structured(
+            content,
+            user_id=user_id,
+            memory_type=memory_type,
+            tags=tags,
+            metadata=metadata,
+        )
+    except Exception:
+        log.exception("memory.add_structured failed for chat %d", chat_id)
+        return web.json_response({"error": "Memory storage failed"}, status=500)
 
     if memory_id is None:
         # Reaching here means is_enabled() was True at precheck (so we
-        # know memory was up), but add_structured returned None anyway.
-        # The only remaining None path inside add_structured (after the
-        # empty-content path which we filtered above with the 400 check)
-        # is the caught Exception around _memory.add(). 500 distinguishes
-        # this transient store failure from the 503 hard-disabled case
-        # so callers can pick a different retry policy per status code.
+        # know memory was up) and add_structured did not raise, but it
+        # returned None anyway. The only remaining None path inside
+        # add_structured (after the empty-content path which we filtered
+        # above with the 400 check) is the caught Exception around
+        # _memory.add(). Same 500 response body as the wider guard above
+        # because callers cannot meaningfully distinguish "primitive
+        # raised" from "primitive caught and returned None" - both are
+        # transient store failures.
         return web.json_response({"error": "Memory storage failed"}, status=500)
 
     log.info("Stored memory %s for chat %d via API", memory_id, chat_id)

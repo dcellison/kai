@@ -2159,6 +2159,28 @@ class TestMemoryAdd:
         assert resp.status == 403
         mock_add.assert_not_called()
 
+    async def test_returns_500_when_add_structured_raises(self, mock_request):
+        """Unexpected exception in add_structured() -> clean 500 JSON.
+
+        Defense-in-depth: add_structured catches its own exceptions and
+        returns None (handled by the None-check 500 path), but the
+        handler also wraps in case the call raises BEFORE reaching that
+        internal try (init failure, bad argument shape, etc.). Pins the
+        contract that BOTH failure modes produce the same 500 JSON body.
+        """
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"content": "x"})
+
+        with (
+            patch("kai.memory.is_enabled", return_value=True),
+            patch("kai.memory.add_structured", side_effect=RuntimeError("boom")),
+        ):
+            resp = await _handle_memory_add(mock_request)
+
+        assert resp.status == 500
+        body = json.loads(resp.body.decode())
+        assert body == {"error": "Memory storage failed"}
+
     async def test_returns_400_on_non_string_content(self, mock_request):
         """Non-string content (number, bool, list, etc.) -> 400, not 500.
 
@@ -2436,6 +2458,20 @@ class TestMemorySearch:
         body = json.loads(resp.body.decode())
         assert body == {"error": "Memory search failed"}
 
+    async def test_returns_403_on_unauthorized_chat_id(self, mock_request):
+        """chat_id not in allowed_user_ids -> 403, primitive not called."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"query": "x", "chat_id": 999})
+
+        with (
+            patch("kai.memory.is_enabled", return_value=True),
+            patch("kai.memory.search") as mock_search,
+        ):
+            resp = await _handle_memory_search(mock_request)
+
+        assert resp.status == 403
+        mock_search.assert_not_called()
+
 
 class TestMemoryStats:
     """GET /api/memory/stats"""
@@ -2680,3 +2716,22 @@ class TestMemoryDeleteAll:
         assert resp.status == 500
         body = json.loads(resp.body.decode())
         assert body == {"error": "Memory delete failed"}
+
+    async def test_returns_403_on_unauthorized_chat_id(self, mock_request):
+        """chat_id not in allowed_user_ids -> 403, primitive not called.
+
+        Verifies the 403 path runs even when the confirm token is
+        correct: an unauthorized caller with the right token should
+        still be blocked at the chat_id resolution step.
+        """
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"confirm": self._CONFIRM, "chat_id": 999})
+
+        with (
+            patch("kai.memory.is_enabled", return_value=True),
+            patch("kai.memory.delete_all") as mock_del,
+        ):
+            resp = await _handle_memory_delete_all(mock_request)
+
+        assert resp.status == 403
+        mock_del.assert_not_called()
