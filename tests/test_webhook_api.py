@@ -2414,6 +2414,28 @@ class TestMemorySearch:
         body = json.loads(resp.body.decode())
         assert body == {"error": "Memory search failed"}
 
+    async def test_returns_500_when_serialization_raises(self, mock_request):
+        """asdict failure on a non-dataclass return -> wrapped into 500.
+
+        Pins the contract that the try/except guard covers BOTH the
+        primitive call and the asdict serialization, not just the
+        primitive. Without the wider guard, asdict raising TypeError
+        would escape to aiohttp as an HTML 500.
+        """
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"query": "x"})
+
+        # Returning a non-dataclass forces asdict() to TypeError.
+        with (
+            patch("kai.memory.is_enabled", return_value=True),
+            patch("kai.memory.search", return_value=["not a dataclass"]),
+        ):
+            resp = await _handle_memory_search(mock_request)
+
+        assert resp.status == 500
+        body = json.loads(resp.body.decode())
+        assert body == {"error": "Memory search failed"}
+
 
 class TestMemoryStats:
     """GET /api/memory/stats"""
@@ -2532,6 +2554,28 @@ class TestMemoryStats:
         with (
             patch("kai.memory.is_enabled", return_value=True),
             patch("kai.memory.get_stats", side_effect=RuntimeError("boom")),
+        ):
+            resp = await _handle_memory_stats(mock_request)
+
+        assert resp.status == 500
+        body = json.loads(resp.body.decode())
+        assert body == {"error": "Memory stats failed"}
+
+    async def test_returns_500_when_serialization_raises(self, mock_request):
+        """asdict failure on a non-dataclass return -> wrapped into 500.
+
+        Same wider-guard contract as the search handler: try/except
+        covers both get_stats() and the asdict step. A future refactor
+        that returns a dict (or anything non-dataclass) instead of
+        MemoryStats would otherwise leak as HTML 500.
+        """
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {}
+
+        # asdict() raises TypeError on a plain dict.
+        with (
+            patch("kai.memory.is_enabled", return_value=True),
+            patch("kai.memory.get_stats", return_value={"not": "a dataclass"}),
         ):
             resp = await _handle_memory_stats(mock_request)
 

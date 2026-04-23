@@ -1653,21 +1653,25 @@ async def _handle_memory_search(request: web.Request) -> web.Response:
 
     user_id = str(chat_id)
 
-    # search() catches its own exceptions and returns [] today, so this
-    # try/except is defense-in-depth: if a future refactor ever lets
-    # an exception escape, the handler still returns a clean 500 JSON
-    # body instead of letting aiohttp render an HTML 500 page.
+    # Defense-in-depth around the full risky path: primitive call AND
+    # serialization. search() catches its own exceptions and returns []
+    # today, and asdict() should always succeed on the frozen dataclass
+    # MemoryResult, but extending the guard to cover the asdict+
+    # json_response step keeps the 500-as-clean-JSON contract intact
+    # even if a future refactor changes search()'s return type or if
+    # MemoryResult.metadata ever contains non-JSON-native values.
+    # Without the wider guard, asdict raising TypeError or json_response
+    # raising ValueError would escape to aiohttp as an unstyled HTML 500.
     try:
         results = memory.search(query, user_id=user_id, limit=limit)
+        # asdict() flattens each frozen dataclass to a plain dict. Every
+        # value inside MemoryResult.metadata is JSON-native because Mem0
+        # stores metadata in Qdrant as JSON, so json_response can
+        # serialize the whole structure without a custom encoder.
+        return web.json_response({"results": [asdict(r) for r in results]})
     except Exception:
         log.exception("memory.search failed for chat %d", chat_id)
         return web.json_response({"error": "Memory search failed"}, status=500)
-
-    # asdict() flattens each frozen dataclass to a plain dict. Every
-    # value inside MemoryResult.metadata is JSON-native because Mem0
-    # stores metadata in Qdrant as JSON, so json_response can serialize
-    # the whole structure without a custom encoder.
-    return web.json_response({"results": [asdict(r) for r in results]})
 
 
 @_require_secret
@@ -1715,21 +1719,22 @@ async def _handle_memory_stats(request: web.Request) -> web.Response:
 
     user_id = str(chat_id)
 
-    # get_stats() doesn't have its own try/except; aggregation errors on
-    # malformed rows could surface here. Defense-in-depth guard so the
-    # handler returns a clean 500 JSON body rather than an aiohttp HTML
-    # 500 page if the primitive ever raises.
+    # Wider guard around primitive call AND serialization, matching the
+    # search handler. get_stats() doesn't have its own try/except today
+    # (aggregation errors on a malformed row could surface here), and
+    # extending the guard to the asdict+json_response step closes the
+    # remaining route by which an exception could escape to aiohttp as
+    # an HTML 500.
     try:
         stats = memory.get_stats(user_id=user_id)
+        # asdict() preserves None for the optional confidence_* fields,
+        # which become JSON null on the wire. The IDENTITY.md
+        # "Memory System" section documents this so inner Claude does
+        # not misread null as a store failure.
+        return web.json_response(asdict(stats))
     except Exception:
         log.exception("memory.get_stats failed for chat %d", chat_id)
         return web.json_response({"error": "Memory stats failed"}, status=500)
-
-    # asdict() preserves None for the optional confidence_* fields, which
-    # become JSON null on the wire. The IDENTITY.md "Memory System"
-    # section documents this so inner Claude does not misread null as
-    # a store failure.
-    return web.json_response(asdict(stats))
 
 
 @_require_secret
