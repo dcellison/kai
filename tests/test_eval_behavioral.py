@@ -99,18 +99,29 @@ def _make_config(**overrides) -> BehavioralConfig:
 def _make_outcome(*, probe: Probe, memory_outcome: str) -> ProbeOutcome:
     """Construct a synthetic ProbeOutcome for aggregation tests.
 
-    The aggregation paths only read `memory_outcome` and `tags`, so the
-    other fields can carry placeholder values. Keeping this helper here
-    (rather than importing the production constructor) means a future
-    refactor of ProbeOutcome's required fields surfaces in this single
-    place rather than in every aggregation test.
+    The aggregation paths only read `memory_outcome` and `tags`, but
+    `judge_choice` is set consistently with `memory_outcome` so the
+    fixture is trustworthy for any future test that reads both fields
+    (e.g. _outcome_to_per_probe_dict serialization checks). Mapping:
+    memory_arm_letter is fixed at "A", so memory_wins -> A_wins,
+    memory_loses -> B_wins, and the passthrough buckets (tie,
+    both_wrong, judge_error, generation_error) carry their own name
+    as judge_choice, matching the production rollup.
     """
+    judge_choice_by_outcome = {
+        "memory_wins": "A_wins",
+        "memory_loses": "B_wins",
+        "tie": "tie",
+        "both_wrong": "both_wrong",
+        "judge_error": "judge_error",
+        "generation_error": "generation_error",
+    }
     return ProbeOutcome(
         probe=probe,
         tags=(),
         memory_arm_letter="A",
         responses={"A": "ra", "B": "rb"},
-        judge_choice="A_wins" if memory_outcome == "memory_wins" else "B_wins",
+        judge_choice=judge_choice_by_outcome[memory_outcome],
         judge_reasoning="reason",
         memory_outcome=memory_outcome,
         latency_ms={"A": 1.0, "B": 1.0, "judge": 1.0},

@@ -520,7 +520,23 @@ async def _run_subprocess(
         # at the caller, which knows which subprocess this was.
         return -1, b"", b"", elapsed_ms
     elapsed_ms = (loop.time() - start) * 1000.0
-    return proc.returncode or 0, stdout, stderr, elapsed_ms
+    rc = proc.returncode or 0
+    if rc != 0:
+        # Surface the subprocess's own diagnostic on a clean failure.
+        # Without this, the caller buckets the probe as
+        # judge_error / generation_error but the operator has no way to
+        # see WHAT the CLI complained about (rate limit, missing flag,
+        # OOM kill, auth expiry). Truncate to keep one line per failed
+        # call; the full tail is one debug-level rerun away. errors=
+        # "replace" because stderr can carry partial UTF-8 from a
+        # SIGKILL mid-write.
+        log.warning(
+            "subprocess exited rc=%d: %s | stderr: %s",
+            rc,
+            cmd[0],
+            stderr[:500].decode("utf-8", errors="replace").strip(),
+        )
+    return rc, stdout, stderr, elapsed_ms
 
 
 # ── Judge call + parsing ───────────────────────────────────────────
