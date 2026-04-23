@@ -156,6 +156,34 @@ _DEFAULT_GEN_TIMEOUT_S = 120
 _DEFAULT_MAX_CONCURRENCY = 4
 
 
+# Default pollution-injection count. Eval-only mechanism: when this is
+# greater than zero, the harness loads the user's history JSONLs once
+# at run start and per-probe samples N entries to splice into the
+# memory context block as `- User said: <text>` bullets, mimicking the
+# prompt shape Track 1 produced before PR #361 deleted that ingestion
+# path. Used by the three-way compare in eval epic #362 to test
+# whether retrieval-block pollution materially hurts behavioral
+# outcomes WITHOUT resurrecting the deleted Track 1 machinery (which
+# carries a real risk surface: any single bit-flip of an "eval-only"
+# flag in production would re-introduce the bug PR #361 fixed).
+# Default zero means today's runs stay byte-identical to the existing
+# baseline; the byte-level A/B isolation guarantee in test 1 depends
+# on this no-op default.
+_DEFAULT_POLLUTION_LINES = 0
+
+
+# Per-line truncation cap for synthetic-pollution lines. Matches
+# memory_extraction._MAX_USER_CHARS so the synthesized prompt shape
+# faithfully mirrors what Track 1 actually produced; Track 1 itself
+# truncated user utterances to the same 2000-char ceiling before
+# storing them as `User said: <text>` rows. Lines longer than this
+# are truncated with a trailing ellipsis, same as the extractor's
+# convention. Held as a separate module-level constant rather than
+# imported from memory_extraction so behavioral.py stays free of an
+# eval-time dependency on the extractor module's private internals.
+_MAX_POLLUTION_LINE_CHARS = 2000
+
+
 # JSON Schema passed to `claude --print --json-schema` for the judge
 # call. The four-value `choice` enum maps directly to the harness's
 # outcome buckets (after de-anonymization). `additionalProperties=false`
@@ -258,6 +286,15 @@ class BehavioralConfig:
     gen_timeout_s: int
     seed: str
     max_concurrency: int
+    # Eval-only synthetic-pollution count. Defaults to 0 so existing
+    # tests and existing CLI invocations stay byte-for-byte identical
+    # to today's behavior; a non-zero value opts the run into the
+    # Track 1 pollution comparison without changing the schema for
+    # callers that do not use the feature. Field kept on
+    # BehavioralConfig (rather than threaded as a separate function
+    # arg) so it surfaces in the output JSON automatically alongside
+    # seed and max_concurrency, making each saved run self-describing.
+    pollution_lines: int = 0
 
 
 @dataclass
@@ -749,10 +786,144 @@ def _rollup_outcome(*, judge_choice: str, memory_arm_letter: str) -> str:
     return "judge_error"
 
 
+# ── Eval-only synthetic-pollution helpers ──────────────────────────
+
+
+def _load_user_history_messages(user_id: str, data_dir: Path) -> list[str]:
+    """Load every user-role message from a chat_id's history JSONLs.
+
+    Reads every `*.jsonl` under `<data_dir>/history/<user_id>/` and
+    returns the `text` field of rows whose `dir == "user"`. Used as
+    the raw source for synthetic-pollution sampling; the harness loads
+    this once at run start and re-samples per-probe rather than
+    reading from disk for every probe.
+
+    Lines longer than _MAX_POLLUTION_LINE_CHARS are truncated with a
+    trailing ellipsis. Track 1 itself truncated user utterances to the
+    same length before storing them, so this preserves the prompt
+    shape we are trying to reproduce; an un-truncated injection would
+    NOT be a faithful reconstruction of the deleted behavior.
+
+    Returns an empty list when the history directory does not exist
+    or contains no user messages. Callers are expected to treat empty
+    as "no pollution available, proceed without it" rather than as an
+    error, because the harness must remain runnable against fresh
+    users with no history (e.g. new operators bringing up Layer 2 on
+    a clean install). The CLI prints a one-line stderr warning when
+    pollution is requested but no history is found, so the empty-list
+    fall-through is visible without halting the run.
+
+    Skips silently on individual JSONDecodeError lines (corrupt rows
+    in long-running history files, e.g. truncated final-line writes
+    after a power-loss restart) rather than failing the whole load.
+    The bot's own history reader follows the same convention.
+    """
+    history_dir = data_dir / "history" / user_id
+    if not history_dir.is_dir():
+        return []
+    messages: list[str] = []
+    for path in sorted(history_dir.glob("*.jsonl")):
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError:
+                # Corrupt line in history file; skip silently.
+                continue
+            if row.get("dir") != "user":
+                continue
+            text = row.get("text") or ""
+            if not text.strip():
+                continue
+            if len(text) > _MAX_POLLUTION_LINE_CHARS:
+                text = text[:_MAX_POLLUTION_LINE_CHARS] + "..."
+            messages.append(text)
+    return messages
+
+
+def _sample_pollution_for_probe(
+    history: list[str],
+    n: int,
+    *,
+    base_seed: str,
+    expected_fact_id: str,
+) -> list[str]:
+    """Deterministically sample N pollution lines for one probe.
+
+    Uses a SEPARATE RNG seeded from
+    `sha256(base_seed + expected_fact_id + b"pollution")[:16]`,
+    distinct from the per-probe RNG that drives the A/B coin flip in
+    _run_all_probes. Keeping these RNGs strictly separate is the
+    invariant that lets the operator compare a pollution-on run
+    against a pollution-off run of the same (probes, user_id, seed)
+    triple: the arm letter assigned to memory-on for each probe must
+    NOT shift when pollution is enabled, otherwise per-probe wins/
+    losses become incomparable across runs and the whole point of
+    the deterministic seed is lost. The trailing `b"pollution"` salt
+    is what guarantees this independence: any other RNG seeded from
+    (base_seed, expected_fact_id) without the salt would re-derive
+    the same hash and consume identical bytes.
+
+    Sampling is WITHOUT replacement; if N exceeds the history size
+    the entire history is returned in shuffled order. Returns an
+    empty list when n <= 0 or history is empty so callers can
+    unconditionally pass the result through to build_arm_prompt
+    without re-checking the no-op case.
+    """
+    if n <= 0 or not history:
+        return []
+    h = hashlib.sha256()
+    h.update(base_seed.encode("utf-8"))
+    h.update(expected_fact_id.encode("utf-8"))
+    h.update(b"pollution")
+    rng = random.Random(int(h.hexdigest()[:16], 16))
+    return rng.sample(history, min(n, len(history)))
+
+
+def _inject_synthetic_pollution(memory_ctx: str, lines: list[str]) -> str:
+    """Append `- User said: <text>` bullets to a memory context block.
+
+    Bullets are appended AFTER the existing facts in `memory_ctx`,
+    matching where the most-recent Track 1 rows used to land in the
+    pre-#361 prompt: Mem0's recency-weighted ranking placed user-said
+    rows near the bottom of the retrieval block (closest to the
+    question), which is exactly the position the model is most likely
+    to weigh heavily. The bullet prefix matches Mem0's own
+    output-formatting (`- <fact>`) so the synthetic lines visually
+    blend with the genuine facts and the model has no easy way to
+    distinguish "this came from extraction" from "this came from
+    Track 1"; that visual indistinguishability is the core mechanism
+    PR #361's commit message identified as the failure mode.
+
+    No-ops when `lines` is empty. The byte-level A/B isolation test
+    (test 1) depends on this no-op contract: a default
+    pollution_lines=0 invocation must leave memory_ctx byte-identical
+    to today's production format_context output, otherwise the
+    foundational A/B-arms-differ-in-exactly-one-place guarantee
+    would silently regress for non-eval callers.
+    """
+    if not lines:
+        return memory_ctx
+    bullets = [f"- User said: {line.strip()}" for line in lines]
+    # rstrip() to avoid a double-newline if format_context already
+    # ends in \n; the join-with-\n pattern then produces exactly one
+    # newline between the existing facts and the first synthetic
+    # bullet, matching the bullet-per-line shape format_context itself
+    # uses.
+    return memory_ctx.rstrip() + "\n" + "\n".join(bullets)
+
+
 # ── Arm prompt assembly ────────────────────────────────────────────
 
 
-async def build_arm_prompt(question: str, user_id: str, *, memory_enabled: bool) -> str:
+async def build_arm_prompt(
+    question: str,
+    user_id: str,
+    *,
+    memory_enabled: bool,
+    pollution_lines: list[str] | None = None,
+) -> str:
     """Build the user prompt for one A/B arm.
 
     The hypothesis "memory helps generation" only holds if the two
@@ -772,6 +943,17 @@ async def build_arm_prompt(question: str, user_id: str, *, memory_enabled: bool)
     `src/kai/backend.py`; reusing it rather than reimplementing the
     join means the byte-level isolation test (test 1) stays valid
     even if the production join's separator ever changes.
+
+    `pollution_lines` is the eval-only Track 1 reconstruction knob:
+    when non-empty AND memory is enabled AND format_context returned
+    a non-empty block, the lines are spliced into memory_ctx before
+    prepend_to_prompt is called. When None, empty, or paired with
+    memory_enabled=False, the call is byte-identical to today's
+    no-pollution behavior (the byte-level isolation test depends on
+    this contract). The memory-off arm is intentionally never
+    polluted because the question being tested ("does noise inside
+    the memory block hurt?") is undefined when there is no memory
+    block to put noise into.
     """
     from kai.backend import prepend_to_prompt
     from kai.memory import format_context
@@ -783,6 +965,16 @@ async def build_arm_prompt(question: str, user_id: str, *, memory_enabled: bool)
     if memory_enabled:
         memory_ctx = await format_context(question, user_id=user_id)
         if memory_ctx:
+            if pollution_lines:
+                # Inject BEFORE prepend so the pollution lives inside
+                # the memory context block (where Track 1 lines used
+                # to live), not above or below it. Keeping the
+                # injection point here also means the production
+                # prepend_to_prompt sees a single concatenated block
+                # and applies its delimiter rules uniformly to both
+                # genuine facts and synthetic lines, matching how the
+                # pre-#361 codepath behaved.
+                memory_ctx = _inject_synthetic_pollution(memory_ctx, pollution_lines)
             # prepend_to_prompt returns str | list; for a str input it
             # always returns str. The cast via assignment is safe because
             # we just passed a str in. type: ignore would be the more
@@ -889,6 +1081,7 @@ async def _run_one_probe(
     ground_truth_text: str,
     cwd: Path,
     env: dict[str, str],
+    pollution_lines: list[str] | None = None,
 ) -> ProbeOutcome:
     """Drive one probe through both arms + judge; return the rolled-up outcome.
 
@@ -917,7 +1110,19 @@ async def _run_one_probe(
     # may fail (Mem0 not initialized, store unreadable) — that
     # surfaces as an exception here, propagating to the gather() in
     # _run_all_probes which wraps it as a generation_error outcome.
-    memory_on_prompt = await build_arm_prompt(probe.question, user_id, memory_enabled=True)
+    # Only the memory-on arm receives pollution_lines: the question
+    # under test ("does noise inside the memory block hurt?") is
+    # undefined for the memory-off arm because there is no memory
+    # block to splice noise into. Passing the same lines to both
+    # would inflate the memory-off prompt with unrelated user-said
+    # text, conflating the pollution measurement with a generic
+    # added-context-helps measurement.
+    memory_on_prompt = await build_arm_prompt(
+        probe.question,
+        user_id,
+        memory_enabled=True,
+        pollution_lines=pollution_lines,
+    )
     memory_off_prompt = await build_arm_prompt(probe.question, user_id, memory_enabled=False)
     arm_prompts: dict[str, str] = {
         memory_arm_letter: memory_on_prompt,
@@ -1048,6 +1253,32 @@ async def _run_all_probes(
     _ensure_extractor_cwd()
     env = _subprocess_env()
 
+    # Load the user's history ONCE per run (not per probe) so the
+    # reading cost stays O(history_size) rather than O(history_size
+    # * probe_count). When pollution_lines == 0 we skip the load
+    # entirely; the helper would just return [] but reading the
+    # JSONL files is real I/O on a live snapshot and there is no
+    # reason to pay it when the feature is off. The empty-history
+    # warning lives here (not in the helper) because here we have
+    # the data_dir path to surface in the operator-facing message.
+    pollution_history: list[str] = []
+    if config.pollution_lines > 0:
+        # Late import to keep the module's startup cost off the
+        # critical path for the (common) no-pollution invocation;
+        # load_config touches the env, the .env file, and the SQLite
+        # config table, none of which the no-pollution path needs.
+        from kai.config import load_config
+
+        data_dir = load_config().data_dir
+        pollution_history = _load_user_history_messages(user_id, data_dir)
+        if not pollution_history:
+            print(
+                f"eval: --pollution-lines={config.pollution_lines} requested but "
+                f"no user history found at {data_dir}/history/{user_id}/; "
+                f"injection will be a no-op",
+                file=sys.stderr,
+            )
+
     sem = asyncio.Semaphore(config.max_concurrency)
 
     async def _run_under_semaphore(probe: Probe) -> ProbeOutcome:
@@ -1098,6 +1329,19 @@ async def _run_all_probes(
                 probe.expected_fact_id,
             )
 
+        # Sample pollution OUTSIDE the semaphore: the sampling is pure
+        # CPU and deterministic per (probe, seed), and doing it
+        # outside the slot avoids holding a Semaphore slot during the
+        # sample call. With pollution_lines=0 the helper returns []
+        # without consulting history, which keeps the no-pollution
+        # path zero-cost.
+        pollution = _sample_pollution_for_probe(
+            pollution_history,
+            config.pollution_lines,
+            base_seed=config.seed,
+            expected_fact_id=probe.expected_fact_id,
+        )
+
         async with sem:
             try:
                 return await _run_one_probe(
@@ -1109,6 +1353,7 @@ async def _run_all_probes(
                     ground_truth_text=gt,
                     cwd=_EXTRACTOR_CWD,
                     env=env,
+                    pollution_lines=pollution,
                 )
             except Exception as e:
                 # An unexpected exception (Mem0 not initialized, OS
@@ -1387,6 +1632,13 @@ def build_output_json(
         "gen_model": config.gen_model,
         "seed": config.seed,
         "max_concurrency": config.max_concurrency,
+        # `pollution_lines` is recorded even when zero so an operator
+        # diff-ing two run JSONs can confirm at a glance whether the
+        # second run had pollution enabled. Omitting the field on
+        # zero would force the operator to remember the default and
+        # mentally fill it in, defeating the self-describing-output
+        # property the rest of the envelope was built around.
+        "pollution_lines": config.pollution_lines,
         "outcomes": counts,
         **rates,
         "by_tag": by_tag,
@@ -1414,21 +1666,33 @@ def _render_summary(output: dict[str, Any]) -> str:
         f"Claude CLI: {output['claude_cli_version']}",
         f"Models: gen={output['gen_model']}, judge={output['judge_model']}",
         f"Seed: {output['seed']} (max_concurrency={output['max_concurrency']})",
-        "",
-        "Outcomes:",
-        f"  memory_wins:      {counts['memory_wins']}",
-        f"  memory_loses:     {counts['memory_loses']}",
-        f"  tie:              {counts['tie']}",
-        f"  both_wrong:       {counts['both_wrong']}",
-        f"  judge_error:      {counts['judge_error']}",
-        f"  generation_error: {counts['generation_error']}",
-        "",
-        "Rates (over scorable = wins+loses+tie+both_wrong):",
-        f"  win_rate_pct:        {output['win_rate_pct']:.2f}",
-        f"  loss_rate_pct:       {output['loss_rate_pct']:.2f}",
-        f"  tie_rate_pct:        {output['tie_rate_pct']:.2f}",
-        f"  both_wrong_rate_pct: {output['both_wrong_rate_pct']:.2f}",
     ]
+    # Pollution line is conditional on a non-zero count so the default
+    # summary (the common case) stays clean. When the operator opts
+    # into pollution they want to see the count loud and clear in the
+    # header so a pasted summary in a chat or bug report cannot be
+    # mistaken for a non-pollution baseline run.
+    pollution_n = output.get("pollution_lines", 0)
+    if pollution_n > 0:
+        lines.append(f"Pollution: {pollution_n} synthetic 'User said:' lines per probe (eval-only)")
+    lines.extend(
+        [
+            "",
+            "Outcomes:",
+            f"  memory_wins:      {counts['memory_wins']}",
+            f"  memory_loses:     {counts['memory_loses']}",
+            f"  tie:              {counts['tie']}",
+            f"  both_wrong:       {counts['both_wrong']}",
+            f"  judge_error:      {counts['judge_error']}",
+            f"  generation_error: {counts['generation_error']}",
+            "",
+            "Rates (over scorable = wins+loses+tie+both_wrong):",
+            f"  win_rate_pct:        {output['win_rate_pct']:.2f}",
+            f"  loss_rate_pct:       {output['loss_rate_pct']:.2f}",
+            f"  tie_rate_pct:        {output['tie_rate_pct']:.2f}",
+            f"  both_wrong_rate_pct: {output['both_wrong_rate_pct']:.2f}",
+        ]
+    )
     by_tag = output.get("by_tag", {})
     if by_tag:
         lines.append("")
@@ -1475,6 +1739,27 @@ def _positive_int(raw: str) -> int:
         raise argparse.ArgumentTypeError(f"expected integer, got {raw!r}") from None
     if value < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1 (got {value})")
+    return value
+
+
+def _non_negative_int(raw: str) -> int:
+    """argparse `type=` callable that rejects negative integers but allows 0.
+
+    Used for --pollution-lines, where 0 is the legitimate default
+    (no injection, today's behavior) and a typoed negative would
+    otherwise pass argparse's plain `type=int` and reach
+    _sample_pollution_for_probe with `n=-3`. random.sample raises a
+    confusing ValueError on negative `k`; rejecting at the parse
+    boundary turns that into a one-line argparse error before any
+    subprocess or history load is attempted, mirroring the
+    _positive_int discipline applied to --max-concurrency.
+    """
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected integer, got {raw!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0 (got {value})")
     return value
 
 
@@ -1552,6 +1837,32 @@ def _build_parser() -> argparse.ArgumentParser:
             f"within a probe run sequentially, so this is also the cap "
             f"on concurrent claude subprocesses "
             f"(default: {_DEFAULT_MAX_CONCURRENCY})."
+        ),
+    )
+    # --pollution-lines is the eval-only switch that lets the harness
+    # measure how Track-1-style raw-utterance noise in the memory
+    # context block degrades behavioral outcomes, WITHOUT resurrecting
+    # the deleted production code path (which carried a real input-loss
+    # bug). The default is 0 (no injection), and the byte-level A/B
+    # isolation invariant continues to hold at the default. Source for
+    # the injected lines is the user's actual chat history at
+    # DATA_DIR/history/<user_id>/, so the snapshot procedure must copy
+    # `history/` alongside `memory/` when running against an isolated
+    # KAI_DATA_DIR. See _inject_synthetic_pollution / _sample_pollution_for_probe.
+    parser.add_argument(
+        "--pollution-lines",
+        type=_non_negative_int,
+        default=_DEFAULT_POLLUTION_LINES,
+        help=(
+            f"Eval-only: inject N synthetic 'User said:' lines, sampled "
+            f"deterministically per probe from the user's chat history "
+            f"at DATA_DIR/history/<user_id>/, into the memory context "
+            f"block of the memory-on arm. Used to test whether removing "
+            f"raw-utterance pollution mattered more than adding semantic "
+            f"retrieval (the open Layer 2 hypothesis). Defaults to "
+            f"{_DEFAULT_POLLUTION_LINES} (no injection); set to 0 for the "
+            f"clean A/B baseline. The memory-off arm is never polluted, "
+            f"by design; pollution is a property of the memory-on prompt."
         ),
     )
     return parser
@@ -1672,6 +1983,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
         gen_timeout_s=args.gen_timeout_s,
         seed=_resolve_seed(cli_seed=args.seed, probes=probes, user_id=args.user_id),
         max_concurrency=args.max_concurrency,
+        pollution_lines=args.pollution_lines,
     )
 
     claude_cli_version = _capture_claude_cli_version()

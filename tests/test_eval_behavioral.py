@@ -63,13 +63,17 @@ from kai.eval.behavioral import (
     _build_gen_cmd,
     _build_judge_cmd,
     _compute_rates,
+    _inject_synthetic_pollution,
+    _load_user_history_messages,
     _make_drift_outcome,
+    _non_negative_int,
     _parse_judge_stdout,
     _positive_int,
     _render_judge_user_payload,
     _resolve_seed,
     _rollup_outcome,
     _run_subprocess,
+    _sample_pollution_for_probe,
     build_arm_prompt,
 )
 from kai.eval.retrieval import Probe
@@ -839,6 +843,7 @@ class TestOutputWriteFailure:
         args.gen_timeout_s = 120
         args.seed = None
         args.max_concurrency = 1
+        args.pollution_lines = 0
 
         # Mock the heavy machinery: init succeeds, drift detection
         # produces one scored probe, all_probes returns one
@@ -959,3 +964,263 @@ class TestPositiveIntCLIArg:
     @pytest.mark.parametrize("good,expected", [("1", 1), ("4", 4), ("128", 128)])
     def test_accepts_positive(self, good: str, expected: int):
         assert _positive_int(good) == expected
+
+
+# ── Pollution injection (eval-only Track 1 reconstruction) ─────────
+
+
+class TestPollutionInjection:
+    """Synthetic pollution: helpers, determinism, A/B-isolation respect.
+
+    The pollution feature exists to test the Layer 2 hypothesis that
+    removing Track 1 raw-utterance noise mattered more than adding
+    semantic retrieval. The tests below lock down the invariants the
+    feature MUST preserve for that hypothesis test to be meaningful:
+
+    1. Default (pollution_lines=0) is byte-identical to today's
+       behavior; the existing A/B isolation guarantee in
+       TestArmPromptIsolation still holds, so the no-pollution baseline
+       is interpretable as "exactly the production memory-on prompt".
+    2. The pollution RNG is independent of the A/B coin-flip RNG, so
+       enabling pollution does NOT shift arm assignments. Without this,
+       a pollution-on vs pollution-off comparison would conflate the
+       pollution effect with arbitrary arm-letter changes.
+    3. The memory-off arm is never polluted; the asymmetry IS the
+       experimental contrast.
+    """
+
+    def test_inject_with_empty_lines_is_noop(self):
+        # Byte-level no-op when no lines are sampled (the pollution-off
+        # case). This is what protects test 1's isolation invariant from
+        # accidentally regressing once the pollution code path is wired
+        # into build_arm_prompt; if the helper added even a trailing
+        # newline here, every existing memory-on arm would silently
+        # diverge from production format_context output.
+        ctx = "[Relevant memories]\n- foo\n- bar"
+        assert _inject_synthetic_pollution(ctx, []) == ctx
+
+    def test_inject_appends_user_said_bullets(self):
+        # The "User said:" prefix is the literal Track 1 prompt shape
+        # we are reconstructing. Whitespace is stripped per-line so that
+        # history entries with trailing newlines do not produce ragged
+        # bullets that would tip off the judge that something synthetic
+        # is happening.
+        ctx = "[Relevant memories]\n- favorite color is blue"
+        out = _inject_synthetic_pollution(ctx, ["hello world  ", "  what time is it"])
+        # Original facts preserved verbatim, bullets appended with one
+        # newline separator (rstrip on ctx tolerates an existing trailing
+        # newline without producing a blank-line gap).
+        assert out == (
+            "[Relevant memories]\n- favorite color is blue\n- User said: hello world\n- User said: what time is it"
+        )
+
+    def test_inject_strips_existing_trailing_newline(self):
+        # format_context returns text ending in "\n" in some paths; the
+        # rstrip + explicit "\n" join produces a single separator
+        # regardless. This test is the regression guard against a future
+        # change that drops the rstrip and produces double-newlines.
+        ctx = "[Relevant memories]\n- a\n"
+        out = _inject_synthetic_pollution(ctx, ["x"])
+        assert "\n\n" not in out
+        assert out.endswith("- User said: x")
+
+    def test_sample_returns_empty_for_zero_n(self):
+        assert _sample_pollution_for_probe(["a", "b", "c"], 0, base_seed="seed", expected_fact_id="fid") == []
+
+    def test_sample_returns_empty_for_empty_history(self):
+        assert _sample_pollution_for_probe([], 5, base_seed="seed", expected_fact_id="fid") == []
+
+    def test_sample_is_deterministic_for_same_seed_and_fact_id(self):
+        # Same (seed, fact_id) -> same sample. This is the property that
+        # lets a re-run produce identical pollution per probe, which is
+        # required for any "did the fix help?" comparison to be valid.
+        history = [f"msg-{i}" for i in range(50)]
+        a = _sample_pollution_for_probe(history, 5, base_seed="s", expected_fact_id="f")
+        b = _sample_pollution_for_probe(history, 5, base_seed="s", expected_fact_id="f")
+        assert a == b
+        assert len(a) == 5
+
+    def test_sample_differs_across_probes(self):
+        # Different fact_ids -> different samples (with high
+        # probability). 30 lines / 5 sampled gives ~3.4M unique combos;
+        # collision is essentially impossible. If this ever fails, the
+        # hash domain separation is broken.
+        history = [f"msg-{i}" for i in range(30)]
+        a = _sample_pollution_for_probe(history, 5, base_seed="s", expected_fact_id="fact-A")
+        b = _sample_pollution_for_probe(history, 5, base_seed="s", expected_fact_id="fact-B")
+        assert a != b
+
+    def test_sample_independent_of_ab_coin_flip_rng(self):
+        # CRITICAL invariant: enabling pollution must NOT shift arm
+        # assignments. The pollution RNG seeds with `+ b"pollution"`
+        # salt; the A/B RNG (in _run_all_probes) seeds without it. This
+        # test reproduces both seedings and asserts the salt actually
+        # changes the byte stream, which is the only thing keeping
+        # pollution-on vs pollution-off comparisons valid against the
+        # same (probes, user_id, seed) triple.
+        import hashlib
+
+        base_seed = "seed-xyz"
+        fact_id = "fact-1"
+
+        # The A/B RNG seeding (mirrors _run_all_probes:_run_under_semaphore).
+        ab_h = hashlib.sha256()
+        ab_h.update(base_seed.encode("utf-8"))
+        ab_h.update(fact_id.encode("utf-8"))
+        ab_seed_int = int(ab_h.hexdigest()[:16], 16)
+
+        # The pollution RNG seeding (mirrors _sample_pollution_for_probe).
+        poll_h = hashlib.sha256()
+        poll_h.update(base_seed.encode("utf-8"))
+        poll_h.update(fact_id.encode("utf-8"))
+        poll_h.update(b"pollution")
+        poll_seed_int = int(poll_h.hexdigest()[:16], 16)
+
+        assert ab_seed_int != poll_seed_int
+
+    def test_sample_returns_all_when_n_exceeds_history(self):
+        # When n >= len(history), sampling returns the full history
+        # (in shuffled order). The harness must not crash on a small
+        # history with --pollution-lines set high; this exercises the
+        # min(n, len(history)) clamp inside _sample_pollution_for_probe.
+        history = ["a", "b", "c"]
+        out = _sample_pollution_for_probe(history, 100, base_seed="s", expected_fact_id="f")
+        assert sorted(out) == ["a", "b", "c"]
+
+    def test_load_history_returns_empty_when_dir_missing(self, tmp_path: Path):
+        # Running against a fresh KAI_DATA_DIR with no history directory
+        # is a legitimate path (e.g. a new operator bringing up Layer 2).
+        # The helper returns [] and the CLI emits a stderr warning;
+        # nothing raises.
+        assert _load_user_history_messages("does-not-exist", tmp_path) == []
+
+    def test_load_history_filters_to_user_role_and_truncates(self, tmp_path: Path):
+        # End-to-end through the JSONL parser: round-trip a synthetic
+        # history file with a mix of user/assistant rows, blank lines,
+        # corrupt lines, and one over-length user row. The expected
+        # output exercises every filter branch in one fixture.
+        history_dir = tmp_path / "history" / "user-1"
+        history_dir.mkdir(parents=True)
+        long_text = "x" * 2500
+        rows = [
+            json.dumps({"ts": 1, "dir": "user", "chat_id": 1, "text": "first user msg"}),
+            json.dumps({"ts": 2, "dir": "assistant", "chat_id": 1, "text": "ignored bot reply"}),
+            json.dumps({"ts": 3, "dir": "user", "chat_id": 1, "text": "  "}),  # whitespace-only, dropped
+            "",  # blank line, dropped
+            "{not valid json",  # corrupt row, skipped silently
+            json.dumps({"ts": 4, "dir": "user", "chat_id": 1, "text": long_text}),
+            json.dumps({"ts": 5, "dir": "user", "chat_id": 1, "text": "second user msg"}),
+        ]
+        (history_dir / "001.jsonl").write_text("\n".join(rows), encoding="utf-8")
+
+        out = _load_user_history_messages("user-1", tmp_path)
+        # Three user-role messages: assistant + whitespace + blank +
+        # corrupt all dropped.
+        assert len(out) == 3
+        assert out[0] == "first user msg"
+        # Long row truncated to _MAX_POLLUTION_LINE_CHARS (2000) + "...".
+        assert out[1].startswith("x" * 2000)
+        assert out[1].endswith("...")
+        assert len(out[1]) == 2003
+        assert out[2] == "second user msg"
+
+    def test_load_history_reads_multiple_jsonl_files_in_sorted_order(self, tmp_path: Path):
+        # Production history rotates into multiple JSONL files; the
+        # loader concatenates them in lexicographic filename order
+        # (matching the bot's own reader). Test asserts both ordering
+        # and that the loader does not stop at the first file.
+        history_dir = tmp_path / "history" / "user-2"
+        history_dir.mkdir(parents=True)
+        (history_dir / "001.jsonl").write_text(
+            json.dumps({"ts": 1, "dir": "user", "chat_id": 2, "text": "from-001"}) + "\n",
+            encoding="utf-8",
+        )
+        (history_dir / "002.jsonl").write_text(
+            json.dumps({"ts": 2, "dir": "user", "chat_id": 2, "text": "from-002"}) + "\n",
+            encoding="utf-8",
+        )
+        out = _load_user_history_messages("user-2", tmp_path)
+        assert out == ["from-001", "from-002"]
+
+    @pytest.mark.parametrize("bad", ["-1", "-100"])
+    def test_non_negative_int_rejects_negatives(self, bad: str):
+        with pytest.raises(argparse.ArgumentTypeError, match=r"must be >= 0"):
+            _non_negative_int(bad)
+
+    def test_non_negative_int_rejects_non_integer(self):
+        with pytest.raises(argparse.ArgumentTypeError, match=r"expected integer"):
+            _non_negative_int("ten")
+
+    @pytest.mark.parametrize("good,expected", [("0", 0), ("1", 1), ("100", 100)])
+    def test_non_negative_int_accepts_zero_and_positives(self, good: str, expected: int):
+        # 0 is the legitimate default (pollution off); the divergence
+        # from _positive_int's contract is exactly what makes this a
+        # separate validator rather than a parameter on the existing one.
+        assert _non_negative_int(good) == expected
+
+    def test_build_arm_prompt_with_pollution_none_matches_today(self):
+        # Byte-level isolation extends to the new pollution_lines arg:
+        # the default (None) MUST produce the exact prompt today's code
+        # produces. This is the regression guard that the existing
+        # TestArmPromptIsolation cases continue to hold once the
+        # pollution code path is wired in.
+        memory_block = "[Relevant memories]\n- the user's favorite color is blue"
+        question = "What's my favorite color?"
+
+        with patch("kai.memory.format_context", new=AsyncMock(return_value=memory_block)):
+            arm_default = asyncio.run(build_arm_prompt(question, "user-1", memory_enabled=True))
+            arm_explicit_none = asyncio.run(
+                build_arm_prompt(question, "user-1", memory_enabled=True, pollution_lines=None)
+            )
+            arm_empty_list = asyncio.run(build_arm_prompt(question, "user-1", memory_enabled=True, pollution_lines=[]))
+
+        # Default, explicit None, and empty list all produce the exact
+        # same prompt as the production memory-on path: no separator,
+        # no marker, no whitespace difference.
+        assert arm_default == arm_explicit_none == arm_empty_list
+
+    def test_build_arm_prompt_injects_when_pollution_lines_supplied(self):
+        # Positive case: with pollution_lines passed and memory enabled,
+        # the bullets land inside the memory block (before
+        # prepend_to_prompt fuses it with the question), so the user-
+        # message marker added by prepend_to_prompt still cleanly
+        # separates the polluted memory block from the question.
+        memory_block = "[Relevant memories]\n- favorite color is blue"
+        question = "What's my favorite color?"
+
+        with patch("kai.memory.format_context", new=AsyncMock(return_value=memory_block)):
+            arm_polluted = asyncio.run(
+                build_arm_prompt(
+                    question,
+                    "user-1",
+                    memory_enabled=True,
+                    pollution_lines=["I had pizza yesterday", "where did I park"],
+                )
+            )
+
+        # Pollution bullets present.
+        assert "- User said: I had pizza yesterday" in arm_polluted
+        assert "- User said: where did I park" in arm_polluted
+        # Original fact preserved.
+        assert "favorite color is blue" in arm_polluted
+        # Question still in there (memory-on arm always ends with the question).
+        assert "What's my favorite color?" in arm_polluted
+
+    def test_build_arm_prompt_memory_off_ignores_pollution_lines(self):
+        # The memory-off arm is the no-injection control by definition;
+        # passing pollution_lines into a memory_enabled=False call must
+        # be a no-op. If this ever fails, the experimental contrast
+        # collapses (both arms polluted equally -> nothing being
+        # measured).
+        question = "What's my favorite color?"
+        with patch("kai.memory.format_context", new=AsyncMock(return_value="ignored")):
+            arm_off = asyncio.run(
+                build_arm_prompt(
+                    question,
+                    "user-1",
+                    memory_enabled=False,
+                    pollution_lines=["should-not-appear"],
+                )
+            )
+        assert arm_off == question
+        assert "should-not-appear" not in arm_off
