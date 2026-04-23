@@ -1292,6 +1292,18 @@ class TestInitializeMemoryDataDirContract:
         # If the function tries to access a non-existent attr (the
         # exact bug we shipped), it lands in the except branch and
         # returns None, which the assertion catches loudly.
+        #
+        # Mechanics note for future readers extending this pattern:
+        # _initialize_memory uses a function-local `from kai.config
+        # import DATA_DIR`, which Python resolves by reading
+        # sys.modules["kai.config"].DATA_DIR at call time, NOT at
+        # test-module import time. monkeypatch.setattr on the module
+        # object therefore takes effect for every subsequent
+        # function-local import in the same process. The same logic
+        # applies to `patch("kai.memory.init_memory")` and
+        # `patch("kai.memory.is_enabled")`: those patch the module
+        # attribute, which the function-local `from kai.memory
+        # import ...` re-reads each call.
         from kai import config as _cfg
 
         monkeypatch.setattr(_cfg, "DATA_DIR", tmp_path)
