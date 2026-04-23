@@ -1144,7 +1144,6 @@ class TestTrendClassifier:
             aggregates=_make_aggregates(rates),
             events=[],
             user_turns=self._ut_ok(),
-            memory_state=MemoryAvailability.ENABLED,
         )
 
     def test_prediction_holds_drop_then_flat(self):
@@ -1212,7 +1211,6 @@ class TestTrendClassifier:
             ),
             events=[],
             user_turns={"A": 100, "B": 100, "C": 5},  # C below 30
-            memory_state=MemoryAvailability.ENABLED,
         )
         assert s.matched_pattern == "inconclusive"
 
@@ -1274,7 +1272,6 @@ class TestTrendClassifier:
             ),
             events=[],
             user_turns={"A": 100, "B": 100, "C": 5},
-            memory_state=MemoryAvailability.ENABLED,
         )
         assert s.matched_pattern == "inconclusive"
         assert s.verdict_driving_sum["A"] == 10.0

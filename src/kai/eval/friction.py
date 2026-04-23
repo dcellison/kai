@@ -976,8 +976,8 @@ def _classify_band(prior: float, new: float) -> str:
       - flat: 0.85 * prior < new <= 1.15 * prior (open lower, closed upper)
       - up:   new > 1.15 * prior
 
-    Zero-prior is handled by the caller via _band_for_transition; this
-    helper assumes prior > 0. Tests that exercise the `unclassified`
+    Zero-prior is handled inline by `classify_trend`; this helper
+    assumes prior > 0. Tests that exercise the `unclassified`
     catch-all monkey-patch this helper to return a sentinel value
     outside `{drop, flat, up}`, then assert the classifier emits
     `unclassified` with the correct narrative.
@@ -1015,28 +1015,11 @@ _BAND_DESCRIPTIONS = {
 }
 
 
-def _band_for_transition(prior: float, new: float) -> tuple[str, bool]:
-    """Compute band with zero-prior fallback.
-
-    Returns (band_label, undefined_ratio). When prior=0 + new>0, the
-    band falls back to "up" AND the caller is expected to record a
-    zero-prior-rate caveat AND emit JSON `null` for the ratio.
-    `undefined_ratio` is True only in that case; (0, 0) gives ("flat",
-    False) since the ratio is reported as 1.0 by convention.
-    """
-    if prior == 0 and new == 0:
-        return "flat", False
-    if prior == 0 and new > 0:
-        return "up", True
-    return _classify_band(prior, new), False
-
-
 def classify_trend(
     *,
     aggregates: list[BucketAggregate],
     events: list[FrictionEvent],
     user_turns: dict[str, int],
-    memory_state: MemoryAvailability,
 ) -> TrendSummary:
     """Compute the trend classification + narrative for one run.
 
@@ -1525,7 +1508,13 @@ def _atomic_write(path: Path, content: str) -> None:
     except Exception:
         # Best-effort cleanup of the temp file on any write failure;
         # leaving it would accumulate stale .tmp files in the output
-        # directory across repeated failed runs.
+        # directory across repeated failed runs. Also close the raw fd
+        # defensively in case os.fdopen itself raised before taking
+        # ownership - otherwise the descriptor leaks.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         if temp_path.exists():
             try:
                 temp_path.unlink()
@@ -1678,7 +1667,6 @@ async def _run_cli(args: argparse.Namespace, run_started_at_utc: datetime) -> in
         aggregates=aggregates,
         events=events,
         user_turns=user_turns,
-        memory_state=memory_state.availability,
     )
     report = _build_report(
         config=config,
