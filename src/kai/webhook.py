@@ -26,6 +26,10 @@ Routes are organized into these groups:
     - /api/services/{name}  - External service proxy (injects auth from .env)
     - /api/send-message     - Send a text message to the Telegram chat
     - /api/send-file        - Send a file from the filesystem to the Telegram chat
+    - /api/memory/add       - Store a structured memory (POST)
+    - /api/memory/search    - Search memories by query (POST)
+    - /api/memory/stats     - Memory statistics for a user (GET)
+    - /api/memory/all       - Delete all memories for a user (DELETE, requires confirm token)
 
 The Telegram webhook route uses its own secret (TELEGRAM_WEBHOOK_SECRET) and is
 only registered in webhook mode. All other webhook/API endpoints require
@@ -45,13 +49,14 @@ import json
 import logging
 import re
 import time
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
 from aiohttp import web
 from telegram import Bot, Update
 
-from kai import cron, review, services, sessions, triage
+from kai import cron, memory, review, services, sessions, triage
 from kai.config import DATA_DIR, IMAGE_EXTENSIONS, Config, UserConfig
 from kai.telegram_utils import chunk_text
 
@@ -1443,6 +1448,307 @@ async def _handle_send_file(request: web.Request) -> web.Response:
     return web.json_response({"status": "sent", "file": path.name})
 
 
+# ── Memory API ───────────────────────────────────────────────────────
+# Four thin REST handlers wrapping memory.py primitives. Implementation
+# notes that apply uniformly across all four:
+#
+#   - All four share the symmetric `is_enabled()` precheck. Returns 503
+#     when memory is off, even on read endpoints whose primitives degrade
+#     gracefully (search returns [], get_stats returns zeroed). Returning
+#     the degraded value at the API would conflate "memory off" with
+#     "no data" and inner Claude could not pick a retry policy from the
+#     status code alone.
+#
+#   - Memory primitives take user_id as a string; _resolve_chat_id returns
+#     int. Stringify at the boundary in every handler. Removing the cast
+#     is a load-bearing bug: Mem0 keys are stored under the string form,
+#     so a missed cast would silently isolate the caller's memories from
+#     their existing facts.
+#
+#   - Handlers import memory as a module (`from kai import memory`) so
+#     tests can patch `kai.memory.<func>` uniformly. Function-level
+#     imports would force tests to patch the local binding
+#     (kai.webhook.add_structured), which is a known mocking pitfall.
+
+# Static well-known token for the DELETE /api/memory/all confirmation
+# field. Picked over a per-request UUID because the threat model is
+# typo-resistance and prompt-injection defense, not replay protection;
+# a static descriptive string is sufficient for both. The exact value
+# also appears in the 400 error body so a stray curl gets a clear hint
+# at what was missing.
+_DELETE_ALL_CONFIRM_TOKEN = "delete-all-memories"
+
+
+def _memory_disabled_response() -> web.Response:
+    """503 response used by the symmetric is_enabled() precheck.
+
+    Centralized so all four memory handlers return the identical body and
+    status. The 503 contract (vs the 500 used for `add_structured` failure
+    in /api/memory/add) is documented in IDENTITY.md: 503 means the
+    operator must enable memory, so callers should NOT retry; 500 means
+    the underlying store call failed and may be transient.
+    """
+    return web.json_response({"error": "Memory system disabled"}, status=503)
+
+
+@_require_secret
+async def _handle_memory_add(request: web.Request) -> web.Response:
+    """
+    Store a structured memory via memory.add_structured().
+
+    Wraps the existing add_structured() primitive used by the Haiku
+    extraction path. Lets inner Claude (and other localhost clients)
+    deliberately store facts without waiting for the extractor to pass
+    over a conversation. The primitive itself is unchanged; this handler
+    only adds the HTTP surface.
+
+    Request body (JSON):
+        content: str, required, non-empty after strip
+        memory_type: str, optional, default "fact"
+        tags: list[str], optional
+        metadata: dict, optional (keys "type" and "tags" are reserved by
+            add_structured; user values for those will be overwritten)
+        chat_id: int, optional, defaults to app["chat_id"]
+
+    Responses:
+        200 {"id": "<mem0-uuid>"} on success
+        400 on bad input (invalid JSON, missing/empty content, bad chat_id)
+        401 on bad/missing X-Webhook-Secret (handled by the decorator)
+        403 on unauthorized chat_id
+        503 when memory is disabled (precheck; do not retry, escalate)
+        500 when add_structured() returns None despite memory being enabled
+            (the underlying store call failed; may be transient)
+    """
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    # Required-field validation runs BEFORE the is_enabled() precheck so
+    # callers learn about bad-input bugs even when memory is off. Without
+    # this ordering, a caller debugging a missing-field bug while memory
+    # happens to be disabled would chase a 503 red herring instead of
+    # seeing the real 400.
+    content = payload.get("content", "").strip()
+    if not content:
+        return web.json_response({"error": "Missing required field: content"}, status=400)
+
+    try:
+        chat_id = _resolve_chat_id(request, payload)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    except UnauthorizedChatIdError as e:
+        return web.json_response({"error": str(e)}, status=403)
+
+    # Symmetric is_enabled() precheck. Runs after auth + 400-level
+    # validation but before the primitive call. See the §Memory API
+    # block comment above for why all four memory handlers share this.
+    if not memory.is_enabled():
+        return _memory_disabled_response()
+
+    # int -> str at the memory boundary; do NOT remove the cast.
+    user_id = str(chat_id)
+
+    memory_id = memory.add_structured(
+        content,
+        user_id=user_id,
+        memory_type=payload.get("memory_type", "fact"),
+        tags=payload.get("tags"),
+        metadata=payload.get("metadata"),
+    )
+
+    if memory_id is None:
+        # Reaching here means is_enabled() was True at precheck (so we
+        # know memory was up), but add_structured returned None anyway.
+        # The only remaining None path inside add_structured (after the
+        # empty-content path which we filtered above with the 400 check)
+        # is the caught Exception around _memory.add(). 500 distinguishes
+        # this transient store failure from the 503 hard-disabled case
+        # so callers can pick a different retry policy per status code.
+        return web.json_response({"error": "Memory storage failed"}, status=500)
+
+    log.info("Stored memory %s for chat %d via API", memory_id, chat_id)
+    return web.json_response({"id": memory_id})
+
+
+@_require_secret
+async def _handle_memory_search(request: web.Request) -> web.Response:
+    """
+    Search memories via memory.search().
+
+    POST chosen over GET because user-message-shaped queries can be long
+    enough to bump against URL-length limits on some HTTP clients, and
+    POST also matches the rest of the /api/* surface (POST except
+    /api/jobs* GET).
+
+    Request body (JSON):
+        query: str, required, non-empty after strip
+        limit: int, optional (defaults to config.memory_search_limit)
+        chat_id: int, optional, defaults to app["chat_id"]
+
+    Responses:
+        200 {"results": [<MemoryResult-dict>, ...]} on success (empty list
+            is a valid 200 result for "no matches")
+        400 on bad input
+        401 on bad secret
+        403 on unauthorized chat_id
+        503 when memory is disabled
+    """
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    query = payload.get("query", "").strip()
+    if not query:
+        return web.json_response({"error": "Missing required field: query"}, status=400)
+
+    try:
+        chat_id = _resolve_chat_id(request, payload)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    except UnauthorizedChatIdError as e:
+        return web.json_response({"error": str(e)}, status=403)
+
+    # search() degrades to [] when memory is disabled, but returning []
+    # at the API layer would be indistinguishable from "no matches".
+    # Inner Claude needs to pick "log no relevant memories and continue"
+    # vs "memory is off, surface to operator" - the only distinguishing
+    # signal is the status code, so the precheck is required.
+    if not memory.is_enabled():
+        return _memory_disabled_response()
+
+    user_id = str(chat_id)
+    limit = payload.get("limit")
+
+    results = memory.search(query, user_id=user_id, limit=limit)
+
+    # asdict() flattens each frozen dataclass to a plain dict. Every
+    # value inside MemoryResult.metadata is JSON-native because Mem0
+    # stores metadata in Qdrant as JSON, so json_response can serialize
+    # the whole structure without a custom encoder.
+    return web.json_response({"results": [asdict(r) for r in results]})
+
+
+@_require_secret
+async def _handle_memory_stats(request: web.Request) -> web.Response:
+    """
+    Return memory statistics via memory.get_stats().
+
+    GET endpoint reads chat_id from query params, mirroring _handle_get_jobs.
+
+    Query params:
+        chat_id: int, optional (defaults to app["chat_id"])
+
+    Response is the MemoryStats object at the top level, NOT wrapped in
+    {"results": ...} - single-object reads return the object bare per
+    the API's response-shape rule (matches /api/jobs/{id} returning
+    `job` at top level).
+
+    Note on null fields: confidence_min, confidence_median, confidence_max
+    are JSON null when extracted_count == 0. This is correct for users
+    with no extracted facts and is NOT a store-failure signal. Callers
+    should treat null in those fields as "no data to summarize."
+
+    Responses:
+        200 <MemoryStats-dict> on success
+        400 on bad chat_id
+        401 on bad secret
+        403 on unauthorized chat_id
+        503 when memory is disabled
+    """
+    # GET handlers feed query params to _resolve_chat_id; established
+    # pattern at _handle_get_jobs.
+    try:
+        chat_id = _resolve_chat_id(request, dict(request.query))
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    except UnauthorizedChatIdError as e:
+        return web.json_response({"error": str(e)}, status=403)
+
+    # get_stats() returns zeroed MemoryStats when memory is disabled,
+    # but - same as search - "memory off" and "user has no facts yet"
+    # would be indistinguishable at the API. The 503 precheck preserves
+    # the distinction at the status-code layer.
+    if not memory.is_enabled():
+        return _memory_disabled_response()
+
+    user_id = str(chat_id)
+    stats = memory.get_stats(user_id=user_id)
+
+    # asdict() preserves None for the optional confidence_* fields, which
+    # become JSON null on the wire. The IDENTITY.md "Memory System"
+    # section documents this so inner Claude does not misread null as
+    # a store failure.
+    return web.json_response(asdict(stats))
+
+
+@_require_secret
+async def _handle_memory_delete_all(request: web.Request) -> web.Response:
+    """
+    Delete all memories for a user via memory.delete_all().
+
+    Requires an exact-match confirm token in the body. Static
+    well-known token (not per-request UUID) because the threat model
+    is typo + prompt-injection defense, not replay protection.
+
+    Convention divergence (deliberate): _handle_delete_job reads chat_id
+    from query params, but this handler reads chat_id from the body
+    alongside the confirm token, since the body already exists for the
+    confirm field. Splitting confirm into the body and chat_id into the
+    query would be inconsistent within the same endpoint.
+
+    Request body (JSON):
+        confirm: str, required, must equal "delete-all-memories"
+        chat_id: int, optional, defaults to app["chat_id"]
+
+    Responses:
+        200 {"status": "deleted"} on success
+        400 on missing/wrong confirm or bad chat_id
+        401 on bad secret
+        403 on unauthorized chat_id
+        503 when memory is disabled
+
+    Caveat: delete_all() swallows internal errors (memory.py:1066-1069).
+    Partial failures inside Mem0 are logged but invisible at the API
+    layer. Surfacing them would require widening memory.py's error
+    contract, which is out of scope for the foundation issue.
+    """
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    # Confirm-token check before chat_id resolution: a request with the
+    # wrong token is structurally bad input regardless of which user it
+    # was aimed at, and rejecting it first means we don't waste a
+    # _resolve_chat_id call on requests we will reject anyway.
+    if payload.get("confirm") != _DELETE_ALL_CONFIRM_TOKEN:
+        return web.json_response(
+            {"error": (f'Missing or incorrect confirm field; expected "{_DELETE_ALL_CONFIRM_TOKEN}"')},
+            status=400,
+        )
+
+    try:
+        chat_id = _resolve_chat_id(request, payload)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    except UnauthorizedChatIdError as e:
+        return web.json_response({"error": str(e)}, status=403)
+
+    # Symmetric precheck. delete_all() is a no-op when disabled, but
+    # callers asking the API to wipe their memories deserve to know the
+    # operation didn't actually run because the system was off.
+    if not memory.is_enabled():
+        return _memory_disabled_response()
+
+    user_id = str(chat_id)
+    memory.delete_all(user_id=user_id)
+
+    log.info("Deleted all memories for chat %d via API", chat_id)
+    return web.json_response({"status": "deleted"})
+
+
 # ── Webhook health monitor ───────────────────────────────────────────
 
 
@@ -1676,6 +1982,10 @@ async def start(telegram_app, config) -> None:
         _app.router.add_post("/api/services/{name}", _handle_service_call)
         _app.router.add_post("/api/send-message", _handle_send_message)
         _app.router.add_post("/api/send-file", _handle_send_file)
+        _app.router.add_post("/api/memory/add", _handle_memory_add)
+        _app.router.add_post("/api/memory/search", _handle_memory_search)
+        _app.router.add_get("/api/memory/stats", _handle_memory_stats)
+        _app.router.add_delete("/api/memory/all", _handle_memory_delete_all)
     else:
         log.warning("WEBHOOK_SECRET not set - webhook and scheduling endpoints disabled")
 

@@ -147,6 +147,77 @@ curl -s -X POST http://localhost:8080/api/send-file \
 - `caption` - string; optional
 - Images (png, jpg, webp) are sent as photos (rendered inline). Everything else is sent as a document attachment.
 
+## Memory System
+
+You have a per-user vector store that holds extracted facts about the user (preferences, decisions, identity, locations, constraints). Two paths populate it: a Haiku extraction pass that runs automatically over conversations, and the explicit API documented here. Use the API to deliberately store a fact when you notice something worth recalling later, instead of waiting for the extractor to find it.
+
+This is distinct from your `MEMORY.md` file, which is monolithic identity text injected at every turn. MEMORY.md is for stable identity and rules; the memory store is for queryable, retrievable facts that you may or may not need on a given turn.
+
+### When to store a fact via the API
+
+- The user states a stable preference, constraint, or piece of identity
+- The user confirms an architectural decision worth recalling later
+- You complete a task whose outcome (succeeded / failed / lessons) is worth recalling
+- Don't store: anything that's already in MEMORY.md, ephemeral conversation context, or anything that violates the user's privacy preferences
+
+### Storing a fact
+
+```bash
+curl -s -X POST http://localhost:8080/api/memory/add \
+  -H 'Content-Type: application/json' \
+  -H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET" \
+  -d '{"chat_id": <chat_id>, "content": "User prefers Earl Grey over English Breakfast", "memory_type": "preference", "tags": ["beverage", "preference"], "metadata": {"source": "explicit"}}'
+```
+
+Fields: `content` (string, required), `memory_type` (string, default `"fact"`), `tags` (list of strings, optional), `metadata` (dict, optional), `chat_id` (integer, required for routing). Response: `{"id": "<mem0-uuid>"}`.
+
+### Searching memories
+
+```bash
+curl -s -X POST http://localhost:8080/api/memory/search \
+  -H 'Content-Type: application/json' \
+  -H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET" \
+  -d '{"chat_id": <chat_id>, "query": "what tea does the user like"}'
+```
+
+Fields: `query` (string, required), `limit` (integer, optional), `chat_id` (integer, required). Response: `{"results": [{"id": ..., "text": ..., "score": ..., "memory_type": ..., "metadata": {...}, "created_at": ...}, ...]}`. Empty `results` means no matches above the relevance threshold; this is a normal 200, not an error.
+
+### Stats
+
+```bash
+curl -s "http://localhost:8080/api/memory/stats?chat_id=<chat_id>" \
+  -H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET"
+```
+
+Returns the stats object at the top level: `{"total_count": N, "by_type": {...}, "extracted_count": M, "by_tag": {...}, "confidence_min": ..., "confidence_median": ..., "confidence_max": ..., ...}`.
+
+For a fresh user with no extracted facts (`extracted_count == 0`), the confidence fields ship as `null`:
+
+```json
+{"total_count": 0, "by_type": {}, "extracted_count": 0, "confidence_min": null, "confidence_median": null, "confidence_max": null, ...}
+```
+
+`null` here means "no extracted facts to summarize," NOT a store failure. Treat it as expected for new users.
+
+### Deleting all memories
+
+```bash
+curl -s -X DELETE http://localhost:8080/api/memory/all \
+  -H 'Content-Type: application/json' \
+  -H "X-Webhook-Secret: $KAI_WEBHOOK_SECRET" \
+  -d '{"chat_id": <chat_id>, "confirm": "delete-all-memories"}'
+```
+
+The `confirm` field MUST equal the literal string `"delete-all-memories"`. Anything else returns 400. This is intentional: a stray curl or prompt-injected fetch call cannot accidentally wipe a user's memory store. Only invoke this when the user has explicitly asked to clear their memories. Response: `{"status": "deleted"}`.
+
+### Error handling
+
+- `400` - your request was bad (missing field, invalid JSON, wrong confirm token). Fix the request and retry.
+- `401` - wrong webhook secret. Configuration bug; surface to the operator.
+- `403` - the chat_id you sent isn't authorized. Use your own chat_id.
+- `503` - the memory system is disabled. Don't retry; surface to the operator. Same status across all four memory endpoints, so a single retry policy covers the disabled case.
+- `500` - on `/api/memory/add` only, the underlying store call failed despite memory being enabled. May be transient; retrying once with a short backoff is reasonable. Persistent 500s should be surfaced to the operator.
+
 ## Issue-First Workflow
 
 For non-trivial work (new features, bug fixes, design changes), create a GitHub issue before opening a PR. This lets the issue triage agent label and categorize the work, and keeps the "why" (issue) separate from the "how" (PR).
