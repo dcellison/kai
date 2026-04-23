@@ -436,10 +436,12 @@ class TestKaiAsksBackSignal:
                     line_no=n + 1,
                 )
             )
-        # The single matching prior is at position 21; the assistant
-        # question lands at position 42 (21 + 21 fillers between them),
-        # so the matching prior is exactly one slot OUTSIDE the 20-record
-        # lookback window.
+        # After the insert, the layout is: indices 0-20 (21 noise),
+        # index 21 (matching prior), indices 22-42 (21 more noise),
+        # index 43 (assistant question). The matching prior is 22
+        # slots back from the assistant; the 20-record lookback
+        # window covers indices 23-42, so the prior at index 21 is
+        # 2 slots outside the window.
         records.insert(
             21,
             HistoryRecord(
