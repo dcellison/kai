@@ -574,11 +574,24 @@ def read_history(data_dir: Path, user_id: str) -> Iterator[HistoryRecord]:
                     parse_reason,
                     ts_raw[:80] if isinstance(ts_raw, str) else "",
                 )
+            # Production JSONL always has integer chat_id, but a hand-
+            # edited or corrupted row could carry a non-numeric value.
+            # Skip the line rather than aborting the run; the docstring
+            # promises malformed rows do not crash the harness.
+            try:
+                chat_id_value = int(row.get("chat_id") or 0)
+            except (TypeError, ValueError):
+                log.debug(
+                    "friction.timestamp_skip path=%s line=%d reason=chat_id_not_integer",
+                    path,
+                    line_no,
+                )
+                continue
             yield HistoryRecord(
                 ts_utc=ts_utc,
                 ts_raw=ts_raw if isinstance(ts_raw, str) else "",
                 direction=str(row.get("dir") or ""),
-                chat_id=int(row.get("chat_id") or 0),
+                chat_id=chat_id_value,
                 text=str(row.get("text") or ""),
                 media=row.get("media") if isinstance(row.get("media"), dict) else None,
                 source_path=str(path),

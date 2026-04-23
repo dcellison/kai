@@ -221,6 +221,21 @@ class TestHistoryReader:
         out = [r.text for r in read_history(tmp_path, "u1")]
         assert out == ["good"]
 
+    def test_non_integer_chat_id_skipped_not_aborted(self, tmp_path: Path):
+        # A row with a non-numeric chat_id is valid JSON, so the parse
+        # guard above lets it through; the int() cast must not crash
+        # the run. The docstring promises malformed rows do not abort.
+        history_dir = tmp_path / "history" / "u1"
+        history_dir.mkdir(parents=True)
+        bad = {"ts": _IN_B, "dir": "user", "chat_id": "corrupted", "text": "bad"}
+        good = _user_msg(_IN_B, "good")
+        (history_dir / "2026-04-18.jsonl").write_text(
+            "\n".join(json.dumps(r) for r in (bad, good)) + "\n",
+            encoding="utf-8",
+        )
+        out = [r.text for r in read_history(tmp_path, "u1")]
+        assert out == ["good"]
+
 
 # ── TestBucketAssignment ────────────────────────────────────────────
 
@@ -466,7 +481,10 @@ class TestKaiAsksBackSignal:
         events = _detect_kai_asks_back(records, tmp_path)
         # Window covers the 20 most recent priors before the assistant
         # record; the matching prior is 22 slots back, outside the cap.
-        assert events == [] or all("outside.jsonl" not in mid for ev in events for mid in ev.context_message_ids)
+        # The disjunctive form would mask a future regression (any
+        # event from any other source would still pass), so assert
+        # no events fire at all.
+        assert events == []
 
     def test_question_mark_detector_handles_closers(self):
         # A question wrapped in quotes ("...?") still counts as a
