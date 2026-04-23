@@ -1262,13 +1262,19 @@ def _pick_qualitative_examples(outcomes: list[ProbeOutcome]) -> dict[str, dict[s
         "clearest_tie": {},
     }
     for o in outcomes:
+        # Independent `if` branches rather than `elif`: each outcome
+        # value is mutually exclusive today, but the reader should not
+        # have to verify that to confirm correctness. The three buckets
+        # are independent slots, and writing them as independent guards
+        # makes that obvious without coupling the branch structure to
+        # the (unrelated) shape of the memory_outcome enum.
         if o.memory_outcome == "memory_wins" and not examples["best_help"]:
             examples["best_help"] = _example_dict(o)
-        elif o.memory_outcome == "memory_loses" and not examples["worst_hurt"]:
+        if o.memory_outcome == "memory_loses" and not examples["worst_hurt"]:
             examples["worst_hurt"] = _example_dict(o)
-        elif o.memory_outcome == "tie" and not examples["clearest_tie"]:
+        if o.memory_outcome == "tie" and not examples["clearest_tie"]:
             examples["clearest_tie"] = _example_dict(o)
-        # Stop scanning once all three are filled — typical case on
+        # Stop scanning once all three are filled; typical case on
         # any non-trivial probe set, and avoids re-walking the list.
         if all(examples.values()):
             break
