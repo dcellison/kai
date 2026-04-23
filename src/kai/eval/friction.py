@@ -882,23 +882,26 @@ def _detect_repeated_fact(records: list[HistoryRecord], data_dir: Path) -> list[
     # Cache shingles only for fact-shape user records; non-fact-shape
     # priors don't qualify as a comparison target (the prior record
     # must itself be a fact-shape match), so there's no point building
-    # their shingle sets. Bounded by the lookback window (see eviction
-    # below), so peak memory is O(_REPEAT_LOOKBACK) entries regardless
-    # of total history length.
+    # their shingle sets. With the eviction below running on every
+    # user record (not just fact-shape ones), peak memory is bounded
+    # at most _REPEAT_LOOKBACK + 1 entries regardless of total
+    # history length.
     shingle_cache: dict[int, set[str]] = {}
     events: list[FrictionEvent] = []
     for pos, idx in enumerate(user_indices):
+        # Evict the entry that just fell out of the lookback window;
+        # nothing later in the loop can read it. This runs BEFORE the
+        # fact-shape check so the eviction fires once per user record
+        # rather than once per fact-shape record - otherwise sparse
+        # fact-shape histories would skip the eviction step on most
+        # iterations and let the cache grow unbounded.
+        evict_pos = pos - _REPEAT_LOOKBACK - 1
+        if evict_pos >= 0:
+            shingle_cache.pop(user_indices[evict_pos], None)
         record = records[idx]
         if not _FACT_SHAPE_RE.search(record.text):
             continue
         shingle_cache[idx] = _shingles(record.text)
-        # Evict the entry that just fell out of the lookback window;
-        # nothing later in the loop can read it. Without this the cache
-        # grows unbounded across a long history, even though only the
-        # last _REPEAT_LOOKBACK entries are ever touched.
-        evict_pos = pos - _REPEAT_LOOKBACK - 1
-        if evict_pos >= 0:
-            shingle_cache.pop(user_indices[evict_pos], None)
         # Walk priors most-recent-first; break on the first qualifying
         # match so the cited prior is the closest in time.
         start = max(0, pos - _REPEAT_LOOKBACK)
