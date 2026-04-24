@@ -53,7 +53,17 @@ log = logging.getLogger(__name__)
 # kept here on the assistant side because moving it would be churn
 # unrelated to spec 360, which removed only the Track 1 user-side
 # symbol set.
-_MAX_ASSISTANT_CHARS = 1000
+#
+# Value chosen for latency, not just budget: Haiku inference time
+# scales roughly linearly with input tokens (~18ms per char observed
+# via scripts/measure-extraction-timing.py with a ~120-char floor for
+# subprocess startup + system prompt cost). At a 1000-char cap, mean
+# extraction was ~28s; at 500 chars, expected mean is ~19-21s. Going
+# lower (300, 200) gets diminishing returns and increases the chance
+# of cutting off facts in the middle of a long assistant response.
+# The user-side cap stays at 2000 because user-stated preferences are
+# the highest-signal input and worth the extra payload cost.
+_MAX_ASSISTANT_CHARS = 500
 
 # Fetch more results than needed from search so we can trim to the
 # token budget after filtering by threshold.
