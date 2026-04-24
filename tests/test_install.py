@@ -1230,7 +1230,7 @@ class TestCmdConfig:
                 effort,  # claude effort level ("" = default "high")
             ]
 
-        # Legacy CLAUDE_USER prompt at install.py:730 is gated on
+        # Legacy CLAUDE_USER prompt in install.py is gated on
         # agent_backend == "claude" by issue #380. The
         # fixture entry is conditional so the input iterator does not
         # carry a surplus value when the prompt is skipped.
