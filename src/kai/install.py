@@ -543,40 +543,53 @@ def _cmd_config() -> None:
     # conversation history. Lower values compact sooner, reducing token
     # usage at the cost of losing raw context earlier. Claude Code caps
     # this at ~83% regardless of what you set - values above that are
-    # silently clamped.
-    while True:
-        autocompact_pct = _prompt(
-            "Autocompact threshold (% of context window, 0 = default ~83%)",
-            existing_env.get("CLAUDE_AUTOCOMPACT_PCT", "80"),
-        )
-        try:
-            val = int(autocompact_pct)
-            if 0 <= val <= 100:
-                break
-        except ValueError:
-            pass
-        print("  Must be 0-100.")
-    print()
+    # silently clamped. Claude-binary specific (CLAUDE_AUTOCOMPACT_PCT
+    # is consumed only by ClaudeCodeBackend per claude.py); Goose has
+    # no autocompact concept, so the prompt is suppressed when goose is
+    # the selected backend. Initialize to "0" first (the dataclass
+    # default) so the env-emission check `int(autocompact_pct) != 0`
+    # below correctly skips writing the var for goose without needing
+    # a parallel gate down at the emission site.
+    autocompact_pct = "0"
+    if agent_backend == "claude":
+        while True:
+            autocompact_pct = _prompt(
+                "Autocompact threshold (% of context window, 0 = default ~83%)",
+                existing_env.get("CLAUDE_AUTOCOMPACT_PCT", "80"),
+            )
+            try:
+                val = int(autocompact_pct)
+                if 0 <= val <= 100:
+                    break
+            except ValueError:
+                pass
+            print("  Must be 0-100.")
+        print()
 
-    # CLAUDE_EFFORT_LEVEL is a truly-global setting (single value applies
-    # to every chat's inner Claude subprocess), so the prompt sits OUT-
-    # SIDE the per-user-vs-global if/else above and runs unconditionally.
-    # This matches the autocompact_pct precedent immediately above.
-    # _prompt_choice enforces the allow-list at wizard time, mirroring
-    # the runtime allow-list check in config._VALID_EFFORT_LEVELS so the
-    # operator cannot persist an invalid value to install.conf and have
-    # it fail later at service startup.
-    # Use the canonical EFFORT_LEVELS tuple from config so the wizard
-    # prompt and the runtime allow-list cannot drift out of sync. Cast
-    # to list because _prompt_choice expects a list (it joins with "/"
-    # for the display string and uses `in` for membership; tuple would
-    # work for both but the type signature asks for list).
-    claude_effort_level = _prompt_choice(
-        "Inner Claude effort level",
-        list(EFFORT_LEVELS),
-        existing_env.get("CLAUDE_EFFORT_LEVEL", "high"),
-    )
-    print()
+    # CLAUDE_EFFORT_LEVEL is consumed only by ClaudeCodeBackend's
+    # `--effort` CLI flag (claude.py); Goose has no equivalent flag,
+    # so the prompt is suppressed when goose is the selected backend.
+    # Initialize to "high" first (matches Config.claude_effort_level
+    # default) so the env-emission check `claude_effort_level != "high"`
+    # below correctly skips writing the var for goose without needing
+    # a parallel gate down at the emission site. _prompt_choice still
+    # enforces the allow-list at wizard time for the claude path,
+    # mirroring the runtime allow-list check in config._VALID_EFFORT_LEVELS
+    # so the operator cannot persist an invalid value to install.conf
+    # and have it fail later at service startup.
+    claude_effort_level = "high"
+    if agent_backend == "claude":
+        # Use the canonical EFFORT_LEVELS tuple from config so the wizard
+        # prompt and the runtime allow-list cannot drift out of sync. Cast
+        # to list because _prompt_choice expects a list (it joins with "/"
+        # for the display string and uses `in` for membership; tuple would
+        # work for both but the type signature asks for list).
+        claude_effort_level = _prompt_choice(
+            "Inner Claude effort level",
+            list(EFFORT_LEVELS),
+            existing_env.get("CLAUDE_EFFORT_LEVEL", "high"),
+        )
+        print()
 
     # -- Webhook server --
     print("-- Webhook server --")
@@ -725,6 +738,16 @@ def _cmd_config() -> None:
         print("  OS user isolation is now per-user. Set 'os_user' in users.yaml.")
         claude_user = ""
     elif admin_os_user:
+        claude_user = ""
+    elif agent_backend != "claude":
+        # CLAUDE_USER is the legacy global fallback for sudo subprocess
+        # isolation. Only ClaudeCodeBackend wires it through (claude.py
+        # invokes `sudo -H -u <user> -- claude ...`). Goose has no sudo
+        # path - GooseBackend in pool.py:186-198 takes no claude_user
+        # kwarg - so the prompt has no meaning when agent_backend is
+        # not claude. Short-circuit to "" here matches the two branches
+        # above, both of which suppress the prompt for the same shape
+        # of "this prompt does not apply" reason.
         claude_user = ""
     else:
         claude_user = _prompt(

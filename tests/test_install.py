@@ -772,7 +772,7 @@ class TestCmdConfig:
                 "",  # github notify chat id (empty)
                 "false",  # voice
                 "false",  # tts
-                "",  # claude user (empty)
+                "",  # claude user (legacy single-user mode)
                 "false",  # memory enabled
                 "",  # perplexity key (empty)
             ]
@@ -925,7 +925,7 @@ class TestCmdConfig:
                 "",  # github notify chat id
                 "false",  # voice
                 "false",  # tts
-                "",  # claude user (empty)
+                "",  # claude user (legacy single-user mode)
                 "false",  # memory enabled
                 "",  # perplexity key (empty)
             ]
@@ -1034,8 +1034,6 @@ class TestCmdConfig:
                 "120",  # timeout
                 "10.0",  # budget
                 "200000",  # max context window
-                "80",  # autocompact pct
-                "",  # claude effort level (take default "high")
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
@@ -1047,7 +1045,6 @@ class TestCmdConfig:
                 "",  # github notify chat id (empty)
                 "false",  # voice
                 "false",  # tts
-                "",  # claude user (empty)
                 "false",  # memory enabled
                 "",  # perplexity key (empty)
             ]
@@ -1090,8 +1087,6 @@ class TestCmdConfig:
                 "120",  # timeout
                 "10.0",  # budget
                 "200000",  # max context window
-                "80",  # autocompact pct
-                "",  # claude effort level (take default "high")
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
@@ -1103,7 +1098,6 @@ class TestCmdConfig:
                 "",  # github notify chat id (empty)
                 "false",  # voice
                 "false",  # tts
-                "",  # claude user (empty)
                 "false",  # memory enabled
                 "",  # perplexity key (empty)
             ]
@@ -1175,15 +1169,60 @@ class TestCmdConfig:
     # ── Memory env var prompts (#343) ─────────────────────────────────
 
     @staticmethod
-    def _base_inputs(memory_block: list[str], effort: str = "") -> list[str]:
-        """Default wizard inputs with a swappable memory block.
+    def _base_inputs(
+        memory_block: list[str],
+        effort: str = "",
+        agent_backend: str = "claude",
+        llm_provider: str = "anthropic",
+        llm_api_key: str = "sk-ant-test-key",
+    ) -> list[str]:
+        """Default wizard inputs with swappable memory block, effort, and backend.
 
         `effort` lets a test exercise a non-default CLAUDE_EFFORT_LEVEL
         without rebuilding the whole input list. Empty string accepts
         the wizard default ("high"); pass any allow-list value (low,
         medium, high, xhigh, max) to drive the non-default emission
         branch in install.py.
+
+        `agent_backend` lets a test exercise the goose path. When set
+        to anything other than "claude", the helper:
+          - Inserts an llm_provider prompt answer (and the API key for
+            non-ollama providers) immediately after the agent_backend
+            slot, matching the wizard's flow for non-claude backends.
+          - Omits the autocompact, effort, and claude_user entries that
+            the wizard now skips for non-claude backends per issue #380.
+        Defaults (anthropic + sk-ant-test-key) are sufficient for the
+        gating tests. For exotic providers, override llm_provider /
+        llm_api_key as needed - or set llm_api_key=None for ollama
+        (which skips the API key prompt).
         """
+        # Wizard prompts for provider + API key only for non-claude
+        # backends. The API key prompt itself is skipped when provider
+        # is "ollama" (local model, no auth).
+        backend_block: list[str] = []
+        if agent_backend != "claude":
+            backend_block.append(llm_provider)
+            if llm_provider != "ollama":
+                backend_block.append(llm_api_key)
+
+        # Autocompact + effort prompts are gated on agent_backend ==
+        # "claude" by issue #380. Their fixture entries are conditional
+        # to match the wizard's runtime conditional.
+        claude_only_pre_webhook: list[str] = []
+        if agent_backend == "claude":
+            claude_only_pre_webhook = [
+                "80",  # autocompact pct
+                effort,  # claude effort level ("" = default "high")
+            ]
+
+        # Legacy CLAUDE_USER prompt at install.py:730 is gated on
+        # agent_backend == "claude" by issue #380 (Change 4). The
+        # fixture entry is conditional so the input iterator does not
+        # carry a surplus value when the prompt is skipped.
+        claude_user_entry: list[str] = []
+        if agent_backend == "claude":
+            claude_user_entry = [""]
+
         return [
             "/opt/kai",  # install dir
             "/var/lib/kai",  # data dir
@@ -1194,13 +1233,13 @@ class TestCmdConfig:
             "admin",  # admin display name
             "false",  # advanced user options
             "polling",  # transport
-            "claude",  # agent backend
+            agent_backend,  # agent backend
+            *backend_block,  # llm_provider + api_key (non-claude only)
             "sonnet",  # model
             "120",  # timeout
             "10.0",  # budget
             "200000",  # max context window
-            "80",  # autocompact pct
-            effort,  # claude effort level ("" = default "high")
+            *claude_only_pre_webhook,  # autocompact + effort (claude only)
             "8080",  # port
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base
@@ -1212,7 +1251,7 @@ class TestCmdConfig:
             "",  # github notify chat id
             "false",  # voice
             "false",  # tts
-            "",  # claude user
+            *claude_user_entry,  # claude user (claude only)
             *memory_block,
             "",  # perplexity key
         ]
@@ -1273,6 +1312,90 @@ class TestCmdConfig:
 
         conf = json.loads((tmp_path / "install.conf").read_text())
         assert conf["env"].get("CLAUDE_EFFORT_LEVEL") == "xhigh"
+
+    def test_goose_backend_skips_claude_only_prompts(self, tmp_path, monkeypatch):
+        """When agent_backend is goose, the Claude-only wizard prompts
+        (autocompact, effort, legacy claude_user) must not fire and the
+        corresponding env keys must not appear in install.conf.
+
+        Pins the gating from issue #380. Without this test, a future
+        refactor that re-introduces an unconditional prompt would slip
+        through silently because every other fixture passes 'claude'.
+
+        Note: the admin_os_user prompt at install.py:382 is NOT gated
+        in this PR (it lives inside the `if advanced:` block, and
+        agent_backend is not yet defined at that point in the wizard).
+        Deferred to the broader multi-backend revisit; tracked in
+        memory as project_multi_backend_revisit_pending.md."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+
+        inputs = iter(self._base_inputs(["false"], agent_backend="goose"))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        conf = json.loads((tmp_path / "install.conf").read_text())
+        env = conf["env"]
+        # The three Claude-only env keys gated by issue #380. Their
+        # absence is the positive signal that the prompts were skipped:
+        # the wizard would have written them on a non-default value,
+        # and the value cannot be set to non-default without the
+        # prompt firing.
+        assert "CLAUDE_AUTOCOMPACT_PCT" not in env
+        assert "CLAUDE_EFFORT_LEVEL" not in env
+        assert "CLAUDE_USER" not in env
+
+        # Sanity: AGENT_BACKEND was emitted (it always is for non-claude).
+        assert env.get("AGENT_BACKEND") == "goose"
+
+    def test_goose_backend_prunes_existing_claude_only_keys(self, tmp_path, monkeypatch):
+        """When the operator switches an existing claude install to
+        goose and re-runs the wizard, the previously-set Claude-only
+        env keys must disappear from install.conf.
+
+        This is an implicit side-effect of the gating in issue #380:
+        the prompt is skipped, the variable stays at its dataclass
+        default, and the existing `if value != default` emission check
+        correctly drops the write. Pinning the auto-prune so a future
+        refactor that adds an `else: keep existing value` fallback to
+        the gate cannot silently regress it."""
+        monkeypatch.chdir(tmp_path)
+        conf_path = tmp_path / "install.conf"
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+
+        # Pre-seed: an install.conf as if the operator had previously
+        # configured the wizard under claude with non-default values
+        # for all three of the env keys gated by this PR.
+        pre_existing = {
+            "version": 1,
+            "env": {
+                "AGENT_BACKEND": "claude",
+                "CLAUDE_AUTOCOMPACT_PCT": "50",
+                "CLAUDE_EFFORT_LEVEL": "xhigh",
+                "CLAUDE_USER": "kai",
+            },
+        }
+        conf_path.write_text(json.dumps(pre_existing))
+
+        # Re-run wizard, switch to goose this time.
+        inputs = iter(self._base_inputs(["false"], agent_backend="goose"))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        conf = json.loads(conf_path.read_text())
+        env = conf["env"]
+        # All three previously-set Claude-only keys must be absent.
+        # AGENT_BACKEND must reflect the new selection.
+        assert "CLAUDE_AUTOCOMPACT_PCT" not in env
+        assert "CLAUDE_EFFORT_LEVEL" not in env
+        assert "CLAUDE_USER" not in env
+        assert env.get("AGENT_BACKEND") == "goose"
 
     def test_memory_enabled_writes_tunables(self, tmp_path, monkeypatch):
         """MEMORY_ENABLED=true with extraction writes the chosen tunables."""
@@ -1445,8 +1568,6 @@ class TestCmdConfig:
                 "120",  # timeout
                 "10.0",  # budget
                 "200000",  # max context window
-                "80",  # autocompact pct
-                "",  # claude effort level (take default "high")
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
@@ -1458,7 +1579,6 @@ class TestCmdConfig:
                 "",  # github notify chat id
                 "false",  # voice
                 "false",  # tts
-                "",  # claude user
                 "true",  # memory enabled (extraction + timeout prompts skipped: non-claude)
                 "2000",  # token budget
                 "10",  # search limit
