@@ -743,8 +743,8 @@ def _cmd_config() -> None:
         # CLAUDE_USER is the legacy global fallback for sudo subprocess
         # isolation. Only ClaudeCodeBackend wires it through (claude.py
         # invokes `sudo -H -u <user> -- claude ...`). Goose has no sudo
-        # path - GooseBackend in pool.py:186-198 takes no claude_user
-        # kwarg - so the prompt has no meaning when agent_backend is
+        # path - GooseBackend takes no claude_user kwarg in pool.py,
+        # so the prompt has no meaning when agent_backend is
         # not claude. Short-circuit to "" here matches the two branches
         # above, both of which suppress the prompt for the same shape
         # of "this prompt does not apply" reason.
