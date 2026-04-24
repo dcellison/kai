@@ -1337,8 +1337,8 @@ class TestCmdConfig:
         refactor that re-introduces an unconditional prompt would slip
         through silently because every other fixture passes 'claude'.
 
-        Note: the admin_os_user prompt at install.py:382 is NOT gated
-        in this PR. It lives inside the `if advanced:` block, and
+        Note: the admin_os_user prompt is NOT gated in this PR. It
+        lives inside the `if advanced:` block in install.py, and
         agent_backend is not yet defined at that point in the wizard;
         honoring the gate would require structural reordering. Deferred
         to a separate cleanup once the broader multi-backend rework
