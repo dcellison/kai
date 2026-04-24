@@ -120,14 +120,21 @@ def get_effective_provider(backend: str, llm_provider: str) -> str:
 
 # Valid values for the inner Claude --effort flag, taken verbatim from
 # `claude --help` output. If Anthropic adds a new tier (e.g. "ultra"),
-# this set must be updated here or otherwise-valid configs will be
-# rejected at config-load time. Pinned as a module-level frozenset so
-# the membership check is O(1) and the values are not re-allocated on
-# every config load. Validation against this set keeps an invalid
-# CLAUDE_EFFORT_LEVEL from reaching the inner-Claude subprocess: a
-# bad value would otherwise cost a full session to discover (the
-# subprocess would fail at startup, not at config load).
-_VALID_EFFORT_LEVELS: frozenset[str] = frozenset({"low", "medium", "high", "xhigh", "max"})
+# update EFFORT_LEVELS here or otherwise-valid configs will be rejected
+# at config-load time. Two shapes intentionally:
+#   - EFFORT_LEVELS (ordered tuple): operator-facing surface. Used in
+#     error messages and wizard prompts so the listing reads as an
+#     intensity progression (low -> max) rather than alphabetical
+#     ('high','low','max','medium','xhigh'), which is what sorted()
+#     on the frozenset would produce and would confuse an operator.
+#   - _VALID_EFFORT_LEVELS (derived frozenset): internal membership
+#     check, O(1). Derived from EFFORT_LEVELS so the two cannot drift.
+# Validation against the frozenset keeps an invalid CLAUDE_EFFORT_LEVEL
+# from reaching the inner-Claude subprocess: a bad value would otherwise
+# cost a full session to discover (the subprocess would fail at startup,
+# not at config load).
+EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+_VALID_EFFORT_LEVELS: frozenset[str] = frozenset(EFFORT_LEVELS)
 
 
 def validate_model_for_provider(model: str, provider: str) -> bool:
@@ -1362,9 +1369,11 @@ def load_config() -> Config:
     # operator-visible behavior consistent across the cluster.
     claude_effort_level = os.environ.get("CLAUDE_EFFORT_LEVEL", "high").strip().lower() or "high"
     if claude_effort_level not in _VALID_EFFORT_LEVELS:
-        raise SystemExit(
-            f"CLAUDE_EFFORT_LEVEL must be one of {sorted(_VALID_EFFORT_LEVELS)}, got {claude_effort_level!r}"
-        )
+        # Use the ordered tuple, not sorted(_VALID_EFFORT_LEVELS) - the
+        # latter would print alphabetically ('high','low','max','medium',
+        # 'xhigh'), which mangles the intensity progression an operator
+        # expects to see in an error string.
+        raise SystemExit(f"CLAUDE_EFFORT_LEVEL must be one of {list(EFFORT_LEVELS)}, got {claude_effort_level!r}")
 
     # PR review agent config
     pr_review_enabled = os.environ.get("PR_REVIEW_ENABLED", "").lower() in ("1", "true", "yes")

@@ -1257,6 +1257,22 @@ class TestClaudeEffortLevel:
         config = load_config()
         assert config.claude_effort_level == "medium"
 
+    def test_whitespace_only_falls_back_to_default(self, monkeypatch):
+        # The `or "high"` fallback in the parser fires only when the
+        # stripped value is empty - i.e. when the env var is set but
+        # contains only whitespace. test_whitespace_stripped above
+        # uses a real value with surrounding whitespace; this case
+        # closes the gap by exercising the fallback branch directly.
+        # Without this test, a regression that dropped the `or "high"`
+        # would let an empty string slip past the strip and hit the
+        # allow-list check, producing a SystemExit instead of the
+        # silent default behavior an operator would expect when the
+        # env var is effectively unset.
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_EFFORT_LEVEL", "   ")
+        config = load_config()
+        assert config.claude_effort_level == "high"
+
 
 # ── Memory extraction config (spec §6.4, §13.1) ─────────────────────
 

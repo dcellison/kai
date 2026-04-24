@@ -94,6 +94,11 @@ class ClaudeCodeBackend(AgentBackend):
         workspace_config: WorkspaceConfig | None = None,
         max_context_window: int = 0,
         autocompact_pct: int = 0,
+        # Default duplicated from Config.claude_effort_level (config.py).
+        # Production calls (pool.py) always pass an explicit value from
+        # config so the duplication is invisible there; the default here
+        # exists so direct ClaudeCodeBackend(...) instantiation in tests
+        # does not have to plumb an effort kwarg. Keep the two in sync.
         claude_effort_level: str = "high",
     ):
         # ABC-required attributes (pool.py reads/writes these)

@@ -40,6 +40,7 @@ from pathlib import Path
 import yaml
 
 from kai.config import (
+    EFFORT_LEVELS,
     MAX_CONTEXT_CEILING,
     OPEN_ENDED_PROVIDERS,
     PROJECT_ROOT,
@@ -565,9 +566,14 @@ def _cmd_config() -> None:
     # the runtime allow-list check in config._VALID_EFFORT_LEVELS so the
     # operator cannot persist an invalid value to install.conf and have
     # it fail later at service startup.
+    # Use the canonical EFFORT_LEVELS tuple from config so the wizard
+    # prompt and the runtime allow-list cannot drift out of sync. Cast
+    # to list because _prompt_choice expects a list (it joins with "/"
+    # for the display string and uses `in` for membership; tuple would
+    # work for both but the type signature asks for list).
     claude_effort_level = _prompt_choice(
         "Inner Claude effort level",
-        ["low", "medium", "high", "xhigh", "max"],
+        list(EFFORT_LEVELS),
         existing_env.get("CLAUDE_EFFORT_LEVEL", "high"),
     )
     print()

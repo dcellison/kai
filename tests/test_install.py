@@ -1175,8 +1175,15 @@ class TestCmdConfig:
     # ── Memory env var prompts (#343) ─────────────────────────────────
 
     @staticmethod
-    def _base_inputs(memory_block: list[str]) -> list[str]:
-        """Default wizard inputs with a swappable memory block."""
+    def _base_inputs(memory_block: list[str], effort: str = "") -> list[str]:
+        """Default wizard inputs with a swappable memory block.
+
+        `effort` lets a test exercise a non-default CLAUDE_EFFORT_LEVEL
+        without rebuilding the whole input list. Empty string accepts
+        the wizard default ("high"); pass any allow-list value (low,
+        medium, high, xhigh, max) to drive the non-default emission
+        branch in install.py.
+        """
         return [
             "/opt/kai",  # install dir
             "/var/lib/kai",  # data dir
@@ -1193,7 +1200,7 @@ class TestCmdConfig:
             "10.0",  # budget
             "200000",  # max context window
             "80",  # autocompact pct
-            "",  # claude effort level (take default "high")
+            effort,  # claude effort level ("" = default "high")
             "8080",  # port
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base
@@ -1225,6 +1232,47 @@ class TestCmdConfig:
         conf = json.loads((tmp_path / "install.conf").read_text())
         for key in conf["env"]:
             assert not key.startswith("MEMORY_"), f"unexpected memory key: {key}"
+
+    def test_effort_level_default_omits_env_key(self, tmp_path, monkeypatch):
+        """The CLAUDE_EFFORT_LEVEL env key is omitted when the operator
+        accepts the wizard default. install.conf is meant to be a delta
+        from defaults, so the absence of the key is the positive signal
+        that nothing was overridden. Pairs with the non-default test
+        below to pin both sides of the emission branch in install.py."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+
+        inputs = iter(self._base_inputs(["false"], effort=""))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        conf = json.loads((tmp_path / "install.conf").read_text())
+        assert "CLAUDE_EFFORT_LEVEL" not in conf["env"]
+
+    def test_effort_level_non_default_writes_env_key(self, tmp_path, monkeypatch):
+        """A non-default CLAUDE_EFFORT_LEVEL must round-trip from the
+        wizard prompt into install.conf. Closes the gap noted in PR
+        review: previously every test took the default, leaving the
+        emission branch (`if claude_effort_level != "high": env[...] =`)
+        untested as a positive case. xhigh is chosen because it is
+        unambiguously non-default and is also the value used by the
+        unit test in tests/test_claude.py for the matching subprocess
+        side, keeping a single non-default value across both layers."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+
+        inputs = iter(self._base_inputs(["false"], effort="xhigh"))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        conf = json.loads((tmp_path / "install.conf").read_text())
+        assert conf["env"].get("CLAUDE_EFFORT_LEVEL") == "xhigh"
 
     def test_memory_enabled_writes_tunables(self, tmp_path, monkeypatch):
         """MEMORY_ENABLED=true with extraction writes the chosen tunables."""
