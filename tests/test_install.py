@@ -1182,7 +1182,9 @@ class TestCmdConfig:
         without rebuilding the whole input list. Empty string accepts
         the wizard default ("high"); pass any allow-list value (low,
         medium, high, xhigh, max) to drive the non-default emission
-        branch in install.py.
+        branch in install.py. Only meaningful when agent_backend is
+        "claude" - passing effort with another backend raises
+        ValueError to prevent silent no-ops.
 
         `agent_backend` lets a test exercise the goose path. When set
         to anything other than "claude", the helper:
@@ -1192,10 +1194,23 @@ class TestCmdConfig:
           - Omits the autocompact, effort, and claude_user entries that
             the wizard now skips for non-claude backends per issue #380.
         Defaults (anthropic + sk-ant-test-key) are sufficient for the
-        gating tests. For exotic providers, override llm_provider /
-        llm_api_key as needed - or set llm_api_key=None for ollama
-        (which skips the API key prompt).
+        gating tests. For ollama, the API key prompt is skipped by the
+        wizard, so the llm_api_key default is harmless and unused (no
+        need to override it).
         """
+        # Guard against silent no-ops: a caller passing effort="xhigh"
+        # with a non-claude backend would expect the value to land in
+        # the wizard's effort prompt, but that prompt does not fire for
+        # non-claude backends (gated by issue #380). Raise loudly here
+        # rather than silently dropping the value, which would be a
+        # confusing failure mode for a future test author.
+        if agent_backend != "claude" and effort:
+            raise ValueError(
+                f"_base_inputs: effort={effort!r} is ignored for non-claude "
+                f"backend ({agent_backend!r}). The wizard does not prompt for "
+                f"effort under non-claude backends. Pass effort only with "
+                f"agent_backend='claude'."
+            )
         # Wizard prompts for provider + API key only for non-claude
         # backends. The API key prompt itself is skipped when provider
         # is "ollama" (local model, no auth).
@@ -1323,10 +1338,11 @@ class TestCmdConfig:
         through silently because every other fixture passes 'claude'.
 
         Note: the admin_os_user prompt at install.py:382 is NOT gated
-        in this PR (it lives inside the `if advanced:` block, and
-        agent_backend is not yet defined at that point in the wizard).
-        Deferred to the broader multi-backend revisit; tracked in
-        memory as project_multi_backend_revisit_pending.md."""
+        in this PR. It lives inside the `if advanced:` block, and
+        agent_backend is not yet defined at that point in the wizard;
+        honoring the gate would require structural reordering. Deferred
+        to a separate cleanup once the broader multi-backend rework
+        revisits the wizard end-to-end."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
