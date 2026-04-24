@@ -879,6 +879,11 @@ async def _handle_generic(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         return web.Response(status=400, text="Invalid JSON")
 
+    # Reject non-object JSON shapes (null, lists, scalars, strings) before
+    # any payload.get() call. See _handle_schedule for the shared rationale.
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "Request body must be a JSON object"}, status=400)
+
     # Use the "message" field if present (including empty string),
     # otherwise dump the full JSON. `is not None` avoids treating "" as absent.
     msg = payload.get("message")
@@ -1002,6 +1007,14 @@ async def _handle_schedule(request: web.Request) -> web.Response:
         payload = await request.json()
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    # Reject non-object JSON shapes (null, lists, scalars, strings) before
+    # any payload.get() call. JSON bodies like `null`, `[]`, `42`, or
+    # `"string"` parse successfully (no JSONDecodeError) but raise
+    # AttributeError on .get(), which would escape as an unstyled HTML
+    # 500 traceback instead of a clean JSON 400.
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "Request body must be a JSON object"}, status=400)
 
     # Extract and validate required fields
     name = payload.get("name")
@@ -1193,6 +1206,14 @@ async def _handle_update_job(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
 
+    # Reject non-object JSON shapes (null, lists, scalars, strings) before
+    # any payload.get() call. JSON bodies like `null`, `[]`, `42`, or
+    # `"string"` parse successfully (no JSONDecodeError) but raise
+    # AttributeError on .get(), which would escape as an unstyled HTML
+    # 500 traceback instead of a clean JSON 400.
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "Request body must be a JSON object"}, status=400)
+
     # Validate schedule_type if provided
     new_schedule_type = payload.get("schedule_type")
     if new_schedule_type and new_schedule_type not in _VALID_SCHEDULE_TYPES:
@@ -1290,12 +1311,21 @@ async def _handle_service_call(request: web.Request) -> web.Response:
     # Extract service name from URL path
     service_name = request.match_info["name"]
 
-    # Parse optional JSON body with request parameters
+    # Parse optional JSON body with request parameters. The body is
+    # genuinely optional here (services with no JSON-body config still
+    # work), so JSONDecodeError is silently treated as "no body provided"
+    # and the field defaults stay in effect. A non-object JSON value
+    # (null, lists, scalars, strings) is treated as a structural error
+    # and rejected with 400, matching the other handlers - silently
+    # accepting `null` as "no body" would mask client bugs that send a
+    # malformed body intending to send fields.
     body = None
     params = None
     path_suffix = ""
     try:
         payload = await request.json()
+        if not isinstance(payload, dict):
+            return web.json_response({"error": "Request body must be a JSON object"}, status=400)
         body = payload.get("body")
         params = payload.get("params")
         path_suffix = payload.get("path_suffix", "")
@@ -1337,6 +1367,14 @@ async def _handle_send_message(request: web.Request) -> web.Response:
         payload = await request.json()
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    # Reject non-object JSON shapes (null, lists, scalars, strings) before
+    # any payload.get() call. JSON bodies like `null`, `[]`, `42`, or
+    # `"string"` parse successfully (no JSONDecodeError) but raise
+    # AttributeError on .get(), which would escape as an unstyled HTML
+    # 500 traceback instead of a clean JSON 400.
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "Request body must be a JSON object"}, status=400)
 
     text = payload.get("text", "").strip()
     if not text:
@@ -1385,6 +1423,14 @@ async def _handle_send_file(request: web.Request) -> web.Response:
         payload = await request.json()
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    # Reject non-object JSON shapes (null, lists, scalars, strings) before
+    # any payload.get() call. JSON bodies like `null`, `[]`, `42`, or
+    # `"string"` parse successfully (no JSONDecodeError) but raise
+    # AttributeError on .get(), which would escape as an unstyled HTML
+    # 500 traceback instead of a clean JSON 400.
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "Request body must be a JSON object"}, status=400)
 
     file_path = payload.get("path")
     if not file_path:
@@ -1524,6 +1570,14 @@ async def _handle_memory_add(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
 
+    # Reject non-object JSON shapes (null, lists, scalars, strings) before
+    # any payload.get() call. JSON bodies like `null`, `[]`, `42`, or
+    # `"string"` parse successfully (no JSONDecodeError) but raise
+    # AttributeError on .get(), which would escape as an unstyled HTML
+    # 500 traceback instead of a clean JSON 400.
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "Request body must be a JSON object"}, status=400)
+
     # Required-field validation runs BEFORE the is_enabled() precheck so
     # callers learn about bad-input bugs even when memory is off. Without
     # this ordering, a caller debugging a missing-field bug while memory
@@ -1642,6 +1696,14 @@ async def _handle_memory_search(request: web.Request) -> web.Response:
         payload = await request.json()
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    # Reject non-object JSON shapes (null, lists, scalars, strings) before
+    # any payload.get() call. JSON bodies like `null`, `[]`, `42`, or
+    # `"string"` parse successfully (no JSONDecodeError) but raise
+    # AttributeError on .get(), which would escape as an unstyled HTML
+    # 500 traceback instead of a clean JSON 400.
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "Request body must be a JSON object"}, status=400)
 
     # Same isinstance-before-.strip() rationale as _handle_memory_add:
     # a non-string `query` from JSON would raise AttributeError on .strip()
@@ -1796,6 +1858,14 @@ async def _handle_memory_delete_all(request: web.Request) -> web.Response:
         payload = await request.json()
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    # Reject non-object JSON shapes (null, lists, scalars, strings) before
+    # any payload.get() call. JSON bodies like `null`, `[]`, `42`, or
+    # `"string"` parse successfully (no JSONDecodeError) but raise
+    # AttributeError on .get(), which would escape as an unstyled HTML
+    # 500 traceback instead of a clean JSON 400.
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "Request body must be a JSON object"}, status=400)
 
     # Confirm-token check before chat_id resolution: a request with the
     # wrong token is structurally bad input regardless of which user it

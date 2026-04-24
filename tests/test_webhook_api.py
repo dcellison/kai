@@ -2756,3 +2756,87 @@ class TestMemoryDeleteAll:
 
         assert resp.status == 403
         mock_del.assert_not_called()
+
+
+# ── Cross-handler payload-shape rejection (issue #377) ────────────────
+
+
+# Every JSON-body handler must reject non-object JSON shapes (null,
+# lists, scalars, strings) with a clean 400 instead of crashing on
+# AttributeError when the next payload.get() is called. This grew out
+# of a PR #376 review suggestion: the existing `try: payload =
+# await request.json() except json.JSONDecodeError` guard catches
+# malformed JSON only - valid JSON that happens to be `null`, `[]`,
+# `42`, or `"string"` parses successfully and then escapes as an
+# unstyled HTML 500 traceback the moment a `.get()` runs.
+#
+# The fix is one isinstance check after the existing JSONDecodeError
+# guard, applied uniformly across all 9 handlers. These tests pin the
+# rejection at every handler so a future refactor that drops the check
+# at any one site fails loudly here.
+
+# (handler_func, fixture_overrides) tuples for each in-scope handler.
+# fixture_overrides is a callable that takes the mock_request and
+# applies any handler-specific setup needed to reach the isinstance
+# check (e.g., match_info["name"] for service_call). Keep the override
+# minimal - the goal is to reach the isinstance check, not to exercise
+# the rest of the handler.
+_NON_OBJECT_HANDLERS = [
+    pytest.param(_handle_generic, lambda r: None, id="generic"),
+    pytest.param(_handle_schedule, lambda r: None, id="schedule"),
+    pytest.param(
+        _handle_update_job,
+        lambda r: r.match_info.update({"id": "1"}),
+        id="update_job",
+    ),
+    pytest.param(
+        _handle_service_call,
+        lambda r: r.match_info.update({"name": "perplexity"}),
+        id="service_call",
+    ),
+    pytest.param(_handle_send_message, lambda r: None, id="send_message"),
+    pytest.param(_handle_send_file, lambda r: None, id="send_file"),
+    pytest.param(_handle_memory_add, lambda r: None, id="memory_add"),
+    pytest.param(_handle_memory_search, lambda r: None, id="memory_search"),
+    pytest.param(_handle_memory_delete_all, lambda r: None, id="memory_delete_all"),
+]
+
+# Non-object JSON shapes the handlers must reject. `True` is included
+# because Python's `bool` is a subclass of `int`, so a True payload
+# would pass an `isinstance(payload, int)` check that someone might
+# someday be tempted to write - covers the bool/int subclass footgun.
+_NON_OBJECT_PAYLOADS = [
+    pytest.param(None, id="null"),
+    pytest.param([], id="empty_list"),
+    pytest.param([1, 2, 3], id="non_empty_list"),
+    pytest.param(42, id="int"),
+    pytest.param("a string", id="string"),
+    pytest.param(True, id="bool"),
+]
+
+
+class TestNonObjectPayloadRejection:
+    """Issue #377: every JSON-body handler must reject non-object
+    JSON shapes with 400 instead of crashing on AttributeError."""
+
+    @pytest.mark.parametrize("payload", _NON_OBJECT_PAYLOADS)
+    @pytest.mark.parametrize("handler, override", _NON_OBJECT_HANDLERS)
+    async def test_non_object_payload_returns_400(self, mock_request, handler, override, payload):
+        # Apply the handler-specific override (e.g., match_info) to reach
+        # the isinstance check. The mock_request fixture already supplies
+        # webhook_secret, telegram_app/bot, chat_id, and match_info as
+        # an empty dict ready for in-place updates.
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value=payload)
+        override(mock_request)
+
+        resp = await handler(mock_request)
+
+        # The isinstance check fires before any handler-specific work
+        # (storage, scheduling, sending), so no kai.memory / sessions /
+        # bot patches are needed. A 400 response confirms the check
+        # caught the bad shape; anything else (200, 500, exception)
+        # means the check is missing or misordered for this handler.
+        assert resp.status == 400, (
+            f"{handler.__name__} accepted non-object payload {payload!r} (status={resp.status}); expected 400"
+        )
