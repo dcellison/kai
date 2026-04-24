@@ -2763,12 +2763,11 @@ class TestMemoryDeleteAll:
 
 # Every JSON-body handler must reject non-object JSON shapes (null,
 # lists, scalars, strings) with a clean 400 instead of crashing on
-# AttributeError when the next payload.get() is called. This grew out
-# of a PR #376 review suggestion: the existing `try: payload =
-# await request.json() except json.JSONDecodeError` guard catches
-# malformed JSON only - valid JSON that happens to be `null`, `[]`,
-# `42`, or `"string"` parses successfully and then escapes as an
-# unstyled HTML 500 traceback the moment a `.get()` runs.
+# AttributeError when the next payload.get() is called. The existing
+# `try: payload = await request.json() except json.JSONDecodeError`
+# guard catches malformed JSON only - valid JSON that happens to be
+# `null`, `[]`, `42`, or `"string"` parses successfully and then
+# escapes as an unstyled HTML 500 traceback the moment a `.get()` runs.
 #
 # The fix is one isinstance check after the existing JSONDecodeError
 # guard, applied uniformly across all 9 handlers. These tests pin the
@@ -2816,8 +2815,8 @@ _NON_OBJECT_PAYLOADS = [
 
 
 class TestNonObjectPayloadRejection:
-    """Issue #377: every JSON-body handler must reject non-object
-    JSON shapes with 400 instead of crashing on AttributeError."""
+    """Every JSON-body handler must reject non-object JSON shapes with
+    400 instead of crashing on AttributeError."""
 
     @pytest.mark.parametrize("payload", _NON_OBJECT_PAYLOADS)
     @pytest.mark.parametrize("handler, override", _NON_OBJECT_HANDLERS)

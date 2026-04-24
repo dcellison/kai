@@ -880,7 +880,10 @@ async def _handle_generic(request: web.Request) -> web.Response:
         return web.Response(status=400, text="Invalid JSON")
 
     # Reject non-object JSON shapes (null, lists, scalars, strings) before
-    # any payload.get() call. See _handle_schedule for the shared rationale.
+    # any payload.get() call. JSON bodies like `null`, `[]`, `42`, or
+    # `"string"` parse successfully (no JSONDecodeError) but raise
+    # AttributeError on .get(), which would escape as an unstyled HTML
+    # 500 traceback instead of a clean JSON 400.
     if not isinstance(payload, dict):
         return web.json_response({"error": "Request body must be a JSON object"}, status=400)
 
