@@ -2095,8 +2095,9 @@ class TestPayloadSizeBound:
         assistant_text = _capped_assistant("a" * memory._MAX_ASSISTANT_CHARS)
         payload = _build_extraction_payload(user_text, assistant_text, cands)
         # 8 * ~600 (candidate line) + 2000 (user) + 500 (assistant) +
-        # template overhead ~< 200 = roughly 7500 ceiling. Assertion
-        # bound stays at 8000 to leave headroom for minor template
-        # changes; tightening it would couple this test to the
-        # template's exact byte-count rather than its order-of-magnitude.
-        assert len(payload) < 8000
+        # template overhead ~< 200 = roughly 7500 ceiling. Bound is
+        # 7800 to leave ~300 chars of headroom for minor template
+        # tweaks (a section header, a wrapper line) while still
+        # catching any future change that grows the payload by
+        # hundreds of chars.
+        assert len(payload) < 7800
