@@ -94,6 +94,7 @@ class ClaudeCodeBackend(AgentBackend):
         workspace_config: WorkspaceConfig | None = None,
         max_context_window: int = 0,
         autocompact_pct: int = 0,
+        claude_effort_level: str = "high",
     ):
         # ABC-required attributes (pool.py reads/writes these)
         self.model = model
@@ -103,6 +104,15 @@ class ClaudeCodeBackend(AgentBackend):
         self.timeout_seconds = timeout_seconds
         self.workspace_config = workspace_config
         self.max_context_window = max_context_window
+        # Effort level for the inner Claude --effort flag. Stored on the
+        # instance so the value is fixed for the life of the subprocess
+        # rather than re-read from config on every claude_cmd build, and
+        # so subclasses / tests can override it without monkey-patching
+        # config. No _default_claude_effort_level shadow because there
+        # is no workspace-level override path that would need to restore
+        # a default after a /workspace switch (see workspace_config block
+        # below for the pattern that DOES need a default shadow).
+        self.claude_effort_level = claude_effort_level
         self.provider = "anthropic"  # Claude CLI always uses Anthropic
 
         # Claude-Code-specific attributes (not on the ABC)
@@ -191,6 +201,19 @@ class ClaudeCodeBackend(AgentBackend):
             "--verbose",
             "--model",
             self.model,
+            # Effort level controls how many reasoning tokens Claude spends
+            # per turn. Passed as a CLI flag (verified against `claude --help`)
+            # rather than via the --settings JSON path below, because CLI
+            # flags fail loudly on typo at subprocess startup while the
+            # --settings JSON path is reserved for keys that have no
+            # dedicated CLI entry. Future maintainer: do NOT migrate this
+            # into the --settings JSON without first re-verifying the key
+            # name against `claude --help`. The value is validated at
+            # config load (config.py _VALID_EFFORT_LEVELS) so by the time
+            # it reaches this point it is guaranteed to be one of the
+            # five accepted strings.
+            "--effort",
+            self.claude_effort_level,
             "--permission-mode",
             "bypassPermissions",
             "--max-budget-usd",

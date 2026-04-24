@@ -42,6 +42,7 @@ _CONFIG_ENV_VARS = [
     "GITHUB_NOTIFY_CHAT_ID",
     "CLAUDE_MAX_CONTEXT_WINDOW",
     "CLAUDE_AUTOCOMPACT_PCT",
+    "CLAUDE_EFFORT_LEVEL",
     "TOTP_SESSION_MINUTES",
     "TOTP_CHALLENGE_SECONDS",
     "TOTP_LOCKOUT_ATTEMPTS",
@@ -1186,6 +1187,75 @@ class TestLegacyEnvOnlyMode:
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             load_config()
         assert "deprecated" not in caplog.text.lower()
+
+
+# ── CLAUDE_EFFORT_LEVEL config ───────────────────────────────────────
+
+
+class TestClaudeEffortLevel:
+    """Coverage for the CLAUDE_EFFORT_LEVEL env var: a single global
+    string validated against a hard-coded allow-list pulled from
+    `claude --help` output. Default "high" is intentional - it must
+    match the operator's outer-Claude default so user-isolated inner
+    Claude (CLAUDE_USER / users.yaml `os_user`) does not silently
+    fall to whatever the binary picks as its own default. Tests here
+    cover happy path, allow-list rejection, and the two normalization
+    behaviors (case + whitespace) that exist to absorb common copy-
+    paste shapes from .env files."""
+
+    def test_default_when_unset(self, monkeypatch):
+        # Default "high" applies when the env var is not set at all.
+        # Critical because operators on existing installs will deploy
+        # without setting CLAUDE_EFFORT_LEVEL and must get the same
+        # reasoning quality as before this PR landed.
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.claude_effort_level == "high"
+
+    def test_valid_value_parses(self, monkeypatch):
+        # All five allow-list values must round-trip cleanly. If the
+        # `claude --help` output ever adds a value, this list (and the
+        # _VALID_EFFORT_LEVELS frozenset in config.py) must be updated
+        # together; failing one without the other would silently
+        # reject otherwise-valid configs at load time.
+        _set_required(monkeypatch)
+        for value in ["low", "medium", "high", "xhigh", "max"]:
+            monkeypatch.setenv("CLAUDE_EFFORT_LEVEL", value)
+            config = load_config()
+            assert config.claude_effort_level == value, f"value {value!r} did not round-trip"
+
+    def test_invalid_value_raises(self, monkeypatch):
+        # Anything outside the allow-list must SystemExit at config load,
+        # not silently fall through to the inner-Claude subprocess. A
+        # subprocess-level rejection would burn an entire chat session
+        # before the operator saw the error; the allow-list check fails
+        # at startup before any chat is served.
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_EFFORT_LEVEL", "extreme")
+        with pytest.raises(SystemExit, match="CLAUDE_EFFORT_LEVEL"):
+            load_config()
+
+    def test_uppercase_normalized(self, monkeypatch):
+        # `.lower()` in the parser must accept "HIGH" / "Medium" / etc.
+        # Without normalization, mixed case copied from docs or upper-
+        # cased by an operator's editor would be silently rejected, and
+        # the rejection reason ("not in allow-list") would be opaque
+        # because the values look identical to a casual reader.
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_EFFORT_LEVEL", "HIGH")
+        config = load_config()
+        assert config.claude_effort_level == "high"
+
+    def test_whitespace_stripped(self, monkeypatch):
+        # `.strip()` must absorb surrounding whitespace from copy-paste
+        # of .env entries (a common source of "value looks right but is
+        # rejected" footguns). Same reason as the case test: prevents
+        # an opaque allow-list rejection on a value that visually
+        # matches an allowed one.
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_EFFORT_LEVEL", "  medium  ")
+        config = load_config()
+        assert config.claude_effort_level == "medium"
 
 
 # ── Memory extraction config (spec §6.4, §13.1) ─────────────────────

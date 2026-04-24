@@ -368,6 +368,52 @@ class TestCommandConstruction:
             env = mock_exec.call_args[1]["env"]
             assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in env
 
+    @pytest.mark.asyncio
+    async def test_effort_flag_default_in_cmd(self):
+        """--effort high is always present in the command, even when no
+        explicit value is passed. The default at the kwarg layer must
+        propagate to the subprocess so user-isolated installs do not
+        silently fall to the claude binary's own internal default."""
+        claude = _make_claude()
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            cmd = mock_exec.call_args[0]
+            # `--effort` must appear with its value at the next index.
+            # Asserting adjacency catches a regression where the flag
+            # name and value get separated by an inserted arg.
+            assert "--effort" in cmd, f"--effort missing from cmd: {cmd}"
+            idx = cmd.index("--effort")
+            assert cmd[idx + 1] == "high", f"expected default 'high', got {cmd[idx + 1]!r}"
+
+    @pytest.mark.asyncio
+    async def test_effort_flag_custom_value_in_cmd(self):
+        """A non-default effort_level threads from the constructor kwarg
+        into the subprocess command line. This is the contract that the
+        whole config -> pool -> backend -> subprocess plumbing exists
+        to satisfy; if it breaks, operator-set CLAUDE_EFFORT_LEVEL
+        becomes a silent no-op."""
+        claude = _make_claude(claude_effort_level="xhigh")
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            cmd = mock_exec.call_args[0]
+            assert "--effort" in cmd
+            idx = cmd.index("--effort")
+            assert cmd[idx + 1] == "xhigh"
+
 
 # ── Process signal handling ──────────────────────────────────────────
 

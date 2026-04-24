@@ -760,6 +760,7 @@ class TestCmdConfig:
                 "10.0",  # budget
                 "200000",  # max context window
                 "80",  # autocompact pct
+                "",  # claude effort level (take default "high")
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
@@ -833,6 +834,7 @@ class TestCmdConfig:
                 "10.0",  # budget
                 "200000",  # max context window
                 "80",  # autocompact pct
+                "",  # claude effort level (take default "high")
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
@@ -911,6 +913,7 @@ class TestCmdConfig:
                 "10.0",  # budget
                 "200000",  # max context window
                 "80",  # autocompact pct
+                "",  # claude effort level (take default "high")
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
@@ -974,6 +977,7 @@ class TestCmdConfig:
                 "10.0",
                 "200000",
                 "80",
+                "",  # claude effort level (take default "high")
                 "8080",
                 "test-secret",
                 "~/Projects",
@@ -1031,6 +1035,7 @@ class TestCmdConfig:
                 "10.0",  # budget
                 "200000",  # max context window
                 "80",  # autocompact pct
+                "",  # claude effort level (take default "high")
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
@@ -1086,6 +1091,7 @@ class TestCmdConfig:
                 "10.0",  # budget
                 "200000",  # max context window
                 "80",  # autocompact pct
+                "",  # claude effort level (take default "high")
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
@@ -1187,6 +1193,7 @@ class TestCmdConfig:
             "10.0",  # budget
             "200000",  # max context window
             "80",  # autocompact pct
+            "",  # claude effort level (take default "high")
             "8080",  # port
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base
@@ -1391,6 +1398,7 @@ class TestCmdConfig:
                 "10.0",  # budget
                 "200000",  # max context window
                 "80",  # autocompact pct
+                "",  # claude effort level (take default "high")
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base

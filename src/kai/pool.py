@@ -215,6 +215,7 @@ class SubprocessPool:
             workspace_config=ws_config,
             max_context_window=context_window,
             autocompact_pct=self._config.claude_autocompact_pct,
+            claude_effort_level=self._config.claude_effort_level,
         )
 
     # ── Prompt routing ──────────────────────────────────────────────
