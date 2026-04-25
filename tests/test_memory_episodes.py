@@ -357,6 +357,34 @@ class TestStage2Trigger:
         # cancels it on teardown.
 
     @pytest.mark.asyncio
+    async def test_stage2_task_is_named_for_incident_triage(self, monkeypatch):
+        """The stage-2 task carries an asyncio name that includes the
+        user_id, so an operator dumping `asyncio.all_tasks()` during
+        an incident can identify in-flight stage-2 work and the user
+        it belongs to. Without the name, the task shows up as `Task-N`
+        with no provenance hint. This is a secondary affordance; the
+        `_pending_episode_tasks` set is the primary operational tool."""
+
+        async def _slow_stage2(**kwargs):
+            await asyncio.sleep(5)  # long enough to inspect task list
+
+        monkeypatch.setattr(memory_extraction, "_generate_episode", _slow_stage2)
+
+        async def _fake_exec(*args, **kwargs):
+            return _make_proc(stdout=_stage1_envelope(facts=[], has_episode=True))
+
+        monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
+
+        await extract_and_store("hi", "hello", user_id="alice-42", config=_cfg())
+
+        # The pending-tasks set is the contract; pick the task and
+        # check its name. Asserts user_id round-trips into the name
+        # so a future change that strips the user_id would surface.
+        pending = list(memory_extraction._pending_episode_tasks)
+        assert len(pending) == 1
+        assert pending[0].get_name() == "episode-alice-42"
+
+    @pytest.mark.asyncio
     async def test_stage2_scheduled_after_store_facts(self, monkeypatch):
         """Spec §5.1 invariant: stage-2 spawn happens AFTER _store_facts
         returns so stage-1 facts are durably stored before stage 2 is

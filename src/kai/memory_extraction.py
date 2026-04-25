@@ -1838,6 +1838,14 @@ async def extract_and_store(
             # Acceptable because episodes are about cumulative pattern
             # recall over many sessions, not per-turn recall within one.
             if result.has_episode:
+                # Name the task so an operator dumping
+                # `asyncio.all_tasks()` during incident triage can
+                # immediately identify in-flight stage-2 work and the
+                # user it belongs to. Without a name, the task shows
+                # up as `Task-N` with no provenance hint. The
+                # `_pending_episode_tasks` set is the primary
+                # operational tool here; the name is a secondary
+                # affordance for ad-hoc debugging.
                 ep_task = asyncio.create_task(
                     _generate_episode(
                         user_text=user_text,
@@ -1845,7 +1853,8 @@ async def extract_and_store(
                         user_id=user_id,
                         session_id=session_id,
                         config=config,
-                    )
+                    ),
+                    name=f"episode-{user_id}",
                 )
                 _pending_episode_tasks.add(ep_task)
                 ep_task.add_done_callback(_pending_episode_tasks.discard)
