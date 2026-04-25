@@ -1349,14 +1349,28 @@ async def _generate_episode(
     serialize. Stage 1 calls for the same user proceed in parallel
     because stage 2 is by design out-of-band.
     """
-    start = time.monotonic()
     sem = _get_episode_semaphore(user_id)
+    # Pre-acquire fallback so the post-try _emit_episode_log call
+    # always has a usable timestamp, even if `async with sem` itself
+    # raises (extremely unlikely, but the broad except below catches
+    # it). The in-acquire reassignment is the value used on every
+    # successful path.
+    start = time.monotonic()
     outcome: str = "store_failed"
     memory_id: str | None = None
     cost_usd: float = 0.0
     reason: str | None = None
     try:
         async with sem:
+            # Restart the clock AFTER acquiring the per-user semaphore
+            # so `duration_ms` in the memory.episode log line reflects
+            # actual generation latency, not time spent queued behind
+            # a prior in-flight stage-2 call for the same user. Mirrors
+            # stage 1's pattern in extract_and_store. Under the typical
+            # one-in-flight-per-user case the delta is negligible; the
+            # restart matters when episode-worthy turns arrive in
+            # quick succession and the second waits on the first.
+            start = time.monotonic()
             payload = _build_episode_payload(user_text, assistant_text)
             episode, cost_usd, run_reason = await _run_episode_extractor(payload, config)
             if episode is None:

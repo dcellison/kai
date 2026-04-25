@@ -468,6 +468,59 @@ class TestStage2Isolation:
         assert payload["duration_ms"] >= 0
 
     @pytest.mark.asyncio
+    async def test_stage2_duration_ms_excludes_semaphore_wait(self, monkeypatch, caplog):
+        """duration_ms in the memory.episode log must reflect actual
+        stage-2 generation latency, NOT time spent queued behind a
+        prior in-flight stage-2 call for the same user. If the clock
+        starts before the semaphore acquire, the second call's
+        duration includes wait time and operators watching production
+        latency see queue contention as slow generations.
+
+        Forces the failure mode: hold the user's episode semaphore for
+        300ms, fire a no-op stage-2 call, assert the logged duration is
+        well under the 300ms wait time."""
+        # Pre-seize the semaphore so the next _generate_episode call
+        # blocks for at least 300ms before it starts running.
+        sem = memory_extraction._get_episode_semaphore("u1")
+        await sem.acquire()
+
+        async def _release_after_delay():
+            await asyncio.sleep(0.30)
+            sem.release()
+
+        # Stub the subprocess so the in-acquire body runs near-instantly.
+        async def _fake_exec(*args, **kwargs):
+            return _make_proc(stdout=_stage2_envelope(_valid_episode(), cost_usd=0.01))
+
+        monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
+        monkeypatch.setattr(memory_extraction.memory, "add_structured", lambda *a, **kw: "fake-id")
+
+        release_task = asyncio.create_task(_release_after_delay())
+        with caplog.at_level(logging.INFO, logger="kai.memory_extraction"):
+            await _generate_episode(
+                user_text="u",
+                assistant_text="a",
+                user_id="u1",
+                session_id=None,
+                config=_cfg(),
+            )
+        await release_task
+
+        records = [r for r in caplog.records if r.message.startswith("memory.episode ")]
+        assert len(records) == 1
+        payload = json.loads(records[0].message[len("memory.episode ") :])
+        # The 300ms wait must NOT show up in duration_ms. Generation
+        # itself is a sub-millisecond stub, so anything above ~250ms
+        # means the clock started too early. Bound is loose to absorb
+        # event-loop scheduling jitter on slow CI hosts; the failure
+        # mode (clock pre-acquire) would push duration_ms past 290ms.
+        assert payload["duration_ms"] < 250, (
+            f"duration_ms={payload['duration_ms']} suggests semaphore "
+            f"wait leaked into the timing window (expected sub-50ms "
+            f"for the stub, got most of the 300ms wait)"
+        )
+
+    @pytest.mark.asyncio
     async def test_stage2_is_error_envelope_maps_to_subprocess_error(self, monkeypatch, caplog):
         """Budget exhaustion (and any other CLI is_error condition) must
         map to outcome=subprocess_error, NOT parse_error. Pre-fix this
