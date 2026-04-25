@@ -67,7 +67,7 @@ def _cfg(**overrides) -> Config:
         "memory_extraction_timeout_s": 60,
         "memory_consolidation_candidates_n": 0,
         "memory_episode_model": "claude-haiku-4-5-20251001",
-        "memory_episode_budget_usd": 0.05,
+        "memory_episode_budget_usd": 0.15,
         "memory_episode_timeout_s": 120,
     }
     defaults.update(overrides)
@@ -533,7 +533,7 @@ class TestStage2Isolation:
             {
                 "is_error": True,
                 "subtype": "error_max_budget_usd",
-                "total_cost_usd": 0.05,
+                "total_cost_usd": 0.15,
                 "structured_output": {"episode": _valid_episode()},
             }
         ).encode("utf-8")
@@ -561,8 +561,10 @@ class TestStage2Isolation:
         assert payload["reason"] is not None
         assert "error_max_budget_usd" in payload["reason"]
         # Cost_usd is captured from the envelope even on the error path
-        # so budget tracking still sees the burn.
-        assert payload["cost_usd"] == 0.05
+        # so budget tracking still sees the burn. Value matches the
+        # Sonnet-sized 0.15 dataclass default to make the budget-burn
+        # scenario read as realistic for the recommended model.
+        assert payload["cost_usd"] == 0.15
 
     @pytest.mark.asyncio
     async def test_stage2_unexpected_exception_caught(self, monkeypatch, caplog):

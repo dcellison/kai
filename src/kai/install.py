@@ -837,14 +837,30 @@ def _cmd_config() -> None:
                 # classifier comes from stage 1's output). Operators
                 # who disable extraction also disable episodes; those
                 # tunables would otherwise be wizard noise.
+                #
+                # Wizard recommends Sonnet for stage 2 even though the
+                # config dataclass default falls back to the extraction
+                # model (Haiku). Reasoning: stage 2 runs out-of-band so
+                # latency does not reach the user, and on a Max-plan
+                # OAuth subscription headless `claude --print` calls do
+                # not bill per-token, so the only reason to keep Haiku
+                # for stage 2 was historical (cost-asymmetry framing
+                # that does not apply to Kai's deployment shape).
+                # Narrative quality across the 7-8 Sophia episode
+                # fields is exactly the regime where Sonnet pulls ahead
+                # of Haiku, so the default the operator sees should
+                # reflect that. The dataclass default stays at "" so
+                # the inheritance fallback continues to work for tests
+                # and for operators who explicitly want to track
+                # whatever extraction model is set.
                 memory_episode_model = _prompt(
-                    "Episode generator model (blank to inherit extraction model)",
-                    existing_env.get("MEMORY_EPISODE_MODEL", ""),
+                    "Episode generator model (Sonnet recommended for narrative quality)",
+                    existing_env.get("MEMORY_EPISODE_MODEL", "claude-sonnet-4-6"),
                 )
                 while True:
                     memory_episode_budget_usd = _prompt(
-                        "Per-episode USD budget (suggest 0.05 for Haiku, 0.15+ for Sonnet)",
-                        existing_env.get("MEMORY_EPISODE_BUDGET_USD", "0.05"),
+                        "Per-episode USD budget (0.15 for Sonnet, 0.05 for Haiku)",
+                        existing_env.get("MEMORY_EPISODE_BUDGET_USD", "0.15"),
                     )
                     if _validate_positive_float(memory_episode_budget_usd):
                         break
@@ -1026,7 +1042,7 @@ def _cmd_config() -> None:
             # key out so the inheritance path stays intact across reinstall.
             if memory_episode_model.strip():
                 env["MEMORY_EPISODE_MODEL"] = memory_episode_model.strip()
-            if float(memory_episode_budget_usd) != 0.05:
+            if float(memory_episode_budget_usd) != 0.15:
                 env["MEMORY_EPISODE_BUDGET_USD"] = memory_episode_budget_usd
             if int(memory_episode_timeout_s) != 120:
                 env["MEMORY_EPISODE_TIMEOUT_S"] = memory_episode_timeout_s

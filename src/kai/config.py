@@ -521,13 +521,18 @@ class Config:
     # is never the effective value. Test fixtures that construct Config
     # directly should set this explicitly to a real model name.
     memory_episode_model: str = ""
-    # Per-call budget ceiling (USD). Default 0.05 matches the production-
-    # tuned stage-1 ceiling (5x the stage-1 dataclass default of $0.01).
-    # Sized for a Haiku run on the FULL uncapped (user, assistant) pair;
+    # Per-call budget ceiling (USD). Default 0.15 is sized for a
+    # Sonnet-class model on the FULL uncapped (user, assistant) pair;
     # stage 2 deliberately bypasses stage-1's 500-char assistant cap.
-    # Operators upgrading memory_episode_model to a Sonnet-class model
-    # should raise this to $0.15 or higher.
-    memory_episode_budget_usd: float = 0.05
+    # Sonnet is the recommended stage-2 model because it produces
+    # materially better narratives across the 7-8 Sophia episode
+    # fields, and stage 2 is fully out-of-band (latency invisible to
+    # the user). Operators on a Max-plan OAuth subscription do not
+    # bill per-token for headless `claude --print`, so this ceiling
+    # is a safety rail rather than a real cost gate. Operators
+    # downgrading memory_episode_model to Haiku can drop this to
+    # 0.05 or lower; the wizard recommends 0.15 as the default.
+    memory_episode_budget_usd: float = 0.15
     # Subprocess timeout (seconds). Default 120 - twice the production-
     # tuned stage-1 value (60s) and 12x the stage-1 dataclass default
     # (10s). The asymmetry is intentional: stage 2 is fire-and-forget
@@ -1534,7 +1539,7 @@ def load_config() -> Config:
     # to prevent accidentally tightening it below Haiku's warm-up time.
     memory_episode_model = os.environ.get("MEMORY_EPISODE_MODEL", "").strip() or memory_extraction_model
     try:
-        memory_episode_budget_usd = float(os.environ.get("MEMORY_EPISODE_BUDGET_USD", "0.05"))
+        memory_episode_budget_usd = float(os.environ.get("MEMORY_EPISODE_BUDGET_USD", "0.15"))
         if memory_episode_budget_usd <= 0:
             raise SystemExit("MEMORY_EPISODE_BUDGET_USD must be positive")
     except ValueError:

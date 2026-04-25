@@ -1400,13 +1400,16 @@ class TestMemoryEpisode:
 
     def test_defaults(self, monkeypatch):
         """Defaults must stay stable so unset = production behavior.
-        Model inheritance from memory_extraction_model is the contract:
-        a fresh install with neither var set ends up with both stages
-        on Haiku."""
+        Model inheritance from memory_extraction_model is the contract
+        when no env var is set: a fresh install with neither var set
+        ends up with both stages on Haiku (the wizard separately
+        recommends Sonnet for stage 2; the inheritance fallback is
+        the safety floor for tests and operators who skipped wizard).
+        Budget default is 0.15, sized for Sonnet."""
         _set_required(monkeypatch)
         config = load_config()
         assert config.memory_episode_model == "claude-haiku-4-5-20251001"
-        assert config.memory_episode_budget_usd == 0.05
+        assert config.memory_episode_budget_usd == 0.15
         assert config.memory_episode_timeout_s == 120
 
     def test_model_inherits_extraction_model_when_unset(self, monkeypatch):
@@ -1428,10 +1431,14 @@ class TestMemoryEpisode:
         assert config.memory_episode_model == "claude-sonnet-4-6"
 
     def test_budget_override(self, monkeypatch):
+        """Override path: arbitrary positive value beats the dataclass
+        default of 0.15. Test value 0.30 chosen specifically to be
+        non-default so a future flip of the dataclass default to 0.30
+        would not silently mask a regression in the override path."""
         _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_EPISODE_BUDGET_USD", "0.15")
+        monkeypatch.setenv("MEMORY_EPISODE_BUDGET_USD", "0.30")
         config = load_config()
-        assert config.memory_episode_budget_usd == 0.15
+        assert config.memory_episode_budget_usd == 0.30
 
     def test_timeout_override(self, monkeypatch):
         _set_required(monkeypatch)
