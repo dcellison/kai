@@ -97,7 +97,14 @@ async def test_episode_classifier_precision_recall():
         expected: bool = item["expected_has_episode"]
         item_id = item.get("id", "?")
 
-        payload = _build_extraction_payload(user, assistant)
+        # Pass an empty candidate list explicitly to mirror the
+        # production call shape with memory_consolidation_candidates_n=0
+        # (the kill-switch branch in extract_and_store passes []). The
+        # function's `candidates` arg defaults to None and treats None
+        # and [] identically, so this is cosmetic, not a behavior fix -
+        # but it makes the eval's correspondence to the production code
+        # path one less inferential step for a future reader.
+        payload = _build_extraction_payload(user, assistant, [])
         start = time.monotonic()
         try:
             result = await _run_extractor(payload, config, candidate_ids=set(), user_id=f"eval-{item_id}")
