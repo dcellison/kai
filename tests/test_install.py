@@ -1474,17 +1474,21 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
 
+        # Every input below matches the corresponding dataclass
+        # default so the emission gates suppress non-episode keys.
+        # Asserted on the negative side below for the episode keys;
+        # the positive assertion is on the Sonnet model entry.
         memory_block = [
             "true",  # memory enabled
             "true",  # extraction enabled
-            "0.05",  # extraction budget (matches stage-1 dataclass default; suppressed)
-            "10",  # extraction timeout (matches dataclass default; suppressed)
-            "8",  # consolidation candidates (matches default; suppressed)
+            "0.01",  # extraction budget (stage-1 dataclass default; suppressed)
+            "10",  # extraction timeout (dataclass default; suppressed)
+            "8",  # consolidation candidates (dataclass default; suppressed)
             "",  # episode model: accept wizard default = claude-sonnet-4-6
-            "0.15",  # episode budget: accept wizard default
-            "120",  # episode timeout: accept wizard default
-            "2000",  # token budget (default)
-            "10",  # search limit (default)
+            "0.15",  # episode budget (dataclass default; suppressed)
+            "120",  # episode timeout (dataclass default; suppressed)
+            "2000",  # token budget (dataclass default; suppressed)
+            "10",  # search limit (dataclass default; suppressed)
         ]
         inputs = iter(self._base_inputs(memory_block))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
@@ -1497,6 +1501,12 @@ class TestCmdConfig:
         # Budget and timeout match dataclass defaults → no emission.
         assert "MEMORY_EPISODE_BUDGET_USD" not in env
         assert "MEMORY_EPISODE_TIMEOUT_S" not in env
+        # Stage-1 keys also suppressed because their inputs match
+        # the dataclass defaults too. Assert the suppression so a
+        # future change to the gate semantics surfaces here.
+        assert "MEMORY_EXTRACTION_BUDGET_USD" not in env
+        assert "MEMORY_EXTRACTION_TIMEOUT_S" not in env
+        assert "MEMORY_CONSOLIDATION_CANDIDATES_N" not in env
 
     def test_memory_round_trip_through_env_file(self, tmp_path, monkeypatch):
         """Wizard-captured memory vars survive _generate_env_file()."""
