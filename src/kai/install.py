@@ -772,13 +772,18 @@ def _cmd_config() -> None:
     memory_extraction_budget_usd = "0.01"
     memory_extraction_timeout_s = "10"
     memory_consolidation_candidates_n = "8"
-    # Stage-2 episode generation defaults (issue #385). Empty string for
-    # the model means "inherit memory_extraction_model" - load_config
-    # implements the inheritance, so a blank entry here writes no
-    # MEMORY_EPISODE_MODEL key and the runtime falls through to whatever
-    # MEMORY_EXTRACTION_MODEL is set to.
+    # Stage-2 episode generation defaults (issue #385). Each pre-init
+    # value matches the corresponding wizard prompt default and the
+    # emission-gate sentinel so the data flow reads consistently
+    # whether the operator runs the episode block or skips it.
+    # Model is the exception by design: empty string here means
+    # "inherit memory_extraction_model" via load_config, while the
+    # wizard separately recommends Sonnet to operators who reach the
+    # prompt - they're different defaults for different audiences
+    # (test fixtures and skipped-wizard installs vs operators
+    # actively configuring).
     memory_episode_model = ""
-    memory_episode_budget_usd = "0.05"
+    memory_episode_budget_usd = "0.15"
     memory_episode_timeout_s = "120"
     memory_token_budget = "2000"
     memory_search_limit = "10"
