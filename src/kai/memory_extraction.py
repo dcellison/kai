@@ -1191,17 +1191,25 @@ def _emit_episode_log(
     `cost_usd` and `duration_ms` are always populated for budget tracking
     parity with stage 1's _emit_intent_log; on the timeout path cost is
     0.0 because the subprocess was killed before it returned a billed
-    envelope. `reason` is omitted from the JSON when None (the success
-    path) so an operator scanning logs can grep `outcome=stored` without
-    a noisy null reason field.
+    envelope.
+
+    `memory_id` and `reason` are presence-symmetric: each is included
+    only when it carries information. `memory_id` appears only on the
+    `stored` outcome (no other path produces a row); `reason` appears
+    only on non-`stored` outcomes (success has no failure tag). The
+    payoff is that operator log queries like `memory_id IS NOT NULL`
+    and `reason IS NOT NULL` are mutually exclusive partitions of the
+    log stream, instead of one being always-present-as-null and the
+    other being conditional.
     """
     payload: dict = {
         "user_id": user_id,
         "outcome": outcome,
-        "memory_id": memory_id,
         "cost_usd": cost_usd,
         "duration_ms": duration_ms,
     }
+    if memory_id is not None:
+        payload["memory_id"] = memory_id
     if reason is not None:
         payload["reason"] = reason
     log.info("memory.episode %s", json.dumps(payload, separators=(",", ":")))

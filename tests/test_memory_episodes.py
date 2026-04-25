@@ -763,8 +763,11 @@ class TestStage2Storage:
         assert payload["memory_id"] == "fake-id"
         assert payload["cost_usd"] == 0.039
         assert payload["duration_ms"] >= 0
-        # `reason` is OMITTED on the success path so an operator can grep
-        # outcome=stored without a noisy null reason field.
+        # `memory_id` and `reason` are presence-symmetric: each is
+        # included only when it carries information. Success has a
+        # memory_id but no reason; the assertion below pins that
+        # contract so an operator's `reason IS NOT NULL` log query
+        # cleanly partitions failures from successes.
         assert "reason" not in payload
 
     @pytest.mark.asyncio
@@ -793,7 +796,10 @@ class TestStage2Storage:
         assert len(records) == 1
         payload = json.loads(records[0].message[len("memory.episode ") :])
         assert payload["outcome"] == "store_failed"
-        assert payload["memory_id"] is None
+        # Presence-symmetric contract: failure outcomes have no memory
+        # row to point at, so memory_id is OMITTED rather than emitted
+        # as null. Mirror of the "reason omitted on success" rule.
+        assert "memory_id" not in payload
         assert payload["reason"]  # non-empty
 
 
