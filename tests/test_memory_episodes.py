@@ -468,6 +468,50 @@ class TestStage2Isolation:
         assert payload["duration_ms"] >= 0
 
     @pytest.mark.asyncio
+    async def test_stage2_is_error_envelope_maps_to_subprocess_error(self, monkeypatch, caplog):
+        """Budget exhaustion (and any other CLI is_error condition) must
+        map to outcome=subprocess_error, NOT parse_error. Pre-fix this
+        was silently mislabeled because the only branches checking
+        run_reason were `timeout`, `exit_*`, and `invalid_json`; an
+        is_error envelope fell through to the else and got tagged as a
+        content fault. Operators triaging by outcome would otherwise see
+        budget burns mixed with genuine JSON-parse failures."""
+        is_error_envelope = json.dumps(
+            {
+                "is_error": True,
+                "subtype": "error_max_budget_usd",
+                "total_cost_usd": 0.05,
+                "structured_output": {"episode": _valid_episode()},
+            }
+        ).encode("utf-8")
+
+        async def _fake_exec(*args, **kwargs):
+            return _make_proc(stdout=is_error_envelope)
+
+        monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
+
+        with caplog.at_level(logging.INFO, logger="kai.memory_extraction"):
+            await _generate_episode(
+                user_text="u",
+                assistant_text="a",
+                user_id="u1",
+                session_id=None,
+                config=_cfg(),
+            )
+
+        records = [r for r in caplog.records if r.message.startswith("memory.episode ")]
+        assert len(records) == 1
+        payload = json.loads(records[0].message[len("memory.episode ") :])
+        assert payload["outcome"] == "subprocess_error"
+        # The subtype detail survives in the reason field so operators
+        # can distinguish budget burns from auth failures.
+        assert payload["reason"] is not None
+        assert "error_max_budget_usd" in payload["reason"]
+        # Cost_usd is captured from the envelope even on the error path
+        # so budget tracking still sees the burn.
+        assert payload["cost_usd"] == 0.05
+
+    @pytest.mark.asyncio
     async def test_stage2_unexpected_exception_caught(self, monkeypatch, caplog):
         """The broad try/except Exception in _generate_episode must
         catch ANY exception class, not just the documented ones, so an

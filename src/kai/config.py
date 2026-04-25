@@ -512,12 +512,15 @@ class Config:
     # produce one Sophia-shaped episode record per episode-worthy turn.
     # Honors memory_enabled; no dedicated kill switch.
     #
-    # memory_episode_model: defaults to memory_extraction_model so a fresh
-    # install sees no behavior change without explicit opt-in. The dataclass
-    # literal here is informational; load_config() reads the env var and
-    # falls back to memory_extraction_model when unset, so changing
-    # MEMORY_EXTRACTION_MODEL alone moves both stages onto the new model.
-    memory_episode_model: str = "claude-haiku-4-5-20251001"
+    # memory_episode_model: empty string is the sentinel for "inherit
+    # memory_extraction_model" - load_config() applies the inheritance
+    # at startup, so an operator who only sets MEMORY_EXTRACTION_MODEL
+    # gets both stages on the new model. The literal stays empty here
+    # rather than a model name so a reader who greps for "what is the
+    # default model" is not misled: in production the dataclass literal
+    # is never the effective value. Test fixtures that construct Config
+    # directly should set this explicitly to a real model name.
+    memory_episode_model: str = ""
     # Per-call budget ceiling (USD). Default 0.05 matches the production-
     # tuned stage-1 ceiling (5x the stage-1 dataclass default of $0.01).
     # Sized for a Haiku run on the FULL uncapped (user, assistant) pair;

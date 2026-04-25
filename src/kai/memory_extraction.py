@@ -1362,17 +1362,36 @@ async def _generate_episode(
             if episode is None:
                 # Map the run-helper's failure tags onto the documented
                 # outcome enum: timeout, subprocess_error, parse_error,
-                # store_failed, stored. Anything starting with `exit_`
-                # or `invalid_json` is a subprocess-level fault, not a
-                # content fault, so they collapse to `subprocess_error`
-                # and `parse_error` respectively.
+                # store_failed, stored.
+                #
+                # Subprocess-level faults (exit code, is_error envelope
+                # from a budget burn or auth failure) collapse to
+                # `subprocess_error`. Content faults (malformed JSON,
+                # non-object envelope, missing episode field) collapse
+                # to `parse_error`. The is_error branch is load-bearing:
+                # without it, budget exhaustion would silently mislabel
+                # as a parse error and operators triaging by outcome
+                # would see budget burns mixed with genuine JSON
+                # problems.
                 if run_reason == "timeout":
                     outcome = "timeout"
-                elif run_reason and run_reason.startswith("exit_"):
+                elif run_reason and (run_reason.startswith("exit_") or run_reason.startswith("is_error")):
+                    # Subprocess-level faults: nonzero exit (binary
+                    # crashed, env wrong, OOM kill) or is_error
+                    # envelope (CLI exited 0 but signaled failure -
+                    # most commonly error_max_budget_usd from a budget
+                    # burn, occasionally an auth error). Both belong
+                    # under the same outcome label so operators
+                    # triaging by outcome see them together rather
+                    # than scanning two buckets for related symptoms.
                     outcome = "subprocess_error"
                 elif run_reason and run_reason.startswith("invalid_json"):
                     outcome = "parse_error"
                 else:
+                    # Catches `non_object_envelope` and
+                    # `missing_episode_field` - both content-shape
+                    # faults where the subprocess succeeded but the
+                    # output did not satisfy the schema contract.
                     outcome = "parse_error"
                 reason = run_reason
             else:
@@ -1679,13 +1698,24 @@ async def extract_and_store(
             return 0
 
     sem = _get_semaphore(user_id)
+    # Pre-initialize the storage counters so the post-try summary log
+    # cannot reference an unbound name regardless of which branch (or
+    # which exception path) leaves the try block. Pre-PR-#387 this was
+    # implicit because the no-facts path returned early; the
+    # restructure to support stage-2 spawning under both has-facts and
+    # no-facts branches removed that early-return guarantee, so the
+    # init moves out where the lifecycle is obvious.
+    stored = replaced = skipped = 0
+    start = time.monotonic()
     try:
         async with sem:
-            # Start the clock AFTER acquiring the per-user semaphore so
-            # `duration_ms` in the memory.extract: log line reflects
+            # Restart the clock AFTER acquiring the per-user semaphore
+            # so `duration_ms` in the memory.extract: log line reflects
             # actual extraction latency, not time spent queued behind a
             # prior in-flight extraction for the same user. Under queued
-            # load the two are easy to confuse.
+            # load the two are easy to confuse. The pre-acquire init
+            # above is a fallback used only when an exception bypasses
+            # this assignment.
             start = time.monotonic()
             # Apply the assistant cap ONCE up front so the candidate
             # fetch and the payload's ASSISTANT segment see byte-
