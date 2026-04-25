@@ -26,6 +26,7 @@ import os
 import re
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 
 from kai import memory
 from kai.config import DATA_DIR, Config
@@ -39,7 +40,16 @@ log = logging.getLogger(__name__)
 # Stored in each fact's metadata so future cleanups can target specific
 # prompt revisions (delete_by_source can be extended, or a sibling
 # delete_by_prompt_version admin command can be added).
-_EXTRACTION_PROMPT_VERSION: str = "2"
+# v3 adds the EPISODE CLASSIFICATION section (issue #385); the FORMAT and
+# CONSOLIDATION sections are unchanged from v2.
+_EXTRACTION_PROMPT_VERSION: str = "3"
+
+# Sibling of _EXTRACTION_PROMPT_VERSION for stage-2 episode generation.
+# Stored in each episode's metadata so future cleanups can target a
+# specific episode-prompt revision the same way fact prompt versions
+# are tracked. Bump on any substantive edit to _EPISODE_SYSTEM_PROMPT
+# or _EPISODE_SCHEMA.
+_EPISODE_PROMPT_VERSION: str = "1"
 
 # Memory `type` values this module writes. Track 1 writes "exchange"
 # from memory.py; Track 2 writes "fact" from here. Any other type value
@@ -87,6 +97,24 @@ _GENERIC_CONFIRMATION_RE = re.compile(
 _SEMAPHORE_CAP = 256
 _per_user_semaphores: OrderedDict[str, asyncio.Semaphore] = OrderedDict()
 
+# Stage-2 (issue #385) per-user semaphore cache. Independent of stage 1
+# because stage 2 runs OUTSIDE the stage-1 semaphore: a concurrent
+# stage-1 call for the same user during a stage-2 in-flight is desirable
+# (the stage-1 call is the user's next turn). Same Semaphore(1) shape so
+# stage-2 calls for the SAME user serialize, preventing pile-ups on a
+# rapid sequence of episode-worthy turns. Same LRU cap so memory
+# footprint mirrors stage 1.
+_per_user_episode_semaphores: OrderedDict[str, asyncio.Semaphore] = OrderedDict()
+
+# Strong references to in-flight stage-2 tasks. asyncio holds only
+# WEAK refs to tasks created via create_task; without a strong ref
+# somewhere, a heap-pressure GC cycle can reap an in-flight task
+# silently (no exception, no log). The set is module-level so it
+# outlives any single extraction; the done-callback set.discard
+# registered at spawn keeps the set self-pruning. Pattern matches
+# webhook.py's _background_tasks.
+_pending_episode_tasks: set[asyncio.Task[None]] = set()
+
 # Neutral cwd for the subprocess. Fixed (not per-call tmp) so
 # ~/.claude/projects/ does not accumulate a new session directory per
 # extraction. Creation is deferred to first use via
@@ -131,6 +159,7 @@ _SUBPROCESS_ENV_ALLOWLIST = (
 
 # ── JSON schema ──────────────────────────────────────────────────────
 
+
 # Passed to `claude --print --json-schema <schema>`. The CLI validates
 # structure before returning, so malformed Haiku output fails at the
 # subprocess boundary (non-zero exit) rather than polluting the store.
@@ -149,6 +178,18 @@ _SUBPROCESS_ENV_ALLOWLIST = (
 # Mem0 metadata. The closed tag enum means a typo'd tag fails the
 # whole fact list at the CLI, which is preferred over silently storing
 # an untypo'd tag that retrieval cannot match.
+# Stage-1 extractor returns BOTH a fact list and the stage-2 classifier
+# bit on every call. A small dataclass keeps every early-exit path on a
+# single shape (`ExtractionResult(facts=[], has_episode=False)`) so the
+# caller never has to handle "result is None" alongside "result has no
+# facts" alongside "result has facts but no classifier"; one return type
+# means one branch table downstream.
+@dataclass(frozen=True)
+class ExtractionResult:
+    facts: list[dict]
+    has_episode: bool
+
+
 _FACT_SCHEMA: dict = {
     "type": "object",
     "properties": {
@@ -209,8 +250,15 @@ _FACT_SCHEMA: dict = {
             },
             "maxItems": 5,
         },
+        # Stage-2 classifier (issue #385). One extra output bit per call;
+        # no extra subprocess. The stage-2 episode generator runs only
+        # when this is true. Required so the field is always present
+        # (caller does not have to default-handle it) and so
+        # additionalProperties=false at root still rejects smuggled
+        # fields.
+        "has_episode": {"type": "boolean"},
     },
-    "required": ["facts"],
+    "required": ["facts", "has_episode"],
     "additionalProperties": False,
 }
 
@@ -289,6 +337,22 @@ FORMAT each fact as:
   the action specifically (not a generic "thanks"). If no such
   quote exists, do not emit the fact.
 
+EPISODE CLASSIFICATION:
+Set `has_episode: true` when the exchange constitutes a complete
+narrative situation: a task that ran to a conclusion (success,
+partial, or failure), a design decision that played out with
+rationale, an incident the user navigated, or a novel interaction
+pattern with a visible outcome.
+
+Set `has_episode: false` when the exchange is routine: a single
+fact exchange, a short confirmation, a lookup, an acknowledgment,
+casual chat, or a mid-conversation turn where the situation is
+still unfolding without resolution.
+
+When in doubt, prefer false. Episodes exist to capture "what
+happened and what we learned"; a turn without a clear outcome
+or lesson is not yet an episode.
+
 CONSOLIDATION:
 You will sometimes receive an EXISTING FACTS block before the USER/ASSISTANT
 exchange. Each existing fact is shown with its id in square brackets,
@@ -328,6 +392,145 @@ Important constraints:
   fact). Never emit "skip_redundant" or "update_of" for a confirmed_action;
   always store it as a separate "new" fact so the timestamp record stays
   intact.
+"""
+
+
+# ── Stage-2 episode schema and prompt (issue #385) ─────────────────────
+
+# Stage-2 episode generator schema. Wrapped under `episode` so the CLI's
+# structured_output nesting handling matches the {"facts": [...]} pattern
+# at root for stage 1.
+#
+# `lessons` is the only optional field. The Sophia design doc explicitly
+# says "if anything", so the prompt is told to omit it when no genuine
+# lesson emerged from the exchange. A required `lessons` would push the
+# extractor toward fabrication.
+#
+# `actors` is required despite being a Kai-specific extension (Sophia
+# was designed around a single-agent task frame). Every situation has
+# at least "user" as an actor; if the model cannot identify one, the
+# stage-1 classifier should probably have been false. Same logic for
+# `tags` with minItems=1.
+#
+# additionalProperties=false at both levels closes property names so the
+# model cannot smuggle extra fields into Mem0 metadata.
+_EPISODE_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "episode": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "minLength": 10, "maxLength": 300},
+                "context": {"type": "string", "minLength": 10, "maxLength": 500},
+                "approach": {"type": "string", "minLength": 10, "maxLength": 500},
+                "outcome": {"type": "string", "minLength": 10, "maxLength": 500},
+                "outcome_quality": {
+                    "type": "string",
+                    "enum": ["success", "partial", "failure"],
+                },
+                "lessons": {"type": "string", "minLength": 20, "maxLength": 500},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 50},
+                    "minItems": 1,
+                    "maxItems": 5,
+                },
+                "actors": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 100},
+                    "minItems": 1,
+                    "maxItems": 10,
+                },
+            },
+            "required": [
+                "goal",
+                "context",
+                "approach",
+                "outcome",
+                "outcome_quality",
+                "tags",
+                "actors",
+            ],
+            "additionalProperties": False,
+        },
+    },
+    "required": ["episode"],
+    "additionalProperties": False,
+}
+
+# Stage-2 episode generator system prompt. Stored verbatim so review can
+# diff future edits. Bump _EPISODE_PROMPT_VERSION on any substantive
+# change so existing episodes can be targeted for cleanup under the old
+# wording.
+_EPISODE_SYSTEM_PROMPT = """You are an episode generator for Kai, a personal AI agent's memory
+system. You receive one USER/ASSISTANT exchange that has been
+pre-classified as containing an episode-worthy situation. Your job
+is to produce a single structured record capturing what happened,
+so it can be retrieved later when a similar situation recurs and
+so the learning (if any) is preserved.
+
+Return a JSON object matching the provided schema.
+
+FIELDS (required unless noted):
+
+- goal: one sentence naming what was being accomplished in this
+  exchange. Third-person, concrete. Example: "Fix the memory
+  system's input-loss failure after the track-1 ingestion bug."
+
+- context: one to three sentences describing the situation the user
+  and Kai were operating in. What was the state of the world that
+  made this exchange happen? Example: "After a regression caused
+  Kai to refuse user messages about memory, the user ran a
+  live-store cleanup while Kai held the memory system disabled."
+
+- approach: one to three sentences describing what approach was
+  taken to address the goal. What did Kai or the user do? Example:
+  "Ran `delete_by_source` against the live Qdrant store to purge
+  114 user_raw rows while preserving 100 extracted facts; deferred
+  the code removal to a tracked issue."
+
+- outcome: one to three sentences describing what actually happened
+  as a result of the approach. What is now true that wasn't before?
+  Example: "The contaminated rows were purged on both active users;
+  memory is disabled pending code-level removal of Track 1."
+
+- outcome_quality: one of "success", "partial", "failure". Use
+  "success" when the goal was achieved cleanly. Use "partial" when
+  progress was made but the goal is not fully achieved or a
+  follow-up remains. Use "failure" when the goal was not achieved
+  or was abandoned.
+
+- lessons: OPTIONAL. One or two sentences describing what was
+  learned from this situation that would be useful to remember
+  next time a similar situation occurs. Examples of genuine
+  lessons: a design assumption that turned out to be wrong, a
+  failure mode that was not anticipated, a tool or technique that
+  worked well where one expected it would not. If no genuine
+  lesson emerged from this exchange, OMIT the field. Do not
+  fabricate lessons; an exchange without a lesson is not an
+  anomaly and should simply have no lessons field.
+
+- tags: 1 to 5 lowercase free-form domain tags identifying what
+  topical areas this situation touches. Free-form strings (e.g.
+  "memory", "mem0", "incident", "cleanup", "track-1"). These are
+  used for retrieval-time topic filtering. Do not reuse the 9-value
+  tag enum from fact extraction; episode tags are domain labels,
+  not classification labels.
+
+- actors: 1 to 10 short strings naming participants in the
+  situation. Use "user" for the user, "Kai" for Kai itself, a
+  GitHub login or service name for an external actor, or a PR or
+  issue number (e.g. "PR #360", "#306") for an artifact that was
+  central to the situation.
+
+GUIDELINES:
+- Prefer specificity over generality. An episode that could fit
+  any conversation is not an episode.
+- Do not fabricate. If a detail is not supported by the exchange,
+  omit it; omissions are always safer than inventions.
+- Do not include code snippets, error traces, or raw content.
+  Summarize their role in the situation instead.
+- Write third-person past tense throughout.
 """
 
 
@@ -373,6 +576,29 @@ def _get_semaphore(user_id: str) -> asyncio.Semaphore:
     _per_user_semaphores[user_id] = sem
     while len(_per_user_semaphores) > _SEMAPHORE_CAP:
         _per_user_semaphores.popitem(last=False)
+    return sem
+
+
+def _get_episode_semaphore(user_id: str) -> asyncio.Semaphore:
+    """
+    Return this user's episode-generation semaphore, creating one if
+    needed.
+
+    Sibling of `_get_semaphore`; same LRU shape, same Semaphore(1)
+    posture (true mutual exclusion within a user). Independent dict
+    because stage 2 deliberately runs OUTSIDE the stage-1 semaphore
+    (a concurrent stage-1 call for the same user during a stage-2
+    in-flight is desirable - the stage-1 call is the user's next
+    turn, which the user is waiting on).
+    """
+    sem = _per_user_episode_semaphores.get(user_id)
+    if sem is not None:
+        _per_user_episode_semaphores.move_to_end(user_id)
+        return sem
+    sem = asyncio.Semaphore(1)
+    _per_user_episode_semaphores[user_id] = sem
+    while len(_per_user_episode_semaphores) > _SEMAPHORE_CAP:
+        _per_user_episode_semaphores.popitem(last=False)
     return sem
 
 
@@ -780,15 +1006,23 @@ async def _run_extractor(
     *,
     candidate_ids: set[str],
     user_id: str,
-) -> list[dict]:
+) -> ExtractionResult:
     """
     Spawn `claude --print` with the extractor prompt and parse the JSON.
 
-    All three failure modes (timeout, non-zero exit, JSON parse error)
-    collapse to an empty list. The broad `except Exception` shell that
-    implements the "never raises" contract lives in `extract_and_store`,
-    not here - this helper surfaces known failures as empty-list returns
-    and lets unexpected classes propagate up for the outer handler.
+    All failure modes (timeout, non-zero exit, JSON parse error,
+    is_error envelope, non-dict parsed payload) collapse to
+    `ExtractionResult(facts=[], has_episode=False)`. The broad
+    `except Exception` shell that implements the "never raises"
+    contract lives in `extract_and_store`, not here - this helper
+    surfaces known failures as zero-state result returns and lets
+    unexpected classes propagate up for the outer handler.
+
+    Returns ExtractionResult so the caller can read `facts` and
+    `has_episode` (the stage-2 classifier; see issue #385) off one
+    object instead of branching on tuple unpacking. Defaulting
+    has_episode=False on every failure path means a flaky
+    extraction can never falsely trigger stage-2 episode generation.
 
     Flag rationale (see §9):
     - NO --bare. `--help` says --bare forces Anthropic auth to be strictly
@@ -881,14 +1115,14 @@ async def _run_extractor(
             "Memory extraction timed out after %ds",
             config.memory_extraction_timeout_s,
         )
-        return []
+        return ExtractionResult(facts=[], has_episode=False)
     if proc.returncode != 0:
         log.warning(
             "Memory extraction subprocess exited %d: %s",
             proc.returncode,
             stderr[:500].decode("utf-8", errors="replace"),
         )
-        return []
+        return ExtractionResult(facts=[], has_episode=False)
     try:
         parsed = json.loads(stdout)
     except json.JSONDecodeError:
@@ -896,10 +1130,10 @@ async def _run_extractor(
             "Memory extraction produced invalid JSON: %r",
             stdout[:500].decode("utf-8", errors="replace"),
         )
-        return []
+        return ExtractionResult(facts=[], has_episode=False)
     if not isinstance(parsed, dict):
         log.warning("Memory extraction returned non-object JSON: %r", parsed)
-        return []
+        return ExtractionResult(facts=[], has_episode=False)
     # Defense-in-depth: the CLI can exit 0 with is_error=true when a
     # retry loop burns the budget but the envelope still parses. Treat
     # that as extraction failure, not silent success with partial data.
@@ -908,19 +1142,304 @@ async def _run_extractor(
             "Memory extraction CLI envelope reports is_error=true (subtype=%s)",
             parsed.get("subtype"),
         )
-        return []
+        return ExtractionResult(facts=[], has_episode=False)
     # The §13.2 step-5 smoke test revealed that `claude --print
     # --output-format json --json-schema ...` nests schema-validated
     # payloads under a top-level `structured_output` key, not at the
     # root as §9 originally assumed. Prefer the nested location; fall
     # back to the root for resilience against a future CLI shape change
     # or a mocked response that emits facts at the top level.
+    #
+    # has_episode lives at the same level as `facts` in the schema, so
+    # the same nested/root resolution applies to it. A defensive bool()
+    # coerces a missing or non-bool value to False rather than letting
+    # a model that ignores the schema (or a hand-rolled mock that
+    # forgets the field) trigger stage-2 unintentionally.
     structured = parsed.get("structured_output")
     if isinstance(structured, dict) and "facts" in structured:
-        facts_raw = structured.get("facts")
+        payload_root = structured
     else:
-        facts_raw = parsed.get("facts")
-    return _validate_facts(facts_raw or [], candidate_ids, user_id)
+        payload_root = parsed
+    facts_raw = payload_root.get("facts") or []
+    has_episode = bool(payload_root.get("has_episode"))
+    return ExtractionResult(
+        facts=_validate_facts(facts_raw, candidate_ids, user_id),
+        has_episode=has_episode,
+    )
+
+
+# ── Stage 2: episode generation (issue #385) ──────────────────────────
+
+
+def _emit_episode_log(
+    *,
+    user_id: str,
+    outcome: str,
+    memory_id: str | None,
+    cost_usd: float,
+    duration_ms: int,
+    reason: str | None,
+) -> None:
+    """
+    Single emit site for `memory.episode` log lines.
+
+    Stage 2 emits exactly one of these per call (success or failure),
+    matching the per-extraction `memory.consolidate.intent` and
+    per-recall `memory.recall` patterns. Compact JSON separators so
+    downstream parsers see one wire format across the memory subsystem.
+
+    `cost_usd` and `duration_ms` are always populated for budget tracking
+    parity with stage 1's _emit_intent_log; on the timeout path cost is
+    0.0 because the subprocess was killed before it returned a billed
+    envelope. `reason` is omitted from the JSON when None (the success
+    path) so an operator scanning logs can grep `outcome=stored` without
+    a noisy null reason field.
+    """
+    payload: dict = {
+        "user_id": user_id,
+        "outcome": outcome,
+        "memory_id": memory_id,
+        "cost_usd": cost_usd,
+        "duration_ms": duration_ms,
+    }
+    if reason is not None:
+        payload["reason"] = reason
+    log.info("memory.episode %s", json.dumps(payload, separators=(",", ":")))
+
+
+def _build_episode_payload(user_text: str, assistant_text: str) -> str:
+    """
+    Format the exchange as a single user message for the episode generator.
+
+    Differs from `_build_extraction_payload` in two ways: NO existing-fact
+    consolidation block (episodes are not consolidated against prior
+    episodes in v1), and NO length caps on either side (the spec
+    deliberately gives stage 2 the FULL exchange because narrative
+    generation across the Sophia structured fields benefits from the
+    full assistant reply, not the 500-char cap stage 1 uses for latency).
+
+    Role-label stripping is preserved: a user message containing literal
+    "USER:" or "ASSISTANT:" boundary markers could otherwise inject a
+    fabricated turn into the payload Haiku reads. Same threat model as
+    stage 1.
+    """
+    safe_user = _strip_role_labels(user_text)
+    safe_assistant = _strip_role_labels(assistant_text)
+    return f"Generate an episode record for this exchange.\n\nUSER: {safe_user}\n\nASSISTANT: {safe_assistant}"
+
+
+async def _run_episode_extractor(
+    payload_text: str,
+    config: Config,
+) -> tuple[dict | None, float, str | None]:
+    """
+    Spawn `claude --print` with the episode-generator prompt and parse.
+
+    Returns a triple `(episode, cost_usd, reason)` where:
+    - `episode` is the validated episode dict on success, or None on any
+      failure path.
+    - `cost_usd` is the CLI envelope's `total_cost_usd` (0.0 on timeout
+      because the envelope never returned).
+    - `reason` is a short failure tag for telemetry on non-success paths
+      (`timeout`, `subprocess_error`, `parse_error`); None on success.
+
+    Single-return-shape on every path keeps the caller's branch table
+    flat and makes the stage-2 outcome enum easy to populate downstream.
+
+    Flag set is identical to stage 1 except for model, budget, timeout,
+    schema, and system prompt - the env allowlist, sandboxing flags,
+    auth posture, and stdin-only payload delivery are all reused so the
+    security review of stage 1 transfers without re-evaluation.
+    """
+    _ensure_extractor_cwd()
+
+    cmd = [
+        "claude",
+        "--print",
+        "--model",
+        config.memory_episode_model,
+        "--output-format",
+        "json",
+        "--json-schema",
+        json.dumps(_EPISODE_SCHEMA),
+        "--max-budget-usd",
+        str(config.memory_episode_budget_usd),
+        "--system-prompt",
+        _EPISODE_SYSTEM_PROMPT,
+        "--permission-mode",
+        "bypassPermissions",
+        "--tools",
+        "",
+        "--no-session-persistence",
+    ]
+    subprocess_env: dict[str, str] = {key: os.environ[key] for key in _SUBPROCESS_ENV_ALLOWLIST if key in os.environ}
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(_EXTRACTOR_CWD),
+        env=subprocess_env,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=payload_text.encode("utf-8")),
+            timeout=config.memory_episode_timeout_s,
+        )
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return None, 0.0, "timeout"
+    if proc.returncode != 0:
+        return (
+            None,
+            0.0,
+            f"exit_{proc.returncode}: {stderr[:200].decode('utf-8', errors='replace')}",
+        )
+    try:
+        parsed = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None, 0.0, f"invalid_json: {stdout[:200].decode('utf-8', errors='replace')}"
+    if not isinstance(parsed, dict):
+        return None, 0.0, "non_object_envelope"
+    # Cost lives in the CLI envelope. Coerce defensively: a future CLI
+    # version that renames or omits the field should produce 0.0, not a
+    # KeyError that would be caught by the broad except in
+    # `_generate_episode` and report `unexpected_exception` for what is
+    # actually just a CLI shape drift.
+    cost_usd = float(parsed.get("total_cost_usd") or 0.0)
+    if parsed.get("is_error") is True:
+        return None, cost_usd, f"is_error subtype={parsed.get('subtype')}"
+    # Same nested/root resolution as stage 1: `claude --print
+    # --output-format json --json-schema ...` puts the schema-validated
+    # payload under `structured_output`. Fall back to root for tests
+    # that mock the response at top level.
+    structured = parsed.get("structured_output")
+    if isinstance(structured, dict) and "episode" in structured:
+        episode_root = structured
+    else:
+        episode_root = parsed
+    episode = episode_root.get("episode")
+    if not isinstance(episode, dict):
+        return None, cost_usd, "missing_episode_field"
+    return episode, cost_usd, None
+
+
+async def _generate_episode(
+    *,
+    user_text: str,
+    assistant_text: str,
+    user_id: str,
+    session_id: str | None,
+    config: Config,
+) -> None:
+    """
+    Stage-2 task body: generate one episode record and store it.
+
+    Runs as `asyncio.create_task` from `extract_and_store`, so this
+    coroutine NEVER raises. Every failure mode collapses to a logged
+    `memory.episode` line with an outcome tag from the documented enum.
+    The broad `try/except Exception` shell at the top of the body
+    catches unexpected exception classes too so an unhandled-exception
+    warning never reaches the event loop.
+
+    Holds the per-user EPISODE semaphore (independent of stage 1's
+    extraction semaphore) so concurrent stage-2 calls for the same user
+    serialize. Stage 1 calls for the same user proceed in parallel
+    because stage 2 is by design out-of-band.
+    """
+    start = time.monotonic()
+    sem = _get_episode_semaphore(user_id)
+    outcome: str = "store_failed"
+    memory_id: str | None = None
+    cost_usd: float = 0.0
+    reason: str | None = None
+    try:
+        async with sem:
+            payload = _build_episode_payload(user_text, assistant_text)
+            episode, cost_usd, run_reason = await _run_episode_extractor(payload, config)
+            if episode is None:
+                # Map the run-helper's failure tags onto the documented
+                # outcome enum: timeout, subprocess_error, parse_error,
+                # store_failed, stored. Anything starting with `exit_`
+                # or `invalid_json` is a subprocess-level fault, not a
+                # content fault, so they collapse to `subprocess_error`
+                # and `parse_error` respectively.
+                if run_reason == "timeout":
+                    outcome = "timeout"
+                elif run_reason and run_reason.startswith("exit_"):
+                    outcome = "subprocess_error"
+                elif run_reason and run_reason.startswith("invalid_json"):
+                    outcome = "parse_error"
+                else:
+                    outcome = "parse_error"
+                reason = run_reason
+            else:
+                # Build the metadata dict matching the Sophia schema +
+                # the `actors` Kai extension. `lessons` is optional and
+                # absent from the dict when the model omitted it (the
+                # design-doc "if anything" pattern; absence is the
+                # sentinel for "no lesson this time", not empty-string).
+                content = f"{episode['goal']}\n\n{episode['context']}"
+                extra: dict = {
+                    "source": "episode",
+                    "goal": episode["goal"],
+                    "context": episode["context"],
+                    "approach": episode["approach"],
+                    "outcome": episode["outcome"],
+                    "outcome_quality": episode["outcome_quality"],
+                    "tags": episode["tags"],
+                    "actors": episode["actors"],
+                    "session_id": session_id or "",
+                    "episode_prompt_version": _EPISODE_PROMPT_VERSION,
+                }
+                if "lessons" in episode:
+                    extra["lessons"] = episode["lessons"]
+                # add_structured is sync (Mem0 is sync). Run off the
+                # event loop so the embedding step does not block other
+                # stage-2 tasks queued behind this user's semaphore.
+                loop = asyncio.get_running_loop()
+                mem_id = await loop.run_in_executor(
+                    None,
+                    lambda: memory.add_structured(
+                        content=content,
+                        user_id=user_id,
+                        memory_type="episode",
+                        tags=episode["tags"],
+                        metadata=extra,
+                    ),
+                )
+                # add_structured returns the new memory ID on success or
+                # None when the underlying Mem0 call failed (backend
+                # error, content rejected). Branch on the return so the
+                # `store_failed` outcome is reachable; without this only
+                # success outcomes would log.
+                if mem_id is not None:
+                    outcome = "stored"
+                    memory_id = mem_id
+                    reason = None
+                else:
+                    outcome = "store_failed"
+                    reason = "add_structured returned None"
+    except asyncio.CancelledError:
+        # Cooperative-shutdown signal. Re-raise so the runner knows the
+        # task was cancelled (not silently completed) - same posture as
+        # extract_and_store. Skip the log line because cancellation is
+        # not a stage-2 outcome; it is a shutdown event.
+        raise
+    except Exception as e:
+        outcome = "store_failed"
+        reason = f"unexpected: {type(e).__name__}: {e}"
+    duration_ms = int((time.monotonic() - start) * 1000)
+    _emit_episode_log(
+        user_id=user_id,
+        outcome=outcome,
+        memory_id=memory_id,
+        cost_usd=cost_usd,
+        duration_ms=duration_ms,
+        reason=reason,
+    )
 
 
 def _store_facts(
@@ -1225,28 +1744,59 @@ async def extract_and_store(
                 ),
             )
             payload = _build_extraction_payload(user_text, assistant_capped, candidates)
-            facts = await _run_extractor(
+            result = await _run_extractor(
                 payload,
                 config,
                 candidate_ids=candidate_id_set,
                 user_id=user_id,
             )
-            if not facts:
-                duration_ms = int((time.monotonic() - start) * 1000)
-                log.info(
-                    "memory.extract: user_id=%s duration_ms=%d facts=0 replaced=0 skipped=0",
-                    user_id,
-                    duration_ms,
+            # Restructured for stage-2 (issue #385): facts and has_episode
+            # are independent. An exchange can be episode-worthy without
+            # producing atomic facts (a narrative arc with no extractable
+            # preference/decision/etc.), and vice versa. Store facts when
+            # present; emit the summary log unconditionally so operators
+            # can correlate the per-exchange `memory.extract:` line with
+            # the per-episode `memory.episode:` line emitted by stage 2.
+            # The actual stage-2 spawn happens AFTER _store_facts returns
+            # so stage-1 facts are durably stored before stage 2 is even
+            # scheduled (see task #142).
+            if result.facts:
+                loop = asyncio.get_running_loop()
+                # _store_facts is sync (memory.add_structured is sync).
+                # Run it off the event loop to avoid blocking while Mem0
+                # embeds each fact.
+                stored, replaced, skipped = await loop.run_in_executor(
+                    None,
+                    lambda: _store_facts(result.facts, user_id=user_id, session_id=session_id),
                 )
-                return 0
-            loop = asyncio.get_running_loop()
-            # _store_facts is sync (memory.add_structured is sync). Run
-            # it off the event loop to avoid blocking while Mem0 embeds
-            # each fact.
-            stored, replaced, skipped = await loop.run_in_executor(
-                None,
-                lambda: _store_facts(facts, user_id=user_id, session_id=session_id),
-            )
+            else:
+                stored = replaced = skipped = 0
+            # Stage-2 spawn (issue #385). Scheduled AFTER _store_facts
+            # returns so stage-1 facts are durably stored before stage
+            # 2 is even on the event loop. Independent of result.facts:
+            # has_episode and the fact list are orthogonal (a narrative
+            # turn can be episode-worthy without producing atomic
+            # facts). Strong reference saved into _pending_episode_tasks
+            # because asyncio holds only weak refs to created tasks; a
+            # heap-pressure GC cycle could otherwise reap an in-flight
+            # task silently. Pattern matches webhook.py's
+            # _background_tasks. Eventual-consistency note: the user's
+            # NEXT message can arrive before stage 2's add_structured
+            # completes; that retrieval misses the brand-new episode.
+            # Acceptable because episodes are about cumulative pattern
+            # recall over many sessions, not per-turn recall within one.
+            if result.has_episode:
+                ep_task = asyncio.create_task(
+                    _generate_episode(
+                        user_text=user_text,
+                        assistant_text=assistant_text,
+                        user_id=user_id,
+                        session_id=session_id,
+                        config=config,
+                    )
+                )
+                _pending_episode_tasks.add(ep_task)
+                ep_task.add_done_callback(_pending_episode_tasks.discard)
     except FileNotFoundError:
         # `claude` binary missing on PATH. Graceful degradation: no
         # facts this turn, system continues running. Same outcome as

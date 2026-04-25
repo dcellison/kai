@@ -82,6 +82,11 @@ _SEARCH_OVERFETCH = 20
 # preferentially boosted.
 _SOURCE_WEIGHTS: dict[str, float] = {
     "extracted": 1.2,
+    # Episode rows (issue #385) carry the same boost as extracted facts:
+    # both are high-signal curated content. Equal weight in v1; if
+    # post-deploy evaluation shows one source dominates retrieval the
+    # other shouldn't, this is the one knob to retune.
+    "episode": 1.2,
     "": 0.6,
 }
 
@@ -113,6 +118,11 @@ def _source_weight(r: MemoryResult) -> float:
 # that "extracted" is the only source being written.
 _SOURCE_SHORT: dict[str, str] = {
     "extracted": "fact",
+    # Episode rows (issue #385) get a distinct provenance tag so the
+    # injected context block visually separates "what is true" from
+    # "what happened, and what we learned". The render path also adds
+    # an outcome_quality suffix on episode lines (see format_context).
+    "episode": "episode",
     "": "legacy",
 }
 
@@ -647,11 +657,34 @@ async def format_context(
             row_source = ""
         source_short = _SOURCE_SHORT.get(row_source, "legacy")
 
+        date_str = ""
         if r.created_at:
             date_str = r.created_at[:10] if len(r.created_at) >= 10 else r.created_at
-            line = f"- ({date_str}, {source_short}) {r.text}"
+
+        if row_source == "episode":
+            # Episode rows render the Sophia "moderate relevance" form
+            # (issue #385): goal + outcome + outcome_quality inline.
+            # The semantic content of an episode lives across multiple
+            # metadata fields, not the embedded text, so r.text is only
+            # the fallback when goal is missing (defensive path for
+            # rows produced by a bug or future schema drift). The
+            # remaining Sophia fields (context, approach, lessons,
+            # tags, actors) are stored but not rendered inline in v1.
+            metadata = r.metadata or {}
+            goal = metadata.get("goal") or r.text.split("\n")[0]
+            outcome_text = metadata.get("outcome", "")
+            quality = metadata.get("outcome_quality", "")
+            quality_tag = f", {quality}" if quality else ""
+            body = f"{goal}. Outcome: {outcome_text}" if outcome_text else goal
+            if date_str:
+                line = f"- ({date_str}, episode{quality_tag}) {body}"
+            else:
+                line = f"- (episode{quality_tag}) {body}"
         else:
-            line = f"- ({source_short}) {r.text}"
+            if date_str:
+                line = f"- ({date_str}, {source_short}) {r.text}"
+            else:
+                line = f"- ({source_short}) {r.text}"
 
         line_tokens = _estimate_tokens(line)
         if used_tokens + line_tokens > budget:

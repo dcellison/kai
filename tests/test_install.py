@@ -1420,13 +1420,16 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
 
-        # Memory on, extraction on, custom budget + timeout + consolidation candidates + token budget + search limit.
+        # Memory on, extraction on, custom budget + timeout + consolidation candidates + episode tunables + token budget + search limit.
         memory_block = [
             "true",  # memory enabled
             "true",  # extraction enabled (claude backend)
             "0.05",  # extraction budget USD
             "60",  # extraction timeout seconds (#345)
             "5",  # consolidation candidates (non-default, exercises emission branch)
+            "",  # episode model (blank = inherit extraction model)
+            "0.07",  # episode budget USD (non-default)
+            "60",  # episode timeout seconds (non-default)
             "3000",  # token budget
             "20",  # search limit (#345)
         ]
@@ -1442,6 +1445,13 @@ class TestCmdConfig:
         assert env["MEMORY_EXTRACTION_BUDGET_USD"] == "0.05"
         assert env["MEMORY_EXTRACTION_TIMEOUT_S"] == "60"
         assert env["MEMORY_CONSOLIDATION_CANDIDATES_N"] == "5"
+        # Episode model entered as blank inherits MEMORY_EXTRACTION_MODEL
+        # at runtime, so the wizard deliberately omits the key. Asserted
+        # absent so a future change that emits empty-string MEMORY_EPISODE_MODEL
+        # (and breaks the inheritance fallback in load_config) surfaces here.
+        assert "MEMORY_EPISODE_MODEL" not in env
+        assert env["MEMORY_EPISODE_BUDGET_USD"] == "0.07"
+        assert env["MEMORY_EPISODE_TIMEOUT_S"] == "60"
         assert env["MEMORY_TOKEN_BUDGET"] == "3000"
         assert env["MEMORY_SEARCH_LIMIT"] == "20"
 
@@ -1452,8 +1462,19 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
 
-        # Inputs in wizard order: enabled, ext enabled, budget, timeout, consolidation, token budget, search limit.
-        memory_block = ["true", "true", "0.07", "45", "4", "2500", "15"]
+        # Inputs in wizard order: enabled, ext enabled, budget, timeout, consolidation, episode model/budget/timeout, token budget, search limit.
+        memory_block = [
+            "true",
+            "true",
+            "0.07",
+            "45",
+            "4",
+            "claude-haiku-4-5-future",
+            "0.10",
+            "90",
+            "2500",
+            "15",
+        ]
         inputs = iter(self._base_inputs(memory_block))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
 
@@ -1466,6 +1487,12 @@ class TestCmdConfig:
         assert 'MEMORY_EXTRACTION_BUDGET_USD="0.07"' in rendered
         assert 'MEMORY_EXTRACTION_TIMEOUT_S="45"' in rendered
         assert 'MEMORY_CONSOLIDATION_CANDIDATES_N="4"' in rendered
+        # Episode tunables: explicit model entry survives, non-default
+        # budget and timeout survive. Round-trip parity with the
+        # extraction tunables above.
+        assert 'MEMORY_EPISODE_MODEL="claude-haiku-4-5-future"' in rendered
+        assert 'MEMORY_EPISODE_BUDGET_USD="0.10"' in rendered
+        assert 'MEMORY_EPISODE_TIMEOUT_S="90"' in rendered
         assert 'MEMORY_TOKEN_BUDGET="2500"' in rendered
         assert 'MEMORY_SEARCH_LIMIT="15"' in rendered
 

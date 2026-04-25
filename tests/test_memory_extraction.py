@@ -486,9 +486,16 @@ class TestSubprocessCommandAssembly:
         assert args[args.index("--model") + 1] == "claude-haiku-4-5-20251001"
         assert args[args.index("--max-budget-usd") + 1] == "0.05"
         assert args[args.index("--output-format") + 1] == "json"
-        # Schema arg must be a JSON string that round-trips
+        # Schema arg must be a JSON string that round-trips. Both root
+        # required fields are present: `facts` (the original extractor
+        # output) and `has_episode` (the stage-2 classifier; issue
+        # #385). Asserted as a set so future field additions do not
+        # have to re-pin order, but the count is locked at 2 so a
+        # silent drop of either field surfaces here.
         schema_str = args[args.index("--json-schema") + 1]
-        assert json.loads(schema_str)["required"] == ["facts"]
+        required_root = json.loads(schema_str)["required"]
+        assert set(required_root) == {"facts", "has_episode"}
+        assert len(required_root) == 2
         # Tools disabled
         assert args[args.index("--tools") + 1] == ""
         # Permission mode set to bypassPermissions (harmless: no tools

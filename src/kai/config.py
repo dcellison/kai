@@ -507,6 +507,33 @@ class Config:
     # per-call cost.
     memory_consolidation_candidates_n: int = 8
 
+    # Stage-2 episode generation (issue #385). Conditional second extractor
+    # that runs out-of-band on stage-1 positives (has_episode=true) to
+    # produce one Sophia-shaped episode record per episode-worthy turn.
+    # Honors memory_enabled; no dedicated kill switch.
+    #
+    # memory_episode_model: defaults to memory_extraction_model so a fresh
+    # install sees no behavior change without explicit opt-in. The dataclass
+    # literal here is informational; load_config() reads the env var and
+    # falls back to memory_extraction_model when unset, so changing
+    # MEMORY_EXTRACTION_MODEL alone moves both stages onto the new model.
+    memory_episode_model: str = "claude-haiku-4-5-20251001"
+    # Per-call budget ceiling (USD). Default 0.05 matches the production-
+    # tuned stage-1 ceiling (5x the stage-1 dataclass default of $0.01).
+    # Sized for a Haiku run on the FULL uncapped (user, assistant) pair;
+    # stage 2 deliberately bypasses stage-1's 500-char assistant cap.
+    # Operators upgrading memory_episode_model to a Sonnet-class model
+    # should raise this to $0.15 or higher.
+    memory_episode_budget_usd: float = 0.05
+    # Subprocess timeout (seconds). Default 120 - twice the production-
+    # tuned stage-1 value (60s) and 12x the stage-1 dataclass default
+    # (10s). The asymmetry is intentional: stage 2 is fire-and-forget
+    # off the user-facing turn, so a long-tailed timeout only delays
+    # storage, never the user's reply. Floor of 10s prevents accidental
+    # sub-Haiku-warm-up timeouts that would mask real model failure as
+    # configuration error.
+    memory_episode_timeout_s: int = 120
+
     # Minimum Mem0 similarity score for a memory to be returned by
     # search-driven paths: both `format_context` (context injection
     # at session start) and the `/memory search` UI surface in
@@ -1494,6 +1521,28 @@ def load_config() -> Config:
     except ValueError:
         raise SystemExit("MEMORY_CONSOLIDATION_CANDIDATES_N must be an integer") from None
 
+    # Stage-2 episode generation (issue #385). Same try/except pattern as
+    # the other memory_* numeric vars. Model defaults to whatever was
+    # loaded for memory_extraction_model so an operator who changed only
+    # MEMORY_EXTRACTION_MODEL also moves stage 2 onto the new model;
+    # explicit MEMORY_EPISODE_MODEL takes precedence. Budget is strictly
+    # positive (zero would silently disable a real subprocess; the
+    # intentional kill switch is MEMORY_ENABLED). Timeout floor is 10s
+    # to prevent accidentally tightening it below Haiku's warm-up time.
+    memory_episode_model = os.environ.get("MEMORY_EPISODE_MODEL", "").strip() or memory_extraction_model
+    try:
+        memory_episode_budget_usd = float(os.environ.get("MEMORY_EPISODE_BUDGET_USD", "0.05"))
+        if memory_episode_budget_usd <= 0:
+            raise SystemExit("MEMORY_EPISODE_BUDGET_USD must be positive")
+    except ValueError:
+        raise SystemExit("MEMORY_EPISODE_BUDGET_USD must be a number") from None
+    try:
+        memory_episode_timeout_s = int(os.environ.get("MEMORY_EPISODE_TIMEOUT_S", "120"))
+        if memory_episode_timeout_s < 10:
+            raise SystemExit("MEMORY_EPISODE_TIMEOUT_S must be at least 10")
+    except ValueError:
+        raise SystemExit("MEMORY_EPISODE_TIMEOUT_S must be an integer") from None
+
     # Search relevance floor. Float in [0.0, 1.0]; default 0.3 matches
     # Mem0's built-in default and the prior hard-coded constant. Same
     # try/except pattern as the other memory_* numeric vars: bad input
@@ -1668,5 +1717,8 @@ def load_config() -> Config:
         memory_extraction_budget_usd=memory_extraction_budget_usd,
         memory_extraction_timeout_s=memory_extraction_timeout_s,
         memory_consolidation_candidates_n=memory_consolidation_candidates_n,
+        memory_episode_model=memory_episode_model,
+        memory_episode_budget_usd=memory_episode_budget_usd,
+        memory_episode_timeout_s=memory_episode_timeout_s,
         memory_search_floor=memory_search_floor,
     )

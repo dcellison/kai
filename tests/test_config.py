@@ -58,6 +58,9 @@ _CONFIG_ENV_VARS = [
     "MEMORY_EXTRACTION_BUDGET_USD",
     "MEMORY_EXTRACTION_TIMEOUT_S",
     "MEMORY_CONSOLIDATION_CANDIDATES_N",
+    "MEMORY_EPISODE_MODEL",
+    "MEMORY_EPISODE_BUDGET_USD",
+    "MEMORY_EPISODE_TIMEOUT_S",
     "MEMORY_SEARCH_FLOOR",
     "KAI_DATA_DIR",
     "KAI_INSTALL_DIR",
@@ -1379,6 +1382,104 @@ class TestMemoryExtractionConfig:
     def test_consolidation_candidates_rejects_non_integer(self, monkeypatch):
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_CONSOLIDATION_CANDIDATES_N", "not-an-int")
+        with pytest.raises(SystemExit, match="must be an integer"):
+            load_config()
+
+
+# ── Stage-2 episode generation (issue #385) ───────────────────────────
+
+
+class TestMemoryEpisode:
+    """The MEMORY_EPISODE_* env vars: stage-2 episode generation, which
+    runs out-of-band on stage-1 positives. Bounds differ from stage 1:
+    budget is strictly positive (no zero kill-switch; the master switch
+    is MEMORY_ENABLED) and timeout has a 10s floor (Haiku warm-up time).
+    The model defaults to whatever memory_extraction_model is set to,
+    so an operator who only changed MEMORY_EXTRACTION_MODEL also moves
+    stage 2 onto the new model without a second var."""
+
+    def test_defaults(self, monkeypatch):
+        """Defaults must stay stable so unset = production behavior.
+        Model inheritance from memory_extraction_model is the contract:
+        a fresh install with neither var set ends up with both stages
+        on Haiku."""
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.memory_episode_model == "claude-haiku-4-5-20251001"
+        assert config.memory_episode_budget_usd == 0.05
+        assert config.memory_episode_timeout_s == 120
+
+    def test_model_inherits_extraction_model_when_unset(self, monkeypatch):
+        """Operator changes MEMORY_EXTRACTION_MODEL only - episode
+        follows. Documented in the .env.example comment."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EXTRACTION_MODEL", "claude-haiku-4-5-future")
+        config = load_config()
+        assert config.memory_episode_model == "claude-haiku-4-5-future"
+
+    def test_model_override_takes_precedence(self, monkeypatch):
+        """Explicit MEMORY_EPISODE_MODEL beats extraction inheritance.
+        Use case: operator runs Haiku for stage 1 and Sonnet for stage 2
+        narrative quality."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EXTRACTION_MODEL", "claude-haiku-4-5-20251001")
+        monkeypatch.setenv("MEMORY_EPISODE_MODEL", "claude-sonnet-4-6")
+        config = load_config()
+        assert config.memory_episode_model == "claude-sonnet-4-6"
+
+    def test_budget_override(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EPISODE_BUDGET_USD", "0.15")
+        config = load_config()
+        assert config.memory_episode_budget_usd == 0.15
+
+    def test_timeout_override(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EPISODE_TIMEOUT_S", "60")
+        config = load_config()
+        assert config.memory_episode_timeout_s == 60
+
+    def test_budget_rejects_zero(self, monkeypatch):
+        """Stage-2 budget of zero would mean every call exits at first
+        token with error_max_budget_usd. Unlike the consolidation
+        candidates field, zero is NOT a kill switch here - the master
+        switch is MEMORY_ENABLED. Reject explicitly so a typo doesn't
+        silently disable the feature."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EPISODE_BUDGET_USD", "0")
+        with pytest.raises(SystemExit, match="positive"):
+            load_config()
+
+    def test_budget_rejects_negative(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EPISODE_BUDGET_USD", "-0.05")
+        with pytest.raises(SystemExit, match="positive"):
+            load_config()
+
+    def test_budget_rejects_non_number(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EPISODE_BUDGET_USD", "not-a-number")
+        with pytest.raises(SystemExit, match="must be a number"):
+            load_config()
+
+    def test_timeout_rejects_below_floor(self, monkeypatch):
+        """Floor is 10s because Haiku's warm-up alone can run several
+        seconds; a sub-floor timeout would make every call a timeout
+        and mask the real model failure as configuration error."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EPISODE_TIMEOUT_S", "9")
+        with pytest.raises(SystemExit, match="at least 10"):
+            load_config()
+
+    def test_timeout_rejects_negative(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EPISODE_TIMEOUT_S", "-1")
+        with pytest.raises(SystemExit, match="at least 10"):
+            load_config()
+
+    def test_timeout_rejects_non_integer(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EPISODE_TIMEOUT_S", "not-an-int")
         with pytest.raises(SystemExit, match="must be an integer"):
             load_config()
 

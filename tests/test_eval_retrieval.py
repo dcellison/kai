@@ -77,9 +77,13 @@ def _reset_memory_module() -> None:
     mem_mod._config = None
     # _SOURCE_WEIGHTS is the production default snapshot; reset both
     # the dict contents AND _UNKNOWN_SOURCE_WEIGHT so a sweep test
-    # mutating "extracted" does not leak into the next test.
+    # mutating "extracted" does not leak into the next test. Must
+    # mirror the production default in src/kai/memory.py exactly,
+    # including the "episode" entry (issue #385) - otherwise tests
+    # in tests/test_memory_episodes.py that read the dict after this
+    # fixture has run will see a stale snapshot missing the entry.
     mem_mod._SOURCE_WEIGHTS.clear()
-    mem_mod._SOURCE_WEIGHTS.update({"extracted": 1.2, "": 0.6})
+    mem_mod._SOURCE_WEIGHTS.update({"extracted": 1.2, "episode": 1.2, "": 0.6})
     mem_mod._UNKNOWN_SOURCE_WEIGHT = mem_mod._SOURCE_WEIGHTS[""]
     mem_mod._SEARCH_OVERFETCH = 20
 
