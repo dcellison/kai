@@ -455,8 +455,16 @@ class TestErrorMessageLifecycle:
         ):
             await bot._handle_response(update, ctx, chat_id=12345, prompt="hi", pool=pool, model="sonnet")
 
+        # Iterate over ALL _reply_safe calls (not just error-path
+        # ones) because the streaming text is also user-facing
+        # output that must not contain the bug string. The
+        # `_error_path_calls` helper would over-filter here.
+        # Length guard mirrors the helper's pattern - protects
+        # against a future call site that omits the text arg
+        # raising IndexError instead of producing the meaningful
+        # "Error: None re-introduced" failure.
         for call in mock_reply_safe.await_args_list:
-            text = call.args[1]
+            text = call.args[1] if len(call.args) > 1 else ""
             assert "Error: None" not in text, f"chat surface re-introduced the bug: {text!r}"
         for text in captured_log:
             assert "[error: None]" not in text, f"history log re-introduced the bug: {text!r}"
