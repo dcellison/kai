@@ -245,18 +245,33 @@ class TestBudgetDetection:
 class TestErrorMessageLifecycle:
     """End-to-end behavior of `_handle_response` when the stream ends
     in an error: append (don't overwrite), no "Error: None", budget
-    errors get the directive, non-budget errors don't."""
+    errors get the directive, non-budget errors don't.
 
-    def _make_pool_yielding_error(self, error_text: str | None = "Reached maximum budget ($10)"):
-        """Mock pool whose .send() yields one done StreamEvent with
-        success=False and the given error string."""
+    All five tests stream a text event BEFORE the terminal error so
+    `_handle_response` actually creates a live_msg via the streaming
+    loop. Without that, the live_msg branch in the error path is
+    never exercised and the overwrite-not-called assertion is
+    trivially true regardless of the fix. Assertions on the error
+    path target the patched `_reply_safe` directly rather than its
+    internal `reply_text` call, so a future refactor of `_reply_safe`
+    cannot silently void these tests."""
+
+    def _make_pool_text_then_error(self, error_text: str | None = "Reached maximum budget ($10)"):
+        """Mock pool whose .send() yields a text event followed by a
+        done StreamEvent with the given error string. The text event
+        triggers live_msg creation in the streaming loop, so the
+        error path's append-not-overwrite contract is exercised
+        against an actually-existing live_msg."""
 
         async def _fake_stream(*args, **kwargs):
+            # First a text event so the streaming loop creates live_msg.
+            yield StreamEvent(text_so_far="streamed work", done=False, response=None)
+            # Then the terminal error.
             yield StreamEvent(
-                text_so_far="",
+                text_so_far="streamed work",
                 done=True,
                 response=AgentResponse(
-                    text="",
+                    text="streamed work",
                     success=False,
                     error=error_text,
                     cost_usd=10.10,
@@ -269,12 +284,21 @@ class TestErrorMessageLifecycle:
         pool.send = MagicMock(side_effect=_fake_stream)
         return pool
 
-    def _make_update(self):
+    def _make_update_with_live_msg(self):
+        """Build an update whose `update.message.reply_text` returns a
+        mock `live_msg` (with its own AsyncMock `edit_text`). The
+        streaming loop calls reply_text once to create live_msg; that
+        first call returns the mock and live_msg becomes truthy in the
+        error branch. Subsequent reply_text traffic on update.message
+        (e.g., from `_reply_safe` calling reply_text internally) keeps
+        going through the same AsyncMock and is observable separately."""
+        live_msg = MagicMock()
+        live_msg.edit_text = AsyncMock()
         update = MagicMock()
         update.message = MagicMock()
-        update.message.reply_text = AsyncMock()
+        update.message.reply_text = AsyncMock(return_value=live_msg)
         update.effective_chat.id = 12345
-        return update
+        return update, live_msg
 
     def _make_context(self):
         from kai.config import Config
@@ -294,51 +318,91 @@ class TestErrorMessageLifecycle:
     @pytest.mark.asyncio
     async def test_error_does_not_overwrite_live_msg(self):
         """The streamed message stays untouched; the error is sent as
-        a reply_text. Pre-#326 the live_msg.edit_text overwrite
-        erased visible tool-use context; the new behavior preserves
-        it. Asserted by patching _edit_message_safe and asserting it
-        was never called for the error path."""
-        update = self._make_update()
+        a follow-up via _reply_safe. Pre-fix the live_msg.edit_text
+        overwrite (via _edit_message_safe) erased visible tool-use
+        context; the new behavior preserves it. Asserted by exercising
+        the live_msg path (text event triggers creation) and pinning
+        that _edit_message_safe is never invoked for the error
+        rendering AND _reply_safe IS invoked with an error notice."""
+        update, live_msg = self._make_update_with_live_msg()
         ctx = self._make_context()
-        pool = self._make_pool_yielding_error("Reached maximum budget ($10)")
+        pool = self._make_pool_text_then_error("Reached maximum budget ($10)")
 
         with (
             patch("kai.bot.log_message"),
             patch("kai.bot.sessions"),
-            patch("kai.bot._edit_message_safe", new_callable=AsyncMock) as mock_edit,
+            patch("kai.bot._edit_message_safe", new_callable=AsyncMock) as mock_edit_safe,
+            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply_safe,
         ):
             await bot._handle_response(update, ctx, chat_id=12345, prompt="hi", pool=pool, model="sonnet")
 
-        # The error path never touches live_msg via edit_text or
-        # _edit_message_safe; it sends new messages instead.
-        mock_edit.assert_not_called()
-        # At least one reply_text call (the error notice). Budget
-        # variant adds a second; tested separately below.
-        assert update.message.reply_text.await_count >= 1
+        # The error path never overwrites live_msg via the safe
+        # editor. _edit_message_safe may have been called by the
+        # streaming loop's chunk-by-chunk update path (depending on
+        # debouncing/edit cadence), but it must NOT have been called
+        # with the error string.
+        for call in mock_edit_safe.await_args_list:
+            text_arg = call.args[1] if len(call.args) > 1 else ""
+            assert "Error" not in text_arg, (
+                f"_edit_message_safe was called with an error string ({text_arg!r}), "
+                f"violating the append-not-overwrite contract"
+            )
+        # The error notice WAS sent via _reply_safe (asserts the
+        # follow-up message path is taken).
+        error_calls = [c for c in mock_reply_safe.await_args_list if "Error" in c.args[1]]
+        assert len(error_calls) >= 1, "_reply_safe was not called with an error notice"
+        # live_msg.edit_text directly should not carry the error
+        # either (defensive against bypassing the wrapper).
+        for call in live_msg.edit_text.await_args_list:
+            text_arg = call.args[0] if call.args else ""
+            assert "Error" not in text_arg
+
+    @staticmethod
+    def _error_path_calls(mock_reply_safe) -> list:
+        """Filter `_reply_safe` calls to those carrying an error
+        notice or budget directive, separating them from the
+        streaming-loop's live_msg-creation call (which uses the same
+        wrapper to send the initial text chunk). Error-path calls
+        are identified by the "Error: " prefix or the presence of
+        BUDGET_CEILING in the directive - both of which the
+        streaming text would never legitimately contain."""
+        out = []
+        for call in mock_reply_safe.await_args_list:
+            text = call.args[1] if len(call.args) > 1 else ""
+            if text.startswith("Error: ") or "BUDGET_CEILING" in text:
+                out.append(call)
+        return out
 
     @pytest.mark.asyncio
     async def test_budget_error_sends_two_messages(self):
         """Budget-exhaustion: error notice + recovery directive,
-        sent as two separate reply_text calls."""
-        update = self._make_update()
+        sent as two separate _reply_safe calls (in addition to the
+        streaming loop's live_msg-creation call)."""
+        update, _live_msg = self._make_update_with_live_msg()
         ctx = self._make_context()
-        pool = self._make_pool_yielding_error("Reached maximum budget ($10)")
+        pool = self._make_pool_text_then_error("Reached maximum budget ($10)")
 
         with (
             patch("kai.bot.log_message"),
             patch("kai.bot.sessions"),
             patch("kai.bot._edit_message_safe", new_callable=AsyncMock),
+            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply_safe,
         ):
             await bot._handle_response(update, ctx, chat_id=12345, prompt="hi", pool=pool, model="sonnet")
 
-        assert update.message.reply_text.await_count == 2
-        first_call = update.message.reply_text.await_args_list[0].args[0]
-        second_call = update.message.reply_text.await_args_list[1].args[0]
-        assert first_call == "Error: Reached maximum budget ($10)"
-        # The directive carries the dollar amount and the recovery hint.
-        assert "$10" in second_call
-        assert "/new" in second_call
-        assert "BUDGET_CEILING" in second_call
+        # Filter to error-path calls so the streaming-loop's
+        # live_msg-creation call (which also goes through _reply_safe)
+        # does not pollute the count. Patching _reply_safe directly
+        # (rather than asserting on the inner reply_text) keeps this
+        # test stable against future _reply_safe internal changes.
+        error_calls = self._error_path_calls(mock_reply_safe)
+        assert len(error_calls) == 2
+        first_text = error_calls[0].args[1]
+        second_text = error_calls[1].args[1]
+        assert first_text == "Error: Reached maximum budget ($10)"
+        assert "$10" in second_text
+        assert "/new" in second_text
+        assert "BUDGET_CEILING" in second_text
 
     @pytest.mark.asyncio
     async def test_non_budget_error_sends_one_message(self):
@@ -346,19 +410,21 @@ class TestErrorMessageLifecycle:
         get just the error notice; no directive. Structure leaves
         room for additional error-class directives if recurring
         patterns emerge."""
-        update = self._make_update()
+        update, _live_msg = self._make_update_with_live_msg()
         ctx = self._make_context()
-        pool = self._make_pool_yielding_error("Authentication failed")
+        pool = self._make_pool_text_then_error("Authentication failed")
 
         with (
             patch("kai.bot.log_message"),
             patch("kai.bot.sessions"),
             patch("kai.bot._edit_message_safe", new_callable=AsyncMock),
+            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply_safe,
         ):
             await bot._handle_response(update, ctx, chat_id=12345, prompt="hi", pool=pool, model="sonnet")
 
-        assert update.message.reply_text.await_count == 1
-        assert update.message.reply_text.await_args.args[0] == "Error: Authentication failed"
+        error_calls = self._error_path_calls(mock_reply_safe)
+        assert len(error_calls) == 1
+        assert error_calls[0].args[1] == "Error: Authentication failed"
 
     @pytest.mark.asyncio
     async def test_no_error_none_literal_in_user_facing_output(self):
@@ -368,30 +434,25 @@ class TestErrorMessageLifecycle:
         the literal "Error: None" string from appearing. Pin the
         full chain so a future change at either layer can't
         re-introduce it."""
-        update = self._make_update()
+        update, _live_msg = self._make_update_with_live_msg()
         ctx = self._make_context()
-        pool = self._make_pool_yielding_error(None)  # forces fallback path
+        pool = self._make_pool_text_then_error(None)  # forces fallback path
 
-        captured_chat: list[str] = []
         captured_log: list[str] = []
 
         def _capture_log(*, direction, chat_id, text):
             captured_log.append(text)
 
-        async def _capture_reply(text, *args, **kwargs):
-            captured_chat.append(text)
-            return MagicMock()
-
-        update.message.reply_text = AsyncMock(side_effect=_capture_reply)
-
         with (
             patch("kai.bot.log_message", side_effect=_capture_log),
             patch("kai.bot.sessions"),
             patch("kai.bot._edit_message_safe", new_callable=AsyncMock),
+            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply_safe,
         ):
             await bot._handle_response(update, ctx, chat_id=12345, prompt="hi", pool=pool, model="sonnet")
 
-        for text in captured_chat:
+        for call in mock_reply_safe.await_args_list:
+            text = call.args[1]
             assert "Error: None" not in text, f"chat surface re-introduced the bug: {text!r}"
         for text in captured_log:
             assert "[error: None]" not in text, f"history log re-introduced the bug: {text!r}"
@@ -403,9 +464,9 @@ class TestErrorMessageLifecycle:
         so a post-hoc grep of the log lands on the same text the
         operator could see in chat. Divergence would break
         debuggability."""
-        update = self._make_update()
+        update, _live_msg = self._make_update_with_live_msg()
         ctx = self._make_context()
-        pool = self._make_pool_yielding_error("Reached maximum budget ($10)")
+        pool = self._make_pool_text_then_error("Reached maximum budget ($10)")
 
         captured_log: list[str] = []
 
@@ -416,12 +477,17 @@ class TestErrorMessageLifecycle:
             patch("kai.bot.log_message", side_effect=_capture_log),
             patch("kai.bot.sessions"),
             patch("kai.bot._edit_message_safe", new_callable=AsyncMock),
+            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply_safe,
         ):
             await bot._handle_response(update, ctx, chat_id=12345, prompt="hi", pool=pool, model="sonnet")
 
-        # First reply is the error notice; first log entry should
-        # carry the same reason inside the [error: <reason>] format.
-        chat_error = update.message.reply_text.await_args_list[0].args[0]
+        # The error-path _reply_safe call (filtered from the
+        # streaming-loop's live_msg-creation call) carries the error
+        # notice; the first log entry carries the same reason inside
+        # the [error: <reason>] format.
+        error_calls = self._error_path_calls(mock_reply_safe)
+        assert len(error_calls) >= 1
+        chat_error = error_calls[0].args[1]
         assert "Reached maximum budget ($10)" in chat_error
         # Synthetic history entry uses the same reason string.
         assert any("Reached maximum budget ($10)" in t for t in captured_log)
