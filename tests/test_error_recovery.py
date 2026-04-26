@@ -34,7 +34,7 @@ from kai.backend import AgentResponse, StreamEvent
 from kai.bot import _budget_recovery_hint, _is_budget_exhaustion
 from kai.claude import ClaudeCodeBackend
 
-# ── §9.1 claude.py error-event handling ──────────────────────────────
+# ── claude.py error-event handling ──────────────────────────────────
 
 
 def _make_claude(**kwargs) -> ClaudeCodeBackend:
@@ -178,7 +178,7 @@ class TestClaudeErrorPopulation:
         assert response.error == "Model self-reported error"
 
 
-# ── §9.3 budget detection + recovery directive ───────────────────────
+# ── budget detection helpers ────────────────────────────────────────
 
 
 class TestBudgetDetection:
@@ -239,7 +239,7 @@ class TestBudgetDetection:
         assert "BUDGET_CEILING" in hint
 
 
-# ── §9.2 + §9.3 bot.py message lifecycle on error ────────────────────
+# ── bot.py error message lifecycle ──────────────────────────────────
 
 
 class TestErrorMessageLifecycle:
