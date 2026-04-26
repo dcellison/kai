@@ -662,16 +662,21 @@ class ClaudeCodeBackend(AgentBackend):
                     #   (b) `result` empty BUT `errors` populated with a
                     #       list of strings (the documented variant for
                     #       BUDGET_CEILING exhaustion: errors carries
-                    #       ["Reached maximum budget ($N)"]). Pre-#326
-                    #       this fell through to None, which `bot.py`
-                    #       rendered as the literal "Error: None"
-                    #       string in chat.
+                    #       ["Reached maximum budget ($N)"]).
                     #
                     # Falls back to a non-None sentinel when both fields
-                    # are empty so downstream rendering never re-introduces
-                    # the "Error: None" surface, even on a future CLI
-                    # variant that emits is_error=true with neither field
-                    # populated.
+                    # are empty so downstream rendering never produces
+                    # the literal "Error: None" string in chat, even on
+                    # a future CLI variant that emits is_error=true with
+                    # neither field populated.
+                    #
+                    # Note on `result_text`: it is `event.get("result", "")`
+                    # captured a few lines above, with no transformation
+                    # applied. Using `result_text` here (rather than
+                    # `event.get("result")` again) is equivalent and avoids
+                    # the second dict lookup; the truthiness check still
+                    # catches the empty-string case which is what the
+                    # branch table targets.
                     response_error: str | None = None
                     if event.get("is_error", False):
                         if result_text:

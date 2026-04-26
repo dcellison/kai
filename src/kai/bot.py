@@ -172,7 +172,7 @@ _QUEUED_MESSAGE_MARKER = (
 _LOCK_ACQUIRE_TIMEOUT = 3600  # 1 hour
 
 
-# Budget-exhaustion recovery directive (issue #326).
+# Budget-exhaustion recovery directive.
 #
 # When the inner Claude session hits BUDGET_CEILING (default $10), the
 # CLI emits an `is_error=true` event whose `errors` field carries the
@@ -202,7 +202,12 @@ _BUDGET_RECOVERY_HINT_NO_AMOUNT = (
 # amount can't be extracted, and the no-amount hint is sent. The chat
 # still surfaces the real error string from claude.py either way -
 # only the dollar-amount-aware directive is missed.
-_BUDGET_PHRASE_RE = re.compile(r"maximum budget \(\$([\d.]+)\)", re.IGNORECASE)
+#
+# `\d+(?:\.\d+)?` accepts integer ($10) or one-decimal ($10.50)
+# amounts and rejects malformed compositions like $1.2.3.4. Tighter
+# than `[\d.]+`; signals intent to a future reader that we expect a
+# single decimal point at most.
+_BUDGET_PHRASE_RE = re.compile(r"maximum budget \(\$(\d+(?:\.\d+)?)\)", re.IGNORECASE)
 
 
 def _is_budget_exhaustion(error_text: str | None) -> bool:
@@ -3603,16 +3608,21 @@ async def _handle_response(
         # Send the error notice as a NEW message (not an edit of the
         # live streamed message), so any tool-use, partial reasoning,
         # and intermediate output the user was watching stays visible.
-        # Pre-#326 the live_msg.edit_text overwrite erased that
-        # context entirely, which on long sessions could mean minutes
-        # of visible work disappearing into a single error line.
-        await update.message.reply_text(error_text)
+        # The previous in-place edit erased that context entirely,
+        # which on long sessions could mean minutes of visible work
+        # disappearing into a single error line. _reply_safe is the
+        # right wrapper here: error strings can carry markdown-like
+        # characters (parens, dollar signs, brackets) that Telegram's
+        # Markdown parser sometimes rejects, and the wrapper falls
+        # back to plain text on BadRequest while letting network
+        # errors propagate naturally.
+        await _reply_safe(update.message, error_text)
         # Budget-exhaustion gets a recovery directive as a second
         # follow-up message. Other error types fall through with no
         # extra guidance; structure leaves room for additional
         # error-class directives if recurring patterns emerge.
         if _is_budget_exhaustion(real_error):
-            await update.message.reply_text(_budget_recovery_hint(real_error))
+            await _reply_safe(update.message, _budget_recovery_hint(real_error))
         return
 
     # Persist session info for /stats (cost accumulates across interactions)
