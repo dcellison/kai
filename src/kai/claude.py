@@ -654,13 +654,41 @@ class ClaudeCodeBackend(AgentBackend):
                             event.get("duration_ms"),
                             sorted(event.keys()),
                         )
+                    # Resolve the error string for downstream consumers.
+                    # The CLI's `is_error=true` events come in two shapes:
+                    #
+                    #   (a) `result` populated with a human-readable
+                    #       reason. Use it directly.
+                    #   (b) `result` empty BUT `errors` populated with a
+                    #       list of strings (the documented variant for
+                    #       BUDGET_CEILING exhaustion: errors carries
+                    #       ["Reached maximum budget ($N)"]). Pre-#326
+                    #       this fell through to None, which `bot.py`
+                    #       rendered as the literal "Error: None"
+                    #       string in chat.
+                    #
+                    # Falls back to a non-None sentinel when both fields
+                    # are empty so downstream rendering never re-introduces
+                    # the "Error: None" surface, even on a future CLI
+                    # variant that emits is_error=true with neither field
+                    # populated.
+                    response_error: str | None = None
+                    if event.get("is_error", False):
+                        if result_text:
+                            response_error = result_text
+                        else:
+                            errors_list = event.get("errors")
+                            if isinstance(errors_list, list) and errors_list:
+                                response_error = "; ".join(str(e) for e in errors_list)
+                            else:
+                                response_error = "no error detail provided"
                     response = AgentResponse(
                         success=not event.get("is_error", False),
                         text=text,
                         session_id=event.get("session_id", self._session_id),
                         cost_usd=event.get("total_cost_usd", 0.0),
                         duration_ms=event.get("duration_ms", 0),
-                        error=event.get("result") if event.get("is_error") else None,
+                        error=response_error,
                     )
                     yield StreamEvent(text_so_far=response.text, done=True, response=response)
                     return

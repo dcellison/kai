@@ -172,6 +172,63 @@ _QUEUED_MESSAGE_MARKER = (
 _LOCK_ACQUIRE_TIMEOUT = 3600  # 1 hour
 
 
+# Budget-exhaustion recovery directive (issue #326).
+#
+# When the inner Claude session hits BUDGET_CEILING (default $10), the
+# CLI emits an `is_error=true` event whose `errors` field carries the
+# string "Reached maximum budget ($N)". `claude.py` populates
+# AgentResponse.error from that field; the bot uses the helper below
+# to detect the budget variant and append a recovery hint as a
+# follow-up message.
+#
+# The hint is a SEPARATE message, not appended to the error notice
+# itself, so Telegram clients show it with a notification badge and
+# the user immediately sees "what to do next" alongside "what
+# happened". The bot remains responsive to /new (and every other
+# command) after the error - the per-chat lock is released by the
+# return below, and the dispatch loop continues unaffected.
+_BUDGET_RECOVERY_HINT_WITH_AMOUNT = (
+    "Hit session budget ({amount}). Type /new to start a fresh session, "
+    "or ask your operator to raise BUDGET_CEILING in /etc/kai/env."
+)
+_BUDGET_RECOVERY_HINT_NO_AMOUNT = (
+    "Hit session budget. Type /new to start a fresh session, "
+    "or ask your operator to raise BUDGET_CEILING in /etc/kai/env."
+)
+
+# Matches the CLI's "Reached maximum budget ($N)" wording. The regex
+# is anchored on the documented phrasing; if Anthropic ever changes the
+# wording the budget detection regresses to "no match", the dollar
+# amount can't be extracted, and the no-amount hint is sent. The chat
+# still surfaces the real error string from claude.py either way -
+# only the dollar-amount-aware directive is missed.
+_BUDGET_PHRASE_RE = re.compile(r"maximum budget \(\$([\d.]+)\)", re.IGNORECASE)
+
+
+def _is_budget_exhaustion(error_text: str | None) -> bool:
+    """True iff the error string indicates BUDGET_CEILING exhaustion.
+
+    Substring match on the CLI's documented phrasing. Wording change
+    in a future Anthropic release would silently regress this to
+    False, in which case the recovery hint stops appearing - the
+    error notice itself still surfaces. A regression test pins the
+    current phrasing.
+    """
+    if not error_text:
+        return False
+    return "maximum budget" in error_text.lower()
+
+
+def _budget_recovery_hint(error_text: str | None) -> str:
+    """Return the budget-exhaustion recovery directive, with the
+    dollar amount inlined when extractable from the error string."""
+    if error_text:
+        match = _BUDGET_PHRASE_RE.search(error_text)
+        if match:
+            return _BUDGET_RECOVERY_HINT_WITH_AMOUNT.format(amount=f"${match.group(1)}")
+    return _BUDGET_RECOVERY_HINT_NO_AMOUNT
+
+
 async def _acquire_lock_or_kill(
     chat_id: int,
     pool: "SubprocessPool",
@@ -3534,12 +3591,28 @@ async def _handle_response(
         return
 
     if not final_response.success:
-        error_text = f"Error: {final_response.error}"
-        log_message(direction="assistant", chat_id=chat_id, text=f"[error: {final_response.error}]")
-        if live_msg:
-            await _edit_message_safe(live_msg, error_text)
-        else:
-            await update.message.reply_text(error_text)
+        # Defensive fallback: claude.py now always populates `error`
+        # with a non-None string for is_error events (see the
+        # response_error resolution there). The `or` here is belt-and-
+        # suspenders against a future change that re-introduces None,
+        # so the literal "Error: None" string can't reappear via this
+        # surface even on a regression.
+        real_error = final_response.error or "no error detail provided"
+        error_text = f"Error: {real_error}"
+        log_message(direction="assistant", chat_id=chat_id, text=f"[error: {real_error}]")
+        # Send the error notice as a NEW message (not an edit of the
+        # live streamed message), so any tool-use, partial reasoning,
+        # and intermediate output the user was watching stays visible.
+        # Pre-#326 the live_msg.edit_text overwrite erased that
+        # context entirely, which on long sessions could mean minutes
+        # of visible work disappearing into a single error line.
+        await update.message.reply_text(error_text)
+        # Budget-exhaustion gets a recovery directive as a second
+        # follow-up message. Other error types fall through with no
+        # extra guidance; structure leaves room for additional
+        # error-class directives if recurring patterns emerge.
+        if _is_budget_exhaustion(real_error):
+            await update.message.reply_text(_budget_recovery_hint(real_error))
         return
 
     # Persist session info for /stats (cost accumulates across interactions)

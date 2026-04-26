@@ -2645,7 +2645,13 @@ class TestHandleResponse:
 
     @pytest.mark.asyncio
     async def test_error_response_with_live_msg(self):
-        """success=False with existing live message: edits error into live message."""
+        """success=False with existing live message: error appears as
+        a NEW follow-up reply (not edited into the live message). The
+        live streamed content stays visible so any tool-use, partial
+        reasoning, and intermediate output the user was watching
+        survives the error. This contract changed in issue #326;
+        pre-#326 the error overwrote live_msg via edit_text and erased
+        all the streamed context."""
         from kai.bot import _handle_response
 
         update = _make_update()
@@ -2665,9 +2671,17 @@ class TestHandleResponse:
         with patch.multiple("kai.bot", **self._base_patches()):
             await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
 
-        # Error should be edited into the live message
-        last_edit = live_msg.edit_text.call_args_list[-1]
-        assert "Error" in last_edit[0][0]
+        # The error path no longer touches live_msg.edit_text. The
+        # last edit on live_msg is whatever the streaming loop wrote
+        # before the error arrived (or nothing, if the error was the
+        # first event). Asserted below: any reply_text call that
+        # carries the "Error" surface must come AFTER live_msg was
+        # last touched - i.e., a separate message, not an in-place
+        # edit. Pinning the negative property because the absence of
+        # an edit is the load-bearing contract change.
+        error_replies = [call for call in update.message.reply_text.call_args_list if call[0] and "Error" in call[0][0]]
+        assert len(error_replies) >= 1, "expected the error to appear as a follow-up reply_text call"
+        assert "Something broke" in error_replies[-1][0][0]
 
     @pytest.mark.asyncio
     async def test_error_response_no_live_msg(self):
