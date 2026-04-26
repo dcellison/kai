@@ -348,8 +348,12 @@ class TestErrorMessageLifecycle:
                 f"violating the append-not-overwrite contract"
             )
         # The error notice WAS sent via _reply_safe (asserts the
-        # follow-up message path is taken).
-        error_calls = [c for c in mock_reply_safe.await_args_list if "Error" in c.args[1]]
+        # follow-up message path is taken). Routes through the
+        # `_error_path_calls` helper so the args-length guard is
+        # consistent with the other tests in this class - a future
+        # call site that omits the text arg won't raise IndexError
+        # here, just produce a meaningful "no error notice" failure.
+        error_calls = self._error_path_calls(mock_reply_safe)
         assert len(error_calls) >= 1, "_reply_safe was not called with an error notice"
         # live_msg.edit_text directly should not carry the error
         # either (defensive against bypassing the wrapper).
