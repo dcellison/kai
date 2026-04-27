@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from kai import history
-from kai.history import get_recent_history, log_message
+from kai.history import get_recent_history, get_recent_pairs, log_message
 
 
 @pytest.fixture(autouse=True)
@@ -251,3 +251,295 @@ class TestPerUserHistory:
         result = get_recent_history(chat_id=999)
         # No legacy files either, so should be empty
         assert result == ""
+
+
+# ── get_recent_pairs (issue #392) ────────────────────────────────────
+
+
+class TestGetRecentPairs:
+    """get_recent_pairs feeds the windowed episode classifier in
+    memory_extraction (issue #392). It walks JSONL newest-first
+    internally but returns oldest-first so callers can render
+    PRIOR USER 1, 2, 3 in chronological order. Strict filtering
+    matters here in a way it doesn't for get_recent_history: a
+    botched-exchange placeholder in prior context distorts the
+    classifier's closure heuristic.
+    """
+
+    @staticmethod
+    def _write_records(log_dir, chat_id: int, day_offset: int, records: list[dict]) -> None:
+        """Write raw JSONL records to a chat_id subdirectory for a
+        specific date offset (0 = today, 1 = yesterday, ...).
+
+        Bypasses log_message so tests can stage synthetic edge cases
+        (missing chat_id field, synthetic markers, empty text) that
+        the public API would never produce. day_offset > 0 is used
+        by the cross-day chronological-order test.
+        """
+        date = (datetime.now(UTC) - timedelta(days=day_offset)).strftime("%Y-%m-%d")
+        user_dir = log_dir / str(chat_id)
+        user_dir.mkdir(parents=True, exist_ok=True)
+        path = user_dir / f"{date}.jsonl"
+        with path.open("a") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+
+    def test_returns_chronological_order_across_days(self, _log_dir):
+        """Walking files newest-first internally must reverse to
+        oldest-first on output. Three pairs spread across two days:
+        the day-1 pair must appear BEFORE the day-0 pairs in the
+        returned list."""
+        # Day -1 (yesterday): one pair
+        self._write_records(
+            _log_dir,
+            chat_id=1,
+            day_offset=1,
+            records=[
+                {"dir": "user", "chat_id": 1, "text": "yesterday user"},
+                {"dir": "assistant", "chat_id": 1, "text": "yesterday asst"},
+            ],
+        )
+        # Day 0 (today): two pairs
+        self._write_records(
+            _log_dir,
+            chat_id=1,
+            day_offset=0,
+            records=[
+                {"dir": "user", "chat_id": 1, "text": "today user 1"},
+                {"dir": "assistant", "chat_id": 1, "text": "today asst 1"},
+                {"dir": "user", "chat_id": 1, "text": "today user 2"},
+                {"dir": "assistant", "chat_id": 1, "text": "today asst 2"},
+            ],
+        )
+
+        pairs = get_recent_pairs(chat_id=1, n=10)
+
+        # All three pairs returned, oldest-first.
+        assert pairs == [
+            ("yesterday user", "yesterday asst"),
+            ("today user 1", "today asst 1"),
+            ("today user 2", "today asst 2"),
+        ]
+
+    def test_caps_at_n_keeping_most_recent(self, _log_dir):
+        """When more pairs exist than requested, return the N most
+        recent in chronological order. Pin the slice direction:
+        slicing from the tail (rather than the head) is what makes
+        'window of recent prior turns' work correctly."""
+        records: list[dict] = []
+        for i in range(1, 6):
+            records.append({"dir": "user", "chat_id": 1, "text": f"u{i}"})
+            records.append({"dir": "assistant", "chat_id": 1, "text": f"a{i}"})
+        self._write_records(_log_dir, chat_id=1, day_offset=0, records=records)
+
+        pairs = get_recent_pairs(chat_id=1, n=3)
+
+        assert pairs == [("u3", "a3"), ("u4", "a4"), ("u5", "a5")]
+
+    def test_skips_other_users(self, _log_dir):
+        """User-partition filter: records belonging to a different
+        chat_id must not leak into the returned pairs. Defends against
+        a backup/restore that mis-placed a JSONL into the wrong
+        subdirectory."""
+        # Stage records for user 1, then write rogue records for user
+        # 2 into user 1's directory directly (mimicking a misplaced
+        # backup file). The chat_id field on each record is the
+        # source of truth, not the directory location.
+        date = datetime.now(UTC).strftime("%Y-%m-%d")
+        user_dir = _log_dir / "1"
+        user_dir.mkdir(parents=True, exist_ok=True)
+        path = user_dir / f"{date}.jsonl"
+        with path.open("w") as f:
+            f.write(json.dumps({"dir": "user", "chat_id": 1, "text": "u1 mine"}) + "\n")
+            f.write(json.dumps({"dir": "user", "chat_id": 2, "text": "u2 stranger"}) + "\n")
+            f.write(json.dumps({"dir": "assistant", "chat_id": 2, "text": "a2 stranger"}) + "\n")
+            f.write(json.dumps({"dir": "assistant", "chat_id": 1, "text": "a1 mine"}) + "\n")
+
+        pairs = get_recent_pairs(chat_id=1, n=10)
+
+        # Stranger's records are filtered out before pairing. The
+        # remaining records pair u1 (mine) with a1 (mine) - the
+        # stranger's u2/a2 do not interpose between them.
+        assert pairs == [("u1 mine", "a1 mine")]
+
+    def test_skips_synthetic_assistant_markers(self, _log_dir):
+        """The failure-path placeholders written by bot.py
+        (`[stopped by user]`, `[no response]`, `[error: ...]`) are
+        not real conversation; pairing them into a windowed payload
+        would feed the classifier a botched-exchange prior turn.
+        Verify all three shapes are filtered out AND that an
+        anchored-regex false-positive case (a real user message that
+        quotes one of the markers as prose) is NOT mis-skipped."""
+        self._write_records(
+            _log_dir,
+            chat_id=1,
+            day_offset=0,
+            records=[
+                # Pair 1: real exchange (kept).
+                {"dir": "user", "chat_id": 1, "text": "ask 1"},
+                {"dir": "assistant", "chat_id": 1, "text": "real reply 1"},
+                # Pair 2: assistant `[stopped by user]` synthetic — assistant filtered, leaves orphan user "stop test"
+                {"dir": "user", "chat_id": 1, "text": "stop test"},
+                {"dir": "assistant", "chat_id": 1, "text": "[stopped by user]"},
+                # Pair 3: assistant `[error: TimeoutError]` synthetic — same shape
+                {"dir": "user", "chat_id": 1, "text": "timeout test"},
+                {"dir": "assistant", "chat_id": 1, "text": "[error: TimeoutError]"},
+                # Pair 4: anchored-regex false-positive case. A USER
+                # message asking about an error literal is NOT an
+                # assistant synthetic marker; even if it were on the
+                # assistant side, the substring is mid-line which the
+                # ^...$ anchor rejects.
+                {"dir": "user", "chat_id": 1, "text": "what does [error: foo] mean?"},
+                {"dir": "assistant", "chat_id": 1, "text": "real reply 2"},
+                # Pair 5: assistant `[no response]` synthetic — same shape
+                {"dir": "user", "chat_id": 1, "text": "noresp test"},
+                {"dir": "assistant", "chat_id": 1, "text": "[no response]"},
+            ],
+        )
+
+        pairs = get_recent_pairs(chat_id=1, n=10)
+
+        # The synthetic-marker assistants are filtered out. Their
+        # preceding user records become orphans (no following real
+        # assistant before the next user), so the next user message
+        # OVERWRITES the pending_user slot per the documented
+        # multi-user-before-assistant collapse. Final pair shape:
+        # ("ask 1", "real reply 1") and ("what does [error: foo] mean?", "real reply 2").
+        # Note that pair 2 turns into "stop test" -> overwritten by
+        # "timeout test" -> overwritten by "what does [error: foo] mean?"
+        # which finally pairs with "real reply 2". Verifies that the
+        # quoted-error user message survives the assistant-only
+        # synthetic filter.
+        assert pairs == [
+            ("ask 1", "real reply 1"),
+            ("what does [error: foo] mean?", "real reply 2"),
+        ]
+
+    def test_skips_empty_text(self, _log_dir):
+        """Image-only and voice-only records can land in JSONL with
+        empty `text` (the media field carries the payload metadata).
+        The classifier path drops these because pairing produces a
+        meaningless prior turn. A user record with empty text
+        followed by a real assistant produces an orphan assistant
+        (the orphan handler drops it)."""
+        self._write_records(
+            _log_dir,
+            chat_id=1,
+            day_offset=0,
+            records=[
+                # A real pair before, so the test asserts the empty-text
+                # filter does not silently consume good records.
+                {"dir": "user", "chat_id": 1, "text": "real q"},
+                {"dir": "assistant", "chat_id": 1, "text": "real a"},
+                # Empty user text followed by real assistant: filter
+                # drops the empty user, leaving the assistant orphan.
+                {"dir": "user", "chat_id": 1, "text": "", "media": {"type": "photo"}},
+                {"dir": "assistant", "chat_id": 1, "text": "orphan asst"},
+            ],
+        )
+
+        pairs = get_recent_pairs(chat_id=1, n=10)
+
+        # Only the real pair survives. The empty-user-then-orphan-assistant
+        # sequence produces zero pairs because the orphan assistant is dropped.
+        assert pairs == [("real q", "real a")]
+
+    def test_skips_records_without_chat_id_field(self, _log_dir):
+        """Greenfield divergence from get_recent_history: pre-Phase-2
+        legacy records (no chat_id field) are dropped entirely. The
+        classifier path is sensitive to mis-attributed prior turns
+        in a way the display path is not."""
+        self._write_records(
+            _log_dir,
+            chat_id=1,
+            day_offset=0,
+            records=[
+                # Legacy record (no chat_id field) — filtered out.
+                {"dir": "user", "text": "legacy q"},
+                {"dir": "assistant", "text": "legacy a"},
+                # Modern record (has chat_id) — kept.
+                {"dir": "user", "chat_id": 1, "text": "modern q"},
+                {"dir": "assistant", "chat_id": 1, "text": "modern a"},
+            ],
+        )
+
+        pairs = get_recent_pairs(chat_id=1, n=10)
+
+        # Legacy pair filtered out; only the modern pair survives.
+        assert pairs == [("modern q", "modern a")]
+
+    def test_handles_unpaired_assistant(self, _log_dir):
+        """An assistant record with no prior pending user (operator
+        restored from backup, partial JSONL truncation, etc.) is
+        dropped silently. The next real user/assistant pair then
+        reads cleanly."""
+        self._write_records(
+            _log_dir,
+            chat_id=1,
+            day_offset=0,
+            records=[
+                # Orphan assistant at start of file (no prior user) —
+                # dropped silently.
+                {"dir": "assistant", "chat_id": 1, "text": "orphan"},
+                # Real pair survives intact.
+                {"dir": "user", "chat_id": 1, "text": "real q"},
+                {"dir": "assistant", "chat_id": 1, "text": "real a"},
+            ],
+        )
+
+        pairs = get_recent_pairs(chat_id=1, n=10)
+
+        assert pairs == [("real q", "real a")]
+
+    def test_multiple_users_before_assistant_collapse_to_last(self, _log_dir):
+        """Telegram supports rapid-fire user messages before getting a
+        reply. Pair against the LAST user message: that's the one the
+        assistant is actually responding to, and it carries the most
+        immediate intent. Pin this so a future change to use the FIRST
+        user (or to emit multiple pairs per assistant) breaks the test
+        rather than silently changing classifier semantics."""
+        self._write_records(
+            _log_dir,
+            chat_id=1,
+            day_offset=0,
+            records=[
+                {"dir": "user", "chat_id": 1, "text": "u1 first"},
+                {"dir": "user", "chat_id": 1, "text": "u2 follow up"},
+                {"dir": "user", "chat_id": 1, "text": "u3 final"},
+                {"dir": "assistant", "chat_id": 1, "text": "asst reply"},
+            ],
+        )
+
+        pairs = get_recent_pairs(chat_id=1, n=10)
+
+        # Only the last user pairs with the assistant; u1 and u2 are
+        # dropped as orphans.
+        assert pairs == [("u3 final", "asst reply")]
+
+    def test_no_history_returns_empty(self, _log_dir):
+        """A user with no history directory returns [] without
+        raising. Brand-new users hit this path on every extraction;
+        the helper must handle it cleanly."""
+        pairs = get_recent_pairs(chat_id=999, n=10)
+
+        assert pairs == []
+
+    def test_zero_n_returns_empty(self, _log_dir):
+        """Defensive bound: `n=0` is the disable path that
+        bot.py uses when EPISODE_CLASSIFIER_CONTEXT_TURNS=0. The
+        helper short-circuits without touching the disk so the
+        kill-switch path stays cheap."""
+        # Stage real records that would otherwise return.
+        self._write_records(
+            _log_dir,
+            chat_id=1,
+            day_offset=0,
+            records=[
+                {"dir": "user", "chat_id": 1, "text": "u"},
+                {"dir": "assistant", "chat_id": 1, "text": "a"},
+            ],
+        )
+
+        pairs = get_recent_pairs(chat_id=1, n=0)
+
+        assert pairs == []

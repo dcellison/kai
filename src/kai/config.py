@@ -500,6 +500,24 @@ class Config:
     # an executor thread on a hung subprocess.
     memory_extraction_timeout_s: int = 10
 
+    # Number of prior (user, assistant) exchanges fed to the stage-1
+    # extractor as PRIOR CONTEXT background for the episode classifier.
+    # The classifier judges whether the CURRENT exchange (the one being
+    # logged) is the closing turn of an episode; it needs the lead-up
+    # to recognize closure that wasn't visible in a single-turn payload
+    # (issue #392). Total payload window = N + 1 (current + N prior).
+    # Set 0 to disable windowing entirely — the extractor reverts to
+    # the single-turn payload that was production behavior before this
+    # field shipped. The 0-10 range is enforced at load time; the cap
+    # exists to prevent an operator-typo (3000 instead of 3) from
+    # producing a 30-call-deep payload that blows Haiku's context
+    # window. Default 3 is empirically grounded: the live probe that
+    # motivated this fix flipped the test episode true at 3 and 4
+    # turns, but 4 turns leaked one borderline assistant-claim fact
+    # that 3 turns suppressed; 3 is the cleaner pick for fact
+    # extraction at equal classifier accuracy.
+    episode_classifier_context_turns: int = 3
+
     # Number of existing facts surfaced to the extractor per call as
     # consolidation candidates (intent: update_of / skip_redundant).
     # Selected by semantic similarity to the assistant payload, capped
@@ -1529,6 +1547,21 @@ def load_config() -> Config:
             raise SystemExit("MEMORY_EXTRACTION_TIMEOUT_S must be a positive integer")
     except ValueError:
         raise SystemExit("MEMORY_EXTRACTION_TIMEOUT_S must be an integer") from None
+    # Episode-classifier context-turn count. Zero is a valid disable
+    # value (single-turn payload, current pre-#392 behavior). Upper
+    # bound 10 caps the payload size to protect against an operator
+    # typo (a 3000-turn window would blow Haiku's context). The cap is
+    # enforced here AND inline at the wizard prompt; load_config is
+    # the single source of truth for the daemon, the wizard inline
+    # check exists only to give immediate operator feedback.
+    try:
+        episode_classifier_context_turns = int(os.environ.get("EPISODE_CLASSIFIER_CONTEXT_TURNS", "3"))
+        if episode_classifier_context_turns < 0:
+            raise SystemExit("EPISODE_CLASSIFIER_CONTEXT_TURNS must be non-negative")
+        if episode_classifier_context_turns > 10:
+            raise SystemExit("EPISODE_CLASSIFIER_CONTEXT_TURNS must be <= 10")
+    except ValueError:
+        raise SystemExit("EPISODE_CLASSIFIER_CONTEXT_TURNS must be an integer") from None
     # Consolidation candidate count. Zero is a valid kill-switch value
     # (consolidation disabled, extractor falls back to all-`new`); only
     # negatives are rejected. Same try/except pattern as the other
@@ -1735,6 +1768,7 @@ def load_config() -> Config:
         memory_extraction_model=memory_extraction_model,
         memory_extraction_budget_usd=memory_extraction_budget_usd,
         memory_extraction_timeout_s=memory_extraction_timeout_s,
+        episode_classifier_context_turns=episode_classifier_context_turns,
         memory_consolidation_candidates_n=memory_consolidation_candidates_n,
         memory_episode_model=memory_episode_model,
         memory_episode_budget_usd=memory_episode_budget_usd,

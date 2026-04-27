@@ -792,6 +792,14 @@ def _cmd_config() -> None:
     memory_extraction_budget_usd = "0.01"
     memory_extraction_timeout_s = "10"
     memory_consolidation_candidates_n = "8"
+    # Issue #392: episode classifier context window. Pre-init matches
+    # the dataclass default so the emission gate `int(...) != 3`
+    # correctly suppresses the env entry when an operator (a) skips
+    # the prompt because of the non-claude branch or (b) reaches the
+    # prompt and accepts the default. The prompt itself only fires
+    # when the operator is on the claude backend AND extraction is
+    # enabled - same gating pattern as the other extraction tunables.
+    episode_classifier_context_turns = "3"
     # Stage-2 episode generation defaults (issue #385). Each pre-init
     # value matches the corresponding wizard prompt default and the
     # emission-gate sentinel so the data flow reads consistently
@@ -856,6 +864,33 @@ def _cmd_config() -> None:
                     if _validate_non_negative_int(memory_consolidation_candidates_n):
                         break
                     print("  Must be a non-negative integer (0 to disable consolidation).")
+                # Episode-classifier context-turn count (issue #392).
+                # Inline parse-and-range-check rather than calling
+                # `_validate_non_negative_int` because that helper only
+                # enforces `>= 0` with no upper bound; the 0-10 cap
+                # exists so an operator typo (3000 instead of 3) cannot
+                # produce a 30-call-deep windowed payload that blows
+                # Haiku's context window. Pattern mirrors the
+                # `max_context_window` prompt above, which handles the
+                # same lower-bound-plus-ceiling shape inline rather
+                # than introducing a single-use validator helper. The
+                # cap is enforced again at load_config (config.py); the
+                # wizard inline check exists only to give the operator
+                # immediate feedback rather than a delayed SystemExit
+                # at next daemon start.
+                while True:
+                    episode_classifier_context_turns = _prompt(
+                        "Episode classifier context turns (number of prior exchanges shown to "
+                        "the classifier as background; 0 disables windowing)",
+                        existing_env.get("EPISODE_CLASSIFIER_CONTEXT_TURNS", "3"),
+                    )
+                    try:
+                        val = int(episode_classifier_context_turns)
+                        if 0 <= val <= 10:
+                            break
+                    except ValueError:
+                        pass
+                    print("  Must be 0-10.")
                 # Stage-2 episode generation tunables (issue #385). All
                 # three sit inside the extraction-enabled guard because
                 # episodes only fire when stage 1 fires (the has_episode
@@ -1077,6 +1112,16 @@ def _cmd_config() -> None:
             # dataclass default.
             if int(memory_consolidation_candidates_n) != 8:
                 env["MEMORY_CONSOLIDATION_CANDIDATES_N"] = memory_consolidation_candidates_n
+            # Episode-classifier context-turn count (issue #392). Same
+            # delta-from-default discipline as the surrounding memory
+            # tunables. Numeric compare so "03" or "3 " do not produce
+            # a spurious entry equal to the dataclass default. No
+            # backend gate needed here: the prompt is already nested
+            # inside `if agent_backend == "claude":` above, so on
+            # non-claude this value stays at its pre-init "3" and the
+            # `!= 3` check suppresses the emission.
+            if int(episode_classifier_context_turns) != 3:
+                env["EPISODE_CLASSIFIER_CONTEXT_TURNS"] = episode_classifier_context_turns
             # Stage-2 episode tunables (issue #385). Same delta-from-default
             # discipline as the stage-1 keys above. Episode model is
             # written ONLY when the operator entered a non-blank value -
@@ -1109,6 +1154,11 @@ def _cmd_config() -> None:
         env.pop("MEMORY_EXTRACTION_BUDGET_USD", None)
         env.pop("MEMORY_EXTRACTION_TIMEOUT_S", None)
         env.pop("MEMORY_CONSOLIDATION_CANDIDATES_N", None)
+        # Episode-classifier window key (issue #392). Same lifecycle
+        # as the other stage-1 extraction tunables: only consulted on
+        # the claude backend, so leaving a stale value here after a
+        # claude→goose flip would be misleading without effect.
+        env.pop("EPISODE_CLASSIFIER_CONTEXT_TURNS", None)
         # Episode keys follow the same lifecycle: stage 2 only fires
         # when stage 1 fires, and stage 1 silently skips on non-claude
         # backends. Leaving these in the env file would mislead an

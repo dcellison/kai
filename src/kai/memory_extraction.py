@@ -42,7 +42,15 @@ log = logging.getLogger(__name__)
 # delete_by_prompt_version admin command can be added).
 # v3 adds the EPISODE CLASSIFICATION section (issue #385); the FORMAT and
 # CONSOLIDATION sections are unchanged from v2.
-_EXTRACTION_PROMPT_VERSION: str = "3"
+# v4 windows the EPISODE CLASSIFICATION section to take a multi-turn
+# PRIOR CONTEXT block (issue #392). The opening sentence is also
+# updated to describe the windowed payload shape and to scope fact
+# extraction to the current exchange only. The schema, the FORMAT
+# section, and the CONSOLIDATION section are unchanged from v3, so
+# fact-storage parsing on the Python side is the same; the bump is
+# the canary that lets post-rollout log analysis distinguish facts
+# produced by the windowed prompt from facts produced by v3.
+_EXTRACTION_PROMPT_VERSION: str = "4"
 
 # Sibling of _EXTRACTION_PROMPT_VERSION for stage-2 episode generation.
 # Stored in each episode's metadata so future cleanups can target a
@@ -72,6 +80,23 @@ _CONFIRMATION_QUOTE_MIN_CHARS = 20
 # occasionally paste long content (logs, code, error traces) and an
 # uncapped paste would dominate the per-call Haiku token cost.
 _MAX_USER_CHARS = 2000
+
+# Prior-turn character caps used by `_build_extraction_payload` when
+# rendering the PRIOR CONTEXT block for the windowed episode classifier
+# (issue #392). Tighter than `_MAX_USER_CHARS`/`_capped_assistant`
+# because prior turns are compressed background, not the unit being
+# classified - the classifier needs enough lead-up to recognize
+# closure but does not need the full transcript. Asymmetric caps
+# (800 user / 1200 assistant) mirror the typical message-length
+# asymmetry in this codebase: assistant replies tend to be longer,
+# so capping users tighter saves more bytes per dropped char. The
+# values come from the live probe documented in spec 392; payload
+# sizes stayed under 5KB across the labeled corpus at these caps.
+# Constants rather than config knobs because operator tuning here
+# is premature - the per-turn caps interact with prompt cache
+# behavior in ways that are not obvious from a single env var.
+_PRIOR_USER_CHARS = 800
+_PRIOR_ASSISTANT_CHARS = 1200
 
 # Rejects one-word affirmations and short generic acknowledgments as
 # "laundered" confirmations. Haiku should already filter these per the
@@ -270,7 +295,14 @@ _FACT_SCHEMA: dict = {
 # If you edit this prompt, bump _EXTRACTION_PROMPT_VERSION above so
 # existing facts can be targeted for cleanup under the old wording.
 _EXTRACTION_SYSTEM_PROMPT = """You are a memory extraction assistant for Kai, a personal AI agent.
-You receive one exchange: a USER message and an ASSISTANT reply.
+You receive a short conversation window: zero or more PRIOR CONTEXT
+exchanges followed by ONE current exchange (a USER message and an
+ASSISTANT reply, marked with >>>).
+
+Fact extraction operates ONLY on the current exchange. PRIOR CONTEXT
+is for episode classification only; do NOT extract facts from prior
+turns.
+
 Your job is to extract stable, high-signal facts worth remembering
 across sessions. Return a JSON object matching the provided schema.
 
@@ -337,21 +369,31 @@ FORMAT each fact as:
   the action specifically (not a generic "thanks"). If no such
   quote exists, do not emit the fact.
 
-EPISODE CLASSIFICATION:
-Set `has_episode: true` when the exchange constitutes a complete
-narrative situation: a task that ran to a conclusion (success,
-partial, or failure), a design decision that played out with
-rationale, an incident the user navigated, or a novel interaction
-pattern with a visible outcome.
+EPISODE CLASSIFICATION (windowed):
+Decide whether the CURRENT exchange (marked with >>>) is the closing
+turn of an episode. PRIOR CONTEXT shows the lead-up; it is background,
+NEVER the unit being classified.
 
-Set `has_episode: false` when the exchange is routine: a single
-fact exchange, a short confirmation, a lookup, an acknowledgment,
-casual chat, or a mid-conversation turn where the situation is
-still unfolding without resolution.
+Set `has_episode: true` ONLY when ALL of the following hold:
+1. The CURRENT exchange contains a stated decision, lesson, outcome,
+   or resolution. Closure must be visible in the current turn itself.
+2. The PRIOR CONTEXT (if non-empty) sets up that closure: a problem,
+   a question, a deliberation, an incident in progress.
+3. You can quote a fragment from the CURRENT exchange (not from
+   prior turns) that signals the closure.
 
-When in doubt, prefer false. Episodes exist to capture "what
-happened and what we learned"; a turn without a clear outcome
-or lesson is not yet an episode.
+Set `has_episode: false` when:
+- The current exchange is itself a question, a request, an analytical
+  reply, or a status update with no resolution. Even if prior context
+  is rich, an unresolved current turn is not an episode close.
+- The current exchange is routine: a single fact lookup, an
+  acknowledgment, casual chat.
+- Closure exists in prior turns but the current turn moved on to a
+  new topic.
+
+When in doubt, prefer false. The cost of a false negative is one
+missed episode; the cost of a false positive is a hallucinated
+episode entering the memory store.
 
 CONSOLIDATION:
 You will sometimes receive an EXISTING FACTS block before the USER/ASSISTANT
@@ -738,6 +780,7 @@ def _build_extraction_payload(
     user_text: str,
     assistant_text: str,
     candidates: list[MemoryResult] | None = None,
+    prior_pairs: list[tuple[str, str]] | None = None,
 ) -> str:
     """
     Format the exchange as a single user message for the extractor.
@@ -753,12 +796,34 @@ def _build_extraction_payload(
     user confirmation that extraction would happily accept.
 
     The optional `candidates` list is rendered as the EXISTING FACTS
-    block between the "Extract facts from this exchange." line and the
-    USER segment. Empty or None `candidates` omits the block entirely;
-    the CONSOLIDATION section of the system prompt tells Haiku to emit
-    `intent: "new"` in that case. The block is omitted rather than
-    rendered as an empty header so a model looking at a brand-new user
-    sees a payload identical to the pre-consolidation shape.
+    block between the prior-context block (if any) and the CURRENT
+    EXCHANGE segment. Empty or None `candidates` omits the block
+    entirely; the CONSOLIDATION section of the system prompt tells
+    Haiku to emit `intent: "new"` in that case. The block is omitted
+    rather than rendered as an empty header so a model looking at a
+    brand-new user sees a payload identical to the pre-consolidation
+    shape.
+
+    The optional `prior_pairs` list is rendered as the PRIOR CONTEXT
+    block before EXISTING FACTS - a windowed payload for the episode
+    classifier (issue #392). Each pair renders as `[USER N]` /
+    `[ASSISTANT N]` lines, capped at `_PRIOR_USER_CHARS` /
+    `_PRIOR_ASSISTANT_CHARS`. Prior-turn role labels are stripped via
+    `_strip_role_labels` mirroring the current-exchange protection so
+    a crafted prior message cannot inject a fake current turn either.
+    Empty or None `prior_pairs` omits the block; the system prompt
+    handles a missing block by treating the current exchange as
+    standalone (the pre-#392 single-turn behavior).
+
+    The `>>> CURRENT EXCHANGE` marker is emitted UNCONDITIONALLY,
+    even when there is no prior context. The system prompt references
+    the marker as the load-bearing structural cue ("decide whether
+    the CURRENT exchange marked with >>>"), so a conditional render
+    would create two prompt shapes and a silent-divergence risk if
+    a future edit removes the conditional. The blank line BEFORE
+    `USER:` preserves the `\\n\\nUSER:` and `\\n\\nASSISTANT:`
+    separator pattern that existing role-label-injection tests count
+    against in tests/test_memory_extraction.py.
 
     The payload is delivered via stdin, not argv - see `_run_extractor`.
     """
@@ -774,18 +839,47 @@ def _build_extraction_payload(
         user_text = user_text[:_MAX_USER_CHARS] + "..."
     safe_user = _strip_role_labels(user_text)
     safe_assistant = _strip_role_labels(assistant_text)
-    # The EXISTING FACTS block sits between the instruction line and
-    # the USER turn. Its header is omitted when there are no
-    # candidates so the payload shape exactly matches pre-spec
-    # extraction on brand-new users (where no facts yet exist) and on
-    # the kill-switch path (n_candidates == 0). The prompt's
-    # CONSOLIDATION section handles that branch by mandating
-    # intent: "new" when the block is absent.
+    # Render PRIOR CONTEXT first so it appears at the top of the
+    # payload (before EXISTING FACTS and before the CURRENT EXCHANGE
+    # marker). Rendering uses 1-based indexing so the prompt's
+    # "PRIOR USER 1, 2, 3 ..." framing matches what the model sees
+    # rather than zero-indexed labels that would surprise a reader.
+    # Prior-turn caps are tighter than the current-exchange caps -
+    # see `_PRIOR_USER_CHARS` / `_PRIOR_ASSISTANT_CHARS` for rationale.
+    prior_block = ""
+    if prior_pairs:
+        lines: list[str] = []
+        for i, (u, a) in enumerate(prior_pairs, 1):
+            su = _strip_role_labels(u)
+            sa = _strip_role_labels(a)
+            if len(su) > _PRIOR_USER_CHARS:
+                su = su[:_PRIOR_USER_CHARS] + "..."
+            if len(sa) > _PRIOR_ASSISTANT_CHARS:
+                sa = sa[:_PRIOR_ASSISTANT_CHARS] + "..."
+            lines.append(f"[USER {i}] {su}")
+            lines.append(f"[ASSISTANT {i}] {sa}")
+        prior_block = "PRIOR CONTEXT (background only, NOT the unit to classify):\n" + "\n".join(lines) + "\n\n"
+    # The EXISTING FACTS block sits between the prior-context block
+    # (if any) and the CURRENT EXCHANGE marker. Its header is omitted
+    # when there are no candidates so the payload shape exactly
+    # matches pre-spec extraction on brand-new users (where no facts
+    # yet exist) and on the kill-switch path (n_candidates == 0).
+    # The prompt's CONSOLIDATION section handles that branch by
+    # mandating intent: "new" when the block is absent.
     candidate_block = ""
     if candidates:
-        lines = "\n".join(_render_candidate_line(c) for c in candidates)
-        candidate_block = "EXISTING FACTS FOR THIS USER (most semantically related first):\n" + lines + "\n\n"
-    return f"Extract facts from this exchange.\n\n{candidate_block}USER: {safe_user}\n\nASSISTANT: {safe_assistant}"
+        cand_lines = "\n".join(_render_candidate_line(c) for c in candidates)
+        candidate_block = "EXISTING FACTS FOR THIS USER (most semantically related first):\n" + cand_lines + "\n\n"
+    return (
+        f"Extract facts from this exchange.\n\n"
+        f"{prior_block}"
+        f"{candidate_block}"
+        f">>> CURRENT EXCHANGE (classify and extract from this exchange only):\n"
+        f"\n"
+        f"USER: {safe_user}\n"
+        f"\n"
+        f"ASSISTANT: {safe_assistant}"
+    )
 
 
 _CONSOLIDATION_INTENTS: frozenset[str] = frozenset({"new", "update_of", "skip_redundant"})
@@ -1694,6 +1788,7 @@ async def extract_and_store(
     user_id: str,
     session_id: str | None = None,
     config: Config | None = None,
+    prior_pairs: list[tuple[str, str]] | None = None,
 ) -> int:
     """
     Run Haiku extraction on an exchange and store the resulting facts.
@@ -1714,6 +1809,12 @@ async def extract_and_store(
     the caller always passes `config`; None falls back to loading
     load_config() which is acceptable but slow and not used on the
     hot path.
+
+    The optional `prior_pairs` parameter is the windowed PRIOR CONTEXT
+    for the episode classifier (issue #392). bot.py's `_ingest_memory`
+    fetches it from `history.get_recent_pairs` and threads it through;
+    None preserves the pre-#392 single-turn behavior for any caller
+    (notably the existing test suite) that does not yet pass it.
     """
     if config is None:
         from kai.config import load_config
@@ -1800,7 +1901,12 @@ async def extract_and_store(
                     separators=(",", ":"),
                 ),
             )
-            payload = _build_extraction_payload(user_text, assistant_capped, candidates)
+            payload = _build_extraction_payload(
+                user_text,
+                assistant_capped,
+                candidates,
+                prior_pairs=prior_pairs,
+            )
             result = await _run_extractor(
                 payload,
                 config,

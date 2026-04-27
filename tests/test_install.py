@@ -1444,6 +1444,7 @@ class TestCmdConfig:
             "true",  # extraction enabled (claude backend)
             "60",  # extraction timeout seconds (#345)
             "5",  # consolidation candidates (non-default, exercises emission branch)
+            "5",  # episode classifier context turns (#392, non-default exercises emission)
             # Episode model: empty input now resolves to the wizard's
             # default of "claude-sonnet-4-6" rather than the empty
             # string. To exercise the explicit-override emission
@@ -1467,6 +1468,10 @@ class TestCmdConfig:
         assert "MEMORY_EXTRACTION_BUDGET_USD" not in env
         assert env["MEMORY_EXTRACTION_TIMEOUT_S"] == "60"
         assert env["MEMORY_CONSOLIDATION_CANDIDATES_N"] == "5"
+        # Episode-classifier context window (#392): operator picked
+        # non-default 5, so the emission gate fires and the env entry
+        # is written.
+        assert env["EPISODE_CLASSIFIER_CONTEXT_TURNS"] == "5"
         # Episode model: the wizard's non-blank default means an
         # operator who hits Enter at the prompt now gets Sonnet
         # written to the env. This test asserts the explicit-override
@@ -1504,6 +1509,7 @@ class TestCmdConfig:
             "true",  # extraction enabled
             "10",  # extraction timeout (dataclass default; suppressed)
             "8",  # consolidation candidates (dataclass default; suppressed)
+            "3",  # episode classifier context turns (#392, dataclass default; suppressed)
             "",  # episode model: accept wizard default = claude-sonnet-4-6
             "120",  # episode timeout (dataclass default; suppressed)
             "2000",  # token budget (dataclass default; suppressed)
@@ -1526,6 +1532,9 @@ class TestCmdConfig:
         assert "MEMORY_EXTRACTION_BUDGET_USD" not in env
         assert "MEMORY_EXTRACTION_TIMEOUT_S" not in env
         assert "MEMORY_CONSOLIDATION_CANDIDATES_N" not in env
+        # Episode-classifier context window (#392) at default 3 is
+        # also suppressed by the emission gate.
+        assert "EPISODE_CLASSIFIER_CONTEXT_TURNS" not in env
 
     def test_memory_round_trip_through_env_file(self, tmp_path, monkeypatch):
         """Wizard-captured memory vars survive _generate_env_file()."""
@@ -1534,7 +1543,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
 
-        # Inputs in wizard order: enabled, ext enabled, timeout, consolidation, episode model/timeout, token budget, search limit.
+        # Inputs in wizard order: enabled, ext enabled, timeout, consolidation, classifier-window, episode model/timeout, token budget, search limit.
         # Budget prompts (extraction, episode) are skipped on the claude
         # backend per issue #390, so they are absent from this input list.
         memory_block = [
@@ -1542,6 +1551,7 @@ class TestCmdConfig:
             "true",
             "45",
             "4",
+            "7",  # episode classifier context turns (#392, non-default)
             "claude-haiku-4-5-future",
             "90",
             "2500",
@@ -1562,6 +1572,8 @@ class TestCmdConfig:
         assert "MEMORY_EXTRACTION_BUDGET_USD" not in rendered
         assert 'MEMORY_EXTRACTION_TIMEOUT_S="45"' in rendered
         assert 'MEMORY_CONSOLIDATION_CANDIDATES_N="4"' in rendered
+        # Episode-classifier context window (#392) round-trip parity.
+        assert 'EPISODE_CLASSIFIER_CONTEXT_TURNS="7"' in rendered
         # Episode tunables: explicit model entry survives, non-default
         # timeout survives. Round-trip parity with the extraction tunables
         # above. Budget is suppressed on claude for the same reason.
@@ -1721,18 +1733,22 @@ class TestCmdConfig:
         assert "MEMORY_EXTRACTION_TIMEOUT_S" not in env
 
     def test_extraction_disabled_skips_timeout_prompt(self, tmp_path, monkeypatch):
-        """Extraction off must skip the timeout, consolidation, AND episode prompts; search limit still asked.
+        """Extraction off must skip the timeout, consolidation, classifier-window, AND episode prompts; search limit still asked.
 
         Regression guard for the off-by-one trap: timeout, consolidation,
-        and the entire episode block sit inside the extraction-enabled
-        branch, so disabling extraction must consume strictly fewer
-        prompts than enabling it. (Issue #390 removed the extraction
-        budget and episode budget prompts from the claude branch
-        entirely; the extraction-enabled branch now drives only timeout,
-        consolidation, episode model, and episode timeout.) If the
-        gating drifts, the input iterator desynchronises and the wizard
-        reads search limit as if it were one of the extraction-only
-        prompts - the assertion below catches that.
+        the new episode-classifier context window (#392), and the entire
+        episode block sit inside the extraction-enabled branch, so
+        disabling extraction must consume strictly fewer prompts than
+        enabling it. (Issue #390 removed the extraction budget and
+        episode budget prompts; #392 adds the classifier window prompt;
+        the extraction-enabled branch now drives only timeout,
+        consolidation, classifier-window, episode model, and episode
+        timeout.) If the gating drifts on any of these prompts - notably
+        if a future edit accidentally hoists the classifier-window
+        prompt out of the extraction-enabled branch - the input iterator
+        desynchronises and the wizard reads search limit as if it were
+        one of the extraction-only prompts. The assertion below catches
+        that.
         """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
@@ -1757,6 +1773,107 @@ class TestCmdConfig:
         assert "MEMORY_EXTRACTION_TIMEOUT_S" not in env
         assert env["MEMORY_TOKEN_BUDGET"] == "3000"
         assert env["MEMORY_SEARCH_LIMIT"] == "20"
+        # Classifier-window key (#392) must also be absent: with
+        # extraction off, the prompt is gated out and the dataclass
+        # default never gets emitted. Pin this so a future edit that
+        # hoists the prompt out of the extraction-enabled branch
+        # surfaces here.
+        assert "EPISODE_CLASSIFIER_CONTEXT_TURNS" not in env
+
+    # Spec 392: episode-classifier context window. The new wizard
+    # prompt fires alongside MEMORY_CONSOLIDATION_CANDIDATES_N inside
+    # the extraction-enabled branch on the claude backend. These three
+    # tests pin the emission contract - non-default writes the env
+    # entry, default suppresses it, non-claude skips the prompt
+    # entirely (the dataclass default applies at startup).
+
+    def test_episode_classifier_context_turns_writes_env_when_non_default(self, tmp_path, monkeypatch):
+        """Operator picks 5 (non-default). The emission gate fires
+        and EPISODE_CLASSIFIER_CONTEXT_TURNS=5 lands in the env file."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+
+        # All other fields at default; only the classifier window is
+        # non-default so the test isolates the new emission path from
+        # surrounding noise.
+        memory_block = [
+            "true",  # memory enabled
+            "true",  # extraction enabled
+            "10",  # extraction timeout (default; suppressed)
+            "8",  # consolidation candidates (default; suppressed)
+            "5",  # episode classifier context turns (#392, non-default)
+            "",  # episode model (accept Sonnet wizard default)
+            "120",  # episode timeout (default; suppressed)
+            "2000",  # token budget (default; suppressed)
+            "10",  # search limit (default; suppressed)
+        ]
+        inputs = iter(self._base_inputs(memory_block))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        env = json.loads((tmp_path / "install.conf").read_text())["env"]
+        assert env["EPISODE_CLASSIFIER_CONTEXT_TURNS"] == "5"
+
+    def test_episode_classifier_context_turns_dataclass_default_suppressed(self, tmp_path, monkeypatch):
+        """Operator picks 3 (the dataclass default). The
+        delta-from-default emission gate suppresses the env entry so
+        install.conf stays a delta from defaults rather than a
+        snapshot of every available knob."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+
+        memory_block = [
+            "true",  # memory enabled
+            "true",  # extraction enabled
+            "10",  # extraction timeout (default)
+            "8",  # consolidation candidates (default)
+            "3",  # episode classifier context turns (#392, dataclass default)
+            "",  # episode model (Sonnet default)
+            "120",  # episode timeout (default)
+            "2000",  # token budget (default)
+            "10",  # search limit (default)
+        ]
+        inputs = iter(self._base_inputs(memory_block))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        env = json.loads((tmp_path / "install.conf").read_text())["env"]
+        # All defaults → key is absent.
+        assert "EPISODE_CLASSIFIER_CONTEXT_TURNS" not in env
+
+    def test_episode_classifier_context_turns_skipped_on_goose_backend(self, tmp_path, monkeypatch):
+        """On agent_backend="goose", the entire memory-extraction
+        branch is gated out (the classifier only runs under claude
+        per bot.py's effective_backend == "claude" check). The wizard
+        does not prompt for the new key, the dataclass default
+        applies at startup, and the env file does not carry the key."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+
+        # On goose, the extraction-enabled prompt itself is skipped, so
+        # memory_block is shaped like a no-extraction run. The entire
+        # extraction-enabled branch (including the new classifier-window
+        # prompt) does not fire.
+        memory_block = ["true", "2000", "10"]  # memory_enabled, token_budget, search_limit
+        inputs = iter(self._base_inputs(memory_block, agent_backend="goose"))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        env = json.loads((tmp_path / "install.conf").read_text())["env"]
+        # Backend-cleanup pop in install.py drops the key under non-
+        # claude backends; pin the absence so a future regression
+        # that leaves a stale value in /etc/kai/env after a
+        # claude→goose flip surfaces here.
+        assert "EPISODE_CLASSIFIER_CONTEXT_TURNS" not in env
 
 
 # ── Apply subcommand ─────────────────────────────────────────────────

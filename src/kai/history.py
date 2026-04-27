@@ -22,6 +22,7 @@ summary of the last few messages for ambient recall at session start.
 
 import json
 import logging
+import re
 from datetime import UTC, datetime
 
 from kai.config import DATA_DIR
@@ -37,6 +38,21 @@ _LOG_DIR = DATA_DIR / "history"
 # Limits for the recent-history summary injected at session start
 _MAX_RECENT_MESSAGES = 20
 _MAX_CHARS_PER_MESSAGE = 500
+
+# Synthetic placeholder markers written by the failure-path log_message
+# calls in bot.py - `/stop` aborts ("[stopped by user]"), empty results
+# ("[no response]"), and error paths ("[error: <type/message>]"). These
+# are formatted-text-only entries with no real assistant content;
+# `get_recent_pairs` skips them so a windowed extraction payload does
+# not feed a "botched exchange" prior turn into the episode classifier
+# (issue #392). The regex is anchored to the full line so a legitimate
+# message that happens to contain "[error: ...]" as quoted prose - e.g.
+# a user asking "what does [error: foo] mean?" - is NOT mis-skipped.
+# `error: .+` rather than `error: [^\]]+` because the inner content can
+# itself contain `]` characters (Python tracebacks frequently do); the
+# trailing `]$` anchor still requires the final `]` to be the last
+# character of the entire line.
+_SYNTHETIC_ASSISTANT_MARKERS: re.Pattern[str] = re.compile(r"^\[(stopped by user|no response|error: .+)\]$")
 
 
 def log_message(
@@ -175,3 +191,172 @@ def get_recent_history(chat_id: int | None = None) -> str:
         lines.append(f"[{ts}] {speaker}: {text}")
 
     return "\n".join(lines)
+
+
+def get_recent_pairs(chat_id: int, n: int) -> list[tuple[str, str]]:
+    """
+    Return the most recent N (user_text, assistant_text) pairs from the
+    user's JSONL chat history, in CHRONOLOGICAL order (oldest first).
+
+    Used by the stage-1 memory extractor (issue #392) to feed prior
+    turns to the episode classifier as PRIOR CONTEXT background. The
+    classifier needs structured pairs (not the formatted text that
+    `get_recent_history` produces) and stricter filtering (synthetic
+    failure-path markers and empty-text records would distort the
+    closure heuristic).
+
+    The implementation walks JSONL files newest-first internally to
+    bound the work when history is long, then reverses the collected
+    records to deliver oldest-first so callers can render PRIOR USER 1,
+    2, 3 ... naturally in the prompt.
+
+    Pairing semantics:
+    - A user record followed (eventually) by an assistant record forms
+      one pair. Records between the two are skipped per the rules below.
+    - Multiple user records before a single assistant record collapse:
+      only the LAST user record (the one immediately preceding the
+      assistant) is paired. Earlier orphan user messages are dropped.
+      This matches the "user can send multiple messages before getting
+      a reply" pattern in Telegram.
+    - An assistant record with no prior pending user record is dropped
+      (orphan; legacy or restored-from-backup data).
+
+    Records skipped before pairing:
+    - Records with empty `text` (after strip). Image-only and voice-only
+      messages with no transcribed text would otherwise produce
+      meaningless prior turns.
+    - Assistant records whose text matches `_SYNTHETIC_ASSISTANT_MARKERS`
+      (the failure-path placeholders written by bot.py's `/stop`,
+      empty-result, and error paths). Pairing one of these into a
+      windowed payload would feed the classifier a "botched exchange"
+      prior context that distorts the closure heuristic.
+    - Records with no `chat_id` field (pre-Phase-2 legacy records).
+      Greenfield helper sets the deliberate convention: skip rather
+      than risk mixing chats. `get_recent_history` includes such
+      records for backward compat; this helper diverges because the
+      classifier path is sensitive to mis-attributed prior turns in
+      a way the display path is not.
+
+    Both halves of the current in-flight exchange are already written
+    to JSONL by the time extraction runs (the user message is logged
+    when it arrives in `bot.py`; the assistant message is logged
+    immediately before `_ingest_memory` is dispatched as a background
+    task). So the most recent pair returned by this helper IS the
+    current exchange. Callers MUST drop the most recent pair before
+    passing prior turns to the classifier - see `_ingest_memory` in
+    `bot.py` for the +1/drop pattern.
+
+    Args:
+        chat_id: Telegram chat ID. Records without this exact id are
+            filtered out (alongside no-chat_id legacy records).
+        n: Maximum number of pairs to return. Non-positive values
+            return an empty list (used by callers that want to disable
+            windowing without a special-case branch).
+
+    Returns:
+        Up to N pairs, oldest-first. Returns fewer than N pairs when
+        history is short, the user is new, or filters drop rows.
+        Never raises; OS errors are logged and the affected file is
+        skipped.
+    """
+    if n <= 0:
+        return []
+    if not _LOG_DIR.exists():
+        return []
+
+    # Per-user subdirectory; ignore legacy flat files entirely. The
+    # classifier path's strictness on chat_id provenance means
+    # admin-restored backups in user_dir are also filtered out below
+    # (records without `chat_id` are dropped) so even a misplaced
+    # legacy file in the wrong subdirectory cannot leak across users.
+    user_dir = _LOG_DIR / str(chat_id)
+    if not user_dir.exists():
+        return []
+
+    files = sorted(user_dir.glob("*.jsonl"), reverse=True)  # newest first
+    if not files:
+        return []
+
+    # Collect filtered records, building oldest-first by prepending
+    # each newer file's records to the running list. The threshold
+    # `3 * n` is a budget heuristic: each pair needs at least one
+    # user + one assistant record, so 2n is the structural minimum;
+    # 3n adds headroom for filtered-out rows (synthetic markers, empty
+    # texts, multi-user-before-assistant collapses) so the typical
+    # case stops scanning after a single recent file. Files are small
+    # (one day apiece), so this stays cheap even on heavy users.
+    records: list[dict] = []
+    for path in files:
+        file_records: list[dict] = []
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            log.exception("Failed to read history file %s", path)
+            continue
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                # Skip individual bad lines rather than discarding the
+                # whole file - matches the existing get_recent_history
+                # tolerance for partial corruption.
+                log.debug("Skipping malformed JSON line in %s", path.name)
+                continue
+            # Drop records without a `chat_id` field (legacy pre-Phase-2).
+            # Greenfield divergence from get_recent_history: the
+            # classifier path needs strict provenance; legacy records
+            # have no way to confirm they belong to this chat.
+            if "chat_id" not in rec:
+                continue
+            # User partition: drop records belonging to other chats.
+            # Possible if a backup/restore mis-placed a file, or if a
+            # future operator action stages JSONL across chats.
+            if rec.get("chat_id") != chat_id:
+                continue
+            text = (rec.get("text") or "").strip()
+            if not text:
+                continue
+            direction = rec.get("dir")
+            # Synthetic-marker filter applies only to assistant records.
+            # A user message that quotes one of the marker shapes is
+            # legitimate prior context (the anchored regex shape catches
+            # only exact full-line matches; quoted prose is safe).
+            if direction == "assistant" and _SYNTHETIC_ASSISTANT_MARKERS.match(text):
+                continue
+            file_records.append({"dir": direction, "text": text})
+        # Prepend so the running list stays oldest-first across files.
+        records = file_records + records
+        if len(records) >= 3 * n:
+            break
+
+    if not records:
+        return []
+
+    # Pair records walking forward through chronological order. The
+    # `pending_user` slot keeps overwriting on consecutive user records
+    # so the LAST user before an assistant is the one that pairs - this
+    # is the multi-user-before-assistant collapse documented above.
+    pairs: list[tuple[str, str]] = []
+    pending_user: str | None = None
+    for rec in records:
+        direction = rec["dir"]
+        text = rec["text"]
+        if direction == "user":
+            pending_user = text
+        # Assistant records pair only when a pending user exists. An
+        # assistant record with no pending user is an orphan (legacy
+        # data, restored-from-backup mishap, or partial JSONL
+        # truncation) and is silently dropped - the falling-out branch
+        # of the elif is the no-op orphan handler.
+        elif direction == "assistant" and pending_user is not None:
+            pairs.append((pending_user, text))
+            pending_user = None
+
+    # Cap at the N most recent. Slicing from the tail preserves
+    # chronological order among the kept pairs, which is what the
+    # PRIOR USER 1, 2, 3 ... rendering relies on.
+    if len(pairs) > n:
+        pairs = pairs[-n:]
+    return pairs

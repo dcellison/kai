@@ -3680,12 +3680,33 @@ async def _handle_response(
                     user_config.agent_backend if user_config and user_config.agent_backend else config.agent_backend
                 )
                 if config.memory_extraction_enabled and effective_backend == "claude":
+                    # Windowed PRIOR CONTEXT for the episode classifier
+                    # (issue #392). Fetch one extra pair beyond the
+                    # configured window and drop the most recent: the
+                    # current exchange has already been written to JSONL
+                    # by the log_message(direction="assistant", ...) call
+                    # above, so the newest pair returned by
+                    # `get_recent_pairs` IS the current exchange. The
+                    # `fetched[:-1] if fetched else []` slice handles
+                    # short-history cases gracefully (a brand-new user
+                    # with only the current exchange logged returns
+                    # `[(current_user, current_asst)]`, sliced to `[]`,
+                    # which the payload builder treats as no prior
+                    # context). N=0 disables windowing entirely; skip
+                    # the disk read in that case.
+                    prior_pairs: list[tuple[str, str]] = []
+                    if config.episode_classifier_context_turns > 0:
+                        from kai.history import get_recent_pairs
+
+                        fetched = get_recent_pairs(chat_id, config.episode_classifier_context_turns + 1)
+                        prior_pairs = fetched[:-1] if fetched else []
                     await memory_extraction.extract_and_store(
                         user_text=user_text,
                         assistant_text=final_text,
                         user_id=str(chat_id),
                         session_id=final_response.session_id,
                         config=config,
+                        prior_pairs=prior_pairs,
                     )
             except Exception:
                 log.warning("Memory ingestion failed", exc_info=True)
