@@ -414,6 +414,44 @@ class TestCommandConstruction:
             idx = cmd.index("--effort")
             assert cmd[idx + 1] == "xhigh"
 
+    @pytest.mark.asyncio
+    async def test_max_budget_usd_flag_absent_on_claude_backend(self):
+        """--max-budget-usd must NOT be emitted to the inner Claude
+        argv (issue #390). ClaudeCodeBackend is only instantiated for
+        the claude backend (pool.py selects between ClaudeCodeBackend
+        and GooseBackend by agent_backend), so the absence is
+        unconditional at this site. Max-plan OAuth makes the CLI's
+        computed-cost ceiling a phantom signal; runaway protection
+        comes from timeout_seconds at the per-message wait_for() call.
+        The max_budget_usd attribute on the instance stays so
+        /settings budget can read it back, but the value no longer
+        reaches the subprocess argv. Pinned as an absence assertion
+        so a future regression that re-adds the flag fails here.
+        """
+        # Construct with a non-default max_budget_usd so the assertion
+        # would catch a regression that simply forgot to remove the
+        # argv pair (rather than a regression that emits the dataclass
+        # default 1.0). Using an obviously-non-default 7.0 makes the
+        # intent legible at the call site.
+        claude = _make_claude(max_budget_usd=7.0)
+        assert claude.max_budget_usd == 7.0  # constructor wired it through
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            cmd = mock_exec.call_args[0]
+            assert "--max-budget-usd" not in cmd
+            # The numeric value also must not slip into argv as a
+            # bare positional. Belt-and-suspenders: covers a regression
+            # that drops the flag name but accidentally leaves the
+            # value behind in the list.
+            assert "7.0" not in cmd
+
 
 # ── Process signal handling ──────────────────────────────────────────
 

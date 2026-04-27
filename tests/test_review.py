@@ -518,22 +518,25 @@ class TestRunReview:
         assert "sonnet" in cmd
 
     @pytest.mark.asyncio
-    async def test_budget_argv_uses_fixed_point_for_small_values(self):
+    async def test_max_budget_usd_flag_absent_on_claude_backend(self):
         """
-        --max-budget-usd must be rendered as fixed-point, not scientific
-        notation. str(1e-5) yields '1e-05', which some numeric parsers
-        reject; using f'{budget:.4f}' keeps the argv stable.
+        --max-budget-usd must NOT be emitted to claude --print argv
+        on the claude backend (issue #390): Max-plan OAuth makes the
+        CLI's computed-cost ceiling a phantom signal, so passing the
+        flag would terminate the subprocess at a ceiling that does
+        not correspond to real billing. Runaway protection comes from
+        the per-review timeout instead. Pinned as an absence assertion
+        so a future regression that re-adds the flag fails here.
         """
         mock_proc = _mock_process(stdout=b"ok")
 
         with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_review("prompt", budget_usd=1e-4)
+            # agent_backend defaults to "claude"; budget_usd is still
+            # accepted on the signature but no longer reaches argv.
+            await run_review("prompt", budget_usd=1.0)
 
         cmd = mock_exec.call_args[0]
-        budget_idx = cmd.index("--max-budget-usd")
-        budget_value = cmd[budget_idx + 1]
-        assert "e" not in budget_value.lower()
-        assert budget_value == "0.0001"
+        assert "--max-budget-usd" not in cmd
 
     @pytest.mark.asyncio
     async def test_failure_raises(self):

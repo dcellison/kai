@@ -457,13 +457,21 @@ async def run_triage(
             raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from None
     else:
         # Claude one-shot mode: --print reads from stdin, writes to stdout.
+        # No --max-budget-usd on this branch: the claude backend runs under
+        # Max-plan OAuth, where the CLI tracks computed token cost regardless
+        # of whether any money is being charged. Passing the flag would
+        # terminate the subprocess at a ceiling that does not correspond to
+        # real billing. Runaway protection comes from _TRIAGE_TIMEOUT at the
+        # asyncio.wait_for call below: a stuck subprocess cannot hold the
+        # executor longer than that timeout, regardless of how many tokens
+        # it has notionally produced. _TRIAGE_BUDGET_USD stays defined for
+        # symmetry with the other budget defaults in this codebase; cleanup
+        # is deferred to a separate refactor.
         cmd = [
             "claude",
             "--print",
             "--model",
             _TRIAGE_MODEL,
-            "--max-budget-usd",
-            str(_TRIAGE_BUDGET_USD),
         ]
 
         # Resolve self-sudo: skip sudo when claude_user matches the bot

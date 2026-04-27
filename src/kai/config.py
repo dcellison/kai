@@ -320,6 +320,11 @@ class Config:
         budget_ceiling: Global budget ceiling in USD. Users cannot exceed
             this via /settings budget. Also serves as the fallback default
             for users without a per-user max_budget in users.yaml.
+            Informational only on the claude backend (Max-plan OAuth makes
+            the CLI's computed-cost ceiling a phantom signal; the
+            --max-budget-usd flag is omitted from claude --print argv).
+            Enforced on non-claude backends, which run on pay-per-token
+            billing where the ceiling is a real cost gate.
         claude_max_session_hours: Hours before the inner Claude process is recycled. Prevents
             unbounded V8 memory growth that can trigger macOS Jetsam kernel panics. 0 = no limit.
         session_db_path: Path to the SQLite database for sessions, jobs, and settings
@@ -415,10 +420,13 @@ class Config:
     # a long time; the default gives thinking-heavy reviews room while
     # still terminating genuinely stuck processes.
     pr_review_timeout_s: int = 900
-    # Hard USD ceiling for one PR review subprocess. Passed through to
-    # claude --max-budget-usd. Not a typical-run estimate - Sonnet reviews
-    # of normal PRs cost well under this. The ceiling is a safety limit
-    # against runaway invocations, not a cost target.
+    # Hard USD ceiling for one PR review subprocess. Omitted from claude
+    # --print argv on the claude backend (Max-plan OAuth makes the CLI's
+    # computed-cost ceiling a phantom signal); the field is consulted by
+    # non-claude backends, where reviews run on pay-per-token billing
+    # and the ceiling is a real cost gate. Field stays defined so
+    # operators with hand-edited /etc/kai/env from a previous install
+    # are not affected by upgrade.
     pr_review_budget_usd: float = 1.0
     # Deprecated: review agent now resolves repos via workspace config.
     # Kept for backwards compatibility with existing .env files; the value
@@ -478,13 +486,14 @@ class Config:
     memory_extraction_enabled: bool = False
     # Claude model name for extraction. Default is Haiku 4.5.
     memory_extraction_model: str = "claude-haiku-4-5-20251001"
-    # Per-call budget ceiling, passed via --max-budget-usd. The
-    # subprocess bills pay-per-token at Haiku rates regardless of the
-    # operator's Max-plan status (observed ~$0.02-$0.03 per call, mostly
-    # cache-creation tokens). The 0.01 default is a strict safety rail
-    # and is intentionally insufficient for a single real extraction;
-    # operators enabling MEMORY_EXTRACTION_ENABLED should raise this to
-    # at least 0.05 after reading the expected cost.
+    # Per-call budget ceiling. Omitted from claude --print argv on the
+    # claude backend (Max-plan OAuth makes the CLI's computed-cost
+    # ceiling a phantom signal; runaway protection comes from
+    # memory_extraction_timeout_s instead). Field stays defined for
+    # non-claude backends, which run on pay-per-token billing where
+    # the ceiling is a real cost gate, and so operators upgrading a
+    # deployment with MEMORY_EXTRACTION_BUDGET_USD already set in
+    # /etc/kai/env do not see a startup error after upgrade.
     memory_extraction_budget_usd: float = 0.01
     # Timeout (seconds) for a single extraction subprocess. Haiku
     # typically finishes in 2-4s; 10s gives headroom without stranding
@@ -521,17 +530,19 @@ class Config:
     # is never the effective value. Test fixtures that construct Config
     # directly should set this explicitly to a real model name.
     memory_episode_model: str = ""
-    # Per-call budget ceiling (USD). Default 0.15 is sized for a
-    # Sonnet-class model on the FULL uncapped (user, assistant) pair;
-    # stage 2 deliberately bypasses stage-1's 500-char assistant cap.
-    # Sonnet is the recommended stage-2 model because it produces
-    # materially better narratives across the 7-8 Sophia episode
-    # fields, and stage 2 is fully out-of-band (latency invisible to
-    # the user). Operators on a Max-plan OAuth subscription do not
-    # bill per-token for headless `claude --print`, so this ceiling
-    # is a safety rail rather than a real cost gate. Operators
-    # downgrading memory_episode_model to Haiku can drop this to
-    # 0.05 or lower; the wizard recommends 0.15 as the default.
+    # Per-call budget ceiling (USD). Omitted from claude --print argv
+    # on the claude backend (Max-plan OAuth makes the CLI's
+    # computed-cost ceiling a phantom signal; runaway protection comes
+    # from memory_episode_timeout_s instead). Field stays defined for
+    # non-claude backends, which run on pay-per-token billing where
+    # the ceiling is a real cost gate, and so operators upgrading a
+    # deployment with MEMORY_EPISODE_BUDGET_USD already set in
+    # /etc/kai/env do not see a startup error after upgrade. Default
+    # 0.15 is sized for a Sonnet-class model on the FULL uncapped
+    # (user, assistant) pair; stage 2 deliberately bypasses stage-1's
+    # 500-char assistant cap. Operators downgrading memory_episode_model
+    # to Haiku can drop this to 0.05 or lower; the wizard recommends
+    # 0.15 as the default for non-claude backends.
     memory_episode_budget_usd: float = 0.15
     # Subprocess timeout (seconds). Default 120 - twice the production-
     # tuned stage-1 value (60s) and 12x the stage-1 dataclass default

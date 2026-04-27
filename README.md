@@ -226,7 +226,7 @@ cp .env.example .env
 
 *Deprecated vars still work for backward compatibility when `users.yaml` is absent. When `users.yaml` is present, `users.yaml` wins and a warning is logged. Run `make config` to migrate.
 
-`BUDGET_CEILING` limits spending in a single session. For Claude Code, this maps to the `--max-budget-usd` CLI flag (on Pro/Max plans, purely a runaway prevention mechanism). Goose does not currently enforce this limit. The session resets on `/new`, model switch, or workspace switch.
+`BUDGET_CEILING` limits spending in a single session. On the Claude Code backend the flag is omitted on Max-plan OAuth (no real cost is incurred); runaway prevention is handled by the per-session timeout instead. Goose does not currently enforce this limit. The session resets on `/new`, model switch, or workspace switch.
 
 ## Running
 

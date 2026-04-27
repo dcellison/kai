@@ -1238,6 +1238,20 @@ class TestCmdConfig:
         if agent_backend == "claude":
             claude_user_entry = [""]
 
+        # BUDGET_CEILING and PR_REVIEW_BUDGET_USD prompts are skipped
+        # on the claude backend (issue #390): --max-budget-usd is no
+        # longer emitted to claude --print argv, so prompting for a
+        # value that is never enforced would be wizard noise. The
+        # fixture entries are conditional to match the wizard's
+        # runtime conditional. Same shape as claude_only_pre_webhook
+        # immediately above; the inverted conditional reflects that
+        # these prompts now fire ONLY on non-claude backends.
+        budget_entry: list[str] = []
+        pr_review_budget_entry: list[str] = []
+        if agent_backend != "claude":
+            budget_entry = ["10.0"]  # BUDGET_CEILING
+            pr_review_budget_entry = ["1.0"]  # PR_REVIEW_BUDGET_USD
+
         return [
             "/opt/kai",  # install dir
             "/var/lib/kai",  # data dir
@@ -1252,7 +1266,7 @@ class TestCmdConfig:
             *backend_block,  # llm_provider + api_key (non-claude only)
             "sonnet",  # model
             "120",  # timeout
-            "10.0",  # budget
+            *budget_entry,  # BUDGET_CEILING (non-claude only)
             "200000",  # max context window
             *claude_only_pre_webhook,  # autocompact + effort (claude only)
             "8080",  # port
@@ -1261,7 +1275,7 @@ class TestCmdConfig:
             "",  # allowed workspaces
             "false",  # pr review enabled
             "900",  # pr review timeout
-            "1.0",  # pr review budget
+            *pr_review_budget_entry,  # PR_REVIEW_BUDGET_USD (non-claude only)
             "false",  # issue triage
             "",  # github notify chat id
             "false",  # voice
@@ -1420,11 +1434,14 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
 
-        # Memory on, extraction on, custom budget + timeout + consolidation candidates + episode tunables + token budget + search limit.
+        # Memory on, extraction on, custom timeout + consolidation candidates + episode tunables + token budget + search limit.
+        # Budget prompts (extraction, episode) are skipped on the claude
+        # backend per issue #390 - --max-budget-usd is no longer emitted
+        # to claude --print argv at either stage, so the wizard does not
+        # ask for a value that would never be enforced.
         memory_block = [
             "true",  # memory enabled
             "true",  # extraction enabled (claude backend)
-            "0.05",  # extraction budget USD
             "60",  # extraction timeout seconds (#345)
             "5",  # consolidation candidates (non-default, exercises emission branch)
             # Episode model: empty input now resolves to the wizard's
@@ -1432,7 +1449,6 @@ class TestCmdConfig:
             # string. To exercise the explicit-override emission
             # branch, type a different model literal here.
             "claude-haiku-4-5-20251001",  # episode model (explicit override)
-            "0.07",  # episode budget USD (non-default; exercises emission branch)
             "60",  # episode timeout seconds (non-default)
             "3000",  # token budget
             "20",  # search limit (#345)
@@ -1446,7 +1462,9 @@ class TestCmdConfig:
         env = conf["env"]
         assert env["MEMORY_ENABLED"] == "true"
         assert env["MEMORY_EXTRACTION_ENABLED"] == "true"
-        assert env["MEMORY_EXTRACTION_BUDGET_USD"] == "0.05"
+        # Budget keys absent on claude backend: prompt is skipped, value
+        # stays at dataclass default, double-gated emission suppresses.
+        assert "MEMORY_EXTRACTION_BUDGET_USD" not in env
         assert env["MEMORY_EXTRACTION_TIMEOUT_S"] == "60"
         assert env["MEMORY_CONSOLIDATION_CANDIDATES_N"] == "5"
         # Episode model: the wizard's non-blank default means an
@@ -1454,7 +1472,7 @@ class TestCmdConfig:
         # written to the env. This test asserts the explicit-override
         # path: a model literal typed in the prompt survives to env.
         assert env["MEMORY_EPISODE_MODEL"] == "claude-haiku-4-5-20251001"
-        assert env["MEMORY_EPISODE_BUDGET_USD"] == "0.07"
+        assert "MEMORY_EPISODE_BUDGET_USD" not in env
         assert env["MEMORY_EPISODE_TIMEOUT_S"] == "60"
         assert env["MEMORY_TOKEN_BUDGET"] == "3000"
         assert env["MEMORY_SEARCH_LIMIT"] == "20"
@@ -1478,14 +1496,15 @@ class TestCmdConfig:
         # default so the emission gates suppress non-episode keys.
         # Asserted on the negative side below for the episode keys;
         # the positive assertion is on the Sonnet model entry.
+        # Budget prompts (extraction, episode) are skipped on the
+        # claude backend per issue #390, so they are absent from
+        # the input list rather than supplying the dataclass default.
         memory_block = [
             "true",  # memory enabled
             "true",  # extraction enabled
-            "0.01",  # extraction budget (stage-1 dataclass default; suppressed)
             "10",  # extraction timeout (dataclass default; suppressed)
             "8",  # consolidation candidates (dataclass default; suppressed)
             "",  # episode model: accept wizard default = claude-sonnet-4-6
-            "0.15",  # episode budget (dataclass default; suppressed)
             "120",  # episode timeout (dataclass default; suppressed)
             "2000",  # token budget (dataclass default; suppressed)
             "10",  # search limit (dataclass default; suppressed)
@@ -1515,15 +1534,15 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
 
-        # Inputs in wizard order: enabled, ext enabled, budget, timeout, consolidation, episode model/budget/timeout, token budget, search limit.
+        # Inputs in wizard order: enabled, ext enabled, timeout, consolidation, episode model/timeout, token budget, search limit.
+        # Budget prompts (extraction, episode) are skipped on the claude
+        # backend per issue #390, so they are absent from this input list.
         memory_block = [
             "true",
             "true",
-            "0.07",
             "45",
             "4",
             "claude-haiku-4-5-future",
-            "0.10",
             "90",
             "2500",
             "15",
@@ -1537,14 +1556,17 @@ class TestCmdConfig:
         rendered = _generate_env_file(conf["env"])
         assert 'MEMORY_ENABLED="true"' in rendered
         assert 'MEMORY_EXTRACTION_ENABLED="true"' in rendered
-        assert 'MEMORY_EXTRACTION_BUDGET_USD="0.07"' in rendered
+        # Budget keys never reach the env file on claude (prompt skipped,
+        # double-gated emission suppresses) - asserted absent here as the
+        # round-trip equivalent of test_memory_enabled_writes_tunables.
+        assert "MEMORY_EXTRACTION_BUDGET_USD" not in rendered
         assert 'MEMORY_EXTRACTION_TIMEOUT_S="45"' in rendered
         assert 'MEMORY_CONSOLIDATION_CANDIDATES_N="4"' in rendered
         # Episode tunables: explicit model entry survives, non-default
-        # budget and timeout survive. Round-trip parity with the
-        # extraction tunables above.
+        # timeout survives. Round-trip parity with the extraction tunables
+        # above. Budget is suppressed on claude for the same reason.
         assert 'MEMORY_EPISODE_MODEL="claude-haiku-4-5-future"' in rendered
-        assert 'MEMORY_EPISODE_BUDGET_USD="0.10"' in rendered
+        assert "MEMORY_EPISODE_BUDGET_USD" not in rendered
         assert 'MEMORY_EPISODE_TIMEOUT_S="90"' in rendered
         assert 'MEMORY_TOKEN_BUDGET="2500"' in rendered
         assert 'MEMORY_SEARCH_LIMIT="15"' in rendered
@@ -1588,7 +1610,14 @@ class TestCmdConfig:
         env = conf["env"]
         assert env["MEMORY_ENABLED"] == "true"
         assert env["MEMORY_EXTRACTION_ENABLED"] == "true"
-        assert env["MEMORY_EXTRACTION_BUDGET_USD"] == "0.08"
+        # Budget key dropped on claude backend per issue #390: prompt
+        # is skipped, the pre-init "0.01" stays untouched (existing env
+        # is no longer consulted for this key on claude), and the
+        # double-gated emission suppresses. A previously-set value on
+        # an upgrade path is intentionally cleared - the field is
+        # informational only on claude, so a stale operator value does
+        # not need to round-trip.
+        assert "MEMORY_EXTRACTION_BUDGET_USD" not in env
         assert env["MEMORY_EXTRACTION_TIMEOUT_S"] == "75"
         assert env["MEMORY_TOKEN_BUDGET"] == "4000"
         assert env["MEMORY_SEARCH_LIMIT"] == "25"
@@ -1692,14 +1721,18 @@ class TestCmdConfig:
         assert "MEMORY_EXTRACTION_TIMEOUT_S" not in env
 
     def test_extraction_disabled_skips_timeout_prompt(self, tmp_path, monkeypatch):
-        """Extraction off must skip the budget, timeout, AND consolidation prompts; search limit still asked.
+        """Extraction off must skip the timeout, consolidation, AND episode prompts; search limit still asked.
 
-        Regression guard for the off-by-one trap: timeout and consolidation
-        sit inside the extraction-enabled branch, so disabling extraction
-        must consume exactly three fewer prompts (budget + timeout +
-        consolidation candidates). If the gating drifts, the input iterator
-        desynchronises and the wizard reads search limit as if it were one
-        of the extraction-only prompts - the assertion below catches that.
+        Regression guard for the off-by-one trap: timeout, consolidation,
+        and the entire episode block sit inside the extraction-enabled
+        branch, so disabling extraction must consume strictly fewer
+        prompts than enabling it. (Issue #390 removed the extraction
+        budget and episode budget prompts from the claude branch
+        entirely; the extraction-enabled branch now drives only timeout,
+        consolidation, episode model, and episode timeout.) If the
+        gating drifts, the input iterator desynchronises and the wizard
+        reads search limit as if it were one of the extraction-only
+        prompts - the assertion below catches that.
         """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
@@ -1708,7 +1741,7 @@ class TestCmdConfig:
 
         memory_block = [
             "true",  # memory enabled
-            "false",  # extraction disabled (skips budget + timeout prompts)
+            "false",  # extraction disabled (skips timeout + consolidation + episode block)
             "3000",  # token budget
             "20",  # search limit
         ]

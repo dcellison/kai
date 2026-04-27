@@ -74,8 +74,16 @@ class ClaudeCodeBackend(AgentBackend):
     lock to prevent interleaving.
 
     The process runs with --permission-mode bypassPermissions (required
-    for headless operation via Telegram) and --max-budget-usd to cap
-    per-session spending.
+    for headless operation via Telegram). No --max-budget-usd is emitted:
+    the claude backend is committed to Max-plan OAuth, where the CLI's
+    computed-cost ceiling has no relation to actual billing (the CLI
+    tracks pay-per-token rates whether or not the operator owes any of
+    that money). Terminating the subprocess at a phantom ceiling would
+    just stop work that is not costing anything. Runaway protection
+    comes from the per-message stdout-read timeouts and idle detection
+    (both derived from `timeout_seconds`) - a stuck or recursive
+    subprocess surfaces via stream-read failure rather than holding
+    the executor indefinitely.
     """
 
     def __init__(
@@ -221,8 +229,6 @@ class ClaudeCodeBackend(AgentBackend):
             self.claude_effort_level,
             "--permission-mode",
             "bypassPermissions",
-            "--max-budget-usd",
-            str(self.max_budget_usd),
         ]
 
         # Limit context window size to reduce token usage and cache

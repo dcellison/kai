@@ -316,6 +316,26 @@ class TestRunTriage:
         assert result == expected
 
     @pytest.mark.asyncio
+    async def test_max_budget_usd_flag_absent_on_claude_backend(self):
+        """
+        --max-budget-usd must NOT be emitted to claude --print argv on
+        the claude backend (issue #390). Max-plan OAuth makes the CLI's
+        computed-cost ceiling a phantom signal, and the triage
+        subprocess's runaway protection comes from _TRIAGE_TIMEOUT
+        instead. Pinned as an absence assertion so a future regression
+        that re-adds the flag fails here.
+        """
+        mock_proc = _mock_subprocess(returncode=0, stdout='{"labels": []}')
+
+        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            # agent_backend defaults to "claude" via the kwarg default
+            # on run_triage; explicit pass for clarity.
+            await run_triage("prompt", agent_backend="claude")
+
+        cmd = mock_exec.call_args[0]
+        assert "--max-budget-usd" not in cmd
+
+    @pytest.mark.asyncio
     async def test_timeout(self):
         """Timed-out subprocess raises RuntimeError and kills the process."""
         mock_proc = AsyncMock()

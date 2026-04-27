@@ -481,11 +481,18 @@ class TestSubprocessCommandAssembly:
         # Positional flags we rely on
         assert "--print" in args
         assert "--output-format" in args
-        # --model, --max-budget-usd, --json-schema must be present with
-        # the configured values immediately following them
+        # --model and --json-schema must be present with the configured
+        # values immediately following them.
         assert args[args.index("--model") + 1] == "claude-haiku-4-5-20251001"
-        assert args[args.index("--max-budget-usd") + 1] == "0.05"
         assert args[args.index("--output-format") + 1] == "json"
+        # --max-budget-usd is NOT emitted on the claude backend (issue
+        # #390): Max-plan OAuth makes the CLI's computed-cost ceiling a
+        # phantom signal. Runaway protection comes from
+        # memory_extraction_timeout_s instead. Pinned as an absence
+        # assertion so a future regression that re-adds the flag fails
+        # here rather than silently re-introducing phantom-cost
+        # subprocess termination.
+        assert "--max-budget-usd" not in args
         # Schema arg must be a JSON string that round-trips. Both root
         # required fields are present: `facts` (the original extractor
         # output) and `has_episode` (the stage-2 classifier; issue

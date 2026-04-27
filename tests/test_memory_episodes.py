@@ -869,7 +869,11 @@ class TestStage2SubprocessAssembly:
 
         args = captured["args"]
         assert args[args.index("--model") + 1] == "claude-sonnet-4-6"
-        assert args[args.index("--max-budget-usd") + 1] == "0.15"
+        # --max-budget-usd is NOT emitted on the claude backend (issue
+        # #390): Max-plan OAuth makes the CLI's computed-cost ceiling a
+        # phantom signal. Runaway protection comes from
+        # memory_episode_timeout_s instead.
+        assert "--max-budget-usd" not in args
         assert args[args.index("--system-prompt") + 1] == _EPISODE_SYSTEM_PROMPT
         # Schema arg is the episode schema, not the fact schema.
         schema_str = args[args.index("--json-schema") + 1]

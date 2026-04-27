@@ -737,17 +737,22 @@ async def run_review(
             raise RuntimeError(f"Review subprocess timed out after {timeout_s}s") from None
     else:
         # Claude one-shot mode: --print reads from stdin, writes to stdout.
-        # Format budget as fixed-point (f-string :.4f) rather than str() so
-        # very small values never render in scientific notation like
-        # "1e-05", which the Claude CLI's numeric parser may reject. Four
-        # fractional digits cover any realistic per-review ceiling.
+        # No --max-budget-usd on this branch: the claude backend runs under
+        # Max-plan OAuth, where the CLI tracks computed token cost regardless
+        # of whether any money is being charged. Passing the flag would
+        # terminate the subprocess at a ceiling that does not correspond to
+        # real billing. Runaway protection comes from `timeout_s` at the
+        # asyncio.wait_for call below. The `budget_usd` parameter is still
+        # accepted on this function's signature for backward compatibility
+        # and for a future non-claude review path; cleanup of the now-unused
+        # parameter is deferred to a separate refactor (out of spec scope
+        # here because it would change a public signature consumed by
+        # webhook.py and the review test corpus).
         cmd = [
             "claude",
             "--print",
             "--model",
             _REVIEW_MODEL,
-            "--max-budget-usd",
-            f"{budget_usd:.4f}",
         ]
 
         # Resolve self-sudo: skip sudo when claude_user matches the bot

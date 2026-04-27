@@ -1036,12 +1036,18 @@ async def _run_extractor(
       disable all tools`). The extractor only reads stdin and writes JSON.
     - --no-session-persistence keeps ~/.claude/projects/ from growing a
       directory per extraction.
-    - --max-budget-usd is a strict safety rail. The extractor subprocess
-      bills pay-per-token at Haiku rates regardless of Max-plan status
-      (observed ~$0.02-$0.03 per call, dominated by cache-creation
-      tokens), so this ceiling is a real cost gate, not a "Max means
-      free" shortcut. See config.memory_extraction_budget_usd for the
-      default and the expected-cost caveat.
+    - NO --max-budget-usd on the claude backend. The flag enforces a
+      computed-cost ceiling that has no relation to actual billing under
+      Max-plan OAuth (the CLI tracks token rates whether or not money is
+      charged), so terminating a subprocess at the configured ceiling
+      would just stop work that is not costing anything. Runaway-loop
+      protection comes from `memory_extraction_timeout_s` (passed to
+      `asyncio.wait_for` below), which is sufficient: a stuck or
+      recursive extractor cannot hold the executor longer than the
+      timeout, regardless of how many tokens it has notionally generated.
+      The `memory_extraction_budget_usd` Config field stays defined so
+      non-claude backends - which run on pay-per-token billing and need
+      a real ceiling - can read it through their own dispatch.
     - --permission-mode bypassPermissions is acceptable because
       --tools "" leaves nothing to permit or deny.
 
@@ -1077,8 +1083,6 @@ async def _run_extractor(
         "json",
         "--json-schema",
         json.dumps(_FACT_SCHEMA),
-        "--max-budget-usd",
-        str(config.memory_extraction_budget_usd),
         "--system-prompt",
         _EXTRACTION_SYSTEM_PROMPT,
         "--permission-mode",
@@ -1254,10 +1258,13 @@ async def _run_episode_extractor(
     Single-return-shape on every path keeps the caller's branch table
     flat and makes the stage-2 outcome enum easy to populate downstream.
 
-    Flag set is identical to stage 1 except for model, budget, timeout,
-    schema, and system prompt - the env allowlist, sandboxing flags,
-    auth posture, and stdin-only payload delivery are all reused so the
+    Flag set is identical to stage 1 except for model, timeout, schema,
+    and system prompt - the env allowlist, sandboxing flags, auth
+    posture, and stdin-only payload delivery are all reused so the
     security review of stage 1 transfers without re-evaluation.
+    --max-budget-usd is omitted for the same Max-plan reason documented
+    on `_run_extractor`; runaway protection comes from
+    `memory_episode_timeout_s` at the `asyncio.wait_for` call below.
     """
     _ensure_extractor_cwd()
 
@@ -1270,8 +1277,6 @@ async def _run_episode_extractor(
         "json",
         "--json-schema",
         json.dumps(_EPISODE_SCHEMA),
-        "--max-budget-usd",
-        str(config.memory_episode_budget_usd),
         "--system-prompt",
         _EPISODE_SYSTEM_PROMPT,
         "--permission-mode",
