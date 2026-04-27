@@ -3687,19 +3687,21 @@ async def _handle_response(
                     # by the log_message(direction="assistant", ...) call
                     # above, so the newest pair returned by
                     # `get_recent_pairs` IS the current exchange. The
-                    # `fetched[:-1] if fetched else []` slice handles
-                    # short-history cases gracefully (a brand-new user
-                    # with only the current exchange logged returns
-                    # `[(current_user, current_asst)]`, sliced to `[]`,
-                    # which the payload builder treats as no prior
-                    # context). N=0 disables windowing entirely; skip
-                    # the disk read in that case.
+                    # `[:-1]` slice handles short-history cases
+                    # gracefully without a guard - on an empty `fetched`
+                    # list the slice is `[][:-1] == []`, on a single
+                    # element list it is `[]` (the only pair IS the
+                    # current exchange, nothing prior to drop into
+                    # `prior_pairs`), and on a multi-pair list it
+                    # drops only the most-recent entry. N=0 disables
+                    # windowing entirely; skip the disk read in that
+                    # case.
                     prior_pairs: list[tuple[str, str]] = []
                     if config.episode_classifier_context_turns > 0:
                         from kai.history import get_recent_pairs
 
                         fetched = get_recent_pairs(chat_id, config.episode_classifier_context_turns + 1)
-                        prior_pairs = fetched[:-1] if fetched else []
+                        prior_pairs = fetched[:-1]
                     await memory_extraction.extract_and_store(
                         user_text=user_text,
                         assistant_text=final_text,

@@ -45,14 +45,22 @@ _MAX_CHARS_PER_MESSAGE = 500
 # are formatted-text-only entries with no real assistant content;
 # `get_recent_pairs` skips them so a windowed extraction payload does
 # not feed a "botched exchange" prior turn into the episode classifier
-# (issue #392). The regex is anchored to the full line so a legitimate
-# message that happens to contain "[error: ...]" as quoted prose - e.g.
-# a user asking "what does [error: foo] mean?" - is NOT mis-skipped.
-# `error: .+` rather than `error: [^\]]+` because the inner content can
-# itself contain `]` characters (Python tracebacks frequently do); the
-# trailing `]$` anchor still requires the final `]` to be the last
-# character of the entire line.
-_SYNTHETIC_ASSISTANT_MARKERS: re.Pattern[str] = re.compile(r"^\[(stopped by user|no response|error: .+)\]$")
+# (issue #392). Matched via `re.fullmatch` (which implicitly anchors
+# at both ends, so the regex body has no leading `^`/trailing `$`)
+# against the FULL line so a legitimate message that happens to
+# contain "[error: ...]" as quoted prose - e.g. a user asking "what
+# does [error: foo] mean?" - is NOT mis-skipped. The DOTALL flag
+# lets `.` match newlines so a multi-line error string (a Python
+# traceback rendered into the placeholder) still matches; without
+# DOTALL, `.+` would stop at the first `\n` and the closing `]`
+# would fail to match. `error: .+` rather than `error: [^\]]+`
+# because the inner content can itself contain `]` characters
+# (tracebacks frequently do); the trailing `]` requirement still
+# forces the final `]` to be the last character of the entire line.
+_SYNTHETIC_ASSISTANT_MARKERS: re.Pattern[str] = re.compile(
+    r"\[(stopped by user|no response|error: .+)\]",
+    re.DOTALL,
+)
 
 
 def log_message(
@@ -278,14 +286,18 @@ def get_recent_pairs(chat_id: int, n: int) -> list[tuple[str, str]]:
         return []
 
     # Collect filtered records, building oldest-first by prepending
-    # each newer file's records to the running list. The threshold
-    # `3 * n` is a budget heuristic: each pair needs at least one
-    # user + one assistant record, so 2n is the structural minimum;
-    # 3n adds headroom for filtered-out rows (synthetic markers, empty
-    # texts, multi-user-before-assistant collapses) so the typical
-    # case stops scanning after a single recent file. Files are small
-    # (one day apiece), so this stays cheap even on heavy users.
+    # each newer file's records to the running list. After each file
+    # we re-pair the running list and check the PAIR count (not the
+    # raw record count) against the requested N - the early-break
+    # condition has to be expressed in pairs because the structural
+    # cost is per-pair: a heavy stop-and-retry run can produce many
+    # filtered records that all collapse to the same multi-user
+    # pending slot or get dropped as orphan assistants. Files are
+    # small (one day apiece), and re-pairing the running list is
+    # bounded by total filtered records, so the per-file overhead
+    # stays cheap even on heavy users.
     records: list[dict] = []
+    pairs: list[tuple[str, str]] = []
     for path in files:
         file_records: list[dict] = []
         try:
@@ -323,21 +335,47 @@ def get_recent_pairs(chat_id: int, n: int) -> list[tuple[str, str]]:
             # A user message that quotes one of the marker shapes is
             # legitimate prior context (the anchored regex shape catches
             # only exact full-line matches; quoted prose is safe).
-            if direction == "assistant" and _SYNTHETIC_ASSISTANT_MARKERS.match(text):
+            if direction == "assistant" and _SYNTHETIC_ASSISTANT_MARKERS.fullmatch(text):
                 continue
             file_records.append({"dir": direction, "text": text})
-        # Prepend so the running list stays oldest-first across files.
+        # Prepend so the running list stays oldest-first across files,
+        # then re-pair. Pair count grows monotonically as we add
+        # older records (newer pairs already exist; older records can
+        # only add older pairs at the head), so checking after each
+        # file is sound.
         records = file_records + records
-        if len(records) >= 3 * n:
+        pairs = _pair_records_chronologically(records)
+        if len(pairs) >= n:
             break
 
-    if not records:
-        return []
+    # Cap at the N most recent. Slicing from the tail preserves
+    # chronological order among the kept pairs, which is what the
+    # PRIOR USER 1, 2, 3 ... rendering relies on.
+    if len(pairs) > n:
+        pairs = pairs[-n:]
+    return pairs
 
-    # Pair records walking forward through chronological order. The
-    # `pending_user` slot keeps overwriting on consecutive user records
-    # so the LAST user before an assistant is the one that pairs - this
-    # is the multi-user-before-assistant collapse documented above.
+
+def _pair_records_chronologically(records: list[dict]) -> list[tuple[str, str]]:
+    """
+    Walk chronologically and emit (user, assistant) pairs.
+
+    Multi-user-before-assistant collapse: the `pending_user` slot
+    keeps overwriting on consecutive user records, so the LAST user
+    before an assistant is the one that pairs. Earlier orphan user
+    messages are dropped. This matches the Telegram pattern where a
+    user can send several messages before getting a reply.
+
+    Assistant records pair only when a pending user exists. An
+    assistant record with no pending user is an orphan (legacy data,
+    restored-from-backup mishap, or partial JSONL truncation) and
+    is silently dropped - the falling-out branch of the elif is the
+    no-op orphan handler.
+
+    Used both by `get_recent_pairs` for the early-break pair-count
+    check and for the final returned pairs. Single source of truth
+    for the pairing semantics.
+    """
     pairs: list[tuple[str, str]] = []
     pending_user: str | None = None
     for rec in records:
@@ -345,18 +383,7 @@ def get_recent_pairs(chat_id: int, n: int) -> list[tuple[str, str]]:
         text = rec["text"]
         if direction == "user":
             pending_user = text
-        # Assistant records pair only when a pending user exists. An
-        # assistant record with no pending user is an orphan (legacy
-        # data, restored-from-backup mishap, or partial JSONL
-        # truncation) and is silently dropped - the falling-out branch
-        # of the elif is the no-op orphan handler.
         elif direction == "assistant" and pending_user is not None:
             pairs.append((pending_user, text))
             pending_user = None
-
-    # Cap at the N most recent. Slicing from the tail preserves
-    # chronological order among the kept pairs, which is what the
-    # PRIOR USER 1, 2, 3 ... rendering relies on.
-    if len(pairs) > n:
-        pairs = pairs[-n:]
     return pairs

@@ -1400,11 +1400,10 @@ class TestEpisodeClassifierContextTurns:
     at config time)."""
 
     def test_episode_classifier_context_turns_default(self, monkeypatch):
-        """Default 3 = current + 2 prior. Empirical from the live probe
-        that motivated #392: classification flipped true at 3 and 4
-        turns, but 4 leaked one borderline assistant-claim fact that
-        3 suppressed. Default chosen for clean fact extraction at
-        equal classifier accuracy."""
+        """Default 3 = 3 prior exchanges in addition to the current
+        one (4-turn payload window total; see Config docstring for
+        the N+1 framing). Pin the default so an unset env produces
+        production behavior."""
         _set_required(monkeypatch)
         config = load_config()
         assert config.episode_classifier_context_turns == 3
