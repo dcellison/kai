@@ -30,7 +30,7 @@ between probe and production should fail loudly here rather than
 silently masking real classifier behavior.
 
 Cost: at the default 2-case corpus and Haiku-rate billing, well under
-\\$0.01 per run on pay-per-token billing. On Max-plan OAuth (the only
+$0.01 per run on pay-per-token billing. On Max-plan OAuth (the only
 deployment posture for the claude backend after #390), the run is
 unbilled. Operators can iterate on the corpus and prompt freely.
 """
@@ -154,7 +154,7 @@ _LABELED_CORPUS: list[_LabeledCase] = [
 ]
 
 
-async def _run_one(case: _LabeledCase, model: str, prior_turns: int) -> dict:
+async def _run_one(case: _LabeledCase, model: str, prior_turns: int, timeout_s: int) -> dict:
     """
     Spawn one extraction subprocess for the labeled case and return a
     per-case result dict. The dict is the merged shape of the CLI
@@ -163,12 +163,14 @@ async def _run_one(case: _LabeledCase, model: str, prior_turns: int) -> dict:
 
     Mirrors the production stage-1 invocation in
     `kai.memory_extraction._run_extractor` (no --max-budget-usd per
-    #390; allow-listed env per the original sandboxing rationale).
-    The probe diverges from production only by reading the labeled
-    `prior_pairs` directly from the corpus rather than via
-    `history.get_recent_pairs` - the goal is to exercise the
-    classifier prompt with controlled inputs, not to also test the
-    JSONL retrieval path.
+    #390; allow-listed env per the original sandboxing rationale;
+    `asyncio.wait_for` around `proc.communicate` so a hung Haiku call
+    surfaces as an explicit error rather than freezing the operator's
+    terminal). The probe diverges from production only by reading the
+    labeled `prior_pairs` directly from the corpus rather than via
+    `history.get_recent_pairs`. The goal is to exercise the classifier
+    prompt with controlled inputs, not to also test the JSONL
+    retrieval path.
     """
     # Slice the labeled prior pairs to the configured window. The
     # default (3) matches the production default; operators tuning N
@@ -211,7 +213,23 @@ async def _run_one(case: _LabeledCase, model: str, prior_turns: int) -> dict:
         stderr=asyncio.subprocess.PIPE,
         env=subprocess_env,
     )
-    stdout, stderr = await proc.communicate(input=payload_bytes)
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=payload_bytes),
+            timeout=timeout_s,
+        )
+    except TimeoutError:
+        # Hung Haiku call. Reap the subprocess so operators running
+        # the probe interactively are not left with an orphan claude
+        # process draining battery. Return an error result so the
+        # final summary surfaces the timeout case as a failure.
+        proc.kill()
+        await proc.wait()
+        return {
+            "case": case.name,
+            "error": f"subprocess timed out after {timeout_s}s",
+            "payload_size": len(payload_bytes),
+        }
 
     if proc.returncode != 0:
         return {
@@ -268,15 +286,25 @@ async def _main() -> int:
         default=_DEFAULT_MODEL,
         help=f"Extractor model id (default: {_DEFAULT_MODEL}).",
     )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=90,
+        help=(
+            "Per-case subprocess timeout in seconds (default: 90). Matches the "
+            "production-tuned MEMORY_EXTRACTION_TIMEOUT_S; raise it if Haiku is "
+            "running slowly under load."
+        ),
+    )
     args = parser.parse_args()
 
-    print(f"Episode-classifier probe (turns={args.turns}, model={args.model})")
+    print(f"Episode-classifier probe (turns={args.turns}, model={args.model}, timeout={args.timeout}s)")
     print(f"Cases: {len(_LABELED_CORPUS)}")
     print()
 
     results = []
     for case in _LABELED_CORPUS:
-        result = await _run_one(case, args.model, args.turns)
+        result = await _run_one(case, args.model, args.turns, args.timeout)
         results.append(result)
         # Pretty-print one case at a time so an operator watching live
         # output can see progress on a slow Haiku call.
