@@ -510,8 +510,9 @@ class Config:
     # the single-turn payload that was production behavior before this
     # field shipped. The 0-10 range is enforced at load time; the cap
     # exists to prevent an operator-typo (3000 instead of 3) from
-    # producing a 30-call-deep payload that blows Haiku's context
-    # window. Default 3 is empirically grounded: the live probe that
+    # producing a single payload with ~3001 pairs in the PRIOR
+    # CONTEXT block, which would exceed Haiku's per-call token
+    # limit. Default 3 is empirically grounded: the live probe that
     # motivated this fix flipped the test episode true at 3 and 4
     # turns, but 4 turns leaked one borderline assistant-claim fact
     # that 3 turns suppressed; 3 is the cleaner pick for fact

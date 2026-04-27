@@ -869,8 +869,9 @@ def _cmd_config() -> None:
                 # `_validate_non_negative_int` because that helper only
                 # enforces `>= 0` with no upper bound; the 0-10 cap
                 # exists so an operator typo (3000 instead of 3) cannot
-                # produce a 30-call-deep windowed payload that blows
-                # Haiku's context window. Pattern mirrors the
+                # produce a single payload with ~3001 pairs in the
+                # PRIOR CONTEXT block that exceeds Haiku's per-call
+                # token limit. Pattern mirrors the
                 # `max_context_window` prompt above, which handles the
                 # same lower-bound-plus-ceiling shape inline rather
                 # than introducing a single-use validator helper. The
