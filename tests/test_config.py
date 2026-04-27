@@ -1435,9 +1435,10 @@ class TestEpisodeClassifierContextTurns:
 
     def test_episode_classifier_context_turns_rejects_above_cap(self, monkeypatch):
         """The defensive cap exists so a typo (3000 instead of 3)
-        cannot ship a 30-call-deep windowed payload that blows
-        Haiku's context window. Pin the cap behavior so a future
-        edit that loosens or removes it surfaces here."""
+        cannot ship a single payload with ~3001 pairs in the PRIOR
+        CONTEXT block, which would exceed Haiku's per-call token
+        limit. Pin the cap behavior so a future edit that loosens
+        or removes it surfaces here."""
         _set_required(monkeypatch)
         monkeypatch.setenv("EPISODE_CLASSIFIER_CONTEXT_TURNS", "11")
         with pytest.raises(SystemExit, match="must be <= 10"):

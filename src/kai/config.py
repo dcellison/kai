@@ -506,7 +506,7 @@ class Config:
     # logged) is the closing turn of an episode; it needs the lead-up
     # to recognize closure that wasn't visible in a single-turn payload
     # (issue #392). Total payload window = N + 1 (current + N prior).
-    # Set 0 to disable windowing entirely — the extractor reverts to
+    # Set 0 to disable windowing entirely - the extractor reverts to
     # the single-turn payload that was production behavior before this
     # field shipped. The 0-10 range is enforced at load time; the cap
     # exists to prevent an operator-typo (3000 instead of 3) from

@@ -378,10 +378,10 @@ class TestGetRecentPairs:
                 # Pair 1: real exchange (kept).
                 {"dir": "user", "chat_id": 1, "text": "ask 1"},
                 {"dir": "assistant", "chat_id": 1, "text": "real reply 1"},
-                # Pair 2: assistant `[stopped by user]` synthetic — assistant filtered, leaves orphan user "stop test"
+                # Pair 2: assistant `[stopped by user]` synthetic - assistant filtered, leaves orphan user "stop test"
                 {"dir": "user", "chat_id": 1, "text": "stop test"},
                 {"dir": "assistant", "chat_id": 1, "text": "[stopped by user]"},
-                # Pair 3: assistant `[error: TimeoutError]` synthetic — same shape
+                # Pair 3: assistant `[error: TimeoutError]` synthetic - same shape
                 {"dir": "user", "chat_id": 1, "text": "timeout test"},
                 {"dir": "assistant", "chat_id": 1, "text": "[error: TimeoutError]"},
                 # Pair 4: full-line-match false-positive case. A USER
@@ -392,7 +392,7 @@ class TestGetRecentPairs:
                 # the marker shape, so re.fullmatch correctly rejects.
                 {"dir": "user", "chat_id": 1, "text": "what does [error: foo] mean?"},
                 {"dir": "assistant", "chat_id": 1, "text": "real reply 2"},
-                # Pair 5: assistant `[no response]` synthetic — same shape
+                # Pair 5: assistant `[no response]` synthetic - same shape
                 {"dir": "user", "chat_id": 1, "text": "noresp test"},
                 {"dir": "assistant", "chat_id": 1, "text": "[no response]"},
             ],
@@ -455,10 +455,10 @@ class TestGetRecentPairs:
             chat_id=1,
             day_offset=0,
             records=[
-                # Legacy record (no chat_id field) — filtered out.
+                # Legacy record (no chat_id field) - filtered out.
                 {"dir": "user", "text": "legacy q"},
                 {"dir": "assistant", "text": "legacy a"},
-                # Modern record (has chat_id) — kept.
+                # Modern record (has chat_id) - kept.
                 {"dir": "user", "chat_id": 1, "text": "modern q"},
                 {"dir": "assistant", "chat_id": 1, "text": "modern a"},
             ],
@@ -479,7 +479,7 @@ class TestGetRecentPairs:
             chat_id=1,
             day_offset=0,
             records=[
-                # Orphan assistant at start of file (no prior user) —
+                # Orphan assistant at start of file (no prior user) -
                 # dropped silently.
                 {"dir": "assistant", "chat_id": 1, "text": "orphan"},
                 # Real pair survives intact.
