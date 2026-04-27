@@ -754,12 +754,10 @@ async def run_review(
         # of whether any money is being charged. Passing the flag would
         # terminate the subprocess at a ceiling that does not correspond to
         # real billing. Runaway protection comes from `timeout_s` at the
-        # asyncio.wait_for call below. The `budget_usd` parameter is still
-        # accepted on this function's signature for backward compatibility
-        # and for a future non-claude review path; cleanup of the now-unused
-        # parameter is deferred to a separate refactor (out of spec scope
-        # here because it would change a public signature consumed by
-        # webhook.py and the review test corpus).
+        # asyncio.wait_for call below. The `budget_usd` parameter on the
+        # signature is unused on every currently-exercised path - see the
+        # comment on the parameter declaration above for the full rationale
+        # and why cleanup is deferred to a separate refactor.
         cmd = [
             "claude",
             "--print",
