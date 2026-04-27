@@ -51,11 +51,17 @@ _MAX_DIFF_CHARS = 100_000
 # Opus tokens. Sonnet is more than capable for code review.
 _REVIEW_MODEL = "sonnet"
 
-# Default per-review budget cap in USD. Overridable via PR_REVIEW_BUDGET_USD
-# in config; the Config field is the runtime source of truth. Kept here as a
-# fallback default for direct run_review() callers (tests, scripts) that do
-# not thread config through. Sonnet reviews of typical PRs cost well under
-# $0.50, so 1.0 is a headroom ceiling rather than a typical cost.
+# Default per-review budget cap in USD. Vestigial after #390:
+# --max-budget-usd is no longer emitted to claude --print argv on the
+# claude branch (Max-plan OAuth makes the CLI's computed-cost ceiling
+# a phantom signal), and the Goose branch uses --max-turns 1 rather
+# than a dollar ceiling, so the constant's only remaining role is to
+# provide the default for the `budget_usd` parameter on `run_review`
+# / `run_review_session` - a parameter that is itself unused on every
+# currently-exercised path. Retained for symmetry with
+# _TRIAGE_BUDGET_USD and to avoid changing public signatures (see
+# PR_REVIEW_BUDGET_USD env var); cleanup deferred to a separate
+# refactor that can also drop the `budget_usd` parameter.
 _REVIEW_BUDGET_USD = 1.0
 
 # Default subprocess timeout for a single review, in seconds. Overridable
@@ -661,6 +667,12 @@ async def run_review(
     agent_backend: str = "claude",
     provider: str = "",
     timeout_s: int = _REVIEW_TIMEOUT,
+    # `budget_usd` is unused on every currently-exercised path: the
+    # claude branch no longer emits --max-budget-usd to argv (#390),
+    # and the Goose branch uses --max-turns 1 rather than a dollar
+    # ceiling. Kept on the signature to avoid a public API break in
+    # this fix; cleanup deferred to a separate refactor that updates
+    # webhook.py and the test suite together.
     budget_usd: float = _REVIEW_BUDGET_USD,
 ) -> str:
     """
@@ -908,6 +920,8 @@ async def review_pr(
     agent_backend: str = "claude",
     provider: str = "",
     timeout_s: int = _REVIEW_TIMEOUT,
+    # See `run_review` above for why `budget_usd` is currently unused
+    # on every exercised path; cleanup deferred to a separate refactor.
     budget_usd: float = _REVIEW_BUDGET_USD,
 ) -> None:
     """
