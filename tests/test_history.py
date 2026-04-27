@@ -384,11 +384,12 @@ class TestGetRecentPairs:
                 # Pair 3: assistant `[error: TimeoutError]` synthetic — same shape
                 {"dir": "user", "chat_id": 1, "text": "timeout test"},
                 {"dir": "assistant", "chat_id": 1, "text": "[error: TimeoutError]"},
-                # Pair 4: anchored-regex false-positive case. A USER
+                # Pair 4: full-line-match false-positive case. A USER
                 # message asking about an error literal is NOT an
                 # assistant synthetic marker; even if it were on the
-                # assistant side, the substring is mid-line which the
-                # ^...$ anchor rejects.
+                # assistant side, the surrounding prose ("what does
+                # ... mean?") means the FULL string does not match
+                # the marker shape, so re.fullmatch correctly rejects.
                 {"dir": "user", "chat_id": 1, "text": "what does [error: foo] mean?"},
                 {"dir": "assistant", "chat_id": 1, "text": "real reply 2"},
                 # Pair 5: assistant `[no response]` synthetic — same shape
