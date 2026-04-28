@@ -74,11 +74,14 @@ _SOURCE_EXCLUDES = {"__pycache__", "*.pyc", "*.egg-info", ".git", ".venv", ".env
 # personal data that should not be part of a clean install:
 #   history/    - conversation logs written by history.py at runtime
 #   MEMORY.md   - personal data (gitignored), user creates from .example
+#   CLAUDE.md   - per-operator symlink (gitignored); created idempotently
+#                 by _bootstrap_home_identity so the bootstrap path is the
+#                 single source of truth for the symlink target.
 #   skills/     - downloaded skills, environment-specific
 # History and MEMORY.md now live in DATA_DIR, outside the install tree.
 # Both are still excluded because stale files may remain at the source
 # after migration (source files are preserved as backups, not deleted).
-_HOME_CLAUDE_EXCLUDES = {"history", "MEMORY.md", "skills", "__pycache__"}
+_HOME_CLAUDE_EXCLUDES = {"history", "MEMORY.md", "CLAUDE.md", "skills", "__pycache__"}
 
 
 # ── Input helpers ────────────────────────────────────────────────────
@@ -2562,6 +2565,94 @@ def _apply_directories(
             print(f"  Created {path}")
 
 
+def _bootstrap_home_identity(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
+    """
+    Ensure the install location has a working IDENTITY.md and CLAUDE.md symlink.
+
+    On a fresh install (or whenever home/IDENTITY.md is missing from the source
+    checkout because it is per-operator and untracked), the operator has no seed
+    identity to copy. This function bootstraps the identity surface by falling
+    back to the tracked home/.claude/CLAUDE.md.example template, then ensures
+    home/.claude/CLAUDE.md is a symlink pointing at ../IDENTITY.md so inner
+    Claude finds the identity at the path Claude Code expects.
+
+    Behavior:
+      1. If the operator's home/IDENTITY.md is present in source, copy it to
+         the install location. This preserves the existing make-install-as-edit
+         -propagation workflow for operators with local edits.
+      2. Else, if no IDENTITY.md exists at the install location yet, seed it
+         from home/.claude/CLAUDE.md.example. Fresh-clone path.
+      3. Else (steady state on reinstall after first bootstrap), leave the
+         install copy in place. No-op.
+      4. Always reconcile home/.claude/CLAUDE.md: if it is missing or its
+         symlink target is not "../IDENTITY.md", recreate it.
+
+    Idempotent: a second invocation with no source changes performs at most
+    a refresh copy of IDENTITY.md and is otherwise silent.
+
+    Args:
+        install_path: Root of the install tree (e.g. /opt/kai).
+        svc_uid: Service user UID. The identity file and the symlink are
+            owned by the service user so inner Claude can write to them
+            from Telegram.
+        svc_gid: Service group GID.
+        dry_run: If True, log the actions that would happen without doing them.
+    """
+    identity_src = PROJECT_ROOT / "home" / "IDENTITY.md"
+    example_src = PROJECT_ROOT / "home" / ".claude" / "CLAUDE.md.example"
+    identity_dst = install_path / "home" / "IDENTITY.md"
+    claude_md_dst = install_path / "home" / ".claude" / "CLAUDE.md"
+
+    # Step 1: ensure IDENTITY.md exists at the install location, picking the
+    # best available seed. Source IDENTITY.md is preferred when present so
+    # operator edits in their checkout still propagate; the .example is the
+    # fresh-clone fallback because IDENTITY.md is no longer tracked.
+    if identity_src.is_file():
+        if dry_run:
+            print(f"[DRY RUN] Would copy: {identity_src} -> {identity_dst}")
+        else:
+            identity_dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(identity_src, identity_dst)
+            os.chown(identity_dst, svc_uid, svc_gid)
+            print(f"  Copied {identity_dst}")
+    elif not identity_dst.exists() and example_src.is_file():
+        if dry_run:
+            print(f"[DRY RUN] Would seed {identity_dst} from {example_src}")
+        else:
+            identity_dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(example_src, identity_dst)
+            os.chown(identity_dst, svc_uid, svc_gid)
+            print(f"  Bootstrapped {identity_dst} from CLAUDE.md.example")
+    elif not identity_dst.exists():
+        # No source IDENTITY.md, no install copy, and no .example to fall
+        # back to. The .example is tracked, so missing here means a corrupt
+        # or partial source checkout. Skip the symlink step too: a symlink
+        # to a nonexistent target only obscures the underlying problem.
+        print(f"  WARNING: neither {identity_src} nor {example_src} found; cannot bootstrap {identity_dst}")
+        return
+
+    # Step 2: reconcile the CLAUDE.md symlink. The relative target keeps the
+    # symlink valid regardless of where the install tree is rooted. Detecting
+    # "already correct" via os.readlink avoids noisy unlink-and-relink work
+    # on every reinstall.
+    expected_target = "../IDENTITY.md"
+    is_correct_symlink = claude_md_dst.is_symlink() and os.readlink(claude_md_dst) == expected_target
+    if not is_correct_symlink:
+        if dry_run:
+            print(f"[DRY RUN] Would (re)create symlink {claude_md_dst} -> {expected_target}")
+        else:
+            claude_md_dst.parent.mkdir(parents=True, exist_ok=True)
+            # is_symlink() catches broken symlinks that exists() misses;
+            # check both so unlink covers every pre-existing case.
+            if claude_md_dst.is_symlink() or claude_md_dst.exists():
+                claude_md_dst.unlink()
+            os.symlink(expected_target, claude_md_dst)
+            # _set_ownership picks lchown for symlinks; using the helper
+            # keeps the syscall choice in one place and lets tests mock it.
+            _set_ownership(claude_md_dst, svc_uid, svc_gid)
+            print(f"  Created symlink {claude_md_dst} -> {expected_target}")
+
+
 def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
     """Copy source tree and home config from PROJECT_ROOT to the install location."""
     src_src = PROJECT_ROOT / "src"
@@ -2589,9 +2680,6 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
             old_ws.rename(new_ws)
             print(f"  Renamed {old_ws} -> {new_ws}")
 
-    identity_src = PROJECT_ROOT / "home" / "IDENTITY.md"
-    identity_dst = install_path / "home" / "IDENTITY.md"
-
     if dry_run:
         print(f"[DRY RUN] Would copy: {src_src} -> {src_dst}")
         print(f"[DRY RUN] Would copy: {pyproject_src} -> {pyproject_dst}")
@@ -2599,10 +2687,7 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
             print(f"[DRY RUN] Would copy: {ws_claude_src} -> {ws_claude_dst}")
         if config_src.is_dir():
             print(f"[DRY RUN] Would copy: {config_src} -> {config_dst}")
-        if identity_src.is_file():
-            print(f"[DRY RUN] Would copy: {identity_src} -> {identity_dst}")
-        elif ws_claude_src.is_dir():
-            print(f"[DRY RUN] WARNING: {identity_src} not found; home/.claude/CLAUDE.md symlink may dangle")
+        _bootstrap_home_identity(install_path, svc_uid, svc_gid, dry_run=True)
         return
 
     _copy_tree(src_src, src_dst, _SOURCE_EXCLUDES)
@@ -2638,19 +2723,11 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         _set_ownership(config_dst, 0, 0, recursive=True)
         print(f"  Copied config templates to {config_dst}")
 
-    # Copy home/IDENTITY.md (the editable identity file pointed to by the
-    # home/.claude/CLAUDE.md symlink). Owned by the service user, not root,
-    # so inner Claude can write to it from Telegram.
-    if identity_src.is_file():
-        identity_dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(identity_src, identity_dst)
-        os.chown(identity_dst, svc_uid, svc_gid)
-        print(f"  Copied {identity_dst}")
-    elif ws_claude_src.is_dir():
-        # IDENTITY.md missing but home/.claude/ exists - the symlink at
-        # home/.claude/CLAUDE.md will dangle, silently breaking identity
-        # injection. Warn loudly so the user can fix it.
-        print(f"  WARNING: {identity_src} not found; home/.claude/CLAUDE.md symlink may dangle")
+    # Bootstrap the per-operator IDENTITY.md and the CLAUDE.md symlink.
+    # IDENTITY.md is no longer tracked, so the helper falls back to the
+    # tracked CLAUDE.md.example template on fresh clones and reconciles
+    # the symlink target on every install.
+    _bootstrap_home_identity(install_path, svc_uid, svc_gid, dry_run=False)
 
 
 def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:

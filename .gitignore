@@ -34,12 +34,13 @@ install.conf
 CLAUDE.md
 
 # Home workspace runtime data (Kai's state, not source code)
+# CLAUDE.md and IDENTITY.md are per-operator; bootstrapped from the
+# tracked .example by `make install`. See CLAUDE.md.example for content.
 home/*
 !home/.claude
 home/.claude/*
-!home/.claude/CLAUDE.md
+!home/.claude/CLAUDE.md.example
 !home/.claude/MEMORY.md.example
-!home/IDENTITY.md
 !home/config
 home/config/*
 !home/config/goose-config.yaml

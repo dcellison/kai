@@ -21,6 +21,7 @@ from kai.install import (
     _apply_source,
     _apply_sudoers,
     _apply_venv,
+    _bootstrap_home_identity,
     _check_path,
     _check_service_status,
     _check_traversal,
@@ -3628,8 +3629,9 @@ class TestApplySource:
             _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
         # Should call _copy_tree twice: once for src/, once for home/.claude/
         assert mock_copy.call_count == 2
-        # Should call _set_ownership twice: once for src/, once for home/.claude/
-        assert mock_own.call_count == 2
+        # _set_ownership: src/, home/.claude/, and the CLAUDE.md symlink
+        # created by _bootstrap_home_identity (lchown via _set_ownership).
+        assert mock_own.call_count == 3
         # shutil.copy2 called twice: pyproject.toml and IDENTITY.md
         assert mock_cp.call_count == 2
         # os.chown: pyproject.toml (root), .claude/ dir (svc), IDENTITY.md (svc)
@@ -3730,28 +3732,36 @@ class TestApplySource:
         output = capsys.readouterr().out
         assert "IDENTITY.md" in output
 
-    def test_dry_run_warns_when_identity_md_missing(self, tmp_path, capsys):
-        """Dry run warns when IDENTITY.md is missing but home/.claude/ exists."""
+    def test_dry_run_warns_when_neither_source_nor_example_present(self, tmp_path, capsys):
+        """
+        Dry run warns when both home/IDENTITY.md and CLAUDE.md.example are
+        missing from the source checkout. The .example is tracked, so this
+        means a corrupt or partial checkout, and the bootstrap can't proceed.
+        """
         src = tmp_path / "source"
+        # Empty home/.claude/ - no .example file, no IDENTITY.md
         (src / "home" / ".claude").mkdir(parents=True)
-        # No IDENTITY.md
         with patch("kai.install.PROJECT_ROOT", src):
             _apply_source(tmp_path / "install", svc_uid=1000, svc_gid=1000, dry_run=True)
         output = capsys.readouterr().out
         assert "WARNING" in output
-        assert "IDENTITY.md" in output
-        assert "dangle" in output
+        assert "neither" in output
+        assert "CLAUDE.md.example" in output
 
-    def test_warns_when_identity_md_missing(self, tmp_path, capsys):
-        """Warns when IDENTITY.md is missing but home/.claude/ exists."""
+    def test_warns_when_neither_source_nor_example_present(self, tmp_path, capsys):
+        """
+        Warns when home/IDENTITY.md and CLAUDE.md.example are both missing
+        from source. Bootstrap returns early in this case so the symlink is
+        not created either - a symlink to a nonexistent target would only
+        obscure the underlying problem.
+        """
         src = tmp_path / "source"
         (src / "src").mkdir(parents=True)
         (src / "src" / "module.py").write_text("code")
         (src / "pyproject.toml").write_text("[project]")
+        # home/.claude/ exists but is empty - no .example, no IDENTITY.md
         ws_claude = src / "home" / ".claude"
         ws_claude.mkdir(parents=True)
-        (ws_claude / "CLAUDE.md").write_text("identity")
-        # No IDENTITY.md - should warn about dangling symlink
         install = tmp_path / "install"
 
         with (
@@ -3764,8 +3774,10 @@ class TestApplySource:
             _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
         output = capsys.readouterr().out
         assert "WARNING" in output
-        assert "IDENTITY.md" in output
-        assert "dangle" in output
+        assert "neither" in output
+        assert "CLAUDE.md.example" in output
+        # Bootstrap returned early; no symlink should have been created.
+        assert not (install / "home" / ".claude" / "CLAUDE.md").exists()
 
     def test_copies_home_config(self, tmp_path):
         """home/config/ is copied to the install tree (e.g. goose-config.yaml)."""
@@ -3812,6 +3824,186 @@ class TestApplySource:
         assert "home/config" in output
         # Should not create the directory during dry run
         assert not (tmp_path / "install" / "home" / "config").exists()
+
+
+# ── _bootstrap_home_identity ─────────────────────────────────────────
+
+
+class TestBootstrapHomeIdentity:
+    """
+    Direct tests for _bootstrap_home_identity. End-to-end behavior is also
+    exercised through TestApplySource; these tests pin the per-branch logic:
+    seed-from-example, idempotency on reinstall, and symlink reconciliation.
+    """
+
+    def test_seeds_from_example_when_source_identity_missing(self, tmp_path):
+        """
+        Fresh-clone path: no home/IDENTITY.md in source, no install copy
+        yet, but the tracked CLAUDE.md.example is present. Bootstrap copies
+        the .example to install_path/home/IDENTITY.md and creates the
+        symlink so inner Claude's identity injection works on first run.
+        """
+        src = tmp_path / "source"
+        (src / "home" / ".claude").mkdir(parents=True)
+        (src / "home" / ".claude" / "CLAUDE.md.example").write_text("# example template")
+        install = tmp_path / "install"
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _bootstrap_home_identity(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+
+        identity_dst = install / "home" / "IDENTITY.md"
+        assert identity_dst.is_file()
+        assert identity_dst.read_text() == "# example template"
+        symlink = install / "home" / ".claude" / "CLAUDE.md"
+        assert symlink.is_symlink()
+        assert os.readlink(symlink) == "../IDENTITY.md"
+
+    def test_copies_from_source_identity_when_present(self, tmp_path):
+        """
+        Existing-operator path: home/IDENTITY.md is present in source. Even
+        though the .example also exists, bootstrap prefers the source copy
+        so the operator's local edits in their checkout still propagate to
+        the install location on `make install`.
+        """
+        src = tmp_path / "source"
+        (src / "home" / ".claude").mkdir(parents=True)
+        (src / "home" / ".claude" / "CLAUDE.md.example").write_text("# example template")
+        (src / "home" / "IDENTITY.md").write_text("# operator-local content")
+        install = tmp_path / "install"
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _bootstrap_home_identity(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+
+        identity_dst = install / "home" / "IDENTITY.md"
+        assert identity_dst.read_text() == "# operator-local content"
+
+    def test_no_op_when_install_copy_exists_and_no_source(self, tmp_path):
+        """
+        Steady state: the install copy was seeded on a prior run and the
+        operator has no source IDENTITY.md (fresh-clone operator who
+        customized only the install copy). Bootstrap leaves the install
+        copy untouched - .example must NOT overwrite it on reinstall.
+        """
+        src = tmp_path / "source"
+        (src / "home" / ".claude").mkdir(parents=True)
+        (src / "home" / ".claude" / "CLAUDE.md.example").write_text("# example template")
+        install = tmp_path / "install"
+        (install / "home").mkdir(parents=True)
+        (install / "home" / "IDENTITY.md").write_text("# customized after first install")
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _bootstrap_home_identity(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+
+        identity_dst = install / "home" / "IDENTITY.md"
+        assert identity_dst.read_text() == "# customized after first install"
+
+    def test_skips_symlink_when_target_already_correct(self, tmp_path, capsys):
+        """
+        Re-running install with a valid symlink in place: bootstrap detects
+        the existing target via os.readlink and short-circuits. Avoids
+        unnecessary unlink-and-relink work and keeps reinstall logs quiet.
+        """
+        src = tmp_path / "source"
+        (src / "home" / ".claude").mkdir(parents=True)
+        (src / "home" / ".claude" / "CLAUDE.md.example").write_text("# example")
+        (src / "home" / "IDENTITY.md").write_text("# existing")
+        install = tmp_path / "install"
+        ws_claude = install / "home" / ".claude"
+        ws_claude.mkdir(parents=True)
+        (ws_claude / "CLAUDE.md").symlink_to("../IDENTITY.md")
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._set_ownership") as mock_own,
+            patch("os.chown"),
+            patch("os.symlink") as mock_symlink,
+        ):
+            _bootstrap_home_identity(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+
+        mock_symlink.assert_not_called()
+        # _set_ownership is only called inside the symlink-recreation branch;
+        # if the symlink is already correct, it should not run.
+        mock_own.assert_not_called()
+        assert "Created symlink" not in capsys.readouterr().out
+
+    def test_recreates_symlink_when_target_wrong(self, tmp_path):
+        """
+        Symlink exists at install location but points elsewhere (e.g.
+        leftover from an older layout). Bootstrap unlinks the wrong
+        symlink and creates a fresh one with the correct target.
+        """
+        src = tmp_path / "source"
+        (src / "home" / ".claude").mkdir(parents=True)
+        (src / "home" / ".claude" / "CLAUDE.md.example").write_text("# example")
+        (src / "home" / "IDENTITY.md").write_text("# existing")
+        install = tmp_path / "install"
+        ws_claude = install / "home" / ".claude"
+        ws_claude.mkdir(parents=True)
+        (ws_claude / "CLAUDE.md").symlink_to("WRONG_TARGET.md")
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _bootstrap_home_identity(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+
+        symlink = ws_claude / "CLAUDE.md"
+        assert symlink.is_symlink()
+        assert os.readlink(symlink) == "../IDENTITY.md"
+
+    def test_dry_run_makes_no_filesystem_changes(self, tmp_path):
+        """
+        Dry-run mode logs intended actions without touching the filesystem.
+        Verified by ensuring nothing is written under install/ even when
+        the bootstrap would otherwise both seed IDENTITY.md and create
+        the symlink.
+        """
+        src = tmp_path / "source"
+        (src / "home" / ".claude").mkdir(parents=True)
+        (src / "home" / ".claude" / "CLAUDE.md.example").write_text("# example")
+        install = tmp_path / "install"
+
+        with patch("kai.install.PROJECT_ROOT", src):
+            _bootstrap_home_identity(install, svc_uid=1000, svc_gid=1000, dry_run=True)
+
+        assert not (install / "home" / "IDENTITY.md").exists()
+        assert not (install / "home" / ".claude" / "CLAUDE.md").exists()
+
+    def test_warns_and_returns_early_when_no_seed_available(self, tmp_path, capsys):
+        """
+        Source has no IDENTITY.md AND no CLAUDE.md.example, and the
+        install copy does not exist either. Bootstrap warns and returns
+        without creating the symlink. A symlink to a nonexistent target
+        would only mask the underlying problem.
+        """
+        src = tmp_path / "source"
+        # Empty source: nothing to bootstrap from.
+        install = tmp_path / "install"
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _bootstrap_home_identity(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+
+        output = capsys.readouterr().out
+        assert "WARNING" in output
+        assert not (install / "home" / "IDENTITY.md").exists()
+        assert not (install / "home" / ".claude" / "CLAUDE.md").exists()
 
 
 # ── _apply_models ────────────────────────────────────────────────────
