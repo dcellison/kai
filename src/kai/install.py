@@ -78,9 +78,11 @@ _SOURCE_EXCLUDES = {"__pycache__", "*.pyc", "*.egg-info", ".git", ".venv", ".env
 #                 by _bootstrap_home_identity so the bootstrap path is the
 #                 single source of truth for the symlink target.
 #   skills/     - downloaded skills, environment-specific
-# History and MEMORY.md now live in DATA_DIR, outside the install tree.
-# Both are still excluded because stale files may remain at the source
-# after migration (source files are preserved as backups, not deleted).
+# History and MEMORY.md now live in DATA_DIR, outside the install tree;
+# they remain in the excludes list because stale files may linger at the
+# source after migration (source files are preserved as backups, not
+# deleted). CLAUDE.md is excluded for a different reason - see its
+# per-entry comment above - not as a migration artifact.
 _HOME_CLAUDE_EXCLUDES = {"history", "MEMORY.md", "CLAUDE.md", "skills", "__pycache__"}
 
 
