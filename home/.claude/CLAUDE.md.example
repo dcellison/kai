@@ -150,9 +150,11 @@ curl -s -X POST http://localhost:8080/api/send-file \
 
 ## Memory System
 
-You have a per-user vector store that holds extracted facts about the user (preferences, decisions, identity, locations, constraints). Two paths populate it: a Haiku extraction pass that runs automatically over conversations, and the explicit API documented here. Use the API to deliberately store a fact when you notice something worth recalling later, instead of waiting for the extractor to find it.
+The notes in this section apply only when the `[Memory subsystem: enabled]` line is present in your context. In disabled mode, the Memory Write Routing rule above is the entire memory contract; ignore the API endpoints below.
 
-This is distinct from your `MEMORY.md` file, which is monolithic identity text injected at every turn. MEMORY.md is for stable identity and rules; the memory store is for queryable, retrievable facts that you may or may not need on a given turn.
+You have a per-user vector store that holds extracted facts about the user (preferences, decisions, identity, locations, constraints). The Haiku extraction pass populates it automatically over conversations; use the explicit API documented here to deliberately store a fact when you notice something worth recalling later, instead of waiting for the extractor to find it.
+
+This is distinct from your `MEMORY.md` file, which holds operator notes and project state. In enabled mode, MEMORY.md is not injected; the vector store is the active fact surface, populated automatically by the extractor and on demand via the API.
 
 ### When to store a fact via the API
 

@@ -2607,6 +2607,11 @@ def _bootstrap_home_identity(install_path: Path, svc_uid: int, svc_gid: int, dry
     example_src = PROJECT_ROOT / "home" / ".claude" / "CLAUDE.md.example"
     identity_dst = install_path / "home" / "IDENTITY.md"
     claude_md_dst = install_path / "home" / ".claude" / "CLAUDE.md"
+    # Tracks whether either step took action so the steady-state path can
+    # emit a single positive "already bootstrapped" log. Without this,
+    # full-no-op reinstalls would be silent, which makes it hard for an
+    # operator to confirm the identity surface is healthy.
+    did_work = False
 
     # Step 1: ensure IDENTITY.md exists at the install location, picking the
     # best available seed. Source IDENTITY.md is preferred when present so
@@ -2620,6 +2625,7 @@ def _bootstrap_home_identity(install_path: Path, svc_uid: int, svc_gid: int, dry
             shutil.copy2(identity_src, identity_dst)
             os.chown(identity_dst, svc_uid, svc_gid)
             print(f"  Copied {identity_dst}")
+        did_work = True
     elif not identity_dst.exists() and example_src.is_file():
         if dry_run:
             print(f"[DRY RUN] Would seed {identity_dst} from {example_src}")
@@ -2628,6 +2634,7 @@ def _bootstrap_home_identity(install_path: Path, svc_uid: int, svc_gid: int, dry
             shutil.copy2(example_src, identity_dst)
             os.chown(identity_dst, svc_uid, svc_gid)
             print(f"  Bootstrapped {identity_dst} from CLAUDE.md.example")
+        did_work = True
     elif not identity_dst.exists():
         # No source IDENTITY.md, no install copy, and no .example to fall
         # back to. The .example is tracked, so missing here means a corrupt
@@ -2656,6 +2663,17 @@ def _bootstrap_home_identity(install_path: Path, svc_uid: int, svc_gid: int, dry
             # keeps the syscall choice in one place and lets tests mock it.
             _set_ownership(claude_md_dst, svc_uid, svc_gid)
             print(f"  Created symlink {claude_md_dst} -> {expected_target}")
+        did_work = True
+
+    # Steady state: install copy is present, source IDENTITY.md is absent,
+    # and the symlink target is already correct. Emit a single positive
+    # confirmation so reinstalls produce visible output rather than silent
+    # inaction. The spec calls for this log line explicitly.
+    if not did_work:
+        if dry_run:
+            print(f"[DRY RUN] {identity_dst} and {claude_md_dst} already valid; no action")
+        else:
+            print(f"  Identity surface already bootstrapped: {identity_dst} and {claude_md_dst} are in place")
 
 
 def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:

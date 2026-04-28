@@ -3991,6 +3991,40 @@ class TestBootstrapHomeIdentity:
         assert not (install / "home" / "IDENTITY.md").exists()
         assert not (install / "home" / ".claude" / "CLAUDE.md").exists()
 
+    def test_logs_already_bootstrapped_when_fully_idempotent(self, tmp_path, capsys):
+        """
+        Full no-op steady state: install copy of IDENTITY.md is in place,
+        source IDENTITY.md is absent (fresh-clone operator who never
+        customized in source), and the symlink already points at the
+        correct target. Bootstrap performs no copy and no symlink work,
+        and emits a positive "already bootstrapped" log line so reinstalls
+        produce visible confirmation rather than silent inaction.
+        """
+        src = tmp_path / "source"
+        (src / "home" / ".claude").mkdir(parents=True)
+        (src / "home" / ".claude" / "CLAUDE.md.example").write_text("# example")
+        # No source IDENTITY.md - operator only customized the install copy.
+        install = tmp_path / "install"
+        (install / "home").mkdir(parents=True)
+        (install / "home" / "IDENTITY.md").write_text("# install copy")
+        ws_claude = install / "home" / ".claude"
+        ws_claude.mkdir(parents=True)
+        (ws_claude / "CLAUDE.md").symlink_to("../IDENTITY.md")
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _bootstrap_home_identity(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+
+        output = capsys.readouterr().out
+        assert "already bootstrapped" in output
+        # No copy, no seed, no symlink-create lines should be emitted.
+        assert "Copied " not in output
+        assert "Bootstrapped " not in output
+        assert "Created symlink" not in output
+
     def test_warns_and_returns_early_when_no_seed_available(self, tmp_path, capsys):
         """
         Source has no IDENTITY.md AND no CLAUDE.md.example, and the
