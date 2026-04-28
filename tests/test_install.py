@@ -3737,16 +3737,25 @@ class TestApplySource:
         Dry run warns when both home/IDENTITY.md and CLAUDE.md.example are
         missing from the source checkout. The .example is tracked, so this
         means a corrupt or partial checkout, and the bootstrap can't proceed.
+        Mirrors the non-dry-run counterpart: also pin the early-return
+        contract so a future regression cannot start emitting a symlink
+        creation message in dry-run output.
         """
         src = tmp_path / "source"
         # Empty home/.claude/ - no .example file, no IDENTITY.md
         (src / "home" / ".claude").mkdir(parents=True)
+        install = tmp_path / "install"
         with patch("kai.install.PROJECT_ROOT", src):
-            _apply_source(tmp_path / "install", svc_uid=1000, svc_gid=1000, dry_run=True)
+            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=True)
         output = capsys.readouterr().out
         assert "WARNING" in output
         assert "neither" in output
         assert "CLAUDE.md.example" in output
+        # Bootstrap returned early; dry-run output should not describe a
+        # symlink creation, and (since this is dry-run anyway) nothing on
+        # disk should have been written.
+        assert "Would (re)create symlink" not in output
+        assert not (install / "home" / ".claude" / "CLAUDE.md").exists()
 
     def test_warns_when_neither_source_nor_example_present(self, tmp_path, capsys):
         """

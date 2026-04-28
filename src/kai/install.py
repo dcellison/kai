@@ -2578,12 +2578,15 @@ def _bootstrap_home_identity(install_path: Path, svc_uid: int, svc_gid: int, dry
 
     Behavior:
       1. If the operator's home/IDENTITY.md is present in source, copy it to
-         the install location. This preserves the existing make-install-as-edit
-         -propagation workflow for operators with local edits.
+         the install location, overwriting any prior install copy. Source
+         is the authoritative copy when present: operators edit IDENTITY.md
+         in their checkout, then `make install` propagates those edits to
+         the install location. Direct edits to the install copy are not
+         protected against overwrite by this branch.
       2. Else, if no IDENTITY.md exists at the install location yet, seed it
          from home/.claude/CLAUDE.md.example. Fresh-clone path.
-      3. Else (steady state on reinstall after first bootstrap), leave the
-         install copy in place. No-op.
+      3. Else (steady state on reinstall after first bootstrap with no
+         source IDENTITY.md), leave the install copy in place. No-op.
       4. Always reconcile home/.claude/CLAUDE.md: if it is missing or its
          symlink target is not "../IDENTITY.md", recreate it.
 
