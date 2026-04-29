@@ -547,8 +547,11 @@ def _build_tag_view(
 # `_TAG_ENUM`: importing memory_extraction would pull in the Anthropic
 # SDK on the UI path. A drift between the two lists shows up
 # immediately in the episode list view (every row would render as
-# `[----]`).
-_OUTCOME_QUALITY_ENUM: tuple[str, ...] = ("success", "partial", "failure")
+# `[----]`). frozenset (not tuple) because the only operation here
+# is `in` membership; matches the `USER_VISIBLE_SOURCES` pattern.
+# `_TAG_ENUM` is a tuple because iteration order matters for the
+# dashboard tag-button rendering; here it does not.
+_OUTCOME_QUALITY_ENUM: frozenset[str] = frozenset({"success", "partial", "failure"})
 
 
 def _build_episode_list_view(
