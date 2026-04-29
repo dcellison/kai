@@ -317,7 +317,6 @@ def _do_forward_migration(args: argparse.Namespace, chunks: list[Chunk]) -> int:
     from kai.memory import add_structured, search
 
     user_id_str = str(args.user_id)
-    plan_lines: list[str] = []
     scores: list[float] = []
     added = 0
     skipped = 0
@@ -330,10 +329,12 @@ def _do_forward_migration(args: argparse.Namespace, chunks: list[Chunk]) -> int:
 
         action = "SKIP" if top_score >= args.threshold else "ADD"
         title_label = chunk.title or f"(level-{chunk.level} chunk)"
-        plan_lines.append(f"CHUNK {idx:2d} {action} score={top_score:.3f} title={title_label!r}")
-
         if args.verbose:
-            print(plan_lines[-1])
+            # Print per-chunk plan inline. Earlier shape kept a
+            # plan_lines list with no consumer past the loop body;
+            # collapsed to a local since nothing outside the loop
+            # reads accumulated plan output.
+            print(f"CHUNK {idx:2d} {action} score={top_score:.3f} title={title_label!r}")
 
         if args.dry_run:
             continue

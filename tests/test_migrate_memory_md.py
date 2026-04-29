@@ -303,7 +303,7 @@ def test_force_bypasses_idempotency_guard(fake_memory_md, stub_memory_module, en
     assert "WARNING" in captured.err  # warning about layering
 
 
-def test_rollback_calls_delete_by_source(fake_memory_md, stub_memory_module, enabled_config):
+def test_rollback_calls_delete_by_source(stub_memory_module, enabled_config):
     """Test 13: --rollback --yes deletes via delete_by_source, no other writes.
 
     Pre-check via count_by_source short-circuits when count==0 so the
@@ -319,7 +319,7 @@ def test_rollback_calls_delete_by_source(fake_memory_md, stub_memory_module, ena
     stub_memory_module["add_structured"].assert_not_called()
 
 
-def test_rollback_short_circuits_when_no_migration_rows(fake_memory_md, stub_memory_module, enabled_config, capsys):
+def test_rollback_short_circuits_when_no_migration_rows(stub_memory_module, enabled_config, capsys):
     """Pre-check: --rollback with zero existing rows exits cleanly without
     calling delete_by_source. Holds for both --yes and interactive paths
     so the operator never sees a confusing "Deleted 0 migration entries"
@@ -334,7 +334,7 @@ def test_rollback_short_circuits_when_no_migration_rows(fake_memory_md, stub_mem
     assert "No migration entries to delete" in captured.out
 
 
-def test_rollback_dry_run_calls_count_not_delete(fake_memory_md, stub_memory_module, enabled_config, capsys):
+def test_rollback_dry_run_calls_count_not_delete(stub_memory_module, enabled_config, capsys):
     """Test 14: --rollback --dry-run previews via count_by_source."""
     stub_memory_module["count_by_source"].return_value = 12
 

@@ -790,16 +790,23 @@ def count_by_source(user_id: str, source: str) -> int:
             count += 1
 
     if len(rows) >= _DELETE_PAGE_SIZE:
-        # Hit the cap. The actual store may have more rows; the
-        # returned count is a lower bound. Operator-relevant signal,
-        # not a silent failure.
+        # Hit the cap. Mem0 row ordering is not guaranteed, so unseen
+        # pages could contain additional matching rows; the returned
+        # count is a lower bound regardless of how many matched on
+        # this page. Operators tend to read "may be higher" as
+        # alarming when matched=0; spell out total vs matched so the
+        # warning is informative rather than confusing.
         log.warning(
-            "count_by_source: get_all returned %d rows (full page); "
-            "actual count for user_id=%s source=%r may be higher. "
-            "If this fires, single-user-scale assumptions no longer hold.",
+            "count_by_source: get_all returned %d total rows (page cap); "
+            "matched %d for source=%r. If the user has >%d total rows, "
+            "unseen pages may contain additional matches and the count "
+            "above is a lower bound. At single-user scale (<%d rows) "
+            "this should not fire.",
             _DELETE_PAGE_SIZE,
-            user_id,
+            count,
             source,
+            _DELETE_PAGE_SIZE,
+            _DELETE_PAGE_SIZE,
         )
 
     return count

@@ -1251,8 +1251,12 @@ class TestCountBySource:
         assert mock_mem.get_all.call_count == 1
         # When the cap fires, the function logs a warning so the
         # operator knows the count is a lower bound, not silent.
+        # The wording must spell out total vs matched so an operator
+        # whose match count is 0 but whose total exceeds the cap does
+        # not misread the warning as alarming.
         joined = "\n".join(r.message for r in caplog.records)
-        assert "may be higher" in joined
+        assert "page cap" in joined
+        assert "lower bound" in joined
 
 
 class TestMigrationSourceMetadata:
