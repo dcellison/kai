@@ -362,6 +362,14 @@ def _do_forward_migration(args: argparse.Namespace, chunks: list[Chunk]) -> int:
                 },
             )
             if mid is None:
+                # add_structured returns None on store failure or
+                # disabled-memory; surface to stderr so the operator
+                # can correlate the error count with specific chunks
+                # (silent counter increment was the original bug).
+                print(
+                    f"ERROR on chunk {idx} ({title_label}): add_structured returned None",
+                    file=sys.stderr,
+                )
                 errors += 1
             else:
                 added += 1
@@ -400,14 +408,20 @@ def _do_rollback(args: argparse.Namespace) -> int:
         print(f"Dry-run rollback: would delete {n} migration entries for user_id {args.user_id}.")
         return EXIT_OK
 
+    # Pre-check the count regardless of --yes so the zero-row case
+    # short-circuits cleanly in both interactive and scripted paths.
+    # Without this, --yes would call delete_by_source on a guaranteed-
+    # empty result set, printing a confusing "Deleted 0 migration
+    # entries" line for what was meant as a no-op verification.
+    n = count_by_source(user_id_str, "migration")
+    if n == 0:
+        print(f"No migration entries to delete for user_id {args.user_id}. Exiting.")
+        return EXIT_OK
+
     # Confirmation prompt unless --yes. Reads from stdin so the prompt
-    # is interactive in a terminal but the operator can pipe `yes` or
-    # set --yes in scripted contexts.
+    # is interactive in a terminal but the operator can pass --yes in
+    # scripted contexts.
     if not args.yes:
-        n = count_by_source(user_id_str, "migration")
-        if n == 0:
-            print(f"No migration entries to delete for user_id {args.user_id}. Exiting.")
-            return EXIT_OK
         prompt = f"Delete {n} migration entries for user_id {args.user_id}? [y/N]: "
         try:
             answer = input(prompt).strip().lower()
@@ -525,7 +539,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
 
-    chunks = _chunk_memory_md(memory_md.read_text(), rollup_tokens=args.rollup_tokens)
+    chunks = _chunk_memory_md(memory_md.read_text(encoding="utf-8"), rollup_tokens=args.rollup_tokens)
     print(f"Parsed {len(chunks)} chunks from {memory_md}.")
 
     return _do_forward_migration(args, chunks)

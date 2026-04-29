@@ -1184,9 +1184,12 @@ class TestCountBySource:
 
         assert count_by_source("user-a", "migration") == 0
 
-    def test_count_by_source_returns_count(self):
-        """Counts only rows whose metadata source matches; ignores others."""
-        import kai.memory as mem_mod
+    def test_count_by_source_returns_count(self, monkeypatch):
+        """Counts only rows whose metadata source matches; ignores others.
+
+        Uses monkeypatch (not direct attribute assignment) so an
+        assertion failure does not leak the mock into subsequent tests.
+        """
         from kai.memory import count_by_source
 
         mock_mem = MagicMock()
@@ -1202,25 +1205,54 @@ class TestCountBySource:
                 {"id": "m3", "metadata": {"source": "migration"}},
             ]
         }
-        mem_mod._memory = mock_mem
+        monkeypatch.setattr("kai.memory._memory", mock_mem)
 
         assert count_by_source("user-a", "migration") == 3
 
-        # Reset state so other tests are not influenced by the stub.
-        mem_mod._memory = None
-
-    def test_count_by_source_handles_empty_user(self):
+    def test_count_by_source_handles_empty_user(self, monkeypatch):
         """Empty store returns 0 cleanly (no exceptions)."""
-        import kai.memory as mem_mod
         from kai.memory import count_by_source
 
         mock_mem = MagicMock()
         mock_mem.get_all.return_value = {"results": []}
-        mem_mod._memory = mock_mem
+        monkeypatch.setattr("kai.memory._memory", mock_mem)
 
         assert count_by_source("user-a", "migration") == 0
 
-        mem_mod._memory = None
+    def test_count_by_source_does_not_loop_on_full_page(self, monkeypatch, caplog):
+        """Regression: count_by_source must call get_all exactly once.
+
+        An earlier shape (mirroring delete_by_source's paged loop)
+        would re-fetch when the page came back full with matches,
+        because Mem0's get_all has no offset and read-only operations
+        don't shrink the store. The loop would either hang forever or
+        silently double-count matching rows. Pin the single-fetch
+        contract so a future refactor cannot reintroduce the loop.
+        """
+        import logging
+
+        import kai.memory as mem_mod
+        from kai.memory import count_by_source
+
+        # Build a full page (_DELETE_PAGE_SIZE rows) of matches. If
+        # the function loops, the second iteration would re-add the
+        # same _DELETE_PAGE_SIZE matches and the assertion would
+        # observe call_count > 1 OR a doubled count (whichever the
+        # broken loop hit first).
+        full_page = [{"id": f"m{i}", "metadata": {"source": "migration"}} for i in range(mem_mod._DELETE_PAGE_SIZE)]
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {"results": full_page}
+        monkeypatch.setattr("kai.memory._memory", mock_mem)
+
+        with caplog.at_level(logging.WARNING, logger="kai.memory"):
+            count = count_by_source("user-a", "migration")
+
+        assert count == mem_mod._DELETE_PAGE_SIZE
+        assert mock_mem.get_all.call_count == 1
+        # When the cap fires, the function logs a warning so the
+        # operator knows the count is a lower bound, not silent.
+        joined = "\n".join(r.message for r in caplog.records)
+        assert "may be higher" in joined
 
 
 class TestMigrationSourceMetadata:

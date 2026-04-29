@@ -304,12 +304,34 @@ def test_force_bypasses_idempotency_guard(fake_memory_md, stub_memory_module, en
 
 
 def test_rollback_calls_delete_by_source(fake_memory_md, stub_memory_module, enabled_config):
-    """Test 13: --rollback --yes deletes via delete_by_source, no other writes."""
+    """Test 13: --rollback --yes deletes via delete_by_source, no other writes.
+
+    Pre-check via count_by_source short-circuits when count==0 so the
+    fixture must report a non-zero count for the rollback to actually
+    fire (matches the operator-visible behavior: "no migration entries
+    to delete" exits cleanly without calling delete_by_source).
+    """
+    stub_memory_module["count_by_source"].return_value = 7
     rc = mig.main(["--user-id", "123", "--rollback", "--yes"])
 
     assert rc == mig.EXIT_OK
     stub_memory_module["delete_by_source"].assert_called_once_with("123", "migration")
     stub_memory_module["add_structured"].assert_not_called()
+
+
+def test_rollback_short_circuits_when_no_migration_rows(fake_memory_md, stub_memory_module, enabled_config, capsys):
+    """Pre-check: --rollback with zero existing rows exits cleanly without
+    calling delete_by_source. Holds for both --yes and interactive paths
+    so the operator never sees a confusing "Deleted 0 migration entries"
+    line for what is meant as a no-op verification.
+    """
+    stub_memory_module["count_by_source"].return_value = 0
+    rc = mig.main(["--user-id", "123", "--rollback", "--yes"])
+
+    assert rc == mig.EXIT_OK
+    stub_memory_module["delete_by_source"].assert_not_called()
+    captured = capsys.readouterr()
+    assert "No migration entries to delete" in captured.out
 
 
 def test_rollback_dry_run_calls_count_not_delete(fake_memory_md, stub_memory_module, enabled_config, capsys):

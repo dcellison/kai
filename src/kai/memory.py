@@ -742,13 +742,15 @@ def count_by_source(user_id: str, source: str) -> int:
     `delete_by_source`. Calls `_memory.get_all` directly without an
     executor; Mem0's `get_all` is itself sync.
 
-    Inherits the same tail-miss tradeoff as `delete_by_source`: if a
-    full _DELETE_PAGE_SIZE page contains zero matches we conclude the
-    user has no further matches and stop, which under-counts in
-    pathological cases where matching rows sit past the first page in
-    Mem0's internal row order. At single-user scale (<10K rows) this
-    is fine; do NOT "fix" the early termination without re-reading
-    `delete_by_source`'s rationale (the alternative live-locks).
+    Single-fetch (no loop): unlike `delete_by_source`, this function
+    has no side effect on the store, so a paged loop would request
+    the same rows on every iteration (Mem0's get_all has no offset)
+    and would either hang forever (when matching rows exist on a full
+    page) or silently double-count. We fetch up to `_DELETE_PAGE_SIZE`
+    rows once and count client-side. At single-user scale (<10K rows
+    per user) this returns the exact count; if a user ever has more
+    than `_DELETE_PAGE_SIZE` rows, the count caps at the page size
+    and a warning is logged so the operator can investigate.
 
     Args:
         user_id: Telegram chat_id as string.
@@ -758,54 +760,48 @@ def count_by_source(user_id: str, source: str) -> int:
             as `delete_by_source`.
 
     Returns:
-        Count of rows matching the source filter. 0 when memory is
-        disabled (`_memory is None`) or the user has no rows.
+        Count of rows matching the source filter, capped at
+        `_DELETE_PAGE_SIZE`. 0 when memory is disabled
+        (`_memory is None`) or the user has no rows.
     """
     if _memory is None:
         return 0
 
+    # Single fetch: top_k bounds the result; no looping. See docstring
+    # for why a paged loop is unsafe here even though it works in
+    # delete_by_source.
+    result = _memory.get_all(
+        filters={"user_id": user_id},
+        top_k=_DELETE_PAGE_SIZE,
+    )
+    rows = result.get("results", []) if isinstance(result, dict) else result or []
+
+    # Match logic mirrors delete_by_source: empty-source means legacy
+    # rows (missing-or-empty), explicit value means exact equality.
+    # Metadata key is conditionally absent on rows with no extra
+    # payload (mem0/memory/main.py:1118-1120).
     count = 0
-    while True:
-        # Same fetch shape as delete_by_source: top_k page, results-
-        # wrapped dict response. No executor wrap because this whole
-        # function is sync.
-        result = _memory.get_all(
-            filters={"user_id": user_id},
-            top_k=_DELETE_PAGE_SIZE,
+    for row in rows:
+        row_source = row.get("metadata", {}).get("source") if isinstance(row, dict) else None
+        if source == "":
+            if row_source is None or row_source == "":
+                count += 1
+        elif row_source == source:
+            count += 1
+
+    if len(rows) >= _DELETE_PAGE_SIZE:
+        # Hit the cap. The actual store may have more rows; the
+        # returned count is a lower bound. Operator-relevant signal,
+        # not a silent failure.
+        log.warning(
+            "count_by_source: get_all returned %d rows (full page); "
+            "actual count for user_id=%s source=%r may be higher. "
+            "If this fires, single-user-scale assumptions no longer hold.",
+            _DELETE_PAGE_SIZE,
+            user_id,
+            source,
         )
-        rows = result.get("results", []) if isinstance(result, dict) else result or []
 
-        # Match logic mirrors delete_by_source: empty-source means
-        # legacy rows (missing-or-empty), explicit value means exact
-        # equality. Metadata key is conditionally absent on rows with
-        # no extra payload (mem0/memory/main.py:1118-1120).
-        matches = 0
-        for row in rows:
-            row_source = row.get("metadata", {}).get("source") if isinstance(row, dict) else None
-            if source == "":
-                if row_source is None or row_source == "":
-                    matches += 1
-            elif row_source == source:
-                matches += 1
-        count += matches
-
-        # Termination: same shape as delete_by_source. Page not full
-        # means we've seen the whole store; full page with zero matches
-        # means we'd live-lock on the next iteration since get_all has
-        # no offset/cursor.
-        if len(rows) < _DELETE_PAGE_SIZE:
-            break
-        if matches == 0:
-            log.warning(
-                "count_by_source: first full page had zero matches; "
-                "terminating to avoid live-lock. Possible undercount if "
-                "matching rows exist past position %d in Mem0's row order "
-                "(user_id=%s, source=%r).",
-                _DELETE_PAGE_SIZE,
-                user_id,
-                source,
-            )
-            break
     return count
 
 
