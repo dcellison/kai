@@ -1,8 +1,10 @@
 # Preferences
 
-This file holds your always-on personal rules and preferences. Inner Claude reads it on every turn (injected as `[Your personal preferences (file: ...):]`) and writes to it via `Edit` or `Write` when persisting a new always-on rule.
+This file is your always-on personal rule layer. Inner Claude reads it on every turn (injected as `[Your personal preferences (file: ...):]`) but does NOT auto-edit it. Treat it like `CLAUDE.md`: a curated set of always-on rules, edited deliberately, never silently appended.
 
-Keep this file tight. Anything that should fire every turn (writing style, formatting directives, behavioral rules tied to your specific working patterns) belongs here. Anything fact-shaped (project state, decisions, dated incidents, contextual references) belongs in `MEMORY.md` instead, where retrieval surfaces it on similarity rather than on every turn.
+Write to PREFERENCES.md ONLY when the operator explicitly instructs ("save this as a preference," "add this to PREFERENCES," "make this always-on"). Even then, surface the proposed wording and confirm before persisting. Proactive saves of inferred preferences route to `MEMORY.md` (or Qdrant in enabled mode), NOT here.
+
+Keep this file tight. Anything that should fire every turn (writing style, formatting directives, behavioral rules tied to your specific working patterns) belongs here. Anything fact-shaped (project state, decisions, dated incidents, contextual references) belongs in `MEMORY.md`, where retrieval surfaces it on similarity rather than on every turn.
 
 ## Style
 
