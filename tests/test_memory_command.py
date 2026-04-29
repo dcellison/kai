@@ -788,9 +788,11 @@ class TestDashboardMultiSource:
             confidence_min=0.8,
         )
         text, _ = memory_command._build_dashboard(stats)
-        # Exact match on the original wording so a future change to
-        # the headline format trips this regression test.
-        assert "Memories: 10 facts across 1 tags." in text
+        # Singular "tag" with len(nonzero)==1; the pre-#407 code
+        # rendered "1 tags" which was a latent mismatch. Verified
+        # so a future change to the headline format trips this
+        # regression test.
+        assert "Memories: 10 facts across 1 tag." in text
         assert "episodes" not in text
         assert "imported" not in text
 

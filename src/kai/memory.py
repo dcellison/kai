@@ -1297,17 +1297,23 @@ def get_stats(*, user_id: str) -> MemoryStats:
     for m in memories:
         by_type[m.memory_type] = by_type.get(m.memory_type, 0) + 1
 
-    # Extracted-only aggregates. Build the filtered list once; every
-    # downstream metric reads from it.
-    extracted = [m for m in memories if m.metadata.get("source") == "extracted"]
-
-    # Per-source counts (issue #407). Computed in one walk alongside
-    # the extracted list so the aggregation stays O(n) rather than
-    # O(n) per source. Confidence aggregates and `by_tag` stay scoped
-    # to extracted (see `MemoryStats` docstring); these counts are the
-    # only new aggregation work needed here.
-    episode_count = sum(1 for m in memories if m.metadata.get("source") == "episode")
-    migration_count = sum(1 for m in memories if m.metadata.get("source") == "migration")
+    # Per-source partition (issue #407). Single walk over `memories`;
+    # the extracted list feeds the confidence / by_tag / prompt_version
+    # aggregation below, while episode and migration counts are surfaced
+    # directly in MemoryStats. Confidence aggregates and `by_tag` stay
+    # scoped to extracted (see `MemoryStats` docstring); these counts
+    # are the only new per-source aggregation work needed here.
+    extracted: list[MemoryResult] = []
+    episode_count = 0
+    migration_count = 0
+    for m in memories:
+        src = m.metadata.get("source")
+        if src == "extracted":
+            extracted.append(m)
+        elif src == "episode":
+            episode_count += 1
+        elif src == "migration":
+            migration_count += 1
 
     by_tag: dict[str, int] = {}
     by_prompt_version: dict[str, int] = {}

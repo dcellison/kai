@@ -366,7 +366,15 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
         parts.append(f"{stats.episode_count} episodes")
     if stats.migration_count:
         parts.append(f"{stats.migration_count} imported")
-    summary = "Memories: " + ", ".join(parts) + f" across {len(nonzero)} tags."
+    # tag_word handles two cases that the pre-#407 surface never
+    # reached: a `len(nonzero) == 1` extracted operator (singular
+    # "1 tag") and a `len(nonzero) == 0` episode-only / migration-only
+    # operator (zero "0 tags" reads awkwardly but is the honest count
+    # since `by_tag` is extracted-only). The "1 tags" mismatch was
+    # latent in the pre-#407 code; fixing it here in the same edit
+    # keeps the headline grammar consistent across all three branches.
+    tag_word = "tag" if len(nonzero) == 1 else "tags"
+    summary = "Memories: " + ", ".join(parts) + f" across {len(nonzero)} {tag_word}."
     lines.append(summary)
     lines.append("")
     # Footer line: three branches keep the action prompt accurate to
@@ -534,35 +542,31 @@ def _build_fact_view(
     tags = md.get("tags") or []
     source = md.get("source", "")
 
-    # Tags row is shared across all three source shapes; assembling
-    # once avoids duplication in the per-source branches below.
-    tags_line = f"Tags:  {', '.join(tags) if tags else '(none)'}"
-
-    if source == "episode":
-        # Episode rows surface the Sophia outcome_quality field as
-        # a header parenthetical when present (e.g., "Episode (good)")
-        # so the operator can tell at a glance how the conversation
-        # resolved. Date renders with HH:MM precision so episodes
-        # from the same day are distinguishable.
-        quality = md.get("outcome_quality") or ""
-        header = f"Episode ({quality})" if quality else "Episode"
+    if source == "episode" or source == "migration":
+        # Episode and migration rows share a minimal body shape:
+        # narrow Tags + Date with none of the extractor-only rows.
+        # Header differs (Episode (<outcome_quality>) vs Imported)
+        # but the rest of the layout is identical, so the tags
+        # line is computed once for both.
+        tags_line = f"Tags:  {', '.join(tags) if tags else '(none)'}"
+        if source == "episode":
+            # Episode rows surface the Sophia outcome_quality field as
+            # a header parenthetical when present (e.g., "Episode
+            # (good)") so the operator can tell at a glance how the
+            # conversation resolved. Date renders with HH:MM precision
+            # so episodes from the same day are distinguishable.
+            quality = md.get("outcome_quality") or ""
+            header = f"Episode ({quality})" if quality else "Episode"
+        else:
+            # Migration rows already include the H3 title and section
+            # structure inside `fact.text` (the migration script writes
+            # the chunk as `### <title>\n<body>` per #408), so no
+            # additional section rendering is needed here. The header
+            # diverges from the prompt-side `_SOURCE_SHORT="fact"` on
+            # purpose - see docstring.
+            header = "Imported"
         lines = [
             header,
-            "",
-            f'"{fact.text}"',
-            "",
-            tags_line,
-            f"Date:  {_format_date(fact.created_at, with_time=True)}",
-        ]
-    elif source == "migration":
-        # Migration rows already include the H3 title and section
-        # structure inside `fact.text` (the migration script writes
-        # the chunk as `### <title>\n<body>` per #408), so no
-        # additional section rendering is needed here. The header
-        # diverges from the prompt-side `_SOURCE_SHORT="fact"` on
-        # purpose - see docstring.
-        lines = [
-            "Imported",
             "",
             f'"{fact.text}"',
             "",
