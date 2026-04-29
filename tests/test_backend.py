@@ -217,7 +217,7 @@ class TestBuildSessionContext:
         assert "(currently empty)" in pref_block
 
     def test_preferences_block_missing_file(self, tmp_path):
-        """'(file is missing or empty)' when PREFERENCES.md is absent."""
+        """'(not yet created)' placeholder when PREFERENCES.md is absent."""
         workspace = tmp_path / "ws"
         workspace.mkdir()
         data_dir = tmp_path / "data"
