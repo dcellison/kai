@@ -239,7 +239,11 @@ def build_session_context(
             else:
                 parts.append(f"[Your personal preferences (file: {pref_path}):]\n(currently empty)")
         except OSError:
-            parts.append(f"[Your personal preferences (file: {pref_path}):]\n(file is missing or empty)")
+            # OSError fires only on missing or unreadable files; the
+            # empty case is handled by the else branch above with a
+            # distinct "(currently empty)" placeholder. Match the
+            # MEMORY.md branch's wording for symmetry.
+            parts.append(f"[Your personal preferences (file: {pref_path}):]\n(not yet created)")
 
     # Always inject Kai's personal memory from DATA_DIR. This file
     # lives outside the install tree (/var/lib/kai/memory/ in production)

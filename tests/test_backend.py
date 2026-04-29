@@ -204,6 +204,12 @@ class TestBuildSessionContext:
         # block contains it by anchoring on the block label.
         pref_block_idx = result.find("[Your personal preferences (file:")
         memory_block_idx = result.find("[Your persistent memory (file:")
+        # Defensive: a -1 from str.find() would silently turn the slice
+        # below into a near-full-string slice and produce a false pass.
+        # Both labels are always emitted in this fixture (preferences
+        # because chat_id is set, memory unconditionally), so a missing
+        # block here is a regression worth surfacing immediately.
+        assert memory_block_idx >= 0, "memory block label missing - inject ordering may have regressed"
         # Slice between the preferences block start and the memory block
         # start to verify the empty placeholder is in the preferences
         # block specifically.
@@ -229,7 +235,7 @@ class TestBuildSessionContext:
             )
 
         assert "[Your personal preferences (file:" in result
-        assert "(file is missing or empty)" in result
+        assert "(not yet created)" in result
 
     def test_preferences_block_omitted_when_chat_id_none(self, tmp_path):
         """No preferences block when chat_id is None (no per-user file to read)."""

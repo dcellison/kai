@@ -2276,13 +2276,13 @@ def _apply_migrate(
     # "remember to also chown the file" reminder. Lazy bootstrap at
     # runtime (backend.ensure_user_preferences) is the fallback for
     # chat_ids added between installs.
-    preferences_root = data_path / "preferences"
+    preferences_tree = data_path / "preferences"
     preferences_template = PROJECT_ROOT / "home" / ".claude" / "PREFERENCES.md.example"
 
     for chat_id, _os_user in memory_owners:
         if chat_id is None:
             continue
-        pref_dir = preferences_root / str(chat_id)
+        pref_dir = preferences_tree / str(chat_id)
         pref_dst = pref_dir / "PREFERENCES.md"
 
         if dry_run:
@@ -2318,7 +2318,6 @@ def _apply_migrate(
     # This pass is what corrects ownership drift when os_user changes
     # between installs. Without it, the seeding block above would set
     # ownership on first-run only and stale files would persist.
-    preferences_tree = data_path / "preferences"
     if preferences_tree.is_dir():
         if dry_run:
             print(f"[DRY RUN] Would set ownership on {preferences_tree} (service + per-user)")
