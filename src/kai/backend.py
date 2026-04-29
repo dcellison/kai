@@ -469,9 +469,9 @@ def ensure_user_preferences(chat_id: int | None, data_dir: Path) -> None:
 
     Sibling to ensure_user_memory(). Same idempotency, same OSError
     swallow behavior, same multi-user ownership caveats - the install
-    step (install.py `_apply_migrate`) pre-creates and chowns
-    `preferences/<chat_id>/` to the user's os_user when one is set in
-    users.yaml; lazy bootstrap is the runtime fallback for chat_ids
+    step (install.py `_apply_migrate`) pre-creates `preferences/<chat_id>/`
+    for every entry in users.yaml and chowns it to that user's os_user
+    when one is set; lazy bootstrap is the runtime fallback for chat_ids
     added between installs (a reinstall picks up the ownership in the
     `-- PREFERENCES.md directory ownership --` pass).
 
