@@ -74,6 +74,8 @@ def _fact(
 def _stats(
     *,
     extracted_count: int = 0,
+    episode_count: int = 0,
+    migration_count: int = 0,
     by_tag: dict[str, int] | None = None,
     confidence_min: float | None = None,
     confidence_median: float | None = None,
@@ -83,11 +85,19 @@ def _stats(
     confirmation_quote_count: int = 0,
     by_prompt_version: dict[str, int] | None = None,
 ) -> MemoryStats:
-    """Construct a MemoryStats with extracted-only aggregates."""
+    """Construct a MemoryStats with extracted-only aggregates.
+
+    `episode_count` and `migration_count` (issue #407) default to zero
+    so existing tests stay unchanged. Tests that exercise the
+    multi-source dashboard / stats / fact-view branches override them
+    explicitly.
+    """
     return MemoryStats(
-        total_count=extracted_count,
+        total_count=extracted_count + episode_count + migration_count,
         by_type={"fact": extracted_count} if extracted_count else {},
         extracted_count=extracted_count,
+        episode_count=episode_count,
+        migration_count=migration_count,
         by_tag=by_tag or {},
         confidence_min=confidence_min,
         confidence_median=confidence_median,
@@ -539,7 +549,11 @@ class TestBuildSearchResults:
 class TestBuildStats:
     def test_empty_state(self):
         text, kb = memory_command._build_stats(_stats(extracted_count=0))
-        assert "No extracted facts yet" in text
+        # Issue #407 changed the empty-state wording from
+        # "No extracted facts yet" because the post-#407 surface
+        # also accounts for episode and migration sources; the new
+        # wording is honest about the empty-state's full scope.
+        assert "No facts, episodes, or imported memory yet" in text
         assert kb.inline_keyboard[0][0].text == "back"
 
     def test_renders_full_aggregates(self):
@@ -565,8 +579,12 @@ class TestBuildStats:
             by_prompt_version={"v3": 128, "v2": 14},
         )
         text, _ = memory_command._build_stats(stats)
-        # Total
-        assert "Total:            142 facts" in text
+        # Total: per-source headline (issue #407). Extracted-only
+        # operator sees just the "Total facts:" line; episode and
+        # migration count lines are omitted when zero.
+        assert "Total facts:      142" in text
+        assert "Total episodes:" not in text
+        assert "Total imported:" not in text
         # Spec §6.1 asymmetry: zero-count tags ARE shown in stats.
         assert "location" in text
         assert "  0" in text  # location's zero count
@@ -663,6 +681,327 @@ class TestBuildStats:
         # Both buckets render without raising; presence is enough.
         assert "1" in text
         assert "2" in text
+
+
+# ── Issue #407: multi-source UI surface ────────────────────────────
+#
+# Episode and migration rows joined extracted as user-visible sources
+# in `/memory` (memory.py `_USER_VISIBLE_SOURCES`). The four classes
+# below exercise the dashboard, stats, fact-view, and forget-confirm
+# branches added by the spec.
+
+
+def _episode_fact(
+    fact_id: str = "ep-1",
+    text: str = "Set up CI for the kai repo. Outcome: succeeded.",
+    *,
+    tags: list[str] | None = None,
+    outcome_quality: str | None = "good",
+    created_at: str = "2026-04-28T15:00:00",
+) -> MemoryResult:
+    """Construct a MemoryResult shaped like an episode row.
+
+    Episode rows do not carry confidence / session_id / prompt_version
+    / confirmation_quote in production; tests deliberately omit those
+    fields so the renderer's "omit extractor-only rows" branch is
+    actually exercised. `outcome_quality` is None when the test wants
+    to drive the no-quality branch of the header.
+    """
+    metadata: dict[str, Any] = {
+        "source": "episode",
+        "tags": tags if tags is not None else [],
+        "type": "fact",
+    }
+    if outcome_quality is not None:
+        metadata["outcome_quality"] = outcome_quality
+    return MemoryResult(
+        id=fact_id,
+        text=text,
+        score=0.0,
+        memory_type="fact",
+        metadata=metadata,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+
+
+def _migration_fact(
+    fact_id: str = "mig-1",
+    text: str = "### /backend\nRole-based backend assignment.",
+    *,
+    tags: list[str] | None = None,
+    created_at: str = "2026-04-29T16:30:00",
+) -> MemoryResult:
+    """Construct a MemoryResult shaped like a migration row (#408).
+
+    Tags default to ["migration"] which is what the migration script
+    writes for chunks without an H3 slug; tests exercising tag rendering
+    should pass an explicit list including the H3 slug too.
+    """
+    metadata: dict[str, Any] = {
+        "source": "migration",
+        "tags": tags if tags is not None else ["migration"],
+        "type": "fact",
+    }
+    return MemoryResult(
+        id=fact_id,
+        text=text,
+        score=0.0,
+        memory_type="fact",
+        metadata=metadata,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+
+
+class TestDashboardMultiSource:
+    """`/memory` dashboard surfacing of episode and migration rows."""
+
+    def test_dashboard_shows_episode_and_migration_counts(self):
+        """Headline lists per-source counts when all three are non-zero.
+        The substrings "facts", "episodes", and "imported" each appear,
+        confirming the per-source wording rather than a single
+        aggregated total."""
+        stats = _stats(
+            extracted_count=12,
+            episode_count=3,
+            migration_count=25,
+            by_tag={"preference": 5},
+            confidence_median=0.85,
+            confidence_min=0.6,
+        )
+        text, _ = memory_command._build_dashboard(stats)
+        assert "12 facts" in text
+        assert "3 episodes" in text
+        assert "25 imported" in text
+
+    def test_dashboard_omits_zero_source_counts(self):
+        """A fresh extracted-only operator (episode_count==0,
+        migration_count==0) sees the original
+        "Memories: <N> facts across <M> tags." headline. Zero-valued
+        sources are omitted from the comma list rather than rendered
+        as "0 episodes" / "0 imported"."""
+        stats = _stats(
+            extracted_count=10,
+            by_tag={"preference": 5},
+            confidence_median=0.9,
+            confidence_min=0.8,
+        )
+        text, _ = memory_command._build_dashboard(stats)
+        # Exact match on the original wording so a future change to
+        # the headline format trips this regression test.
+        assert "Memories: 10 facts across 1 tags." in text
+        assert "episodes" not in text
+        assert "imported" not in text
+
+    def test_dashboard_episode_only_user_renders(self):
+        """An episode-only operator (`episode_count > 0`,
+        `extracted_count == 0`, `migration_count == 0`) sees the
+        dashboard rendered (NOT _MSG_NO_FACTS) with no tag buttons
+        (since `by_tag` is extracted-only and empty). Footer points
+        at the always-rendered Search/Stats button row.
+
+        Pins both empty-state guard fixes AND the footer conditional
+        simultaneously: the pre-#407 dashboard returned _MSG_NO_FACTS
+        for this input via its extracted-only guard."""
+        stats = _stats(episode_count=4)
+        text, kb = memory_command._build_dashboard(stats)
+        # Not the empty state.
+        assert "No memories yet" not in text
+        assert kb is not None
+        # Headline shows the episode count.
+        assert "4 episodes" in text
+        # Footer text is the no-tag-buttons branch.
+        assert "Use Search to find specific memories, or tap Stats for details." in text
+        assert "Tap a tag to browse" not in text
+        # Keyboard has only the footer Search/Stats row (no tag rows).
+        assert len(kb.inline_keyboard) == 1
+        footer = kb.inline_keyboard[-1]
+        assert [btn.text for btn in footer] == ["Search", "Stats"]
+
+    def test_dashboard_migration_only_user_renders(self):
+        """Same shape as the episode-only case: migration_count > 0,
+        extracted_count == 0, episode_count == 0. Same empty-state
+        guard fix and same no-tag-button footer assertion."""
+        stats = _stats(migration_count=25)
+        text, kb = memory_command._build_dashboard(stats)
+        assert "No memories yet" not in text
+        assert kb is not None
+        assert "25 imported" in text
+        assert "Use Search to find specific memories, or tap Stats for details." in text
+        assert "Tap a tag to browse" not in text
+        assert len(kb.inline_keyboard) == 1
+
+    def test_dashboard_all_zero_returns_empty_state(self):
+        """The empty state fires only when every user-visible source
+        is zero. Pins the combined-guard contract."""
+        stats = _stats()  # all three counts default to 0
+        text, kb = memory_command._build_dashboard(stats)
+        assert text == memory_command._MSG_NO_FACTS
+        assert kb is None
+
+
+class TestStatsMultiSource:
+    """`/memory stats` surfacing of episode and migration totals."""
+
+    def test_stats_view_shows_per_source_breakdown(self):
+        """The headline shows per-source totals on distinct lines for
+        all non-zero sources."""
+        stats = _stats(
+            extracted_count=12,
+            episode_count=3,
+            migration_count=25,
+            by_tag={"preference": 12},
+            confidence_min=0.6,
+            confidence_median=0.85,
+            confidence_max=0.95,
+        )
+        text, _ = memory_command._build_stats(stats)
+        assert "Total facts:      12" in text
+        assert "Total episodes:   3" in text
+        assert "Total imported:   25" in text
+
+    def test_stats_view_all_zero_says_no_memories_yet(self):
+        """All-zero empty-state text matches the dashboard's wording
+        update (per spec §D5)."""
+        stats = _stats()
+        text, kb = memory_command._build_stats(stats)
+        assert text == "Memory stats\n\nNo facts, episodes, or imported memory yet."
+        # Back button is still rendered so the user can return to the
+        # dashboard rather than being stuck on the stats screen.
+        assert kb.inline_keyboard[0][0].text == "back"
+
+    def test_stats_view_episode_only_omits_extracted_sections(self):
+        """An episode-only operator's stats output contains only the
+        per-source headline. The four extracted-shaped sections
+        (by-tag table, confidence block, confirmed-actions line,
+        prompt-version table) are omitted because they read
+        extractor-only metadata.
+
+        Pins §D5's "the four extracted-shaped sections are omitted"
+        contract for the extracted-zero case."""
+        stats = _stats(episode_count=5)
+        text, _ = memory_command._build_stats(stats)
+        assert "Total episodes:   5" in text
+        # None of the four extracted-shaped sections render.
+        assert "By tag:" not in text
+        assert "Confidence:" not in text
+        assert "Confirmed actions:" not in text
+        assert "Prompt versions:" not in text
+
+
+class TestFactViewMultiSource:
+    """`_build_fact_view` per-source render branches."""
+
+    def test_fact_view_renders_episode_with_outcome_quality(self):
+        """Episode header includes outcome_quality as a parenthetical
+        and the body shows Tags + Date only - none of the four
+        extractor-only rows (Confidence/Session/Prompt version/
+        Confirmation) appear."""
+        fact = _episode_fact(outcome_quality="good", tags=["sophia/topic"])
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        # Header reads "Episode (good)".
+        assert "Episode (good)" in text
+        # Tags line renders.
+        assert "Tags:" in text
+        assert "sophia/topic" in text
+        # Date line renders with HH:MM precision.
+        assert "Date:" in text
+        # Extractor-only rows are absent. Each label is checked
+        # individually so a regression that adds back ANY one of them
+        # trips the assertion.
+        assert "Confidence:" not in text
+        assert "Session:" not in text
+        assert "Prompt version:" not in text
+        assert "Confirmation:" not in text
+
+    def test_fact_view_renders_episode_without_outcome_quality(self):
+        """When `outcome_quality` is missing from metadata the header
+        falls back to a bare "Episode" with no parenthetical."""
+        fact = _episode_fact(outcome_quality=None)
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        # Header reads "Episode" without parenthetical. Use a regex-
+        # style assertion: line begins with "Episode\n" (no "(").
+        first_line = text.split("\n", 1)[0]
+        assert first_line == "Episode"
+
+    def test_fact_view_renders_migration_with_imported_header(self):
+        """Migration row renders the `Imported` header and the same
+        minimal Tags + Date body as the episode case. Distinct header
+        from `Fact` (extracted) and `Episode` so the operator can
+        tell the row's provenance at a glance."""
+        fact = _migration_fact(tags=["migration", "backend"])
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        # Header is the load-bearing distinction.
+        first_line = text.split("\n", 1)[0]
+        assert first_line == "Imported"
+        # Tags include the migration H3 slug.
+        assert "migration" in text
+        assert "backend" in text
+        # Date renders.
+        assert "Date:" in text
+        # No extractor-only rows.
+        assert "Confidence:" not in text
+        assert "Session:" not in text
+        assert "Prompt version:" not in text
+        assert "Confirmation:" not in text
+
+    def test_fact_view_renders_extracted_unchanged(self):
+        """Pins the unchanged-extracted-shape contract: extracted
+        rows still render the original six-row block (Tags,
+        Confidence, Date, Session, Prompt version, Confirmation).
+        A regression that accidentally routes extracted rows
+        through the episode / migration shape would drop four of
+        these labels."""
+        fact = _fact("id1", "Prefers tea.", ["preference"], confidence=0.85, prompt_version="v3")
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        first_line = text.split("\n", 1)[0]
+        assert first_line == "Fact"
+        assert "Tags:" in text
+        assert "Confidence:" in text
+        assert "Date:" in text
+        assert "Session:" in text
+        assert "Prompt version:" in text
+        assert "Confirmation:" in text
+
+
+class TestForgetConfirmMultiSource:
+    """`_build_forget_fact_confirm` per-source label injection."""
+
+    def test_delete_confirm_extracted_keeps_verb_and_warning(self):
+        """Pins the verb + warning regression-test contract per D4:
+        the verb stays `Forget`, the noun for extracted rows stays
+        `fact`, and the irreversibility cue (`This cannot be undone.`)
+        remains. A future change that swaps wording should be a
+        deliberate spec change, not a silent edit."""
+        fact = _fact("id1", "Prefers tea.", ["preference"])
+        text, kb = memory_command._build_forget_fact_confirm(fact)
+        assert text.startswith("Forget")
+        assert "fact" in text
+        assert "This cannot be undone." in text
+        # Inline-button flow unchanged.
+        labels = [btn.text for btn in kb.inline_keyboard[0]]
+        assert labels == ["confirm forget", "cancel"]
+
+    def test_delete_confirm_episode_uses_episode_label(self):
+        """Episode rows render the prompt with the `episode` noun.
+        Verb and warning sentence are unchanged from the extracted
+        case so the operator sees one consistent surface."""
+        fact = _episode_fact()
+        text, _ = memory_command._build_forget_fact_confirm(fact)
+        assert text.startswith("Forget")
+        assert "episode" in text
+        assert "This cannot be undone." in text
+
+    def test_delete_confirm_migration_uses_imported_memory_label(self):
+        """Migration rows render the prompt with the `imported memory`
+        noun. The label includes a space so a future code change that
+        forgets the multi-word rendering trips this assertion."""
+        fact = _migration_fact()
+        text, _ = memory_command._build_forget_fact_confirm(fact)
+        assert text.startswith("Forget")
+        assert "imported memory" in text
+        assert "This cannot be undone." in text
 
 
 # ── Subcommand parsing dispatch ────────────────────────────────────

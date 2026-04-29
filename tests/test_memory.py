@@ -2135,6 +2135,376 @@ class TestGetStatsExtended:
         assert stats.by_prompt_version == {}
 
 
+class TestUserVisibleSources:
+    """Issue #407: episode and migration rows joined extracted as
+    addressable sources from the /memory UI.
+
+    The source-admit gate now lives in
+    `memory._USER_VISIBLE_SOURCES = {"extracted", "episode", "migration"}`,
+    used by `get_by_id` and `get_by_tag`. `delete_by_id` inherits via
+    its delegation to `get_by_id`. Legacy ""-source rows stay hidden;
+    they are managed via `delete_by_source` / memory_admin.py."""
+
+    # ── get_by_id ──────────────────────────────────────────────────
+
+    def test_get_by_id_returns_extracted_row(self):
+        """Extracted rows still resolve through get_by_id (regression
+        pin against the source-admit-set expansion). Mirrors the
+        existing `test_happy_path_wraps_result` but sized to the
+        post-#407 contract: an extracted row is one of three admitted
+        sources, not the only one."""
+        import kai.memory as mem_mod
+        from kai.memory import get_by_id
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "abc",
+            "memory": "user prefers tea",
+            "user_id": "123",
+            "metadata": {"source": "extracted", "type": "preference"},
+            "created_at": "2026-04-29T10:00:00Z",
+        }
+        mem_mod._memory = mock_mem
+
+        result = get_by_id(user_id="123", memory_id="abc")
+        assert result is not None
+        assert result.id == "abc"
+        assert result.metadata.get("source") == "extracted"
+
+    def test_get_by_id_returns_episode_row(self):
+        """Episode rows (#385/#387) are now addressable from /memory
+        so the fact-view can render Sophia-style fields. Pre-#407
+        the same input returned None and the screen rendered "This
+        memory no longer exists." for a row the operator could see
+        in retrieval-time prompt injection."""
+        import kai.memory as mem_mod
+        from kai.memory import get_by_id
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "ep-1",
+            "memory": "Set up cron",
+            "user_id": "123",
+            "metadata": {"source": "episode", "outcome_quality": "good"},
+            "created_at": "2026-04-28T15:00:00Z",
+        }
+        mem_mod._memory = mock_mem
+
+        result = get_by_id(user_id="123", memory_id="ep-1")
+        assert result is not None
+        assert result.id == "ep-1"
+        assert result.metadata.get("source") == "episode"
+
+    def test_get_by_id_returns_migration_row(self):
+        """Migration rows (#406/#408) are also addressable so the
+        fact-view's `Imported` shape can render. Same regression
+        rationale as the episode case."""
+        import kai.memory as mem_mod
+        from kai.memory import get_by_id
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "mig-1",
+            "memory": "### /backend\nRole-based assignment",
+            "user_id": "123",
+            "metadata": {"source": "migration", "tags": ["migration"]},
+            "created_at": "2026-04-29T16:30:00Z",
+        }
+        mem_mod._memory = mock_mem
+
+        result = get_by_id(user_id="123", memory_id="mig-1")
+        assert result is not None
+        assert result.id == "mig-1"
+        assert result.metadata.get("source") == "migration"
+
+    def test_get_by_id_rejects_legacy_source(self):
+        """Legacy ""-source rows stay invisible to /memory after #407.
+        The admit list is intentionally enumerated rather than
+        "everything except legacy"; a value not in the set returns
+        None just like the pre-#407 non-extracted branch did."""
+        import kai.memory as mem_mod
+        from kai.memory import get_by_id
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "legacy-1",
+            "memory": "ancient row",
+            "user_id": "123",
+            "metadata": {"source": ""},
+        }
+        mem_mod._memory = mock_mem
+
+        assert get_by_id(user_id="123", memory_id="legacy-1") is None
+
+    # ── get_by_tag ─────────────────────────────────────────────────
+
+    def test_get_by_tag_includes_all_user_visible_sources(self):
+        """A tap on an enum tag returns rows of every user-visible
+        source that carries the tag in metadata. The dashboard's
+        `_TAG_ENUM` button gate is unchanged (the tag must be enum
+        for a button to render in the first place); this test
+        exercises the post-tap fetch only.
+
+        Note: in production, episode rows usually carry Sophia tags
+        and migration rows usually carry H3-slug tags - neither in
+        `_TAG_ENUM`. Cross-source overlap on enum tags is rare; it
+        is exercised here so the contract is regression-pinned for
+        the rare case."""
+        import kai.memory as mem_mod
+        from kai.memory import get_by_tag
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {
+            "results": [
+                {
+                    "id": "1",
+                    "memory": "Prefers Celsius",
+                    "score": 0.0,
+                    "metadata": {"source": "extracted", "tags": ["preference"]},
+                    "created_at": "2026-04-01T00:00:00",
+                    "updated_at": "2026-04-01T00:00:00",
+                },
+                {
+                    "id": "2",
+                    "memory": "Configured CI to run on PR",
+                    "score": 0.0,
+                    "metadata": {"source": "episode", "tags": ["preference"]},
+                    "created_at": "2026-04-02T00:00:00",
+                    "updated_at": "2026-04-02T00:00:00",
+                },
+                {
+                    "id": "3",
+                    "memory": "### preferences\nNo em dashes",
+                    "score": 0.0,
+                    "metadata": {"source": "migration", "tags": ["preference"]},
+                    "created_at": "2026-04-03T00:00:00",
+                    "updated_at": "2026-04-03T00:00:00",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+
+        results = get_by_tag(user_id="123", tag="preference")
+        # Sort order is updated_at desc; assert membership rather
+        # than ordering so this test stays focused on the source
+        # admit-list expansion.
+        assert {r.id for r in results} == {"1", "2", "3"}
+
+    def test_get_by_tag_excludes_legacy_source(self):
+        """A legacy ""-source row that happens to carry an enum tag
+        in its metadata is still excluded - the admit list is the
+        gate, not the tag list."""
+        import kai.memory as mem_mod
+        from kai.memory import get_by_tag
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {
+            "results": [
+                {
+                    "id": "legacy",
+                    "memory": "Old preference row",
+                    "score": 0.0,
+                    "metadata": {"source": "", "tags": ["preference"]},
+                    "created_at": "2026-01-01T00:00:00",
+                    "updated_at": "2026-01-01T00:00:00",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+
+        assert get_by_tag(user_id="123", tag="preference") == []
+
+    # ── delete_by_id (via get_by_id delegation) ────────────────────
+
+    def test_delete_by_id_allows_episode_via_delegation(self):
+        """delete_by_id has no source filter of its own; it delegates
+        ownership and source admit to get_by_id. Verifies the chain
+        works end-to-end for episode rows after #407."""
+        import kai.memory as mem_mod
+        from kai.memory import delete_by_id
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "ep-1",
+            "user_id": "123",
+            "metadata": {"source": "episode"},
+        }
+        mem_mod._memory = mock_mem
+
+        assert delete_by_id(user_id="123", memory_id="ep-1") is True
+        mock_mem.delete.assert_called_once_with(memory_id="ep-1")
+
+    def test_delete_by_id_allows_migration_via_delegation(self):
+        """Same delegation contract as the episode case - migration
+        rows also reach the actual Mem0 delete call now."""
+        import kai.memory as mem_mod
+        from kai.memory import delete_by_id
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "mig-1",
+            "user_id": "123",
+            "metadata": {"source": "migration"},
+        }
+        mem_mod._memory = mock_mem
+
+        assert delete_by_id(user_id="123", memory_id="mig-1") is True
+        mock_mem.delete.assert_called_once_with(memory_id="mig-1")
+
+    def test_delete_by_id_rejects_legacy_via_delegation(self):
+        """Legacy ""-source rows still cannot be deleted through
+        /memory - the inherited admit gate refuses them. They remain
+        managed via `delete_by_source` / memory_admin.py."""
+        import kai.memory as mem_mod
+        from kai.memory import delete_by_id
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "legacy-1",
+            "user_id": "123",
+            "metadata": {"source": ""},
+        }
+        mem_mod._memory = mock_mem
+
+        assert delete_by_id(user_id="123", memory_id="legacy-1") is False
+        mock_mem.delete.assert_not_called()
+
+    # ── get_stats per-source counts ───────────────────────────────
+
+    def test_get_stats_episode_count(self):
+        """`MemoryStats.episode_count` is computed over rows with
+        metadata.source == "episode". Counts are independent of
+        extracted_count and confidence aggregates."""
+        import kai.memory as mem_mod
+        from kai.memory import get_stats
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {
+            "results": [
+                {
+                    "id": "1",
+                    "memory": "ep one",
+                    "score": 0.0,
+                    "metadata": {"type": "fact", "source": "episode"},
+                    "created_at": "",
+                },
+                {
+                    "id": "2",
+                    "memory": "ep two",
+                    "score": 0.0,
+                    "metadata": {"type": "fact", "source": "episode"},
+                    "created_at": "",
+                },
+                {
+                    "id": "3",
+                    "memory": "extracted one",
+                    "score": 0.0,
+                    "metadata": {"type": "fact", "source": "extracted"},
+                    "created_at": "",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+
+        stats = get_stats(user_id="123")
+        assert stats.episode_count == 2
+        # extracted_count is independent of episode_count.
+        assert stats.extracted_count == 1
+        assert stats.migration_count == 0
+
+    def test_get_stats_migration_count(self):
+        """`MemoryStats.migration_count` is computed over rows with
+        metadata.source == "migration". Same independence contract
+        as episode_count."""
+        import kai.memory as mem_mod
+        from kai.memory import get_stats
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {
+            "results": [
+                {
+                    "id": "1",
+                    "memory": "mig one",
+                    "score": 0.0,
+                    "metadata": {"type": "fact", "source": "migration"},
+                    "created_at": "",
+                },
+                {
+                    "id": "2",
+                    "memory": "mig two",
+                    "score": 0.0,
+                    "metadata": {"type": "fact", "source": "migration"},
+                    "created_at": "",
+                },
+                {
+                    "id": "3",
+                    "memory": "mig three",
+                    "score": 0.0,
+                    "metadata": {"type": "fact", "source": "migration"},
+                    "created_at": "",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+
+        stats = get_stats(user_id="123")
+        assert stats.migration_count == 3
+        assert stats.extracted_count == 0
+        assert stats.episode_count == 0
+
+    def test_get_stats_confidence_stays_extracted_only(self):
+        """Confidence aggregates compute over extracted-source rows
+        only, regardless of whether non-extracted rows happen to
+        carry the field. Episode rows do not carry confidence in
+        production today; this test pins the principle (rather than
+        the current data shape) so a future schema where episodes
+        gain a confidence field cannot quietly contaminate the
+        confidence histogram."""
+        import kai.memory as mem_mod
+        from kai.memory import get_stats
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {
+            "results": [
+                # Extracted with high confidence - the only row that
+                # should contribute to the confidence aggregates.
+                {
+                    "id": "1",
+                    "memory": "fact",
+                    "score": 0.0,
+                    "metadata": {
+                        "type": "fact",
+                        "source": "extracted",
+                        "confidence": 0.9,
+                        "tags": ["fact"],
+                    },
+                    "created_at": "",
+                },
+                # Synthetic episode row carrying a low confidence
+                # value. Must NOT pull min/median/max down.
+                {
+                    "id": "2",
+                    "memory": "ep",
+                    "score": 0.0,
+                    "metadata": {
+                        "type": "fact",
+                        "source": "episode",
+                        "confidence": 0.1,
+                    },
+                    "created_at": "",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+
+        stats = get_stats(user_id="123")
+        # Only the extracted row's 0.9 contributes; the episode's 0.1
+        # is excluded so min == max == 0.9.
+        assert stats.confidence_min == 0.9
+        assert stats.confidence_max == 0.9
+        assert stats.confidence_median == 0.9
+
+
 # ── Integration tests (real Mem0 + Qdrant, slower) ──────────────────
 
 

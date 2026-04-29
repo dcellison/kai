@@ -148,6 +148,25 @@ _SOURCE_SHORT: dict[str, str] = {
 _DELETE_PAGE_SIZE = 10_000
 
 
+# Sources that the /memory Telegram UI surfaces as user-visible rows.
+# Used by `get_by_id` and `get_by_tag` (and via delegation, `delete_by_id`)
+# to gate addressability from the operator-facing surface. Three reasons
+# the set is intentional rather than "everything except legacy":
+#   - extracted: Track 2 Haiku-derived facts; the original target of the
+#     /memory dashboard.
+#   - episode:   per-conversation episode summaries (issue #385/#387).
+#     Tagged distinctly so the fact-view can render Sophia-style fields
+#     instead of empty extractor placeholders.
+#   - migration: operator-curated MEMORY.md content imported via #408.
+#     Fact-view header reads "Imported" so operators can distinguish at
+#     a glance from extracted facts whose freshness implications differ.
+# Legacy ""-source rows (from pre-spec ingestion paths or any future-
+# additional source not in this set) stay hidden in the UI; they are
+# managed via memory_admin.py / `delete_by_source`. A frozenset is used
+# so the constant cannot be mutated by importing callers.
+_USER_VISIBLE_SOURCES: frozenset[str] = frozenset({"extracted", "episode", "migration"})
+
+
 @dataclass(frozen=True)
 class MemoryResult:
     """A single memory from search or retrieval."""
@@ -186,6 +205,16 @@ class MemoryStats:
     sentinel (None for min/median/max, 0 for counts, empty dict for the
     grouped fields) so a caller that constructs `MemoryStats(total_count=0,
     by_type={})` (the legacy two-arg form) still produces a valid value.
+
+    `episode_count` and `migration_count` are parallel per-source counts,
+    added so the /memory dashboard and stats screens can surface
+    user-visible non-extracted sources alongside the extracted total.
+    Their sum with `extracted_count` may be less than `total_count`
+    because legacy ""-source rows still contribute to the total but are
+    not enumerated as a separate per-source field. Confidence aggregates
+    and `by_tag` stay scoped to extracted (see comments below) because
+    episode and migration rows do not carry confidence and use tag
+    spaces that are not enumerated by `_TAG_ENUM` in memory_command.py.
     """
 
     total_count: int
@@ -198,6 +227,12 @@ class MemoryStats:
     # because picking 0.0 would be misleading (it is a valid score
     # value, not "no data"). Counts default to 0 / empty dict.
     extracted_count: int = 0
+    # Parallel per-source counts (issue #407). Defaulted to zero so the
+    # legacy two-arg `MemoryStats(total_count=0, by_type={})`
+    # construction in tests stays source-compatible. Episode rows come
+    # from issue #385/#387; migration rows come from issue #406/#408.
+    episode_count: int = 0
+    migration_count: int = 0
     by_tag: dict[str, int] = field(default_factory=dict)
     confidence_min: float | None = None
     confidence_median: float | None = None
@@ -1063,19 +1098,21 @@ def get_all(*, user_id: str, limit: int | None = 1000) -> list[MemoryResult]:
 
 
 def get_by_tag(*, user_id: str, tag: str) -> list[MemoryResult]:
-    """Return all extracted facts for `user_id` carrying `tag`.
+    """Return user-visible facts for `user_id` carrying `tag`.
 
     Used by the /memory tag drill-down (spec 310 §6.2). Filters
     client-side because Mem0's `get_all` does not accept metadata
     filters. Two filter clauses, both load-bearing:
 
-      - `metadata.source == "extracted"`: defends against rows from
-        any other (legacy or future-additional) source leaking into
-        the extracted-only UI. With spec 360 landed, the only writer
-        is Track 2 extraction so the clause is largely a no-op in
-        production stores; keeping it means the UI contract does not
-        need re-reasoning the next time a second source is introduced.
-        Spec 310 §7.2.
+      - `metadata.source in _USER_VISIBLE_SOURCES`: defends against
+        legacy ""-source (or any future-additional non-UI) rows
+        leaking into the operator-facing surface. Issue #407 expanded
+        this from `== "extracted"` to the three-source set so episode
+        and migration rows that happen to carry an enum tag in their
+        own metadata become browsable from the dashboard's tag
+        buttons. The dashboard's `_TAG_ENUM` gate still limits which
+        tags get rendered as buttons; this filter only governs which
+        rows match a tapped tag.
       - `tag in metadata.tags`: the actual tag match. The `or []`
         guards against a malformed row that lacks the tags list
         entirely; such rows simply do not match any tag.
@@ -1093,7 +1130,9 @@ def get_by_tag(*, user_id: str, tag: str) -> list[MemoryResult]:
         return []
 
     rows = get_all(user_id=user_id, limit=None)
-    matches = [r for r in rows if r.metadata.get("source") == "extracted" and tag in (r.metadata.get("tags") or [])]
+    matches = [
+        r for r in rows if r.metadata.get("source") in _USER_VISIBLE_SOURCES and tag in (r.metadata.get("tags") or [])
+    ]
     # Newest-updated first; created_at is the fallback for rows whose
     # payload predates updated_at being recorded. String comparison on
     # ISO-8601 timestamps is correct because the format is
@@ -1103,7 +1142,7 @@ def get_by_tag(*, user_id: str, tag: str) -> list[MemoryResult]:
 
 
 def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
-    """Fetch a single extracted memory by id, scoped to user.
+    """Fetch a single user-visible memory by id, scoped to user.
 
     Used by the /memory fact view and forget-fact confirmation
     (spec 310 §6.3, §6.4). Replaces the old pattern of pulling
@@ -1115,9 +1154,15 @@ def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
       - Mem0's `get` does NOT scope by user_id, so we verify it
         manually. With multi-user installs the cost of a missed
         check is reading another user's memory.
-      - Track 1 / legacy rows are out of scope for /memory UI
+      - Legacy ""-source rows are out of scope for /memory UI
         surfaces; they belong to memory_admin.py. Hide them here
-        rather than letting the dashboard expose them.
+        rather than letting the dashboard expose them. The accepted
+        sources are those in `_USER_VISIBLE_SOURCES` (extracted,
+        episode, migration). Issue #407 expanded the set from
+        extracted-only so episode (#385/#387) and migration (#406/
+        #408) rows are addressable from the operator-facing surface;
+        `delete_by_id` inherits the broader admit list via its
+        delegation to this function.
 
     Returns None for not-found, ownership mismatch, source mismatch,
     or a Mem0 fetch failure. The fact-view caller treats all four
@@ -1151,9 +1196,12 @@ def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
             user_id,
         )
         return None
-    if (row.get("metadata") or {}).get("source") != "extracted":
-        # Non-extracted rows are deliberately invisible to /memory.
-        # No log: this is a routine filter, not an anomaly.
+    if (row.get("metadata") or {}).get("source") not in _USER_VISIBLE_SOURCES:
+        # Legacy ""-source (or any future-additional non-UI source) is
+        # deliberately invisible to /memory. The user-visible set
+        # (extracted, episode, migration) is enumerated in
+        # `_USER_VISIBLE_SOURCES`. No log: this is a routine filter,
+        # not an anomaly.
         return None
 
     return _wrap_result(row)
@@ -1253,6 +1301,14 @@ def get_stats(*, user_id: str) -> MemoryStats:
     # downstream metric reads from it.
     extracted = [m for m in memories if m.metadata.get("source") == "extracted"]
 
+    # Per-source counts (issue #407). Computed in one walk alongside
+    # the extracted list so the aggregation stays O(n) rather than
+    # O(n) per source. Confidence aggregates and `by_tag` stay scoped
+    # to extracted (see `MemoryStats` docstring); these counts are the
+    # only new aggregation work needed here.
+    episode_count = sum(1 for m in memories if m.metadata.get("source") == "episode")
+    migration_count = sum(1 for m in memories if m.metadata.get("source") == "migration")
+
     by_tag: dict[str, int] = {}
     by_prompt_version: dict[str, int] = {}
     confidences: list[float] = []
@@ -1322,6 +1378,8 @@ def get_stats(*, user_id: str) -> MemoryStats:
         total_count=len(memories),
         by_type=by_type,
         extracted_count=len(extracted),
+        episode_count=episode_count,
+        migration_count=migration_count,
         by_tag=by_tag,
         confidence_min=confidence_min,
         confidence_median=confidence_median,

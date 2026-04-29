@@ -310,30 +310,38 @@ def _format_date(iso_str: str, with_time: bool = False) -> str:
 def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | None]:
     """Render the dashboard text and keyboard from a MemoryStats.
 
-    The dashboard restricts itself to extracted-only counts (spec
-    §6.1). Tags with zero facts are hidden from the keyboard but
-    appear in `/memory stats` - see spec §6.1 final paragraph for
-    the asymmetry rationale.
+    The dashboard surfaces three user-visible source counts (extracted
+    facts, episode summaries, migration imports) and a per-tag button
+    grid. Tags with zero facts are hidden from the keyboard but appear
+    in `/memory stats` (see spec §6.1 for the asymmetry rationale);
+    `by_tag` is extracted-only by design (see MemoryStats docstring),
+    so an episode-only or migration-only operator legitimately renders
+    with zero tag buttons - the source-count headline is their signal
+    that the dashboard is alive.
 
-    Empty state: when `extracted_count` is zero, returns the empty
-    body text from `_MSG_NO_FACTS` and a `None` keyboard so the
-    caller skips inline buttons entirely.
+    Empty state: only when ALL three user-visible source counts are
+    zero. Issue #407 dropped the older "extracted == 0 OR no nonzero
+    enum tags" guard pair: an operator with episode or migration rows
+    but no extracted facts has user-visible memory worth showing.
     """
-    if stats.extracted_count == 0:
+    # Combined empty-state guard (issue #407). Replaces the prior
+    # extracted-only and `not nonzero` guards. When any user-visible
+    # source has rows, fall through to render the dashboard - even
+    # if `nonzero` ends up empty (all rows non-extracted, or extracted
+    # rows with off-enum tags), the source-count headline still
+    # communicates that memory is alive.
+    if stats.extracted_count == 0 and stats.episode_count == 0 and stats.migration_count == 0:
         return _MSG_NO_FACTS, None
 
     # Tags with at least one fact, sorted descending by count. Spec
     # §6.1 mock-up shows this ordering. Ties broken by enum order
     # (the iteration order of `_TAG_ENUM`) so output is deterministic.
+    # `by_tag` is extracted-only (MemoryStats); episode/migration rows
+    # are intentionally not represented here. The rare edge case where
+    # extracted_count > 0 but every extracted row carries off-enum
+    # tags renders as zero buttons + the search/stats footer below.
     nonzero = [(tag, stats.by_tag.get(tag, 0)) for tag in _TAG_ENUM if stats.by_tag.get(tag, 0) > 0]
     nonzero.sort(key=lambda item: (-item[1], _TAG_ENUM.index(item[0])))
-
-    if not nonzero:
-        # extracted_count > 0 but no row matched a known tag. This
-        # would only happen if a row's metadata.tags is empty or
-        # contains an off-enum value - possible if the schema is
-        # bypassed. Surface as empty rather than crashing.
-        return _MSG_NO_FACTS, None
 
     # Per-tag counts are carried by the inline buttons below
     # (`tag (count)` labels), so the dashboard text intentionally
@@ -343,19 +351,45 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
     # operator feedback on real data showed the bars duplicated what
     # the buttons already telegraph through the parenthesized counts.
     lines: list[str] = []
-    summary = f"Memories: {stats.extracted_count} facts across {len(nonzero)} tags."
+    # Headline assembled from non-zero per-source counts so a fresh
+    # extracted-only operator still sees the original "Memories: <N>
+    # facts across <M> tags" wording (issue #407 backwards-compat),
+    # while a mixed-source operator gets distinct visibility into
+    # each source. Zero-valued sources are omitted from the comma list
+    # rather than rendered as "0 episodes" - readability over
+    # uniformity, since most operators have non-zero in only one or
+    # two of the three.
+    parts: list[str] = []
+    if stats.extracted_count:
+        parts.append(f"{stats.extracted_count} facts")
+    if stats.episode_count:
+        parts.append(f"{stats.episode_count} episodes")
+    if stats.migration_count:
+        parts.append(f"{stats.migration_count} imported")
+    summary = "Memories: " + ", ".join(parts) + f" across {len(nonzero)} tags."
     lines.append(summary)
     lines.append("")
-    # Footer line: median + min confidence. Spec §6.1 calls this the
-    # "first-glance tuning signal." Median is the persisted value;
-    # the spec mock-up labels it "avg" but median is more honest about
-    # what is shown.
+    # Footer line: three branches keep the action prompt accurate to
+    # what the keyboard actually offers (issue #407).
+    #   - With tag buttons + confidence data: pin median/min as the
+    #     "first-glance tuning signal" (spec §6.1). Median is the
+    #     persisted value; the spec mock-up labels it "avg" but median
+    #     is more honest about what is shown.
+    #   - With tag buttons but no confidence (extracted rows whose
+    #     metadata lost confidence values): the original "Tap a tag"
+    #     prompt without the confidence suffix.
+    #   - Without tag buttons (episode-only / migration-only operator,
+    #     or extracted rows whose tags are all off-enum): point at the
+    #     Search/Stats button row that always renders, since "Tap a
+    #     tag to browse" would be a lie when no tag buttons exist.
     median = stats.confidence_median
     minv = stats.confidence_min
-    if median is not None and minv is not None:
+    if nonzero and median is not None and minv is not None:
         lines.append(f"Tap a tag to browse. Confidence: median {median:.2f}, min {minv:.2f}.")
-    else:
+    elif nonzero:
         lines.append("Tap a tag to browse.")
+    else:
+        lines.append("Use Search to find specific memories, or tap Stats for details.")
 
     text = "\n".join(lines)
 
@@ -473,42 +507,103 @@ def _build_fact_view(
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Render the fact detail screen (spec §6.3).
 
+    Three render shapes (issue #407), branched on `metadata.source`:
+      - extracted: `Fact` header + the existing six-row block (Tags,
+        Confidence, Date, Session, Prompt version, Confirmation).
+        Unchanged from the pre-#407 surface.
+      - episode:   `Episode (<outcome_quality>)` header (or `Episode`
+        when outcome_quality metadata is absent) + Tags + Date.
+        Confidence/Session/Prompt version/Confirmation are omitted
+        because episode rows do not carry those extractor-only fields;
+        rendering them as placeholders ("----" / "(none)" / "n/a")
+        would imply the data exists and is missing rather than
+        not-applicable.
+      - migration: `Imported` header + Tags + Date. Header chosen to
+        distinguish operator-curated MEMORY.md content from
+        Haiku-extracted facts at a glance, even though both render
+        with the same `_SOURCE_SHORT="fact"` in retrieval-time prompt
+        injection (see memory.py); the fact-view is operator-facing
+        and benefits from the visual distinction.
+
     `return_to` encodes where the back button should land. It can be
     None for callers (e.g., tests) that don't care; in that case the
-    back button defaults to the dashboard.
+    back button defaults to the dashboard. The keyboard is the same
+    (back / forget) across all three sources.
     """
     md = fact.metadata or {}
     tags = md.get("tags") or []
-    confidence = md.get("confidence")
-    session_id = md.get("session_id") or ""
-    prompt_version = md.get("prompt_version") or ""
-    confirmation = md.get("confirmation_quote") or ""
+    source = md.get("source", "")
 
-    if isinstance(confidence, (int, float)):
-        conf_str = f"{float(confidence):.2f}"
+    # Tags row is shared across all three source shapes; assembling
+    # once avoids duplication in the per-source branches below.
+    tags_line = f"Tags:  {', '.join(tags) if tags else '(none)'}"
+
+    if source == "episode":
+        # Episode rows surface the Sophia outcome_quality field as
+        # a header parenthetical when present (e.g., "Episode (good)")
+        # so the operator can tell at a glance how the conversation
+        # resolved. Date renders with HH:MM precision so episodes
+        # from the same day are distinguishable.
+        quality = md.get("outcome_quality") or ""
+        header = f"Episode ({quality})" if quality else "Episode"
+        lines = [
+            header,
+            "",
+            f'"{fact.text}"',
+            "",
+            tags_line,
+            f"Date:  {_format_date(fact.created_at, with_time=True)}",
+        ]
+    elif source == "migration":
+        # Migration rows already include the H3 title and section
+        # structure inside `fact.text` (the migration script writes
+        # the chunk as `### <title>\n<body>` per #408), so no
+        # additional section rendering is needed here. The header
+        # diverges from the prompt-side `_SOURCE_SHORT="fact"` on
+        # purpose - see docstring.
+        lines = [
+            "Imported",
+            "",
+            f'"{fact.text}"',
+            "",
+            tags_line,
+            f"Date:  {_format_date(fact.created_at, with_time=True)}",
+        ]
     else:
-        conf_str = "----"
+        # Extracted (or any defensive fallback for an unknown source
+        # that managed to reach this view). Renders the original
+        # six-row block unchanged so existing screenshots / muscle
+        # memory stay valid.
+        confidence = md.get("confidence")
+        session_id = md.get("session_id") or ""
+        prompt_version = md.get("prompt_version") or ""
+        confirmation = md.get("confirmation_quote") or ""
 
-    # Confirmation row: verbatim quote on confirmed_action facts,
-    # literal "n/a" elsewhere. The schema invariant ("confirmation
-    # _quote present iff tags includes confirmed_action", spec §4)
-    # is asserted at extraction time, so we can render confidently
-    # without re-validating.
-    confirmation_line = confirmation if confirmation else "n/a"
+        if isinstance(confidence, (int, float)):
+            conf_str = f"{float(confidence):.2f}"
+        else:
+            conf_str = "----"
 
-    lines = [
-        "Fact",
-        "",
-        f'"{fact.text}"',
-        "",
-        f"Tags:             {', '.join(tags) if tags else '(none)'}",
-        f"Confidence:       {conf_str}",
-        f"Date:             {_format_date(fact.created_at, with_time=True)}",
-        f"Session:          {session_id or '(none)'}",
-        f"Prompt version:   {prompt_version or '(none)'}",
-        "",
-        f"Confirmation:     {confirmation_line}",
-    ]
+        # Confirmation row: verbatim quote on confirmed_action facts,
+        # literal "n/a" elsewhere. The schema invariant ("confirmation
+        # _quote present iff tags includes confirmed_action", spec §4)
+        # is asserted at extraction time, so we can render confidently
+        # without re-validating.
+        confirmation_line = confirmation if confirmation else "n/a"
+
+        lines = [
+            "Fact",
+            "",
+            f'"{fact.text}"',
+            "",
+            f"Tags:             {', '.join(tags) if tags else '(none)'}",
+            f"Confidence:       {conf_str}",
+            f"Date:             {_format_date(fact.created_at, with_time=True)}",
+            f"Session:          {session_id or '(none)'}",
+            f"Prompt version:   {prompt_version or '(none)'}",
+            "",
+            f"Confirmation:     {confirmation_line}",
+        ]
     text = "\n".join(lines)
 
     back_callback = _encode_callback(return_to[0], *return_to[1]) if return_to is not None else _encode_callback("dash")
@@ -527,8 +622,22 @@ def _build_fact_view(
 
 
 def _build_forget_fact_confirm(fact: MemoryResult) -> tuple[str, InlineKeyboardMarkup]:
-    """Render the single-fact forget confirmation."""
-    text = f'Forget this fact?\n\n"{fact.text}"\n\nThis cannot be undone.'
+    """Render the single-fact forget confirmation.
+
+    Issue #407 expanded the noun in the prompt text per source so the
+    operator sees what is being forgotten (`fact` for extracted,
+    `episode` for episode summaries, `imported memory` for migration
+    rows). The verb (`Forget`), the warning sentence (`This cannot
+    be undone.`), and the inline-button flow (`confirm forget` /
+    `cancel`) are all preserved unchanged. Falls back to the generic
+    label `memory` for an unknown source value (defensive: should be
+    unreachable since `get_by_id` already gates on
+    `_USER_VISIBLE_SOURCES`, but a stale cache during a deploy
+    transition could in principle slip a different source through).
+    """
+    source = (fact.metadata or {}).get("source", "")
+    label = {"extracted": "fact", "episode": "episode", "migration": "imported memory"}.get(source, "memory")
+    text = f'Forget this {label}?\n\n"{fact.text}"\n\nThis cannot be undone.'
     kb = InlineKeyboardMarkup(
         [
             [
@@ -588,88 +697,119 @@ def _build_search_results(
 def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
     """Render the read-only stats dashboard.
 
-    All aggregates are extracted-only by construction (memory.py
-    extends MemoryStats with that scoping). The tag list shows every
-    enum value, including zero-count tags - that is the asymmetry
-    documented in spec §6.1 (dashboard hides zero-count tags; stats
-    surfaces them as a tuning signal).
+    Issue #407 expanded the headline to surface per-source totals for
+    every user-visible source with non-zero rows (extracted facts,
+    episode summaries, migration imports). The four extracted-shaped
+    sections that follow (by-tag table, confidence block,
+    confirmed-actions line, prompt-version table) are conditional on
+    `extracted_count > 0` because they all read extractor-only
+    metadata; for an episode-only or migration-only operator they
+    would be all-zero noise without informational value. The tag list
+    still shows every enum value (including zero-count tags) when
+    rendered - that asymmetry vs the dashboard is documented in
+    spec §6.1.
     """
-    if stats.extracted_count == 0:
-        # Distinct empty-state text from the dashboard so the user
-        # who navigated to /memory stats specifically knows the call
-        # succeeded but the corpus is empty.
-        text = "Memory stats\n\nNo extracted facts yet."
+    # Combined empty-state guard (issue #407): only when every
+    # user-visible source is empty does the corpus count as "no
+    # memories yet." The wording was updated from the original
+    # "No extracted facts yet" because the original would lie about
+    # the empty-state's scope when the post-#407 surface knows about
+    # episode and migration rows too.
+    if stats.extracted_count == 0 and stats.episode_count == 0 and stats.migration_count == 0:
+        text = "Memory stats\n\nNo facts, episodes, or imported memory yet."
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("back", callback_data=_encode_callback("dash"))]])
         return text, kb
 
-    lines = ["Memory stats", "", f"Total:            {stats.extracted_count} facts", "", "By tag:"]
-    # Pad tag column to the longest enum name for alignment.
-    label_width = max(len(t) for t in _TAG_ENUM)
-    for tag in _TAG_ENUM:
-        count = stats.by_tag.get(tag, 0)
-        lines.append(f"  {tag.ljust(label_width)}  {count:>3}")
+    # Headline block: per-source totals, one line per non-zero source.
+    # Padding chosen for alignment with the "By tag:" label column
+    # below (which uses an enum-width pad). Lines for zero-valued
+    # counts are omitted so a fresh extracted-only operator does not
+    # see two empty "Total episodes:" / "Total imported:" rows below
+    # their facts total.
+    lines = ["Memory stats", ""]
+    if stats.extracted_count:
+        lines.append(f"Total facts:      {stats.extracted_count}")
+    if stats.episode_count:
+        lines.append(f"Total episodes:   {stats.episode_count}")
+    if stats.migration_count:
+        lines.append(f"Total imported:   {stats.migration_count}")
 
-    # Confidence block. min/median/max are None when extracted_count
-    # is zero (we returned for that case above), so under current
-    # memory.py semantics they're always populated here. Render "n/a"
-    # rather than 0.00 if the invariant ever breaks: a misleading
-    # 0.00 looks like a real (very low) reading, while "n/a" is
-    # self-describing and makes the bug visible.
-    lines.append("")
-    lines.append("Confidence:")
-    minv = stats.confidence_min
-    medv = stats.confidence_median
-    maxv = stats.confidence_max
-    min_str = f"{minv:.2f}" if minv is not None else "n/a"
-    med_str = f"{medv:.2f}" if medv is not None else "n/a"
-    max_str = f"{maxv:.2f}" if maxv is not None else "n/a"
-    lines.append(f"  min               {min_str}")
-    lines.append(f"  median            {med_str}")
-    lines.append(f"  max               {max_str}")
-    # Below-threshold counts with parenthetical percentages. When
-    # confidence values are missing entirely (min/median/max all
-    # None) the counts are necessarily 0, but rendering them as
-    # "0 (0.0%)" reads as "all facts scored above the threshold"
-    # rather than "no confidence data". Mirror the n/a fallback
-    # above so the row stays honest about the underlying state.
-    has_confidence = minv is not None or medv is not None or maxv is not None
-    if has_confidence:
-        pct_07 = (stats.confidence_below_0_7 / stats.extracted_count) * 100
-        pct_06 = (stats.confidence_below_0_6 / stats.extracted_count) * 100
-        below_07 = f"{stats.confidence_below_0_7:>3}  ({pct_07:.1f}%)"
-        below_06 = f"{stats.confidence_below_0_6:>3}  ({pct_06:.1f}%)"
-    else:
-        below_07 = f"{stats.confidence_below_0_7:>3}  (n/a)"
-        below_06 = f"{stats.confidence_below_0_6:>3}  (n/a)"
-    lines.append(f"  below 0.7         {below_07}")
-    lines.append(f"  below 0.6         {below_06}")
-
-    lines.append("")
-    lines.append(f"Confirmed actions:  {stats.confirmation_quote_count} with confirmation_quote")
-
-    if stats.by_prompt_version:
+    # The four extracted-shaped sections below all read extractor-only
+    # metadata (tags, confidence, confirmation_quote, prompt_version).
+    # For an episode-only or migration-only operator (extracted_count
+    # == 0 but at least one other source > 0), rendering these would
+    # produce an all-zeros tag table and an all-n/a confidence block -
+    # noise without informational value. The headline alone is the
+    # operator's signal in that case.
+    if stats.extracted_count > 0:
         lines.append("")
-        lines.append("Prompt versions:")
-        # Sort by count desc, version asc for ties - deterministic.
-        # The tiebreaker key is wrapped in str() because dict keys
-        # may be mixed-type when a caller constructs MemoryStats
-        # directly (bypassing the aggregation cast in memory.py);
-        # Python 3 raises TypeError on int<->str comparison, so the
-        # cast here must happen before the sort runs - it cannot be
-        # deferred to the formatting step below.
-        sorted_versions = sorted(
-            stats.by_prompt_version.items(),
-            key=lambda item: (-item[1], str(item[0])),
-        )
-        # Aggregation in memory.py already casts prompt_version to
-        # str, but a caller that constructs MemoryStats by a
-        # different path (tests do this directly, and a future admin
-        # endpoint might) bypasses that guarantee. Wrapping len()
-        # and ljust() in str() keeps the renderer resilient on its
-        # own so a stray int key cannot raise TypeError here.
-        version_width = max(len(str(v)) for v, _ in sorted_versions)
-        for version, count in sorted_versions:
-            lines.append(f"  {str(version).ljust(version_width)}  {count:>3}")
+        lines.append("By tag:")
+        # Pad tag column to the longest enum name for alignment.
+        label_width = max(len(t) for t in _TAG_ENUM)
+        for tag in _TAG_ENUM:
+            count = stats.by_tag.get(tag, 0)
+            lines.append(f"  {tag.ljust(label_width)}  {count:>3}")
+
+        # Confidence block. min/median/max are None when no extracted
+        # row carried a confidence value (an extracted_count > 0 corpus
+        # whose rows were all written without the field; rare but
+        # possible on legacy data). Render "n/a" rather than 0.00 so
+        # the row stays honest about the underlying state.
+        lines.append("")
+        lines.append("Confidence:")
+        minv = stats.confidence_min
+        medv = stats.confidence_median
+        maxv = stats.confidence_max
+        min_str = f"{minv:.2f}" if minv is not None else "n/a"
+        med_str = f"{medv:.2f}" if medv is not None else "n/a"
+        max_str = f"{maxv:.2f}" if maxv is not None else "n/a"
+        lines.append(f"  min               {min_str}")
+        lines.append(f"  median            {med_str}")
+        lines.append(f"  max               {max_str}")
+        # Below-threshold counts with parenthetical percentages. When
+        # confidence values are missing entirely (min/median/max all
+        # None) the counts are necessarily 0, but rendering them as
+        # "0 (0.0%)" reads as "all facts scored above the threshold"
+        # rather than "no confidence data". Mirror the n/a fallback
+        # above so the row stays honest about the underlying state.
+        has_confidence = minv is not None or medv is not None or maxv is not None
+        if has_confidence:
+            pct_07 = (stats.confidence_below_0_7 / stats.extracted_count) * 100
+            pct_06 = (stats.confidence_below_0_6 / stats.extracted_count) * 100
+            below_07 = f"{stats.confidence_below_0_7:>3}  ({pct_07:.1f}%)"
+            below_06 = f"{stats.confidence_below_0_6:>3}  ({pct_06:.1f}%)"
+        else:
+            below_07 = f"{stats.confidence_below_0_7:>3}  (n/a)"
+            below_06 = f"{stats.confidence_below_0_6:>3}  (n/a)"
+        lines.append(f"  below 0.7         {below_07}")
+        lines.append(f"  below 0.6         {below_06}")
+
+        lines.append("")
+        lines.append(f"Confirmed actions:  {stats.confirmation_quote_count} with confirmation_quote")
+
+        if stats.by_prompt_version:
+            lines.append("")
+            lines.append("Prompt versions:")
+            # Sort by count desc, version asc for ties - deterministic.
+            # The tiebreaker key is wrapped in str() because dict keys
+            # may be mixed-type when a caller constructs MemoryStats
+            # directly (bypassing the aggregation cast in memory.py);
+            # Python 3 raises TypeError on int<->str comparison, so the
+            # cast here must happen before the sort runs - it cannot be
+            # deferred to the formatting step below.
+            sorted_versions = sorted(
+                stats.by_prompt_version.items(),
+                key=lambda item: (-item[1], str(item[0])),
+            )
+            # Aggregation in memory.py already casts prompt_version to
+            # str, but a caller that constructs MemoryStats by a
+            # different path (tests do this directly, and a future admin
+            # endpoint might) bypasses that guarantee. Wrapping len()
+            # and ljust() in str() keeps the renderer resilient on its
+            # own so a stray int key cannot raise TypeError here.
+            version_width = max(len(str(v)) for v, _ in sorted_versions)
+            for version, count in sorted_versions:
+                lines.append(f"  {str(version).ljust(version_width)}  {count:>3}")
 
     text = "\n".join(lines)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("back", callback_data=_encode_callback("dash"))]])
