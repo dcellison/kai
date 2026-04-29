@@ -7,6 +7,7 @@ and the ApiContext/AgentResponse/StreamEvent data types. These functions are pur
 (no subprocess management), so tests are straightforward.
 """
 
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
@@ -990,8 +991,6 @@ class TestEnsureUserPreferences:
 
     def test_oserror_swallowed(self, tmp_path, monkeypatch, caplog):
         """OSError raised inside the body is swallowed via log.warning, not propagated."""
-        import logging
-
         data_dir = tmp_path / "data"
         project_root = tmp_path / "project"
         (project_root / "home" / ".claude").mkdir(parents=True)
