@@ -20,11 +20,20 @@ Architectural shape:
   reaper task. Losing the cache on process restart is acceptable
   (spec 310 §7.4); the user just retypes `/memory`.
 
-The `source == "extracted"` filter is applied by the underlying
-`memory.get_by_tag` / `memory.delete_by_id` helpers (memory.py
-§7.2). This module never references `metadata.source` directly so
-that a future change to the source-filter rule lives in exactly one
-place.
+Source filtering uses `memory._USER_VISIBLE_SOURCES` (the frozenset
+of `extracted`, `episode`, `migration`). The data-layer gate is
+canonical: `memory.get_by_id` and `memory.get_by_tag` admit only
+those sources, and `memory.delete_by_id` inherits the gate via its
+delegation. The one UI-side reference is `_send_search`'s
+post-filter, which exists because `memory.search` is a Mem0 vector
+lookup that spans every source, including legacy `""`-source rows
+that must not surface in the operator-facing UI. Both sites read
+`_USER_VISIBLE_SOURCES` from `memory.py` so a future change to the
+admit list lives in one place. `memory.get_all_episodes` is the one
+narrower-than-`_USER_VISIBLE_SOURCES` filter, scoped to the literal
+`"episode"` source for the dashboard's episode-list browser; it does
+not participate in the shared admit list because its purpose is
+single-source enumeration, not multi-source admission.
 
 See `home/specs/310-memory-command.md` for the canonical UX flows
 and design rationale.
@@ -257,7 +266,7 @@ _MSG_NO_SEARCH_RESULTS = "No matching memories found."
 # is invisible in Telegram's alert modal anyway since the modal
 # doesn't render with a monospace font.
 _HELP_TEXT = (
-    "/memory - Browse by tag\n"
+    "/memory - Browse memories\n"
     "/memory search <q> - Semantic search\n"
     "/memory stats - Counts and confidence distribution\n"
     "/memory forget <tag> - Delete all memories with a tag\n"
@@ -396,23 +405,43 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
         lines.append(f"Tap a tag to browse. Confidence: median {median:.2f}, min {minv:.2f}.")
     elif nonzero:
         lines.append("Tap a tag to browse.")
+    elif stats.episode_count > 0:
+        # No tag buttons render but the Episodes button does. Footer
+        # names every utility-row affordance the operator can tap.
+        # Without this branch the footer would lie by enumerating only
+        # Search and Stats while the keyboard also rendered Episodes
+        # (issue #410 D6).
+        lines.append("Tap Episodes to browse, Search to find specific memories, or Stats for details.")
     else:
+        # No tag buttons AND no Episodes button. Utility row is just
+        # [Search, Stats]; pre-#410 wording is accurate for this case.
         lines.append("Use Search to find specific memories, or tap Stats for details.")
 
     text = "\n".join(lines)
 
     # Keyboard: one row per tag (preserves ordering, lets a busy
-    # dashboard scroll). A short trailing row holds Search and Stats.
+    # dashboard scroll). A short trailing utility row holds the
+    # cross-corpus actions: an optional Episodes button (issue #410,
+    # only when episode_count > 0), then Search and Stats.
     rows: list[list[InlineKeyboardButton]] = []
     for tag, count in nonzero:
         label = f"{tag} ({count})"
         rows.append([InlineKeyboardButton(label, callback_data=_encode_callback("tag", tag, "0"))])
-    rows.append(
-        [
-            InlineKeyboardButton("Search", callback_data=_encode_callback("help")),
-            InlineKeyboardButton("Stats", callback_data=_encode_callback("stats")),
-        ]
-    )
+    utility_row: list[InlineKeyboardButton] = []
+    if stats.episode_count > 0:
+        # Episodes button only renders when there is content to browse,
+        # mirroring the dashboard's existing zero-count tag suppression.
+        # The "0" arg is the initial page index; `eps:<page>` matches
+        # the `tag:<tag>:<page>` callback shape.
+        utility_row.append(
+            InlineKeyboardButton(
+                f"Episodes ({stats.episode_count})",
+                callback_data=_encode_callback("eps", "0"),
+            )
+        )
+    utility_row.append(InlineKeyboardButton("Search", callback_data=_encode_callback("help")))
+    utility_row.append(InlineKeyboardButton("Stats", callback_data=_encode_callback("stats")))
+    rows.append(utility_row)
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -501,6 +530,104 @@ def _build_tag_view(
             InlineKeyboardButton(
                 "next >",
                 callback_data=_encode_callback("tag", tag, str(clamped + 1)),
+            )
+        )
+    return text, InlineKeyboardMarkup([number_row, nav_row]), memory_ids, clamped, total
+
+
+# ── Builder: episode list view (issue #410) ────────────────────────
+
+
+# The closed enum of `outcome_quality` values written by the
+# memory_extraction.py episode classifier. Episodes whose metadata
+# contains an off-enum string still render via the `[----]` fallback;
+# the strict check defends against a schema drift where a value like
+# `"good"` or `"unknown"` could leak in and look like a real category.
+# Mirrored here (rather than imported) for the same reason as
+# `_TAG_ENUM`: importing memory_extraction would pull in the Anthropic
+# SDK on the UI path. A drift between the two lists shows up
+# immediately in the episode list view (every row would render as
+# `[----]`).
+_OUTCOME_QUALITY_ENUM: tuple[str, ...] = ("success", "partial", "failure")
+
+
+def _build_episode_list_view(
+    facts: list[MemoryResult],
+    page: int,
+) -> tuple[str, InlineKeyboardMarkup, list[str], int, int]:
+    """Render a paginated episode list (issue #410).
+
+    Returns (text, keyboard, memory_ids, clamped_page, total_pages),
+    parallel in shape to `_build_tag_view`. The memory_ids list backs
+    the screen cache so numbered button taps resolve to memory ids
+    via integer index, keeping callback data well under the 64-byte
+    Telegram ceiling.
+
+    Per-row layout:
+        N.  [<outcome_quality>]  <truncated text>
+                                 <date>
+
+    Bracket text is the literal `outcome_quality` string from
+    metadata when it is one of the enumerated values
+    (`success` / `partial` / `failure`); otherwise `[----]`. Episode
+    rows do not carry confidence; the bracket field is the
+    closest-shaped per-row signal to confidence in the tag view.
+
+    Header reads `"Episodes  (page X of Y)"` with two spaces between
+    the label and the parenthetical, matching the tag view convention.
+    """
+    window, clamped, total = _paginate(facts, page)
+
+    if not window:
+        # Reachable only when an operator with episode_count > 0
+        # deletes their last episode mid-session, since the dashboard
+        # hides the Episodes button at zero. Render a graceful empty
+        # state with a back button rather than an empty-pagination
+        # screen.
+        text = "Episodes\n\nNo episodes yet."
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("back", callback_data=_encode_callback("dash"))]])
+        return text, kb, [], 0, 1
+
+    lines = [f"Episodes  (page {clamped + 1} of {total})", ""]
+    memory_ids: list[str] = []
+    for idx, fact in enumerate(window, start=1):
+        quality = fact.metadata.get("outcome_quality")
+        # Strict enum check (not a truthy-string check). Defends
+        # against schema drift where an off-enum value could leak
+        # in and look like a real category in the UI.
+        if quality in _OUTCOME_QUALITY_ENUM:
+            quality_str = f"[{quality}]"
+        else:
+            quality_str = "[----]"
+        date_str = _format_date(fact.updated_at or fact.created_at)
+        lines.append(f"{idx}.  {quality_str}  {_truncate(fact.text)}")
+        # Indent matches the tag view's date row (the `[0.92]`
+        # bracket is six chars; the longest enum value `[failure]`
+        # is nine chars, so the indent compromise lands at twelve
+        # spaces - same column as the tag view's date row.
+        lines.append(f"            {date_str}")
+        lines.append("")
+        memory_ids.append(fact.id)
+
+    text = "\n".join(lines).rstrip()
+
+    number_row = [
+        InlineKeyboardButton(str(i + 1), callback_data=_encode_callback("fact", str(i))) for i in range(len(window))
+    ]
+    nav_row: list[InlineKeyboardButton] = []
+    if clamped > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                "< prev",
+                callback_data=_encode_callback("eps", str(clamped - 1)),
+            )
+        )
+    nav_row.append(InlineKeyboardButton("back", callback_data=_encode_callback("dash")))
+    if clamped < total - 1:
+        nav_row.append(
+            InlineKeyboardButton(
+                "next >",
+                callback_data=_encode_callback("eps", str(clamped + 1)),
             )
         )
     return text, InlineKeyboardMarkup([number_row, nav_row]), memory_ids, clamped, total
@@ -1020,6 +1147,18 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             await _send_tag_view(update, context, chat_id, tag, page, edit=True)
             await query.answer()
             return
+        if verb == "eps":
+            # Episode list browser (issue #410). Single-arg page
+            # index; no further validation gate (no enum to check
+            # against, unlike tag). Invalid integer falls back to
+            # page 0 so a stale callback never blocks navigation.
+            try:
+                page = int(args[0]) if args else 0
+            except ValueError:
+                page = 0
+            await _send_episode_list(update, context, chat_id, page, edit=True)
+            await query.answer()
+            return
         if verb == "fact":
             cache = _get_cache(chat_id)
             if cache is None or not args:
@@ -1079,7 +1218,8 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             return_to = cache.return_to
             ok = memory.delete_by_id(user_id=str(chat_id), memory_id=memory_id)
             # Return to whatever screen the user was on before the
-            # fact view. Tag view if known; otherwise dashboard.
+            # fact view. Tag view or episode list if known; otherwise
+            # dashboard.
             if return_to is not None and return_to[0] == "tag" and len(return_to[1]) >= 2:
                 tag = return_to[1][0]
                 try:
@@ -1087,6 +1227,14 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
                 except ValueError:
                     page = 0
                 await _send_tag_view(update, context, chat_id, tag, page, edit=True)
+            elif return_to is not None and return_to[0] == "eps" and len(return_to[1]) >= 1:
+                # Issue #410: facts opened from the episode list
+                # return to that list at the same page after delete.
+                try:
+                    page = int(return_to[1][0])
+                except ValueError:
+                    page = 0
+                await _send_episode_list(update, context, chat_id, page, edit=True)
             else:
                 await _send_dashboard(update, context, chat_id, edit=True)
             await query.answer("Forgotten." if ok else "Not found.")
@@ -1177,6 +1325,35 @@ async def _send_tag_view(
     await _send_or_edit(update, text, kb, edit=edit)
 
 
+async def _send_episode_list(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    page: int,
+    edit: bool = False,
+) -> None:
+    """Render and send/edit the episode list at `page` (issue #410).
+
+    Mirrors `_send_tag_view` exactly except for the data source:
+    fetches via `memory.get_all_episodes`, builds via
+    `_build_episode_list_view`, and sets the cache screen to
+    `"episodes"` so a fact opened from this list can route back to
+    the same page via `_send_fact_view`'s return_to logic.
+    """
+    try:
+        episodes = memory.get_all_episodes(user_id=str(chat_id))
+    except Exception as exc:
+        log.exception("get_all_episodes failed: %s", exc)
+        await _send_or_edit(update, _MSG_QUERY_FAILED, None, edit=edit)
+        return
+    text, kb, memory_ids, clamped_page, _total = _build_episode_list_view(episodes, page)
+    _set_cache(
+        chat_id,
+        _ScreenCache(screen="episodes", page=clamped_page, memory_ids=memory_ids),
+    )
+    await _send_or_edit(update, text, kb, edit=edit)
+
+
 async def _send_fact_view(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1196,6 +1373,12 @@ async def _send_fact_view(
     # the user where they started rather than at the root.
     if cache is not None and cache.screen == "tag" and cache.tag is not None:
         return_to = ("tag", [cache.tag, str(cache.page)])
+    elif cache is not None and cache.screen == "episodes":
+        # Issue #410: facts opened from the episode list return to
+        # that list at the same page on back-nav. Page is the only
+        # arg needed (unlike tag, which carries both tag and page);
+        # the eps verb decodes a single-element args list.
+        return_to = ("eps", [str(cache.page)])
     elif cache is not None and cache.screen == "search" and cache.query is not None:
         # Searches re-execute on back-nav. Encoding the full query in
         # callback data would risk the 64-byte limit; for now, back
@@ -1274,16 +1457,20 @@ async def _send_search(
     # Apply the floor in the UI path the same way `format_context`
     # does (spec §7.5: one knob, two paths).
     #
-    # Also enforce the source==extracted scope here. Every other read
-    # path in this module (`get_by_tag`, `get_by_id`) filters at the
-    # data layer, but `memory.search` is a Mem0 vector lookup that
-    # spans all sources (Track 1 exchanges, legacy rows). Without this
-    # post-filter, a search hit could surface a non-extracted row;
-    # tapping it would call `get_by_id`, fail the source check, and
+    # Also enforce the user-visible source admit list here. Every
+    # other read path in this module (`get_by_tag`, `get_by_id`)
+    # filters at the data layer, but `memory.search` is a Mem0 vector
+    # lookup that spans every source, including legacy ""-source rows
+    # that must not surface in the operator-facing UI. Without this
+    # post-filter, a search hit could surface a non-user-visible row;
+    # tapping it would call `get_by_id`, fail the admit check, and
     # render "This memory no longer exists." for a row the user just
     # saw - confusing and wrong. Filtering here keeps the UI honest:
     # what the user sees in results is what they can act on.
-    filtered = [r for r in results if r.score >= floor and r.metadata.get("source") == "extracted"]
+    # `_USER_VISIBLE_SOURCES` (the {extracted, episode, migration}
+    # frozenset) is read from `memory.py` so a future change to the
+    # admit list lives in one place.
+    filtered = [r for r in results if r.score >= floor and r.metadata.get("source") in memory._USER_VISIBLE_SOURCES]
     text, kb, memory_ids = _build_search_results(query, filtered, floor)
     _set_cache(
         chat_id,

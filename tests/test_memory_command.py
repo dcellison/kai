@@ -813,13 +813,16 @@ class TestDashboardMultiSource:
         assert kb is not None
         # Headline shows the episode count.
         assert "4 episodes" in text
-        # Footer text is the no-tag-buttons branch.
-        assert "Use Search to find specific memories, or tap Stats for details." in text
+        # Footer text is the no-tag-buttons-with-Episodes branch
+        # (issue #410 D6): when Episodes button is rendered, footer
+        # names every utility-row affordance.
+        assert "Tap Episodes to browse, Search to find specific memories, or Stats for details." in text
         assert "Tap a tag to browse" not in text
-        # Keyboard has only the footer Search/Stats row (no tag rows).
+        # Keyboard has only the utility row, which now includes the
+        # Episodes button (issue #410) alongside Search and Stats.
         assert len(kb.inline_keyboard) == 1
-        footer = kb.inline_keyboard[-1]
-        assert [btn.text for btn in footer] == ["Search", "Stats"]
+        utility_row = kb.inline_keyboard[-1]
+        assert [btn.text for btn in utility_row] == ["Episodes (4)", "Search", "Stats"]
 
     def test_dashboard_migration_only_user_renders(self):
         """Same shape as the episode-only case: migration_count > 0,
@@ -965,6 +968,268 @@ class TestFactViewMultiSource:
         assert "Session:" in text
         assert "Prompt version:" in text
         assert "Confirmation:" in text
+
+
+class TestDashboardEpisodesButton:
+    """Issue #410: Episodes (N) button on the dashboard utility row.
+
+    Conditional on `stats.episode_count > 0`. The pre-#410 utility
+    row was `[Search, Stats]`; post-#410 it can be either
+    `[Search, Stats]` (no episodes) or `[Episodes (N), Search, Stats]`
+    (episodes exist). Tests pin both shapes plus the per-source
+    footer prose changes that ride alongside."""
+
+    def test_dashboard_renders_episodes_button_when_episode_count_nonzero(self):
+        stats = _stats(extracted_count=10, episode_count=4, by_tag={"preference": 5})
+        _, kb = memory_command._build_dashboard(stats)
+        assert kb is not None
+        utility_row = kb.inline_keyboard[-1]
+        labels = [btn.text for btn in utility_row]
+        assert labels == ["Episodes (4)", "Search", "Stats"]
+        # Callback shape: mem:eps:<page>; initial page is 0.
+        episodes_btn = utility_row[0]
+        assert episodes_btn.callback_data == "mem:eps:0"
+
+    def test_dashboard_omits_episodes_button_when_episode_count_zero(self):
+        # Pre-#410 shape: utility row is exactly [Search, Stats].
+        # Pin so a future regression that always emits the Episodes
+        # button trips this test.
+        stats = _stats(extracted_count=10, episode_count=0, by_tag={"preference": 5})
+        _, kb = memory_command._build_dashboard(stats)
+        assert kb is not None
+        utility_row = kb.inline_keyboard[-1]
+        labels = [btn.text for btn in utility_row]
+        assert labels == ["Search", "Stats"]
+
+    def test_dashboard_episode_only_user_renders_episodes_button(self):
+        # Episode-only operator: by_tag is extracted-only (and
+        # therefore empty), so no tag-button rows render. The
+        # Episodes button is on the utility row alongside Search
+        # and Stats. Pins the cross-section of the episode-only
+        # surface and the Episodes button placement.
+        stats = _stats(episode_count=4)
+        _, kb = memory_command._build_dashboard(stats)
+        assert kb is not None
+        # Only one row total: the utility row.
+        assert len(kb.inline_keyboard) == 1
+        utility_row = kb.inline_keyboard[0]
+        labels = [btn.text for btn in utility_row]
+        assert labels == ["Episodes (4)", "Search", "Stats"]
+
+    def test_dashboard_no_tag_buttons_with_episodes_footer_wording(self):
+        # D6 footer branch when no tag buttons render and Episodes
+        # is rendered: footer names every utility-row affordance.
+        # Pins against the pre-#410 wording (which would lie by
+        # enumerating only Search and Stats).
+        stats = _stats(episode_count=4)
+        text, _ = memory_command._build_dashboard(stats)
+        assert "Tap Episodes to browse, Search to find specific memories, or Stats for details." in text
+
+    def test_dashboard_no_tag_buttons_no_episodes_footer_wording(self):
+        # D6 footer branch when no tag buttons AND no Episodes
+        # button render: footer matches pre-#410 wording. Pins
+        # the migration-only operator's surface.
+        stats = _stats(migration_count=25)
+        text, _ = memory_command._build_dashboard(stats)
+        assert "Use Search to find specific memories, or tap Stats for details." in text
+        # Negative regression: the Episodes branch wording must NOT
+        # appear when no Episodes button is rendered.
+        assert "Tap Episodes to browse" not in text
+
+
+class TestBuildEpisodeListView:
+    """Issue #410: paginated list view of episode rows."""
+
+    def _episode(
+        self,
+        fact_id: str,
+        text: str,
+        outcome_quality: str | None = "success",
+        *,
+        created_at: str = "2026-04-29T10:00:00",
+        updated_at: str | None = None,
+    ) -> MemoryResult:
+        metadata: dict[str, Any] = {"source": "episode", "type": "fact"}
+        if outcome_quality is not None:
+            metadata["outcome_quality"] = outcome_quality
+        return MemoryResult(
+            id=fact_id,
+            text=text,
+            score=0.0,
+            memory_type="fact",
+            metadata=metadata,
+            created_at=created_at,
+            updated_at=updated_at if updated_at is not None else created_at,
+        )
+
+    def test_outcome_quality_brackets_render(self):
+        eps = [
+            self._episode("e1", "First episode", outcome_quality="success"),
+            self._episode("e2", "Second episode", outcome_quality="partial"),
+        ]
+        text, _, ids, _, _ = memory_command._build_episode_list_view(eps, 0)
+        assert "[success]  First episode" in text
+        assert "[partial]  Second episode" in text
+        assert ids == ["e1", "e2"]
+
+    def test_falls_back_to_dashes_for_missing_outcome_quality(self):
+        # outcome_quality absent from metadata: render [----].
+        eps = [self._episode("e1", "Episode without quality", outcome_quality=None)]
+        text, _, _, _, _ = memory_command._build_episode_list_view(eps, 0)
+        assert "[----]" in text
+
+    def test_falls_back_to_dashes_for_off_enum_outcome_quality(self):
+        # Strict enum check (D2 line 59 / Implementation step 3
+        # docstring): an off-enum value renders [----] rather than
+        # the literal string. Defends against schema drift.
+        eps = [self._episode("e1", "Episode with bad value", outcome_quality="good")]
+        text, _, _, _, _ = memory_command._build_episode_list_view(eps, 0)
+        assert "[----]" in text
+        assert "[good]" not in text
+
+    def test_paginates(self):
+        # 12 episodes at page-size 5 -> page 1: 5, page 2: 5, page 3: 2.
+        eps = [self._episode(f"e{i}", f"Episode {i}") for i in range(12)]
+        # Page 1 (index 0).
+        _, kb, ids, page, total = memory_command._build_episode_list_view(eps, 0)
+        assert len(ids) == 5
+        assert page == 0
+        assert total == 3
+        nav_labels = [btn.text for btn in kb.inline_keyboard[-1]]
+        assert nav_labels == ["back", "next >"]
+        # Page 2 (middle).
+        _, kb, ids, page, total = memory_command._build_episode_list_view(eps, 1)
+        assert len(ids) == 5
+        assert page == 1
+        nav_labels = [btn.text for btn in kb.inline_keyboard[-1]]
+        assert nav_labels == ["< prev", "back", "next >"]
+        # Page 3 (partial last).
+        _, kb, ids, page, total = memory_command._build_episode_list_view(eps, 2)
+        assert len(ids) == 2
+        assert page == 2
+        nav_labels = [btn.text for btn in kb.inline_keyboard[-1]]
+        assert nav_labels == ["< prev", "back"]
+
+    def test_empty_state(self):
+        text, kb, ids, page, total = memory_command._build_episode_list_view([], 0)
+        assert text == "Episodes\n\nNo episodes yet."
+        assert ids == []
+        assert page == 0
+        assert total == 1
+        # Single back button on the keyboard.
+        assert len(kb.inline_keyboard) == 1
+        assert kb.inline_keyboard[0][0].text == "back"
+
+    def test_truncates_long_text(self):
+        long_text = "x" * 200
+        eps = [self._episode("e1", long_text)]
+        text, _, _, _, _ = memory_command._build_episode_list_view(eps, 0)
+        assert long_text not in text
+        assert "…" in text
+
+    def test_header_uses_two_space_separator(self):
+        # D2 / W5 (v1 evaluation): header label and parenthetical
+        # are separated by exactly two spaces, matching the tag
+        # view convention. Pin so a single-space regression trips
+        # this test.
+        eps = [self._episode("e1", "Just one")]
+        text, _, _, _, _ = memory_command._build_episode_list_view(eps, 0)
+        assert text.startswith("Episodes  (page 1 of 1)")
+
+
+class TestEpsCallbackDispatch:
+    """Issue #410: handle_memory_callback `eps` verb dispatch."""
+
+    @pytest.mark.asyncio
+    async def test_eps_verb_dispatches_to_send_episode_list(self, monkeypatch, update_factory, context_factory):
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        captured: dict[str, Any] = {}
+
+        async def fake_send(update, context, chat_id, page, edit=False):
+            captured["chat_id"] = chat_id
+            captured["page"] = page
+            captured["edit"] = edit
+
+        monkeypatch.setattr(memory_command, "_send_episode_list", fake_send)
+        upd = update_factory(callback_data="mem:eps:0")
+        ctx = context_factory()
+        await memory_command.handle_memory_callback(upd, ctx)
+        assert captured["chat_id"] == 100
+        assert captured["page"] == 0
+        assert captured["edit"] is True
+
+    @pytest.mark.asyncio
+    async def test_eps_verb_invalid_page_falls_back_to_zero(self, monkeypatch, update_factory, context_factory):
+        # Stale or crafted callback with a non-integer page must
+        # not crash; the dispatch falls back to page 0.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        captured: dict[str, Any] = {}
+
+        async def fake_send(update, context, chat_id, page, edit=False):
+            captured["page"] = page
+
+        monkeypatch.setattr(memory_command, "_send_episode_list", fake_send)
+        upd = update_factory(callback_data="mem:eps:notaninteger")
+        ctx = context_factory()
+        await memory_command.handle_memory_callback(upd, ctx)
+        assert captured["page"] == 0
+
+
+class TestFactViewEpisodeReturn:
+    """Issue #410: back-navigation from a fact opened from the
+    episode list returns to the same page of that list."""
+
+    @pytest.mark.asyncio
+    async def test_fact_view_back_returns_to_episode_list(self, monkeypatch, update_factory, context_factory):
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+
+        # Prime the cache as if the user is on page 2 of the
+        # episode list.
+        memory_command._set_cache(
+            100,
+            memory_command._ScreenCache(
+                screen="episodes",
+                page=2,
+                memory_ids=["e1"],
+            ),
+        )
+
+        # Stub get_by_id to return an episode-shaped row so the
+        # fact view actually renders.
+        episode = MemoryResult(
+            id="e1",
+            text="Some episode",
+            score=0.0,
+            memory_type="fact",
+            metadata={"source": "episode", "outcome_quality": "success"},
+            created_at="2026-04-29T10:00:00",
+            updated_at="2026-04-29T10:00:00",
+        )
+        monkeypatch.setattr(memory_command.memory, "get_by_id", lambda *, user_id, memory_id: episode)
+
+        upd = update_factory(callback_data="mem:fact:0")
+        ctx = context_factory()
+        await memory_command.handle_memory_callback(upd, ctx)
+
+        # The fact view's edit_message_text was called with a
+        # keyboard whose back button targets the episode list at
+        # page 2 (mem:eps:2).
+        edit_call = upd.callback_query.edit_message_text.call_args
+        assert edit_call is not None
+        kb = edit_call.kwargs["reply_markup"]
+        back_btn = kb.inline_keyboard[0][0]
+        assert back_btn.text == "back"
+        assert back_btn.callback_data == "mem:eps:2"
+
+
+class TestHelpTextSummaryLine:
+    """Issue #410 D7: `_HELP_TEXT` first line wording change."""
+
+    def test_help_text_says_browse_memories(self):
+        assert "/memory - Browse memories" in memory_command._HELP_TEXT
+        # Pre-#410 wording must be gone so a future revert trips
+        # this assertion.
+        assert "Browse by tag" not in memory_command._HELP_TEXT
 
 
 class TestForgetConfirmMultiSource:
@@ -1128,23 +1393,24 @@ class TestCommandDispatch:
         assert called["user_id"] == "100"  # chat_id stringified
 
     @pytest.mark.asyncio
-    async def test_search_filters_out_non_extracted_rows(self, monkeypatch, update_factory, context_factory):
-        # Spec §7.5 / round-5 review #1: every read path must scope to
-        # source=="extracted". `memory.search()` is a Mem0 vector
-        # lookup that spans all sources (Track 1 exchanges, legacy
-        # rows). Without a post-filter, a non-extracted row could
-        # surface in results, then fail get_by_id's source check on
-        # tap and render "no longer exists." for a row the user just
-        # saw. The filter lives in `_send_search` alongside the score
-        # floor.
+    async def test_search_filters_out_non_user_visible_rows(self, monkeypatch, update_factory, context_factory):
+        # Search results are post-filtered to `_USER_VISIBLE_SOURCES`
+        # (`extracted` + `episode` + `migration`); rows from any
+        # other source - most importantly legacy ""-source rows -
+        # are dropped before reaching the operator. This site exists
+        # because `memory.search` is a Mem0 vector lookup spanning
+        # every source, while the data-layer reads (`get_by_id`,
+        # `get_by_tag`) already gate at fetch time. Issue #410
+        # widened this from extracted-only.
         monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
 
-        # Build one extracted hit (kept) and one non-extracted hit
-        # (dropped). Both clear the score floor so only source
-        # decides. The legacy/Track-1 row uses the same MemoryResult
-        # shape Mem0 returns; the only difference is metadata.source.
+        # Build one user-visible hit (kept) and one non-user-visible
+        # hit (dropped). Both clear the score floor so only source
+        # decides. The non-user-visible row uses `source="track1"`,
+        # exercising the negative-space contract for any value
+        # outside the admit list.
         extracted = _fact("e1", "kept", ["preference"], score=0.9)
-        non_extracted = MemoryResult(
+        non_user_visible = MemoryResult(
             id="t1",
             text="dropped",
             score=0.95,
@@ -1155,7 +1421,7 @@ class TestCommandDispatch:
         )
 
         def fake_search(query, *, user_id, limit):
-            return [extracted, non_extracted]
+            return [extracted, non_user_visible]
 
         monkeypatch.setattr(memory_command.memory, "search", fake_search)
         upd = update_factory()
@@ -1163,11 +1429,73 @@ class TestCommandDispatch:
         await memory_command.handle_memory_command(upd, ctx)
 
         # The cache memory_ids list is populated from the filtered
-        # results - if the non-extracted row leaked through, "t1"
+        # results - if the non-user-visible row leaked through, "t1"
         # would appear here. It must not.
         cache = memory_command._get_cache(100)
         assert cache is not None
         assert cache.memory_ids == ["e1"]
+
+    @pytest.mark.asyncio
+    async def test_search_post_filter_admits_user_visible_sources_drops_legacy(
+        self, monkeypatch, update_factory, context_factory
+    ):
+        # Issue #410 D4: `_send_search` post-filter widens from
+        # extracted-only to `_USER_VISIBLE_SOURCES`. This test drives
+        # the comprehensive contract: extracted + episode + migration
+        # all surface; legacy ""-source rows are dropped. Replaces
+        # v1's redundant 14/15/16 with a single multi-source fixture.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+
+        extracted = MemoryResult(
+            id="ext-1",
+            text="extracted fact",
+            score=0.9,
+            memory_type="fact",
+            metadata={"source": "extracted"},
+            created_at="2026-04-29T10:00:00",
+            updated_at="2026-04-29T10:00:00",
+        )
+        episode = MemoryResult(
+            id="ep-1",
+            text="episode summary",
+            score=0.85,
+            memory_type="fact",
+            metadata={"source": "episode", "outcome_quality": "success"},
+            created_at="2026-04-29T10:00:00",
+            updated_at="2026-04-29T10:00:00",
+        )
+        migration = MemoryResult(
+            id="mig-1",
+            text="imported memory",
+            score=0.8,
+            memory_type="fact",
+            metadata={"source": "migration", "tags": ["migration"]},
+            created_at="2026-04-29T10:00:00",
+            updated_at="2026-04-29T10:00:00",
+        )
+        legacy = MemoryResult(
+            id="legacy-1",
+            text="legacy row",
+            score=0.95,  # high score still gets dropped on source filter
+            memory_type="fact",
+            metadata={"source": ""},
+            created_at="2026-04-29T10:00:00",
+            updated_at="2026-04-29T10:00:00",
+        )
+
+        def fake_search(query, *, user_id, limit):
+            return [extracted, episode, migration, legacy]
+
+        monkeypatch.setattr(memory_command.memory, "search", fake_search)
+        upd = update_factory()
+        ctx = context_factory(args=["search", "anything"])
+        await memory_command.handle_memory_command(upd, ctx)
+
+        # All three user-visible sources surfaced; legacy was dropped.
+        cache = memory_command._get_cache(100)
+        assert cache is not None
+        assert set(cache.memory_ids) == {"ext-1", "ep-1", "mig-1"}
+        assert "legacy-1" not in cache.memory_ids
 
     @pytest.mark.asyncio
     async def test_forget_unknown_tag_rejected(self, monkeypatch, update_factory, context_factory):

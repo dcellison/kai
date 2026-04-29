@@ -1141,6 +1141,38 @@ def get_by_tag(*, user_id: str, tag: str) -> list[MemoryResult]:
     return matches
 
 
+def get_all_episodes(*, user_id: str) -> list[MemoryResult]:
+    """Return all episode-source memories for `user_id`, newest first.
+
+    Read-side primitive for the /memory dashboard's episode-list
+    browser (issue #410). Episode rows mostly carry Sophia-style tags
+    that are not in `_TAG_ENUM`, so the existing tag-button surface
+    cannot reach them; this helper backs a dedicated screen that
+    enumerates every episode in one place.
+
+    The source filter here is intentionally narrower than
+    `_USER_VISIBLE_SOURCES`: this function's purpose is single-source
+    enumeration ("give me everything in the episode bucket"), not
+    multi-source admission. The shared admit list lives in
+    `get_by_id` / `get_by_tag`; this helper does not participate in
+    it. See the `memory_command.py` module docstring for the
+    canonical map of source-filter sites.
+
+    Sort: `updated_at` descending, with `created_at` as the fallback
+    for rows whose payload predates the field. Mirrors `get_by_tag`'s
+    sort contract so the same conventions hold across both list
+    surfaces. The full row set comes from `get_all(limit=None)` so a
+    user with thousands of episodes still gets a complete listing.
+    """
+    if _memory is None:
+        return []
+
+    rows = get_all(user_id=user_id, limit=None)
+    matches = [r for r in rows if r.metadata.get("source") == "episode"]
+    matches.sort(key=lambda r: r.updated_at or r.created_at, reverse=True)
+    return matches
+
+
 def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
     """Fetch a single user-visible memory by id, scoped to user.
 

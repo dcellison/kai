@@ -2505,6 +2505,141 @@ class TestUserVisibleSources:
         assert stats.confidence_median == 0.9
 
 
+class TestGetAllEpisodes:
+    """Issue #410: single-source enumeration helper backing the
+    /memory dashboard's episode-list browser. Sources outside the
+    literal "episode" string are excluded - this is intentionally
+    narrower than `_USER_VISIBLE_SOURCES` because the function's
+    purpose is single-source enumeration, not multi-source admission."""
+
+    def test_get_all_episodes_returns_only_episode_source(self):
+        """Mixed-source store: only the episode rows come back. The
+        `_USER_VISIBLE_SOURCES` admit list is broader (it accepts
+        extracted and migration too) but does not apply here."""
+        import kai.memory as mem_mod
+        from kai.memory import get_all_episodes
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {
+            "results": [
+                {
+                    "id": "ext",
+                    "memory": "extracted fact",
+                    "score": 0.0,
+                    "metadata": {"source": "extracted", "type": "fact"},
+                    "created_at": "2026-04-01T00:00:00",
+                    "updated_at": "2026-04-01T00:00:00",
+                },
+                {
+                    "id": "ep1",
+                    "memory": "episode one",
+                    "score": 0.0,
+                    "metadata": {"source": "episode", "outcome_quality": "success"},
+                    "created_at": "2026-04-02T00:00:00",
+                    "updated_at": "2026-04-02T00:00:00",
+                },
+                {
+                    "id": "mig",
+                    "memory": "migration row",
+                    "score": 0.0,
+                    "metadata": {"source": "migration", "tags": ["migration"]},
+                    "created_at": "2026-04-03T00:00:00",
+                    "updated_at": "2026-04-03T00:00:00",
+                },
+                {
+                    "id": "legacy",
+                    "memory": "legacy row",
+                    "score": 0.0,
+                    "metadata": {"source": ""},
+                    "created_at": "2026-01-01T00:00:00",
+                    "updated_at": "2026-01-01T00:00:00",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+
+        results = get_all_episodes(user_id="123")
+        assert [r.id for r in results] == ["ep1"]
+
+    def test_get_all_episodes_sorts_newest_first(self):
+        """Two episode rows with different `updated_at`; assert
+        descending order. Mirrors `get_by_tag`'s sort contract so
+        the same conventions hold across both list surfaces."""
+        import kai.memory as mem_mod
+        from kai.memory import get_all_episodes
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {
+            "results": [
+                {
+                    "id": "old",
+                    "memory": "older episode",
+                    "score": 0.0,
+                    "metadata": {"source": "episode"},
+                    "created_at": "2026-01-01T00:00:00",
+                    "updated_at": "2026-01-01T00:00:00",
+                },
+                {
+                    "id": "new",
+                    "memory": "newer episode",
+                    "score": 0.0,
+                    "metadata": {"source": "episode"},
+                    "created_at": "2026-04-01T00:00:00",
+                    "updated_at": "2026-04-15T00:00:00",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+
+        results = get_all_episodes(user_id="123")
+        assert [r.id for r in results] == ["new", "old"]
+
+    def test_get_all_episodes_empty_when_no_episodes(self):
+        """Extracted-only store: empty list, not a None or an exception."""
+        import kai.memory as mem_mod
+        from kai.memory import get_all_episodes
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {
+            "results": [
+                {
+                    "id": "ext",
+                    "memory": "fact",
+                    "score": 0.0,
+                    "metadata": {"source": "extracted"},
+                    "created_at": "",
+                    "updated_at": "",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+
+        assert get_all_episodes(user_id="123") == []
+
+    def test_get_all_episodes_disabled_returns_empty(self):
+        """With memory disabled (`_memory is None`), helper short-
+        circuits to empty list. No exception, no get_all call."""
+        from kai.memory import get_all_episodes
+
+        # The autouse `_clean_memory_state` fixture leaves _memory at
+        # None unless the test sets it explicitly.
+        assert get_all_episodes(user_id="123") == []
+
+    def test_get_all_episodes_passes_limit_none(self):
+        """get_all is called with the high ceiling (top_k >= 100_000)
+        so users with thousands of episodes get a complete listing.
+        Parallel to test_passes_limit_none_to_get_all for get_by_tag."""
+        import kai.memory as mem_mod
+        from kai.memory import get_all_episodes
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {"results": []}
+        mem_mod._memory = mock_mem
+
+        get_all_episodes(user_id="123")
+        assert mock_mem.get_all.call_args.kwargs["top_k"] >= 100_000
+
+
 # ── Integration tests (real Mem0 + Qdrant, slower) ──────────────────
 
 
