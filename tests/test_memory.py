@@ -1170,6 +1170,83 @@ class TestDeleteBySource:
         assert "'extracted'" in joined
 
 
+class TestCountBySource:
+    """Tests for count_by_source() (issue #406, Phase 4 of #396).
+
+    Read-side companion to delete_by_source. Sync (no asyncio plumbing)
+    because the migration script's idempotency guard runs on the main
+    sync thread before any async rollback work.
+    """
+
+    def test_count_by_source_disabled_returns_zero(self):
+        """count_by_source returns 0 when memory is disabled; never raises."""
+        from kai.memory import count_by_source
+
+        assert count_by_source("user-a", "migration") == 0
+
+    def test_count_by_source_returns_count(self):
+        """Counts only rows whose metadata source matches; ignores others."""
+        import kai.memory as mem_mod
+        from kai.memory import count_by_source
+
+        mock_mem = MagicMock()
+        # Mixed-source rows: three migration, one extracted, one legacy.
+        # Expected count for "migration" is 3; extracted/legacy are not
+        # counted under that filter.
+        mock_mem.get_all.return_value = {
+            "results": [
+                {"id": "m1", "metadata": {"source": "migration"}},
+                {"id": "e1", "metadata": {"source": "extracted"}},
+                {"id": "m2", "metadata": {"source": "migration"}},
+                {"id": "leg", "metadata": {}},
+                {"id": "m3", "metadata": {"source": "migration"}},
+            ]
+        }
+        mem_mod._memory = mock_mem
+
+        assert count_by_source("user-a", "migration") == 3
+
+        # Reset state so other tests are not influenced by the stub.
+        mem_mod._memory = None
+
+    def test_count_by_source_handles_empty_user(self):
+        """Empty store returns 0 cleanly (no exceptions)."""
+        import kai.memory as mem_mod
+        from kai.memory import count_by_source
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {"results": []}
+        mem_mod._memory = mock_mem
+
+        assert count_by_source("user-a", "migration") == 0
+
+        mem_mod._memory = None
+
+
+class TestMigrationSourceMetadata:
+    """Tests for the new "migration" source tag in _SOURCE_WEIGHTS and
+    _SOURCE_SHORT (issue #406, Phase 4 of #396)."""
+
+    def test_migration_source_weight_is_1_0(self):
+        """Pin the weight value so a future refactor accidentally
+        removing or retuning the entry fails loudly. The value is
+        chosen to sit between extracted (1.2) and legacy (0.6); see
+        spec §D3.
+        """
+        from kai.memory import _SOURCE_WEIGHTS
+
+        assert _SOURCE_WEIGHTS["migration"] == 1.0
+
+    def test_migration_renders_as_fact_prefix_in_format_context(self):
+        """Migration rows render with the same line-prefix label as
+        extracted rows. Spec §D3: source tag is for dedup/rollback,
+        not for prompt-side labeling.
+        """
+        from kai.memory import _SOURCE_SHORT
+
+        assert _SOURCE_SHORT["migration"] == _SOURCE_SHORT["extracted"]
+
+
 class TestGetStats:
     """Tests for get_stats()."""
 

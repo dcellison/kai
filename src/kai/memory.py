@@ -73,8 +73,11 @@ _SEARCH_OVERFETCH = 20
 # filter and only for ranking. Provenance affects ordering among results
 # that passed the quality gate; it never rescues sub-threshold matches.
 # See spec §5.3 for the rationale. Keys:
-#   extracted - Tier 1 Haiku-filtered facts (the only source written by
-#               the live system after spec 360)
+#   extracted - Tier 1 Haiku-filtered facts (live conversational extraction)
+#   episode   - Per-conversation episode summaries (issue #385)
+#   migration - One-shot import of operator-curated MEMORY.md content
+#               (issue #406). Slightly lower weight than extracted
+#               because the entries are not conversation-current.
 #   ""        - legacy or unset source (downweighted for future cleanup)
 # Any other source value found on a row in production fall through to
 # the unknown-source default (`_UNKNOWN_SOURCE_WEIGHT`), which maps to
@@ -87,6 +90,12 @@ _SOURCE_WEIGHTS: dict[str, float] = {
     # post-deploy evaluation shows one source dominates retrieval the
     # other shouldn't, this is the one knob to retune.
     "episode": 1.2,
+    # Migration rows (issue #406) are operator-curated but capture state
+    # from the file's authoring time, so a small de-prioritization on
+    # retrieval is appropriate. Weight chosen as 1.0: above legacy/unknown
+    # (0.6) since the content is intentional, below extracted (1.2) since
+    # it is not freshly conversational.
+    "migration": 1.0,
     "": 0.6,
 }
 
@@ -114,8 +123,8 @@ def _source_weight(r: MemoryResult) -> float:
 # See spec §5.4: `- (YYYY-MM-DD, <source_short>) <text>`.
 # Any source value not listed here (legacy rows from production stores
 # written under earlier code paths) falls through the .get() default
-# below to "legacy", which is the correct retrieval-time label now
-# that "extracted" is the only source being written.
+# below to "legacy", which is the correct retrieval-time label for
+# any source not enumerated below.
 _SOURCE_SHORT: dict[str, str] = {
     "extracted": "fact",
     # Episode rows (issue #385) get a distinct provenance tag so the
@@ -123,6 +132,12 @@ _SOURCE_SHORT: dict[str, str] = {
     # "what happened, and what we learned". The render path also adds
     # an outcome_quality suffix on episode lines (see format_context).
     "episode": "episode",
+    # Migration rows (issue #406) render as "fact" identically to
+    # extracted rows: the source tag is for dedup and rollback, not
+    # for prompt-side labeling. The inner Claude does not need to
+    # distinguish operator-imported facts from conversation-extracted
+    # facts when they surface in retrieval.
+    "migration": "fact",
     "": "legacy",
 }
 
@@ -706,6 +721,92 @@ async def format_context(
     payload["returned_empty"] = False
     _emit_recall_log(payload)
     return "\n".join(lines)
+
+
+def count_by_source(user_id: str, source: str) -> int:
+    """
+    Count rows for `user_id` whose metadata source matches `source`.
+
+    Read-side companion to `delete_by_source` (issue #406). Used by the
+    migration script's idempotency guard: refuse to run a forward
+    migration when migration-source rows already exist for the user,
+    unless --force is passed.
+
+    Mem0's `get_all` does not accept a metadata filter (verified
+    against mem0/memory/main.py:1075-1077): the `filters` kwarg honors
+    only `user_id`/`agent_id`/`run_id`. Filtering happens client-side
+    after the full fetch, mirroring `get_by_tag` and `delete_by_source`.
+
+    Sync (not async) because the migration script runs sync top-to-
+    bottom; only the rollback branch needs async plumbing for
+    `delete_by_source`. Calls `_memory.get_all` directly without an
+    executor; Mem0's `get_all` is itself sync.
+
+    Inherits the same tail-miss tradeoff as `delete_by_source`: if a
+    full _DELETE_PAGE_SIZE page contains zero matches we conclude the
+    user has no further matches and stop, which under-counts in
+    pathological cases where matching rows sit past the first page in
+    Mem0's internal row order. At single-user scale (<10K rows) this
+    is fine; do NOT "fix" the early termination without re-reading
+    `delete_by_source`'s rationale (the alternative live-locks).
+
+    Args:
+        user_id: Telegram chat_id as string.
+        source: Source tag to count, matched against
+            `metadata.source`. Empty string counts legacy rows
+            (missing or empty source) using the same convention
+            as `delete_by_source`.
+
+    Returns:
+        Count of rows matching the source filter. 0 when memory is
+        disabled (`_memory is None`) or the user has no rows.
+    """
+    if _memory is None:
+        return 0
+
+    count = 0
+    while True:
+        # Same fetch shape as delete_by_source: top_k page, results-
+        # wrapped dict response. No executor wrap because this whole
+        # function is sync.
+        result = _memory.get_all(
+            filters={"user_id": user_id},
+            top_k=_DELETE_PAGE_SIZE,
+        )
+        rows = result.get("results", []) if isinstance(result, dict) else result or []
+
+        # Match logic mirrors delete_by_source: empty-source means
+        # legacy rows (missing-or-empty), explicit value means exact
+        # equality. Metadata key is conditionally absent on rows with
+        # no extra payload (mem0/memory/main.py:1118-1120).
+        matches = 0
+        for row in rows:
+            row_source = row.get("metadata", {}).get("source") if isinstance(row, dict) else None
+            if source == "":
+                if row_source is None or row_source == "":
+                    matches += 1
+            elif row_source == source:
+                matches += 1
+        count += matches
+
+        # Termination: same shape as delete_by_source. Page not full
+        # means we've seen the whole store; full page with zero matches
+        # means we'd live-lock on the next iteration since get_all has
+        # no offset/cursor.
+        if len(rows) < _DELETE_PAGE_SIZE:
+            break
+        if matches == 0:
+            log.warning(
+                "count_by_source: first full page had zero matches; "
+                "terminating to avoid live-lock. Possible undercount if "
+                "matching rows exist past position %d in Mem0's row order "
+                "(user_id=%s, source=%r).",
+                _DELETE_PAGE_SIZE,
+                user_id,
+                source,
+            )
+            break
+    return count
 
 
 async def delete_by_source(user_id: str, source: str) -> int:
