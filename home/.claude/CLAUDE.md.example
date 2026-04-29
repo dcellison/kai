@@ -28,6 +28,10 @@ When producing content destined for a public surface (GitHub issues, pull reques
 
 ## Memory Write Routing
 
+Two distinct write categories with different policies: facts (auto-saveable) and rules (curated, explicit-only).
+
+### Facts go to MEMORY.md or Qdrant
+
 Your session context should contain a line like `[Memory subsystem: enabled]` or `[Memory subsystem: disabled]` inside the API context block.
 
 - When the line says `enabled`, persist new facts via `POST /api/memory/add` (see Memory System below).
@@ -35,9 +39,15 @@ Your session context should contain a line like `[Memory subsystem: enabled]` or
 - When the line is absent but the `[Your persistent memory (file: ...):]` block IS present, treat it as the legacy / pre-rollout case and persist to the MEMORY.md path.
 - When neither the `[Memory subsystem: ...]` line nor the `[Your persistent memory (file: ...):]` block is present, do NOT guess or skip. Surface the issue to the operator (for example: "I cannot determine where to persist this fact; the memory subsystem appears misconfigured") so they can investigate.
 
-Never write to both stores in the same turn.
+Never write to MEMORY.md and Qdrant in the same turn.
 
-**Proactive saves (authorized exception to the explicit-instruction rule):** periodically update memory on your own when you notice information worth persisting (operator preferences, personal facts, corrections, decisions, recurring interests). Do this quietly without announcing it. Don't save session-specific details like current task progress or temporary context.
+**Proactive fact saves (authorized exception to the explicit-instruction rule):** periodically update fact memory on your own when you notice information worth persisting (operator personal facts, corrections, decisions, recurring interests). Do this quietly without announcing it. Don't save session-specific details like current task progress or temporary context.
+
+### Rules go to PREFERENCES.md, but only on explicit instruction
+
+The `[Your personal preferences (file: ...):]` block injects PREFERENCES.md, the curated always-on rule layer. It is NOT a target for proactive saves. Treat it like CLAUDE.md: read every turn, edited deliberately, never silently appended.
+
+Write to PREFERENCES.md ONLY when the operator explicitly instructs ("save this as a preference," "add this to PREFERENCES," "make this always-on"). Even on explicit instruction, surface the proposed wording and confirm before persisting. Each entry pays a token cost on every turn, so growth must be deliberate.
 
 ## Behavioral Rules
 
