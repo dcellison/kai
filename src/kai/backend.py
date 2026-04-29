@@ -220,6 +220,27 @@ def build_session_context(
         except OSError:
             pass
 
+    # Always inject the per-user PREFERENCES.md as the always-on rule
+    # surface. Distinct from MEMORY.md, which is the per-user fact
+    # surface; PREFERENCES.md holds operator-personal directives that
+    # need to fire on every turn (writing style, formatting, behavioral
+    # rules), while MEMORY.md holds project state and notes that surface
+    # via similarity retrieval once the Qdrant-backed semantic memory
+    # is enabled. Injected above MEMORY.md so the inner Claude reads
+    # rules before facts on a top-to-bottom scan. When chat_id is None
+    # (one-shot CLI invocations) the block is omitted entirely; there
+    # is no global-fallback PREFERENCES.md.
+    if chat_id is not None:
+        pref_path = data_dir / "preferences" / str(chat_id) / "PREFERENCES.md"
+        try:
+            pref_text = pref_path.read_text().strip()
+            if pref_text:
+                parts.append(f"[Your personal preferences (file: {pref_path}):]\n{pref_text}")
+            else:
+                parts.append(f"[Your personal preferences (file: {pref_path}):]\n(currently empty)")
+        except OSError:
+            parts.append(f"[Your personal preferences (file: {pref_path}):]\n(file is missing or empty)")
+
     # Always inject Kai's personal memory from DATA_DIR. This file
     # lives outside the install tree (/var/lib/kai/memory/ in production)
     # so it survives make install. Available regardless of which
@@ -434,6 +455,63 @@ def ensure_user_memory(chat_id: int | None, data_dir: Path) -> None:
         log.warning(
             "ensure_user_memory: could not bootstrap %s",
             user_memory_file,
+            exc_info=True,
+        )
+
+
+def ensure_user_preferences(chat_id: int | None, data_dir: Path) -> None:
+    """
+    Lazily create the per-user PREFERENCES.md directory and seed file.
+
+    Sibling to ensure_user_memory(). Same idempotency, same OSError
+    swallow behavior, same multi-user ownership caveats - the install
+    step (install.py `_apply_migrate`) pre-creates and chowns
+    `preferences/<chat_id>/` to the user's os_user when one is set in
+    users.yaml; lazy bootstrap is the runtime fallback for chat_ids
+    added between installs (a reinstall picks up the ownership in the
+    `-- PREFERENCES.md directory ownership --` pass).
+
+    When chat_id is None we are on a one-shot CLI / test path: there
+    is no per-user PREFERENCES.md to seed because the inject path
+    (build_session_context) skips the block entirely when chat_id is
+    None. Return immediately; no global-fallback equivalent.
+
+    Silent on OSError: a permissions issue creating per-user
+    preferences must not prevent the bot from answering a message.
+    The read path in build_session_context already returns a
+    placeholder string on missing files, so the downstream session
+    still boots cleanly.
+    """
+    # No global-fallback path for PREFERENCES.md. The inject branch in
+    # build_session_context omits the block entirely when chat_id is
+    # None, so there is nothing to seed.
+    if chat_id is None:
+        return
+
+    user_pref_dir = data_dir / "preferences" / str(chat_id)
+    user_pref_file = user_pref_dir / "PREFERENCES.md"
+
+    try:
+        user_pref_dir.mkdir(parents=True, exist_ok=True)
+        if not user_pref_file.exists():
+            # Seed from the example template if one ships with the
+            # source tree. Copy2 preserves mode bits so a deliberately
+            # permissive example stays that way. Mirrors
+            # ensure_user_memory's seed step.
+            example = PROJECT_ROOT / "home" / ".claude" / "PREFERENCES.md.example"
+            if example.is_file():
+                shutil.copy2(example, user_pref_file)
+            else:
+                # No template available (unusual - only happens when
+                # the install tree is incomplete). Create a minimal
+                # placeholder so the subprocess has a writable file
+                # to edit. Matches ensure_user_memory's `# Memory\n`
+                # precedent for symmetry.
+                user_pref_file.write_text("# Preferences\n")
+    except OSError:
+        log.warning(
+            "ensure_user_preferences: could not bootstrap %s",
+            user_pref_file,
             exc_info=True,
         )
 

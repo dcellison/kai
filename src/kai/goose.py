@@ -35,6 +35,7 @@ from kai.backend import (
     build_foreign_workspace_reminder,
     build_session_context,
     ensure_user_memory,
+    ensure_user_preferences,
     prepend_to_prompt,
 )
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file
@@ -363,6 +364,11 @@ class GooseBackend(AgentBackend):
             # acceptable; documenting it so future readers do not
             # assume self-healing.
             ensure_user_memory(chat_id, DATA_DIR)
+            # Sibling bootstrap for the per-user PREFERENCES.md surface.
+            # Same scope, same OSError-swallow semantics; see
+            # backend.ensure_user_preferences() for the multi-user
+            # ownership caveats.
+            ensure_user_preferences(chat_id, DATA_DIR)
             session_ctx = build_session_context(
                 workspace=self.workspace,
                 home_workspace=self.home_workspace,

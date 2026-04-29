@@ -1,0 +1,11 @@
+# Preferences
+
+This file holds your always-on personal rules and preferences. Inner Claude reads it on every turn (injected as `[Your personal preferences (file: ...):]`) and writes to it via `Edit` or `Write` when persisting a new always-on rule.
+
+Keep this file tight. Anything that should fire every turn (writing style, formatting directives, behavioral rules tied to your specific working patterns) belongs here. Anything fact-shaped (project state, decisions, dated incidents, contextual references) belongs in `MEMORY.md` instead, where retrieval surfaces it on similarity rather than on every turn.
+
+## Style
+
+## Working Discipline
+
+## Behavioral

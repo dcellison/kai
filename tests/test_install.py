@@ -3243,6 +3243,271 @@ class TestApplyMigratePerUserHome:
         )
 
 
+# ── Per-user PREFERENCES.md migration (#400) ─────────────────────────
+
+
+class TestApplyMigratePerUserPreferences:
+    """
+    Tests for the per-user PREFERENCES.md install-time work in
+    _apply_migrate (#400). Mirrors TestApplyMigratePerUserMemory shape:
+    seed block creates DATA_DIR/preferences/<chat_id>/PREFERENCES.md
+    from the example template; ownership pass re-chowns the tree on
+    every install so os_user changes propagate to existing files.
+    """
+
+    def _setup(self, tmp_path, monkeypatch, with_template: bool = True) -> Path:
+        """Common scaffolding: project root, data dirs, optional template."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        claude_dir = tmp_path / "src" / "home" / ".claude"
+        claude_dir.mkdir(parents=True)
+        if with_template:
+            (claude_dir / "PREFERENCES.md.example").write_text("# Preferences\n\n## Style\n\n## Working Discipline\n")
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "memory").mkdir()
+        return data_path
+
+    def test_seeds_per_user_preferences_from_example(self, tmp_path, monkeypatch):
+        """Single-user case: PREFERENCES.md is seeded from .example template."""
+        data_path = self._setup(tmp_path, monkeypatch)
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 7777\n    name: primary\n    role: admin\n")
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        target = data_path / "preferences" / "7777" / "PREFERENCES.md"
+        assert target.is_file()
+        assert "Style" in target.read_text()
+
+    def test_seeds_each_user_in_multi_user_yaml(self, tmp_path, monkeypatch):
+        """Every users.yaml entry gets its own PREFERENCES.md seeded from .example."""
+        data_path = self._setup(tmp_path, monkeypatch)
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            "users:\n"
+            "  - telegram_id: 1001\n    name: alpha\n    role: admin\n"
+            "  - telegram_id: 1002\n    name: beta\n    role: user\n"
+        )
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        assert (data_path / "preferences" / "1001" / "PREFERENCES.md").is_file()
+        assert (data_path / "preferences" / "1002" / "PREFERENCES.md").is_file()
+
+    def test_idempotent_does_not_overwrite_existing(self, tmp_path, monkeypatch):
+        """Pre-existing per-user PREFERENCES.md content is preserved across reinstalls."""
+        data_path = self._setup(tmp_path, monkeypatch)
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 8888\n    name: keeper\n    role: admin\n")
+
+        # Operator already has customized PREFERENCES.md; re-running install
+        # must not overwrite it.
+        existing = data_path / "preferences" / "8888"
+        existing.mkdir(parents=True)
+        target = existing / "PREFERENCES.md"
+        target.write_text("operator-customized rules")
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        assert target.read_text() == "operator-customized rules"
+
+    def test_template_missing_writes_placeholder(self, tmp_path, monkeypatch, capsys):
+        """When .example template is absent, write '# Preferences\\n' placeholder + warn."""
+        data_path = self._setup(tmp_path, monkeypatch, with_template=False)
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 9999\n    name: u\n    role: admin\n")
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        target = data_path / "preferences" / "9999" / "PREFERENCES.md"
+        assert target.is_file()
+        assert target.read_text() == "# Preferences\n"
+        # Warn so the operator notices an incomplete install tree.
+        out = capsys.readouterr().out
+        assert "WARNING" in out
+        assert "PREFERENCES.md.example" in out
+
+    def test_dry_run_makes_no_filesystem_changes(self, tmp_path, monkeypatch, capsys):
+        """Dry run prints intended actions but does not create any file or directory."""
+        data_path = self._setup(tmp_path, monkeypatch)
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 4242\n    name: u\n    role: admin\n")
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=True,
+            users_yaml_path=users_yaml,
+        )
+
+        out = capsys.readouterr().out
+        assert "Would seed" in out
+        assert "PREFERENCES.md" in out
+        # Nothing on disk under preferences/.
+        assert not (data_path / "preferences").exists()
+
+    def test_ownership_pass_chowns_tree(self, tmp_path, monkeypatch):
+        """
+        The recursive ownership pass walks DATA_DIR/preferences/ and
+        chowns every entry. Without this, an os_user change in
+        users.yaml between installs would leave existing PREFERENCES.md
+        files owned by the previous user, reproducing the #347
+        regression that motivated this layer.
+        """
+        data_path = self._setup(tmp_path, monkeypatch)
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 5555\n    name: u\n    role: admin\n")
+
+        # Pre-existing tree with a stale subdir/file from a prior install.
+        pref_root = data_path / "preferences"
+        pref_root.mkdir()
+        user_dir = pref_root / "5555"
+        user_dir.mkdir()
+        (user_dir / "PREFERENCES.md").write_text("existing")
+
+        chowned: list[tuple[str, int, int]] = []
+        monkeypatch.setattr(
+            "kai.install.os.chown",
+            lambda path, uid, gid: chowned.append((str(path), uid, gid)),
+        )
+        # _set_ownership uses os.lchown for symlinks; pin both so the
+        # test does not require root.
+        monkeypatch.setattr("kai.install.os.lchown", lambda path, uid, gid: chowned.append((str(path), uid, gid)))
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        chowned_paths = {entry[0] for entry in chowned}
+        assert str(pref_root) in chowned_paths
+        assert str(user_dir) in chowned_paths
+        assert str(user_dir / "PREFERENCES.md") in chowned_paths
+
+    def test_stray_subdir_falls_through_to_service_user(self, tmp_path, monkeypatch):
+        """
+        A subdir whose chat_id is not in users.yaml gets service-user
+        ownership (fallback path). Mirrors the memory ownership pass's
+        same fallback.
+        """
+        data_path = self._setup(tmp_path, monkeypatch)
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 100\n    name: u\n    role: admin\n")
+
+        # 999 is NOT in users.yaml; it should be chowned to service user.
+        pref_root = data_path / "preferences"
+        pref_root.mkdir()
+        stray = pref_root / "999"
+        stray.mkdir()
+        (stray / "PREFERENCES.md").write_text("stray content")
+
+        chowned: list[tuple[str, int, int]] = []
+        monkeypatch.setattr(
+            "kai.install.os.chown",
+            lambda path, uid, gid: chowned.append((str(path), uid, gid)),
+        )
+        monkeypatch.setattr("kai.install.os.lchown", lambda path, uid, gid: chowned.append((str(path), uid, gid)))
+
+        _apply_migrate(
+            data_path,
+            tmp_path / "install",
+            svc_uid=501,
+            svc_gid=20,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+        )
+
+        # The stray dir should be chowned to (501, 20), the service user.
+        stray_calls = [c for c in chowned if c[0] == str(stray)]
+        assert stray_calls, f"Expected chown call for stray dir {stray}"
+        assert all(uid == 501 and gid == 20 for _, uid, gid in stray_calls)
+
+
+class TestPreferencesExampleShipsViaCopyTree:
+    """
+    The PREFERENCES.md.example template ships into the install tree as
+    part of `_copy_tree(home/.claude/, ...)` in `_apply_source`. No
+    changes to _apply_source are needed; this test pins the contract
+    that `_HOME_CLAUDE_EXCLUDES` does NOT list the new template, so
+    a future excludes change cannot silently strip it.
+    """
+
+    def test_excludes_does_not_drop_preferences_example(self):
+        from kai.install import _HOME_CLAUDE_EXCLUDES
+
+        assert "PREFERENCES.md.example" not in _HOME_CLAUDE_EXCLUDES, (
+            "PREFERENCES.md.example must ship into the install tree; "
+            "adding it to _HOME_CLAUDE_EXCLUDES would silently drop it."
+        )
+
+
+class TestGitignorePreferencesRules:
+    """
+    .gitignore rules for PREFERENCES.md (#400). The runtime
+    preferences/ directory must be ignored (mirrors memory/), and the
+    tracked .example must be allowlisted under home/.claude/.
+    """
+
+    def _gitignore_path(self) -> Path:
+        # PROJECT_ROOT lives at src/kai/install.py - go up two parents
+        # to reach the repo root, then read .gitignore from there.
+        from kai import install
+
+        return Path(install.__file__).resolve().parents[2] / ".gitignore"
+
+    def test_runtime_preferences_dir_is_ignored(self):
+        """`preferences/` is listed under Runtime artifacts so dev-mode data does not leak."""
+        body = self._gitignore_path().read_text()
+        # Match the bare `preferences/` line, not a substring of a
+        # longer path. The exact line appears under the "# Runtime
+        # artifacts" block, between `memory/` and `files/`.
+        assert "\npreferences/\n" in body
+
+    def test_preferences_example_is_allowlisted(self):
+        """`!home/.claude/PREFERENCES.md.example` un-ignores the tracked template."""
+        body = self._gitignore_path().read_text()
+        assert "\n!home/.claude/PREFERENCES.md.example\n" in body
+
+
 # ── Service lifecycle ────────────────────────────────────────────────
 
 

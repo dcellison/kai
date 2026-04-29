@@ -25,6 +25,7 @@ kai.db
 logs/
 history/
 memory/
+preferences/
 files/
 .responding_to
 models/
@@ -41,6 +42,7 @@ home/*
 home/.claude/*
 !home/.claude/CLAUDE.md.example
 !home/.claude/MEMORY.md.example
+!home/.claude/PREFERENCES.md.example
 !home/config
 home/config/*
 !home/config/goose-config.yaml

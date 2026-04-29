@@ -2266,6 +2266,76 @@ def _apply_migrate(
                     # memory/<chat_id>/ whose user has no os_user set.
                     _set_ownership(entry, svc_uid, svc_gid, recursive=True)
 
+    # -- PREFERENCES.md per-user pre-creation --
+    # Mirror the MEMORY.md per-user pattern. For every users.yaml
+    # entry we pre-create DATA_DIR/preferences/<chat_id>/ and seed
+    # PREFERENCES.md from the example template if it does not exist.
+    # Initial ownership is set by the ownership pass below, not here;
+    # keeping the chown in a single block makes the os_user-change
+    # idempotency case fall out naturally rather than requiring a
+    # "remember to also chown the file" reminder. Lazy bootstrap at
+    # runtime (backend.ensure_user_preferences) is the fallback for
+    # chat_ids added between installs.
+    preferences_root = data_path / "preferences"
+    preferences_template = PROJECT_ROOT / "home" / ".claude" / "PREFERENCES.md.example"
+
+    for chat_id, _os_user in memory_owners:
+        if chat_id is None:
+            continue
+        pref_dir = preferences_root / str(chat_id)
+        pref_dst = pref_dir / "PREFERENCES.md"
+
+        if dry_run:
+            if not pref_dst.exists():
+                if preferences_template.is_file():
+                    print(f"[DRY RUN] Would seed {pref_dst} from {preferences_template}")
+                else:
+                    print(f"[DRY RUN] Would seed {pref_dst} with placeholder (template missing)")
+            continue
+
+        pref_dir.mkdir(parents=True, exist_ok=True)
+        if not pref_dst.exists():
+            if preferences_template.is_file():
+                shutil.copy2(preferences_template, pref_dst)
+                print(f"  Seeded {pref_dst} from PREFERENCES.md.example")
+            else:
+                # Match ensure_user_preferences() / ensure_user_memory()
+                # missing-template precedent so the subprocess always
+                # has a writable file. Warn so the operator notices the
+                # install tree gap, but continue.
+                pref_dst.write_text("# Preferences\n")
+                print(f"  WARNING: {preferences_template} not found; wrote placeholder to {pref_dst}")
+
+    # -- PREFERENCES.md directory ownership --
+    # Recursively chown DATA_DIR/preferences/ on every install, exactly
+    # mirroring the MEMORY.md ownership pass above. The top directory
+    # is service-owned so the service user can create new per-user
+    # subdirs on add-user flows. Per-user subdirs whose chat_id appears
+    # in users.yaml are chowned to that user's os_user. Stray entries
+    # (subdirs whose user has no os_user, or files at the top level)
+    # fall through to service ownership.
+    #
+    # This pass is what corrects ownership drift when os_user changes
+    # between installs. Without it, the seeding block above would set
+    # ownership on first-run only and stale files would persist.
+    preferences_tree = data_path / "preferences"
+    if preferences_tree.is_dir():
+        if dry_run:
+            print(f"[DRY RUN] Would set ownership on {preferences_tree} (service + per-user)")
+            for name, (uid, gid) in per_user_ids.items():
+                print(f"[DRY RUN]   {preferences_tree / name} -> ({uid}:{gid})")
+        else:
+            _set_ownership(preferences_tree, svc_uid, svc_gid, recursive=False)
+            for entry in preferences_tree.iterdir():
+                if entry.is_dir() and entry.name in per_user_ids:
+                    uid, gid = per_user_ids[entry.name]
+                    _set_ownership(entry, uid, gid, recursive=True)
+                else:
+                    # Subdirs whose chat_id has no os_user, or any
+                    # stray top-level entry, fall through to service
+                    # ownership. Same fallback as the memory pass.
+                    _set_ownership(entry, svc_uid, svc_gid, recursive=True)
+
     # -- Per-user home workspace pre-creation (#353) --
     # Mirror the per-user memory pattern above. For every users.yaml
     # entry we pre-create the directory the inner Claude subprocess
@@ -2541,6 +2611,12 @@ def _apply_directories(
         (data_path / "files", svc_uid, svc_gid, 0o755),
         (data_path / "history", svc_uid, svc_gid, 0o755),
         (data_path / "memory", svc_uid, svc_gid, 0o755),
+        # Per-user preferences root (#400). Top-level dir is service-
+        # owned so the bot can lazily create new preferences/<chat_id>/
+        # subdirs at first message; per-user subdirs are pre-created
+        # and chowned in _apply_migrate when the user has a distinct
+        # os_user.
+        (data_path / "preferences", svc_uid, svc_gid, 0o755),
         # Per-user home root (#353). Top-level dir is service-owned so
         # the bot can lazily create new home/<chat_id>/ subdirs at first
         # message; per-user subdirs are pre-created and chowned in

@@ -18,6 +18,7 @@ from kai.backend import (
     build_session_context,
     ensure_user_home,
     ensure_user_memory,
+    ensure_user_preferences,
     get_workspace_system_prompt,
     prepend_to_prompt,
     resolve_home_workspace,
@@ -151,6 +152,133 @@ class TestBuildSessionContext:
 
         assert result is not None
         assert "(currently empty)" in result
+
+    def test_preferences_block_with_content(self, tmp_path):
+        """PREFERENCES.md content is injected when chat_id is set and the file has content."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+        # MEMORY.md path so the function does not fail on missing memory dir.
+        (data_dir / "memory" / "42").mkdir(parents=True)
+        # Per-user PREFERENCES.md exists with content.
+        pref_dir = data_dir / "preferences" / "42"
+        pref_dir.mkdir(parents=True)
+        (pref_dir / "PREFERENCES.md").write_text("Use Celsius for temperatures.")
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=42,
+                data_dir=data_dir,
+            )
+
+        assert "[Your personal preferences (file:" in result
+        assert "Use Celsius for temperatures." in result
+
+    def test_preferences_block_empty_file(self, tmp_path):
+        """'(currently empty)' placeholder when PREFERENCES.md exists but is blank."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+        (data_dir / "memory" / "7").mkdir(parents=True)
+        pref_dir = data_dir / "preferences" / "7"
+        pref_dir.mkdir(parents=True)
+        (pref_dir / "PREFERENCES.md").write_text("")
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=7,
+                data_dir=data_dir,
+            )
+
+        assert "[Your personal preferences (file:" in result
+        # Two blocks may match the "(currently empty)" string (preferences
+        # and memory). Both can be empty here; check the preferences
+        # block contains it by anchoring on the block label.
+        pref_block_idx = result.find("[Your personal preferences (file:")
+        memory_block_idx = result.find("[Your persistent memory (file:")
+        # Slice between the preferences block start and the memory block
+        # start to verify the empty placeholder is in the preferences
+        # block specifically.
+        pref_block = result[pref_block_idx:memory_block_idx]
+        assert "(currently empty)" in pref_block
+
+    def test_preferences_block_missing_file(self, tmp_path):
+        """'(file is missing or empty)' when PREFERENCES.md is absent."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+        (data_dir / "memory" / "100").mkdir(parents=True)
+        # No preferences/100/PREFERENCES.md.
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=100,
+                data_dir=data_dir,
+            )
+
+        assert "[Your personal preferences (file:" in result
+        assert "(file is missing or empty)" in result
+
+    def test_preferences_block_omitted_when_chat_id_none(self, tmp_path):
+        """No preferences block when chat_id is None (no per-user file to read)."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+        (data_dir / "memory").mkdir(parents=True)
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=None,
+                data_dir=data_dir,
+            )
+
+        # chat_id=None means no per-user PREFERENCES.md to inject.
+        assert "[Your personal preferences (file:" not in result
+
+    def test_preferences_block_above_memory_block(self, tmp_path):
+        """Block ordering: PREFERENCES.md appears BEFORE MEMORY.md in the assembled context."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+        memory_dir = data_dir / "memory" / "55"
+        memory_dir.mkdir(parents=True)
+        (memory_dir / "MEMORY.md").write_text("memory content")
+        pref_dir = data_dir / "preferences" / "55"
+        pref_dir.mkdir(parents=True)
+        (pref_dir / "PREFERENCES.md").write_text("preference content")
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=55,
+                data_dir=data_dir,
+            )
+
+        pref_idx = result.find("[Your personal preferences (file:")
+        memory_idx = result.find("[Your persistent memory (file:")
+        assert pref_idx >= 0, "preferences block missing"
+        assert memory_idx >= 0, "memory block missing"
+        # Rules out-rank facts; pin the relative ordering.
+        assert pref_idx < memory_idx, "PREFERENCES.md block must appear before MEMORY.md block"
 
     def test_history_included(self, tmp_path):
         """Recent history is included when available."""
@@ -781,6 +909,103 @@ class TestEnsureUserMemory:
 
         legacy = data_dir / "memory" / "MEMORY.md"
         assert legacy.read_text() == "# Memory\n"
+
+
+class TestEnsureUserPreferences:
+    """ensure_user_preferences bootstraps the per-user PREFERENCES.md surface."""
+
+    def test_seeds_from_example_template(self, tmp_path, monkeypatch):
+        """Creates preferences/<chat_id>/PREFERENCES.md from the example template."""
+        data_dir = tmp_path / "data"
+        project_root = tmp_path / "project"
+        example_dir = project_root / "home" / ".claude"
+        example_dir.mkdir(parents=True)
+        (example_dir / "PREFERENCES.md.example").write_text("# Preferences\n\n## Style\n")
+
+        monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
+
+        ensure_user_preferences(42, data_dir)
+
+        target = data_dir / "preferences" / "42" / "PREFERENCES.md"
+        assert target.is_file()
+        assert "Style" in target.read_text()
+
+    def test_no_template_creates_placeholder(self, tmp_path, monkeypatch):
+        """Falls back to '# Preferences\\n' placeholder when no example template exists."""
+        data_dir = tmp_path / "data"
+        project_root = tmp_path / "project"
+        # Empty home/.claude/, no PREFERENCES.md.example.
+        (project_root / "home" / ".claude").mkdir(parents=True)
+        monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
+
+        ensure_user_preferences(7, data_dir)
+
+        target = data_dir / "preferences" / "7" / "PREFERENCES.md"
+        assert target.is_file()
+        assert target.read_text() == "# Preferences\n"
+
+    def test_idempotent_does_not_overwrite(self, tmp_path, monkeypatch):
+        """Existing per-user PREFERENCES.md is preserved across repeated calls."""
+        data_dir = tmp_path / "data"
+        project_root = tmp_path / "project"
+        example_dir = project_root / "home" / ".claude"
+        example_dir.mkdir(parents=True)
+        (example_dir / "PREFERENCES.md.example").write_text("TEMPLATE")
+        monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
+
+        user_dir = data_dir / "preferences" / "100"
+        user_dir.mkdir(parents=True)
+        existing = user_dir / "PREFERENCES.md"
+        existing.write_text("operator-edited preferences")
+
+        ensure_user_preferences(100, data_dir)
+
+        assert existing.read_text() == "operator-edited preferences"
+
+    def test_chat_id_none_returns_immediately(self, tmp_path, monkeypatch):
+        """
+        chat_id=None is a no-op for preferences. Unlike ensure_user_memory,
+        which seeds a legacy global path for the dev / disabled-mode case,
+        ensure_user_preferences has no global fallback because the inject
+        path also skips the block when chat_id is None. No directory or
+        file should be created.
+        """
+        data_dir = tmp_path / "data"
+        project_root = tmp_path / "project"
+        example_dir = project_root / "home" / ".claude"
+        example_dir.mkdir(parents=True)
+        (example_dir / "PREFERENCES.md.example").write_text("TEMPLATE")
+        monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
+
+        ensure_user_preferences(None, data_dir)
+
+        # No preferences/ tree should have been created.
+        assert not (data_dir / "preferences").exists()
+
+    def test_oserror_swallowed(self, tmp_path, monkeypatch, caplog):
+        """OSError raised inside the body is swallowed via log.warning, not propagated."""
+        import logging
+
+        data_dir = tmp_path / "data"
+        project_root = tmp_path / "project"
+        (project_root / "home" / ".claude").mkdir(parents=True)
+        monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
+
+        # Force mkdir to raise; the function must swallow rather than
+        # let the bot die mid-message-bootstrap.
+        def boom(*args, **kwargs):
+            raise PermissionError("mkdir denied")
+
+        monkeypatch.setattr("pathlib.Path.mkdir", boom)
+
+        with caplog.at_level(logging.WARNING, logger="kai.backend"):
+            ensure_user_preferences(99, data_dir)
+
+        # No exception escaped.
+        assert any(
+            "ensure_user_preferences" in record.message and record.levelno == logging.WARNING
+            for record in caplog.records
+        )
 
 
 class TestPerUserMemoryIsolation:
