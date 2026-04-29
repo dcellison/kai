@@ -306,10 +306,9 @@ def test_force_bypasses_idempotency_guard(fake_memory_md, stub_memory_module, en
 def test_rollback_calls_delete_by_source(stub_memory_module, enabled_config):
     """Test 13: --rollback --yes deletes via delete_by_source, no other writes.
 
-    Pre-check via count_by_source short-circuits when count==0 so the
-    fixture must report a non-zero count for the rollback to actually
-    fire (matches the operator-visible behavior: "no migration entries
-    to delete" exits cleanly without calling delete_by_source).
+    Sets count_by_source to 7 (non-zero) so the rollback proceeds past
+    the pre-check; the zero-row short-circuit is exercised separately
+    by test_rollback_short_circuits_when_no_migration_rows.
     """
     stub_memory_module["count_by_source"].return_value = 7
     rc = mig.main(["--user-id", "123", "--rollback", "--yes"])
