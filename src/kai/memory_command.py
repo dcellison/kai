@@ -20,7 +20,7 @@ Architectural shape:
   reaper task. Losing the cache on process restart is acceptable
   (spec 310 §7.4); the user just retypes `/memory`.
 
-Source filtering uses `memory._USER_VISIBLE_SOURCES` (the frozenset
+Source filtering uses `memory.USER_VISIBLE_SOURCES` (the frozenset
 of `extracted`, `episode`, `migration`). The data-layer gate is
 canonical: `memory.get_by_id` and `memory.get_by_tag` admit only
 those sources, and `memory.delete_by_id` inherits the gate via its
@@ -28,9 +28,9 @@ delegation. The one UI-side reference is `_send_search`'s
 post-filter, which exists because `memory.search` is a Mem0 vector
 lookup that spans every source, including legacy `""`-source rows
 that must not surface in the operator-facing UI. Both sites read
-`_USER_VISIBLE_SOURCES` from `memory.py` so a future change to the
+`USER_VISIBLE_SOURCES` from `memory.py` so a future change to the
 admit list lives in one place. `memory.get_all_episodes` is the one
-narrower-than-`_USER_VISIBLE_SOURCES` filter, scoped to the literal
+narrower-than-`USER_VISIBLE_SOURCES` filter, scoped to the literal
 `"episode"` source for the dashboard's episode-list browser; it does
 not participate in the shared admit list because its purpose is
 single-source enumeration, not multi-source admission.
@@ -763,7 +763,7 @@ def _build_forget_fact_confirm(fact: MemoryResult) -> tuple[str, InlineKeyboardM
     `cancel`) are all preserved unchanged. Falls back to the generic
     label `memory` for an unknown source value (defensive: should be
     unreachable since `get_by_id` already gates on
-    `_USER_VISIBLE_SOURCES`, but a stale cache during a deploy
+    `USER_VISIBLE_SOURCES`, but a stale cache during a deploy
     transition could in principle slip a different source through).
     """
     source = (fact.metadata or {}).get("source", "")
@@ -1467,10 +1467,10 @@ async def _send_search(
     # render "This memory no longer exists." for a row the user just
     # saw - confusing and wrong. Filtering here keeps the UI honest:
     # what the user sees in results is what they can act on.
-    # `_USER_VISIBLE_SOURCES` (the {extracted, episode, migration}
+    # `USER_VISIBLE_SOURCES` (the {extracted, episode, migration}
     # frozenset) is read from `memory.py` so a future change to the
     # admit list lives in one place.
-    filtered = [r for r in results if r.score >= floor and r.metadata.get("source") in memory._USER_VISIBLE_SOURCES]
+    filtered = [r for r in results if r.score >= floor and r.metadata.get("source") in memory.USER_VISIBLE_SOURCES]
     text, kb, memory_ids = _build_search_results(query, filtered, floor)
     _set_cache(
         chat_id,

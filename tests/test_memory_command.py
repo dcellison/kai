@@ -686,7 +686,7 @@ class TestBuildStats:
 # ── Issue #407: multi-source UI surface ────────────────────────────
 #
 # Episode and migration rows joined extracted as user-visible sources
-# in `/memory` (memory.py `_USER_VISIBLE_SOURCES`). The four classes
+# in `/memory` (memory.py `USER_VISIBLE_SOURCES`). The four classes
 # below exercise the dashboard, stats, fact-view, and forget-confirm
 # branches added by the spec.
 
@@ -1394,7 +1394,7 @@ class TestCommandDispatch:
 
     @pytest.mark.asyncio
     async def test_search_filters_out_non_user_visible_rows(self, monkeypatch, update_factory, context_factory):
-        # Search results are post-filtered to `_USER_VISIBLE_SOURCES`
+        # Search results are post-filtered to `USER_VISIBLE_SOURCES`
         # (`extracted` + `episode` + `migration`); rows from any
         # other source - most importantly legacy ""-source rows -
         # are dropped before reaching the operator. This site exists
@@ -1440,7 +1440,7 @@ class TestCommandDispatch:
         self, monkeypatch, update_factory, context_factory
     ):
         # Issue #410 D4: `_send_search` post-filter widens from
-        # extracted-only to `_USER_VISIBLE_SOURCES`. This test drives
+        # extracted-only to `USER_VISIBLE_SOURCES`. This test drives
         # the comprehensive contract: extracted + episode + migration
         # all surface; legacy ""-source rows are dropped. Replaces
         # v1's redundant 14/15/16 with a single multi-source fixture.

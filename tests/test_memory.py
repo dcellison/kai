@@ -2140,7 +2140,7 @@ class TestUserVisibleSources:
     addressable sources from the /memory UI.
 
     The source-admit gate now lives in
-    `memory._USER_VISIBLE_SOURCES = {"extracted", "episode", "migration"}`,
+    `memory.USER_VISIBLE_SOURCES = {"extracted", "episode", "migration"}`,
     used by `get_by_id` and `get_by_tag`. `delete_by_id` inherits via
     its delegation to `get_by_id`. Legacy ""-source rows stay hidden;
     they are managed via `delete_by_source` / memory_admin.py."""
@@ -2509,12 +2509,12 @@ class TestGetAllEpisodes:
     """Issue #410: single-source enumeration helper backing the
     /memory dashboard's episode-list browser. Sources outside the
     literal "episode" string are excluded - this is intentionally
-    narrower than `_USER_VISIBLE_SOURCES` because the function's
+    narrower than `USER_VISIBLE_SOURCES` because the function's
     purpose is single-source enumeration, not multi-source admission."""
 
     def test_get_all_episodes_returns_only_episode_source(self):
         """Mixed-source store: only the episode rows come back. The
-        `_USER_VISIBLE_SOURCES` admit list is broader (it accepts
+        `USER_VISIBLE_SOURCES` admit list is broader (it accepts
         extracted and migration too) but does not apply here."""
         import kai.memory as mem_mod
         from kai.memory import get_all_episodes

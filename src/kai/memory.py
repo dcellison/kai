@@ -164,7 +164,7 @@ _DELETE_PAGE_SIZE = 10_000
 # additional source not in this set) stay hidden in the UI; they are
 # managed via memory_admin.py / `delete_by_source`. A frozenset is used
 # so the constant cannot be mutated by importing callers.
-_USER_VISIBLE_SOURCES: frozenset[str] = frozenset({"extracted", "episode", "migration"})
+USER_VISIBLE_SOURCES: frozenset[str] = frozenset({"extracted", "episode", "migration"})
 
 
 @dataclass(frozen=True)
@@ -1104,7 +1104,7 @@ def get_by_tag(*, user_id: str, tag: str) -> list[MemoryResult]:
     client-side because Mem0's `get_all` does not accept metadata
     filters. Two filter clauses, both load-bearing:
 
-      - `metadata.source in _USER_VISIBLE_SOURCES`: defends against
+      - `metadata.source in USER_VISIBLE_SOURCES`: defends against
         legacy ""-source (or any future-additional non-UI) rows
         leaking into the operator-facing surface. Issue #407 expanded
         this from `== "extracted"` to the three-source set so episode
@@ -1131,7 +1131,7 @@ def get_by_tag(*, user_id: str, tag: str) -> list[MemoryResult]:
 
     rows = get_all(user_id=user_id, limit=None)
     matches = [
-        r for r in rows if r.metadata.get("source") in _USER_VISIBLE_SOURCES and tag in (r.metadata.get("tags") or [])
+        r for r in rows if r.metadata.get("source") in USER_VISIBLE_SOURCES and tag in (r.metadata.get("tags") or [])
     ]
     # Newest-updated first; created_at is the fallback for rows whose
     # payload predates updated_at being recorded. String comparison on
@@ -1151,7 +1151,7 @@ def get_all_episodes(*, user_id: str) -> list[MemoryResult]:
     enumerates every episode in one place.
 
     The source filter here is intentionally narrower than
-    `_USER_VISIBLE_SOURCES`: this function's purpose is single-source
+    `USER_VISIBLE_SOURCES`: this function's purpose is single-source
     enumeration ("give me everything in the episode bucket"), not
     multi-source admission. The shared admit list lives in
     `get_by_id` / `get_by_tag`; this helper does not participate in
@@ -1189,7 +1189,7 @@ def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
       - Legacy ""-source rows are out of scope for /memory UI
         surfaces; they belong to memory_admin.py. Hide them here
         rather than letting the dashboard expose them. The accepted
-        sources are those in `_USER_VISIBLE_SOURCES` (extracted,
+        sources are those in `USER_VISIBLE_SOURCES` (extracted,
         episode, migration). Issue #407 expanded the set from
         extracted-only so episode (#385/#387) and migration (#406/
         #408) rows are addressable from the operator-facing surface;
@@ -1228,11 +1228,11 @@ def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
             user_id,
         )
         return None
-    if (row.get("metadata") or {}).get("source") not in _USER_VISIBLE_SOURCES:
+    if (row.get("metadata") or {}).get("source") not in USER_VISIBLE_SOURCES:
         # Legacy ""-source (or any future-additional non-UI source) is
         # deliberately invisible to /memory. The user-visible set
         # (extracted, episode, migration) is enumerated in
-        # `_USER_VISIBLE_SOURCES`. No log: this is a routine filter,
+        # `USER_VISIBLE_SOURCES`. No log: this is a routine filter,
         # not an anomaly.
         return None
 
