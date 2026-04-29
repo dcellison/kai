@@ -109,6 +109,13 @@ class ClaudeCodeBackend(AgentBackend):
         # exists so direct ClaudeCodeBackend(...) instantiation in tests
         # does not have to plumb an effort kwarg. Keep the two in sync.
         claude_effort_level: str = "high",
+        # Operator-intent flag for the memory subsystem (Config.
+        # memory_enabled). Drives the [Memory subsystem: ...] marker
+        # emission and gates MEMORY.md inject in build_session_context.
+        # Default False so direct test instantiations need not plumb
+        # the kwarg; production callers (pool.py) always pass an
+        # explicit value.
+        memory_enabled: bool = False,
     ):
         # ABC-required attributes (pool.py reads/writes these)
         self.model = model
@@ -133,6 +140,7 @@ class ClaudeCodeBackend(AgentBackend):
         self.claude_user = claude_user
         self.max_session_hours = max_session_hours
         self.autocompact_pct = autocompact_pct
+        self.memory_enabled = memory_enabled
 
         # API context for session injection (passed to build_session_context)
         self._api_context = ApiContext(
@@ -503,6 +511,7 @@ class ClaudeCodeBackend(AgentBackend):
                 workspace_config=self.workspace_config,
                 chat_id=chat_id,
                 data_dir=DATA_DIR,
+                memory_enabled=self.memory_enabled,
             )
             prompt = prepend_to_prompt(prompt, session_ctx)
 

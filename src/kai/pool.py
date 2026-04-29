@@ -195,6 +195,7 @@ class SubprocessPool:
                 workspace_config=ws_config,
                 max_context_window=context_window,
                 provider=provider,
+                memory_enabled=self._config.memory_enabled,
             )
 
         # os_user for sudo -u isolation. None = run as bot user.
@@ -216,6 +217,7 @@ class SubprocessPool:
             max_context_window=context_window,
             autocompact_pct=self._config.claude_autocompact_pct,
             claude_effort_level=self._config.claude_effort_level,
+            memory_enabled=self._config.memory_enabled,
         )
 
     # ── Prompt routing ──────────────────────────────────────────────

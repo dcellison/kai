@@ -187,6 +187,7 @@ def build_session_context(
     workspace_config: WorkspaceConfig | None,
     chat_id: int | None,
     data_dir: Path,
+    memory_enabled: bool = False,
 ) -> str:
     """
     Build the context prefix for the first message of a new session.
@@ -204,6 +205,13 @@ def build_session_context(
         workspace_config: Per-workspace config (for system_prompt).
         chat_id: Telegram chat ID for history scoping and API routing.
         data_dir: Root data directory (memory, history, files live here).
+        memory_enabled: Operator-intent flag (Config.memory_enabled).
+            Drives the memory subsystem marker emission and gates
+            MEMORY.md injection. Reflects intent, not runtime success;
+            the runtime-success surface is `memory.is_enabled()`. Passed
+            as a bool rather than the full Config to match the existing
+            convention of backends taking individual config fields at
+            construction.
     """
     parts: list[str] = []
 
@@ -219,6 +227,18 @@ def build_session_context(
                 parts.append(f"[Your core identity and instructions:]\n{identity}")
         except OSError:
             pass
+
+    # Memory subsystem state marker. Tells the inner Claude where to
+    # route new fact saves: enabled = POST /api/memory/add (Qdrant),
+    # disabled = Edit MEMORY.md. Reflects operator INTENT (Config.
+    # memory_enabled), not runtime success; if Qdrant init failed at
+    # startup, the marker still says "enabled" so write attempts
+    # surface the failure as 503s rather than silently re-routing to
+    # MEMORY.md. Always emit (per-deployment, not per-user) so the
+    # routing rule in CLAUDE.md / PREFERENCES.md can branch on a
+    # uniformly-present signal.
+    mode = "enabled" if memory_enabled else "disabled"
+    parts.append(f"[Memory subsystem: {mode}]")
 
     # Always inject the per-user PREFERENCES.md as the always-on rule
     # surface. Distinct from MEMORY.md, which is the per-user fact
@@ -245,11 +265,17 @@ def build_session_context(
             # MEMORY.md branch's wording for symmetry.
             parts.append(f"[Your personal preferences (file: {pref_path}):]\n(not yet created)")
 
-    # Always inject Kai's personal memory from DATA_DIR. This file
-    # lives outside the install tree (/var/lib/kai/memory/ in production)
-    # so it survives make install. Available regardless of which
-    # workspace the inner Claude is operating in. try/except guards
-    # against race and permission errors (same pattern as identity).
+    # Inject Kai's personal memory from DATA_DIR ONLY in disabled mode.
+    # In enabled mode, Qdrant is the active fact surface (retrieved via
+    # memory.format_context in claude.py), and MEMORY.md is dormant;
+    # injecting it would create a dual-source collision where retrieval
+    # results and MEMORY.md content diverge over time. Gate on operator
+    # INTENT (config.memory_enabled), not runtime success: if intent is
+    # "Qdrant is the surface" and init failed, do not re-show MEMORY.md.
+    #
+    # The file lives outside the install tree (/var/lib/kai/memory/ in
+    # production) so it survives make install. try/except guards against
+    # race and permission errors (same pattern as identity).
     #
     # Per-user scoping (#347): when chat_id is set, the file lives under
     # memory/<chat_id>/MEMORY.md so each user has their own writable
@@ -260,18 +286,19 @@ def build_session_context(
     # legacy global path when chat_id is None (local-dev backends
     # with no multi-user config) so nothing regresses on single-user
     # setups that never hit the multi-user pool path.
-    if chat_id is not None:
-        memory_path = data_dir / "memory" / str(chat_id) / "MEMORY.md"
-    else:
-        memory_path = data_dir / "memory" / "MEMORY.md"
-    try:
-        memory = memory_path.read_text().strip()
-        if memory:
-            parts.append(f"[Your persistent memory (file: {memory_path}):]\n{memory}")
+    if not memory_enabled:
+        if chat_id is not None:
+            memory_path = data_dir / "memory" / str(chat_id) / "MEMORY.md"
         else:
-            parts.append(f"[Your persistent memory (file: {memory_path}):]\n(currently empty)")
-    except OSError:
-        parts.append(f"[Your persistent memory (file: {memory_path}):]\n(not yet created)")
+            memory_path = data_dir / "memory" / "MEMORY.md"
+        try:
+            memory = memory_path.read_text().strip()
+            if memory:
+                parts.append(f"[Your persistent memory (file: {memory_path}):]\n{memory}")
+            else:
+                parts.append(f"[Your persistent memory (file: {memory_path}):]\n(currently empty)")
+        except OSError:
+            parts.append(f"[Your persistent memory (file: {memory_path}):]\n(not yet created)")
 
     # Per-workspace system prompt from workspaces.yaml. Injected
     # between the identity/memory block and conversation history,

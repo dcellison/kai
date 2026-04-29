@@ -86,6 +86,13 @@ class GooseBackend(AgentBackend):
         workspace_config: WorkspaceConfig | None = None,
         max_context_window: int = 0,
         provider: str = "",
+        # Operator-intent flag for the memory subsystem (Config.
+        # memory_enabled). Drives the [Memory subsystem: ...] marker
+        # emission and gates MEMORY.md inject in build_session_context.
+        # Default False so direct test instantiations need not plumb
+        # the kwarg; production callers (pool.py) always pass an
+        # explicit value.
+        memory_enabled: bool = False,
     ):
         # ABC-required attributes (pool.py reads/writes these)
         self.model = model
@@ -96,6 +103,7 @@ class GooseBackend(AgentBackend):
         self.workspace_config = workspace_config
         self.max_context_window = max_context_window
         self.provider = provider  # ABC-mandated; bot.py reads this
+        self.memory_enabled = memory_enabled
 
         # API context for session injection (passed to build_session_context)
         self._api_context = ApiContext(
@@ -376,6 +384,7 @@ class GooseBackend(AgentBackend):
                 workspace_config=self.workspace_config,
                 chat_id=chat_id,
                 data_dir=DATA_DIR,
+                memory_enabled=self.memory_enabled,
             )
             prompt = prepend_to_prompt(prompt, session_ctx)
 

@@ -1296,9 +1296,30 @@ class TestMemoryExtractionConfig:
 
     def test_enabled_from_env(self, monkeypatch):
         _set_required(monkeypatch)
+        # memory_extraction_enabled is a sub-toggle of memory_enabled
+        # (compositional gate at parse time, issue #403). Both flags
+        # must be set for extraction to run.
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
         config = load_config()
         assert config.memory_extraction_enabled is True
+
+    def test_extraction_requires_memory_enabled(self, monkeypatch):
+        """Compositional gate at parse time (issue #403).
+
+        Without enforcement, MEMORY_EXTRACTION_ENABLED=true with
+        MEMORY_ENABLED=false would let the Haiku extraction subprocess
+        fire every turn, burning ~$0.01/turn of budget whose result
+        silently no-ops in the `_memory is None` guard inside
+        add_structured. Pin the dependency so future refactors don't
+        accidentally remove it.
+        """
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_ENABLED", "false")
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+        config = load_config()
+        assert config.memory_extraction_enabled is False
+        assert config.memory_enabled is False
 
     def test_model_override(self, monkeypatch):
         _set_required(monkeypatch)

@@ -1533,6 +1533,15 @@ def load_config() -> Config:
     # other memory_* fields: try/except ValueError, SystemExit on bad
     # input, and reject negatives explicitly on numeric fields.
     memory_extraction_enabled = os.environ.get("MEMORY_EXTRACTION_ENABLED", "").lower() in ("1", "true", "yes")
+    # memory_extraction_enabled is a sub-toggle of memory_enabled. The
+    # dataclass docstring documents this dependency, but without
+    # parse-time enforcement the extraction subprocess fires when
+    # MEMORY_EXTRACTION_ENABLED=true is set with MEMORY_ENABLED=false,
+    # burning ~$0.01/turn of Haiku budget whose result silently no-ops
+    # in the `_memory is None` guard inside add_structured. Compose
+    # here so the dependency is explicit and the budget-burn hole is
+    # closed regardless of operator env-var ordering.
+    memory_extraction_enabled = memory_extraction_enabled and memory_enabled
     memory_extraction_model = (
         os.environ.get("MEMORY_EXTRACTION_MODEL", "claude-haiku-4-5-20251001").strip() or "claude-haiku-4-5-20251001"
     )
