@@ -540,8 +540,12 @@ class TestBuildSessionContext:
             )
 
         assert "[Memory subsystem: enabled]" in result
-        # Identity block correctly skipped; marker still present.
-        assert "core identity and instructions" not in result
+        # Identity block correctly skipped (workspace == home_workspace,
+        # so the file is never read). Assert against the file content
+        # itself rather than the wrapper prose: a regression that broke
+        # the skip condition but emitted only the wrapper without the
+        # body would silently pass an "instructions" substring check.
+        assert "identity content" not in result
 
     # ── MEMORY.md inject gate (issue #403) ──────────────────────────
 
@@ -596,6 +600,50 @@ class TestBuildSessionContext:
 
         assert "User likes concise answers." in result
         assert "[Your persistent memory" in result
+
+    def test_memory_md_gate_per_user_chat_id(self, tmp_path):
+        """The MEMORY.md inject gate applies on the per-user `chat_id is not None`
+        branch the same way it does on the global branch.
+
+        Both `chat_id=None` (global path at `memory/MEMORY.md`) and `chat_id=123`
+        (per-user path at `memory/<chat_id>/MEMORY.md`, introduced in #347) must
+        skip injection in enabled mode and inject in disabled mode. This pins the
+        gate's symmetry across both code paths.
+        """
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+        per_user_dir = data_dir / "memory" / "123"
+        per_user_dir.mkdir(parents=True)
+        (per_user_dir / "MEMORY.md").write_text("Per-user fact.")
+
+        # Disabled mode: per-user MEMORY.md IS injected.
+        with patch("kai.backend.get_recent_history", return_value=""):
+            disabled_result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=123,
+                data_dir=data_dir,
+                memory_enabled=False,
+            )
+        assert "Per-user fact." in disabled_result
+        assert "memory/123/MEMORY.md" in disabled_result
+
+        # Enabled mode: per-user MEMORY.md is NOT injected.
+        with patch("kai.backend.get_recent_history", return_value=""):
+            enabled_result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=123,
+                data_dir=data_dir,
+                memory_enabled=True,
+            )
+        assert "Per-user fact." not in enabled_result
+        assert "[Your persistent memory" not in enabled_result
 
 
 # ── Test build_foreign_workspace_reminder ───────────────────────────
