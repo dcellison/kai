@@ -674,11 +674,15 @@ def _build_fact_view(
 
     if source == "episode" or source == "migration":
         # Episode and migration rows share a minimal body shape:
-        # narrow Tags + Date with none of the extractor-only rows.
-        # Header differs (Episode (<outcome_quality>) vs Imported)
-        # but the rest of the layout is identical, so the tags
-        # line is computed once for both.
+        # Tags + Date with none of the extractor-only rows. Header
+        # differs (Episode (<outcome_quality>) vs Imported), and
+        # episodes (issue #412) splice in the four substantive
+        # Sophia fields (Approach, Outcome, Lessons-when-present,
+        # Actors) between the body quote and the Tags / Date footer.
+        # Migration rows skip the splice entirely - they have no
+        # equivalent metadata.
         tags_line = f"Tags:  {', '.join(tags) if tags else '(none)'}"
+        detail_lines: list[str] = []
         if source == "episode":
             # Episode rows surface the Sophia outcome_quality field as
             # a header parenthetical when present (e.g., "Episode
@@ -687,6 +691,30 @@ def _build_fact_view(
             # so episodes from the same day are distinguishable.
             quality = md.get("outcome_quality") or ""
             header = f"Episode ({quality})" if quality else "Episode"
+            # Substantive Sophia fields written by the stage-2
+            # generator (memory_extraction.py:1525-1538). approach /
+            # outcome / actors are schema-required and always present
+            # in production; the `or ""` / `or []` defensive fallbacks
+            # surface malformed-data corruption rather than hiding it
+            # (D3 in spec 412). lessons is optional-by-design and
+            # absent (not empty) when the generator chose to omit
+            # it - rendering `Lessons:  (none)` would lie about that
+            # design intent (D2).
+            approach = md.get("approach") or ""
+            outcome = md.get("outcome") or ""
+            actors_list = md.get("actors") or []
+            actors_str = ", ".join(actors_list) if actors_list else "(none)"
+            lessons = md.get("lessons")
+            detail_lines.append(f"Approach:  {approach}")
+            detail_lines.append(f"Outcome:  {outcome}")
+            # Presence-check, NOT truthy-check. The schema's
+            # minLength=20 makes the two equivalent in practice today,
+            # but `is not None` matches the storage contract literally
+            # (absent key is the sentinel for "no lesson this time")
+            # and protects against future schema relaxation.
+            if lessons is not None:
+                detail_lines.append(f"Lessons:  {lessons}")
+            detail_lines.append(f"Actors:  {actors_str}")
         else:
             # Migration rows already include the H3 title and section
             # structure inside `fact.text` (the migration script writes
@@ -700,6 +728,7 @@ def _build_fact_view(
             "",
             f'"{fact.text}"',
             "",
+            *detail_lines,
             tags_line,
             f"Date:  {_format_date(fact.created_at, with_time=True)}",
         ]

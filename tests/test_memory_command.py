@@ -697,6 +697,10 @@ def _episode_fact(
     *,
     tags: list[str] | None = None,
     outcome_quality: str | None = "good",
+    approach: str | None = "Configured GitHub Actions step-by-step.",
+    outcome: str | None = "CI ran on every PR within an hour.",
+    actors: list[str] | None = None,
+    lessons: str | None = None,
     created_at: str = "2026-04-28T15:00:00",
 ) -> MemoryResult:
     """Construct a MemoryResult shaped like an episode row.
@@ -706,6 +710,20 @@ def _episode_fact(
     fields so the renderer's "omit extractor-only rows" branch is
     actually exercised. `outcome_quality` is None when the test wants
     to drive the no-quality branch of the header.
+
+    `approach`, `outcome`, `actors`, and `lessons` are issue #412
+    metadata. Defaults populate `approach`, `outcome`, and `actors`
+    (the schema-required content-bearing fields, so existing tests
+    that pre-date #412 render with a realistic body shape rather than
+    empty `Approach:  ` / `Outcome:  ` rows). `lessons` defaults to
+    None (the generator's "no lesson this time" sentinel), so tests
+    must opt in to render the Lessons row.
+
+    Presence-check (`is not None`) on `actors` matters: a caller that
+    passes `actors=[]` to test the empty-list defensive-fallback path
+    must see an empty list survive helper transit. `actors or
+    ["operator"]` would silently collapse the empty list to the
+    default and the test's intent would never reach the renderer.
     """
     metadata: dict[str, Any] = {
         "source": "episode",
@@ -714,6 +732,13 @@ def _episode_fact(
     }
     if outcome_quality is not None:
         metadata["outcome_quality"] = outcome_quality
+    if approach is not None:
+        metadata["approach"] = approach
+    if outcome is not None:
+        metadata["outcome"] = outcome
+    metadata["actors"] = actors if actors is not None else ["operator"]
+    if lessons is not None:
+        metadata["lessons"] = lessons
     return MemoryResult(
         id=fact_id,
         text=text,
@@ -968,6 +993,121 @@ class TestFactViewMultiSource:
         assert "Session:" in text
         assert "Prompt version:" in text
         assert "Confirmation:" in text
+
+    # ── Issue #412: episode detail-fields ──────────────────────────
+    #
+    # Adds `Approach`, `Outcome`, `Lessons` (when present), `Actors`
+    # rows to the episode branch of `_build_fact_view`, between the
+    # body quote and the existing `Tags` / `Date` footer. The
+    # extracted and migration branches stay unchanged.
+
+    def test_fact_view_episode_renders_approach_outcome(self):
+        """approach and outcome are schema-required Sophia fields;
+        always render. Two-space-after-colon formatting per spec D4."""
+        fact = _episode_fact(approach="A1", outcome="O1")
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        assert "Approach:  A1" in text
+        assert "Outcome:  O1" in text
+
+    def test_fact_view_episode_renders_lessons_when_present(self):
+        """lessons is optional; when the metadata key is set, the
+        Lessons row renders alongside the always-on rows."""
+        fact = _episode_fact(lessons="L1")
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        assert "Lessons:  L1" in text
+
+    def test_fact_view_episode_omits_lessons_row_when_absent(self):
+        """Pins D2: absence of lessons in metadata is the design-
+        intended sentinel for "no lesson this time" - the row is
+        dropped entirely, NOT rendered as `Lessons:  (none)`. A
+        regression that switched to a `(none)` placeholder would
+        misrepresent the generator's intent."""
+        fact = _episode_fact(lessons=None)
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        assert "Lessons:" not in text
+
+    def test_fact_view_episode_renders_actors_comma_joined(self):
+        fact = _episode_fact(actors=["alice", "bob"])
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        assert "Actors:  alice, bob" in text
+
+    def test_fact_view_episode_actors_empty_list_renders_none(self):
+        """Exercises the defensive-fallback path in D3; production
+        data cannot produce empty `actors` because the schema
+        enforces `minItems=1`, so the test pins a code path that
+        production cannot reach. Documented as an unreachable-state
+        pin so a future reader does not delete it as testing an
+        impossible state."""
+        fact = _episode_fact(actors=[])
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        assert "Actors:  (none)" in text
+
+    def test_fact_view_episode_field_order(self):
+        """Pins D1's vertical ordering against future edits. The
+        four new rows render in priority order before the existing
+        Tags / Date footer."""
+        # Custom body text avoids the labels appearing inside the
+        # body quote (the default helper text contains "Outcome:"
+        # in narrative form). text.index(label) on the rendered
+        # string would otherwise pick up the body occurrence.
+        fact = _episode_fact(
+            text="A short body without label collisions.",
+            approach="aaa",
+            outcome="bbb",
+            lessons="ccc",
+            actors=["alice"],
+            tags=["sophia/topic"],
+        )
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        positions = {
+            label: text.index(label) for label in ("Approach:", "Outcome:", "Lessons:", "Actors:", "Tags:", "Date:")
+        }
+        assert positions["Approach:"] < positions["Outcome:"]
+        assert positions["Outcome:"] < positions["Lessons:"]
+        assert positions["Lessons:"] < positions["Actors:"]
+        assert positions["Actors:"] < positions["Tags:"]
+        assert positions["Tags:"] < positions["Date:"]
+
+    def test_fact_view_episode_label_uses_two_spaces_after_colon(self):
+        """Pins D4's formatting decision in code so the spec's prose
+        decision does not drift away from the implementation. The
+        label uses exactly two spaces after the colon - not one (which
+        would read cramped) and not pad-aligned (which the spec
+        reserves for the wider extracted-row label set)."""
+        fact = _episode_fact(approach="A")
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        assert "Approach:  A" in text
+        # Negative regression: pad-aligned form (3+ spaces) must NOT
+        # appear; single-space form must NOT appear.
+        assert "Approach:   " not in text
+        assert "Approach: A" not in text
+
+    def test_fact_view_episode_unchanged_extracted_branch(self):
+        """Confirms the extracted six-row block stays unchanged: a
+        regression that accidentally routed extracted rows through
+        the episode shape would drop the extractor-only labels and
+        could pick up the new labels. Both directions are pinned
+        here."""
+        fact = _fact("id1", "Prefers tea.", ["preference"])
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        for label in ("Approach:", "Outcome:", "Lessons:", "Actors:"):
+            assert label not in text
+
+    def test_fact_view_episode_unchanged_migration_branch(self):
+        """Required as a separate test even though the assertion is
+        identical to the extracted-branch test, because the two cases
+        exercise different code paths: extracted goes through the
+        standalone `else:` arm at memory_command.py:706 (which never
+        touches `detail_lines`), while migration goes through the
+        combined branch with `detail_lines = []` initialized and the
+        inner `if source == "episode":` guard skipped, leaving the
+        splice empty. A regression mis-indenting the
+        `detail_lines.append(...)` calls so they fire for migration
+        too would only be caught by this test."""
+        fact = _migration_fact(tags=["migration", "backend"])
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        for label in ("Approach:", "Outcome:", "Lessons:", "Actors:"):
+            assert label not in text
 
 
 class TestDashboardEpisodesButton:
