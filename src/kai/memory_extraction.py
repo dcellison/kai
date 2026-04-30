@@ -1071,15 +1071,7 @@ def _validate_facts(
         # dropped (issue #414), the validator carries that contract
         # explicitly.
         if intent in ("skip_redundant", "update_of") and isinstance(existing_id, str):
-            # `or {}` collapses both "key absent" and "key present
-            # with a None payload" to the same empty-dict default.
-            # `.get(key, {})` only handles the first case; a
-            # MemoryResult constructed with metadata=None (a type
-            # violation but possible via direct dataclass
-            # construction in tests or future code) would store
-            # None as the dict value, and the next `.get("tags")`
-            # call would AttributeError.
-            existing_meta = candidate_metadata.get(existing_id) or {}
+            existing_meta = candidate_metadata.get(existing_id, {})
             existing_tags = existing_meta.get("tags") or []
             if "confirmed_action" in existing_tags:
                 log.debug(
@@ -1959,7 +1951,15 @@ async def extract_and_store(
             # tags to detect a confirmation row being consolidated by
             # a synonym-tagged fact. The full `candidates` list is
             # already in scope, so building the dict here is one line.
-            candidate_metadata: dict[str, dict] = {c.id: c.metadata for c in candidates}
+            # `or {}` at construction collapses any null metadata
+            # payload to an empty dict so the `dict[str, dict]`
+            # annotation is truthful and Rule 4b's lookup can stay
+            # clean (no second `or {}` at the consumer site). The
+            # MemoryResult dataclass types metadata as `dict` rather
+            # than `dict | None`, so this defends against a direct-
+            # construction type violation rather than a real runtime
+            # path - cheap insurance.
+            candidate_metadata: dict[str, dict] = {c.id: c.metadata or {} for c in candidates}
             # Emit the candidate-set log line exactly once per
             # extraction call, AFTER the fetch and BEFORE the
             # subprocess spawn. Always emitted (even when empty) so

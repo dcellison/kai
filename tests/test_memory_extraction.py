@@ -2332,12 +2332,15 @@ class TestExtractionPromptSoftVocab:
         prohibition surface without tripping a test. The looser
         "at least three" bar from v2 of the spec was a regression
         magnet."""
-        # The magic-string callout itself.
-        assert "structurally significant" in _EXTRACTION_SYSTEM_PROMPT
-        assert "MUST use the literal tag\n  `confirmed_action`" in _EXTRACTION_SYSTEM_PROMPT or (
-            "MUST use the literal tag `confirmed_action`" in _EXTRACTION_SYSTEM_PROMPT
-        )
-        # All four synonyms named in D2.
+        # Whitespace-normalize before the magic-string callout
+        # check so the assertion holds whether the prompt wraps
+        # "MUST use the literal tag `confirmed_action`" across a
+        # newline (the current shape) or on a single line (a
+        # plausible future reformat).
+        normalized = " ".join(_EXTRACTION_SYSTEM_PROMPT.split())
+        assert "structurally significant" in normalized
+        assert "MUST use the literal tag `confirmed_action`" in normalized
+        # All four synonyms named in the prompt's prohibition list.
         for synonym in ("confirmation", "confirmed", "user_confirmed", "confirm"):
             assert f"`{synonym}`" in _EXTRACTION_SYSTEM_PROMPT, f"synonym `{synonym}` missing"
 
