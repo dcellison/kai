@@ -84,7 +84,14 @@ DEDUP_SOURCES: frozenset[str] = frozenset({"extracted", "episode"})
 # plural/singular rule for these endings only fires when both the
 # plural form (ending in one of these patterns) and the singular form
 # (after dropping `-es`) are observed in the corpus.
-_SIBILANT_PLURAL_SUFFIXES: tuple[str, ...] = ("xes", "shes", "ches", "zes", "sses")
+#
+# `zzes` (not `zes`): a singular-z word like `size` makes its plural
+# via the bare `-s` rule (`size` + `s` -> `sizes`), not via `-es`.
+# Matching `zes` would generate a spurious `siz` candidate for `sizes`,
+# which the corpus check filters out in practice but wastes a candidate
+# slot. Restricting to `zzes` keeps the rule firing for genuine
+# sibilant-z plurals (`buzzes` -> `buzz`, `fizzes` -> `fizz`).
+_SIBILANT_PLURAL_SUFFIXES: tuple[str, ...] = ("xes", "shes", "ches", "zzes", "sses")
 
 
 # The structurally significant tag value that the extractor and validator
@@ -160,7 +167,7 @@ def _try_singular_forms(tag: str) -> list[str]:
       - `-ies/-y`: `categories` -> `category`. Applied first so the
         `-ies` ending does not get reduced to `categori` by the bare
         `-s` rule below.
-      - Sibilant `-es` removal (`-xes`, `-shes`, `-ches`, `-zes`,
+      - Sibilant `-es` removal (`-xes`, `-shes`, `-ches`, `-zzes`,
         `-sses`): `boxes` -> `box`. Applied before the bare `-s` rule
         so `boxes` does not first reduce to `boxe`.
       - Bare `-s` removal: `preferences` -> `preference`.
@@ -202,76 +209,93 @@ def _select_canonical(members: list[str], distribution: dict[str, int]) -> str:
 def identify_clusters(distribution: dict[str, int]) -> list[Cluster]:
     """Group tag variants into clusters and pick a canonical per group.
 
-    Three cluster-detection rules in priority order:
+    Three cluster-detection rules:
       - Case-insensitive equality: tags whose lowercase forms match
         cluster together.
-      - Plural/singular pairs: applied AFTER case folding so
-        `Preferences` and `preference` cluster correctly.
+      - Plural/singular pairs: case-fold representatives are joined
+        when one's singular candidate is another's case-fold form.
       - Within-row deduplication is handled per-row in
         `apply_cluster_to_row`, not here.
 
-    Skips any cluster where any member equals `confirmed_action`
-    (case-insensitive) per D5: the structurally significant tag must
-    not participate in any rewrite.
-    """
-    # Track which variants have already been assigned to a cluster so
-    # a tag is never claimed by two clusters. The cluster-key (the
-    # case-folded representative) doubles as the lookup key.
-    assigned: set[str] = set()
-    clusters: list[Cluster] = []
+    Implementation uses a union-find pass over case-fold keys so a
+    three-way overlap like `{"Preferences", "preferences", "preference"}`
+    collapses into a single cluster. A simpler "case-fold pass first,
+    then plural/singular pass" sequencing would emit two disjoint
+    clusters for that input because the first pass would eagerly claim
+    `["Preferences", "preferences"]` and the second pass would refuse
+    to link the already-assigned plural to the singular.
 
-    # Group by case-folded form first (rule 1). Iterate the distribution
-    # in deterministic order so the test surface is stable.
+    Skips any cluster where any member equals `confirmed_action`
+    (case-insensitive): the structurally significant tag must not
+    participate in any rewrite (the extractor pipeline keys off it
+    in `_validate_facts` Rules 4 and 4b plus the per-source render
+    branch in `_build_fact_view`).
+    """
+    # Group by case-folded form first. Iterate the distribution in
+    # deterministic order so the test surface is stable.
     by_case_fold: dict[str, list[str]] = {}
     for variant in sorted(distribution.keys()):
         case_fold = variant.lower()
         by_case_fold.setdefault(case_fold, []).append(variant)
 
-    # First pass: emit clusters for case-fold groups with multiple
-    # members. Single-member groups are candidates for the plural/
-    # singular pass below.
-    for case_fold, members in by_case_fold.items():
-        if len(members) < 2:
-            continue
-        # Cluster-skip: drop any cluster that touches confirmed_action.
-        # Compare case-folded so a hypothetical `Confirmed_Action`
-        # variant also trips the skip.
-        if case_fold == _CONFIRMED_ACTION_TAG:
-            continue
-        canonical = _select_canonical(members, distribution)
-        total = sum(distribution[m] for m in members)
-        clusters.append(Cluster(members=list(members), canonical=canonical, total_occurrences=total))
-        assigned.update(members)
+    # Union-find over case-fold keys. Two keys are in the same
+    # component when (a) they share a case-fold representative
+    # trivially (each key is its own initial component), or (b) one
+    # key's plural/singular candidate matches another key. Connected
+    # components emit one cluster each.
+    parent: dict[str, str] = {key: key for key in by_case_fold}
 
-    # Second pass: plural/singular pairs across case-folded representatives.
-    # For each unassigned case-fold key, generate singular candidates and
-    # check whether any of them is also an unassigned case-fold key.
-    case_fold_keys = sorted(by_case_fold.keys())
-    for plural_key in case_fold_keys:
-        # Skip case-fold groups already covered by the first pass.
-        if any(member in assigned for member in by_case_fold[plural_key]):
-            continue
+    def find(key: str) -> str:
+        # Iterative path compression. The while loop walks up the
+        # parent chain and rewires each node directly to the eventual
+        # root so subsequent finds are O(1).
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    def union(a: str, b: str) -> None:
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            parent[root_a] = root_b
+
+    # Walk the case-fold keys and link any pair where the plural's
+    # singular candidate matches another key. Iterate in sorted order
+    # for deterministic component-roots across runs.
+    for plural_key in sorted(by_case_fold.keys()):
         for singular_key in _try_singular_forms(plural_key):
             if singular_key == plural_key:
                 continue
             if singular_key not in by_case_fold:
                 continue
-            # Cluster-skip again: never collapse anything into or out
-            # of confirmed_action via the plural/singular rule.
+            # Cluster-skip: never link confirmed_action to anything via
+            # the plural/singular rule. Trips before the union so the
+            # confirmation case-fold key stays in its own component.
             if plural_key == _CONFIRMED_ACTION_TAG or singular_key == _CONFIRMED_ACTION_TAG:
                 continue
-            # Skip if either side has already been assigned.
-            singular_members = by_case_fold[singular_key]
-            if any(member in assigned for member in singular_members):
-                continue
-            plural_members = by_case_fold[plural_key]
-            members = list(plural_members) + list(singular_members)
-            canonical = _select_canonical(members, distribution)
-            total = sum(distribution[m] for m in members)
-            clusters.append(Cluster(members=members, canonical=canonical, total_occurrences=total))
-            assigned.update(members)
-            # First matching singular wins; do not also try other forms.
-            break
+            union(plural_key, singular_key)
+
+    # Build per-component member lists. Components with only one
+    # variant (single case-fold key, no plural/singular link, only one
+    # variant under the case-fold) are not clusters.
+    components: dict[str, list[str]] = {}
+    for case_fold_key in by_case_fold:
+        root = find(case_fold_key)
+        components.setdefault(root, []).extend(by_case_fold[case_fold_key])
+
+    clusters: list[Cluster] = []
+    for component_members in components.values():
+        if len(component_members) < 2:
+            continue
+        # Cluster-skip: drop any component that touches confirmed_action.
+        # Catches both the all-confirmation case-fold cluster and any
+        # hypothetical bypass that links confirmed_action to another
+        # form despite the union-skip above.
+        if any(member.lower() == _CONFIRMED_ACTION_TAG for member in component_members):
+            continue
+        canonical = _select_canonical(component_members, distribution)
+        total = sum(distribution[m] for m in component_members)
+        clusters.append(Cluster(members=list(component_members), canonical=canonical, total_occurrences=total))
 
     return clusters
 
@@ -287,7 +311,7 @@ def apply_cluster_to_row(
     collapse is the second pass: after all rewrites land, `dict.fromkeys`
     deduplicates while preserving order.
 
-    Row-level `confirmed_action` guard (D5 layer 2): if the input list
+    Row-level `confirmed_action` guard (defense-in-depth): if the input list
     contained `confirmed_action` but the output does not, return the
     input unchanged with a False change flag. This is unreachable under
     the cluster-skip in `identify_clusters` plus the rule that the
@@ -603,7 +627,7 @@ def main(argv: list[str] | None = None) -> int:
         # need a chat-id-keyed iteration source instead.
         target_ids = sorted(config.allowed_user_ids)
     else:
-        target_ids = [int(args.chat_id)]
+        target_ids = [args.chat_id]
 
     total_success = 0
     total_failure = 0

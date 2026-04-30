@@ -27,6 +27,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 from kai.config import DATA_DIR, Config
 
@@ -1281,7 +1282,7 @@ def delete_by_id(*, user_id: str, memory_id: str) -> bool:
     return True
 
 
-def update_metadata(*, user_id: str, memory_id: str, data: str, metadata: dict) -> bool:
+def update_metadata(*, user_id: str, memory_id: str, data: str, metadata: dict[str, Any]) -> bool:
     """Replace the metadata dict for `memory_id` belonging to `user_id`.
 
     IMPORTANT: Mem0's underlying `update` REPLACES the metadata dict

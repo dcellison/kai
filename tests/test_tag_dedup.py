@@ -154,6 +154,20 @@ class TestIdentifyClusters:
         assert sorted(clusters[0].members) == ["box", "boxes"]
         assert clusters[0].canonical == "box"
 
+    def test_three_way_case_and_plural_collapse(self):
+        # A case-fold pair AND a plural/singular link must collapse into
+        # one cluster, not two. The earlier two-pass implementation
+        # eagerly clustered `["Preferences", "preferences"]` in pass 1,
+        # then refused to link them to `"preference"` in pass 2 because
+        # the plural side was already assigned. Union-find over case-fold
+        # keys joins all three into one component.
+        clusters = dedup.identify_clusters({"Preferences": 1, "preferences": 2, "preference": 5})
+        assert len(clusters) == 1
+        assert sorted(clusters[0].members) == ["Preferences", "preference", "preferences"]
+        # Most-frequent wins: "preference" with 5 occurrences.
+        assert clusters[0].canonical == "preference"
+        assert clusters[0].total_occurrences == 8
+
     def test_singleton_tag_produces_no_cluster(self):
         # A tag with no near-duplicate in the corpus is not in a cluster.
         clusters = dedup.identify_clusters({"preference": 5})
@@ -346,10 +360,9 @@ class TestApplyRewrites:
 
         assert success == 0
         assert failure == 1
-        # Audit log was created (apply_rewrites opens in append mode)
-        # but contains no entries for failed rewrites.
-        if audit_log.exists():
-            assert audit_log.read_text() == ""
+        # Audit log was created (apply_rewrites opens in append mode
+        # unconditionally) but contains no entries for failed rewrites.
+        assert audit_log.read_text() == ""
 
 
 # ── CLI dispatch ──────────────────────────────────────────────────────
