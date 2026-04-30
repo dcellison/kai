@@ -69,6 +69,44 @@ def test_example_probe_fixture_loads():
         assert isinstance(p.expected, dict)
 
 
+def test_load_probes_malformed_json_raises_with_path_and_line(tmp_path: Path):
+    """A typo in a fixture line surfaces the file path and 1-based
+    line number, not a bare JSONDecodeError. Operators curate this
+    fixture by hand; the diagnostic context shortens the
+    typo-find-fix loop."""
+    f = tmp_path / "probes.jsonl"
+    f.write_text(
+        '{"probe_id":"p1","category":"workflow-noise",'
+        '"window":{"prior":[],"current":{"user":"u","assistant":"a"}},"expected":{}}\n'
+        "this is not json\n"
+    )
+    with pytest.raises(ValueError) as exc_info:
+        extraction.load_probes(f)
+    msg = str(exc_info.value)
+    # Path is in the message.
+    assert str(f) in msg
+    # Line number is 1-based; the bad line is the second one.
+    assert ":2:" in msg
+    # The underlying JSONDecodeError detail is preserved via the
+    # f-string so the operator sees what was wrong, not just where.
+    assert "invalid JSON" in msg
+
+
+def test_load_probes_missing_required_field_raises_with_path_and_line(tmp_path: Path):
+    """Same diagnostic context applies when a line is valid JSON
+    but lacks one of the required Probe fields. The KeyError raised
+    by the dict access is converted into the same ValueError shape
+    so the operator does not need to distinguish failure modes."""
+    f = tmp_path / "probes.jsonl"
+    f.write_text('{"probe_id":"p1","category":"workflow-noise"}\n')
+    with pytest.raises(ValueError) as exc_info:
+        extraction.load_probes(f)
+    msg = str(exc_info.value)
+    assert str(f) in msg
+    assert ":1:" in msg
+    assert "missing required field" in msg
+
+
 def test_load_probes_skips_comments_and_blanks(tmp_path: Path):
     """`#`-prefixed lines and blank lines must be ignored so the
     fixture format can carry inline documentation."""

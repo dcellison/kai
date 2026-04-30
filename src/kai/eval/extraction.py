@@ -255,19 +255,32 @@ def load_probes(path: Path) -> list[Probe]:
     """Parse a JSONL probe file. `#`-prefixed lines are comments."""
     probes: list[Probe] = []
     with path.open() as f:
-        for raw in f:
+        for line_number, raw in enumerate(f, start=1):
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
-            obj = json.loads(line)
-            probes.append(
-                Probe(
-                    probe_id=obj["probe_id"],
-                    category=obj["category"],
-                    window=obj["window"],
-                    expected=obj.get("expected", {}),
+            # Wrap JSON parsing so a malformed fixture line surfaces
+            # the file path and line number rather than a bare
+            # JSONDecodeError. Operators curate this fixture by
+            # hand from session history, so a typo on probe 12 of
+            # 20 should not produce a traceback that buries which
+            # probe broke. Same shape applies to a missing required
+            # field (probe_id / category / window).
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_number}: invalid JSON: {exc}") from exc
+            try:
+                probes.append(
+                    Probe(
+                        probe_id=obj["probe_id"],
+                        category=obj["category"],
+                        window=obj["window"],
+                        expected=obj.get("expected", {}),
+                    )
                 )
-            )
+            except KeyError as exc:
+                raise ValueError(f"{path}:{line_number}: missing required field {exc}") from exc
     return probes
 
 
