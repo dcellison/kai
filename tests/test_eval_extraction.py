@@ -187,7 +187,7 @@ class TestAggregate:
                 category="workflow-noise",
                 v5_facts=["x"],
                 v6_facts=[],
-                expected_outcome="workflow_dropped",
+                outcome="workflow_dropped",
                 v5_rule_6_rejections_delta=2,
                 v6_rule_6_rejections_delta=0,
             ),
@@ -196,7 +196,7 @@ class TestAggregate:
                 category="workflow-noise",
                 v5_facts=["x"],
                 v6_facts=["x"],
-                expected_outcome="regression",
+                outcome="regression",
                 v5_rule_6_rejections_delta=1,
                 v6_rule_6_rejections_delta=0,
             ),
@@ -205,7 +205,7 @@ class TestAggregate:
                 category="workflow-noise",
                 v5_facts=[],
                 v6_facts=[],
-                expected_outcome="ambiguous",
+                outcome="ambiguous",
                 v5_rule_6_rejections_delta=1,
                 v6_rule_6_rejections_delta=0,
             ),
@@ -214,7 +214,7 @@ class TestAggregate:
                 category="durable-content",
                 v5_facts=["x"],
                 v6_facts=["x"],
-                expected_outcome="durable_preserved",
+                outcome="durable_preserved",
                 v5_rule_6_rejections_delta=0,
                 v6_rule_6_rejections_delta=0,
             ),
@@ -223,7 +223,7 @@ class TestAggregate:
                 category="durable-content",
                 v5_facts=["x"],
                 v6_facts=[],
-                expected_outcome="regression",
+                outcome="regression",
                 v5_rule_6_rejections_delta=0,
                 v6_rule_6_rejections_delta=1,
             ),
@@ -251,7 +251,7 @@ class TestAggregate:
                 category="workflow-noise",
                 v5_facts=[],
                 v6_facts=[],
-                expected_outcome="ambiguous",
+                outcome="ambiguous",
                 v5_rule_6_rejections_delta=0,
                 v6_rule_6_rejections_delta=0,
             ),
@@ -259,6 +259,50 @@ class TestAggregate:
         agg = extraction._aggregate(outcomes)
         assert agg["workflow_drop_rate"] is None
         assert agg["durable_preservation_rate"] is None
+
+    def test_aggregate_excludes_error_outcomes_from_denominators(self):
+        """`error` outcomes are recorded in the report (operator
+        sees the failure) but skipped in the rate denominators
+        (parallel to `ambiguous`). Pins the per-probe-exception
+        behavior added so a single mid-run subprocess crash does
+        not poison the workflow_drop_rate or
+        durable_preservation_rate metrics."""
+        outcomes = [
+            extraction.ProbeOutcome(
+                probe_id="wf-1",
+                category="workflow-noise",
+                v5_facts=["x"],
+                v6_facts=[],
+                outcome="workflow_dropped",
+                v5_rule_6_rejections_delta=0,
+                v6_rule_6_rejections_delta=0,
+            ),
+            extraction.ProbeOutcome(
+                probe_id="wf-2",
+                category="workflow-noise",
+                v5_facts=[],
+                v6_facts=[],
+                outcome="error",
+                v5_rule_6_rejections_delta=0,
+                v6_rule_6_rejections_delta=0,
+            ),
+            extraction.ProbeOutcome(
+                probe_id="dur-1",
+                category="durable-content",
+                v5_facts=[],
+                v6_facts=[],
+                outcome="error",
+                v5_rule_6_rejections_delta=0,
+                v6_rule_6_rejections_delta=0,
+            ),
+        ]
+        agg = extraction._aggregate(outcomes)
+        # 1 of 1 scorable workflow probe; the error probe is excluded.
+        assert agg["workflow_drop_rate"] == 1.0
+        assert agg["scorable_workflow_count"] == 1
+        # Both durable probes are errors; the rate is None (not 0.0).
+        assert agg["durable_preservation_rate"] is None
+        assert agg["scorable_durable_count"] == 0
 
 
 class TestWindowToExtractorArgs:
@@ -288,6 +332,22 @@ class TestWindowToExtractorArgs:
                 {"role": "user", "text": "u1"},
                 {"role": "assistant", "text": "a1"},
                 {"role": "user", "text": "u2-orphan"},
+            ],
+            "current": {"user": "uc", "assistant": "ac"},
+        }
+        _, _, prior_pairs = extraction._window_to_extractor_args(window)
+        assert prior_pairs == [("u1", "a1")]
+
+    def test_orphan_assistant_without_preceding_user_dropped(self):
+        """An assistant turn that arrives before any user turn is
+        also dropped. Pinned alongside the user-orphan case so the
+        BOTH-DIRECTIONS contract documented in the function's
+        docstring is enforced symmetrically."""
+        window = {
+            "prior": [
+                {"role": "assistant", "text": "a-orphan"},
+                {"role": "user", "text": "u1"},
+                {"role": "assistant", "text": "a1"},
             ],
             "current": {"user": "uc", "assistant": "ac"},
         }

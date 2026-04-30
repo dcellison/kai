@@ -227,11 +227,22 @@ class Probe:
 
 @dataclass
 class ProbeOutcome:
+    """Per-probe result of running v5 and v6 extractor arms.
+
+    `outcome` is the v6 classification, NOT what the probe expected.
+    Possible values: `"workflow_dropped"`, `"durable_preserved"`,
+    `"regression"`, `"ambiguous"`, `"error"`. The first two are
+    wins; `regression` is a v6 failure; `ambiguous` is an
+    uninformative probe (e.g., v5 was empty so we cannot say v6
+    "dropped" anything); `error` is a probe that raised mid-run
+    and was captured rather than aborting the whole batch.
+    """
+
     probe_id: str
     category: str
     v5_facts: list[str]
     v6_facts: list[str]
-    expected_outcome: str
+    outcome: str
     # Rule 6 fires per-arm; the harness reports both deltas
     # separately so the v6 number is not inflated by v5's
     # higher rejection rate (v5 produces more workflow-event
@@ -265,10 +276,17 @@ def _window_to_extractor_args(window: dict) -> tuple[str, str, list[tuple[str, s
     `_build_extraction_payload` expects.
 
     `prior` is rendered as a list of `(user_text, assistant_text)`
-    pairs, mirroring the production `prior_pairs` shape; an entry
-    is omitted when its role's text is missing (the schema allows
-    asymmetric prior turns). `current.user` and `current.assistant`
-    map directly onto the function's first two positional args.
+    pairs, mirroring the production `prior_pairs` shape. Orphan
+    turns are silently dropped in BOTH directions: a user turn with
+    no following assistant reply is omitted (the user reply has
+    nothing to pair with), and an assistant turn that arrives
+    before any user turn (`pending_user is None`) is also omitted.
+    The schema allows asymmetric prior turns at the JSON layer for
+    fixture-author flexibility; the function commits to a paired
+    rendering for the production payload, so a fixture author who
+    wants an orphan to surface should restructure the window.
+    `current.user` and `current.assistant` map directly onto the
+    function's first two positional args.
     """
     prior_raw = window.get("prior", []) or []
     prior_pairs: list[tuple[str, str]] = []
@@ -340,14 +358,14 @@ async def _run_one_probe(
     v5_facts = [str(f.get("content", "")) for f in v5_result.facts]
     v6_facts = [str(f.get("content", "")) for f in v6_result.facts]
 
-    expected_outcome = _classify_outcome(probe, v5_facts=v5_facts, v6_facts=v6_facts)
+    classified = _classify_outcome(probe, v5_facts=v5_facts, v6_facts=v6_facts)
 
     return ProbeOutcome(
         probe_id=probe.probe_id,
         category=probe.category,
         v5_facts=v5_facts,
         v6_facts=v6_facts,
-        expected_outcome=expected_outcome,
+        outcome=classified,
         v5_rule_6_rejections_delta=v5_rule_6_delta,
         v6_rule_6_rejections_delta=v6_rule_6_delta,
     )
@@ -420,16 +438,22 @@ def _aggregate(outcomes: list[ProbeOutcome]) -> dict:
     durable_preserves = 0
     v5_rule_6_total = 0
     v6_rule_6_total = 0
+    # Outcomes excluded from rate denominators: `ambiguous` (probe
+    # was uninformative) and `error` (probe raised mid-run; see
+    # `_run_async` for the per-probe try/except). Both go in the
+    # report so the operator sees them, but they do not feed the
+    # workflow_drop_rate or durable_preservation_rate arithmetic.
+    _SKIP_OUTCOMES = {"ambiguous", "error"}
     for o in outcomes:
         v5_rule_6_total += o.v5_rule_6_rejections_delta
         v6_rule_6_total += o.v6_rule_6_rejections_delta
-        if o.category == "workflow-noise" and o.expected_outcome != "ambiguous":
+        if o.category == "workflow-noise" and o.outcome not in _SKIP_OUTCOMES:
             workflow_total += 1
-            if o.expected_outcome == "workflow_dropped":
+            if o.outcome == "workflow_dropped":
                 workflow_drops += 1
-        elif o.category == "durable-content" and o.expected_outcome != "ambiguous":
+        elif o.category == "durable-content" and o.outcome not in _SKIP_OUTCOMES:
             durable_total += 1
-            if o.expected_outcome == "durable_preserved":
+            if o.outcome == "durable_preserved":
                 durable_preserves += 1
     return {
         "workflow_drop_rate": (workflow_drops / workflow_total) if workflow_total else None,
@@ -461,14 +485,33 @@ async def _run_async(args: argparse.Namespace) -> int:
 
     outcomes: list[ProbeOutcome] = []
     for probe in probes:
-        outcome = await _run_one_probe(probe, config, user_id=args.user_id)
+        try:
+            result = await _run_one_probe(probe, config, user_id=args.user_id)
+        except Exception as exc:
+            # One probe failure must not abort the whole run. A live
+            # 20-probe run wastes meaningful subprocess cost if it
+            # bails on a transient JSON parse error or a timeout.
+            # Record the failure as an "error" outcome so the report
+            # carries a row, then continue. The aggregate counters
+            # exclude error outcomes (same denominator-shielding the
+            # ambiguous bucket gets).
+            log.exception("probe %s failed: %s", probe.probe_id, exc)
+            result = ProbeOutcome(
+                probe_id=probe.probe_id,
+                category=probe.category,
+                v5_facts=[],
+                v6_facts=[],
+                outcome="error",
+                v5_rule_6_rejections_delta=0,
+                v6_rule_6_rejections_delta=0,
+            )
         log.info(
             "probe %s [%s] -> %s",
-            outcome.probe_id,
-            outcome.category,
-            outcome.expected_outcome,
+            result.probe_id,
+            result.category,
+            result.outcome,
         )
-        outcomes.append(outcome)
+        outcomes.append(result)
 
     aggregate = _aggregate(outcomes)
     probe_set_text = "\n".join(json.dumps(asdict(p), sort_keys=True) for p in probes)
