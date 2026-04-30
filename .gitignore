@@ -53,6 +53,7 @@ home/config/*
 home/evals/*
 !home/evals/retrieval-baseline.example.json
 !home/evals/probes.example.jsonl
+!home/evals/extraction-probes.example.jsonl
 
 # OS / IDE
 .DS_Store

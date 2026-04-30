@@ -30,6 +30,8 @@ from kai.memory_extraction import (
     _EXTRACTION_SYSTEM_PROMPT,
     _FACT_SCHEMA,
     _GENERIC_CONFIRMATION_RE,
+    _RULE_6_REJECTIONS,
+    _WORKFLOW_EVENT_RE,
     _build_extraction_payload,
     _capped_assistant,
     _emit_intent_log,
@@ -41,6 +43,7 @@ from kai.memory_extraction import (
     _strip_role_labels,
     _validate_facts,
     extract_and_store,
+    get_extractor_stats,
 )
 
 # ── Fixtures ─────────────────────────────────────────────────────────
@@ -2347,23 +2350,263 @@ class TestExtractionPromptSoftVocab:
 
     def test_extraction_prompt_version_bumped(self):
         """The version stamp on every fact's metadata; bumped
-        because the schema and prompt changed in tandem."""
-        assert _EXTRACTION_PROMPT_VERSION == "5"
+        whenever the schema or prompt changes meaningfully."""
+        assert _EXTRACTION_PROMPT_VERSION == "6"
 
     def test_extraction_prompt_version_history_extended(self):
         """The prompt-version history comment block (the sequence
         of `#` comments preceding `_EXTRACTION_PROMPT_VERSION`) is
         NOT a module docstring; importable runtime state cannot
-        capture it. Read source text and grep for the unique
-        history fragment so a future unrelated edit that
-        introduces a `v5:` token elsewhere cannot satisfy this
-        test vacuously."""
+        capture it. Read source text and grep for unique history
+        fragments so a future unrelated edit that introduces a `vN:`
+        token elsewhere cannot satisfy this test vacuously.
+
+        Both v5 and v6 fragments are pinned: v5 stays in source
+        unchanged across the v6 bump, and v6 was appended in this
+        spec's history block."""
         from pathlib import Path
 
         import kai.memory_extraction
 
         src = Path(kai.memory_extraction.__file__).read_text()
         assert "v5: free-form tag schema (enum dropped)" in src
+        assert "v6 (2026-04-30, this issue)" in src
+        assert "DURABILITY TEST gate" in src
+
+
+class TestRule6WorkflowEventRegex:
+    """Rule 6 in `_validate_facts` rejects facts whose `content` is
+    pure session-event metadata. The regex catches four shapes,
+    each pinned with positive and negative cases drawn from the
+    2026-04-30 hygiene sweep deletion set + the 8 KEEP entries
+    audited from that sweep."""
+
+    def test_arm1_user_or_oc_decided_to_workflow_action(self):
+        """Arm 1: `^(User|OC)\\s+(decided|requested)\\s+to\\s+
+        (file|create|address|conduct|evaluate|perform|update|push)`.
+        Catches "User/OC decided/requested to <verb>" workflow
+        actions."""
+        positives = [
+            "User decided to file an issue about memory.recall query truncation.",
+            "User requested to update issue #385 with the Sophia field set.",
+            "OC decided to perform a code review of PR #409.",
+            "User decided to address issue #338",
+        ]
+        for content in positives:
+            assert _WORKFLOW_EVENT_RE.search(content), content
+
+    def test_arm2_spec_pr_issue_event(self):
+        """Arm 2: artifact-shape + intervening tokens? +
+        was/were/received + verdict-class noun. Catches "Spec X /
+        PR Y / issue Z (version qualifier)? was/were/received
+        ... <verdict>" wordings.
+
+        Coverage note: "Spec X v1 evaluation verdict IS changes
+        requested" (using "is") is NOT caught by arm 2 because
+        adding "is" to the verb list would false-positive on
+        ordinary statements like "Memory is enabled". The prompt's
+        IGNORE rules cover that shape; the regex stays scoped to
+        the past-tense / received variants."""
+        positives = [
+            "PR #424 received a code review verdict of approved cleanly with no blockers.",
+            "Specification 412 version 3 was approved with three sub-blocking nits.",
+            "Spec 416 (memory UI tag dismantle) version 4 received final approval.",
+        ]
+        for content in positives:
+            assert _WORKFLOW_EVENT_RE.search(content), content
+
+    def test_arm3_findings_closed(self):
+        """Arm 3: `All N (vM)? findings? (were|are) closed`."""
+        positives = [
+            "All eleven v1 findings were closed in v2 with verified-against-source fixes.",
+            "All eight findings are closed.",
+        ]
+        for content in positives:
+            assert _WORKFLOW_EVENT_RE.search(content), content
+
+    def test_arm4_evaluation_of_artifact(self):
+        """Arm 4: `evaluation of (spec|specification|issue|PR) X
+        (produced|was|determined) Y`."""
+        positives = [
+            "The evaluation of specification 380 was written to /tmp/spec-380-evaluation-v1.md",
+            "The evaluation of spec 416 produced a verdict of 'changes requested'.",
+            "The evaluation of PR #X determined three should-fix items.",
+        ]
+        for content in positives:
+            assert _WORKFLOW_EVENT_RE.search(content), content
+
+    def test_durable_content_does_not_match(self):
+        """Durable design decisions, constraints, and preferences
+        are the load-bearing negatives. A regression that broadens
+        the regex to catch substantive content trips here first."""
+        negatives = [
+            "User decided stage 2 should provide only single-turn context (architecture A).",
+            "User stated that collision possibilities between MEMORY.md and Qdrant must be mitigated.",
+            "User prefers Earl Grey over English Breakfast.",
+            "User decided to use a 3-4 turn window for the Haiku memory extraction process.",
+            "User decided the shared /opt/kai/home/ directory must be removed entirely.",
+        ]
+        for content in negatives:
+            assert not _WORKFLOW_EVENT_RE.search(content), content
+
+    def test_rule_6_rejects_workflow_fact_via_validate_facts(self):
+        """End-to-end: a workflow-event fact passed through
+        `_validate_facts` is dropped, the rejection counter
+        increments, and the legitimate fact in the same batch
+        survives."""
+        # Reset the counter so test order does not affect the delta.
+        before = sum(_RULE_6_REJECTIONS.snapshot().values())
+        facts = [
+            {
+                "content": "User decided to file an issue about Track 1.",
+                "tags": ["decision", "project"],
+                "confidence": 0.95,
+                "intent": "new",
+            },
+            {
+                "content": "User prefers Earl Grey over English Breakfast.",
+                "tags": ["preference"],
+                "confidence": 0.9,
+                "intent": "new",
+            },
+        ]
+        validated = _validate_facts(
+            facts,
+            candidate_ids=set(),
+            candidate_metadata={},
+            user_id="test-user-rule6",
+        )
+        kept = [f["content"] for f in validated]
+        assert "User decided to file an issue about Track 1." not in kept
+        assert "User prefers Earl Grey over English Breakfast." in kept
+        after = sum(_RULE_6_REJECTIONS.snapshot().values())
+        assert after - before == 1
+
+    def test_rule_6_skips_confirmed_action_rows(self):
+        """Pins B2 of the spec eval: a confirmed_action fact whose
+        content matches arm 2 ("User confirmed PR #299 was merged
+        on 2026-04-12") must NOT be rejected because the per-fact
+        skip ahead of Rule 6 trusts the existing Rule 1/2/4/4b
+        confirmation chain."""
+        before = sum(_RULE_6_REJECTIONS.snapshot().values())
+        facts = [
+            {
+                "content": "User confirmed PR #299 was merged on 2026-04-12.",
+                "tags": ["confirmed_action"],
+                "confidence": 0.9,
+                "intent": "new",
+                "confirmation_quote": "I see PR #299 is merged, thanks for the update.",
+            },
+        ]
+        validated = _validate_facts(
+            facts,
+            candidate_ids=set(),
+            candidate_metadata={},
+            user_id="test-user-rule6-skip",
+        )
+        kept = [f["content"] for f in validated]
+        # The fact survives. The regex matches the content, but the
+        # confirmed_action skip protects it.
+        assert "User confirmed PR #299 was merged on 2026-04-12." in kept
+        # Counter unchanged: Rule 6 did not fire on this fact.
+        after = sum(_RULE_6_REJECTIONS.snapshot().values())
+        assert after - before == 0
+
+    def test_get_extractor_stats_exposes_rule_6_counter(self):
+        """`get_extractor_stats()` returns the documented top-level
+        shape with the per-user counter map under `rule_6_rejections`."""
+        stats = get_extractor_stats()
+        assert "rule_6_rejections" in stats
+        assert isinstance(stats["rule_6_rejections"], dict)
+
+
+class TestExtractionPromptDurability:
+    """Pins the v6 prompt content additions: STORE / Decisions
+    refinement, two new IGNORE bullets, and the DURABILITY TEST
+    section header. Substring assertions only; the exact wording
+    is captured byte-for-byte by the source-text history-fragment
+    test in TestExtractionPromptSoftVocab."""
+
+    def test_store_decisions_scoped_to_durable(self):
+        assert "durable scope" in _EXTRACTION_SYSTEM_PROMPT
+        assert "NOT workflow micro-decisions" in _EXTRACTION_SYSTEM_PROMPT
+
+    def test_ignore_bullets_added(self):
+        assert "Workflow-event metadata" in _EXTRACTION_SYSTEM_PROMPT
+        assert "Decisions to do" in _EXTRACTION_SYSTEM_PROMPT
+        # Concrete examples carried in the bullets so the model has
+        # specific noise patterns to match against.
+        assert "Spec X v3 was approved" in _EXTRACTION_SYSTEM_PROMPT
+        assert "User decided to file an issue about X" in _EXTRACTION_SYSTEM_PROMPT
+
+    def test_durability_test_section_present(self):
+        assert "DURABILITY TEST:" in _EXTRACTION_SYSTEM_PROMPT
+        # The 30-day frame is the operationally usable phrasing.
+        assert "30 days" in _EXTRACTION_SYSTEM_PROMPT
+
+
+class TestRunExtractorSystemPromptDefault:
+    """Pins B1's compatibility contract: `_run_extractor` accepts a
+    keyword-only `system_prompt` parameter that defaults to the
+    active `_EXTRACTION_SYSTEM_PROMPT`. Production callers that omit
+    the kwarg see byte-identical subprocess argv compared to before
+    the parameter was added."""
+
+    def test_default_kwarg_threads_active_prompt(self, monkeypatch):
+        """Stub `asyncio.create_subprocess_exec` to capture argv.
+        Call `_run_extractor` without `system_prompt`. Assert the
+        captured argv carries `_EXTRACTION_SYSTEM_PROMPT` (the
+        active module-level constant) at the slot following
+        `--system-prompt`."""
+        import asyncio
+
+        from kai import memory_extraction
+
+        captured: dict = {}
+
+        class _StubProc:
+            returncode = 0
+            stdout = None
+            stderr = None
+
+            async def communicate(self, input=None):
+                # Return a minimal valid extractor JSON response so
+                # the caller's parse path does not raise.
+                payload = b'{"facts": [], "has_episode": false}'
+                return (payload, b"")
+
+            async def wait(self):
+                return 0
+
+            def kill(self):
+                pass
+
+        async def _stub_create_subprocess_exec(*args, **kwargs):
+            captured["argv"] = args
+            return _StubProc()
+
+        monkeypatch.setattr(
+            memory_extraction.asyncio,
+            "create_subprocess_exec",
+            _stub_create_subprocess_exec,
+        )
+
+        async def _run():
+            return await memory_extraction._run_extractor(
+                "test payload",
+                _BASE_CONFIG,
+                candidate_ids=set(),
+                candidate_metadata={},
+                user_id="test-user-default-kwarg",
+            )
+
+        asyncio.run(_run())
+
+        argv = captured["argv"]
+        # Find the slot following `--system-prompt`.
+        idx = argv.index("--system-prompt")
+        threaded = argv[idx + 1]
+        assert threaded == _EXTRACTION_SYSTEM_PROMPT, "default kwarg must thread the active prompt byte-for-byte"
 
 
 class TestValidateFactsRule4b:

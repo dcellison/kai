@@ -59,7 +59,17 @@ log = logging.getLogger(__name__)
 # existing confirmation rows. `maxItems` raised from 4 to 5 to
 # match `_EPISODE_SCHEMA` per the parent issue's "single tag
 # taxonomy" decision.
-_EXTRACTION_PROMPT_VERSION: str = "5"
+# v6 (2026-04-30, this issue): scoped Decisions / workflow-event
+# IGNORE / DURABILITY TEST gate. The STORE / Decisions bullet was
+# narrowed to durable architectural and design decisions only;
+# workflow micro-decisions ("which task to do next", "which spec
+# to evaluate", "which issue to file") were carved out into the
+# IGNORE list as transient session activity. A new DURABILITY
+# TEST section asks "would this fact still be useful in 30 days?"
+# as the last gate before emit. Schema unchanged; v6's bump lets
+# future-cleanup queries target rows produced under the new
+# wording (`prompt_version != "6" AND <noise pattern>`).
+_EXTRACTION_PROMPT_VERSION: str = "6"
 
 # Sibling of _EXTRACTION_PROMPT_VERSION for stage-2 episode generation.
 # Stored in each episode's metadata so future cleanups can target a
@@ -318,8 +328,13 @@ STORE these fact types:
   what the user likes or dislikes).
 - Stable facts about the user (e.g., location, role, project names,
   repo names, hardware).
-- Decisions the user made in this exchange ("we're going with X",
-  "let's use Y", "I decided Z").
+- Architectural or design decisions the user made in this exchange
+  with durable scope ("we're going with async architecture",
+  "default to option B in v1 of the spec", "the home workspace
+  must be per-user, not shared"). NOT workflow micro-decisions
+  about which task to do next, which spec to evaluate, or which
+  issue to file - those are transient session activity. Apply the
+  DURABILITY TEST below.
 - Actions the user confirmed happened, BUT with strict evidence
   rules to prevent laundered hallucinations:
   1. A confirmed_action fact must include a `confirmation_quote`
@@ -348,10 +363,38 @@ IGNORE:
 - Intermediate reasoning, tool-output summaries, step-by-step plans.
 - Transient conversation state (what you are mid-doing, open
   questions, clarifying requests).
+- Workflow-event metadata: spec/PR/issue lifecycle events. Examples
+  to NOT extract: "Spec X v3 was approved", "PR Y received a review
+  verdict of Z", "All N findings were closed in vM",
+  "The evaluation of spec Q produced a verdict of R". The durable
+  artifact is the spec/PR/issue itself; events around it are
+  transient session activity that loses meaning once the event
+  closes.
+- "Decisions to do" workflow actions: a decision to file an issue,
+  create a spec, request an evaluation, run a test, or perform
+  any other workflow action. The artifact produced (the issue,
+  the spec, the test result) is the durable fact; the
+  decision-to-do is workflow noise. Examples to NOT extract:
+  "User decided to file an issue about X", "User requested
+  evaluation of spec Y", "User decided to address issue #Z",
+  "User confirmed test input triggered the pipeline".
 - Casual chat, greetings, acknowledgments, thanks without content.
 - Anything that contradicts a stated user preference.
 - Code snippets, file contents, error messages (store facts about
   them if needed, not the raw text).
+
+DURABILITY TEST:
+
+Before emitting any fact, ask: "would this still be useful context
+in 30 days?" If the answer is no - because the fact captures a
+workflow event, a one-off task decision, a status of work in
+progress that will have shipped or moved on, or a session-event
+metadata fragment - do not emit it. The 30-day test catches the
+most common low-quality extraction: session-event metadata that
+reads as fact-shaped but loses meaning once the event closes.
+
+If a fact passes IGNORE rules but fails the durability test,
+do not emit it.
 
 CONFIDENCE:
 - Only store facts you can phrase as a single clear sentence.
@@ -903,6 +946,90 @@ def _build_extraction_payload(
 _CONSOLIDATION_INTENTS: frozenset[str] = frozenset({"new", "update_of", "skip_redundant"})
 
 
+# Workflow-event regex (Rule 6 in `_validate_facts`). Rejects facts
+# whose content is pure session-event metadata: spec/PR/issue
+# lifecycle events and "User decided/requested to <workflow-action>"
+# wordings. Pattern is intentionally narrower than the prompt's
+# IGNORE rules; the prompt is the primary gate, this regex is
+# defense-in-depth for the cases where the model emits noise despite
+# the prompt. The model can defeat the regex by paraphrasing; a
+# future broader pattern (or per-extractor model upgrade) can be
+# added later without churning Rule 6's structure.
+#
+# Each arm catches a distinct shape observed in the 2026-04-30
+# hygiene sweep's 70-row deletion set; the inline comment above each
+# arm names the shape and any known coverage gap. Confirmation rows
+# can match arm 2 (e.g., "User confirmed PR #299 was merged on
+# 2026-04-12"); the per-fact `confirmed_action` skip in Rule 6
+# handles that case before this regex evaluates.
+_WORKFLOW_EVENT_RE = re.compile(
+    r"("
+    # Arm 1: "User/OC decided/requested to file/create/address/
+    # conduct/evaluate/perform/update/push <something>"
+    r"^(User|OC)\s+(decided|requested)\s+to\s+"
+    r"(file|create|address|conduct|evaluate|perform|update|push)\b"
+    r"|"
+    # Arm 2: "Spec X / PR Y / issue Z (intervening tokens)?
+    # was/were/received ... <verdict>". The `(\S+\s+)*?` allows
+    # multi-word identifiers and version qualifiers between the
+    # artifact id and the verb, e.g., "Specification 412 version 3
+    # was approved" or "Spec 416 (memory UI tag dismantle) version 4
+    # received final approval"; lazy quantification keeps the
+    # capture short.
+    r"\b(spec(ification)?\s+\S+|PR\s+#?\d+|issue\s+#?\d+)"
+    r"\s+(\S+\s+)*?(was|were|received)\b"
+    r".*\b(approved|approval|reviewed|merged|verdict|finding)\b"
+    r"|"
+    # Arm 3: "All N findings were closed in vM" /
+    # "All N v1 findings were closed"
+    r"\bAll\s+\w+\s+(v\d+\s+)?findings?\s+(were|are)\s+closed\b"
+    r"|"
+    # Arm 4: "The evaluation of spec/issue/PR X
+    # produced/was/determined Y". The v1 spec proposed an "OC's vN
+    # evaluation ..." sub-arm that was dropped to keep internal
+    # review-loop vocabulary out of production source; the prompt's
+    # IGNORE rules cover the residual shape.
+    r"\b(evaluation\s+of\s+(spec(ification)?|issue|PR)\s+\S+"
+    r"\s+(produced|was|determined))\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+class _Counter:
+    """Per-user rejection counter for `_validate_facts` Rule 6.
+
+    Lives in-process; resets on extractor restart. Exposed via
+    `get_extractor_stats()` for operational dashboards or eval
+    harnesses (the Layer 4 head-to-head harness reads it to assert
+    on rejection rates without parsing log lines).
+    """
+
+    def __init__(self) -> None:
+        self._counts: dict[str, int] = {}
+
+    def increment(self, *, user_id: str) -> None:
+        self._counts[user_id] = self._counts.get(user_id, 0) + 1
+
+    def snapshot(self) -> dict[str, int]:
+        return dict(self._counts)
+
+
+# Module-level counter for Rule 6 rejections, keyed by `user_id`.
+# Process-local; not persisted. Read via `get_extractor_stats()`.
+_RULE_6_REJECTIONS = _Counter()
+
+
+def get_extractor_stats() -> dict[str, dict[str, int]]:
+    """Snapshot of in-process extractor counters.
+
+    Currently exposes Rule 6 rejection counts per user_id. Structure
+    is extensible (top-level dict keyed by counter name) so future
+    counters can land without breaking callers.
+    """
+    return {"rule_6_rejections": _RULE_6_REJECTIONS.snapshot()}
+
+
 def _validate_facts(
     facts: list[dict],
     candidate_ids: set[str],
@@ -1099,6 +1226,32 @@ def _validate_facts(
             )
             continue
 
+        # Rule 6: reject workflow-event-shaped content. Defense-in-depth
+        # against the prompt's IGNORE rules missing edge cases. The
+        # rejection is logged at INFO (not DEBUG) because the rate of
+        # Rule 6 rejections is itself an operational signal: if Rule 6
+        # fires often the prompt is leaking, and the prompt should be
+        # tightened rather than the regex broadened.
+        # `_RULE_6_REJECTIONS` increments per user so the rate is
+        # observable via `get_extractor_stats()` without grepping logs.
+        #
+        # Confirmed-action rows are skipped because the canonical
+        # confirmation example "User confirmed PR #299 was merged on
+        # 2026-04-12" matches arm 2 of `_WORKFLOW_EVENT_RE`. The
+        # existing Rule 1/2/4/4b chain already gates the
+        # confirmed_action path with strict quote and tag rules;
+        # trusting them here keeps Rule 6 narrowly scoped to its
+        # purpose (workflow-event noise without a confirmation anchor).
+        if "confirmed_action" not in tags:
+            content = fact.get("content", "")
+            if isinstance(content, str) and _WORKFLOW_EVENT_RE.search(content):
+                log.info(
+                    "_validate_facts: rejecting workflow-event-shaped fact: %r",
+                    content[:120],
+                )
+                _RULE_6_REJECTIONS.increment(user_id=user_id)
+                continue
+
         # Confirmation-quote rules (preserved from the pre-consolidation
         # validator). These run AFTER the consolidation rules so a
         # fact that hits both classes of rejection is rejected for the
@@ -1167,6 +1320,7 @@ async def _run_extractor(
     candidate_ids: set[str],
     candidate_metadata: dict[str, dict],
     user_id: str,
+    system_prompt: str = _EXTRACTION_SYSTEM_PROMPT,
 ) -> ExtractionResult:
     """
     Spawn `claude --print` with the extractor prompt and parse the JSON.
@@ -1245,7 +1399,7 @@ async def _run_extractor(
         "--json-schema",
         json.dumps(_FACT_SCHEMA),
         "--system-prompt",
-        _EXTRACTION_SYSTEM_PROMPT,
+        system_prompt,
         "--permission-mode",
         "bypassPermissions",
         "--tools",
