@@ -509,14 +509,19 @@ def _classify_outcome(probe: Probe, *, v5_facts: list[str], v6_facts: list[str])
             return "workflow_dropped"
         return "regression"
     if probe.category == "durable-content":
-        # The win condition: v6 produced at least one fact carrying
-        # the required substrings. Symmetric ambiguity check first:
-        # if BOTH arms came up empty the probe window is too sparse
-        # to inform v5-vs-v6 (parallel to the workflow-noise
-        # branch's `if not v5_facts: return "ambiguous"`). When v5
-        # produced facts but v6 did not, that IS a regression
-        # because the durable fact must come through under v6.
-        if not v5_facts and not v6_facts:
+        # The win condition: v6 PRESERVED a fact v5 also produced.
+        # Symmetric ambiguity checks come first:
+        #   - both arms empty: probe window too sparse to inform.
+        #   - v5 empty, v6 non-empty: v6 found something v5 missed.
+        #     Nothing was "preserved" because v5 had nothing to
+        #     start with; treat as ambiguous rather than counting
+        #     a v6 strict-improvement as preservation. Mirrors the
+        #     workflow-noise branch's `if not v5_facts: return
+        #     "ambiguous"` symmetric guard.
+        # When v5 produced facts but v6 did not, that IS a
+        # regression because the durable fact must come through
+        # under v6.
+        if not v5_facts:
             return "ambiguous"
         if not v6_facts:
             return "regression"
@@ -544,15 +549,15 @@ def _aggregate(outcomes: list[ProbeOutcome]) -> dict:
     # `_run_async` for the per-probe try/except). Both go in the
     # report so the operator sees them, but they do not feed the
     # workflow_drop_rate or durable_preservation_rate arithmetic.
-    _SKIP_OUTCOMES = {"ambiguous", "error"}
+    skip_outcomes = {"ambiguous", "error"}
     for o in outcomes:
         v5_rule_6_total += o.v5_rule_6_rejections_delta
         v6_rule_6_total += o.v6_rule_6_rejections_delta
-        if o.category == "workflow-noise" and o.outcome not in _SKIP_OUTCOMES:
+        if o.category == "workflow-noise" and o.outcome not in skip_outcomes:
             workflow_total += 1
             if o.outcome == "workflow_dropped":
                 workflow_drops += 1
-        elif o.category == "durable-content" and o.outcome not in _SKIP_OUTCOMES:
+        elif o.category == "durable-content" and o.outcome not in skip_outcomes:
             durable_total += 1
             if o.outcome == "durable_preserved":
                 durable_preserves += 1

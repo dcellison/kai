@@ -325,6 +325,21 @@ class TestClassifyOutcome:
         )
         assert outcome == "ambiguous"
 
+    def test_durable_v5_empty_v6_extracts_is_ambiguous(self, durable_probe):
+        """v5 produced nothing; v6 found a fact carrying the
+        must_contain anchor. Nothing was "preserved" because v5
+        had nothing to preserve; counting this as
+        `durable_preserved` would inflate the rate by classifying
+        a v6 strict-improvement as preservation. Mirrors the
+        workflow-noise branch's symmetric `not v5_facts ->
+        ambiguous` guard."""
+        outcome = extraction._classify_outcome(
+            durable_probe,
+            v5_facts=[],
+            v6_facts=["User prefers Earl Grey."],
+        )
+        assert outcome == "ambiguous"
+
 
 class TestAggregate:
     def test_aggregate_rates_skip_ambiguous(self):

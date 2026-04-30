@@ -2454,7 +2454,7 @@ class TestRule6WorkflowEventRegex:
         `_validate_facts` is dropped, the rejection counter
         increments, and the legitimate fact in the same batch
         survives."""
-        # Reset the counter so test order does not affect the delta.
+        # Snapshot the baseline so test order does not affect the delta.
         before = sum(_RULE_6_REJECTIONS.snapshot().values())
         facts = [
             {
