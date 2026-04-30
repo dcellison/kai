@@ -15,11 +15,13 @@ What we pin here:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from pathlib import Path
 
 import pytest
 
+from kai import memory_extraction
 from kai.eval import extraction
 
 # Hash of `_PROMPT_V5_PINNED` captured at #426 landing. If the
@@ -163,15 +165,29 @@ class TestClassifyOutcome:
         )
         assert outcome == "regression"
 
-    def test_durable_v6_empty_is_regression(self, durable_probe):
-        """Durable category cares about preservation; an empty v6 is
-        a regression even if v5 was also empty."""
+    def test_durable_v5_extracts_v6_empty_is_regression(self, durable_probe):
+        """Durable category cares about preservation; when v5
+        produced a fact but v6 did not, that is a regression
+        because the durable fact must come through under v6."""
         outcome = extraction._classify_outcome(
             durable_probe,
             v5_facts=["User prefers Earl Grey."],
             v6_facts=[],
         )
         assert outcome == "regression"
+
+    def test_durable_both_empty_is_ambiguous(self, durable_probe):
+        """Symmetric to workflow-noise: a durable-content probe
+        whose window is too sparse to produce extractions on either
+        arm is uninformative, not a v6 failure. Treating it as a
+        regression silently inflates the regression count and
+        deflates `durable_preservation_rate`."""
+        outcome = extraction._classify_outcome(
+            durable_probe,
+            v5_facts=[],
+            v6_facts=[],
+        )
+        assert outcome == "ambiguous"
 
 
 class TestAggregate:
@@ -303,6 +319,64 @@ class TestAggregate:
         # Both durable probes are errors; the rate is None (not 0.0).
         assert agg["durable_preservation_rate"] is None
         assert agg["scorable_durable_count"] == 0
+
+
+class TestRunOneProbeErrorPath:
+    """`_run_one_probe` never raises. On exception it returns a
+    ProbeOutcome with outcome=`error` and whatever per-arm Rule 6
+    deltas it captured before the failure. Pinned because the
+    error-path delta accuracy is operator-facing: a v5 arm that
+    completed should report its real rejection delta even when v6
+    crashes mid-run, otherwise `_aggregate`'s v5_rule_6_rejections
+    total is silently under-counted."""
+
+    def test_v6_exception_preserves_v5_delta(self, monkeypatch):
+        """Drive v5 to completion (returning a fact that fires
+        Rule 6) and v6 to raise. The returned ProbeOutcome must
+        carry outcome=`error`, the v5 delta from the real arm, and
+        v6 delta = 0 (v6 never produced facts)."""
+        # Reset the counter's contents in-place so the test's delta
+        # arithmetic is independent of preceding tests' state. We
+        # do NOT reassign `_RULE_6_REJECTIONS` because other test
+        # modules import it by name; reassignment would leave them
+        # pointing at the old (stale) counter object.
+        memory_extraction._RULE_6_REJECTIONS._counts.clear()
+
+        call_count = {"n": 0}
+
+        async def fake_run_extractor(payload, config, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # v5 arm: emit a workflow-event fact so Rule 6
+                # fires and the counter increments.
+                memory_extraction._RULE_6_REJECTIONS.increment(user_id="probe-x")
+                return memory_extraction.ExtractionResult(
+                    facts=[{"content": "User prefers tea.", "tags": ["preference"]}],
+                    has_episode=False,
+                )
+            # v6 arm: simulate a subprocess crash.
+            raise RuntimeError("v6 subprocess crashed")
+
+        monkeypatch.setattr(memory_extraction, "_run_extractor", fake_run_extractor)
+
+        probe = extraction.Probe(
+            probe_id="probe-x",
+            category="workflow-noise",
+            window={"prior": [], "current": {"user": "u", "assistant": "a"}},
+            expected={"should_extract_any": False, "must_not_contain": []},
+        )
+
+        outcome = asyncio.run(extraction._run_one_probe(probe, config=None, user_id="probe-x"))
+
+        assert outcome.outcome == "error"
+        # v5 arm completed: the increment we drove in fake_run_extractor
+        # should be visible as a real per-arm delta.
+        assert outcome.v5_rule_6_rejections_delta == 1
+        # v6 arm raised before completing: delta stays at 0.
+        assert outcome.v6_rule_6_rejections_delta == 0
+        # v5_facts captured pre-exception; v6_facts empty.
+        assert outcome.v5_facts == ["User prefers tea."]
+        assert outcome.v6_facts == []
 
 
 class TestWindowToExtractorArgs:

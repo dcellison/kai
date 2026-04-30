@@ -965,7 +965,16 @@ _CONSOLIDATION_INTENTS: frozenset[str] = frozenset({"new", "update_of", "skip_re
 _WORKFLOW_EVENT_RE = re.compile(
     r"("
     # Arm 1: "User/OC decided/requested to file/create/address/
-    # conduct/evaluate/perform/update/push <something>"
+    # conduct/evaluate/perform/update/push <something>". The `^`
+    # anchor only matches when the subject is at the start of the
+    # fact content; a paraphrased fact like "In this exchange, User
+    # decided to file an issue about X" is not caught. The active
+    # extraction prompt formats facts as third-person leading with
+    # "User ..." or "OC ..." so the anchor is the right shape for
+    # the production case; broader paraphrases are left for the
+    # prompt's IGNORE rules. A future maintainer who needs to
+    # catch non-leading subjects should drop the `^` rather than
+    # only adding more verbs.
     r"^(User|OC)\s+(decided|requested)\s+to\s+"
     r"(file|create|address|conduct|evaluate|perform|update|push)\b"
     r"|"

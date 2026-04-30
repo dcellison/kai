@@ -311,54 +311,84 @@ async def _run_one_probe(
 ) -> ProbeOutcome:
     """Run both prompt arms against a single probe and classify the
     outcome. Each arm is a sequential subprocess call so the active
-    `_RULE_6_REJECTIONS` counter delta can be attributed to v6.
+    `_RULE_6_REJECTIONS` counter delta can be attributed per-arm.
+
+    Never raises: a subprocess crash, JSON parse failure, or any
+    other exception inside either arm is caught and reported as an
+    `outcome="error"` ProbeOutcome with whatever per-arm deltas
+    were captured before the failure. Specifically, if v5 completes
+    cleanly but v6 raises, `v5_rule_6_rejections_delta` carries the
+    v5 arm's real delta (already snapshotted before v6 ran) rather
+    than zero. This is the right shape for the operator-facing
+    report: an attributable accounting of partial progress, not a
+    silent loss of v5's rejections to the error bucket.
     """
     user_text, assistant_text, prior_pairs = _window_to_extractor_args(probe.window)
     payload = memory_extraction._build_extraction_payload(
         user_text, assistant_text, candidates=None, prior_pairs=prior_pairs
     )
 
-    # v5 arm: thread the pinned prompt. The `confirmed_action` skip
-    # in Rule 6 still applies on this arm since the regex is part of
-    # the active validator regardless of which prompt produced the
-    # candidate facts; that is the right behavior because Rule 6 is
-    # the SAME validator the harness is measuring against.
-    #
-    # Rule 6 fires on BOTH arms (the active validator runs against
-    # whatever facts each arm emits), and v5 is expected to fire it
-    # more because v5 produces more workflow-event content. We
-    # snapshot the counter around each arm separately so the v6
-    # delta is attributed to v6 only - lumping the two arms together
-    # would inflate the v6 metric with v5's more numerous rejections.
-    pre_v5 = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
-    v5_result = await memory_extraction._run_extractor(
-        payload,
-        config,
-        candidate_ids=set(),
-        candidate_metadata={},
-        user_id=user_id,
-        system_prompt=_PROMPT_V5_PINNED,
-    )
-    post_v5 = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
+    # Initialize all per-arm state to zero/empty so an exception in
+    # either arm leaves the partial-progress accounting accurate.
+    # The control flow inside the try block updates these in place
+    # as each arm completes.
+    v5_facts: list[str] = []
+    v6_facts: list[str] = []
+    v5_rule_6_delta = 0
+    v6_rule_6_delta = 0
 
-    # v6 arm: default kwarg, inherits the active `_EXTRACTION_SYSTEM_PROMPT`.
-    pre_v6 = post_v5
-    v6_result = await memory_extraction._run_extractor(
-        payload,
-        config,
-        candidate_ids=set(),
-        candidate_metadata={},
-        user_id=user_id,
-    )
-    post_v6 = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
+    try:
+        # v5 arm: thread the pinned prompt. The `confirmed_action`
+        # skip in Rule 6 still applies on this arm since the regex
+        # is part of the active validator regardless of which prompt
+        # produced the candidate facts; that is the right behavior
+        # because Rule 6 is the SAME validator the harness is
+        # measuring against.
+        #
+        # Rule 6 fires on BOTH arms (the active validator runs
+        # against whatever facts each arm emits), and v5 is expected
+        # to fire it more because v5 produces more workflow-event
+        # content. We snapshot the counter around each arm
+        # separately so the v6 delta is attributed to v6 only -
+        # lumping the two arms together would inflate the v6 metric
+        # with v5's more numerous rejections.
+        pre_v5 = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
+        v5_result = await memory_extraction._run_extractor(
+            payload,
+            config,
+            candidate_ids=set(),
+            candidate_metadata={},
+            user_id=user_id,
+            system_prompt=_PROMPT_V5_PINNED,
+        )
+        post_v5 = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
+        v5_rule_6_delta = post_v5 - pre_v5
+        v5_facts = [str(f.get("content", "")) for f in v5_result.facts]
 
-    v5_rule_6_delta = post_v5 - pre_v5
-    v6_rule_6_delta = post_v6 - pre_v6
+        # v6 arm: default kwarg, inherits the active `_EXTRACTION_SYSTEM_PROMPT`.
+        pre_v6 = post_v5
+        v6_result = await memory_extraction._run_extractor(
+            payload,
+            config,
+            candidate_ids=set(),
+            candidate_metadata={},
+            user_id=user_id,
+        )
+        post_v6 = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
+        v6_rule_6_delta = post_v6 - pre_v6
+        v6_facts = [str(f.get("content", "")) for f in v6_result.facts]
 
-    v5_facts = [str(f.get("content", "")) for f in v5_result.facts]
-    v6_facts = [str(f.get("content", "")) for f in v6_result.facts]
-
-    classified = _classify_outcome(probe, v5_facts=v5_facts, v6_facts=v6_facts)
+        classified = _classify_outcome(probe, v5_facts=v5_facts, v6_facts=v6_facts)
+    except Exception as exc:
+        # One probe failure must not abort the whole run; a live
+        # 20-probe run wastes meaningful subprocess cost if it
+        # bails on a transient JSON parse error or a timeout.
+        # Preserve whatever per-arm state we captured before the
+        # exception (see the local-variable initialization above)
+        # so the report attributes Rule 6 rejections accurately
+        # even on partial-completion failures.
+        log.exception("probe %s failed: %s", probe.probe_id, exc)
+        classified = "error"
 
     return ProbeOutcome(
         probe_id=probe.probe_id,
@@ -414,9 +444,14 @@ def _classify_outcome(probe: Probe, *, v5_facts: list[str], v6_facts: list[str])
         return "regression"
     if probe.category == "durable-content":
         # The win condition: v6 produced at least one fact carrying
-        # the required substrings. A v5-empty probe is not informative
-        # for this category either, but a v6-empty probe IS a
-        # regression because the durable fact must come through.
+        # the required substrings. Symmetric ambiguity check first:
+        # if BOTH arms came up empty the probe window is too sparse
+        # to inform v5-vs-v6 (parallel to the workflow-noise
+        # branch's `if not v5_facts: return "ambiguous"`). When v5
+        # produced facts but v6 did not, that IS a regression
+        # because the durable fact must come through under v6.
+        if not v5_facts and not v6_facts:
+            return "ambiguous"
         if not v6_facts:
             return "regression"
         if v6_satisfies_must:
@@ -485,26 +520,11 @@ async def _run_async(args: argparse.Namespace) -> int:
 
     outcomes: list[ProbeOutcome] = []
     for probe in probes:
-        try:
-            result = await _run_one_probe(probe, config, user_id=args.user_id)
-        except Exception as exc:
-            # One probe failure must not abort the whole run. A live
-            # 20-probe run wastes meaningful subprocess cost if it
-            # bails on a transient JSON parse error or a timeout.
-            # Record the failure as an "error" outcome so the report
-            # carries a row, then continue. The aggregate counters
-            # exclude error outcomes (same denominator-shielding the
-            # ambiguous bucket gets).
-            log.exception("probe %s failed: %s", probe.probe_id, exc)
-            result = ProbeOutcome(
-                probe_id=probe.probe_id,
-                category=probe.category,
-                v5_facts=[],
-                v6_facts=[],
-                outcome="error",
-                v5_rule_6_rejections_delta=0,
-                v6_rule_6_rejections_delta=0,
-            )
+        # `_run_one_probe` never raises; on exception it returns a
+        # ProbeOutcome with `outcome="error"` and whatever per-arm
+        # state it captured before the failure. The aggregate skip
+        # set keeps error rows out of rate denominators.
+        result = await _run_one_probe(probe, config, user_id=args.user_id)
         log.info(
             "probe %s [%s] -> %s",
             result.probe_id,
