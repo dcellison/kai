@@ -656,11 +656,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.apply:
         print(f"\nTotal rewrites: {total_success} succeeded, {total_failure} failed.")
-        if total_failure > 0:
-            print(f"Audit log: {audit_log_path}", file=sys.stderr)
-            return EXIT_PARTIAL_FAILURE
+        # Audit log is only created when at least one rewrite succeeds
+        # (apply_rewrites flushes lazily). Guard the path message on
+        # total_success > 0 so an all-fail run does not direct the
+        # operator to a file that was never created.
         if total_success > 0:
-            print(f"Audit log: {audit_log_path}")
+            stream = sys.stderr if total_failure > 0 else sys.stdout
+            print(f"Audit log: {audit_log_path}", file=stream)
+        if total_failure > 0:
+            return EXIT_PARTIAL_FAILURE
 
     return EXIT_OK
 
