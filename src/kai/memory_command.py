@@ -692,14 +692,14 @@ def _build_fact_view(
             quality = md.get("outcome_quality") or ""
             header = f"Episode ({quality})" if quality else "Episode"
             # Substantive Sophia fields written by the stage-2
-            # generator (memory_extraction.py:1525-1538). approach /
-            # outcome / actors are schema-required and always present
-            # in production; the `or ""` / `or []` defensive fallbacks
-            # surface malformed-data corruption rather than hiding it
-            # (D3 in spec 412). lessons is optional-by-design and
-            # absent (not empty) when the generator chose to omit
-            # it - rendering `Lessons:  (none)` would lie about that
-            # design intent (D2).
+            # generator's metadata-write block in memory_extraction.
+            # approach / outcome / actors are schema-required and
+            # always present in production; the `or ""` / `or []`
+            # defensive fallbacks surface malformed-data corruption
+            # rather than hiding it. lessons is optional-by-design
+            # and absent (not empty) when the generator chose to
+            # omit it - rendering `Lessons:  (none)` would lie about
+            # that design intent.
             approach = md.get("approach") or ""
             outcome = md.get("outcome") or ""
             actors_list = md.get("actors") or []

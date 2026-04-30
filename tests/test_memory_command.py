@@ -1003,7 +1003,7 @@ class TestFactViewMultiSource:
 
     def test_fact_view_episode_renders_approach_outcome(self):
         """approach and outcome are schema-required Sophia fields;
-        always render. Two-space-after-colon formatting per spec D4."""
+        always render with two-space-after-colon formatting."""
         fact = _episode_fact(approach="A1", outcome="O1")
         text, _ = memory_command._build_fact_view(fact, return_to=None)
         assert "Approach:  A1" in text
@@ -1017,11 +1017,12 @@ class TestFactViewMultiSource:
         assert "Lessons:  L1" in text
 
     def test_fact_view_episode_omits_lessons_row_when_absent(self):
-        """Pins D2: absence of lessons in metadata is the design-
-        intended sentinel for "no lesson this time" - the row is
-        dropped entirely, NOT rendered as `Lessons:  (none)`. A
-        regression that switched to a `(none)` placeholder would
-        misrepresent the generator's intent."""
+        """Pins the lessons-absence design intent: the metadata key
+        is absent (not empty-string) when the generator chose not
+        to record a lesson. The row is dropped entirely rather than
+        rendered as `Lessons:  (none)`, which would misrepresent
+        the generator's intent as "considered and rejected" rather
+        than "no lesson this time"."""
         fact = _episode_fact(lessons=None)
         text, _ = memory_command._build_fact_view(fact, return_to=None)
         assert "Lessons:" not in text
@@ -1032,20 +1033,20 @@ class TestFactViewMultiSource:
         assert "Actors:  alice, bob" in text
 
     def test_fact_view_episode_actors_empty_list_renders_none(self):
-        """Exercises the defensive-fallback path in D3; production
-        data cannot produce empty `actors` because the schema
-        enforces `minItems=1`, so the test pins a code path that
-        production cannot reach. Documented as an unreachable-state
-        pin so a future reader does not delete it as testing an
-        impossible state."""
+        """Exercises the defensive `(none)` fallback for an empty
+        actors list. Production data cannot produce this state
+        because the schema enforces `minItems=1`, so the test pins
+        a code path that production cannot reach. Documented as an
+        unreachable-state pin so a future reader does not delete
+        it as testing an impossible state."""
         fact = _episode_fact(actors=[])
         text, _ = memory_command._build_fact_view(fact, return_to=None)
         assert "Actors:  (none)" in text
 
     def test_fact_view_episode_field_order(self):
-        """Pins D1's vertical ordering against future edits. The
-        four new rows render in priority order before the existing
-        Tags / Date footer."""
+        """Pins the four-row vertical ordering against future edits:
+        Approach -> Outcome -> Lessons (when present) -> Actors,
+        before the existing Tags / Date footer."""
         # Custom body text avoids the labels appearing inside the
         # body quote (the default helper text contains "Outcome:"
         # in narrative form). text.index(label) on the rendered
@@ -1069,13 +1070,14 @@ class TestFactViewMultiSource:
         assert positions["Tags:"] < positions["Date:"]
 
     def test_fact_view_episode_label_uses_two_spaces_after_colon(self):
-        """Pins D4's formatting decision in code so the spec's prose
-        decision does not drift away from the implementation. Each
-        of the four new labels uses exactly two spaces after the
-        colon - not one (cramped) and not pad-aligned (which the
-        spec reserves for the wider extracted-row label set).
-        Asserts on every label individually so a copy-paste error
-        on any one row trips the test."""
+        """Pins the two-space-after-colon formatting in code so the
+        convention does not drift away from prose comments. Each of
+        the four new labels uses exactly two spaces after the colon
+        - not one (cramped) and not pad-aligned, which is reserved
+        for the wider extracted-row label set ("Confidence:",
+        "Prompt version:", "Confirmation:") where pad-alignment
+        improves scanability. Asserts on every label individually
+        so a copy-paste error on any one row trips the test."""
         fact = _episode_fact(approach="A", outcome="O", lessons="L", actors=["X"])
         text, _ = memory_command._build_fact_view(fact, return_to=None)
         # Positive: every label rendered with two-space spacing.
@@ -1099,7 +1101,8 @@ class TestFactViewMultiSource:
         labeled row rather than crashing. Production data cannot
         produce this state because the schema requires both fields,
         so the test pins a code path that production cannot reach -
-        analogous to the actors-empty-list pin (D3). Documented as
+        analogous to the actors-empty-list defensive-fallback pin.
+        Documented as
         unreachable-state coverage so a future reader does not
         delete it."""
         fact = _episode_fact(approach=None, outcome=None)
@@ -1124,12 +1127,13 @@ class TestFactViewMultiSource:
     def test_fact_view_episode_unchanged_migration_branch(self):
         """Required as a separate test even though the assertion is
         identical to the extracted-branch test, because the two cases
-        exercise different code paths: extracted goes through the
-        standalone `else:` arm at memory_command.py:706 (which never
-        touches `detail_lines`), while migration goes through the
-        combined branch with `detail_lines = []` initialized and the
-        inner `if source == "episode":` guard skipped, leaving the
-        splice empty. A regression mis-indenting the
+        exercise different code paths in `_build_fact_view`:
+        extracted goes through the standalone extracted-branch
+        `else:` arm (which never touches `detail_lines`), while
+        migration goes through the combined episode-or-migration
+        branch with `detail_lines = []` initialized and the inner
+        `if source == "episode":` guard skipped, leaving the splice
+        empty. A regression mis-indenting the
         `detail_lines.append(...)` calls so they fire for migration
         too would only be caught by this test."""
         fact = _migration_fact(tags=["migration", "backend"])
