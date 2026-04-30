@@ -121,6 +121,42 @@ def test_load_probes_missing_window_current_raises_with_path_and_line(tmp_path: 
     assert "window.current is required" in msg
 
 
+def test_load_probes_typo_in_window_current_user_raises(tmp_path: Path):
+    """A fixture line that misspells `user` (e.g., `typo_user`)
+    inside `window.current` passes the outer `current` existence
+    check but produces empty extractor inputs at run time. The
+    deeper validation catches the typo class at load time so the
+    operator does not waste subprocess cost on a probe that will
+    silently route to `error`."""
+    f = tmp_path / "probes.jsonl"
+    f.write_text(
+        '{"probe_id":"p1","category":"workflow-noise",'
+        '"window":{"prior":[],"current":{"typo_user":"u","assistant":"a"}},'
+        '"expected":{}}\n'
+    )
+    with pytest.raises(ValueError) as exc_info:
+        extraction.load_probes(f)
+    msg = str(exc_info.value)
+    assert str(f) in msg
+    assert ":1:" in msg
+    assert "non-empty user and assistant" in msg
+
+
+def test_load_probes_empty_assistant_raises(tmp_path: Path):
+    """Empty-string assistant is rejected too. An empty turn would
+    short-circuit the extractor's confirmation rules and silently
+    produce a meaningless run."""
+    f = tmp_path / "probes.jsonl"
+    f.write_text(
+        '{"probe_id":"p1","category":"workflow-noise",'
+        '"window":{"prior":[],"current":{"user":"u","assistant":""}},'
+        '"expected":{}}\n'
+    )
+    with pytest.raises(ValueError) as exc_info:
+        extraction.load_probes(f)
+    assert "non-empty user and assistant" in str(exc_info.value)
+
+
 def test_load_probes_missing_required_field_raises_with_path_and_line(tmp_path: Path):
     """Same diagnostic context applies when a line is valid JSON
     but lacks one of the required Probe fields. The KeyError raised

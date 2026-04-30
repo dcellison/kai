@@ -280,15 +280,21 @@ def load_probes(path: Path) -> list[Probe]:
             except KeyError as exc:
                 raise ValueError(f"{path}:{line_number}: missing required field {exc}") from exc
             # Validate the window structure at load time so a fixture
-            # missing `current` raises an actionable error here instead
-            # of silently routing through `_run_one_probe`'s
-            # error-bucket path at run time. The harness's
-            # `_window_to_extractor_args` tolerates missing `current`
-            # via `.get("current") or {}` for defensive runtime
-            # behavior; the load-time check is the operator's
-            # diagnostic anchor.
+            # missing `current` (or with a typo'd inner field like
+            # `typo_user` instead of `user`) raises an actionable
+            # error here instead of silently routing through
+            # `_run_one_probe`'s error-bucket path at run time with
+            # empty extractor inputs and an unrecoverable subprocess
+            # cost. The harness's `_window_to_extractor_args`
+            # tolerates missing fields via `.get("user", "")` for
+            # defensive runtime behavior; the load-time check is the
+            # operator's diagnostic anchor and catches the typo
+            # class the runtime fallback can't surface.
             if not isinstance(probe.window, dict) or "current" not in probe.window:
                 raise ValueError(f"{path}:{line_number}: window.current is required")
+            current = probe.window["current"]
+            if not isinstance(current, dict) or not current.get("user") or not current.get("assistant"):
+                raise ValueError(f"{path}:{line_number}: window.current must have non-empty user and assistant")
             probes.append(probe)
     return probes
 
@@ -434,6 +440,20 @@ def _classify_outcome(probe: Probe, *, v5_facts: list[str], v6_facts: list[str])
     outcome string. The labels feed the aggregate counters and
     drive the workflow_drop_rate / durable_preservation_rate
     arithmetic.
+
+    Substring-matching semantics:
+
+    - `must_not_contain` is OR: v6 fails if ANY listed substring
+      appears in any v6 fact. The list enumerates banned
+      substrings; one hit is enough to flag a regression.
+    - `must_contain` is also OR: v6 succeeds if ANY listed
+      substring appears in any v6 fact. The list enumerates
+      acceptable anchors and the probe scores `durable_preserved`
+      on the first hit. A future fixture author who needs strict
+      AND semantics ("v6 must mention BOTH home AND per-user")
+      should split into two probes or extend the schema with a
+      `must_contain_all` field; bare `any()` is the documented
+      behavior here.
     """
     must_not_contain = probe.expected.get("must_not_contain") or []
     must_contain = probe.expected.get("must_contain") or []
