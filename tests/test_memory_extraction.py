@@ -2327,11 +2327,12 @@ class TestExtractionPromptSoftVocab:
         assert expected in normalized
 
     def test_extraction_prompt_includes_synonym_prohibition(self):
-        """Pins all four synonyms named in the spec so a future
-        prompt edit that drops one cannot weaken the synonym
-        prohibition surface without tripping a test. The looser
-        "at least three" bar from v2 of the spec was a regression
-        magnet."""
+        """Pins all four synonyms named in the prompt's synonym
+        prohibition list so a future prompt edit that drops one
+        cannot weaken the prohibition surface without tripping a
+        test. An earlier 'at least three' formulation was a
+        regression magnet; the test must mirror the prompt's
+        contract exactly to be useful."""
         # Whitespace-normalize before the magic-string callout
         # check so the assertion holds whether the prompt wraps
         # "MUST use the literal tag `confirmed_action`" across a
@@ -2350,12 +2351,13 @@ class TestExtractionPromptSoftVocab:
         assert _EXTRACTION_PROMPT_VERSION == "5"
 
     def test_extraction_prompt_version_history_extended(self):
-        """The version-history block at memory_extraction.py:38-52
-        is a sequence of `#` comments, NOT a module docstring;
-        importable runtime state cannot capture it. Read source
-        text and grep for the unique D3 fragment so a future
-        unrelated edit that introduces a `v5:` token elsewhere
-        cannot satisfy this test vacuously."""
+        """The prompt-version history comment block (the sequence
+        of `#` comments preceding `_EXTRACTION_PROMPT_VERSION`) is
+        NOT a module docstring; importable runtime state cannot
+        capture it. Read source text and grep for the unique
+        history fragment so a future unrelated edit that
+        introduces a `v5:` token elsewhere cannot satisfy this
+        test vacuously."""
         from pathlib import Path
 
         import kai.memory_extraction

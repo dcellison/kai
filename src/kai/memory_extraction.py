@@ -1070,7 +1070,13 @@ def _validate_facts(
         # synonym tags impossible at the CLI boundary; with the enum
         # dropped (issue #414), the validator carries that contract
         # explicitly.
-        if intent in ("skip_redundant", "update_of") and isinstance(existing_id, str):
+        if intent in ("skip_redundant", "update_of"):
+            # Rule 3 already guaranteed `existing_id` is a non-empty
+            # str on this branch, so no isinstance guard here. The
+            # `.get(..., {})` default covers the case where Mem0
+            # returned a candidate with no metadata payload at all
+            # (the metadata key is conditionally absent on rows with
+            # no extra payload, per mem0/memory/main.py).
             existing_meta = candidate_metadata.get(existing_id, {})
             existing_tags = existing_meta.get("tags") or []
             if "confirmed_action" in existing_tags:
@@ -1948,18 +1954,12 @@ async def extract_and_store(
             candidate_id_set: set[str] = {c.id for c in candidates}
             # Per-id metadata lookup for `_validate_facts` Rule 4b
             # (issue #414): the rule needs the existing row's stored
-            # tags to detect a confirmation row being consolidated by
-            # a synonym-tagged fact. The full `candidates` list is
-            # already in scope, so building the dict here is one line.
-            # `or {}` at construction collapses any null metadata
-            # payload to an empty dict so the `dict[str, dict]`
-            # annotation is truthful and Rule 4b's lookup can stay
-            # clean (no second `or {}` at the consumer site). The
-            # MemoryResult dataclass types metadata as `dict` rather
-            # than `dict | None`, so this defends against a direct-
-            # construction type violation rather than a real runtime
-            # path - cheap insurance.
-            candidate_metadata: dict[str, dict] = {c.id: c.metadata or {} for c in candidates}
+            # tags to detect a confirmation row being consolidated
+            # by a synonym-tagged fact. The full `candidates` list
+            # is already in scope, so building the dict here is one
+            # line. `MemoryResult.metadata` is typed `dict`, so the
+            # comprehension produces a real `dict[str, dict]`.
+            candidate_metadata: dict[str, dict] = {c.id: c.metadata for c in candidates}
             # Emit the candidate-set log line exactly once per
             # extraction call, AFTER the fetch and BEFORE the
             # subprocess spawn. Always emitted (even when empty) so
