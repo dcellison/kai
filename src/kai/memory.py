@@ -1281,6 +1281,56 @@ def delete_by_id(*, user_id: str, memory_id: str) -> bool:
     return True
 
 
+def update_metadata(*, user_id: str, memory_id: str, data: str, metadata: dict) -> bool:
+    """Replace the metadata dict for `memory_id` belonging to `user_id`.
+
+    IMPORTANT: Mem0's underlying `update` REPLACES the metadata dict
+    wholesale. Auto-preserved fields are: `data`, `hash`,
+    `text_lemmatized`, `created_at`, `updated_at`, `user_id` (when
+    absent in new), `agent_id` (when absent in new), `run_id` (when
+    absent in new), `actor_id` (always), `role` (when absent in new).
+    Every other field on the existing row (e.g. `source`, `confidence`,
+    `prompt_version`, `confirmation_quote`, `tags`, `outcome_quality`,
+    `approach`, `outcome`, `lessons`, `actors`) is DESTROYED unless the
+    caller passes it explicitly. Callers that want to change only
+    specific fields must read the existing row first, modify those
+    fields on the existing metadata dict, and pass the merged dict to
+    this wrapper. Failure to follow this pattern silently erases
+    metadata that may matter for downstream reads (UI rendering,
+    extractor consolidation gates, etc.).
+
+    Mem0's `update` requires the row's text content (`data`) and
+    recomputes the embedding regardless. Callers that want to change
+    only metadata still pay one embedding API call per row.
+
+    Source-scope: the user-id gate admits any row whose
+    `metadata.source` is in `USER_VISIBLE_SOURCES` (extracted, episode,
+    migration). Callers wanting narrower scope must filter at the
+    caller level. The `confirmed_action`-tag protection used by the
+    tag dedup pass is the caller's responsibility, not this wrapper's.
+
+    Returns True on success, False when the row is not found, does not
+    belong to `user_id`, or the source filter rejects it. Mem0
+    exceptions are caught, logged, and surface as False.
+    """
+    if _memory is None:
+        return False
+
+    # Single source of truth for ownership + source scoping. Mirrors
+    # the gate used by delete_by_id; if get_by_id returns None for any
+    # reason (missing, wrong user, source not in USER_VISIBLE_SOURCES,
+    # fetch error) we refuse to update.
+    if get_by_id(user_id=user_id, memory_id=memory_id) is None:
+        return False
+
+    try:
+        _memory.update(memory_id=memory_id, data=data, metadata=metadata)
+    except Exception:
+        log.warning("update_metadata: update failed for %s", memory_id, exc_info=True)
+        return False
+    return True
+
+
 def delete_all(*, user_id: str) -> None:
     """
     Delete all memories for a user.

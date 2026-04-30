@@ -1794,6 +1794,181 @@ class TestDeleteById:
         mock_mem.delete.assert_not_called()
 
 
+class TestUpdateMetadataWrapper:
+    """Issue #418, Sub D of #388: thin wrapper around Mem0's
+    `update` that pins ownership + source and forwards the call.
+
+    The wrapper's docstring documents (a) the metadata-overwrite
+    contract (Mem0 REPLACES wholesale; callers must read-merge-write
+    for partial updates) and (b) the source-scope contract (admits any
+    USER_VISIBLE_SOURCES row). These tests pin both contracts so a
+    future "helpful" auto-merge refactor cannot silently change the
+    semantics that callers depend on."""
+
+    def test_disabled_returns_false(self):
+        from kai.memory import update_metadata
+
+        assert update_metadata(user_id="123", memory_id="abc", data="x", metadata={"tags": []}) is False
+
+    def test_returns_false_when_row_missing(self):
+        import kai.memory as mem_mod
+        from kai.memory import update_metadata
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = None
+        mem_mod._memory = mock_mem
+
+        result = update_metadata(
+            user_id="123",
+            memory_id="missing",
+            data="x",
+            metadata={"tags": ["preference"]},
+        )
+        assert result is False
+        mock_mem.update.assert_not_called()
+
+    def test_returns_false_on_user_mismatch(self):
+        """Cross-user metadata writes are the worst-case consequence
+        of a malformed memory_id leak; the gate must refuse."""
+        import kai.memory as mem_mod
+        from kai.memory import update_metadata
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "abc",
+            "user_id": "other-user",
+            "metadata": {"source": "extracted"},
+        }
+        mem_mod._memory = mock_mem
+
+        result = update_metadata(
+            user_id="123",
+            memory_id="abc",
+            data="x",
+            metadata={"tags": ["preference"]},
+        )
+        assert result is False
+        mock_mem.update.assert_not_called()
+
+    def test_returns_false_on_source_outside_user_visible(self):
+        """Legacy ""-source rows and any future non-USER_VISIBLE
+        sources are admin-CLI territory; refuse to write to them
+        through this wrapper."""
+        import kai.memory as mem_mod
+        from kai.memory import update_metadata
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "abc",
+            "user_id": "123",
+            "metadata": {"source": ""},  # legacy
+        }
+        mem_mod._memory = mock_mem
+
+        result = update_metadata(
+            user_id="123",
+            memory_id="abc",
+            data="x",
+            metadata={"tags": ["preference"]},
+        )
+        assert result is False
+        mock_mem.update.assert_not_called()
+
+    def test_mem0_exception_returns_false(self):
+        """A Mem0 raise during update is caught, logged, and surfaces
+        as False. Callers can treat False as "nothing to do" without
+        an exception bubble."""
+        import kai.memory as mem_mod
+        from kai.memory import update_metadata
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "abc",
+            "user_id": "123",
+            "metadata": {"source": "extracted"},
+        }
+        mock_mem.update.side_effect = RuntimeError("vector store down")
+        mem_mod._memory = mock_mem
+
+        result = update_metadata(
+            user_id="123",
+            memory_id="abc",
+            data="x",
+            metadata={"tags": ["preference"]},
+        )
+        assert result is False
+
+    def test_happy_path_calls_mem0_update_and_returns_true(self):
+        import kai.memory as mem_mod
+        from kai.memory import update_metadata
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "abc",
+            "user_id": "123",
+            "metadata": {"source": "extracted"},
+        }
+        mem_mod._memory = mock_mem
+
+        result = update_metadata(
+            user_id="123",
+            memory_id="abc",
+            data="fact text",
+            metadata={"source": "extracted", "tags": ["preference"]},
+        )
+        assert result is True
+        # The wrapper passes the caller-provided metadata dict through
+        # to Mem0 unchanged; no auto-merge happens at this layer.
+        mock_mem.update.assert_called_once_with(
+            memory_id="abc",
+            data="fact text",
+            metadata={"source": "extracted", "tags": ["preference"]},
+        )
+
+    def test_sparse_metadata_passes_through_unchanged(self):
+        """Pin the wrapper's destructive behavior: a sparse caller-
+        provided metadata dict (e.g. {"tags": [...]}) MUST be passed
+        through to Mem0 unmodified. The wrapper does NOT auto-merge
+        with the existing row; callers wanting to preserve other
+        fields are responsible for read-merge-write at the call site.
+
+        A future "helpful" refactor that auto-merges in the wrapper
+        would change the contract that the dedup script's
+        apply_rewrites depends on (the script reads, merges, then
+        passes the merged dict). Surfacing the pin here means the
+        refactor cannot land silently."""
+        import kai.memory as mem_mod
+        from kai.memory import update_metadata
+
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "abc",
+            "user_id": "123",
+            "metadata": {
+                "source": "extracted",
+                "confidence": 0.9,
+                "tags": ["original"],
+            },
+        }
+        mem_mod._memory = mock_mem
+
+        # Caller passes a sparse dict; the wrapper forwards it AS-IS.
+        result = update_metadata(
+            user_id="123",
+            memory_id="abc",
+            data="x",
+            metadata={"tags": ["new"]},  # missing source, confidence
+        )
+        assert result is True
+        # Verify Mem0 received the sparse dict literally; no merge with
+        # existing fields happened in the wrapper.
+        call_args = mock_mem.update.call_args
+        passed_metadata = call_args.kwargs["metadata"]
+        assert passed_metadata == {"tags": ["new"]}
+        assert "source" not in passed_metadata
+        assert "confidence" not in passed_metadata
+
+
 class TestGetStatsExtended:
     """Spec 310 §6.6 / §7.2: extended MemoryStats fields.
 

@@ -59,3 +59,6 @@ home/evals/*
 .idea/
 .vscode/
 *.swp
+
+# Tag dedup script audit logs (one per --apply run; never tracked)
+scripts/.tag-dedup-audit-*.jsonl
