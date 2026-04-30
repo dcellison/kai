@@ -225,6 +225,13 @@ class Probe:
     expected: dict
 
 
+# Closed set of categories recognised by `_classify_outcome`. Used
+# at load time by `load_probes` to reject typo'd category strings
+# before the harness starts running, since the classifier silently
+# returns "ambiguous" for unknown categories.
+_VALID_CATEGORIES: frozenset[str] = frozenset({"workflow-noise", "durable-content"})
+
+
 @dataclass
 class ProbeOutcome:
     """Per-probe result of running v5 and v6 extractor arms.
@@ -295,6 +302,17 @@ def load_probes(path: Path) -> list[Probe]:
             current = probe.window["current"]
             if not isinstance(current, dict) or not current.get("user") or not current.get("assistant"):
                 raise ValueError(f"{path}:{line_number}: window.current must have non-empty user and assistant")
+            # Validate category against the closed set so a typo
+            # (e.g. underscore-vs-hyphen `workflow_noise`) raises at
+            # load time. The classifier's `if probe.category ==`
+            # comparisons would otherwise silently fall through to
+            # `ambiguous` for every probe in the file, yielding
+            # `None` rates with no indication of why.
+            if probe.category not in _VALID_CATEGORIES:
+                raise ValueError(
+                    f"{path}:{line_number}: unknown category {probe.category!r}"
+                    f" (must be one of {sorted(_VALID_CATEGORIES)})"
+                )
             probes.append(probe)
     return probes
 

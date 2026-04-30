@@ -2558,10 +2558,6 @@ class TestRunExtractorSystemPromptDefault:
         captured argv carries `_EXTRACTION_SYSTEM_PROMPT` (the
         active module-level constant) at the slot following
         `--system-prompt`."""
-        import asyncio
-
-        from kai import memory_extraction
-
         captured: dict = {}
 
         class _StubProc:

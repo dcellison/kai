@@ -121,6 +121,32 @@ def test_load_probes_missing_window_current_raises_with_path_and_line(tmp_path: 
     assert "window.current is required" in msg
 
 
+def test_load_probes_unknown_category_raises_with_path_and_line(tmp_path: Path):
+    """A category typo (e.g. underscore instead of hyphen) would
+    otherwise silently route every probe in the file to
+    `ambiguous` in `_classify_outcome`, yielding `None` rates
+    with no indication of the cause. The load-time check raises
+    a ValueError naming the offending category and the allowed
+    set so the operator can find and fix the typo."""
+    f = tmp_path / "probes.jsonl"
+    f.write_text(
+        '{"probe_id":"p1","category":"workflow_noise",'
+        '"window":{"prior":[],"current":{"user":"u","assistant":"a"}},'
+        '"expected":{}}\n'
+    )
+    with pytest.raises(ValueError) as exc_info:
+        extraction.load_probes(f)
+    msg = str(exc_info.value)
+    assert str(f) in msg
+    assert ":1:" in msg
+    assert "unknown category" in msg
+    # The error names the typo'd value AND the allowed set, so the
+    # operator does not have to grep the source for the right names.
+    assert "workflow_noise" in msg
+    assert "workflow-noise" in msg
+    assert "durable-content" in msg
+
+
 def test_load_probes_typo_in_window_current_user_raises(tmp_path: Path):
     """A fixture line that misspells `user` (e.g., `typo_user`)
     inside `window.current` passes the outer `current` existence
