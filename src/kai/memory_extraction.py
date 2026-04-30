@@ -906,6 +906,7 @@ _CONSOLIDATION_INTENTS: frozenset[str] = frozenset({"new", "update_of", "skip_re
 def _validate_facts(
     facts: list[dict],
     candidate_ids: set[str],
+    *,
     candidate_metadata: dict[str, dict],
     user_id: str,
 ) -> list[dict]:
@@ -1070,7 +1071,15 @@ def _validate_facts(
         # dropped (issue #414), the validator carries that contract
         # explicitly.
         if intent in ("skip_redundant", "update_of") and isinstance(existing_id, str):
-            existing_meta = candidate_metadata.get(existing_id, {})
+            # `or {}` collapses both "key absent" and "key present
+            # with a None payload" to the same empty-dict default.
+            # `.get(key, {})` only handles the first case; a
+            # MemoryResult constructed with metadata=None (a type
+            # violation but possible via direct dataclass
+            # construction in tests or future code) would store
+            # None as the dict value, and the next `.get("tags")`
+            # call would AttributeError.
+            existing_meta = candidate_metadata.get(existing_id) or {}
             existing_tags = existing_meta.get("tags") or []
             if "confirmed_action" in existing_tags:
                 log.debug(
@@ -1321,7 +1330,7 @@ async def _run_extractor(
     facts_raw = payload_root.get("facts") or []
     has_episode = bool(payload_root.get("has_episode"))
     return ExtractionResult(
-        facts=_validate_facts(facts_raw, candidate_ids, candidate_metadata, user_id),
+        facts=_validate_facts(facts_raw, candidate_ids, candidate_metadata=candidate_metadata, user_id=user_id),
         has_episode=has_episode,
     )
 

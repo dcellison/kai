@@ -383,7 +383,7 @@ class TestValidateFacts:
                 "intent": "new",
             }
         ]
-        assert _validate_facts(facts, set(), {}, "u-test") == facts
+        assert _validate_facts(facts, set(), candidate_metadata={}, user_id="u-test") == facts
 
     def test_valid_confirmed_action_fact_passes(self):
         quote = "I see PR #299 is merged, thanks"
@@ -397,7 +397,7 @@ class TestValidateFacts:
                 "intent": "new",
             }
         ]
-        assert _validate_facts(facts, set(), {}, "u-test") == facts
+        assert _validate_facts(facts, set(), candidate_metadata={}, user_id="u-test") == facts
 
     def test_confirmed_action_without_quote_rejected(self):
         facts = [
@@ -408,7 +408,7 @@ class TestValidateFacts:
                 "intent": "new",
             }
         ]
-        assert _validate_facts(facts, set(), {}, "u-test") == []
+        assert _validate_facts(facts, set(), candidate_metadata={}, user_id="u-test") == []
 
     def test_confirmed_action_with_short_quote_rejected(self):
         """A quote shorter than _CONFIRMATION_QUOTE_MIN_CHARS (20) is
@@ -422,7 +422,7 @@ class TestValidateFacts:
                 "intent": "new",
             }
         ]
-        assert _validate_facts(facts, set(), {}, "u-test") == []
+        assert _validate_facts(facts, set(), candidate_metadata={}, user_id="u-test") == []
 
     @pytest.mark.parametrize(
         "quote",
@@ -461,7 +461,9 @@ class TestValidateFacts:
                 "intent": "new",
             }
         ]
-        assert _validate_facts(facts_bare, set(), {}, "u-test") == [], f"{quote!r} should be rejected"
+        assert _validate_facts(facts_bare, set(), candidate_metadata={}, user_id="u-test") == [], (
+            f"{quote!r} should be rejected"
+        )
         assert padded  # silence unused-var; padded is the name-only form
 
     def test_regex_fullmatch_behavior_only_rejects_pure_generic(self):
@@ -485,17 +487,17 @@ class TestValidateFacts:
                 "intent": "new",
             }
         ]
-        assert _validate_facts(facts, set(), {}, "u-test") == []
+        assert _validate_facts(facts, set(), candidate_metadata={}, user_id="u-test") == []
 
     def test_non_dict_fact_skipped(self):
         """Defensive: schema guarantees dicts but a future
         subprocess-response change should not crash the loop."""
-        assert _validate_facts([None, "string", 42], set(), {}, "u-test") == []
+        assert _validate_facts([None, "string", 42], set(), candidate_metadata={}, user_id="u-test") == []
 
     def test_mixed_batch_keeps_valid_drops_invalid(self):
         good = {"content": "X", "tags": ["preference"], "confidence": 0.9, "intent": "new"}
         bad = {"content": "Y", "tags": ["confirmed_action"], "confidence": 0.8, "intent": "new"}
-        result = _validate_facts([good, bad], set(), {}, "u-test")
+        result = _validate_facts([good, bad], set(), candidate_metadata={}, user_id="u-test")
         assert result == [good]
 
 
@@ -1377,11 +1379,11 @@ class TestValidateFactsConsolidation:
     def test_rule1_unknown_intent_rejected(self):
         """Rule 1 defense-in-depth against a future schema regression."""
         facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "merge"}]
-        assert _validate_facts(facts, set(), {}, "u1") == []
+        assert _validate_facts(facts, set(), candidate_metadata={}, user_id="u1") == []
 
     def test_rule1_missing_intent_rejected(self):
         facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9}]
-        assert _validate_facts(facts, set(), {}, "u1") == []
+        assert _validate_facts(facts, set(), candidate_metadata={}, user_id="u1") == []
 
     def test_rule2_new_with_existing_id_rejected(self):
         facts = [
@@ -1393,12 +1395,12 @@ class TestValidateFactsConsolidation:
                 "existing_id": "stray-id",
             }
         ]
-        assert _validate_facts(facts, {"stray-id"}, {}, "u1") == []
+        assert _validate_facts(facts, {"stray-id"}, candidate_metadata={}, user_id="u1") == []
 
     def test_rule3_update_of_missing_id_rejected_silently(self, caplog):
         facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "update_of"}]
         with caplog.at_level("INFO", logger="kai.memory_extraction"):
-            assert _validate_facts(facts, set(), {}, "u1") == []
+            assert _validate_facts(facts, set(), candidate_metadata={}, user_id="u1") == []
         # Missing id is a schema-shape violation, NOT a real
         # classification decision - so no consolidate.intent line.
         assert not any("memory.consolidate.intent" in r.getMessage() for r in caplog.records)
@@ -1418,7 +1420,7 @@ class TestValidateFactsConsolidation:
             }
         ]
         with caplog.at_level("INFO", logger="kai.memory_extraction"):
-            assert _validate_facts(facts, {"real-id"}, {}, "u1") == []
+            assert _validate_facts(facts, {"real-id"}, candidate_metadata={}, user_id="u1") == []
         record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
         json_part = record.getMessage().split("memory.consolidate.intent ", 1)[1]
         payload = json.loads(json_part)
@@ -1440,7 +1442,7 @@ class TestValidateFactsConsolidation:
             }
         ]
         with caplog.at_level("INFO", logger="kai.memory_extraction"):
-            _validate_facts(facts, {"real-id"}, {}, "u1")
+            _validate_facts(facts, {"real-id"}, candidate_metadata={}, user_id="u1")
         record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
         payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
         assert payload["original_intent"] == "skip_redundant"
@@ -1457,7 +1459,7 @@ class TestValidateFactsConsolidation:
             }
         ]
         with caplog.at_level("INFO", logger="kai.memory_extraction"):
-            assert _validate_facts(facts, {"real-id"}, {}, "u1") == []
+            assert _validate_facts(facts, {"real-id"}, candidate_metadata={}, user_id="u1") == []
         # Rule 4 is DEBUG-only, no consolidate.intent.
         assert not any("memory.consolidate.intent" in r.getMessage() for r in caplog.records)
 
@@ -1479,7 +1481,7 @@ class TestValidateFactsConsolidation:
             }
         ]
         with caplog.at_level("INFO", logger="kai.memory_extraction"):
-            assert _validate_facts(facts, {"prior-confirmation-id"}, {}, "u1") == []
+            assert _validate_facts(facts, {"prior-confirmation-id"}, candidate_metadata={}, user_id="u1") == []
         # Rule 4 is DEBUG-only - consistent with skip_redundant case above.
         assert not any("memory.consolidate.intent" in r.getMessage() for r in caplog.records)
 
@@ -1501,7 +1503,7 @@ class TestValidateFactsConsolidation:
             },
         ]
         with caplog.at_level("INFO", logger="kai.memory_extraction"):
-            assert _validate_facts(facts, {"shared-id"}, {}, "u1") == []
+            assert _validate_facts(facts, {"shared-id"}, candidate_metadata={}, user_id="u1") == []
         # Rule 5 is DEBUG-only AND deliberately avoids double-logging
         # the pair: zero consolidate.intent lines, not two.
         assert not any("memory.consolidate.intent" in r.getMessage() for r in caplog.records)
@@ -1519,7 +1521,7 @@ class TestValidateFactsConsolidation:
                 "existing_id": "unique-id",
             }
         ]
-        result = _validate_facts(facts, {"unique-id"}, {}, "u1")
+        result = _validate_facts(facts, {"unique-id"}, candidate_metadata={}, user_id="u1")
         assert len(result) == 1
 
     def test_empty_candidate_set_drops_non_new_via_rule3(self, caplog):
@@ -1536,7 +1538,7 @@ class TestValidateFactsConsolidation:
             }
         ]
         with caplog.at_level("INFO", logger="kai.memory_extraction"):
-            assert _validate_facts(facts, set(), {}, "u1") == []
+            assert _validate_facts(facts, set(), candidate_metadata={}, user_id="u1") == []
         # Rule 3 fires (the model decided update_of, we couldn't anchor it).
         record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
         payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
@@ -1557,7 +1559,7 @@ class TestValidateFactsConsolidation:
             }
         ]
         with caplog.at_level("INFO", logger="kai.memory_extraction"):
-            _validate_facts(facts, {"real-id"}, {}, "user-12345")
+            _validate_facts(facts, {"real-id"}, candidate_metadata={}, user_id="user-12345")
         record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
         payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
         assert payload["user_id"] == "user-12345"
@@ -2309,24 +2311,20 @@ class TestExtractionPromptSoftVocab:
     )
 
     def test_extraction_prompt_seeds_exactly_nine_preferred_tags(self):
-        """The seed names exactly the nine prior-enum values; no
-        more, no fewer. Tightens vs. a "contains all nine" pin so
-        a future edit that adds a tenth seed value (which would be
-        a vocabulary-design judgment call orthogonal to Sub A)
-        trips the assertion."""
-        # Whitespace-normalize the entire prompt before locating
-        # the seed sentence, since the prompt wraps lines and the
-        # sentinel spans a newline (`Use these preferred tags\n
-        # when one fits the fact:`).
+        """The seed names exactly the nine prior-enum values in
+        the documented order. Pin via a literal substring after
+        whitespace-normalizing the prompt (the seed list wraps
+        across lines in the source). A literal-substring pin is
+        more robust than parsing-up-to-the-next-period, which
+        would break if a future prompt edit introduces an
+        abbreviation period inside the seed region."""
         normalized = " ".join(_EXTRACTION_SYSTEM_PROMPT.split())
-        sentinel = "Use these preferred tags when one fits the fact: "
-        assert sentinel in normalized, "seed sentence missing"
-        idx = normalized.index(sentinel) + len(sentinel)
-        # Read until the next period that ends the sentence.
-        end = normalized.index(".", idx)
-        listed = normalized[idx:end]
-        names = tuple(t.strip() for t in listed.split(","))
-        assert names == self._PREFERRED_TAGS
+        expected = (
+            "Use these preferred tags when one fits the fact: "
+            "preference, decision, fact, constraint, confirmed_action, "
+            "project, location, schedule, relationship."
+        )
+        assert expected in normalized
 
     def test_extraction_prompt_includes_synonym_prohibition(self):
         """Pins all four synonyms named in the spec so a future
@@ -2383,7 +2381,7 @@ class TestValidateFactsRule4b:
                 "intent": "new",
             }
         ]
-        assert _validate_facts(facts, set(), {}, "u-test") == facts
+        assert _validate_facts(facts, set(), candidate_metadata={}, user_id="u-test") == facts
 
     def test_validate_facts_rejects_update_of_against_existing_confirmation_row(self):
         """A new fact with synonym tags + intent=update_of cites an
@@ -2402,7 +2400,7 @@ class TestValidateFactsRule4b:
         ]
         candidate_ids = {"prior-conf"}
         candidate_metadata = {"prior-conf": {"tags": ["confirmed_action"], "source": "extracted"}}
-        assert _validate_facts(facts, candidate_ids, candidate_metadata, "u-test") == []
+        assert _validate_facts(facts, candidate_ids, candidate_metadata=candidate_metadata, user_id="u-test") == []
 
     def test_validate_facts_rejects_skip_redundant_against_existing_confirmation_row(self):
         """Mirror of the update_of case: the second consolidation
@@ -2418,7 +2416,7 @@ class TestValidateFactsRule4b:
         ]
         candidate_ids = {"prior-conf"}
         candidate_metadata = {"prior-conf": {"tags": ["confirmed_action"], "source": "extracted"}}
-        assert _validate_facts(facts, candidate_ids, candidate_metadata, "u-test") == []
+        assert _validate_facts(facts, candidate_ids, candidate_metadata=candidate_metadata, user_id="u-test") == []
 
     def test_validate_facts_allows_update_of_against_non_confirmation_row(self):
         """Pins the negative-space contract for Rule 4b: only
@@ -2438,4 +2436,4 @@ class TestValidateFactsRule4b:
         ]
         candidate_ids = {"prior-pref"}
         candidate_metadata = {"prior-pref": {"tags": ["preference"], "source": "extracted"}}
-        assert _validate_facts(facts, candidate_ids, candidate_metadata, "u-test") == facts
+        assert _validate_facts(facts, candidate_ids, candidate_metadata=candidate_metadata, user_id="u-test") == facts
