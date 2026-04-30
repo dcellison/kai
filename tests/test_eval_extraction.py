@@ -130,6 +130,19 @@ class TestClassifyOutcome:
         )
         assert outcome == "regression"
 
+    def test_workflow_noise_partial_drop_is_regression_when_should_extract_any_false(self, workflow_probe):
+        """Pin the strict classification: when the probe declares
+        `should_extract_any: false`, v6 must produce zero facts to
+        score `workflow_dropped`. A partial drop where v6 emits
+        non-forbidden content is a regression because the probe
+        asked for nothing and v6 did not deliver nothing."""
+        outcome = extraction._classify_outcome(
+            workflow_probe,
+            v5_facts=["User decided to file an issue.", "Spec X v3 was approved."],
+            v6_facts=["User mentioned a project name."],
+        )
+        assert outcome == "regression"
+
     def test_durable_v6_preserves_with_must_contain(self, durable_probe):
         """v6 produced a fact carrying the required substring =>
         durable_preserved."""
@@ -166,12 +179,16 @@ class TestAggregate:
         """Ambiguous outcomes drop out of the denominator so a few
         uninformative probes do not drag the rate down."""
         outcomes = [
+            # v5 fired Rule 6 four times across the workflow probes
+            # (v5 produces workflow-event content); v6 fired it once
+            # (defense-in-depth on a leak the prompt missed).
             extraction.ProbeOutcome(
                 probe_id="wf-1",
                 category="workflow-noise",
                 v5_facts=["x"],
                 v6_facts=[],
                 expected_outcome="workflow_dropped",
+                v5_rule_6_rejections_delta=2,
                 v6_rule_6_rejections_delta=0,
             ),
             extraction.ProbeOutcome(
@@ -180,6 +197,7 @@ class TestAggregate:
                 v5_facts=["x"],
                 v6_facts=["x"],
                 expected_outcome="regression",
+                v5_rule_6_rejections_delta=1,
                 v6_rule_6_rejections_delta=0,
             ),
             extraction.ProbeOutcome(
@@ -188,6 +206,7 @@ class TestAggregate:
                 v5_facts=[],
                 v6_facts=[],
                 expected_outcome="ambiguous",
+                v5_rule_6_rejections_delta=1,
                 v6_rule_6_rejections_delta=0,
             ),
             extraction.ProbeOutcome(
@@ -196,6 +215,7 @@ class TestAggregate:
                 v5_facts=["x"],
                 v6_facts=["x"],
                 expected_outcome="durable_preserved",
+                v5_rule_6_rejections_delta=0,
                 v6_rule_6_rejections_delta=0,
             ),
             extraction.ProbeOutcome(
@@ -204,6 +224,7 @@ class TestAggregate:
                 v5_facts=["x"],
                 v6_facts=[],
                 expected_outcome="regression",
+                v5_rule_6_rejections_delta=0,
                 v6_rule_6_rejections_delta=1,
             ),
         ]
@@ -215,9 +236,10 @@ class TestAggregate:
         # 1 durable_preserved of 2 scorable durable probes.
         assert agg["durable_preservation_rate"] == 0.5
         assert agg["scorable_durable_count"] == 2
-        # Counter delta is the sum across all probes regardless of
-        # category or scorability.
-        assert agg["rule_6_rejections"] == 1
+        # Per-arm counter sums attributed correctly: v5 fired four
+        # times (the workflow-noise probes), v6 fired once.
+        assert agg["v5_rule_6_rejections"] == 4
+        assert agg["v6_rule_6_rejections"] == 1
 
     def test_aggregate_zero_scorable_returns_none(self):
         """All-ambiguous category => rate is None, not 0.0, so a
@@ -230,6 +252,7 @@ class TestAggregate:
                 v5_facts=[],
                 v6_facts=[],
                 expected_outcome="ambiguous",
+                v5_rule_6_rejections_delta=0,
                 v6_rule_6_rejections_delta=0,
             ),
         ]

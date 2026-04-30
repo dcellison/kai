@@ -232,6 +232,11 @@ class ProbeOutcome:
     v5_facts: list[str]
     v6_facts: list[str]
     expected_outcome: str
+    # Rule 6 fires per-arm; the harness reports both deltas
+    # separately so the v6 number is not inflated by v5's
+    # higher rejection rate (v5 produces more workflow-event
+    # content by design).
+    v5_rule_6_rejections_delta: int
     v6_rule_6_rejections_delta: int
 
 
@@ -295,13 +300,19 @@ async def _run_one_probe(
         user_text, assistant_text, candidates=None, prior_pairs=prior_pairs
     )
 
-    pre_count = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
-
     # v5 arm: thread the pinned prompt. The `confirmed_action` skip
     # in Rule 6 still applies on this arm since the regex is part of
     # the active validator regardless of which prompt produced the
     # candidate facts; that is the right behavior because Rule 6 is
     # the SAME validator the harness is measuring against.
+    #
+    # Rule 6 fires on BOTH arms (the active validator runs against
+    # whatever facts each arm emits), and v5 is expected to fire it
+    # more because v5 produces more workflow-event content. We
+    # snapshot the counter around each arm separately so the v6
+    # delta is attributed to v6 only - lumping the two arms together
+    # would inflate the v6 metric with v5's more numerous rejections.
+    pre_v5 = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
     v5_result = await memory_extraction._run_extractor(
         payload,
         config,
@@ -310,8 +321,10 @@ async def _run_one_probe(
         user_id=user_id,
         system_prompt=_PROMPT_V5_PINNED,
     )
+    post_v5 = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
 
     # v6 arm: default kwarg, inherits the active `_EXTRACTION_SYSTEM_PROMPT`.
+    pre_v6 = post_v5
     v6_result = await memory_extraction._run_extractor(
         payload,
         config,
@@ -319,8 +332,10 @@ async def _run_one_probe(
         candidate_metadata={},
         user_id=user_id,
     )
+    post_v6 = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
 
-    post_count = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
+    v5_rule_6_delta = post_v5 - pre_v5
+    v6_rule_6_delta = post_v6 - pre_v6
 
     v5_facts = [str(f.get("content", "")) for f in v5_result.facts]
     v6_facts = [str(f.get("content", "")) for f in v6_result.facts]
@@ -333,7 +348,8 @@ async def _run_one_probe(
         v5_facts=v5_facts,
         v6_facts=v6_facts,
         expected_outcome=expected_outcome,
-        v6_rule_6_rejections_delta=post_count - pre_count,
+        v5_rule_6_rejections_delta=v5_rule_6_delta,
+        v6_rule_6_rejections_delta=v6_rule_6_delta,
     )
 
 
@@ -358,8 +374,23 @@ def _classify_outcome(probe: Probe, *, v5_facts: list[str], v6_facts: list[str])
         # we cannot say v6 "dropped" something v5 also did not produce.
         if not v5_facts:
             return "ambiguous"
-        if should_extract_any is False and not v6_facts:
-            return "workflow_dropped"
+        # Strict win condition: when the probe declares
+        # `should_extract_any: false`, only a fully-empty v6 counts
+        # as `workflow_dropped`. Earlier wording let a partial drop
+        # (v6 still emitted facts, just none containing the
+        # forbidden substrings) score as a win, which inflated
+        # workflow_drop_rate on probes where v6 partially-suppresses
+        # but the operator asked for zero extraction.
+        if should_extract_any is False:
+            if not v6_facts:
+                return "workflow_dropped"
+            return "regression"
+        # When the probe does NOT declare should_extract_any: false
+        # (no opinion on whether v6 must be empty), a v6 that
+        # produced fewer facts than v5 AND avoided every forbidden
+        # substring still counts as `workflow_dropped`. This is the
+        # softer win condition for probes where some durable signal
+        # may legitimately remain.
         if not v6_violates_must_not and len(v6_facts) < len(v5_facts):
             return "workflow_dropped"
         return "regression"
@@ -387,9 +418,11 @@ def _aggregate(outcomes: list[ProbeOutcome]) -> dict:
     workflow_drops = 0
     durable_total = 0
     durable_preserves = 0
-    rule_6_total = 0
+    v5_rule_6_total = 0
+    v6_rule_6_total = 0
     for o in outcomes:
-        rule_6_total += o.v6_rule_6_rejections_delta
+        v5_rule_6_total += o.v5_rule_6_rejections_delta
+        v6_rule_6_total += o.v6_rule_6_rejections_delta
         if o.category == "workflow-noise" and o.expected_outcome != "ambiguous":
             workflow_total += 1
             if o.expected_outcome == "workflow_dropped":
@@ -401,7 +434,8 @@ def _aggregate(outcomes: list[ProbeOutcome]) -> dict:
     return {
         "workflow_drop_rate": (workflow_drops / workflow_total) if workflow_total else None,
         "durable_preservation_rate": (durable_preserves / durable_total) if durable_total else None,
-        "rule_6_rejections": rule_6_total,
+        "v5_rule_6_rejections": v5_rule_6_total,
+        "v6_rule_6_rejections": v6_rule_6_total,
         "scorable_workflow_count": workflow_total,
         "scorable_durable_count": durable_total,
     }
@@ -465,10 +499,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--user-id",
-        default="2114582497",
+        default="eval-harness",
         help="user_id passed through to the extractor (cosmetic for "
         "this harness; the harness does not read or write the live "
-        "memory store).",
+        "memory store). The Rule 6 rejection counter is keyed by "
+        "user_id, so setting this to a stable label makes a long-"
+        "running session's rejection counts easy to attribute.",
     )
     parser.add_argument(
         "--output",

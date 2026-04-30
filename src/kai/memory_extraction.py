@@ -970,15 +970,19 @@ _WORKFLOW_EVENT_RE = re.compile(
     r"(file|create|address|conduct|evaluate|perform|update|push)\b"
     r"|"
     # Arm 2: "Spec X / PR Y / issue Z (intervening tokens)?
-    # was/were/received ... <verdict>". The `(\S+\s+)*?` allows
-    # multi-word identifiers and version qualifiers between the
-    # artifact id and the verb, e.g., "Specification 412 version 3
-    # was approved" or "Spec 416 (memory UI tag dismantle) version 4
-    # received final approval"; lazy quantification keeps the
-    # capture short.
+    # was/were/received ... <verdict>". The intervening-token group
+    # is bounded with `{0,8}?` (a few words plus a parenthetical at
+    # most, lazy) so a long fact text cannot drive quadratic
+    # backtracking through the unbounded `(\S+\s+)*?` form. The
+    # gap between `was/were/received` and the verdict word is
+    # bounded with `{0,80}` (chars, not tokens) for the same reason.
+    # Real examples: "Specification 412 version 3 was approved"
+    # (1 token between id and verb), "Spec 416 (memory UI tag
+    # dismantle) version 4 received final approval" (5 tokens),
+    # "PR #424 received a code review verdict" (0 tokens).
     r"\b(spec(ification)?\s+\S+|PR\s+#?\d+|issue\s+#?\d+)"
-    r"\s+(\S+\s+)*?(was|were|received)\b"
-    r".*\b(approved|approval|reviewed|merged|verdict|finding)\b"
+    r"\s+(\S+\s+){0,8}?(was|were|received)\b"
+    r".{0,80}?\b(approved|approval|reviewed|merged|verdict|finding)\b"
     r"|"
     # Arm 3: "All N findings were closed in vM" /
     # "All N v1 findings were closed"
