@@ -187,7 +187,7 @@ class TestExtractionResultClassifier:
             return _make_proc(stdout=_stage1_envelope(facts=[], has_episode=True))
 
         monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
-        result = await _run_extractor("payload", _cfg(), candidate_ids=set(), user_id="u1")
+        result = await _run_extractor("payload", _cfg(), candidate_ids=set(), candidate_metadata={}, user_id="u1")
         assert isinstance(result, ExtractionResult)
         assert result.has_episode is True
         assert result.facts == []
@@ -202,7 +202,7 @@ class TestExtractionResultClassifier:
             return _make_proc(stdout=_stage1_envelope(facts=[], has_episode=False))
 
         monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
-        result = await _run_extractor("payload", _cfg(), candidate_ids=set(), user_id="u1")
+        result = await _run_extractor("payload", _cfg(), candidate_ids=set(), candidate_metadata={}, user_id="u1")
         assert result.has_episode is False
 
     @pytest.mark.asyncio
@@ -228,7 +228,7 @@ class TestExtractionResultClassifier:
             return build_proc()
 
         monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
-        result = await _run_extractor("payload", _cfg(), candidate_ids=set(), user_id="u1")
+        result = await _run_extractor("payload", _cfg(), candidate_ids=set(), candidate_metadata={}, user_id="u1")
         assert result.has_episode is False
         assert result.facts == []
 

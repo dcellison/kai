@@ -50,7 +50,16 @@ log = logging.getLogger(__name__)
 # fact-storage parsing on the Python side is the same; the bump is
 # the canary that lets post-rollout log analysis distinguish facts
 # produced by the windowed prompt from facts produced by v3.
-_EXTRACTION_PROMPT_VERSION: str = "4"
+# v5: free-form tag schema (enum dropped). Soft-vocab seed in prompt
+# names the prior nine values as preferred but advisory; the LLM may
+# invent new tags when nothing fits. `confirmed_action` remains a
+# structurally significant magic string with explicit synonym
+# prohibition in the prompt; `_validate_facts` Rule 4b added to
+# defend the consolidation gate against synonym-tagged updates of
+# existing confirmation rows. `maxItems` raised from 4 to 5 to
+# match `_EPISODE_SCHEMA` per the parent issue's "single tag
+# taxonomy" decision.
+_EXTRACTION_PROMPT_VERSION: str = "5"
 
 # Sibling of _EXTRACTION_PROMPT_VERSION for stage-2 episode generation.
 # Stored in each episode's metadata so future cleanups can target a
@@ -225,23 +234,21 @@ _FACT_SCHEMA: dict = {
                 "properties": {
                     "content": {"type": "string", "minLength": 1, "maxLength": 500},
                     "tags": {
+                        # Free-form per issue #388 / #414: the closed
+                        # enum was retired so the same LLM-generated
+                        # tag system can apply across extracted and
+                        # episode rows. Shape mirrors `_EPISODE_SCHEMA`
+                        # exactly. The structurally significant
+                        # `confirmed_action` magic string is no longer
+                        # enforced at the schema layer; the prompt
+                        # carries an explicit synonym prohibition,
+                        # and `_validate_facts` enforces the
+                        # confirmation-quote and consolidation rules
+                        # that key off the literal tag.
                         "type": "array",
-                        "items": {
-                            "type": "string",
-                            "enum": [
-                                "preference",
-                                "decision",
-                                "fact",
-                                "constraint",
-                                "confirmed_action",
-                                "project",
-                                "location",
-                                "schedule",
-                                "relationship",
-                            ],
-                        },
+                        "items": {"type": "string", "minLength": 1, "maxLength": 50},
                         "minItems": 1,
-                        "maxItems": 4,
+                        "maxItems": 5,
                     },
                     "confidence": {"type": "number", "minimum": 0.5, "maximum": 1.0},
                     "confirmation_quote": {
@@ -357,9 +364,20 @@ FORMAT each fact as:
 - content: one sentence, third-person where possible
   ("User prefers Celsius"), past tense for confirmed actions
   ("User confirmed PR #299 was merged on 2026-04-12").
-- tags: 1 to 4 lowercase topical tags. Pick the most relevant ones
-  from: preference, decision, fact, constraint, confirmed_action,
-  project, location, schedule, relationship.
+- tags: 1 to 5 lowercase topical tags. Use these preferred tags
+  when one fits the fact: preference, decision, fact, constraint,
+  confirmed_action, project, location, schedule, relationship.
+  Only invent new tags when none of these capture the fact's
+  topic; new tags should be single lowercase words or short
+  underscore-joined compounds, no punctuation beyond underscores.
+
+  The tag `confirmed_action` is structurally significant: when
+  the fact represents a user-confirmed action (with a
+  confirmation_quote), you MUST use the literal tag
+  `confirmed_action`. NEVER substitute synonyms like
+  `confirmation`, `confirmed`, `user_confirmed`, or `confirm` -
+  they are NOT recognized by the storage system and will cause
+  the fact to be rejected.
 - confidence: a number in [0, 1]. Use 0.9+ for direct user statements,
   0.7 for clear user confirmation of an assistant claim, 0.5 for
   paraphrased or implied facts. Do not store below 0.5.
@@ -888,14 +906,16 @@ _CONSOLIDATION_INTENTS: frozenset[str] = frozenset({"new", "update_of", "skip_re
 def _validate_facts(
     facts: list[dict],
     candidate_ids: set[str],
+    candidate_metadata: dict[str, dict],
     user_id: str,
 ) -> list[dict]:
     """
     Drop facts that violate confirmation-quote or consolidation rules.
 
     The CLI's JSON Schema validation already constrains property names,
-    tag enum, and primitive types. This function enforces the cross-field
-    and batch-internal rules JSON Schema does NOT express cleanly:
+    tag shape, and primitive types. This function enforces the
+    cross-field and batch-internal rules JSON Schema does NOT express
+    cleanly:
 
     Confirmation-quote rules (existed pre-consolidation; unchanged):
       A. If tags includes "confirmed_action": confirmation_quote MUST
@@ -904,7 +924,7 @@ def _validate_facts(
       B. If tags does NOT include "confirmed_action": confirmation_quote
          MUST be absent entirely.
 
-    Consolidation rules (new):
+    Consolidation rules:
       1. `intent` is present and is one of the three enum values.
          Defense-in-depth against schema regression; the schema already
          enforces this, but a future too-permissive schema edit would
@@ -920,9 +940,24 @@ def _validate_facts(
          the ONE rule that emits a structured log line; the others are
          DEBUG-only because they represent schema-shape violations or
          batch-internal inconsistencies, not real classification decisions.
-      4. `intent == "skip_redundant"`: tags MUST NOT include
-         `confirmed_action`. A confirmation is a fresh observation about
-         reality even if the wording paraphrases an existing fact.
+      4. `intent in ("skip_redundant", "update_of")`: tags MUST NOT
+         include `confirmed_action`. A confirmation is a fresh
+         observation about reality even if the wording paraphrases an
+         existing fact; a confirmation row's timestamp and
+         `confirmation_quote` are load-bearing storage artifacts that
+         must not be erased by consolidation. Defense-in-depth gate
+         against the model disobeying the prompt's "use new for
+         confirmed_action" instruction; keys off the NEW fact's tags.
+      4b. `intent in ("skip_redundant", "update_of")` AND the existing
+         row's metadata tags include `confirmed_action`: REJECTED.
+         Defends the consolidation gate against synonym-tagged
+         updates that bypass Rule 4 (which keys off the NEW fact's
+         tags). With a free-form tag space, the LLM can emit
+         `tags=["confirmation"]` (a synonym) on a fact whose intent
+         is to overwrite a prior confirmation row; Rule 4 would not
+         fire, but the existing row's stored tags would still mark
+         it as a confirmation. Reading `existing_metadata["tags"]`
+         via the `candidate_metadata` parameter closes the gap.
       5. Existing-id uniqueness within the batch: if two proposed facts
          cite the same `existing_id`, BOTH are dropped. The failure
          mode being defended against is the extractor emitting two
@@ -938,8 +973,8 @@ def _validate_facts(
     emission co-located rather than splitting the two across modules.
 
     Rejected facts are dropped silently (DEBUG log) for rules 1, 2, 4,
-    5 and confirmation-quote rules. Rule 3 emits the structured log
-    line documented above.
+    4b, 5 and confirmation-quote rules. Rule 3 emits the structured
+    log line documented above.
     """
     # Pre-pass: count existing_id citations across the batch so rule 5
     # (uniqueness) can be evaluated without two passes through the per-
@@ -1021,6 +1056,30 @@ def _validate_facts(
             log.debug("_validate_facts: rejecting %s on confirmed_action fact", intent)
             continue
 
+        # Rule 4b: cannot consolidate against an existing confirmation
+        # row. A confirmation is a load-bearing storage artifact (the
+        # timestamp and the confirmation_quote both matter) that must
+        # not be erased by an update_of from a non-confirmation fact.
+        # Defends against the case where a free-form tag space lets the
+        # LLM emit a synonym tag (`confirmation`, `confirmed`,
+        # `user_confirmed`, ...) that bypasses Rule 4 above. Rule 4
+        # checks the NEW fact's tags; this rule checks the EXISTING
+        # row's tags, looked up via candidate_metadata. The schema's
+        # prior closed enum implicitly defended this gate by making
+        # synonym tags impossible at the CLI boundary; with the enum
+        # dropped (issue #414), the validator carries that contract
+        # explicitly.
+        if intent in ("skip_redundant", "update_of") and isinstance(existing_id, str):
+            existing_meta = candidate_metadata.get(existing_id, {})
+            existing_tags = existing_meta.get("tags") or []
+            if "confirmed_action" in existing_tags:
+                log.debug(
+                    "_validate_facts: rejecting %s against existing confirmed_action row %s",
+                    intent,
+                    existing_id,
+                )
+                continue
+
         # Rule 5: existing-id uniqueness across the batch. Pre-counted
         # above so this check is O(1) per fact. Only non-`new` facts
         # are subject to the rule because a `new` fact without an
@@ -1099,6 +1158,7 @@ async def _run_extractor(
     config: Config,
     *,
     candidate_ids: set[str],
+    candidate_metadata: dict[str, dict],
     user_id: str,
 ) -> ExtractionResult:
     """
@@ -1261,7 +1321,7 @@ async def _run_extractor(
     facts_raw = payload_root.get("facts") or []
     has_episode = bool(payload_root.get("has_episode"))
     return ExtractionResult(
-        facts=_validate_facts(facts_raw, candidate_ids, user_id),
+        facts=_validate_facts(facts_raw, candidate_ids, candidate_metadata, user_id),
         has_episode=has_episode,
     )
 
@@ -1885,6 +1945,12 @@ async def extract_and_store(
                 # to the documented contract (a list).
                 candidates = candidates or []
             candidate_id_set: set[str] = {c.id for c in candidates}
+            # Per-id metadata lookup for `_validate_facts` Rule 4b
+            # (issue #414): the rule needs the existing row's stored
+            # tags to detect a confirmation row being consolidated by
+            # a synonym-tagged fact. The full `candidates` list is
+            # already in scope, so building the dict here is one line.
+            candidate_metadata: dict[str, dict] = {c.id: c.metadata for c in candidates}
             # Emit the candidate-set log line exactly once per
             # extraction call, AFTER the fetch and BEFORE the
             # subprocess spawn. Always emitted (even when empty) so
@@ -1911,6 +1977,7 @@ async def extract_and_store(
                 payload,
                 config,
                 candidate_ids=candidate_id_set,
+                candidate_metadata=candidate_metadata,
                 user_id=user_id,
             )
             # Restructured for stage-2 (issue #385): facts and has_episode

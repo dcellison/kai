@@ -2100,20 +2100,3 @@ class TestCallbackDispatch:
         assert upd.callback_query.answer.await_count == 1
         toast = upd.callback_query.answer.call_args.args[0]
         assert toast == memory_command._MSG_QUERY_FAILED
-
-
-# ── Tag enum drift guard ───────────────────────────────────────────
-
-
-def test_tag_enum_matches_extraction_schema():
-    """The `_TAG_ENUM` mirror must stay in sync with the schema source.
-
-    Drift would silently exclude valid tags from `/memory stats`
-    (a tag with rows but no enum entry would never appear). Both
-    lists are short and unlikely to change often, but a unit test
-    catches the next time they do.
-    """
-    from kai.memory_extraction import _FACT_SCHEMA
-
-    schema_enum = tuple(_FACT_SCHEMA["properties"]["facts"]["items"]["properties"]["tags"]["items"]["enum"])
-    assert schema_enum == memory_command._TAG_ENUM

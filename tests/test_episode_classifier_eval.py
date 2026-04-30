@@ -107,7 +107,9 @@ async def test_episode_classifier_precision_recall():
         payload = _build_extraction_payload(user, assistant, [])
         start = time.monotonic()
         try:
-            result = await _run_extractor(payload, config, candidate_ids=set(), user_id=f"eval-{item_id}")
+            result = await _run_extractor(
+                payload, config, candidate_ids=set(), candidate_metadata={}, user_id=f"eval-{item_id}"
+            )
             predicted: bool = result.has_episode
             error: str | None = None
         except Exception as e:
