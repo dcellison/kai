@@ -1869,13 +1869,12 @@ class TestTagBrowseAxisRetired:
         for row in kb.inline_keyboard:
             if len(row) == 1:
                 label = row[0].text
-                # The prior shape was `<tag> (<count>)`. Test for the
-                # closing-paren marker preceded by a digit, which is
-                # specific enough to avoid false-matching the Episodes
-                # button label `Episodes (4)` (also a single-button
-                # row possibility) - no, actually that DOES match.
-                # The fix: exempt the Episodes button label explicitly,
-                # since it has the same shape.
+                # The prior per-tag shape was `<tag> (<count>)`. The
+                # surviving Episodes button (`Episodes (N)`) has the
+                # same `<word> (<int>)` shape and lands in a single-
+                # button row when it's the only utility-row item, so
+                # exempt it by prefix; any other single-button row
+                # ending in `)` is a regression.
                 assert not label.endswith(")") or label.startswith("Episodes ("), (
                     f"unexpected single-button row: {label!r}"
                 )
@@ -1947,9 +1946,12 @@ class TestTagBrowseAxisRetired:
         ctx = context_factory()
         await memory_command.handle_memory_callback(upd, ctx)
         # query.answer was called exactly once with no arguments.
+        # Both positional args and kwargs must be empty: a stray
+        # positional toast text or a `show_alert=True` kwarg would
+        # both cross the "silent dismiss" line.
         assert upd.callback_query.answer.await_count == 1
         call = upd.callback_query.answer.call_args
-        assert call.args == () or call.args == ()
+        assert call.args == () and call.kwargs == {}
         # No edit_message_text invocation - the dashboard did not
         # re-render for this stale verb.
         upd.callback_query.edit_message_text.assert_not_called()

@@ -1100,9 +1100,14 @@ def get_all(*, user_id: str, limit: int | None = 1000) -> list[MemoryResult]:
 def get_by_tag(*, user_id: str, tag: str) -> list[MemoryResult]:
     """Return user-visible facts for `user_id` carrying `tag`.
 
-    Data-layer entry point for tag-keyed lookups. Filters client-side
-    because Mem0's `get_all` does not accept metadata filters. Two
-    filter clauses, both load-bearing:
+    Public data-layer entry point for tag-keyed lookups. Kept as a
+    primitive in the `kai.memory` API surface even though no UI path
+    in this repo currently calls it: external integrations and future
+    surfaces (admin tooling, batch reports) want to reach memory rows
+    by tag, and reimplementing the filter+sort+source-gate logic per
+    caller is the kind of duplication this helper exists to prevent.
+    Filters client-side because Mem0's `get_all` does not accept
+    metadata filters. Two filter clauses, both load-bearing:
 
       - `metadata.source in USER_VISIBLE_SOURCES`: defends against
         legacy ""-source (or any future-additional non-UI) rows
