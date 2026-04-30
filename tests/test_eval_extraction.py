@@ -28,6 +28,13 @@ from kai.eval import extraction
 # pinned constant drifts (intentional or not), this test fails and
 # either the constant must be reverted or this hash must be updated
 # to a new captured baseline.
+#
+# Stored as the raw hexdigest; the JSON report emitted by the
+# harness CLI prefixes the same value with "sha256:" via the
+# `_hash()` helper. An operator cross-checking a report's
+# `v5_prompt_hash` against this constant should strip the
+# prefix from the report value (or compare report value to
+# `f"sha256:{_V5_PROMPT_HASH}"`).
 _V5_PROMPT_HASH = "764f249d2556a6e00489ac7ba5eac265f4a4d09f27d21dc76f612b84f0874c13"
 
 

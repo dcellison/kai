@@ -323,21 +323,27 @@ async def _run_one_probe(
     report: an attributable accounting of partial progress, not a
     silent loss of v5's rejections to the error bucket.
     """
-    user_text, assistant_text, prior_pairs = _window_to_extractor_args(probe.window)
-    payload = memory_extraction._build_extraction_payload(
-        user_text, assistant_text, candidates=None, prior_pairs=prior_pairs
-    )
-
     # Initialize all per-arm state to zero/empty so an exception in
-    # either arm leaves the partial-progress accounting accurate.
-    # The control flow inside the try block updates these in place
-    # as each arm completes.
+    # either arm (or the payload-build below) leaves the
+    # partial-progress accounting accurate. The control flow inside
+    # the try block updates these in place as each step completes.
     v5_facts: list[str] = []
     v6_facts: list[str] = []
     v5_rule_6_delta = 0
     v6_rule_6_delta = 0
 
     try:
+        # Payload construction lives inside the try block so a
+        # malformed probe (e.g., a window field that violates an
+        # invariant `_build_extraction_payload` does not check
+        # defensively) routes through the same error-bucket path
+        # as a subprocess crash. Without the guard the docstring's
+        # "Never raises" contract would have a hole - the exact
+        # failure mode the per-probe try/except exists to prevent.
+        user_text, assistant_text, prior_pairs = _window_to_extractor_args(probe.window)
+        payload = memory_extraction._build_extraction_payload(
+            user_text, assistant_text, candidates=None, prior_pairs=prior_pairs
+        )
         # v5 arm: thread the pinned prompt. The `confirmed_action`
         # skip in Rule 6 still applies on this arm since the regex
         # is part of the active validator regardless of which prompt
