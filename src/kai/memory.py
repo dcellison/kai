@@ -214,7 +214,7 @@ class MemoryStats:
     not enumerated as a separate per-source field. Confidence aggregates
     and `by_tag` stay scoped to extracted (see comments below) because
     episode and migration rows do not carry confidence and use tag
-    spaces that are not enumerated by `_TAG_ENUM` in memory_command.py.
+    spaces that are independent of the extractor's tag vocabulary.
     """
 
     total_count: int
@@ -1100,28 +1100,25 @@ def get_all(*, user_id: str, limit: int | None = 1000) -> list[MemoryResult]:
 def get_by_tag(*, user_id: str, tag: str) -> list[MemoryResult]:
     """Return user-visible facts for `user_id` carrying `tag`.
 
-    Used by the /memory tag drill-down (spec 310 §6.2). Filters
-    client-side because Mem0's `get_all` does not accept metadata
-    filters. Two filter clauses, both load-bearing:
+    Data-layer entry point for tag-keyed lookups. Filters client-side
+    because Mem0's `get_all` does not accept metadata filters. Two
+    filter clauses, both load-bearing:
 
       - `metadata.source in USER_VISIBLE_SOURCES`: defends against
         legacy ""-source (or any future-additional non-UI) rows
         leaking into the operator-facing surface. Issue #407 expanded
         this from `== "extracted"` to the three-source set so episode
-        and migration rows that happen to carry an enum tag in their
-        own metadata become browsable from the dashboard's tag
-        buttons. The dashboard's `_TAG_ENUM` gate still limits which
-        tags get rendered as buttons; this filter only governs which
-        rows match a tapped tag.
+        and migration rows that happen to share an extractor tag in
+        their own metadata become reachable through this helper.
       - `tag in metadata.tags`: the actual tag match. The `or []`
         guards against a malformed row that lacks the tags list
         entirely; such rows simply do not match any tag.
 
     Sort: `updated_at` descending. A re-extracted fact bubbles to the
-    top of its tag list, which is the spec's intended drill-down
-    ordering (§6.2). Falls back to `created_at` for rows that are
-    missing `updated_at`; both default to "" in `_wrap_result` so the
-    sort is total-order stable rather than raising on None comparisons.
+    top of its tag list. Falls back to `created_at` for rows that
+    are missing `updated_at`; both default to "" in `_wrap_result`
+    so the sort is total-order stable rather than raising on None
+    comparisons.
 
     The full row set comes from `get_all(limit=None)` so a user with
     thousands of extracted facts still gets a complete tag listing.
@@ -1145,10 +1142,9 @@ def get_all_episodes(*, user_id: str) -> list[MemoryResult]:
     """Return all episode-source memories for `user_id`, newest first.
 
     Read-side primitive for the /memory dashboard's episode-list
-    browser (issue #410). Episode rows mostly carry Sophia-style tags
-    that are not in `_TAG_ENUM`, so the existing tag-button surface
-    cannot reach them; this helper backs a dedicated screen that
-    enumerates every episode in one place.
+    browser (issue #410). Episode rows surface here in one place,
+    independent of the extractor's tag vocabulary, since the dashboard
+    browses by source rather than by tag.
 
     The source filter here is intentionally narrower than
     `USER_VISIBLE_SOURCES`: this function's purpose is single-source

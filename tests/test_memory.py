@@ -1368,7 +1368,7 @@ class TestGetAllLimit:
 
 
 class TestGetByTag:
-    """Spec 310 §7.2 helper: extracted-only tag drill-down."""
+    """Data-layer helper for tag-keyed lookups across user-visible sources."""
 
     def test_disabled_returns_empty(self):
         from kai.memory import get_by_tag
@@ -1444,9 +1444,9 @@ class TestGetByTag:
 
     def test_handles_multiple_tags_per_row(self):
         """A fact tagged [preference, constraint] matches BOTH
-        get_by_tag('preference') AND get_by_tag('constraint'). The
-        spec's forget-by-tag warning ("tags are independent") is a
-        consequence of this overlap."""
+        get_by_tag('preference') AND get_by_tag('constraint'). Tags
+        are independent in metadata, so a row can be reached through
+        any of its tags."""
         import kai.memory as mem_mod
         from kai.memory import get_by_tag
 
@@ -2239,17 +2239,12 @@ class TestUserVisibleSources:
     # ── get_by_tag ─────────────────────────────────────────────────
 
     def test_get_by_tag_includes_all_user_visible_sources(self):
-        """A tap on an enum tag returns rows of every user-visible
-        source that carries the tag in metadata. The dashboard's
-        `_TAG_ENUM` button gate is unchanged (the tag must be enum
-        for a button to render in the first place); this test
-        exercises the post-tap fetch only.
-
-        Note: in production, episode rows usually carry Sophia tags
-        and migration rows usually carry H3-slug tags - neither in
-        `_TAG_ENUM`. Cross-source overlap on enum tags is rare; it
-        is exercised here so the contract is regression-pinned for
-        the rare case."""
+        """`get_by_tag` returns rows of every user-visible source
+        that carries the queried tag in metadata. Cross-source
+        overlap on a single tag value is rare in production (episode
+        rows usually carry Sophia-style tags and migration rows
+        usually carry H3-slug tags, with little overlap), but the
+        contract is regression-pinned here for the rare case."""
         import kai.memory as mem_mod
         from kai.memory import get_by_tag
 

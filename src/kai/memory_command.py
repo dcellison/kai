@@ -64,30 +64,9 @@ log = logging.getLogger(__name__)
 
 # ── Constants ───────────────────────────────────────────────────────
 
-# The closed enum of tags accepted by the Haiku extractor, in the same
-# order as `_FACT_SCHEMA["properties"]["facts"]["items"]["properties"]
-# ["tags"]["items"]["enum"]` at memory_extraction.py:153-163. Mirrored
-# here (rather than imported) because importing memory_extraction would
-# pull in the Anthropic SDK, an unnecessary dependency for the UI path.
-# A drift between the two lists shows up immediately in `/memory stats`
-# (a tag with rows but no enum entry would be silently absent from the
-# stats view), and is also covered by a unit test in test_memory_command.
-_TAG_ENUM: tuple[str, ...] = (
-    "preference",
-    "decision",
-    "fact",
-    "constraint",
-    "confirmed_action",
-    "project",
-    "location",
-    "schedule",
-    "relationship",
-)
-
-# Page size for the tag drill-down view (spec §6.2). Five fits on a
-# single phone screen with the surrounding buttons; raising it forces
-# scrolling.
-_TAG_PAGE_SIZE = 5
+# Page size for paginated list views. Five fits on a single phone
+# screen with the surrounding buttons; raising it forces scrolling.
+_PAGE_SIZE = 5
 
 # Default number of search hits returned by `/memory search`, before
 # the relevance floor is applied (spec §5: "default N = 8"). Floor
@@ -95,9 +74,9 @@ _TAG_PAGE_SIZE = 5
 # eliminate borderline-relevant rows that the floor would have kept.
 _SEARCH_LIMIT = 8
 
-# Maximum line length for fact text in list views (tag drill-down,
-# search results). Spec §6.2 mandates 80 chars + ellipsis. Fact detail
-# view shows the full text (no truncation).
+# Maximum line length for fact text in list views (search results,
+# episode list). 80 chars + ellipsis. Fact detail view shows the full
+# text (no truncation).
 _LIST_TRUNCATE_LEN = 80
 
 # Per-chat cache TTL in seconds (spec §7.4: "30 minutes"). Checked
@@ -118,11 +97,12 @@ class _ScreenCache:
     """Per-chat ephemeral state backing /memory navigation.
 
     Holds the screen the user is currently looking at plus the
-    arguments needed to re-render it (tag name + page, search query,
-    fact id list). The numbered buttons in tag and search views are
-    stored as a list of memory ids indexed 0..n; the callback data
-    only carries the integer index, keeping every callback under the
-    Telegram 64-byte limit even when memory ids are 36-char UUIDs.
+    arguments needed to re-render it (page index for the episode list,
+    search query, fact id list). The numbered buttons in episode and
+    search views are stored as a list of memory ids indexed 0..n; the
+    callback data only carries the integer index, keeping every
+    callback under the Telegram 64-byte limit even when memory ids
+    are 36-char UUIDs.
 
     `return_to` carries the encoding of the screen the back button on
     a fact view should land on. It is a tuple of (verb, args) where
@@ -134,7 +114,6 @@ class _ScreenCache:
 
     screen: str
     memory_ids: list[str] = field(default_factory=list)
-    tag: str | None = None
     page: int = 0
     query: str | None = None
     return_to: tuple[str, list[str]] | None = None
@@ -269,7 +248,6 @@ _HELP_TEXT = (
     "/memory - Browse memories\n"
     "/memory search <q> - Semantic search\n"
     "/memory stats - Counts and confidence distribution\n"
-    "/memory forget <tag> - Delete all memories with a tag\n"
     "/memory help - Show this help"
 )
 
@@ -320,52 +298,29 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
     """Render the dashboard text and keyboard from a MemoryStats.
 
     The dashboard surfaces three user-visible source counts (extracted
-    facts, episode summaries, migration imports) and a per-tag button
-    grid. Tags with zero facts are hidden from the keyboard but appear
-    in `/memory stats` (see spec §6.1 for the asymmetry rationale);
-    `by_tag` is extracted-only by design (see MemoryStats docstring),
-    so an episode-only or migration-only operator legitimately renders
-    with zero tag buttons - the source-count headline is their signal
-    that the dashboard is alive.
+    facts, episode summaries, migration imports) and a single utility
+    keyboard row holding an optional Episodes button (when
+    episode_count > 0), plus unconditional Search and Stats buttons.
+    There is no per-source filter axis: the parent decision in #388
+    settled tags as row decoration only, not a primary browse axis.
 
     Empty state: only when ALL three user-visible source counts are
-    zero. Issue #407 dropped the older "extracted == 0 OR no nonzero
-    enum tags" guard pair: an operator with episode or migration rows
-    but no extracted facts has user-visible memory worth showing.
+    zero. An operator with episode or migration rows but no extracted
+    facts still has user-visible memory worth showing.
     """
-    # Combined empty-state guard (issue #407). Replaces the prior
-    # extracted-only and `not nonzero` guards. When any user-visible
-    # source has rows, fall through to render the dashboard - even
-    # if `nonzero` ends up empty (all rows non-extracted, or extracted
-    # rows with off-enum tags), the source-count headline still
-    # communicates that memory is alive.
+    # Combined empty-state guard (issue #407). When any user-visible
+    # source has rows, fall through to render the dashboard - the
+    # source-count headline communicates that memory is alive even
+    # for an episode-only or migration-only operator.
     if stats.extracted_count == 0 and stats.episode_count == 0 and stats.migration_count == 0:
         return _MSG_NO_FACTS, None
 
-    # Tags with at least one fact, sorted descending by count. Spec
-    # §6.1 mock-up shows this ordering. Ties broken by enum order
-    # (the iteration order of `_TAG_ENUM`) so output is deterministic.
-    # `by_tag` is extracted-only (MemoryStats); episode/migration rows
-    # are intentionally not represented here. The rare edge case where
-    # extracted_count > 0 but every extracted row carries off-enum
-    # tags renders as zero buttons + the search/stats footer below.
-    nonzero = [(tag, stats.by_tag.get(tag, 0)) for tag in _TAG_ENUM if stats.by_tag.get(tag, 0) > 0]
-    nonzero.sort(key=lambda item: (-item[1], _TAG_ENUM.index(item[0])))
-
-    # Per-tag counts are carried by the inline buttons below
-    # (`tag (count)` labels), so the dashboard text intentionally
-    # stops at the summary header and confidence footer. Per #351,
-    # rendering the same counts in both surfaces was redundant - the
-    # original spec §6.1 mock-up included a bar chart here, but
-    # operator feedback on real data showed the bars duplicated what
-    # the buttons already telegraph through the parenthesized counts.
     lines: list[str] = []
     # Headline assembled from non-zero per-source counts so a fresh
-    # extracted-only operator still sees the original "Memories: <N>
-    # facts across <M> tags" wording (issue #407 backwards-compat),
+    # extracted-only operator gets a tight "Memories: N facts."
     # while a mixed-source operator gets distinct visibility into
-    # each source. Zero-valued sources are omitted from the comma list
-    # rather than rendered as "0 episodes" - readability over
+    # each source. Zero-valued sources are omitted from the comma
+    # list rather than rendered as "0 episodes" - readability over
     # uniformity, since most operators have non-zero in only one or
     # two of the three.
     parts: list[str] = []
@@ -375,64 +330,28 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
         parts.append(f"{stats.episode_count} episodes")
     if stats.migration_count:
         parts.append(f"{stats.migration_count} imported")
-    # tag_word handles two cases that the pre-#407 surface never
-    # reached: a `len(nonzero) == 1` extracted operator (singular
-    # "1 tag") and a `len(nonzero) == 0` episode-only / migration-only
-    # operator (zero "0 tags" reads awkwardly but is the honest count
-    # since `by_tag` is extracted-only). The "1 tags" mismatch was
-    # latent in the pre-#407 code; fixing it here in the same edit
-    # keeps the headline grammar consistent across all three branches.
-    tag_word = "tag" if len(nonzero) == 1 else "tags"
-    summary = "Memories: " + ", ".join(parts) + f" across {len(nonzero)} {tag_word}."
+    summary = "Memories: " + ", ".join(parts) + "."
     lines.append(summary)
     lines.append("")
-    # Footer line: three branches keep the action prompt accurate to
-    # what the keyboard actually offers (issue #407).
-    #   - With tag buttons + confidence data: pin median/min as the
-    #     "first-glance tuning signal" (spec §6.1). Median is the
-    #     persisted value; the spec mock-up labels it "avg" but median
-    #     is more honest about what is shown.
-    #   - With tag buttons but no confidence (extracted rows whose
-    #     metadata lost confidence values): the original "Tap a tag"
-    #     prompt without the confidence suffix.
-    #   - Without tag buttons (episode-only / migration-only operator,
-    #     or extracted rows whose tags are all off-enum): point at the
-    #     Search/Stats button row that always renders, since "Tap a
-    #     tag to browse" would be a lie when no tag buttons exist.
-    median = stats.confidence_median
-    minv = stats.confidence_min
-    if nonzero and median is not None and minv is not None:
-        lines.append(f"Tap a tag to browse. Confidence: median {median:.2f}, min {minv:.2f}.")
-    elif nonzero:
-        lines.append("Tap a tag to browse.")
-    elif stats.episode_count > 0:
-        # No tag buttons render but the Episodes button does. Footer
-        # names every utility-row affordance the operator can tap.
-        # Without this branch the footer would lie by enumerating only
-        # Search and Stats while the keyboard also rendered Episodes
-        # (issue #410 D6).
+    # Footer line: two branches keep the action prompt accurate to
+    # what the keyboard actually offers.
+    #   - Episodes button visible (episode_count > 0): name every
+    #     utility-row affordance the operator can tap.
+    #   - No Episodes button: only Search and Stats render.
+    if stats.episode_count > 0:
         lines.append("Tap Episodes to browse, Search to find specific memories, or Stats for details.")
     else:
-        # No tag buttons AND no Episodes button. Utility row is just
-        # [Search, Stats]; pre-#410 wording is accurate for this case.
         lines.append("Use Search to find specific memories, or tap Stats for details.")
 
     text = "\n".join(lines)
 
-    # Keyboard: one row per tag (preserves ordering, lets a busy
-    # dashboard scroll). A short trailing utility row holds the
-    # cross-corpus actions: an optional Episodes button (issue #410,
-    # only when episode_count > 0), then Search and Stats.
+    # Keyboard: a single utility row holds the cross-corpus actions.
+    # Episodes button only renders when there is content to browse,
+    # so an operator with no episodes does not see a button that
+    # would lead to an empty list. Search and Stats always render.
     rows: list[list[InlineKeyboardButton]] = []
-    for tag, count in nonzero:
-        label = f"{tag} ({count})"
-        rows.append([InlineKeyboardButton(label, callback_data=_encode_callback("tag", tag, "0"))])
     utility_row: list[InlineKeyboardButton] = []
     if stats.episode_count > 0:
-        # Episodes button only renders when there is content to browse,
-        # mirroring the dashboard's existing zero-count tag suppression.
-        # The "0" arg is the initial page index; `eps:<page>` matches
-        # the `tag:<tag>:<page>` callback shape.
         utility_row.append(
             InlineKeyboardButton(
                 f"Episodes ({stats.episode_count})",
@@ -445,11 +364,11 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
     return text, InlineKeyboardMarkup(rows)
 
 
-# ── Builder: tag view ───────────────────────────────────────────────
+# ── Pagination helper ───────────────────────────────────────────────
 
 
 def _paginate(facts: list[MemoryResult], page: int) -> tuple[list[MemoryResult], int, int]:
-    """Slice `facts` into the page-th window of `_TAG_PAGE_SIZE`.
+    """Slice `facts` into the page-th window of `_PAGE_SIZE`.
 
     Returns (window, clamped_page, total_pages). `clamped_page` is
     `page` clipped to [0, total_pages-1]; out-of-range page numbers
@@ -459,80 +378,10 @@ def _paginate(facts: list[MemoryResult], page: int) -> tuple[list[MemoryResult],
     """
     if not facts:
         return [], 0, 1
-    total = (len(facts) + _TAG_PAGE_SIZE - 1) // _TAG_PAGE_SIZE
+    total = (len(facts) + _PAGE_SIZE - 1) // _PAGE_SIZE
     clamped = max(0, min(page, total - 1))
-    start = clamped * _TAG_PAGE_SIZE
-    return facts[start : start + _TAG_PAGE_SIZE], clamped, total
-
-
-def _build_tag_view(
-    tag: str,
-    facts: list[MemoryResult],
-    page: int,
-) -> tuple[str, InlineKeyboardMarkup, list[str], int, int]:
-    """Render a paginated tag drill-down.
-
-    Returns (text, keyboard, memory_ids, clamped_page, total_pages).
-    The memory_ids list is the per-fact id for the items displayed on
-    THIS page only - the caller stores it in the screen cache so
-    numbered button taps can resolve back to memory ids.
-
-    Per-fact line layout (spec §6.2):
-        N.  [0.92]  <truncated text>
-                    <date>
-    """
-    window, clamped, total = _paginate(facts, page)
-
-    if not window:
-        # Empty tag - should be unreachable from the dashboard since
-        # zero-fact tags are hidden, but a delete-by-id flow can
-        # leave a tag empty mid-session. Render a graceful empty
-        # state with a back button.
-        text = f"{tag}\n\nNo memories with this tag."
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("back", callback_data=_encode_callback("dash"))]])
-        return text, kb, [], 0, 1
-
-    # Body text
-    lines = [f"{tag}  (page {clamped + 1} of {total})", ""]
-    memory_ids: list[str] = []
-    for idx, fact in enumerate(window, start=1):
-        confidence = fact.metadata.get("confidence")
-        # Defensive default: extracted rows always carry confidence,
-        # but legacy or pre-#335 rows might not. Render a placeholder
-        # rather than KeyError-ing the screen.
-        if isinstance(confidence, (int, float)):
-            conf_str = f"[{float(confidence):.2f}]"
-        else:
-            conf_str = "[----]"
-        date_str = _format_date(fact.updated_at or fact.created_at)
-        lines.append(f"{idx}.  {conf_str}  {_truncate(fact.text)}")
-        lines.append(f"            {date_str}")
-        lines.append("")
-        memory_ids.append(fact.id)
-
-    text = "\n".join(lines).rstrip()
-
-    # Keyboard: numbered button row + nav row.
-    number_row = [
-        InlineKeyboardButton(str(i + 1), callback_data=_encode_callback("fact", str(i))) for i in range(len(window))
-    ]
-    nav_row: list[InlineKeyboardButton] = []
-    if clamped > 0:
-        nav_row.append(
-            InlineKeyboardButton(
-                "< prev",
-                callback_data=_encode_callback("tag", tag, str(clamped - 1)),
-            )
-        )
-    nav_row.append(InlineKeyboardButton("back", callback_data=_encode_callback("dash")))
-    if clamped < total - 1:
-        nav_row.append(
-            InlineKeyboardButton(
-                "next >",
-                callback_data=_encode_callback("tag", tag, str(clamped + 1)),
-            )
-        )
-    return text, InlineKeyboardMarkup([number_row, nav_row]), memory_ids, clamped, total
+    start = clamped * _PAGE_SIZE
+    return facts[start : start + _PAGE_SIZE], clamped, total
 
 
 # ── Builder: episode list view (issue #410) ────────────────────────
@@ -543,14 +392,12 @@ def _build_tag_view(
 # contains an off-enum string still render via the `[----]` fallback;
 # the strict check defends against a schema drift where a value like
 # `"good"` or `"unknown"` could leak in and look like a real category.
-# Mirrored here (rather than imported) for the same reason as
-# `_TAG_ENUM`: importing memory_extraction would pull in the Anthropic
-# SDK on the UI path. A drift between the two lists shows up
-# immediately in the episode list view (every row would render as
-# `[----]`). frozenset (not tuple) because the only operation here
-# is `in` membership; matches the `USER_VISIBLE_SOURCES` pattern.
-# `_TAG_ENUM` is a tuple because iteration order matters for the
-# dashboard tag-button rendering; here it does not.
+# Mirroring (rather than importing from `memory_extraction`) avoids
+# pulling in the Anthropic SDK on the UI path. A drift between the
+# two lists shows up immediately in the episode list view (every
+# row would render as `[----]`). frozenset (not tuple) because the
+# only operation here is `in` membership; iteration order does not
+# matter.
 _OUTCOME_QUALITY_ENUM: frozenset[str] = frozenset({"success", "partial", "failure"})
 
 
@@ -560,11 +407,11 @@ def _build_episode_list_view(
 ) -> tuple[str, InlineKeyboardMarkup, list[str], int, int]:
     """Render a paginated episode list (issue #410).
 
-    Returns (text, keyboard, memory_ids, clamped_page, total_pages),
-    parallel in shape to `_build_tag_view`. The memory_ids list backs
-    the screen cache so numbered button taps resolve to memory ids
-    via integer index, keeping callback data well under the 64-byte
-    Telegram ceiling.
+    Returns the (text, keyboard, memory_ids, clamped_page,
+    total_pages) tuple consumed by `_send_episode_list`. The
+    memory_ids list backs the screen cache so numbered button taps
+    resolve to memory ids via integer index, keeping callback data
+    well under the 64-byte Telegram ceiling.
 
     Per-row layout:
         N.  [<outcome_quality>]  <truncated text>
@@ -573,11 +420,11 @@ def _build_episode_list_view(
     Bracket text is the literal `outcome_quality` string from
     metadata when it is one of the enumerated values
     (`success` / `partial` / `failure`); otherwise `[----]`. Episode
-    rows do not carry confidence; the bracket field is the
-    closest-shaped per-row signal to confidence in the tag view.
+    rows do not carry confidence; the bracket field is the per-row
+    quality signal.
 
     Header reads `"Episodes  (page X of Y)"` with two spaces between
-    the label and the parenthetical, matching the tag view convention.
+    the label and the parenthetical for visual separation.
     """
     window, clamped, total = _paginate(facts, page)
 
@@ -604,10 +451,11 @@ def _build_episode_list_view(
             quality_str = "[----]"
         date_str = _format_date(fact.updated_at or fact.created_at)
         lines.append(f"{idx}.  {quality_str}  {_truncate(fact.text)}")
-        # Indent matches the tag view's date row (the `[0.92]`
-        # bracket is six chars; the longest enum value `[failure]`
-        # is nine chars, so the indent compromise lands at twelve
-        # spaces - same column as the tag view's date row.
+        # Twelve-space indent on the date row visually nests it under
+        # the bracket-prefixed text row above; the longest enum value
+        # (`[failure]`, nine chars) plus the leading "N.  " plus the
+        # gap between the bracket and the text lands the body text at
+        # column 12.
         lines.append(f"            {date_str}")
         lines.append("")
         memory_ids.append(fact.id)
@@ -825,7 +673,7 @@ def _build_search_results(
     Score shown is the Mem0 similarity score, NOT the Haiku confidence
     (spec §6.5 explicitly calls this out). Tags + date are shown on
     the second line of each result. Returns the memory_ids list for
-    cache storage - same contract as the tag view.
+    cache storage - same contract as the episode list view.
     """
     if not results:
         text = f'Search: "{query}"\n\n{_MSG_NO_SEARCH_RESULTS}'
@@ -862,15 +710,12 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
 
     Issue #407 expanded the headline to surface per-source totals for
     every user-visible source with non-zero rows (extracted facts,
-    episode summaries, migration imports). The four extracted-shaped
-    sections that follow (by-tag table, confidence block,
-    confirmed-actions line, prompt-version table) are conditional on
-    `extracted_count > 0` because they all read extractor-only
-    metadata; for an episode-only or migration-only operator they
-    would be all-zero noise without informational value. The tag list
-    still shows every enum value (including zero-count tags) when
-    rendered - that asymmetry vs the dashboard is documented in
-    spec §6.1.
+    episode summaries, migration imports). The three extracted-shaped
+    sections that follow (confidence block, confirmed-actions line,
+    prompt-version table) are conditional on `extracted_count > 0`
+    because they all read extractor-only metadata; for an episode-only
+    or migration-only operator they would be all-n/a noise without
+    informational value.
     """
     # Combined empty-state guard (issue #407): only when every
     # user-visible source is empty does the corpus count as "no
@@ -884,11 +729,11 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
         return text, kb
 
     # Headline block: per-source totals, one line per non-zero source.
-    # Padding chosen for alignment with the "By tag:" label column
-    # below (which uses an enum-width pad). Lines for zero-valued
-    # counts are omitted so a fresh extracted-only operator does not
-    # see two empty "Total episodes:" / "Total imported:" rows below
-    # their facts total.
+    # Right-padding holds the "Total <source>:" labels at consistent
+    # width across the three header lines so the count column lines
+    # up. Lines for zero-valued counts are omitted so a fresh
+    # extracted-only operator does not see two empty "Total episodes:"
+    # / "Total imported:" rows below their facts total.
     lines = ["Memory stats", ""]
     if stats.extracted_count:
         lines.append(f"Total facts:      {stats.extracted_count}")
@@ -897,27 +742,14 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
     if stats.migration_count:
         lines.append(f"Total imported:   {stats.migration_count}")
 
-    # The four extracted-shaped sections below all read extractor-only
-    # metadata (tags, confidence, confirmation_quote, prompt_version).
-    # For an episode-only or migration-only operator (extracted_count
-    # == 0 but at least one other source > 0), rendering these would
-    # produce an all-zeros tag table and an all-n/a confidence block -
-    # noise without informational value. The headline alone is the
-    # operator's signal in that case.
+    # The three extracted-shaped sections below all read extractor-only
+    # metadata (confidence, confirmation_quote, prompt_version). For
+    # an episode-only or migration-only operator (extracted_count == 0
+    # but at least one other source > 0), rendering these would produce
+    # an all-n/a confidence block and zero confirmed-actions noise
+    # without informational value. The headline alone is the operator's
+    # signal in that case.
     if stats.extracted_count > 0:
-        lines.append("")
-        lines.append("By tag:")
-        # Pad tag column to the longest enum name for alignment.
-        label_width = max(len(t) for t in _TAG_ENUM)
-        for tag in _TAG_ENUM:
-            count = stats.by_tag.get(tag, 0)
-            lines.append(f"  {tag.ljust(label_width)}  {count:>3}")
-
-        # Confidence block. min/median/max are None when no extracted
-        # row carried a confidence value (an extracted_count > 0 corpus
-        # whose rows were all written without the field; rare but
-        # possible on legacy data). Render "n/a" rather than 0.00 so
-        # the row stays honest about the underlying state.
         lines.append("")
         lines.append("Confidence:")
         minv = stats.confidence_min
@@ -979,37 +811,6 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
     return text, kb
 
 
-# ── Builder: forget-by-tag confirmation (spec §6.7) ─────────────────
-
-
-def _build_forget_tag_confirm(tag: str, count: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Render the bulk forget-by-tag confirmation."""
-    # Singular vs plural noun. Without this, count==1 renders "1 facts"
-    # / "1 memories" / "confirm forget 1 facts". A tag with one
-    # surviving member is a real case (deletes whittle the count).
-    fact_word = "fact" if count == 1 else "facts"
-    memory_word = "memory" if count == 1 else "memories"
-    text = (
-        f'Forget all {count} {fact_word} tagged "{tag}"?\n\n'
-        f"This will permanently remove {count} {memory_word}. Tags are "
-        "independent, so a fact tagged [preference, constraint] will "
-        "also be affected.\n\n"
-        "This cannot be undone."
-    )
-    kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    f"confirm forget {count} {fact_word}",
-                    callback_data=_encode_callback("ftd", tag),
-                ),
-                InlineKeyboardButton("cancel", callback_data=_encode_callback("dash")),
-            ]
-        ]
-    )
-    return text, kb
-
-
 # ── Top-level command handler ───────────────────────────────────────
 
 
@@ -1021,7 +822,6 @@ async def handle_memory_command(update: Update, context: ContextTypes.DEFAULT_TY
       help / unknown → help text
       stats          → stats screen
       search <query> → search (empty query falls through to help)
-      forget <tag>   → forget-by-tag confirmation
     """
     # PTB CommandHandler guarantees a message is attached, but
     # `python -O` strips asserts; use `if/raise` for `-O` safety.
@@ -1066,19 +866,10 @@ async def handle_memory_command(update: Update, context: ContextTypes.DEFAULT_TY
             return
         await _send_search(update, context, chat_id, query)
         return
-    if sub == "forget":
-        if not rest:
-            await update.message.reply_text("Usage: /memory forget <tag>")
-            return
-        tag = rest[0].lower()
-        if tag not in _TAG_ENUM:
-            valid = ", ".join(_TAG_ENUM)
-            await update.message.reply_text(f"Unknown tag '{tag}'. Valid tags: {valid}")
-            return
-        await _send_forget_tag_confirm(update, context, chat_id, tag)
-        return
 
-    # Unknown subcommand - show help (spec §5).
+    # Unknown subcommand falls through to help (so an unrecognized
+    # word, including the retired `forget` subcommand, lands the
+    # operator on the syntax-reminder text).
     await update.message.reply_text(_HELP_TEXT)
 
 
@@ -1090,14 +881,13 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     Verbs:
       dash              - re-render dashboard
-      tag <name> <page> - tag drill-down at page
+      eps <page>        - episode list at page
       fact <idx>        - open fact at index (resolved against cache)
       stats             - re-render stats
       help              - help text (Search button on dashboard)
       ffc               - forget single fact confirm
       ffd               - forget single fact: do delete
       fview             - cancel forget; return to fact view (same id)
-      ftd <tag>         - forget by tag: do bulk delete
     """
     # PTB CallbackQueryHandler guarantees both callback_query and
     # query.data are present, but `python -O` strips asserts; use
@@ -1158,32 +948,10 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             # the response.
             await query.answer(_HELP_TEXT, show_alert=True)
             return
-        if verb == "tag":
-            if len(args) < 2:
-                await _send_dashboard(update, context, chat_id, edit=True)
-                await query.answer(_MSG_SESSION_EXPIRED)
-                return
-            tag = args[0]
-            # Same _TAG_ENUM gate as the ftd verb and the /memory
-            # forget text path. Off-enum tags are safe today (Mem0
-            # returns empty), but accepting them here is inconsistent
-            # with the rest of the surface and a maintenance trap.
-            if tag not in _TAG_ENUM:
-                await _send_dashboard(update, context, chat_id, edit=True)
-                await query.answer(_MSG_SESSION_EXPIRED)
-                return
-            try:
-                page = int(args[1])
-            except ValueError:
-                page = 0
-            await _send_tag_view(update, context, chat_id, tag, page, edit=True)
-            await query.answer()
-            return
         if verb == "eps":
             # Episode list browser (issue #410). Single-arg page
-            # index; no further validation gate (no enum to check
-            # against, unlike tag). Invalid integer falls back to
-            # page 0 so a stale callback never blocks navigation.
+            # index; invalid integer falls back to page 0 so a stale
+            # callback never blocks navigation.
             try:
                 page = int(args[0]) if args else 0
             except ValueError:
@@ -1250,16 +1018,8 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             return_to = cache.return_to
             ok = memory.delete_by_id(user_id=str(chat_id), memory_id=memory_id)
             # Return to whatever screen the user was on before the
-            # fact view. Tag view or episode list if known; otherwise
-            # dashboard.
-            if return_to is not None and return_to[0] == "tag" and len(return_to[1]) >= 2:
-                tag = return_to[1][0]
-                try:
-                    page = int(return_to[1][1])
-                except ValueError:
-                    page = 0
-                await _send_tag_view(update, context, chat_id, tag, page, edit=True)
-            elif return_to is not None and return_to[0] == "eps" and len(return_to[1]) >= 1:
+            # fact view. Episode list if known; otherwise dashboard.
+            if return_to is not None and return_to[0] == "eps" and len(return_to[1]) >= 1:
                 # Issue #410: facts opened from the episode list
                 # return to that list at the same page after delete.
                 try:
@@ -1270,31 +1030,6 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             else:
                 await _send_dashboard(update, context, chat_id, edit=True)
             await query.answer("Forgotten." if ok else "Not found.")
-            return
-        if verb == "ftd":
-            # Forget by tag: execute. Tag is in the callback args
-            # (not the cache) so the action survives a stale cache.
-            if not args:
-                await _send_dashboard(update, context, chat_id, edit=True)
-                await query.answer(_MSG_SESSION_EXPIRED)
-                return
-            tag = args[0]
-            # Validate even though the callback is one we generated:
-            # stale buttons, crafted callbacks, or version skew could
-            # smuggle an arbitrary string into get_by_tag/delete loop.
-            # Mirror the same _TAG_ENUM gate as the /memory forget
-            # text path (see `if sub == "forget"` above).
-            if tag not in _TAG_ENUM:
-                await _send_dashboard(update, context, chat_id, edit=True)
-                await query.answer(_MSG_SESSION_EXPIRED)
-                return
-            facts = memory.get_by_tag(user_id=str(chat_id), tag=tag)
-            deleted = 0
-            for fact in facts:
-                if memory.delete_by_id(user_id=str(chat_id), memory_id=fact.id):
-                    deleted += 1
-            await _send_dashboard(update, context, chat_id, edit=True)
-            await query.answer(f"Forgot {deleted} facts.")
             return
     except Exception as exc:
         # Spec §8: never let a Mem0 exception surface as a stack trace.
@@ -1328,32 +1063,10 @@ async def _send_dashboard(
         return
     text, kb = _build_dashboard(stats)
     # Reset the cache: dashboard is the root. memory_ids cleared so
-    # any stale fact button taps (from a previous tag view) trip the
-    # session-expired branch instead of resolving to a wrong fact.
+    # any stale fact button taps (from a previous search or episode
+    # list) trip the session-expired branch instead of resolving to
+    # a wrong fact.
     _set_cache(chat_id, _ScreenCache(screen="dashboard"))
-    await _send_or_edit(update, text, kb, edit=edit)
-
-
-async def _send_tag_view(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    tag: str,
-    page: int,
-    edit: bool = False,
-) -> None:
-    """Render and send/edit the tag drill-down for `tag` at `page`."""
-    try:
-        facts = memory.get_by_tag(user_id=str(chat_id), tag=tag)
-    except Exception as exc:
-        log.exception("get_by_tag(%s) failed: %s", tag, exc)
-        await _send_or_edit(update, _MSG_QUERY_FAILED, None, edit=edit)
-        return
-    text, kb, memory_ids, clamped_page, _total = _build_tag_view(tag, facts, page)
-    _set_cache(
-        chat_id,
-        _ScreenCache(screen="tag", tag=tag, page=clamped_page, memory_ids=memory_ids),
-    )
     await _send_or_edit(update, text, kb, edit=edit)
 
 
@@ -1366,8 +1079,7 @@ async def _send_episode_list(
 ) -> None:
     """Render and send/edit the episode list at `page` (issue #410).
 
-    Mirrors `_send_tag_view` exactly except for the data source:
-    fetches via `memory.get_all_episodes`, builds via
+    Fetches via `memory.get_all_episodes`, builds via
     `_build_episode_list_view`, and sets the cache screen to
     `"episodes"` so a fact opened from this list can route back to
     the same page via `_send_fact_view`'s return_to logic.
@@ -1401,15 +1113,10 @@ async def _send_fact_view(
     """
     cache = _get_cache(chat_id)
     return_to = cache.return_to if cache is not None else None
-    # If we came from a tag view, set the return target so back lands
-    # the user where they started rather than at the root.
-    if cache is not None and cache.screen == "tag" and cache.tag is not None:
-        return_to = ("tag", [cache.tag, str(cache.page)])
-    elif cache is not None and cache.screen == "episodes":
+    if cache is not None and cache.screen == "episodes":
         # Issue #410: facts opened from the episode list return to
         # that list at the same page on back-nav. Page is the only
-        # arg needed (unlike tag, which carries both tag and page);
-        # the eps verb decodes a single-element args list.
+        # arg needed; the eps verb decodes a single-element args list.
         return_to = ("eps", [str(cache.page)])
     elif cache is not None and cache.screen == "search" and cache.query is not None:
         # Searches re-execute on back-nav. Encoding the full query in
@@ -1535,36 +1242,6 @@ async def _send_stats(
     await _send_or_edit(update, text, kb, edit=edit)
 
 
-async def _send_forget_tag_confirm(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    tag: str,
-) -> None:
-    """Render the forget-by-tag confirmation.
-
-    Called only from the /memory forget text path, where
-    `update.message` is guaranteed by python-telegram-bot's
-    routing. The contract check uses `if/raise` rather than
-    `assert` so it survives `python -O` (assertions are stripped),
-    matching the same hardening applied to `_send_or_edit` and
-    `_encode_callback`.
-    """
-    if update.message is None:
-        raise ValueError("_send_forget_tag_confirm: requires update.message")
-    try:
-        facts = memory.get_by_tag(user_id=str(chat_id), tag=tag)
-    except Exception as exc:
-        log.exception("get_by_tag(%s) failed: %s", tag, exc)
-        await update.message.reply_text(_MSG_QUERY_FAILED)
-        return
-    if not facts:
-        await update.message.reply_text(f'No memories tagged "{tag}".')
-        return
-    text, kb = _build_forget_tag_confirm(tag, len(facts))
-    await _send_or_edit(update, text, kb, edit=False)
-
-
 # ── I/O dispatch (send vs edit) ─────────────────────────────────────
 
 
@@ -1655,8 +1332,7 @@ def _chat_id(update: Update) -> int:
     wiring this helper from a non-routed path under optimized
     bytecode would see `AttributeError` on the next access instead
     of a meaningful contract violation. Matches the convention used
-    everywhere else in this module (_encode_callback, _send_or_edit,
-    _send_forget_tag_confirm).
+    everywhere else in this module (_encode_callback, _send_or_edit).
     """
     chat = update.effective_chat
     if chat is None:

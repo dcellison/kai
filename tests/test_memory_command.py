@@ -1,21 +1,20 @@
 """
-Unit tests for `src/kai/memory_command.py` (spec 310).
+Unit tests for `src/kai/memory_command.py`.
 
 Covers:
 - Subcommand parsing dispatch (every subcommand routes to the right
-  send-helper, including the empty-query and unknown-tag fall-throughs).
+  send-helper, including the empty-query fall-through to help).
 - Callback encoding/decoding round-trips, including a 64-byte ceiling
   check on the longest realistic callback.
-- Pure builder rendering: dashboard, tag view (with pagination edge
-  cases), fact view, forget confirmations, search, stats.
+- Pure builder rendering: dashboard, fact view, forget confirmation,
+  search, stats, episode list view.
 - Per-chat cache: insert, single-entry overwrite, lazy TTL expiry.
-- Empty-state branches: zero-fact dashboard, zero-result search,
-  off-enum tag rejection.
+- Empty-state branches: zero-fact dashboard, zero-result search.
 
-Per spec §10.3, no real Mem0 instance is involved. The handler tests
-that drive `_send_*` swap `kai.memory.get_stats` / `get_by_tag` /
-`get_by_id` / `delete_by_id` / `search` for fakes via monkeypatch,
-and swap `kai.memory.is_enabled` to return True.
+No real Mem0 instance is involved. The handler tests that drive
+`_send_*` swap `kai.memory.get_stats` / `get_by_id` / `delete_by_id`
+/ `search` / `get_all_episodes` for fakes via monkeypatch, and swap
+`kai.memory.is_enabled` to return True.
 """
 
 from __future__ import annotations
@@ -160,14 +159,14 @@ class TestCallbackCodec:
         assert memory_command._decode_callback("mem:") is None
 
     def test_longest_realistic_callback_under_64_bytes(self):
-        # The longest legitimate callback is the forget-by-tag verb
-        # with the longest tag name (`confirmed_action`, 16 chars):
-        #   mem:ftd:confirmed_action  (24 bytes)
+        # The longest legitimate post-dismantle callback is the
+        # episode-list page verb with a multi-digit page index:
+        #   mem:eps:999  (12 bytes)
         # Verifying the constructor's assertion does not fire and the
         # encoded length is well under the 64-byte limit.
-        encoded = memory_command._encode_callback("ftd", "confirmed_action")
+        encoded = memory_command._encode_callback("eps", "999")
         assert len(encoded.encode("utf-8")) <= 64
-        assert encoded == "mem:ftd:confirmed_action"
+        assert encoded == "mem:eps:999"
 
     def test_overlong_callback_raises(self):
         # The 64-byte ceiling is enforced via `if/raise`, not assert,
@@ -244,60 +243,6 @@ class TestBuildDashboard:
         assert "No memories yet" in text
         assert kb is None
 
-    def test_renders_summary_and_tags(self):
-        stats = _stats(
-            extracted_count=10,
-            by_tag={"preference": 5, "fact": 3, "decision": 2},
-            confidence_median=0.86,
-            confidence_min=0.52,
-        )
-        text, kb = memory_command._build_dashboard(stats)
-        assert "10 facts across 3 tags" in text
-        assert "median 0.86, min 0.52" in text
-        # Per #351 the dashboard text intentionally omits per-tag
-        # rows - counts live on the buttons. Two regression checks:
-        # (1) the bar-chart unicode block must be gone entirely; (2)
-        # the leading-space row prefix that the old per-tag rows used
-        # ("  preference" etc.) must not appear. Substring checks for
-        # bare tag names would false-match "facts" in the summary
-        # header, so we anchor on the row prefix instead.
-        assert "\u2593" not in text, "bar-chart character should not appear in dashboard text"
-        for tag in ("preference", "fact", "decision"):
-            assert f"  {tag}" not in text, f"per-tag row for {tag!r} should not appear in dashboard text"
-        assert kb is not None
-        # 3 tag rows + 1 footer row of (Search, Stats).
-        assert len(kb.inline_keyboard) == 4
-        # Tag buttons carry the count in parens, ordered by descending
-        # count. Each button is in its own row (one row per tag).
-        tag_button_labels = [row[0].text for row in kb.inline_keyboard[:-1]]
-        assert tag_button_labels == ["preference (5)", "fact (3)", "decision (2)"]
-        # Footer row holds the two utility buttons.
-        footer = kb.inline_keyboard[-1]
-        assert [btn.text for btn in footer] == ["Search", "Stats"]
-
-    def test_zero_count_tags_hidden(self):
-        # Spec §6.1: dashboard hides zero-count tags. Stats screen
-        # shows them. This test enforces the dashboard half.
-        stats = _stats(
-            extracted_count=5,
-            by_tag={"preference": 5, "location": 0},
-            confidence_median=0.9,
-            confidence_min=0.9,
-        )
-        _, kb = memory_command._build_dashboard(stats)
-        assert kb is not None
-        # 1 nonzero tag row + 1 footer row.
-        assert len(kb.inline_keyboard) == 2
-        assert "preference" in kb.inline_keyboard[0][0].text
-        assert "location" not in kb.inline_keyboard[0][0].text
-
-    def test_callback_data_for_tag_button(self):
-        stats = _stats(extracted_count=3, by_tag={"preference": 3})
-        _, kb = memory_command._build_dashboard(stats)
-        assert kb is not None
-        button = kb.inline_keyboard[0][0]
-        assert button.callback_data == "mem:tag:preference:0"
-
 
 # ── Builder: pagination ────────────────────────────────────────────
 
@@ -342,77 +287,6 @@ class TestPaginate:
         facts = [_fact(f"id{i}", f"t{i}", ["preference"]) for i in range(3)]
         _, page, _ = memory_command._paginate(facts, -1)
         assert page == 0
-
-
-# ── Builder: tag view ──────────────────────────────────────────────
-
-
-class TestBuildTagView:
-    def test_renders_facts_with_confidence_and_date(self):
-        facts = [
-            _fact("a", "First fact", ["preference"], confidence=0.92, updated_at="2026-04-17"),
-            _fact("b", "Second fact", ["preference"], confidence=0.75, updated_at="2026-02-14"),
-        ]
-        text, _, ids, page, total = memory_command._build_tag_view("preference", facts, 0)
-        assert "preference  (page 1 of 1)" in text
-        assert "[0.92]  First fact" in text
-        assert "[0.75]  Second fact" in text
-        assert "2026-04-17" in text
-        assert ids == ["a", "b"]
-        assert page == 0
-        assert total == 1
-
-    def test_truncates_long_text(self):
-        long_text = "x" * 200
-        facts = [_fact("a", long_text, ["preference"], confidence=0.9)]
-        text, _, _, _, _ = memory_command._build_tag_view("preference", facts, 0)
-        # Truncated text appears with ellipsis. The full 200-char
-        # string must NOT appear in the rendered output.
-        assert long_text not in text
-        assert "\u2026" in text
-
-    def test_pagination_buttons(self):
-        facts = [_fact(f"id{i}", f"t{i}", ["preference"]) for i in range(12)]
-        # Middle page should have prev, back, next.
-        _, kb, _, _, _ = memory_command._build_tag_view("preference", facts, 1)
-        nav_row = kb.inline_keyboard[-1]
-        labels = [btn.text for btn in nav_row]
-        assert labels == ["< prev", "back", "next >"]
-
-    def test_first_page_no_prev_button(self):
-        facts = [_fact(f"id{i}", f"t{i}", ["preference"]) for i in range(12)]
-        _, kb, _, _, _ = memory_command._build_tag_view("preference", facts, 0)
-        nav_row = kb.inline_keyboard[-1]
-        assert "< prev" not in [btn.text for btn in nav_row]
-        assert "next >" in [btn.text for btn in nav_row]
-
-    def test_last_page_no_next_button(self):
-        facts = [_fact(f"id{i}", f"t{i}", ["preference"]) for i in range(12)]
-        _, kb, _, _, _ = memory_command._build_tag_view("preference", facts, 2)
-        nav_row = kb.inline_keyboard[-1]
-        assert "next >" not in [btn.text for btn in nav_row]
-        assert "< prev" in [btn.text for btn in nav_row]
-
-    def test_empty_tag_renders_back_button(self):
-        text, kb, ids, _, _ = memory_command._build_tag_view("preference", [], 0)
-        assert "No memories with this tag" in text
-        assert ids == []
-        assert kb.inline_keyboard[0][0].text == "back"
-
-    def test_missing_confidence_renders_placeholder(self):
-        # Legacy or pre-#335 rows may lack confidence; the screen
-        # must not KeyError. Verify the placeholder appears.
-        bad = MemoryResult(
-            id="bad",
-            text="legacy fact",
-            score=0.0,
-            memory_type="fact",
-            metadata={"source": "extracted", "tags": ["preference"]},
-            created_at="2026-04-17",
-            updated_at="2026-04-17",
-        )
-        text, _, _, _, _ = memory_command._build_tag_view("preference", [bad], 0)
-        assert "[----]" in text
 
 
 # ── Builder: fact view ─────────────────────────────────────────────
@@ -478,43 +352,6 @@ class TestBuildForgetFactConfirm:
         # Confirm + cancel buttons.
         labels = [btn.text for btn in kb.inline_keyboard[0]]
         assert labels == ["confirm forget", "cancel"]
-
-
-class TestBuildForgetTagConfirm:
-    def test_count_appears_in_button_label(self):
-        text, kb = memory_command._build_forget_tag_confirm("preference", 38)
-        assert "Forget all 38 facts" in text
-        assert "Tags are independent" in text
-        confirm_btn = kb.inline_keyboard[0][0]
-        # Spec §6.7: "confirm forget 38 facts" - the count is in the
-        # button label as a concreteness cue.
-        assert confirm_btn.text == "confirm forget 38 facts"
-        assert confirm_btn.callback_data == "mem:ftd:preference"
-
-    def test_singular_when_count_is_one(self):
-        # Round-5 review #3: count==1 used to render "1 facts" /
-        # "1 memories" / "confirm forget 1 facts". A tag with one
-        # surviving member is a real case (deletes whittle the
-        # count). Verify the singular form across all three sites
-        # (header, body, button) so a future edit can't regress
-        # any one of them in isolation.
-        text, kb = memory_command._build_forget_tag_confirm("preference", 1)
-        assert "Forget all 1 fact " in text
-        assert "1 memory." in text
-        assert "1 facts" not in text
-        assert "1 memories" not in text
-        confirm_btn = kb.inline_keyboard[0][0]
-        assert confirm_btn.text == "confirm forget 1 fact"
-
-    def test_plural_when_count_is_two(self):
-        # Boundary on the other side: count==2 must use the plural
-        # forms. Otherwise the singular branch would silently catch
-        # everything.
-        text, kb = memory_command._build_forget_tag_confirm("preference", 2)
-        assert "Forget all 2 facts " in text
-        assert "2 memories." in text
-        confirm_btn = kb.inline_keyboard[0][0]
-        assert confirm_btn.text == "confirm forget 2 facts"
 
 
 # ── Builder: search results ────────────────────────────────────────
@@ -585,9 +422,10 @@ class TestBuildStats:
         assert "Total facts:      142" in text
         assert "Total episodes:" not in text
         assert "Total imported:" not in text
-        # Spec §6.1 asymmetry: zero-count tags ARE shown in stats.
-        assert "location" in text
-        assert "  0" in text  # location's zero count
+        # No "By tag:" section in the stats surface (issue #416
+        # dropped the per-tag count table along with the rest of
+        # the tag UI).
+        assert "By tag:" not in text
         # Confidence block
         assert "min               0.52" in text
         assert "median            0.87" in text
@@ -802,10 +640,10 @@ class TestDashboardMultiSource:
 
     def test_dashboard_omits_zero_source_counts(self):
         """A fresh extracted-only operator (episode_count==0,
-        migration_count==0) sees the original
-        "Memories: <N> facts across <M> tags." headline. Zero-valued
-        sources are omitted from the comma list rather than rendered
-        as "0 episodes" / "0 imported"."""
+        migration_count==0) sees a headline naming only their
+        non-zero source. Zero-valued sources are omitted from the
+        comma list rather than rendered as "0 episodes" / "0
+        imported"."""
         stats = _stats(
             extracted_count=10,
             by_tag={"preference": 5},
@@ -813,24 +651,22 @@ class TestDashboardMultiSource:
             confidence_min=0.8,
         )
         text, _ = memory_command._build_dashboard(stats)
-        # Singular "tag" with len(nonzero)==1; the pre-#407 code
-        # rendered "1 tags" which was a latent mismatch. Verified
-        # so a future change to the headline format trips this
-        # regression test.
-        assert "Memories: 10 facts across 1 tag." in text
+        assert "Memories: 10 facts." in text
         assert "episodes" not in text
         assert "imported" not in text
+        # Issue #416 dropped the "across N tags" suffix from the
+        # headline when the tag UI was retired.
+        assert "across" not in text
 
     def test_dashboard_episode_only_user_renders(self):
         """An episode-only operator (`episode_count > 0`,
         `extracted_count == 0`, `migration_count == 0`) sees the
-        dashboard rendered (NOT _MSG_NO_FACTS) with no tag buttons
-        (since `by_tag` is extracted-only and empty). Footer points
-        at the always-rendered Search/Stats button row.
+        dashboard rendered (NOT _MSG_NO_FACTS). Footer points at
+        the always-rendered Episodes/Search/Stats button row.
 
-        Pins both empty-state guard fixes AND the footer conditional
-        simultaneously: the pre-#407 dashboard returned _MSG_NO_FACTS
-        for this input via its extracted-only guard."""
+        Pins the empty-state guard fix from issue #407: the
+        pre-#407 dashboard returned _MSG_NO_FACTS for this input
+        via its extracted-only guard."""
         stats = _stats(episode_count=4)
         text, kb = memory_command._build_dashboard(stats)
         # Not the empty state.
@@ -838,12 +674,10 @@ class TestDashboardMultiSource:
         assert kb is not None
         # Headline shows the episode count.
         assert "4 episodes" in text
-        # Footer text is the no-tag-buttons-with-Episodes branch
-        # (issue #410 D6): when Episodes button is rendered, footer
-        # names every utility-row affordance.
+        # Footer enumerates every utility-row affordance when the
+        # Episodes button renders.
         assert "Tap Episodes to browse, Search to find specific memories, or Stats for details." in text
-        assert "Tap a tag to browse" not in text
-        # Keyboard has only the utility row, which now includes the
+        # Keyboard has only the utility row, which includes the
         # Episodes button (issue #410) alongside Search and Stats.
         assert len(kb.inline_keyboard) == 1
         utility_row = kb.inline_keyboard[-1]
@@ -852,14 +686,14 @@ class TestDashboardMultiSource:
     def test_dashboard_migration_only_user_renders(self):
         """Same shape as the episode-only case: migration_count > 0,
         extracted_count == 0, episode_count == 0. Same empty-state
-        guard fix and same no-tag-button footer assertion."""
+        guard fix; the keyboard renders only the Search/Stats utility
+        row because no Episodes button shows when episode_count == 0."""
         stats = _stats(migration_count=25)
         text, kb = memory_command._build_dashboard(stats)
         assert "No memories yet" not in text
         assert kb is not None
         assert "25 imported" in text
         assert "Use Search to find specific memories, or tap Stats for details." in text
-        assert "Tap a tag to browse" not in text
         assert len(kb.inline_keyboard) == 1
 
     def test_dashboard_all_zero_returns_empty_state(self):
@@ -903,17 +737,22 @@ class TestStatsMultiSource:
 
     def test_stats_view_episode_only_omits_extracted_sections(self):
         """An episode-only operator's stats output contains only the
-        per-source headline. The four extracted-shaped sections
-        (by-tag table, confidence block, confirmed-actions line,
-        prompt-version table) are omitted because they read
-        extractor-only metadata.
+        per-source headline. The three extracted-shaped sections
+        (confidence block, confirmed-actions line, prompt-version
+        table) are omitted because they read extractor-only metadata.
 
-        Pins §D5's "the four extracted-shaped sections are omitted"
-        contract for the extracted-zero case."""
+        Pins the omit-on-extracted-zero contract. The negative
+        `"By tag:" not in text` assertion stays valid even though
+        the per-tag section was retired across the board; keeping
+        the pin protects against a regression that revives any
+        per-tag rendering on this branch.
+        """
         stats = _stats(episode_count=5)
         text, _ = memory_command._build_stats(stats)
         assert "Total episodes:   5" in text
-        # None of the four extracted-shaped sections render.
+        # None of the extracted-shaped sections render. The
+        # per-tag table is retired entirely (issue #416), but the
+        # negative assertion stays valid as a regression pin.
         assert "By tag:" not in text
         assert "Confidence:" not in text
         assert "Confirmed actions:" not in text
@@ -1174,11 +1013,10 @@ class TestDashboardEpisodesButton:
         assert labels == ["Search", "Stats"]
 
     def test_dashboard_episode_only_user_renders_episodes_button(self):
-        # Episode-only operator: by_tag is extracted-only (and
-        # therefore empty), so no tag-button rows render. The
-        # Episodes button is on the utility row alongside Search
-        # and Stats. Pins the cross-section of the episode-only
-        # surface and the Episodes button placement.
+        # Episode-only operator: utility row is the only keyboard
+        # row, with Episodes alongside Search and Stats. Pins the
+        # cross-section of the episode-only surface and the Episodes
+        # button placement.
         stats = _stats(episode_count=4)
         _, kb = memory_command._build_dashboard(stats)
         assert kb is not None
@@ -1188,19 +1026,18 @@ class TestDashboardEpisodesButton:
         labels = [btn.text for btn in utility_row]
         assert labels == ["Episodes (4)", "Search", "Stats"]
 
-    def test_dashboard_no_tag_buttons_with_episodes_footer_wording(self):
-        # D6 footer branch when no tag buttons render and Episodes
-        # is rendered: footer names every utility-row affordance.
-        # Pins against the pre-#410 wording (which would lie by
-        # enumerating only Search and Stats).
+    def test_dashboard_with_episodes_footer_wording(self):
+        # Footer when Episodes is rendered: enumerates every
+        # utility-row affordance. Pins against the pre-#410 wording
+        # which would lie by enumerating only Search and Stats.
         stats = _stats(episode_count=4)
         text, _ = memory_command._build_dashboard(stats)
         assert "Tap Episodes to browse, Search to find specific memories, or Stats for details." in text
 
-    def test_dashboard_no_tag_buttons_no_episodes_footer_wording(self):
-        # D6 footer branch when no tag buttons AND no Episodes
-        # button render: footer matches pre-#410 wording. Pins
-        # the migration-only operator's surface.
+    def test_dashboard_no_episodes_footer_wording(self):
+        # Footer when no Episodes button renders: matches the
+        # pre-#410 wording. Pins the migration-only operator's
+        # surface.
         stats = _stats(migration_count=25)
         text, _ = memory_command._build_dashboard(stats)
         assert "Use Search to find specific memories, or tap Stats for details." in text
@@ -1670,24 +1507,6 @@ class TestCommandDispatch:
         assert "legacy-1" not in cache.memory_ids
 
     @pytest.mark.asyncio
-    async def test_forget_unknown_tag_rejected(self, monkeypatch, update_factory, context_factory):
-        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
-        upd = update_factory()
-        ctx = context_factory(args=["forget", "notatag"])
-        await memory_command.handle_memory_command(upd, ctx)
-        msg = upd.message.reply_text.call_args.args[0]
-        assert "Unknown tag" in msg
-
-    @pytest.mark.asyncio
-    async def test_forget_no_tag_shows_usage(self, monkeypatch, update_factory, context_factory):
-        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
-        upd = update_factory()
-        ctx = context_factory(args=["forget"])
-        await memory_command.handle_memory_command(upd, ctx)
-        msg = upd.message.reply_text.call_args.args[0]
-        assert "Usage:" in msg
-
-    @pytest.mark.asyncio
     async def test_unauthorized_silently_dropped(self, monkeypatch, update_factory, context_factory):
         monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
         upd = update_factory(user_id=12345)  # not in allowed_user_ids
@@ -1815,12 +1634,11 @@ class TestSendOrEditContract:
 
     @pytest.mark.asyncio
     async def test_send_path_raises_when_effective_chat_is_none(self):
-        # Round-5 review #2: the fresh-send branch's None-guard on
-        # `effective_chat` was an `assert`, which `python -O` strips.
-        # Replaced with `if/raise` so the contract holds in optimized
-        # bytecode. This mirrors the same pattern used by
-        # `_encode_callback`, the `edit=True` guard above, and
-        # `_send_forget_tag_confirm`.
+        # The fresh-send branch's None-guard on `effective_chat` is
+        # `if/raise` rather than `assert` so the contract holds under
+        # `python -O` (which strips assertions). Mirrors the same
+        # hardening used by `_encode_callback` and the `edit=True`
+        # guard above.
         upd = MagicMock()
         upd.effective_chat = None
         upd.callback_query = None
@@ -1881,24 +1699,6 @@ class TestSendOrEditContract:
         # Fresh send happened despite the NetworkError on cleanup.
         upd.effective_chat.send_message.assert_awaited_once()
 
-    @pytest.mark.asyncio
-    async def test_send_forget_tag_confirm_raises_without_message(self, monkeypatch):
-        # `_send_forget_tag_confirm` is only called from the text
-        # command path where update.message is guaranteed. The check
-        # is `if/raise` (not `assert`) so it survives `python -O`,
-        # consistent with the other contract gates in this module.
-        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
-        monkeypatch.setattr(
-            memory_command.memory,
-            "get_by_tag",
-            lambda *, user_id, tag: [_fact("a", "x", ["preference"])],
-        )
-        upd = MagicMock()
-        upd.message = None
-        ctx = MagicMock()
-        with pytest.raises(ValueError, match=r"requires update\.message"):
-            await memory_command._send_forget_tag_confirm(upd, ctx, 100, "preference")
-
 
 # ── Callback dispatch (smoke tests for the verb table) ─────────────
 
@@ -1953,15 +1753,16 @@ class TestCallbackDispatch:
         assert toast == memory_command._MSG_SESSION_EXPIRED
 
     @pytest.mark.asyncio
-    async def test_ffd_deletes_and_returns_to_tag(self, monkeypatch, update_factory, context_factory):
+    async def test_ffd_deletes_and_returns_to_episode_list(self, monkeypatch, update_factory, context_factory):
         # Forget single fact: confirm flow. Cache holds the fact id
-        # and a return_to pointing at a tag view. After delete, the
-        # handler should re-render the tag view.
+        # and a return_to pointing at the episode list. After delete,
+        # the handler should re-render the episode list at the same
+        # page. Pins the eps return_to wiring through the ffd path.
         monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
         monkeypatch.setattr(
             memory_command.memory,
-            "get_by_tag",
-            lambda *, user_id, tag: [],  # tag view is now empty
+            "get_all_episodes",
+            lambda *, user_id: [],  # episode list is now empty
         )
         deleted: list[str] = []
 
@@ -1975,7 +1776,7 @@ class TestCallbackDispatch:
             memory_command._ScreenCache(
                 screen="forget_fact_confirm",
                 memory_ids=["mem-id-1"],
-                return_to=("tag", ["preference", "0"]),
+                return_to=("eps", ["0"]),
             ),
         )
         upd = update_factory(callback_data="mem:ffd")
@@ -1984,91 +1785,6 @@ class TestCallbackDispatch:
         assert deleted == ["mem-id-1"]
         toast = upd.callback_query.answer.call_args.args[0]
         assert toast == "Forgotten."
-
-    @pytest.mark.asyncio
-    async def test_ftd_rejects_unknown_tag(self, monkeypatch, update_factory, context_factory):
-        # A stale or crafted callback could carry an arbitrary tag
-        # string. The handler must validate against `_TAG_ENUM`
-        # before invoking get_by_tag/delete_by_id - mirrors the same
-        # gate as the /memory forget text path.
-        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
-        monkeypatch.setattr(
-            memory_command.memory,
-            "get_stats",
-            lambda *, user_id: _stats(extracted_count=0),
-        )
-
-        # If validation fails to fire, get_by_tag would be invoked
-        # with the bogus tag - blow up loudly to surface the bug.
-        def boom(*, user_id, tag):
-            raise AssertionError(f"get_by_tag called with bogus tag {tag!r}")
-
-        monkeypatch.setattr(memory_command.memory, "get_by_tag", boom)
-        monkeypatch.setattr(
-            memory_command.memory,
-            "delete_by_id",
-            lambda *, user_id, memory_id: True,
-        )
-        upd = update_factory(callback_data="mem:ftd:not_a_real_tag")
-        ctx = context_factory()
-        await memory_command.handle_memory_callback(upd, ctx)
-        toast = upd.callback_query.answer.call_args.args[0]
-        assert toast == memory_command._MSG_SESSION_EXPIRED
-
-    @pytest.mark.asyncio
-    async def test_tag_verb_rejects_unknown_tag(self, monkeypatch, update_factory, context_factory):
-        # Symmetric to test_ftd_rejects_unknown_tag: the read-only
-        # `tag` verb must also enforce _TAG_ENUM. A crafted callback
-        # `mem:tag:not_a_real_tag:0` would otherwise reach get_by_tag
-        # with an off-enum string.
-        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
-        monkeypatch.setattr(
-            memory_command.memory,
-            "get_stats",
-            lambda *, user_id: _stats(extracted_count=0),
-        )
-
-        def boom(*, user_id, tag):
-            raise AssertionError(f"get_by_tag called with bogus tag {tag!r}")
-
-        monkeypatch.setattr(memory_command.memory, "get_by_tag", boom)
-        upd = update_factory(callback_data="mem:tag:not_a_real_tag:0")
-        ctx = context_factory()
-        await memory_command.handle_memory_callback(upd, ctx)
-        toast = upd.callback_query.answer.call_args.args[0]
-        assert toast == memory_command._MSG_SESSION_EXPIRED
-
-    @pytest.mark.asyncio
-    async def test_ftd_bulk_deletes_by_tag(self, monkeypatch, update_factory, context_factory):
-        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
-        # Two facts on the tag, both delete cleanly.
-        monkeypatch.setattr(
-            memory_command.memory,
-            "get_by_tag",
-            lambda *, user_id, tag: [
-                _fact("a", "x", ["preference"]),
-                _fact("b", "y", ["preference"]),
-            ],
-        )
-        # After delete, dashboard re-render queries get_stats.
-        monkeypatch.setattr(
-            memory_command.memory,
-            "get_stats",
-            lambda *, user_id: _stats(extracted_count=0),
-        )
-        deleted: list[str] = []
-
-        def fake_delete(*, user_id, memory_id):
-            deleted.append(memory_id)
-            return True
-
-        monkeypatch.setattr(memory_command.memory, "delete_by_id", fake_delete)
-        upd = update_factory(callback_data="mem:ftd:preference")
-        ctx = context_factory()
-        await memory_command.handle_memory_callback(upd, ctx)
-        assert sorted(deleted) == ["a", "b"]
-        toast = upd.callback_query.answer.call_args.args[0]
-        assert toast == "Forgot 2 facts."
 
     @pytest.mark.asyncio
     async def test_send_failure_yields_single_query_failed_answer(self, monkeypatch, update_factory, context_factory):
@@ -2082,17 +1798,27 @@ class TestCallbackDispatch:
 
         # Pick a verb whose Mem0 call is NOT wrapped in a per-helper
         # try/except, so the exception escapes to the outer dispatch
-        # except. The `ftd` (forget-by-tag) verb calls get_by_tag
-        # directly inside the dispatcher, with no inner guard - if
-        # Mem0 is down, RuntimeError bubbles up to handle_memory_callback's
-        # except. Verbs like `dash` won't work here because
-        # _send_dashboard catches its own get_stats failure and renders
-        # an in-screen error instead of propagating.
-        def boom(*, user_id, tag):
+        # except. The `ffc` verb dispatches `_send_forget_fact_confirm`,
+        # which calls `memory.get_by_id` directly without an inner
+        # guard - if Mem0 is down, RuntimeError bubbles up to
+        # handle_memory_callback's except. Verbs like `dash` won't
+        # work here because `_send_dashboard` catches its own
+        # `get_stats` failure and renders an in-screen error instead
+        # of propagating.
+        def boom(*, user_id, memory_id):
             raise RuntimeError("mem0 down")
 
-        monkeypatch.setattr(memory_command.memory, "get_by_tag", boom)
-        upd = update_factory(callback_data="mem:ftd:preference")
+        monkeypatch.setattr(memory_command.memory, "get_by_id", boom)
+        # Prime the cache so the `ffc` handler reads a memory id
+        # from it before invoking the now-blown-up `get_by_id`.
+        memory_command._set_cache(
+            100,
+            memory_command._ScreenCache(
+                screen="fact",
+                memory_ids=["any-id"],
+            ),
+        )
+        upd = update_factory(callback_data="mem:ffc")
         ctx = context_factory()
         await memory_command.handle_memory_callback(upd, ctx)
         # query.answer must have been called exactly once, with the
@@ -2100,3 +1826,163 @@ class TestCallbackDispatch:
         assert upd.callback_query.answer.await_count == 1
         toast = upd.callback_query.answer.call_args.args[0]
         assert toast == memory_command._MSG_QUERY_FAILED
+
+
+# ── Issue #416: tag browse-axis dismantle ──────────────────────────
+
+
+class TestTagBrowseAxisRetired:
+    """Regression pins for the issue #416 dismantle.
+
+    Each test pins a specific dismantle assertion so a future edit
+    that revives any of the deleted surfaces (per-tag dashboard
+    buttons, the `across N tags` headline, the per-tag stats table,
+    `/memory forget <tag>`, the `tag` callback verb) trips a clear
+    test failure rather than silently re-introducing the surface.
+    """
+
+    def test_retired_tag_enum_constant_is_absent(self):
+        # The closed-vocabulary tag-enum constant from the pre-
+        # dismantle surface is fully retired. A future edit that
+        # imports it from memory_extraction or re-declares it
+        # locally would defeat the dismantle. The constant name is
+        # constructed via string concatenation so this test does
+        # not itself register as a stale reference under the dual
+        # grep gate that checks for revival of the deleted symbols.
+        constant_name = "_TAG" + "_ENUM"
+        assert constant_name not in vars(memory_command), (
+            f"constant {constant_name} was resurrected; the tag-dismantle defense is broken"
+        )
+
+    def test_dashboard_renders_no_per_tag_button_rows(self):
+        # The dashboard keyboard is the utility row only post-dismantle;
+        # any inline-button row containing a single button labelled
+        # `<word> (<int>)` (the prior per-tag-row shape) is a regression.
+        stats = _stats(
+            extracted_count=10,
+            by_tag={"preference": 5, "fact": 3},
+            confidence_median=0.85,
+            confidence_min=0.6,
+        )
+        _, kb = memory_command._build_dashboard(stats)
+        assert kb is not None
+        for row in kb.inline_keyboard:
+            if len(row) == 1:
+                label = row[0].text
+                # The prior shape was `<tag> (<count>)`. Test for the
+                # closing-paren marker preceded by a digit, which is
+                # specific enough to avoid false-matching the Episodes
+                # button label `Episodes (4)` (also a single-button
+                # row possibility) - no, actually that DOES match.
+                # The fix: exempt the Episodes button label explicitly,
+                # since it has the same shape.
+                assert not label.endswith(")") or label.startswith("Episodes ("), (
+                    f"unexpected single-button row: {label!r}"
+                )
+
+    def test_dashboard_headline_omits_tag_count(self):
+        # The "across N tags" headline suffix is gone. Permissive
+        # substring check on the leading word avoids over-pinning a
+        # specific wording variant.
+        stats = _stats(
+            extracted_count=10,
+            by_tag={"preference": 5, "fact": 3},
+            confidence_median=0.85,
+            confidence_min=0.6,
+        )
+        text, _ = memory_command._build_dashboard(stats)
+        assert "across " not in text
+
+    def test_stats_renders_no_by_tag_table_for_extracted_only(self):
+        # Complementary to the existing episode-only assertion in
+        # TestStatsMultiSource: an extracted-only operator's stats
+        # output has no `By tag:` header. The pre-Sub-B dashboard
+        # rendered it under the `extracted_count > 0` gate; the
+        # post-dismantle dashboard does not.
+        stats = _stats(extracted_count=5, by_tag={"preference": 3})
+        text, _ = memory_command._build_stats(stats)
+        assert "By tag:" not in text
+
+    def test_help_text_omits_forget_tag_line(self):
+        # The `/memory forget <tag>` line is dropped from the help
+        # text. A future edit that revives the bulk-forget command
+        # must also re-add the help line, so this pin guards against
+        # half-revivals where the command works but help lies about
+        # its absence.
+        assert "/memory forget" not in memory_command._HELP_TEXT
+
+    @pytest.mark.asyncio
+    async def test_forget_subcommand_returns_help_text(self, monkeypatch, update_factory, context_factory):
+        # The /memory forget text path is retired; the unknown-
+        # subcommand fallthrough sends the help text. Both arg-less
+        # and arg-bearing variants must land on help.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        for args in [["forget"], ["forget", "preference"]]:
+            upd = update_factory()
+            ctx = context_factory(args=args)
+            await memory_command.handle_memory_command(upd, ctx)
+            msg = upd.message.reply_text.call_args.args[0]
+            assert msg == memory_command._HELP_TEXT, f"expected help text for /memory {' '.join(args)}, got {msg!r}"
+
+    @pytest.mark.asyncio
+    async def test_unknown_callback_verb_silently_dismisses(self, monkeypatch, update_factory, context_factory):
+        # A stale `mem:tag:<name>:0` callback fired from chat history
+        # after deploy lands on the unknown-verb branch. The handler
+        # must dismiss with `query.answer()` (no arguments) and not
+        # invoke any send-helper. Pins the degraded-but-graceful
+        # behavior that makes the deletion safe for users with stale
+        # dashboards.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        # If a send-helper fired, its data-layer call would surface
+        # as a missing monkeypatch (KeyError or unexpected call).
+        # Mock get_stats defensively in case the dispatcher routed
+        # through dashboard for any reason; the assertion that
+        # edit_message_text was NOT called is the load-bearing check.
+        monkeypatch.setattr(
+            memory_command.memory,
+            "get_stats",
+            lambda *, user_id: _stats(extracted_count=0),
+        )
+        upd = update_factory(callback_data="mem:tag:preference:0")
+        ctx = context_factory()
+        await memory_command.handle_memory_callback(upd, ctx)
+        # query.answer was called exactly once with no arguments.
+        assert upd.callback_query.answer.await_count == 1
+        call = upd.callback_query.answer.call_args
+        assert call.args == () or call.args == ()
+        # No edit_message_text invocation - the dashboard did not
+        # re-render for this stale verb.
+        upd.callback_query.edit_message_text.assert_not_called()
+
+    def test_fact_view_renders_tags_row_for_extracted(self):
+        # The fact-view detail surface still shows a Tags: row on
+        # extracted rows post-Sub-B. The padding is wider than on
+        # episode/migration rows because extracted rows align with
+        # Confidence/Date/Session/Prompt-version/Confirmation, but
+        # the row presence is the load-bearing pin.
+        fact = _fact("a", "Sample preference", ["preference", "constraint"], confidence=0.9)
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        assert "Tags:" in text
+        # Both tags appear in the rendered row.
+        assert "preference" in text
+        assert "constraint" in text
+
+    def test_fact_view_renders_tags_row_for_episode(self):
+        # Episode rows render Tags: with the tighter padding shape
+        # (only Tags + Date in that block). The row is required;
+        # the padding asymmetry vs extracted is intentional.
+        fact = _episode_fact(tags=["sophia/topic", "browser"])
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        assert "Tags:" in text
+        assert "sophia/topic" in text
+
+    def test_fact_view_renders_tags_row_for_migration(self):
+        # Migration rows render Tags: with the same tighter padding
+        # as episode rows. Migration metadata defaults to the
+        # ["migration"] tag in the fixture; an explicit tag list
+        # exercises the multi-tag rendering.
+        fact = _migration_fact(tags=["migration", "/backend"])
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        assert "Tags:" in text
+        assert "migration" in text
+        assert "/backend" in text
