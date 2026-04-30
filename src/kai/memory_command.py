@@ -451,11 +451,8 @@ def _build_episode_list_view(
             quality_str = "[----]"
         date_str = _format_date(fact.updated_at or fact.created_at)
         lines.append(f"{idx}.  {quality_str}  {_truncate(fact.text)}")
-        # Twelve-space indent on the date row visually nests it under
-        # the bracket-prefixed text row above; the longest enum value
-        # (`[failure]`, nine chars) plus the leading "N.  " plus the
-        # gap between the bracket and the text lands the body text at
-        # column 12.
+        # Twelve-space indent visually nests the date under the
+        # bracket label on the line above.
         lines.append(f"            {date_str}")
         lines.append("")
         memory_ids.append(fact.id)
