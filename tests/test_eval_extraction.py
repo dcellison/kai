@@ -472,11 +472,12 @@ class TestRunOneProbeErrorPath:
         carry outcome=`error`, the v5 delta from the real arm, and
         v6 delta = 0 (v6 never produced facts)."""
         # Reset the counter's contents in-place so the test's delta
-        # arithmetic is independent of preceding tests' state. We
-        # do NOT reassign `_RULE_6_REJECTIONS` because other test
-        # modules import it by name; reassignment would leave them
-        # pointing at the old (stale) counter object.
-        memory_extraction._RULE_6_REJECTIONS._counts.clear()
+        # arithmetic is independent of preceding tests' state.
+        # `_Counter._reset` is the test-only entry point; reassigning
+        # `_RULE_6_REJECTIONS` would leave other test modules
+        # (which import the counter by name) holding a stale
+        # reference to the old object.
+        memory_extraction._RULE_6_REJECTIONS._reset()
 
         call_count = {"n": 0}
 

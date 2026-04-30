@@ -1027,6 +1027,18 @@ class _Counter:
     def snapshot(self) -> dict[str, int]:
         return dict(self._counts)
 
+    def _reset(self) -> None:
+        """Test-only: clear the per-user counts in place.
+
+        The leading underscore signals "tests only"; production
+        code should never call this. Resetting in place rather than
+        rebinding `_RULE_6_REJECTIONS` matters because other
+        modules (e.g. `tests/test_memory_extraction.py`) import the
+        counter object by name and would hold a stale reference if
+        the module-level binding moved.
+        """
+        self._counts.clear()
+
 
 # Module-level counter for Rule 6 rejections, keyed by `user_id`.
 # Process-local; not persisted. Read via `get_extractor_stats()`.
