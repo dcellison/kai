@@ -450,3 +450,68 @@ class TestCliDispatch:
         rc = dedup.main(["--all-users"])
         assert rc == dedup.EXIT_OK
         assert sorted(seen_user_ids) == [111, 222, 333]
+
+    def test_apply_no_prompt_invokes_update_metadata(self, monkeypatch, tmp_path):
+        # End-to-end CLI verification of the apply path: --apply with
+        # --no-prompt accepts every proposed cluster and runs the
+        # rewrite pipeline. Without this test, a regression that wires
+        # --apply to the wrong branch of _run_for_user (e.g. an early
+        # return that skips apply_rewrites) would not trip any other
+        # test - the unit tests for apply_rewrites itself would still
+        # pass since they call the helper directly.
+        from kai import config as kai_config
+        from kai import memory as kai_memory
+
+        fake_config = MagicMock()
+        fake_config.memory_enabled = True
+        fake_config.allowed_user_ids = {12345}
+        monkeypatch.setattr(kai_config, "load_config", lambda: fake_config)
+        monkeypatch.setattr(kai_memory, "init_memory", lambda c: None)
+        # Three rows. The two extra "preference" rows make "preference"
+        # the most-frequent canonical (3 occurrences vs 1 for
+        # "Preference"); without that imbalance, lexicographic tiebreak
+        # picks "Preference" and the canonical-matching row would not
+        # be rewritten, leaving only one update_metadata call.
+        monkeypatch.setattr(
+            dedup,
+            "load_rows",
+            lambda user_id: [
+                _row("a", "first", ["Preference"]),
+                _row("b", "second", ["preference"]),
+                _row("c", "third", ["preference"]),
+                _row("d", "fourth", ["preference"]),
+            ],
+        )
+        update_calls: list[dict[str, Any]] = []
+
+        def fake_update(*, user_id, memory_id, data, metadata):
+            update_calls.append({"memory_id": memory_id, "tags": metadata["tags"]})
+            return True
+
+        monkeypatch.setattr(kai_memory, "update_metadata", fake_update)
+
+        # Audit log to a temp path; the real default would write to
+        # scripts/.tag-dedup-audit-* which the test should not touch.
+        audit_log = tmp_path / "audit.jsonl"
+        rc = dedup.main(
+            [
+                "--chat-id",
+                "12345",
+                "--apply",
+                "--no-prompt",
+                "--audit-log",
+                str(audit_log),
+            ]
+        )
+        assert rc == dedup.EXIT_OK
+        # Only row "a" (tagged "Preference") has a non-canonical tag,
+        # so only it gets rewritten. The three "preference" rows match
+        # the canonical and skip the update_metadata call. The point
+        # of this test is end-to-end CLI -> update_metadata wiring;
+        # one call is sufficient to verify the pipeline.
+        assert len(update_calls) == 1
+        assert update_calls[0]["memory_id"] == "a"
+        assert update_calls[0]["tags"] == ["preference"]
+        # Audit log should exist with one entry (success path).
+        assert audit_log.exists()
+        assert len(audit_log.read_text().splitlines()) == 1
