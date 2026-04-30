@@ -1070,17 +1070,45 @@ class TestFactViewMultiSource:
 
     def test_fact_view_episode_label_uses_two_spaces_after_colon(self):
         """Pins D4's formatting decision in code so the spec's prose
-        decision does not drift away from the implementation. The
-        label uses exactly two spaces after the colon - not one (which
-        would read cramped) and not pad-aligned (which the spec
-        reserves for the wider extracted-row label set)."""
-        fact = _episode_fact(approach="A")
+        decision does not drift away from the implementation. Each
+        of the four new labels uses exactly two spaces after the
+        colon - not one (cramped) and not pad-aligned (which the
+        spec reserves for the wider extracted-row label set).
+        Asserts on every label individually so a copy-paste error
+        on any one row trips the test."""
+        fact = _episode_fact(approach="A", outcome="O", lessons="L", actors=["X"])
         text, _ = memory_command._build_fact_view(fact, return_to=None)
+        # Positive: every label rendered with two-space spacing.
         assert "Approach:  A" in text
-        # Negative regression: pad-aligned form (3+ spaces) must NOT
-        # appear; single-space form must NOT appear.
-        assert "Approach:   " not in text
+        assert "Outcome:  O" in text
+        assert "Lessons:  L" in text
+        assert "Actors:  X" in text
+        # Negative regression for each label: pad-aligned form
+        # (3+ spaces) and single-space form must NOT appear.
+        for label in ("Approach", "Outcome", "Lessons", "Actors"):
+            assert f"{label}:   " not in text
         assert "Approach: A" not in text
+        assert "Outcome: O" not in text
+        assert "Lessons: L" not in text
+        assert "Actors: X" not in text
+
+    def test_fact_view_episode_absent_approach_outcome_render_empty_fallback(self):
+        """`approach` and `outcome` are schema-required content-bearing
+        fields. The renderer's `or ""` defensive fallback for an
+        absent metadata key surfaces the corruption as an empty
+        labeled row rather than crashing. Production data cannot
+        produce this state because the schema requires both fields,
+        so the test pins a code path that production cannot reach -
+        analogous to the actors-empty-list pin (D3). Documented as
+        unreachable-state coverage so a future reader does not
+        delete it."""
+        fact = _episode_fact(approach=None, outcome=None)
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        # Both rows render with empty values after the two-space
+        # separator. The trailing-whitespace match would be ambiguous
+        # so anchor on a label-followed-by-newline pattern.
+        assert "Approach:  \n" in text
+        assert "Outcome:  \n" in text
 
     def test_fact_view_episode_unchanged_extracted_branch(self):
         """Confirms the extracted six-row block stays unchanged: a
