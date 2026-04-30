@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from kai import memory_extraction
-from kai.config import load_config
+from kai.config import Config, load_config
 
 log = logging.getLogger(__name__)
 
@@ -318,7 +318,7 @@ def _window_to_extractor_args(window: dict) -> tuple[str, str, list[tuple[str, s
 
 async def _run_one_probe(
     probe: Probe,
-    config,
+    config: Config,
     *,
     user_id: str,
 ) -> ProbeOutcome:
@@ -566,7 +566,20 @@ async def _run_async(args: argparse.Namespace) -> int:
     }
 
     out_path = Path(args.output)
-    out_path.write_text(json.dumps(report, indent=2))
+    # Guard the write: at $0.32 / 20-probe run, losing the report
+    # to a missing parent directory or a read-only output path is
+    # an expensive failure. Convert the OSError into a logged
+    # error and a non-zero return so the operator sees what went
+    # wrong AND can inspect the in-memory aggregate (still printed
+    # below) before re-running.
+    try:
+        out_path.write_text(json.dumps(report, indent=2))
+    except OSError as exc:
+        log.error("failed to write %s: %s", out_path, exc)
+        # Print the aggregate before returning so the caller has
+        # the rate numbers even though the JSON file did not land.
+        print(json.dumps({k: v for k, v in report.items() if k != "per_probe"}, indent=2))
+        return 1
     print(json.dumps({k: v for k, v in report.items() if k != "per_probe"}, indent=2))
     log.info("wrote %s", out_path)
     return 0
@@ -601,9 +614,13 @@ def main(argv: list[str] | None = None) -> int:
     return asyncio.run(_run_async(args))
 
 
+# Public API: dataclasses, the JSONL probe loader, and the CLI
+# entry point. `_PROMPT_V5_PINNED`, `_OUTPUT_SCHEMA_VERSION`, and
+# the helper functions retain their leading-underscore privacy and
+# are not exported via `__all__`. Tests reach in via attribute
+# access (e.g. `extraction._PROMPT_V5_PINNED`) which bypasses
+# `__all__` and is the supported pattern for cross-module pinning.
 __all__ = [
-    "_OUTPUT_SCHEMA_VERSION",
-    "_PROMPT_V5_PINNED",
     "Probe",
     "ProbeOutcome",
     "load_probes",

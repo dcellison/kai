@@ -22,7 +22,19 @@ from pathlib import Path
 import pytest
 
 from kai import memory_extraction
+from kai.config import Config
 from kai.eval import extraction
+
+# Minimal Config for the harness tests. Mirrors _BASE_CONFIG in
+# test_memory_extraction.py. The harness stubs `_run_extractor` so
+# the Config fields are never actually exercised; this exists to
+# satisfy the typed `config: Config` parameter on
+# `_run_one_probe` without needing real credentials.
+_TEST_CONFIG = Config(
+    telegram_bot_token="test-token",
+    allowed_user_ids={12345},
+    webhook_secret="test-secret",
+)
 
 # Hash of `_PROMPT_V5_PINNED` captured at #426 landing. If the
 # pinned constant drifts (intentional or not), this test fails and
@@ -411,7 +423,7 @@ class TestRunOneProbeErrorPath:
             expected={"should_extract_any": False, "must_not_contain": []},
         )
 
-        outcome = asyncio.run(extraction._run_one_probe(probe, config=None, user_id="probe-x"))
+        outcome = asyncio.run(extraction._run_one_probe(probe, config=_TEST_CONFIG, user_id="probe-x"))
 
         assert outcome.outcome == "error"
         # v5 arm completed: the increment we drove in fake_run_extractor
