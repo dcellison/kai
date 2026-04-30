@@ -577,7 +577,20 @@ async def _run_async(args: argparse.Namespace) -> int:
     if not probes_path.exists():
         log.error("probes file not found: %s", probes_path)
         return 1
-    probes = load_probes(probes_path)
+    # `load_probes` raises ValueError on a malformed fixture
+    # (invalid JSON, missing required field, missing
+    # `window.current`, unknown category). The message already
+    # carries `{path}:{line}: ...` context, so logging the
+    # exception text and returning non-zero is the right shape
+    # for the operator-facing CLI: a parse failure looks the
+    # same as the file-not-found and empty-fixture cases above
+    # rather than surfacing as a Python traceback through
+    # `asyncio.run`.
+    try:
+        probes = load_probes(probes_path)
+    except ValueError as exc:
+        log.error("failed to parse probes from %s: %s", probes_path, exc)
+        return 1
     if not probes:
         log.error("no probes loaded from %s", probes_path)
         return 1
