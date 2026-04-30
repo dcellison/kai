@@ -181,25 +181,6 @@ class TestCallbackCodec:
 # ── Constants ───────────────────────────────────────────────────────
 
 
-class TestHelpTextLength:
-    """Round-7 #1 regression: `_HELP_TEXT` is used both in
-    `update.message.reply_text` (no length cap) AND in
-    `query.answer(_HELP_TEXT, show_alert=True)` from the dashboard's
-    Search button. The latter goes through Telegram's
-    `answerCallbackQuery` API, whose `text` field is capped at 200
-    chars. Exceeding the cap causes a 400 BadRequest, which the
-    outer except handler converts to "Memory query failed." -
-    confusing UX for what should be the help screen.
-    """
-
-    def test_help_text_under_telegram_callback_alert_limit(self):
-        # 200 is the Telegram-documented limit for
-        # answerCallbackQuery.text. If someone extends `_HELP_TEXT`
-        # and trips this assertion, either trim wording or split
-        # the dashboard help flow into its own shorter toast string.
-        assert len(memory_command._HELP_TEXT) <= 200
-
-
 # ── Display helpers ─────────────────────────────────────────────────
 
 
@@ -386,11 +367,10 @@ class TestBuildSearchResults:
 class TestBuildStats:
     def test_empty_state(self):
         text, kb = memory_command._build_stats(_stats(extracted_count=0))
-        # Issue #407 changed the empty-state wording from
-        # "No extracted facts yet" because the post-#407 surface
-        # also accounts for episode and migration sources; the new
-        # wording is honest about the empty-state's full scope.
-        assert "No facts, episodes, or imported memory yet" in text
+        # Empty-state wording mirrors the dashboard's two-bucket
+        # surface (facts + episodes); migration folds into "facts"
+        # so the phrasing has no third item.
+        assert "No facts or episodes yet" in text
         assert kb.inline_keyboard[0][0].text == "back"
 
     def test_renders_full_aggregates(self):
@@ -416,9 +396,10 @@ class TestBuildStats:
             by_prompt_version={"v3": 128, "v2": 14},
         )
         text, _ = memory_command._build_stats(stats)
-        # Total: per-source headline (issue #407). Extracted-only
-        # operator sees just the "Total facts:" line; episode and
-        # migration count lines are omitted when zero.
+        # Per-bucket totals: an extracted-only operator sees just the
+        # "Total facts:" line. The Total imported: row is gone post-
+        # fold; migration counts roll into the same Total facts:
+        # number. Total episodes: is still suppressed when zero.
         assert "Total facts:      142" in text
         assert "Total episodes:" not in text
         assert "Total imported:" not in text
@@ -620,11 +601,11 @@ def _migration_fact(
 class TestDashboardMultiSource:
     """`/memory` dashboard surfacing of episode and migration rows."""
 
-    def test_dashboard_shows_episode_and_migration_counts(self):
-        """Headline lists per-source counts when all three are non-zero.
-        The substrings "facts", "episodes", and "imported" each appear,
-        confirming the per-source wording rather than a single
-        aggregated total."""
+    def test_dashboard_headline_sums_extracted_and_migration(self):
+        """Headline sums extracted+migration into a single "facts"
+        count and lists episodes separately. Migration is internal
+        plumbing; the operator does not see a separate "imported"
+        count anywhere."""
         stats = _stats(
             extracted_count=12,
             episode_count=3,
@@ -634,16 +615,14 @@ class TestDashboardMultiSource:
             confidence_min=0.6,
         )
         text, _ = memory_command._build_dashboard(stats)
-        assert "12 facts" in text
+        assert "37 facts" in text
         assert "3 episodes" in text
-        assert "25 imported" in text
+        assert "imported" not in text
 
     def test_dashboard_omits_zero_source_counts(self):
-        """A fresh extracted-only operator (episode_count==0,
-        migration_count==0) sees a headline naming only their
-        non-zero source. Zero-valued sources are omitted from the
-        comma list rather than rendered as "0 episodes" / "0
-        imported"."""
+        """A fresh extracted-only operator sees a headline naming
+        only their non-zero bucket. Zero-valued buckets are omitted
+        from the comma list rather than rendered as "0 episodes"."""
         stats = _stats(
             extracted_count=10,
             by_tag={"preference": 5},
@@ -662,7 +641,7 @@ class TestDashboardMultiSource:
         """An episode-only operator (`episode_count > 0`,
         `extracted_count == 0`, `migration_count == 0`) sees the
         dashboard rendered (NOT _MSG_NO_FACTS). Footer points at
-        the always-rendered Episodes/Search/Stats button row.
+        the Episodes/Stats button row.
 
         Pins the empty-state guard fix from issue #407: the
         pre-#407 dashboard returned _MSG_NO_FACTS for this input
@@ -674,31 +653,32 @@ class TestDashboardMultiSource:
         assert kb is not None
         # Headline shows the episode count.
         assert "4 episodes" in text
-        # Footer enumerates every utility-row affordance when the
-        # Episodes button renders.
-        assert "Tap Episodes to browse, Search to find specific memories, or Stats for details." in text
+        # Footer two-sentence form names Episodes and Stats only.
+        assert "Tap Episodes to browse. Tap Stats for details." in text
         # Keyboard has only the utility row, which includes the
-        # Episodes button (issue #410) alongside Search and Stats.
+        # Episodes button alongside Stats. No Search button.
         assert len(kb.inline_keyboard) == 1
         utility_row = kb.inline_keyboard[-1]
-        assert [btn.text for btn in utility_row] == ["Episodes (4)", "Search", "Stats"]
+        assert [btn.text for btn in utility_row] == ["Episodes (4)", "Stats"]
 
     def test_dashboard_migration_only_user_renders(self):
         """Migration-only operator: migration_count > 0,
         extracted_count == 0, episode_count == 0. The empty-state
         guard does not fire because migration_count is positive.
         The Facts button renders (extracted + migration > 0) and
-        the footer points to it; Episodes does not render."""
+        the headline reads "25 facts"; Episodes does not render
+        and the operator sees no "imported" wording anywhere."""
         stats = _stats(migration_count=25)
         text, kb = memory_command._build_dashboard(stats)
         assert "No memories yet" not in text
         assert kb is not None
-        assert "25 imported" in text
+        assert "25 facts" in text
+        assert "imported" not in text
         # Migration-only is the facts-only footer branch.
-        assert "Tap Facts to browse, Search to find specific memories, or Stats for details." in text
+        assert "Tap Facts to browse. Tap Stats for details." in text
         assert len(kb.inline_keyboard) == 1
         utility_row = kb.inline_keyboard[-1]
-        assert [btn.text for btn in utility_row] == ["Facts (25)", "Search", "Stats"]
+        assert [btn.text for btn in utility_row] == ["Facts (25)", "Stats"]
 
     def test_dashboard_all_zero_returns_empty_state(self):
         """The empty state fires only when every user-visible source
@@ -712,9 +692,10 @@ class TestDashboardMultiSource:
 class TestStatsMultiSource:
     """`/memory stats` surfacing of episode and migration totals."""
 
-    def test_stats_view_shows_per_source_breakdown(self):
-        """The headline shows per-source totals on distinct lines for
-        all non-zero sources."""
+    def test_stats_view_total_facts_sums_extracted_and_migration(self):
+        """The headline sums extracted and migration into a single
+        Total facts: line; episodes get their own line. There is no
+        Total imported: row anywhere in the rendered output."""
         stats = _stats(
             extracted_count=12,
             episode_count=3,
@@ -725,16 +706,27 @@ class TestStatsMultiSource:
             confidence_max=0.95,
         )
         text, _ = memory_command._build_stats(stats)
-        assert "Total facts:      12" in text
+        assert "Total facts:      37" in text
         assert "Total episodes:   3" in text
-        assert "Total imported:   25" in text
+        assert "Total imported:" not in text
+        assert "imported" not in text
+
+    def test_stats_view_migration_only_renders_facts_total(self):
+        """A migration-only operator sees a single Total facts: line
+        with the migration count, no Total imported: row, and no
+        "imported" wording anywhere."""
+        stats = _stats(migration_count=25)
+        text, _ = memory_command._build_stats(stats)
+        assert "Total facts:      25" in text
+        assert "imported" not in text
 
     def test_stats_view_all_zero_says_no_memories_yet(self):
-        """All-zero empty-state text matches the dashboard's wording
-        update (per spec §D5)."""
+        """All-zero empty-state mirrors the dashboard's two-bucket
+        surface; migration folds into facts so the phrasing has no
+        third item."""
         stats = _stats()
         text, kb = memory_command._build_stats(stats)
-        assert text == "Memory stats\n\nNo facts, episodes, or imported memory yet."
+        assert text == "Memory stats\n\nNo facts or episodes yet."
         # Back button is still rendered so the user can return to the
         # dashboard rather than being stuck on the stats screen.
         assert kb.inline_keyboard[0][0].text == "back"
@@ -798,16 +790,20 @@ class TestFactViewMultiSource:
         first_line = text.split("\n", 1)[0]
         assert first_line == "Episode"
 
-    def test_fact_view_renders_migration_with_imported_header(self):
-        """Migration row renders the `Imported` header and the same
-        minimal Tags + Date body as the episode case. Distinct header
-        from `Fact` (extracted) and `Episode` so the operator can
-        tell the row's provenance at a glance."""
+    def test_fact_view_renders_migration_with_fact_header(self):
+        """Migration row renders the `Fact` header (matching extracted)
+        and the same minimal Tags + Date body it used to. The header
+        no longer calls out the extracted/migration distinction; the
+        operator-facing UI treats them as one bucket. The body shape
+        stays minimal because migration rows do not carry the four
+        extractor-only fields."""
         fact = _migration_fact(tags=["migration", "backend"])
         text, _ = memory_command._build_fact_view(fact, return_to=None)
-        # Header is the load-bearing distinction.
+        # Header matches extracted; the literal "Imported" string
+        # must not appear anywhere in the rendered text.
         first_line = text.split("\n", 1)[0]
-        assert first_line == "Imported"
+        assert first_line == "Fact"
+        assert "Imported" not in text
         # Tags include the migration H3 slug.
         assert "migration" in text
         assert "backend" in text
@@ -984,15 +980,63 @@ class TestFactViewMultiSource:
         for label in ("Approach:", "Outcome:", "Lessons:", "Actors:"):
             assert label not in text
 
+    def test_episode_detail_has_blank_lines_between_sections(self):
+        """Each labelled section in the episode detail (Approach,
+        Outcome, Lessons, Actors, Tags) must have a blank line
+        before it. Pins the Actors-to-Tags separator added when the
+        detail view gained inter-section spacing; a regression that
+        drops any of the four blanks would let two adjacent labelled
+        rows fuse together visually."""
+        fact = _episode_fact(
+            tags=["sophia/topic"],
+            approach="Approach body that may be long.",
+            outcome="Outcome body that resolves the conversation.",
+            lessons="Lesson body the generator chose to record.",
+            actors=["alice", "bob"],
+        )
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        lines = text.split("\n")
+        for label in ("Outcome:", "Lessons:", "Actors:", "Tags:"):
+            # Find the line containing the label; assert the line
+            # immediately above it is blank. The Approach line is
+            # preceded by the body's trailing blank from the lines
+            # list construction, so it does not need an extra check.
+            label_idx = next(i for i, line in enumerate(lines) if line.startswith(label))
+            assert lines[label_idx - 1] == "", f"missing blank line before {label}"
+
+    def test_episode_detail_lessons_absent_collapses_blank_lines(self):
+        """When `lessons` is absent the entire Lessons block (label
+        line plus its trailing blank) is skipped, leaving exactly
+        one blank line between Outcome and Actors. Pins against a
+        regression that emits a double blank or no blank when the
+        conditional drops out."""
+        fact = _episode_fact(
+            tags=["sophia/topic"],
+            approach="Approach body.",
+            outcome="Outcome body.",
+            lessons=None,
+            actors=["alice"],
+        )
+        text, _ = memory_command._build_fact_view(fact, return_to=None)
+        lines = text.split("\n")
+        outcome_idx = next(i for i, line in enumerate(lines) if line.startswith("Outcome:"))
+        actors_idx = next(i for i, line in enumerate(lines) if line.startswith("Actors:"))
+        # Exactly one blank line between Outcome and Actors. That
+        # means actors_idx - outcome_idx == 2 (Outcome line, blank,
+        # Actors line). The literal Lessons row must be absent.
+        assert actors_idx - outcome_idx == 2
+        assert "Lessons:" not in text
+
 
 class TestDashboardEpisodesButton:
     """Issue #410: Episodes (N) button on the dashboard utility row.
 
-    Conditional on `stats.episode_count > 0`. The pre-#410 utility
-    row was `[Search, Stats]`; post-#410 it can be either
-    `[Search, Stats]` (no episodes) or `[Episodes (N), Search, Stats]`
-    (episodes exist). Tests pin both shapes plus the per-source
-    footer prose changes that ride alongside."""
+    Conditional on `stats.episode_count > 0`. Post-Search-removal the
+    utility row is one of `[Stats]`, `[Facts (N), Stats]`,
+    `[Episodes (N), Stats]`, or `[Facts (N), Episodes (N), Stats]`.
+    Tests in this class pin the Episodes-button half of the matrix
+    (visibility, placement, footer wording when Episodes is the only
+    browse button)."""
 
     def test_dashboard_renders_episodes_button_when_episode_count_nonzero(self):
         # Mixed-source fixture: extracted_count=10 makes the Facts
@@ -1003,7 +1047,7 @@ class TestDashboardEpisodesButton:
         assert kb is not None
         utility_row = kb.inline_keyboard[-1]
         labels = [btn.text for btn in utility_row]
-        assert labels == ["Facts (10)", "Episodes (4)", "Search", "Stats"]
+        assert labels == ["Facts (10)", "Episodes (4)", "Stats"]
         # Callback shape: mem:eps:<page>; initial page is 0.
         # Episodes is at index 1 because Facts now occupies index 0.
         episodes_btn = utility_row[1]
@@ -1011,22 +1055,22 @@ class TestDashboardEpisodesButton:
 
     def test_dashboard_omits_episodes_button_when_episode_count_zero(self):
         # extracted_count=10 makes Facts visible, so the row is
-        # [Facts (10), Search, Stats]. Episodes is correctly absent.
+        # [Facts (10), Stats]. Episodes is correctly absent.
         # The test name still describes the omit-when-zero intent;
-        # the row contents now also confirm the new Facts presence.
+        # the row contents also confirm the Facts presence.
         stats = _stats(extracted_count=10, episode_count=0, by_tag={"preference": 5})
         _, kb = memory_command._build_dashboard(stats)
         assert kb is not None
         utility_row = kb.inline_keyboard[-1]
         labels = [btn.text for btn in utility_row]
-        assert labels == ["Facts (10)", "Search", "Stats"]
+        assert labels == ["Facts (10)", "Stats"]
 
     def test_dashboard_episode_only_user_renders_episodes_button(self):
         # Episode-only operator: utility row is the only keyboard
-        # row, with Episodes alongside Search and Stats. Pins the
-        # cross-section of the episode-only surface and the Episodes
-        # button placement. Facts is hidden because extracted_count
-        # and migration_count both default to zero in _stats().
+        # row, with Episodes alongside Stats. Pins the cross-section
+        # of the episode-only surface and the Episodes button
+        # placement. Facts is hidden because extracted_count and
+        # migration_count both default to zero in _stats().
         stats = _stats(episode_count=4)
         _, kb = memory_command._build_dashboard(stats)
         assert kb is not None
@@ -1034,29 +1078,25 @@ class TestDashboardEpisodesButton:
         assert len(kb.inline_keyboard) == 1
         utility_row = kb.inline_keyboard[0]
         labels = [btn.text for btn in utility_row]
-        assert labels == ["Episodes (4)", "Search", "Stats"]
+        assert labels == ["Episodes (4)", "Stats"]
 
     def test_dashboard_with_episodes_footer_wording(self):
         # Footer when Episodes is rendered (and Facts is not):
-        # enumerates every utility-row affordance. Pins against the
-        # pre-#410 wording which would lie by enumerating only
-        # Search and Stats. Episode-only fixture; extracted and
-        # migration both default to zero so Facts stays hidden.
+        # two-sentence form names Episodes and Stats. Episode-only
+        # fixture; extracted and migration both default to zero so
+        # Facts stays hidden.
         stats = _stats(episode_count=4)
         text, _ = memory_command._build_dashboard(stats)
-        assert "Tap Episodes to browse, Search to find specific memories, or Stats for details." in text
+        assert "Tap Episodes to browse. Tap Stats for details." in text
 
     def test_dashboard_facts_only_footer_wording(self):
         # Migration-only operator hits the facts-only footer branch
         # (extracted=0, episode=0, migration=25), so Facts is the
-        # only browse button visible. Renamed from
-        # `test_dashboard_no_episodes_footer_wording` because the
-        # scenario now produces a Facts button rather than the
-        # pre-#410 no-browse-button wording. Negative regression on
+        # only browse button visible. Negative regression on
         # "Tap Episodes" stays valid: Episodes really is hidden here.
         stats = _stats(migration_count=25)
         text, _ = memory_command._build_dashboard(stats)
-        assert "Tap Facts to browse, Search to find specific memories, or Stats for details." in text
+        assert "Tap Facts to browse. Tap Stats for details." in text
         # Negative regression: the Episodes branch wording must NOT
         # appear when no Episodes button is rendered.
         assert "Tap Episodes to browse" not in text
@@ -1066,10 +1106,11 @@ class TestDashboardFactsButton:
     """Facts (N) button on the dashboard utility row.
 
     Conditional on `stats.extracted_count + stats.migration_count > 0`.
-    The label sums extracted and migration; the headline keeps them
-    split (extracted as "facts", migration as "imported"). Order on
-    the utility row, when both Facts and Episodes are visible, is
-    Facts first (left), then Episodes, then Search, then Stats.
+    The label sums extracted and migration; the headline now sums
+    them too (a single "<X> facts" headline part rather than
+    extracted + imported split). Order on the utility row, when both
+    Facts and Episodes are visible, is Facts first (left), then
+    Episodes, then Stats.
 
     The empty-state guard at the top of `_build_dashboard` returns
     early when all three source counts are zero, so the
@@ -1084,7 +1125,7 @@ class TestDashboardFactsButton:
         assert kb is not None
         utility_row = kb.inline_keyboard[-1]
         labels = [btn.text for btn in utility_row]
-        assert labels == ["Facts (12)", "Search", "Stats"]
+        assert labels == ["Facts (12)", "Stats"]
         # Callback shape: mem:facts:<page>; initial page is 0.
         facts_btn = utility_row[0]
         assert facts_btn.callback_data == "mem:facts:0"
@@ -1102,71 +1143,70 @@ class TestDashboardFactsButton:
 
     def test_dashboard_omits_facts_button_when_extracted_and_migration_both_zero(self):
         # Episode-only operator: facts_visible is false, so the row
-        # should be [Episodes, Search, Stats] with no Facts button.
-        # Pins the negative case so a future regression that always
-        # emits Facts trips here.
+        # should be [Episodes, Stats] with no Facts button. Pins the
+        # negative case so a future regression that always emits
+        # Facts trips here.
         stats = _stats(episode_count=4)
         _, kb = memory_command._build_dashboard(stats)
         assert kb is not None
         utility_row = kb.inline_keyboard[-1]
         labels = [btn.text for btn in utility_row]
-        assert labels == ["Episodes (4)", "Search", "Stats"]
+        assert labels == ["Episodes (4)", "Stats"]
         assert not any(label.startswith("Facts ") for label in labels)
 
     def test_dashboard_facts_only_user_renders_facts_button(self):
-        # Migration-only operator: the row is exactly [Facts, Search,
-        # Stats] (no Episodes). Tests the migration-only case and the
+        # Migration-only operator: the row is exactly [Facts, Stats]
+        # (no Episodes). Tests the migration-only case and the
         # facts-only row shape together.
         stats = _stats(migration_count=25)
         _, kb = memory_command._build_dashboard(stats)
         assert kb is not None
         utility_row = kb.inline_keyboard[-1]
         labels = [btn.text for btn in utility_row]
-        assert labels == ["Facts (25)", "Search", "Stats"]
+        assert labels == ["Facts (25)", "Stats"]
 
     def test_dashboard_both_browse_buttons_renders_facts_first(self):
         # Both browse buttons visible: Facts must come first
-        # (left-most), then Episodes, then Search, then Stats. Pins
-        # the placement so a regression that swaps the two browse
-        # buttons trips here.
+        # (left-most), then Episodes, then Stats. Pins the placement
+        # so a regression that swaps the two browse buttons trips
+        # here.
         stats = _stats(extracted_count=10, migration_count=2, episode_count=4)
         _, kb = memory_command._build_dashboard(stats)
         assert kb is not None
         utility_row = kb.inline_keyboard[-1]
         labels = [btn.text for btn in utility_row]
-        assert labels == ["Facts (12)", "Episodes (4)", "Search", "Stats"]
+        assert labels == ["Facts (12)", "Episodes (4)", "Stats"]
 
     def test_dashboard_footer_both_browse_wording(self):
         # When both Facts and Episodes render, the footer enumerates
-        # both browse buttons. Pins the new "Tap Facts or Episodes"
-        # phrasing so a regression to either single-button branch
-        # trips this assertion.
+        # both browse buttons in the two-sentence form. Pins the
+        # "Tap Facts or Episodes to browse." phrasing so a regression
+        # to either single-button branch trips this assertion.
         stats = _stats(extracted_count=10, episode_count=4)
         text, _ = memory_command._build_dashboard(stats)
-        assert "Tap Facts or Episodes to browse, Search to find specific memories, or Stats for details." in text
+        assert "Tap Facts or Episodes to browse. Tap Stats for details." in text
 
     def test_dashboard_footer_facts_only_wording(self):
         # When Facts renders but Episodes does not, footer says
-        # "Tap Facts to browse..." (without Episodes). Migration-
-        # only fixture; the cross-test of the facts-only footer
-        # also lives in TestDashboardEpisodesButton's renamed
-        # `test_dashboard_facts_only_footer_wording` for historical
-        # continuity. Both pin the same branch from different angles.
+        # "Tap Facts to browse." (without Episodes). The cross-test
+        # of the facts-only footer also lives in
+        # TestDashboardEpisodesButton's
+        # `test_dashboard_facts_only_footer_wording`; both pin the
+        # same branch from different angles.
         stats = _stats(extracted_count=15)
         text, _ = memory_command._build_dashboard(stats)
-        assert "Tap Facts to browse, Search to find specific memories, or Stats for details." in text
+        assert "Tap Facts to browse. Tap Stats for details." in text
         # Negative regression: the both-buttons phrasing must NOT
         # leak in when only Facts is visible.
         assert "Tap Facts or Episodes" not in text
 
-    def test_dashboard_footer_episodes_only_wording_unchanged(self):
-        # When Episodes renders but Facts does not, footer keeps the
-        # existing post-410 wording verbatim. Pins the unchanged
-        # branch so a sloppy refactor of the four-branch matrix
-        # cannot silently rewrite the episodes-only message.
+    def test_dashboard_footer_episodes_only_wording(self):
+        # When Episodes renders but Facts does not, footer reads the
+        # episodes-only branch of the matrix. Pins the branch so a
+        # sloppy refactor cannot silently rewrite this message.
         stats = _stats(episode_count=4)
         text, _ = memory_command._build_dashboard(stats)
-        assert "Tap Episodes to browse, Search to find specific memories, or Stats for details." in text
+        assert "Tap Episodes to browse. Tap Stats for details." in text
         # Negative regression: Facts-related wording must not leak
         # into the episodes-only branch.
         assert "Tap Facts" not in text
@@ -1197,30 +1237,32 @@ class TestBuildEpisodeListView:
             updated_at=updated_at if updated_at is not None else created_at,
         )
 
-    def test_outcome_quality_brackets_render(self):
+    def test_outcome_quality_brackets_no_longer_render(self):
+        """Negative regression: episode list rows no longer carry the
+        per-row [<outcome_quality>] bracket. The outcome_quality
+        field stays load-bearing in the episode detail view (header
+        parenthetical) but is not surfaced in the list view; per-row
+        quality bracketing was visual noise that did not help triage
+        at the row level. A future revival of the bracket should be
+        a deliberate spec change, not a silent edit; this assertion
+        catches the silent-edit case."""
         eps = [
             self._episode("e1", "First episode", outcome_quality="success"),
             self._episode("e2", "Second episode", outcome_quality="partial"),
+            self._episode("e3", "Third episode", outcome_quality="failure"),
+            self._episode("e4", "Fourth episode", outcome_quality=None),
+            self._episode("e5", "Fifth episode", outcome_quality="off-enum-value"),
         ]
         text, _, ids, _, _ = memory_command._build_episode_list_view(eps, 0)
-        assert "[success]  First episode" in text
-        assert "[partial]  Second episode" in text
-        assert ids == ["e1", "e2"]
-
-    def test_falls_back_to_dashes_for_missing_outcome_quality(self):
-        # outcome_quality absent from metadata: render [----].
-        eps = [self._episode("e1", "Episode without quality", outcome_quality=None)]
-        text, _, _, _, _ = memory_command._build_episode_list_view(eps, 0)
-        assert "[----]" in text
-
-    def test_falls_back_to_dashes_for_off_enum_outcome_quality(self):
-        # Strict enum check (D2 line 59 / Implementation step 3
-        # docstring): an off-enum value renders [----] rather than
-        # the literal string. Defends against schema drift.
-        eps = [self._episode("e1", "Episode with bad value", outcome_quality="good")]
-        text, _, _, _, _ = memory_command._build_episode_list_view(eps, 0)
-        assert "[----]" in text
-        assert "[good]" not in text
+        # All four enumerated bracket forms must be absent.
+        assert "[success]" not in text
+        assert "[partial]" not in text
+        assert "[failure]" not in text
+        assert "[----]" not in text
+        # The fact texts still render in row order.
+        assert "First episode" in text
+        assert "Fifth episode" in text
+        assert ids == ["e1", "e2", "e3", "e4", "e5"]
 
     def test_paginates(self):
         # 12 episodes at page-size 5 -> page 1: 5, page 2: 5, page 3: 2.
@@ -1263,13 +1305,24 @@ class TestBuildEpisodeListView:
         assert "…" in text
 
     def test_header_uses_two_space_separator(self):
-        # D2 / W5 (v1 evaluation): header label and parenthetical
-        # are separated by exactly two spaces, matching the tag
-        # view convention. Pin so a single-space regression trips
-        # this test.
+        # Header label and parenthetical are separated by exactly
+        # two spaces. Pin so a single-space regression trips this
+        # test.
         eps = [self._episode("e1", "Just one")]
         text, _, _, _, _ = memory_command._build_episode_list_view(eps, 0)
         assert text.startswith("Episodes  (page 1 of 1)")
+
+    def test_episode_list_date_indent_four_spaces(self):
+        # Date line on a non-empty row is indented exactly four
+        # spaces, lining up with the start of the truncated fact
+        # text on the line above (after the "N.  " prefix). Same
+        # convention the facts list uses; pin the indent so a
+        # regression to twelve spaces (the pre-bracket-removal
+        # indent) trips this test.
+        eps = [self._episode("e1", "Some episode", created_at="2026-04-30T10:00:00")]
+        text, _, _, _, _ = memory_command._build_episode_list_view(eps, 0)
+        date_line = next(line for line in text.split("\n") if line.lstrip().startswith("2026-04-30"))
+        assert date_line == "    2026-04-30"
 
 
 class TestBuildFactsListView:
@@ -1665,6 +1718,73 @@ class TestForgetFactReturnFacts:
         assert captured["page"] == 0
 
 
+class TestDashboardSearchButtonRemoved:
+    """Pins the absence of the Search button on the dashboard.
+
+    Telegram inline keyboards cannot accept text input, so the
+    Search button could only ever surface a help alert with the
+    slash-command syntax. The slash-command path `/memory search
+    <q>` is the actual search entry point; the button was a
+    redundant affordance that occupied a slot on the utility row
+    without doing search-shaped work."""
+
+    def test_dashboard_utility_row_has_no_search_button(self):
+        # Mixed-source fixture so both browse buttons render. The
+        # utility row has Facts, Episodes, Stats. No Search button
+        # by label and no button with the help-callback data.
+        stats = _stats(extracted_count=10, episode_count=4)
+        _, kb = memory_command._build_dashboard(stats)
+        assert kb is not None
+        utility_row = kb.inline_keyboard[-1]
+        labels = [btn.text for btn in utility_row]
+        assert "Search" not in labels
+        callbacks = [btn.callback_data for btn in utility_row]
+        assert "mem:help" not in callbacks
+
+    def test_dashboard_footer_no_search_callout(self):
+        # Footer wording across all reachable branches no longer
+        # contains the Search call-out. Negative regression on the
+        # old "Search to find specific memories" phrasing.
+        stats = _stats(extracted_count=10, episode_count=4)
+        text, _ = memory_command._build_dashboard(stats)
+        assert "Search" not in text
+        assert "to find specific memories" not in text
+
+    @pytest.mark.asyncio
+    async def test_help_callback_falls_through_to_unknown_verb_dismiss(
+        self, monkeypatch, update_factory, context_factory
+    ):
+        # Stale `mem:help` callbacks fired from chat history pre-
+        # deploy must degrade gracefully via the unknown-verb
+        # dismiss (`await query.answer()` with no args), the same
+        # forward-compat path the retired `tag` verb relied on.
+        # Stub `is_enabled` so the dispatch reaches the verb
+        # branches; verify no send helper was invoked and the
+        # answer call carries no toast or alert content.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+
+        called: dict[str, bool] = {}
+
+        async def fail_send(*args, **kwargs):
+            called["sent"] = True
+            raise AssertionError("no send helper should fire for the orphaned mem:help verb")
+
+        # Cover the full set of send helpers so any accidental
+        # routing trips the assertion.
+        for name in ("_send_dashboard", "_send_stats", "_send_episode_list", "_send_facts_list", "_send_fact_view"):
+            monkeypatch.setattr(memory_command, name, fail_send)
+
+        upd = update_factory(callback_data="mem:help")
+        ctx = context_factory()
+        await memory_command.handle_memory_callback(upd, ctx)
+
+        # The dispatch's trailing `await query.answer()` is the
+        # unknown-verb dismiss; it carries no positional arguments
+        # and no `text=` kwarg.
+        upd.callback_query.answer.assert_awaited_once_with()
+        assert "sent" not in called
+
+
 class TestHelpTextSummaryLine:
     """Issue #410 D7: `_HELP_TEXT` first line wording change."""
 
@@ -1703,14 +1823,17 @@ class TestForgetConfirmMultiSource:
         assert "episode" in text
         assert "This cannot be undone." in text
 
-    def test_delete_confirm_migration_uses_imported_memory_label(self):
-        """Migration rows render the prompt with the `imported memory`
-        noun. The label includes a space so a future code change that
-        forgets the multi-word rendering trips this assertion."""
+    def test_delete_confirm_migration_uses_fact_label(self):
+        """Migration rows render the prompt with the `fact` noun
+        (matching extracted). The operator-facing UI no longer
+        surfaces the extracted/migration distinction; both source
+        rows share the prompt wording. Negative regression on the
+        old `imported memory` label trips a future revert."""
         fact = _migration_fact()
         text, _ = memory_command._build_forget_fact_confirm(fact)
         assert text.startswith("Forget")
-        assert "imported memory" in text
+        assert "fact" in text
+        assert "imported memory" not in text
         assert "This cannot be undone." in text
 
 

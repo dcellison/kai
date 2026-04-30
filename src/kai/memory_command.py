@@ -250,14 +250,12 @@ _MSG_QUERY_FAILED = "Memory query failed. Try again in a moment."
 _MSG_SESSION_EXPIRED = "Session expired, resyncing."
 _MSG_NO_SEARCH_RESULTS = "No matching memories found."
 
-# Help text - the static body shown for `/memory help`, for any
-# unrecognized subcommand (spec §5), AND in the dashboard's Search
-# button alert toast. The toast path passes this string to
-# `answerCallbackQuery`, whose `text` field is capped at 200 chars
-# by Telegram (see Bot API answerCallbackQuery docs). Keep this
-# string under 200; the alignment padding the prior version used
-# is invisible in Telegram's alert modal anyway since the modal
-# doesn't render with a monospace font.
+# Help text - the static body shown for `/memory help` and for any
+# unrecognized `/memory <subcommand>` invocation. Both code paths
+# call `update.message.reply_text(_HELP_TEXT)`, which has no length
+# cap, so the string can grow to whatever wording is useful without
+# the prior 200-char ceiling that the deleted dashboard alert-toast
+# caller imposed.
 _HELP_TEXT = (
     "/memory - Browse memories\n"
     "/memory search <q> - Semantic search\n"
@@ -311,22 +309,20 @@ def _format_date(iso_str: str, with_time: bool = False) -> str:
 def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | None]:
     """Render the dashboard text and keyboard from a MemoryStats.
 
-    The dashboard surfaces three user-visible source counts (extracted
-    facts, episode summaries, migration imports) and a single utility
-    keyboard row holding two optional browse buttons (Facts when
-    extracted_count + migration_count > 0; Episodes when
-    episode_count > 0), plus unconditional Search and Stats buttons.
-    There is no per-source filter axis: the parent decision in #388
-    settled tags as row decoration only, not a primary browse axis.
+    The dashboard surfaces two user-visible counts (facts and episode
+    summaries) and a single utility keyboard row holding two optional
+    browse buttons (Facts when extracted_count + migration_count > 0;
+    Episodes when episode_count > 0), plus an unconditional Stats
+    button. There is no per-source filter axis: the parent decision
+    in #388 settled tags as row decoration only, not a primary
+    browse axis.
 
     Facts vs Episodes split: extracted and migration rows fold into a
-    single "facts" bucket because the extracted/imported distinction
-    is internal plumbing from an operator's perspective. The fact-
-    view detail screen still renders per-source headers (Fact for
-    extracted, Imported for migration) so the provenance surfaces
-    when the operator drills in. Episodes have a distinct semantic
-    shape (outcome quality, approach, lessons) that justifies a
-    separate browser.
+    single "facts" bucket because the extracted/migration distinction
+    is internal plumbing from an operator's perspective. The headline
+    sums them; the fact-view detail screen renders both with the same
+    `Fact` header. Episodes have a distinct semantic shape (outcome
+    quality, approach, lessons) that justifies a separate browser.
 
     Empty state: only when ALL three user-visible source counts are
     zero. An operator with episode or migration rows but no extracted
@@ -350,23 +346,20 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
     episodes_visible = stats.episode_count > 0
 
     lines: list[str] = []
-    # Headline assembled from non-zero per-source counts so a fresh
-    # extracted-only operator gets a tight "Memories: N facts."
-    # while a mixed-source operator gets distinct visibility into
-    # each source. Zero-valued sources are omitted from the comma
+    # Headline assembled from non-zero counts. The fact bucket sums
+    # extracted and migration into a single "facts" count because the
+    # operator does not need to be reminded that some facts arrived
+    # via migration rather than extraction. The summing matches the
+    # Facts button label so the headline and the keyboard agree on
+    # the same number. Zero-valued counts are omitted from the comma
     # list rather than rendered as "0 episodes" - readability over
     # uniformity, since most operators have non-zero in only one or
-    # two of the three. The headline keeps extracted and migration
-    # split (rather than merging them like the Facts button label)
-    # because the headline communicates "where did your memory come
-    # from", which is the question the per-source split answers.
+    # both of the two count buckets.
     parts: list[str] = []
-    if stats.extracted_count:
-        parts.append(f"{stats.extracted_count} facts")
-    if stats.episode_count:
+    if facts_visible:
+        parts.append(f"{facts_count} facts")
+    if episodes_visible:
         parts.append(f"{stats.episode_count} episodes")
-    if stats.migration_count:
-        parts.append(f"{stats.migration_count} imported")
     summary = "Memories: " + ", ".join(parts) + "."
     lines.append(summary)
     lines.append("")
@@ -376,26 +369,32 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
     # because the empty-state guard above would have returned; the
     # `else` arm is retained as a safety net so a future change to
     # the empty-state guard cannot silently produce a broken footer.
-    #   - Both browse buttons: name both, plus Search and Stats.
-    #   - Facts only: Tap Facts to browse, then Search and Stats.
-    #   - Episodes only: existing post-410 wording, unchanged.
-    #   - Neither (unreachable): pre-410 fallback wording.
+    # Two-sentence form ("Tap X to browse. Tap Stats for details.")
+    # reads cleaner than the prior comma-spliced form once the Search
+    # call-out is gone.
+    #   - Both browse buttons: name both, plus Stats for details.
+    #   - Facts only: Tap Facts to browse. Tap Stats for details.
+    #   - Episodes only: same shape with Episodes.
+    #   - Neither (unreachable): Tap Stats for details.
     if facts_visible and episodes_visible:
-        lines.append("Tap Facts or Episodes to browse, Search to find specific memories, or Stats for details.")
+        lines.append("Tap Facts or Episodes to browse. Tap Stats for details.")
     elif facts_visible:
-        lines.append("Tap Facts to browse, Search to find specific memories, or Stats for details.")
+        lines.append("Tap Facts to browse. Tap Stats for details.")
     elif episodes_visible:
-        lines.append("Tap Episodes to browse, Search to find specific memories, or Stats for details.")
+        lines.append("Tap Episodes to browse. Tap Stats for details.")
     else:
-        lines.append("Use Search to find specific memories, or tap Stats for details.")
+        lines.append("Tap Stats for details.")
 
     text = "\n".join(lines)
 
     # Keyboard: a single utility row holds the cross-corpus actions
     # in this exact left-to-right order: Facts (if any), Episodes
-    # (if any), Search, Stats. Both browse buttons hide when their
-    # bucket is empty so an operator does not see a button that
-    # would open an empty list. Search and Stats always render.
+    # (if any), Stats. Both browse buttons hide when their bucket is
+    # empty so an operator does not see a button that would open an
+    # empty list. Stats always renders. The Search button is gone:
+    # Telegram's inline keyboard cannot accept text input, so the
+    # button could never actually run a query; the slash-command
+    # path `/memory search <q>` is the search entry point.
     rows: list[list[InlineKeyboardButton]] = []
     utility_row: list[InlineKeyboardButton] = []
     if facts_visible:
@@ -412,7 +411,6 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
                 callback_data=_encode_callback("eps", "0"),
             )
         )
-    utility_row.append(InlineKeyboardButton("Search", callback_data=_encode_callback("help")))
     utility_row.append(InlineKeyboardButton("Stats", callback_data=_encode_callback("stats")))
     rows.append(utility_row)
     return text, InlineKeyboardMarkup(rows)
@@ -441,20 +439,6 @@ def _paginate(facts: list[MemoryResult], page: int) -> tuple[list[MemoryResult],
 # ── Builder: episode list view (issue #410) ────────────────────────
 
 
-# The closed enum of `outcome_quality` values written by the
-# memory_extraction.py episode classifier. Episodes whose metadata
-# contains an off-enum string still render via the `[----]` fallback;
-# the strict check defends against a schema drift where a value like
-# `"good"` or `"unknown"` could leak in and look like a real category.
-# Mirroring (rather than importing from `memory_extraction`) avoids
-# pulling in the Anthropic SDK on the UI path. A drift between the
-# two lists shows up immediately in the episode list view (every
-# row would render as `[----]`). frozenset (not tuple) because the
-# only operation here is `in` membership; iteration order does not
-# matter.
-_OUTCOME_QUALITY_ENUM: frozenset[str] = frozenset({"success", "partial", "failure"})
-
-
 def _build_episode_list_view(
     facts: list[MemoryResult],
     page: int,
@@ -467,15 +451,14 @@ def _build_episode_list_view(
     resolve to memory ids via integer index, keeping callback data
     well under the 64-byte Telegram ceiling.
 
-    Per-row layout:
-        N.  [<outcome_quality>]  <truncated text>
-                                 <date>
+    Per-row layout matches the facts list:
+        N.  <truncated text>
+            <date>
 
-    Bracket text is the literal `outcome_quality` string from
-    metadata when it is one of the enumerated values
-    (`success` / `partial` / `failure`); otherwise `[----]`. Episode
-    rows do not carry confidence; the bracket field is the per-row
-    quality signal.
+    The `outcome_quality` field is still load-bearing in the episode
+    detail view (header parenthetical: `Episode (success)`) but is
+    not surfaced in the list view; per-row quality bracketing was
+    visual noise that did not help triage at the row level.
 
     Header reads `"Episodes  (page X of Y)"` with two spaces between
     the label and the parenthetical for visual separation.
@@ -495,19 +478,13 @@ def _build_episode_list_view(
     lines = [f"Episodes  (page {clamped + 1} of {total})", ""]
     memory_ids: list[str] = []
     for idx, fact in enumerate(window, start=1):
-        quality = fact.metadata.get("outcome_quality")
-        # Strict enum check (not a truthy-string check). Defends
-        # against schema drift where an off-enum value could leak
-        # in and look like a real category in the UI.
-        if quality in _OUTCOME_QUALITY_ENUM:
-            quality_str = f"[{quality}]"
-        else:
-            quality_str = "[----]"
         date_str = _format_date(fact.updated_at or fact.created_at)
-        lines.append(f"{idx}.  {quality_str}  {_truncate(fact.text)}")
-        # Twelve-space indent visually nests the date under the
-        # bracket label on the line above.
-        lines.append(f"            {date_str}")
+        lines.append(f"{idx}.  {_truncate(fact.text)}")
+        # Four-space indent lines up the date under the start of the
+        # truncated fact text on the line above (after the "N.  "
+        # prefix). Matches the facts list convention so both list
+        # views render with identical alignment.
+        lines.append(f"    {date_str}")
         lines.append("")
         memory_ids.append(fact.id)
 
@@ -582,11 +559,10 @@ def _build_facts_list_view(
     for idx, fact in enumerate(window, start=1):
         date_str = _format_date(fact.updated_at or fact.created_at)
         lines.append(f"{idx}.  {_truncate(fact.text)}")
-        # Four-space indent visually nests the date under the start
-        # of the truncated fact text on the line above (after the
-        # "N.  " prefix). Compare with the episode list, which uses
-        # twelve spaces because its bracket label sits there; with
-        # no bracket on this surface, four is the right alignment.
+        # Four-space indent lines up the date under the start of the
+        # truncated fact text on the line above (after the "N.  "
+        # prefix). The episode list uses the same convention so both
+        # list views render with identical alignment.
         lines.append(f"    {date_str}")
         lines.append("")
         memory_ids.append(fact.id)
@@ -628,23 +604,26 @@ def _build_fact_view(
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Render the fact detail screen (spec §6.3).
 
-    Three render shapes (issue #407), branched on `metadata.source`:
+    Three render shapes, branched on `metadata.source`:
       - extracted: `Fact` header + the existing six-row block (Tags,
         Confidence, Date, Session, Prompt version, Confirmation).
         Unchanged from the pre-#407 surface.
       - episode:   `Episode (<outcome_quality>)` header (or `Episode`
-        when outcome_quality metadata is absent) + Tags + Date.
-        Confidence/Session/Prompt version/Confirmation are omitted
-        because episode rows do not carry those extractor-only fields;
-        rendering them as placeholders ("----" / "(none)" / "n/a")
-        would imply the data exists and is missing rather than
-        not-applicable.
-      - migration: `Imported` header + Tags + Date. Header chosen to
-        distinguish operator-curated MEMORY.md content from
-        Haiku-extracted facts at a glance, even though both render
-        with the same `_SOURCE_SHORT="fact"` in retrieval-time prompt
-        injection (see memory.py); the fact-view is operator-facing
-        and benefits from the visual distinction.
+        when outcome_quality metadata is absent) + Approach / Outcome
+        / Lessons (when present) / Actors / Tags / Date with blank
+        lines between every labelled section. Confidence/Session/
+        Prompt version/Confirmation are omitted because episode rows
+        do not carry those extractor-only fields; rendering them as
+        placeholders ("----" / "(none)" / "n/a") would imply the data
+        exists and is missing rather than not-applicable.
+      - migration: `Fact` header + Tags + Date. Migration rows do not
+        carry extractor-only metadata (Confidence/Session/Prompt
+        version/Confirmation) so the body shape stays minimal; the
+        same not-applicable rationale as the episode arm applies. The
+        header now matches extracted rather than calling out the
+        source distinction; from the operator's perspective extracted
+        and migration are both "facts" and the data-layer source
+        distinction is internal plumbing.
 
     `return_to` encodes where the back button should land. It can be
     None for callers (e.g., tests) that don't care; in that case the
@@ -656,40 +635,48 @@ def _build_fact_view(
     source = md.get("source", "")
 
     if source == "episode" or source == "migration":
-        # Episode and migration rows share a minimal body shape:
-        # Tags + Date with none of the extractor-only rows. Header
-        # differs (Episode (<outcome_quality>) vs Imported), and
-        # episodes (issue #412) splice in the four substantive
-        # Sophia fields (Approach, Outcome, Lessons-when-present,
-        # Actors) between the body quote and the Tags / Date footer.
-        # Migration rows skip the splice entirely - they have no
-        # equivalent metadata.
+        # Episode and migration rows share a minimal body shape with
+        # none of the extractor-only rows. The episode arm splices in
+        # Approach / Outcome / Lessons (when present) / Actors between
+        # the body quote and the Tags / Date footer, with blank lines
+        # between every labelled section so long Approach/Outcome
+        # paragraphs do not visually fuse together. Migration rows
+        # skip the splice entirely (they have no equivalent metadata)
+        # so detail_lines stays empty and the body collapses to the
+        # quoted text plus the Tags / Date footer.
         tags_line = f"Tags:  {', '.join(tags) if tags else '(none)'}"
         detail_lines: list[str] = []
         if source == "episode":
-            # Episode rows surface the Sophia outcome_quality field as
-            # a header parenthetical when present (e.g., "Episode
+            # Episode rows surface the outcome_quality field as a
+            # header parenthetical when present (e.g., "Episode
             # (good)") so the operator can tell at a glance how the
             # conversation resolved. Date renders with HH:MM precision
             # so episodes from the same day are distinguishable.
             quality = md.get("outcome_quality") or ""
             header = f"Episode ({quality})" if quality else "Episode"
-            # Substantive Sophia fields written by the stage-2
-            # generator's metadata-write block in memory_extraction.
-            # approach / outcome / actors are schema-required and
-            # always present in production; the `or ""` / `or []`
-            # defensive fallbacks surface malformed-data corruption
-            # rather than hiding it. lessons is optional-by-design
-            # and absent (not empty) when the generator chose to
-            # omit it - rendering `Lessons:  (none)` would lie about
-            # that design intent.
+            # Substantive fields written by the stage-2 generator's
+            # metadata-write block in memory_extraction. approach /
+            # outcome / actors are schema-required and always present
+            # in production; the `or ""` / `or []` defensive fallbacks
+            # surface malformed-data corruption rather than hiding it.
+            # lessons is optional-by-design and absent (not empty) when
+            # the generator chose to omit it - rendering
+            # `Lessons:  (none)` would lie about that design intent.
             approach = md.get("approach") or ""
             outcome = md.get("outcome") or ""
             actors_list = md.get("actors") or []
             actors_str = ", ".join(actors_list) if actors_list else "(none)"
             lessons = md.get("lessons")
+            # Trailing blank after each labelled section so the splice
+            # produces a blank line between every adjacent pair, plus
+            # a final blank that separates the Actors row from the
+            # Tags row appended below. Lessons-absent collapses to a
+            # single break between Outcome and Actors because no
+            # Lessons block (and no Lessons trailing blank) is added.
             detail_lines.append(f"Approach:  {approach}")
+            detail_lines.append("")
             detail_lines.append(f"Outcome:  {outcome}")
+            detail_lines.append("")
             # Presence-check, NOT truthy-check. The schema's
             # minLength=20 makes the two equivalent in practice today,
             # but `is not None` matches the storage contract literally
@@ -697,15 +684,19 @@ def _build_fact_view(
             # and protects against future schema relaxation.
             if lessons is not None:
                 detail_lines.append(f"Lessons:  {lessons}")
+                detail_lines.append("")
             detail_lines.append(f"Actors:  {actors_str}")
+            detail_lines.append("")
         else:
             # Migration rows already include the H3 title and section
             # structure inside `fact.text` (the migration script writes
             # the chunk as `### <title>\n<body>` per #408), so no
             # additional section rendering is needed here. The header
-            # diverges from the prompt-side `_SOURCE_SHORT="fact"` on
-            # purpose - see docstring.
-            header = "Imported"
+            # matches extracted (`Fact`) rather than calling out
+            # `Imported` because the operator-facing UI no longer
+            # surfaces the extracted/migration distinction; the
+            # data-layer `source` field stays unchanged.
+            header = "Fact"
         lines = [
             header,
             "",
@@ -770,19 +761,22 @@ def _build_fact_view(
 def _build_forget_fact_confirm(fact: MemoryResult) -> tuple[str, InlineKeyboardMarkup]:
     """Render the single-fact forget confirmation.
 
-    Issue #407 expanded the noun in the prompt text per source so the
-    operator sees what is being forgotten (`fact` for extracted,
-    `episode` for episode summaries, `imported memory` for migration
-    rows). The verb (`Forget`), the warning sentence (`This cannot
-    be undone.`), and the inline-button flow (`confirm forget` /
-    `cancel`) are all preserved unchanged. Falls back to the generic
-    label `memory` for an unknown source value (defensive: should be
-    unreachable since `get_by_id` already gates on
-    `USER_VISIBLE_SOURCES`, but a stale cache during a deploy
-    transition could in principle slip a different source through).
+    The noun in the prompt text varies per source so the operator
+    sees what is being forgotten (`fact` for extracted and migration,
+    `episode` for episode summaries). Migration rows share the
+    extracted noun because the operator-facing UI does not surface
+    the extracted/migration distinction; both are facts as far as
+    the prompt wording goes. The verb (`Forget`), the warning
+    sentence (`This cannot be undone.`), and the inline-button flow
+    (`confirm forget` / `cancel`) are all preserved unchanged. Falls
+    back to the generic label `memory` for an unknown source value
+    (defensive: should be unreachable since `get_by_id` already
+    gates on `USER_VISIBLE_SOURCES`, but a stale cache during a
+    deploy transition could in principle slip a different source
+    through).
     """
     source = (fact.metadata or {}).get("source", "")
-    label = {"extracted": "fact", "episode": "episode", "migration": "imported memory"}.get(source, "memory")
+    label = {"extracted": "fact", "episode": "episode", "migration": "fact"}.get(source, "memory")
     text = f'Forget this {label}?\n\n"{fact.text}"\n\nThis cannot be undone.'
     kb = InlineKeyboardMarkup(
         [
@@ -854,28 +848,26 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
     """
     # Combined empty-state guard (issue #407): only when every
     # user-visible source is empty does the corpus count as "no
-    # memories yet." The wording was updated from the original
-    # "No extracted facts yet" because the original would lie about
-    # the empty-state's scope when the post-#407 surface knows about
-    # episode and migration rows too.
+    # memories yet." Wording mirrors the dashboard's two-bucket
+    # surface (facts + episodes); the migration count folds into
+    # "facts" so the empty-state phrasing has no third item.
     if stats.extracted_count == 0 and stats.episode_count == 0 and stats.migration_count == 0:
-        text = "Memory stats\n\nNo facts, episodes, or imported memory yet."
+        text = "Memory stats\n\nNo facts or episodes yet."
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("back", callback_data=_encode_callback("dash"))]])
         return text, kb
 
-    # Headline block: per-source totals, one line per non-zero source.
-    # Right-padding holds the "Total <source>:" labels at consistent
-    # width across the three header lines so the count column lines
-    # up. Lines for zero-valued counts are omitted so a fresh
-    # extracted-only operator does not see two empty "Total episodes:"
-    # / "Total imported:" rows below their facts total.
+    # Headline block: per-bucket totals, one line per non-zero bucket.
+    # Right-padding holds the "Total <bucket>:" labels at consistent
+    # width across the header lines so the count column lines up.
+    # The fact bucket sums extracted and migration so a migration-only
+    # operator sees a single "Total facts:" rather than the prior
+    # split rows; the underlying source field stays unchanged.
+    total_facts = stats.extracted_count + stats.migration_count
     lines = ["Memory stats", ""]
-    if stats.extracted_count:
-        lines.append(f"Total facts:      {stats.extracted_count}")
+    if total_facts:
+        lines.append(f"Total facts:      {total_facts}")
     if stats.episode_count:
         lines.append(f"Total episodes:   {stats.episode_count}")
-    if stats.migration_count:
-        lines.append(f"Total imported:   {stats.migration_count}")
 
     # The three extracted-shaped sections below all read extractor-only
     # metadata (confidence, confirmation_quote, prompt_version). For
@@ -1020,7 +1012,6 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
       facts <page>      - facts list (extracted + migration) at page
       fact <idx>        - open fact at index (resolved against cache)
       stats             - re-render stats
-      help              - help text (Search button on dashboard)
       ffc               - forget single fact confirm
       ffd               - forget single fact: do delete
       fview             - cancel forget; return to fact view (same id)
@@ -1063,9 +1054,6 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
     # error handler itself. The visual cost is the loading spinner
     # persists slightly longer (until the send completes) - for
     # typical Mem0 latencies this is invisible.
-    #
-    # The `help` verb is the one exception: it has no send, only an
-    # alert toast, so answer is the response.
     try:
         if verb == "dash":
             await _send_dashboard(update, context, chat_id, edit=True)
@@ -1074,15 +1062,6 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
         if verb == "stats":
             await _send_stats(update, context, chat_id, edit=True)
             await query.answer()
-            return
-        if verb == "help":
-            # Search button on dashboard - there is no inline text
-            # input in Telegram, so the best we can do is show the
-            # help text in a transient toast and leave the dashboard
-            # visible. Use a long-form alert so the user sees the
-            # full command syntax. No send to defer; the alert is
-            # the response.
-            await query.answer(_HELP_TEXT, show_alert=True)
             return
         if verb == "eps":
             # Episode list browser (issue #410). Single-arg page
