@@ -53,7 +53,7 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from kai.memory import MemoryResult
@@ -456,9 +456,11 @@ def apply_rewrites(
     sparse dict like `{"tags": [...]}` would destroy every other field
     on the row.
 
-    Writes one JSONL audit log entry per successful rewrite. The audit
-    log file is opened in append mode so multiple `--apply` runs in the
-    same session accumulate rather than truncating each other.
+    Successful rewrites are collected in memory and flushed to the
+    audit log in a single append at the end. The flush is skipped
+    entirely when no rewrite landed, so the file is never created
+    empty. Multiple `--apply` runs targeting the same path accumulate
+    via append mode.
 
     Returns (success_count, fail_count). The `fail_count` includes any
     row whose `update_metadata` call returned False (Mem0 raise, row
@@ -468,28 +470,29 @@ def apply_rewrites(
 
     success = 0
     failure = 0
-    with audit_log_path.open("a", encoding="utf-8") as audit_log:
-        for row in rows:
-            new_tags, changed = apply_cluster_to_row(row.metadata.get("tags") or [], clusters)
-            if not changed:
-                continue
-            # Read-merge-write: copy the existing metadata dict, set the
-            # new tags, pass the merged dict. If we passed
-            # `{"tags": new_tags}` directly to the wrapper, Mem0's
-            # `_update_memory` would destroy every other metadata field
-            # (source, confidence, prompt_version, ...) per the wrapper's
-            # documented contract.
-            new_metadata = dict(row.metadata)
-            new_metadata["tags"] = new_tags
-            ok = memory.update_metadata(
-                user_id=str(user_id),
-                memory_id=row.id,
-                data=row.text,
-                metadata=new_metadata,
-            )
-            if ok:
-                success += 1
-                audit_entry = {
+    audit_entries: list[dict[str, Any]] = []
+    for row in rows:
+        new_tags, changed = apply_cluster_to_row(row.metadata.get("tags") or [], clusters)
+        if not changed:
+            continue
+        # Read-merge-write: copy the existing metadata dict, set the
+        # new tags, pass the merged dict. If we passed
+        # `{"tags": new_tags}` directly to the wrapper, Mem0's
+        # `_update_memory` would destroy every other metadata field
+        # (source, confidence, prompt_version, ...) per the wrapper's
+        # documented contract.
+        new_metadata = dict(row.metadata)
+        new_metadata["tags"] = new_tags
+        ok = memory.update_metadata(
+            user_id=str(user_id),
+            memory_id=row.id,
+            data=row.text,
+            metadata=new_metadata,
+        )
+        if ok:
+            success += 1
+            audit_entries.append(
+                {
                     "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "memory_id": row.id,
                     "user_id": str(user_id),
@@ -497,10 +500,20 @@ def apply_rewrites(
                     "new_tags": new_tags,
                     "old_text": row.text,
                 }
-                audit_log.write(json.dumps(audit_entry) + "\n")
-            else:
-                failure += 1
-                print(f"WARN: update_metadata returned False for {row.id}", file=sys.stderr)
+            )
+        else:
+            failure += 1
+            print(f"WARN: update_metadata returned False for {row.id}", file=sys.stderr)
+
+    # Flush only when there's actually something to write. Skipping
+    # the open call entirely on the empty case avoids creating a
+    # zero-byte audit log file when clusters were proposed but no row
+    # in the corpus carried a matching tag (rare but possible if the
+    # corpus changed between load_rows and apply_rewrites).
+    if audit_entries:
+        with audit_log_path.open("a", encoding="utf-8") as audit_log:
+            for entry in audit_entries:
+                audit_log.write(json.dumps(entry) + "\n")
     return success, failure
 
 

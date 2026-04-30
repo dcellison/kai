@@ -29,6 +29,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -61,7 +62,7 @@ def _row(
     text: str,
     tags: list[str],
     source: str = "extracted",
-    extra_metadata: dict | None = None,
+    extra_metadata: dict[str, Any] | None = None,
 ) -> MemoryResult:
     """Construct a MemoryResult with the metadata shape the dedup pass
     actually walks. `extra_metadata` lets a test pin non-tag fields
@@ -347,7 +348,10 @@ class TestApplyRewrites:
 
     def test_failed_rewrite_increments_failure_count(self, monkeypatch, tmp_path):
         # update_metadata returns False (Mem0 raise, row vanished, etc.).
-        # The audit log gets NO entry for the failed row.
+        # The audit log file is NOT created at all when no rewrite
+        # succeeds; the lazy-flush path skips the open call entirely
+        # so an `--apply` run that fails for every row leaves no
+        # zero-byte file behind.
         from kai import memory as kai_memory
 
         monkeypatch.setattr(kai_memory, "update_metadata", lambda **kw: False)
@@ -360,9 +364,8 @@ class TestApplyRewrites:
 
         assert success == 0
         assert failure == 1
-        # Audit log was created (apply_rewrites opens in append mode
-        # unconditionally) but contains no entries for failed rewrites.
-        assert audit_log.read_text() == ""
+        # File should not exist: no entries means no flush.
+        assert not audit_log.exists()
 
 
 # ── CLI dispatch ──────────────────────────────────────────────────────
