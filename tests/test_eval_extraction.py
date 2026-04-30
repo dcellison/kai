@@ -104,6 +104,23 @@ def test_load_probes_malformed_json_raises_with_path_and_line(tmp_path: Path):
     assert "invalid JSON" in msg
 
 
+def test_load_probes_missing_window_current_raises_with_path_and_line(tmp_path: Path):
+    """A fixture line that is valid JSON and has the top-level
+    Probe fields but is missing `window.current` should fail at
+    load time, not silently route through `_run_one_probe`'s
+    error-bucket path. The load-time check is the operator's
+    diagnostic anchor; runtime tolerance for an empty current is
+    a separate concern handled by `_window_to_extractor_args`."""
+    f = tmp_path / "probes.jsonl"
+    f.write_text('{"probe_id":"p1","category":"workflow-noise","window":{"prior":[]},"expected":{}}\n')
+    with pytest.raises(ValueError) as exc_info:
+        extraction.load_probes(f)
+    msg = str(exc_info.value)
+    assert str(f) in msg
+    assert ":1:" in msg
+    assert "window.current is required" in msg
+
+
 def test_load_probes_missing_required_field_raises_with_path_and_line(tmp_path: Path):
     """Same diagnostic context applies when a line is valid JSON
     but lacks one of the required Probe fields. The KeyError raised

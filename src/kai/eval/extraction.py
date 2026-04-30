@@ -271,16 +271,25 @@ def load_probes(path: Path) -> list[Probe]:
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{path}:{line_number}: invalid JSON: {exc}") from exc
             try:
-                probes.append(
-                    Probe(
-                        probe_id=obj["probe_id"],
-                        category=obj["category"],
-                        window=obj["window"],
-                        expected=obj.get("expected", {}),
-                    )
+                probe = Probe(
+                    probe_id=obj["probe_id"],
+                    category=obj["category"],
+                    window=obj["window"],
+                    expected=obj.get("expected", {}),
                 )
             except KeyError as exc:
                 raise ValueError(f"{path}:{line_number}: missing required field {exc}") from exc
+            # Validate the window structure at load time so a fixture
+            # missing `current` raises an actionable error here instead
+            # of silently routing through `_run_one_probe`'s
+            # error-bucket path at run time. The harness's
+            # `_window_to_extractor_args` tolerates missing `current`
+            # via `.get("current") or {}` for defensive runtime
+            # behavior; the load-time check is the operator's
+            # diagnostic anchor.
+            if not isinstance(probe.window, dict) or "current" not in probe.window:
+                raise ValueError(f"{path}:{line_number}: window.current is required")
+            probes.append(probe)
     return probes
 
 
