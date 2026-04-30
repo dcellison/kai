@@ -20,20 +20,34 @@ Architectural shape:
   reaper task. Losing the cache on process restart is acceptable
   (spec 310 §7.4); the user just retypes `/memory`.
 
-Source filtering uses `memory.USER_VISIBLE_SOURCES` (the frozenset
-of `extracted`, `episode`, `migration`). The data-layer gate is
-canonical: `memory.get_by_id` and `memory.get_by_tag` admit only
-those sources, and `memory.delete_by_id` inherits the gate via its
-delegation. The one UI-side reference is `_send_search`'s
-post-filter, which exists because `memory.search` is a Mem0 vector
-lookup that spans every source, including legacy `""`-source rows
-that must not surface in the operator-facing UI. Both sites read
-`USER_VISIBLE_SOURCES` from `memory.py` so a future change to the
-admit list lives in one place. `memory.get_all_episodes` is the one
-narrower-than-`USER_VISIBLE_SOURCES` filter, scoped to the literal
-`"episode"` source for the dashboard's episode-list browser; it does
-not participate in the shared admit list because its purpose is
-single-source enumeration, not multi-source admission.
+Source filtering has three filter-site categories:
+
+  1. Multi-source admit list (`memory.USER_VISIBLE_SOURCES`, the
+     frozenset of `extracted`, `episode`, `migration`). The data-
+     layer gate is canonical: `memory.get_by_id` and
+     `memory.get_by_tag` admit only those sources, and
+     `memory.delete_by_id` inherits the gate via its delegation.
+     The one UI-side reference is `_send_search`'s post-filter,
+     which exists because `memory.search` is a Mem0 vector lookup
+     that spans every source, including legacy `""`-source rows
+     that must not surface in the operator-facing UI. Both sites
+     read `USER_VISIBLE_SOURCES` from `memory.py` so a future
+     change to the admit list lives in one place.
+  2. Single-source enumeration: `memory.get_all_episodes`, scoped
+     to the literal `"episode"` source for the dashboard's episode-
+     list browser.
+  3. Multi-source enumeration scoped to the fact bucket:
+     `memory.get_all_facts`, scoped to `{"extracted", "migration"}`
+     for the dashboard's facts-list browser. Narrower than
+     `USER_VISIBLE_SOURCES` (excludes episode), broader than
+     `get_all_episodes` (admits two sources). Episodes are
+     intentionally excluded because they have their own browser.
+
+Categories 2 and 3 do not participate in `USER_VISIBLE_SOURCES`:
+their purpose is enumeration, not multi-source admission. The
+duplication of source literals is deliberate so that a future
+change to the shared admit list cannot silently broaden either
+enumeration.
 
 See `home/specs/310-memory-command.md` for the canonical UX flows
 and design rationale.
@@ -299,10 +313,20 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
 
     The dashboard surfaces three user-visible source counts (extracted
     facts, episode summaries, migration imports) and a single utility
-    keyboard row holding an optional Episodes button (when
+    keyboard row holding two optional browse buttons (Facts when
+    extracted_count + migration_count > 0; Episodes when
     episode_count > 0), plus unconditional Search and Stats buttons.
     There is no per-source filter axis: the parent decision in #388
     settled tags as row decoration only, not a primary browse axis.
+
+    Facts vs Episodes split: extracted and migration rows fold into a
+    single "facts" bucket because the extracted/imported distinction
+    is internal plumbing from an operator's perspective. The fact-
+    view detail screen still renders per-source headers (Fact for
+    extracted, Imported for migration) so the provenance surfaces
+    when the operator drills in. Episodes have a distinct semantic
+    shape (outcome quality, approach, lessons) that justifies a
+    separate browser.
 
     Empty state: only when ALL three user-visible source counts are
     zero. An operator with episode or migration rows but no extracted
@@ -315,6 +339,16 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
     if stats.extracted_count == 0 and stats.episode_count == 0 and stats.migration_count == 0:
         return _MSG_NO_FACTS, None
 
+    # Cache the visibility predicates once. The Facts button rolls
+    # extracted and migration into one count; the Episodes button is
+    # episode-only. The empty-state guard above ensures at least one
+    # of facts_visible or episode_count > 0 is true on every reachable
+    # path through the rest of this function (otherwise all three
+    # counts would be zero, which the guard already returns for).
+    facts_count = stats.extracted_count + stats.migration_count
+    facts_visible = facts_count > 0
+    episodes_visible = stats.episode_count > 0
+
     lines: list[str] = []
     # Headline assembled from non-zero per-source counts so a fresh
     # extracted-only operator gets a tight "Memories: N facts."
@@ -322,7 +356,10 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
     # each source. Zero-valued sources are omitted from the comma
     # list rather than rendered as "0 episodes" - readability over
     # uniformity, since most operators have non-zero in only one or
-    # two of the three.
+    # two of the three. The headline keeps extracted and migration
+    # split (rather than merging them like the Facts button label)
+    # because the headline communicates "where did your memory come
+    # from", which is the question the per-source split answers.
     parts: list[str] = []
     if stats.extracted_count:
         parts.append(f"{stats.extracted_count} facts")
@@ -333,25 +370,42 @@ def _build_dashboard(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup | No
     summary = "Memories: " + ", ".join(parts) + "."
     lines.append(summary)
     lines.append("")
-    # Footer line: two branches keep the action prompt accurate to
-    # what the keyboard actually offers.
-    #   - Episodes button visible (episode_count > 0): name every
-    #     utility-row affordance the operator can tap.
-    #   - No Episodes button: only Search and Stats render.
-    if stats.episode_count > 0:
+    # Footer line: three reachable branches keep the action prompt
+    # accurate to what the keyboard actually offers. The fourth
+    # branch (no browse buttons at all) is unreachable in production
+    # because the empty-state guard above would have returned; the
+    # `else` arm is retained as a safety net so a future change to
+    # the empty-state guard cannot silently produce a broken footer.
+    #   - Both browse buttons: name both, plus Search and Stats.
+    #   - Facts only: Tap Facts to browse, then Search and Stats.
+    #   - Episodes only: existing post-410 wording, unchanged.
+    #   - Neither (unreachable): pre-410 fallback wording.
+    if facts_visible and episodes_visible:
+        lines.append("Tap Facts or Episodes to browse, Search to find specific memories, or Stats for details.")
+    elif facts_visible:
+        lines.append("Tap Facts to browse, Search to find specific memories, or Stats for details.")
+    elif episodes_visible:
         lines.append("Tap Episodes to browse, Search to find specific memories, or Stats for details.")
     else:
         lines.append("Use Search to find specific memories, or tap Stats for details.")
 
     text = "\n".join(lines)
 
-    # Keyboard: a single utility row holds the cross-corpus actions.
-    # Episodes button only renders when there is content to browse,
-    # so an operator with no episodes does not see a button that
-    # would lead to an empty list. Search and Stats always render.
+    # Keyboard: a single utility row holds the cross-corpus actions
+    # in this exact left-to-right order: Facts (if any), Episodes
+    # (if any), Search, Stats. Both browse buttons hide when their
+    # bucket is empty so an operator does not see a button that
+    # would open an empty list. Search and Stats always render.
     rows: list[list[InlineKeyboardButton]] = []
     utility_row: list[InlineKeyboardButton] = []
-    if stats.episode_count > 0:
+    if facts_visible:
+        utility_row.append(
+            InlineKeyboardButton(
+                f"Facts ({facts_count})",
+                callback_data=_encode_callback("facts", "0"),
+            )
+        )
+    if episodes_visible:
         utility_row.append(
             InlineKeyboardButton(
                 f"Episodes ({stats.episode_count})",
@@ -476,6 +530,90 @@ def _build_episode_list_view(
             InlineKeyboardButton(
                 "next >",
                 callback_data=_encode_callback("eps", str(clamped + 1)),
+            )
+        )
+    return text, InlineKeyboardMarkup([number_row, nav_row]), memory_ids, clamped, total
+
+
+# ── Builder: facts list view ────────────────────────────────────────
+
+
+def _build_facts_list_view(
+    facts: list[MemoryResult],
+    page: int,
+) -> tuple[str, InlineKeyboardMarkup, list[str], int, int]:
+    """Render a paginated facts list folding extracted and migration.
+
+    Returns the (text, keyboard, memory_ids, clamped_page,
+    total_pages) tuple consumed by `_send_facts_list`. The
+    memory_ids list backs the screen cache so numbered button taps
+    resolve to memory ids via integer index, keeping callback data
+    well under the 64-byte Telegram ceiling.
+
+    Per-row layout:
+        N.  <truncated text>
+            <date>
+
+    No bracket field. The list view is source-agnostic: extracted
+    and migration rows are visually indistinguishable in this
+    surface because the operator cannot meaningfully act on the
+    distinction at the list level. The fact-view detail screen
+    (rendered when a number is tapped) keeps the per-source
+    rendering from issue #407.
+
+    Header reads `"Facts  (page X of Y)"` with two spaces between
+    the label and the parenthetical; matches the episode header
+    convention so both list views look uniform side by side.
+    """
+    window, clamped, total = _paginate(facts, page)
+
+    if not window:
+        # Reachable only when an operator with facts_visible at
+        # dashboard-fetch time deletes their last extracted/migration
+        # row mid-session, since the dashboard hides the Facts button
+        # at zero. Render a graceful empty state with a back button
+        # rather than an empty-pagination screen.
+        text = "Facts\n\nNo facts yet."
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("back", callback_data=_encode_callback("dash"))]])
+        return text, kb, [], 0, 1
+
+    lines = [f"Facts  (page {clamped + 1} of {total})", ""]
+    memory_ids: list[str] = []
+    for idx, fact in enumerate(window, start=1):
+        date_str = _format_date(fact.updated_at or fact.created_at)
+        lines.append(f"{idx}.  {_truncate(fact.text)}")
+        # Four-space indent visually nests the date under the start
+        # of the truncated fact text on the line above (after the
+        # "N.  " prefix). Compare with the episode list, which uses
+        # twelve spaces because its bracket label sits there; with
+        # no bracket on this surface, four is the right alignment.
+        lines.append(f"    {date_str}")
+        lines.append("")
+        memory_ids.append(fact.id)
+
+    text = "\n".join(lines).rstrip()
+
+    # Number buttons reuse the existing `fact` verb. The integer
+    # index resolves against `cache.memory_ids` by position; the
+    # verb does not need to know which list type populated the
+    # cache. Same pattern the episode list uses today.
+    number_row = [
+        InlineKeyboardButton(str(i + 1), callback_data=_encode_callback("fact", str(i))) for i in range(len(window))
+    ]
+    nav_row: list[InlineKeyboardButton] = []
+    if clamped > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                "< prev",
+                callback_data=_encode_callback("facts", str(clamped - 1)),
+            )
+        )
+    nav_row.append(InlineKeyboardButton("back", callback_data=_encode_callback("dash")))
+    if clamped < total - 1:
+        nav_row.append(
+            InlineKeyboardButton(
+                "next >",
+                callback_data=_encode_callback("facts", str(clamped + 1)),
             )
         )
     return text, InlineKeyboardMarkup([number_row, nav_row]), memory_ids, clamped, total
@@ -879,6 +1017,7 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
     Verbs:
       dash              - re-render dashboard
       eps <page>        - episode list at page
+      facts <page>      - facts list (extracted + migration) at page
       fact <idx>        - open fact at index (resolved against cache)
       stats             - re-render stats
       help              - help text (Search button on dashboard)
@@ -956,6 +1095,21 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             await _send_episode_list(update, context, chat_id, page, edit=True)
             await query.answer()
             return
+        if verb == "facts":
+            # Facts list browser (extracted + migration). Same page-
+            # arg shape as `eps`; invalid integer falls back to page
+            # 0. The unknown-verb dismiss at the bottom of this
+            # handler covers any future retirement of the verb,
+            # which would silently no-op stale callbacks in chat
+            # history (same compatibility path the retired `tag`
+            # verb relies on).
+            try:
+                page = int(args[0]) if args else 0
+            except ValueError:
+                page = 0
+            await _send_facts_list(update, context, chat_id, page, edit=True)
+            await query.answer()
+            return
         if verb == "fact":
             cache = _get_cache(chat_id)
             if cache is None or not args:
@@ -1015,7 +1169,9 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             return_to = cache.return_to
             ok = memory.delete_by_id(user_id=str(chat_id), memory_id=memory_id)
             # Return to whatever screen the user was on before the
-            # fact view. Episode list if known; otherwise dashboard.
+            # fact view. Episode list, facts list, or dashboard
+            # fallback. The branches mirror the return_to encodings
+            # set in _send_fact_view.
             if return_to is not None and return_to[0] == "eps" and len(return_to[1]) >= 1:
                 # Issue #410: facts opened from the episode list
                 # return to that list at the same page after delete.
@@ -1024,6 +1180,17 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
                 except ValueError:
                     page = 0
                 await _send_episode_list(update, context, chat_id, page, edit=True)
+            elif return_to is not None and return_to[0] == "facts" and len(return_to[1]) >= 1:
+                # Mirrors the eps branch above: facts opened from the
+                # facts list return to that list at the same page
+                # after delete, so the operator can keep deleting
+                # contiguous rows without bouncing back to the
+                # dashboard each time.
+                try:
+                    page = int(return_to[1][0])
+                except ValueError:
+                    page = 0
+                await _send_facts_list(update, context, chat_id, page, edit=True)
             else:
                 await _send_dashboard(update, context, chat_id, edit=True)
             await query.answer("Forgotten." if ok else "Not found.")
@@ -1095,6 +1262,37 @@ async def _send_episode_list(
     await _send_or_edit(update, text, kb, edit=edit)
 
 
+async def _send_facts_list(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    page: int,
+    edit: bool = False,
+) -> None:
+    """Render and send/edit the facts list at `page`.
+
+    Fetches via `memory.get_all_facts` (the fact-bucket enumeration
+    that folds extracted and migration), builds via
+    `_build_facts_list_view`, and sets the cache screen to `"facts"`
+    so a fact opened from this list can route back to the same page
+    via `_send_fact_view`'s return_to logic. Distinct from the
+    `"fact"` (singular) sentinel, which identifies the fact-detail
+    view.
+    """
+    try:
+        facts = memory.get_all_facts(user_id=str(chat_id))
+    except Exception as exc:
+        log.exception("get_all_facts failed: %s", exc)
+        await _send_or_edit(update, _MSG_QUERY_FAILED, None, edit=edit)
+        return
+    text, kb, memory_ids, clamped_page, _total = _build_facts_list_view(facts, page)
+    _set_cache(
+        chat_id,
+        _ScreenCache(screen="facts", page=clamped_page, memory_ids=memory_ids),
+    )
+    await _send_or_edit(update, text, kb, edit=edit)
+
+
 async def _send_fact_view(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1115,6 +1313,13 @@ async def _send_fact_view(
         # that list at the same page on back-nav. Page is the only
         # arg needed; the eps verb decodes a single-element args list.
         return_to = ("eps", [str(cache.page)])
+    elif cache is not None and cache.screen == "facts":
+        # Mirrors the episodes branch: facts opened from the facts
+        # list return to that list at the same page on back-nav.
+        # The new `"facts"` cache sentinel (set by `_send_facts_list`)
+        # is what distinguishes this path from the search path; the
+        # encoded back-target is `mem:facts:<page>`.
+        return_to = ("facts", [str(cache.page)])
     elif cache is not None and cache.screen == "search" and cache.query is not None:
         # Searches re-execute on back-nav. Encoding the full query in
         # callback data would risk the 64-byte limit; for now, back

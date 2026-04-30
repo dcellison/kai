@@ -2810,6 +2810,148 @@ class TestGetAllEpisodes:
         assert mock_mem.get_all.call_args.kwargs["top_k"] >= 100_000
 
 
+class TestGetAllFacts:
+    """Multi-source enumeration helper backing the /memory dashboard's
+    facts-list browser. Filter is `metadata.source in {"extracted",
+    "migration"}` -- narrower than `USER_VISIBLE_SOURCES` (which also
+    admits episode) and broader than `get_all_episodes` (which is
+    scoped to a single source). Episodes are intentionally excluded
+    because they have their own list view."""
+
+    def test_get_all_facts_returns_only_extracted_and_migration_sources(self):
+        """Mixed-source store: only the extracted and migration rows
+        come back. Episode and legacy ""-source rows are filtered
+        out at the data layer rather than in the UI, so the UI cache
+        can't accidentally surface a non-fact-bucket row."""
+        import kai.memory as mem_mod
+        from kai.memory import get_all_facts
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {
+            "results": [
+                {
+                    "id": "ext",
+                    "memory": "extracted fact",
+                    "score": 0.0,
+                    "metadata": {"source": "extracted", "type": "fact"},
+                    "created_at": "2026-04-01T00:00:00",
+                    "updated_at": "2026-04-01T00:00:00",
+                },
+                {
+                    "id": "ep1",
+                    "memory": "episode one",
+                    "score": 0.0,
+                    "metadata": {"source": "episode", "outcome_quality": "success"},
+                    "created_at": "2026-04-02T00:00:00",
+                    "updated_at": "2026-04-02T00:00:00",
+                },
+                {
+                    "id": "mig",
+                    "memory": "migration row",
+                    "score": 0.0,
+                    "metadata": {"source": "migration", "tags": ["migration"]},
+                    "created_at": "2026-04-03T00:00:00",
+                    "updated_at": "2026-04-03T00:00:00",
+                },
+                {
+                    "id": "legacy",
+                    "memory": "legacy row",
+                    "score": 0.0,
+                    "metadata": {"source": ""},
+                    "created_at": "2026-01-01T00:00:00",
+                    "updated_at": "2026-01-01T00:00:00",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+
+        results = get_all_facts(user_id="123")
+        # Sort order is recency-desc on updated_at, so migration
+        # (2026-04-03) precedes extracted (2026-04-01). Episode and
+        # legacy rows are excluded.
+        assert [r.id for r in results] == ["mig", "ext"]
+
+    def test_get_all_facts_sorts_newest_first(self):
+        """Two rows with different `updated_at` (one extracted, one
+        migration) so the sort spans the full fact bucket. Mirrors
+        `get_all_episodes`'s sort contract."""
+        import kai.memory as mem_mod
+        from kai.memory import get_all_facts
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {
+            "results": [
+                {
+                    "id": "old",
+                    "memory": "older extracted",
+                    "score": 0.0,
+                    "metadata": {"source": "extracted"},
+                    "created_at": "2026-01-01T00:00:00",
+                    "updated_at": "2026-01-01T00:00:00",
+                },
+                {
+                    "id": "new",
+                    "memory": "newer migration",
+                    "score": 0.0,
+                    "metadata": {"source": "migration"},
+                    "created_at": "2026-04-01T00:00:00",
+                    "updated_at": "2026-04-15T00:00:00",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+
+        results = get_all_facts(user_id="123")
+        assert [r.id for r in results] == ["new", "old"]
+
+    def test_get_all_facts_empty_when_no_matching_sources(self):
+        """Episode-only store: empty list, not None or an exception.
+        The episode rows are visible to `get_all_episodes` but not to
+        this helper."""
+        import kai.memory as mem_mod
+        from kai.memory import get_all_facts
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {
+            "results": [
+                {
+                    "id": "ep",
+                    "memory": "episode",
+                    "score": 0.0,
+                    "metadata": {"source": "episode"},
+                    "created_at": "",
+                    "updated_at": "",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+
+        assert get_all_facts(user_id="123") == []
+
+    def test_get_all_facts_disabled_returns_empty(self):
+        """With memory disabled (`_memory is None`), helper short-
+        circuits to empty list. No exception, no get_all call."""
+        from kai.memory import get_all_facts
+
+        # The autouse `_clean_memory_state` fixture leaves _memory at
+        # None unless the test sets it explicitly.
+        assert get_all_facts(user_id="123") == []
+
+    def test_get_all_facts_passes_limit_none(self):
+        """get_all is called with the high ceiling (top_k >= 100_000)
+        so users with thousands of fact-bucket rows get a complete
+        listing. Parallel to test_get_all_episodes_passes_limit_none."""
+        import kai.memory as mem_mod
+        from kai.memory import get_all_facts
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {"results": []}
+        mem_mod._memory = mock_mem
+
+        get_all_facts(user_id="123")
+        assert mock_mem.get_all.call_args.kwargs["top_k"] >= 100_000
+
+
 # ── Integration tests (real Mem0 + Qdrant, slower) ──────────────────
 
 

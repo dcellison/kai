@@ -1175,6 +1175,60 @@ def get_all_episodes(*, user_id: str) -> list[MemoryResult]:
     return matches
 
 
+# A literal frozen set, NOT an alias for `USER_VISIBLE_SOURCES`. The two
+# admit lists serve different purposes and must not drift together: the
+# shared list (extracted, episode, migration) gates per-id and per-tag
+# reads where any of the three sources is acceptable; this list
+# (extracted, migration) gates the fact-bucket enumeration where
+# episodes are intentionally excluded because they have their own
+# browser. Aliasing would silently change the function's semantics if
+# `USER_VISIBLE_SOURCES` ever gains a fourth source. The duplication
+# is deliberate.
+_FACT_BUCKET_SOURCES: frozenset[str] = frozenset({"extracted", "migration"})
+
+
+def get_all_facts(*, user_id: str) -> list[MemoryResult]:
+    """Return all fact-bucket memories for `user_id`, newest first.
+
+    Read-side primitive for the /memory dashboard's facts-list browser.
+    The "fact bucket" combines two sources that the operator cannot
+    meaningfully tell apart in a list view: extracted facts (Haiku
+    pulled them out of conversation) and migration facts (the operator
+    imported them from MEMORY.md). The fact-view detail screen still
+    surfaces the per-source distinction via different headers; this
+    enumeration helper exists for the source-agnostic list view.
+
+    Source-filter taxonomy. This module has three filter-site
+    categories; this function is the third:
+      1. Multi-source admit list (`USER_VISIBLE_SOURCES`, all three
+         user-visible sources). Used by `get_by_id`, `get_by_tag`,
+         `delete_by_id`, and the `_send_search` UI post-filter.
+      2. Single-source enumeration (`get_all_episodes`, scoped to the
+         literal `"episode"`).
+      3. Multi-source enumeration scoped to the fact bucket (this
+         function, scoped to `{"extracted", "migration"}`).
+    Category 3 is narrower than the shared admit list (it omits
+    episode) and broader than category 2 (it admits two sources, not
+    one). It does NOT participate in `USER_VISIBLE_SOURCES`; see the
+    `_FACT_BUCKET_SOURCES` comment above for the rationale.
+
+    Sort: `updated_at` descending, with `created_at` as the fallback
+    for rows whose payload predates the field. Mirrors `get_by_tag`
+    and `get_all_episodes` so the convention is uniform across all
+    list surfaces. ISO-8601 strings are lexicographically sortable, so
+    no `datetime` parse is needed. The full row set comes from
+    `get_all(limit=None)` so a user with thousands of facts still
+    gets a complete listing rather than the default 1000-row ceiling.
+    """
+    if _memory is None:
+        return []
+
+    rows = get_all(user_id=user_id, limit=None)
+    matches = [r for r in rows if r.metadata.get("source") in _FACT_BUCKET_SOURCES]
+    matches.sort(key=lambda r: r.updated_at or r.created_at, reverse=True)
+    return matches
+
+
 def get_by_id(*, user_id: str, memory_id: str) -> MemoryResult | None:
     """Fetch a single user-visible memory by id, scoped to user.
 

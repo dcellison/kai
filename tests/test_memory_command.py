@@ -684,17 +684,21 @@ class TestDashboardMultiSource:
         assert [btn.text for btn in utility_row] == ["Episodes (4)", "Search", "Stats"]
 
     def test_dashboard_migration_only_user_renders(self):
-        """Same shape as the episode-only case: migration_count > 0,
-        extracted_count == 0, episode_count == 0. Same empty-state
-        guard fix; the keyboard renders only the Search/Stats utility
-        row because no Episodes button shows when episode_count == 0."""
+        """Migration-only operator: migration_count > 0,
+        extracted_count == 0, episode_count == 0. The empty-state
+        guard does not fire because migration_count is positive.
+        The Facts button renders (extracted + migration > 0) and
+        the footer points to it; Episodes does not render."""
         stats = _stats(migration_count=25)
         text, kb = memory_command._build_dashboard(stats)
         assert "No memories yet" not in text
         assert kb is not None
         assert "25 imported" in text
-        assert "Use Search to find specific memories, or tap Stats for details." in text
+        # Migration-only is the facts-only footer branch.
+        assert "Tap Facts to browse, Search to find specific memories, or Stats for details." in text
         assert len(kb.inline_keyboard) == 1
+        utility_row = kb.inline_keyboard[-1]
+        assert [btn.text for btn in utility_row] == ["Facts (25)", "Search", "Stats"]
 
     def test_dashboard_all_zero_returns_empty_state(self):
         """The empty state fires only when every user-visible source
@@ -991,32 +995,38 @@ class TestDashboardEpisodesButton:
     footer prose changes that ride alongside."""
 
     def test_dashboard_renders_episodes_button_when_episode_count_nonzero(self):
+        # Mixed-source fixture: extracted_count=10 makes the Facts
+        # button visible too, so the row is the both-buttons shape.
+        # Episodes sits at index 1 (Facts at 0).
         stats = _stats(extracted_count=10, episode_count=4, by_tag={"preference": 5})
         _, kb = memory_command._build_dashboard(stats)
         assert kb is not None
         utility_row = kb.inline_keyboard[-1]
         labels = [btn.text for btn in utility_row]
-        assert labels == ["Episodes (4)", "Search", "Stats"]
+        assert labels == ["Facts (10)", "Episodes (4)", "Search", "Stats"]
         # Callback shape: mem:eps:<page>; initial page is 0.
-        episodes_btn = utility_row[0]
+        # Episodes is at index 1 because Facts now occupies index 0.
+        episodes_btn = utility_row[1]
         assert episodes_btn.callback_data == "mem:eps:0"
 
     def test_dashboard_omits_episodes_button_when_episode_count_zero(self):
-        # Pre-#410 shape: utility row is exactly [Search, Stats].
-        # Pin so a future regression that always emits the Episodes
-        # button trips this test.
+        # extracted_count=10 makes Facts visible, so the row is
+        # [Facts (10), Search, Stats]. Episodes is correctly absent.
+        # The test name still describes the omit-when-zero intent;
+        # the row contents now also confirm the new Facts presence.
         stats = _stats(extracted_count=10, episode_count=0, by_tag={"preference": 5})
         _, kb = memory_command._build_dashboard(stats)
         assert kb is not None
         utility_row = kb.inline_keyboard[-1]
         labels = [btn.text for btn in utility_row]
-        assert labels == ["Search", "Stats"]
+        assert labels == ["Facts (10)", "Search", "Stats"]
 
     def test_dashboard_episode_only_user_renders_episodes_button(self):
         # Episode-only operator: utility row is the only keyboard
         # row, with Episodes alongside Search and Stats. Pins the
         # cross-section of the episode-only surface and the Episodes
-        # button placement.
+        # button placement. Facts is hidden because extracted_count
+        # and migration_count both default to zero in _stats().
         stats = _stats(episode_count=4)
         _, kb = memory_command._build_dashboard(stats)
         assert kb is not None
@@ -1027,23 +1037,139 @@ class TestDashboardEpisodesButton:
         assert labels == ["Episodes (4)", "Search", "Stats"]
 
     def test_dashboard_with_episodes_footer_wording(self):
-        # Footer when Episodes is rendered: enumerates every
-        # utility-row affordance. Pins against the pre-#410 wording
-        # which would lie by enumerating only Search and Stats.
+        # Footer when Episodes is rendered (and Facts is not):
+        # enumerates every utility-row affordance. Pins against the
+        # pre-#410 wording which would lie by enumerating only
+        # Search and Stats. Episode-only fixture; extracted and
+        # migration both default to zero so Facts stays hidden.
         stats = _stats(episode_count=4)
         text, _ = memory_command._build_dashboard(stats)
         assert "Tap Episodes to browse, Search to find specific memories, or Stats for details." in text
 
-    def test_dashboard_no_episodes_footer_wording(self):
-        # Footer when no Episodes button renders: matches the
-        # pre-#410 wording. Pins the migration-only operator's
-        # surface.
+    def test_dashboard_facts_only_footer_wording(self):
+        # Migration-only operator hits the facts-only footer branch
+        # (extracted=0, episode=0, migration=25), so Facts is the
+        # only browse button visible. Renamed from
+        # `test_dashboard_no_episodes_footer_wording` because the
+        # scenario now produces a Facts button rather than the
+        # pre-#410 no-browse-button wording. Negative regression on
+        # "Tap Episodes" stays valid: Episodes really is hidden here.
         stats = _stats(migration_count=25)
         text, _ = memory_command._build_dashboard(stats)
-        assert "Use Search to find specific memories, or tap Stats for details." in text
+        assert "Tap Facts to browse, Search to find specific memories, or Stats for details." in text
         # Negative regression: the Episodes branch wording must NOT
         # appear when no Episodes button is rendered.
         assert "Tap Episodes to browse" not in text
+
+
+class TestDashboardFactsButton:
+    """Facts (N) button on the dashboard utility row.
+
+    Conditional on `stats.extracted_count + stats.migration_count > 0`.
+    The label sums extracted and migration; the headline keeps them
+    split (extracted as "facts", migration as "imported"). Order on
+    the utility row, when both Facts and Episodes are visible, is
+    Facts first (left), then Episodes, then Search, then Stats.
+
+    The empty-state guard at the top of `_build_dashboard` returns
+    early when all three source counts are zero, so the
+    no-browse-buttons footer wording is unreachable production code
+    and is intentionally not pinned by a test."""
+
+    def test_dashboard_renders_facts_button_when_extracted_or_migration_nonzero(self):
+        # Facts label sums extracted (10) and migration (2). Episode
+        # count is zero so this is the facts-only row shape.
+        stats = _stats(extracted_count=10, migration_count=2)
+        _, kb = memory_command._build_dashboard(stats)
+        assert kb is not None
+        utility_row = kb.inline_keyboard[-1]
+        labels = [btn.text for btn in utility_row]
+        assert labels == ["Facts (12)", "Search", "Stats"]
+        # Callback shape: mem:facts:<page>; initial page is 0.
+        facts_btn = utility_row[0]
+        assert facts_btn.callback_data == "mem:facts:0"
+
+    def test_dashboard_facts_button_label_sums_extracted_and_migration(self):
+        # Explicit sum check on a fixture where both contributions
+        # are non-zero. Pins the sum semantics so a regression that
+        # uses only one of the two counts trips this assertion.
+        stats = _stats(extracted_count=7, migration_count=18)
+        _, kb = memory_command._build_dashboard(stats)
+        assert kb is not None
+        utility_row = kb.inline_keyboard[-1]
+        labels = [btn.text for btn in utility_row]
+        assert "Facts (25)" in labels
+
+    def test_dashboard_omits_facts_button_when_extracted_and_migration_both_zero(self):
+        # Episode-only operator: facts_visible is false, so the row
+        # should be [Episodes, Search, Stats] with no Facts button.
+        # Pins the negative case so a future regression that always
+        # emits Facts trips here.
+        stats = _stats(episode_count=4)
+        _, kb = memory_command._build_dashboard(stats)
+        assert kb is not None
+        utility_row = kb.inline_keyboard[-1]
+        labels = [btn.text for btn in utility_row]
+        assert labels == ["Episodes (4)", "Search", "Stats"]
+        assert not any(label.startswith("Facts ") for label in labels)
+
+    def test_dashboard_facts_only_user_renders_facts_button(self):
+        # Migration-only operator: the row is exactly [Facts, Search,
+        # Stats] (no Episodes). Tests the migration-only case and the
+        # facts-only row shape together.
+        stats = _stats(migration_count=25)
+        _, kb = memory_command._build_dashboard(stats)
+        assert kb is not None
+        utility_row = kb.inline_keyboard[-1]
+        labels = [btn.text for btn in utility_row]
+        assert labels == ["Facts (25)", "Search", "Stats"]
+
+    def test_dashboard_both_browse_buttons_renders_facts_first(self):
+        # Both browse buttons visible: Facts must come first
+        # (left-most), then Episodes, then Search, then Stats. Pins
+        # the placement so a regression that swaps the two browse
+        # buttons trips here.
+        stats = _stats(extracted_count=10, migration_count=2, episode_count=4)
+        _, kb = memory_command._build_dashboard(stats)
+        assert kb is not None
+        utility_row = kb.inline_keyboard[-1]
+        labels = [btn.text for btn in utility_row]
+        assert labels == ["Facts (12)", "Episodes (4)", "Search", "Stats"]
+
+    def test_dashboard_footer_both_browse_wording(self):
+        # When both Facts and Episodes render, the footer enumerates
+        # both browse buttons. Pins the new "Tap Facts or Episodes"
+        # phrasing so a regression to either single-button branch
+        # trips this assertion.
+        stats = _stats(extracted_count=10, episode_count=4)
+        text, _ = memory_command._build_dashboard(stats)
+        assert "Tap Facts or Episodes to browse, Search to find specific memories, or Stats for details." in text
+
+    def test_dashboard_footer_facts_only_wording(self):
+        # When Facts renders but Episodes does not, footer says
+        # "Tap Facts to browse..." (without Episodes). Migration-
+        # only fixture; the cross-test of the facts-only footer
+        # also lives in TestDashboardEpisodesButton's renamed
+        # `test_dashboard_facts_only_footer_wording` for historical
+        # continuity. Both pin the same branch from different angles.
+        stats = _stats(extracted_count=15)
+        text, _ = memory_command._build_dashboard(stats)
+        assert "Tap Facts to browse, Search to find specific memories, or Stats for details." in text
+        # Negative regression: the both-buttons phrasing must NOT
+        # leak in when only Facts is visible.
+        assert "Tap Facts or Episodes" not in text
+
+    def test_dashboard_footer_episodes_only_wording_unchanged(self):
+        # When Episodes renders but Facts does not, footer keeps the
+        # existing post-410 wording verbatim. Pins the unchanged
+        # branch so a sloppy refactor of the four-branch matrix
+        # cannot silently rewrite the episodes-only message.
+        stats = _stats(episode_count=4)
+        text, _ = memory_command._build_dashboard(stats)
+        assert "Tap Episodes to browse, Search to find specific memories, or Stats for details." in text
+        # Negative regression: Facts-related wording must not leak
+        # into the episodes-only branch.
+        assert "Tap Facts" not in text
 
 
 class TestBuildEpisodeListView:
@@ -1146,6 +1272,141 @@ class TestBuildEpisodeListView:
         assert text.startswith("Episodes  (page 1 of 1)")
 
 
+class TestBuildFactsListView:
+    """Paginated list view of fact-bucket rows (extracted + migration).
+
+    The list surface is intentionally source-agnostic: rows from both
+    sources render with the same shape (`N. <text>` + indented date),
+    no bracket field, no source label. The per-source distinction
+    surfaces only on the fact-view detail screen, which inherits the
+    issue #407 per-source rendering."""
+
+    def _row(
+        self,
+        fact_id: str,
+        text: str,
+        source: str = "extracted",
+        *,
+        created_at: str = "2026-04-29T10:00:00",
+        updated_at: str | None = None,
+    ) -> MemoryResult:
+        return MemoryResult(
+            id=fact_id,
+            text=text,
+            score=0.0,
+            memory_type="fact",
+            metadata={"source": source, "type": "fact"},
+            created_at=created_at,
+            updated_at=updated_at if updated_at is not None else created_at,
+        )
+
+    def test_renders_extracted_and_migration_rows_indistinguishably(self):
+        # Mixed list: one extracted row, one migration row. The list
+        # view must not surface any source distinction in the rendered
+        # text or in any per-row affordance. The fact-view detail
+        # screen handles the per-source rendering separately.
+        rows = [
+            self._row("e1", "Extracted one", source="extracted"),
+            self._row("m1", "Migration one", source="migration"),
+        ]
+        text, _kb, ids, _, _ = memory_command._build_facts_list_view(rows, 0)
+        # No source labels, no bracket fields.
+        assert "[extracted]" not in text
+        assert "[migration]" not in text
+        assert "Imported" not in text
+        assert "Fact:" not in text
+        # Both rows present, in input order (caller pre-sorts).
+        assert "1.  Extracted one" in text
+        assert "2.  Migration one" in text
+        assert ids == ["e1", "m1"]
+
+    def test_paginates(self):
+        # 12 rows at page-size 5 -> page 1: 5, page 2: 5, page 3: 2.
+        rows = [self._row(f"f{i}", f"Fact {i}") for i in range(12)]
+        # Page 1 (index 0).
+        _, kb, ids, page, total = memory_command._build_facts_list_view(rows, 0)
+        assert len(ids) == 5
+        assert page == 0
+        assert total == 3
+        nav_labels = [btn.text for btn in kb.inline_keyboard[-1]]
+        assert nav_labels == ["back", "next >"]
+        # Page 2 (middle).
+        _, kb, ids, page, total = memory_command._build_facts_list_view(rows, 1)
+        assert len(ids) == 5
+        assert page == 1
+        nav_labels = [btn.text for btn in kb.inline_keyboard[-1]]
+        assert nav_labels == ["< prev", "back", "next >"]
+        # Page 3 (partial last).
+        _, kb, ids, page, total = memory_command._build_facts_list_view(rows, 2)
+        assert len(ids) == 2
+        assert page == 2
+        nav_labels = [btn.text for btn in kb.inline_keyboard[-1]]
+        assert nav_labels == ["< prev", "back"]
+
+    def test_empty_state(self):
+        text, kb, ids, page, total = memory_command._build_facts_list_view([], 0)
+        assert text == "Facts\n\nNo facts yet."
+        assert ids == []
+        assert page == 0
+        assert total == 1
+        # Single back button on the keyboard.
+        assert len(kb.inline_keyboard) == 1
+        assert kb.inline_keyboard[0][0].text == "back"
+        # Back goes to dashboard, not to a stale facts page.
+        assert kb.inline_keyboard[0][0].callback_data == "mem:dash"
+
+    def test_truncates_long_text(self):
+        long_text = "x" * 200
+        rows = [self._row("f1", long_text)]
+        text, _, _, _, _ = memory_command._build_facts_list_view(rows, 0)
+        assert long_text not in text
+        assert "…" in text
+
+    def test_header_uses_two_space_separator(self):
+        # Header label and parenthetical are separated by exactly
+        # two spaces, matching the episode header convention. Pin
+        # so a single-space regression trips this test.
+        rows = [self._row("f1", "Just one")]
+        text, _, _, _, _ = memory_command._build_facts_list_view(rows, 0)
+        assert text.startswith("Facts  (page 1 of 1)")
+
+    def test_date_indent_four_spaces(self):
+        # Date line is indented exactly four spaces, lining up under
+        # the start of the fact text after the "N.  " prefix. Pin
+        # the indent so a regression to twelve spaces (the episode
+        # list's indent) trips this test.
+        rows = [self._row("f1", "Some fact", created_at="2026-04-30T10:00:00")]
+        text, _, _, _, _ = memory_command._build_facts_list_view(rows, 0)
+        # The date line is the second non-blank content line.
+        date_line = next(line for line in text.split("\n") if line.lstrip().startswith("2026-04-30"))
+        assert date_line == "    2026-04-30"
+
+    def test_number_buttons_use_fact_verb(self):
+        # Number buttons share the `fact` verb with the episode list.
+        # The fact-detail open is source-agnostic (cache.memory_ids
+        # at integer index); the list-screen sentinel determines the
+        # back-target, not the number-button verb.
+        rows = [self._row(f"f{i}", f"Fact {i}") for i in range(3)]
+        _, kb, _, _, _ = memory_command._build_facts_list_view(rows, 0)
+        number_row = kb.inline_keyboard[0]
+        assert [btn.text for btn in number_row] == ["1", "2", "3"]
+        for i, btn in enumerate(number_row):
+            assert btn.callback_data == f"mem:fact:{i}"
+
+    def test_nav_buttons_use_facts_verb(self):
+        # Prev and next buttons must encode `mem:facts:<page>`, not
+        # `mem:eps:<page>`. Pin the verb so a copy-paste regression
+        # from the episode list trips here.
+        rows = [self._row(f"f{i}", f"Fact {i}") for i in range(12)]
+        # Middle page so both prev and next render.
+        _, kb, _, _, _ = memory_command._build_facts_list_view(rows, 1)
+        nav_row = kb.inline_keyboard[-1]
+        prev_btn = next(btn for btn in nav_row if btn.text == "< prev")
+        next_btn = next(btn for btn in nav_row if btn.text == "next >")
+        assert prev_btn.callback_data == "mem:facts:0"
+        assert next_btn.callback_data == "mem:facts:2"
+
+
 class TestEpsCallbackDispatch:
     """Issue #410: handle_memory_callback `eps` verb dispatch."""
 
@@ -1229,6 +1490,179 @@ class TestFactViewEpisodeReturn:
         back_btn = kb.inline_keyboard[0][0]
         assert back_btn.text == "back"
         assert back_btn.callback_data == "mem:eps:2"
+
+
+class TestFactsCallbackDispatch:
+    """handle_memory_callback `facts` verb dispatch.
+
+    Mirrors `TestEpsCallbackDispatch`: the `facts` verb is the
+    initial entry point for the facts list browser, with a single
+    integer page argument."""
+
+    @pytest.mark.asyncio
+    async def test_facts_verb_dispatches_to_send_facts_list(self, monkeypatch, update_factory, context_factory):
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        captured: dict[str, Any] = {}
+
+        async def fake_send(update, context, chat_id, page, edit=False):
+            captured["chat_id"] = chat_id
+            captured["page"] = page
+            captured["edit"] = edit
+
+        monkeypatch.setattr(memory_command, "_send_facts_list", fake_send)
+        upd = update_factory(callback_data="mem:facts:0")
+        ctx = context_factory()
+        await memory_command.handle_memory_callback(upd, ctx)
+        assert captured["chat_id"] == 100
+        assert captured["page"] == 0
+        assert captured["edit"] is True
+
+    @pytest.mark.asyncio
+    async def test_facts_verb_invalid_page_falls_back_to_zero(self, monkeypatch, update_factory, context_factory):
+        # Stale or crafted callback with a non-integer page must
+        # not crash; the dispatch falls back to page 0. Same
+        # contract as `eps`.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        captured: dict[str, Any] = {}
+
+        async def fake_send(update, context, chat_id, page, edit=False):
+            captured["page"] = page
+
+        monkeypatch.setattr(memory_command, "_send_facts_list", fake_send)
+        upd = update_factory(callback_data="mem:facts:notaninteger")
+        ctx = context_factory()
+        await memory_command.handle_memory_callback(upd, ctx)
+        assert captured["page"] == 0
+
+
+class TestFactViewFactsReturn:
+    """Back-navigation from a fact opened from the facts list returns
+    to the same page of that list. Mirrors `TestFactViewEpisodeReturn`
+    using the new `"facts"` cache sentinel."""
+
+    @pytest.mark.asyncio
+    async def test_fact_view_back_returns_to_facts_list(self, monkeypatch, update_factory, context_factory):
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+
+        # Prime the cache as if the user is on page 2 of the facts
+        # list.
+        memory_command._set_cache(
+            100,
+            memory_command._ScreenCache(
+                screen="facts",
+                page=2,
+                memory_ids=["f1"],
+            ),
+        )
+
+        # Stub get_by_id to return an extracted-shaped row so the
+        # fact view renders. The source value here is irrelevant to
+        # the back-target wiring; the cache sentinel is what
+        # determines the back-target.
+        fact = MemoryResult(
+            id="f1",
+            text="Some fact",
+            score=0.0,
+            memory_type="fact",
+            metadata={"source": "extracted", "tags": ["preference"]},
+            created_at="2026-04-29T10:00:00",
+            updated_at="2026-04-29T10:00:00",
+        )
+        monkeypatch.setattr(memory_command.memory, "get_by_id", lambda *, user_id, memory_id: fact)
+
+        upd = update_factory(callback_data="mem:fact:0")
+        ctx = context_factory()
+        await memory_command.handle_memory_callback(upd, ctx)
+
+        # The fact view's edit_message_text was called with a
+        # keyboard whose back button targets the facts list at page
+        # 2 (mem:facts:2). Distinct from the existing eps target.
+        edit_call = upd.callback_query.edit_message_text.call_args
+        assert edit_call is not None
+        kb = edit_call.kwargs["reply_markup"]
+        back_btn = kb.inline_keyboard[0][0]
+        assert back_btn.text == "back"
+        assert back_btn.callback_data == "mem:facts:2"
+
+
+class TestForgetFactReturnFacts:
+    """Post-delete return-to wiring for facts opened from the facts
+    list. Mirrors the existing eps-branch behavior on `ffd`."""
+
+    @pytest.mark.asyncio
+    async def test_forget_fact_from_facts_list_returns_to_facts_list(
+        self, monkeypatch, update_factory, context_factory
+    ):
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        # Mock the delete to succeed so the post-delete branch fires.
+        monkeypatch.setattr(memory_command.memory, "delete_by_id", lambda *, user_id, memory_id: True)
+
+        # Capture the post-delete dispatch by stubbing
+        # _send_facts_list. The branch should call this rather than
+        # _send_dashboard.
+        captured: dict[str, Any] = {}
+
+        async def fake_send_facts(update, context, chat_id, page, edit=False):
+            captured["facts_called"] = True
+            captured["page"] = page
+
+        async def fake_send_dashboard(update, context, chat_id, edit=False):
+            captured["dashboard_called"] = True
+
+        monkeypatch.setattr(memory_command, "_send_facts_list", fake_send_facts)
+        monkeypatch.setattr(memory_command, "_send_dashboard", fake_send_dashboard)
+
+        # Prime the cache as if the user is on the fact-detail view
+        # for a fact opened from page 1 of the facts list.
+        memory_command._set_cache(
+            100,
+            memory_command._ScreenCache(
+                screen="fact",
+                memory_ids=["f1"],
+                return_to=("facts", ["1"]),
+            ),
+        )
+
+        upd = update_factory(callback_data="mem:ffd")
+        ctx = context_factory()
+        await memory_command.handle_memory_callback(upd, ctx)
+
+        # _send_facts_list must have been called with page 1, and
+        # the dashboard fallback must NOT have been invoked.
+        assert captured.get("facts_called") is True
+        assert captured["page"] == 1
+        assert captured.get("dashboard_called") is not True
+
+    @pytest.mark.asyncio
+    async def test_forget_fact_from_facts_list_invalid_page_falls_back_to_zero(
+        self, monkeypatch, update_factory, context_factory
+    ):
+        # Defensive parsing: a malformed return_to page (e.g., from
+        # a corrupted in-memory cache) must not crash; it falls back
+        # to page 0. Same contract as the eps branch.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        monkeypatch.setattr(memory_command.memory, "delete_by_id", lambda *, user_id, memory_id: True)
+
+        captured: dict[str, Any] = {}
+
+        async def fake_send_facts(update, context, chat_id, page, edit=False):
+            captured["page"] = page
+
+        monkeypatch.setattr(memory_command, "_send_facts_list", fake_send_facts)
+
+        memory_command._set_cache(
+            100,
+            memory_command._ScreenCache(
+                screen="fact",
+                memory_ids=["f1"],
+                return_to=("facts", ["notaninteger"]),
+            ),
+        )
+
+        upd = update_factory(callback_data="mem:ffd")
+        ctx = context_factory()
+        await memory_command.handle_memory_callback(upd, ctx)
+        assert captured["page"] == 0
 
 
 class TestHelpTextSummaryLine:
