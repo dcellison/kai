@@ -288,6 +288,14 @@ class TestCheckSubcommand:
                 # would let the test pass against a 401 (which the
                 # caller would then mis-classify).
                 assert secret == "test-secret", f"expected secret to be threaded; got {secret!r}"
+                # URL must NOT carry an explicit chat_id. The
+                # webhook handler resolves chat_id BEFORE the
+                # is_enabled() branch and rejects any explicit
+                # value not in allowed_user_ids with a 403; an
+                # earlier version of this harness passed chat_id=1
+                # and silently 403'd against production. Pinning
+                # the absence here closes the regression.
+                assert "chat_id" not in url, f"stats URL must not carry a chat_id parameter; got {url!r}"
                 return 503, b'{"error": "memory disabled"}'
             raise AssertionError(f"unexpected url: {url}")
 
@@ -321,6 +329,10 @@ class TestCheckSubcommand:
                 # silently accept), masking the regression. Pinned
                 # symmetrically across all stats-touching mocks.
                 assert secret == "test-secret", f"expected secret to be threaded; got {secret!r}"
+                # URL must NOT carry an explicit chat_id (see the
+                # disabled-test comment for the 403-against-prod
+                # rationale).
+                assert "chat_id" not in url, f"stats URL must not carry a chat_id parameter; got {url!r}"
                 return 200, b'{"total_count": 42}'
             raise AssertionError(f"unexpected url: {url}")
 
@@ -354,6 +366,10 @@ class TestCheckSubcommand:
                 # and enabled tests; pinned symmetrically across
                 # all stats-touching mocks.
                 assert secret == "test-secret", f"expected secret to be threaded; got {secret!r}"
+                # URL must NOT carry an explicit chat_id (see the
+                # disabled-test comment for the 403-against-prod
+                # rationale).
+                assert "chat_id" not in url, f"stats URL must not carry a chat_id parameter; got {url!r}"
                 return 401, b'{"error": "unauthorized"}'
             raise AssertionError(f"unexpected url: {url}")
 

@@ -62,7 +62,6 @@ import re
 import sys
 import tempfile
 import urllib.error
-import urllib.parse
 import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -639,12 +638,18 @@ def _run_check() -> int:
     print("health: ok")
 
     # Stats probe: 200 = enabled, 503 = disabled, anything else =
-    # unexpected. Use the operator-default chat_id from the running
-    # service config; we do not need a real chat_id here since the
-    # auth check fires before the body validation. Pass chat_id=1
-    # as a placeholder (any int the service accepts works; the
-    # 401-before-body order means the value is not exercised).
-    stats_url = f"{base_url}/api/memory/stats?" + urllib.parse.urlencode({"chat_id": _FIXTURE_CHAT_ID})
+    # unexpected. Issue the request with NO `chat_id` query
+    # parameter so the server falls back to its app-default
+    # (`request.app["chat_id"]` at webhook.py's _resolve_chat_id).
+    # Earlier versions of this harness passed `chat_id=1` as a
+    # placeholder, which fails: _resolve_chat_id runs after secret
+    # auth but before the memory.is_enabled() branch, and rejects
+    # any explicit chat_id not in `allowed_user_ids` with a 403.
+    # The mode probe needs the enabled/disabled signal, not any
+    # particular user's stats, so omitting the parameter routes
+    # cleanly through the app-default and reports the system-wide
+    # memory state.
+    stats_url = f"{base_url}/api/memory/stats"
     stats_status, _ = _http_get(stats_url, secret=secret)
 
     ext_v, ep_v = _read_prompt_versions()
