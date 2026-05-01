@@ -43,10 +43,13 @@ _TEST_CONFIG = Config(
 #
 # Stored as the raw hexdigest; the JSON report emitted by the
 # harness CLI prefixes the same value with "sha256:" via the
-# `_hash()` helper. An operator cross-checking a report's
-# `v5_prompt_hash` against this constant should strip the
-# prefix from the report value (or compare report value to
-# `f"sha256:{_V5_PROMPT_HASH}"`).
+# `_hash()` helper. An operator cross-checking the report's
+# `baseline_prompt_hash` (output schema v2) against this constant
+# should strip the prefix from the report value (or compare report
+# value to `f"sha256:{_V5_PROMPT_HASH}"`). The v1 schema's
+# `v5_prompt_hash` key was renamed to `baseline_prompt_hash` at
+# #428 landing; downstream tools should branch on the report's
+# top-level `version` field.
 _V5_PROMPT_HASH = "764f249d2556a6e00489ac7ba5eac265f4a4d09f27d21dc76f612b84f0874c13"
 
 # Hash of `_PROMPT_V6_PINNED` captured at #428 landing (the v6

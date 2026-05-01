@@ -2742,15 +2742,19 @@ class TestValidateEpisodeWorkflowRegex:
     def test_arm1_evaluate_review_audit(self):
         """Arm 1 maps Evaluate/Review/Audit verbs to the `review`
         arm label. Sanitized artifact identifiers throughout (`#0`,
-        `foo`) so the test data carries no real spec/PR numbers."""
+        `foo`) so the test data carries no real spec/PR numbers.
+        The validator returns `(None, reason)` on reject; the reason
+        string is pinned because operators triage by reason in the
+        memory.episode log line."""
         positives = [
             "Evaluate v3 spec for issue #0",
             "Review the v2 PR for component foo",
             "Audit specification bar against current source",
         ]
         for goal in positives:
-            r = _validate_episode({"goal": goal}, user_id="u-test")
-            assert r is None, f"expected reject: {goal!r}"
+            episode, reason = _validate_episode({"goal": goal}, user_id="u-test")
+            assert episode is None, f"expected reject: {goal!r}"
+            assert reason == "workflow-event regex match", (goal, reason)
 
     def test_arm2_approve(self):
         """Arm 2 maps Approve to the `approve` arm label. The
@@ -2762,8 +2766,9 @@ class TestValidateEpisodeWorkflowRegex:
             "Approve v3 of the foo-bar migration spec",
         ]
         for goal in positives:
-            r = _validate_episode({"goal": goal}, user_id="u-test")
-            assert r is None, f"expected reject: {goal!r}"
+            episode, reason = _validate_episode({"goal": goal}, user_id="u-test")
+            assert episode is None, f"expected reject: {goal!r}"
+            assert reason == "workflow-event regex match", (goal, reason)
 
     def test_arm3_routine_transactions(self):
         """Arm 3 covers File/Push/Draft/Schedule/Post verbs mapped
@@ -2779,8 +2784,9 @@ class TestValidateEpisodeWorkflowRegex:
             "Post a comment on PR #2",
         ]
         for goal in positives:
-            r = _validate_episode({"goal": goal}, user_id="u-test")
-            assert r is None, f"expected reject: {goal!r}"
+            episode, reason = _validate_episode({"goal": goal}, user_id="u-test")
+            assert episode is None, f"expected reject: {goal!r}"
+            assert reason == "workflow-event regex match", (goal, reason)
 
     def test_arm_counter_increments_per_user_per_arm(self):
         """End-to-end: drive each arm once and assert the per-user,
@@ -2788,6 +2794,9 @@ class TestValidateEpisodeWorkflowRegex:
         is the load-bearing artifact for eval-harness assertions and
         operator dashboards; without it, the harness cannot tell which
         workflow shape is hitting the backstop."""
+        # Return values discarded; the counter side-effect is what
+        # this test verifies. Each call must hit a distinct arm so
+        # the per-arm counts are unambiguous.
         _validate_episode({"goal": "Evaluate spec foo"}, user_id="u1")
         _validate_episode({"goal": "Approve PR #0"}, user_id="u1")
         _validate_episode({"goal": "File a GitHub issue for bar"}, user_id="u1")
@@ -2803,7 +2812,10 @@ class TestValidateEpisodeWorkflowRegex:
         are the load-bearing negatives. A regression that broadens
         the regex to catch substantive content trips here first.
         Pulled from the snapshot's 13 durable episodes (the inverse
-        of the 29-ID hygiene-sweep deletion list)."""
+        of the 29-ID hygiene-sweep deletion list).
+
+        Pass shape: `(episode_dict, None)` - the episode passes
+        through unchanged with no reason."""
         negatives = [
             "Update wiki documentation to match the current bot command surface",
             "Determine the correct cadence for surfacing the memory_enabled flag",
@@ -2816,8 +2828,25 @@ class TestValidateEpisodeWorkflowRegex:
             "Establish that budget framing has no place in the claude backend",
         ]
         for goal in negatives:
-            r = _validate_episode({"goal": goal}, user_id="u-test")
-            assert r is not None, f"expected pass: {goal!r}"
+            payload = {"goal": goal}
+            episode, reason = _validate_episode(payload, user_id="u-test")
+            assert episode is payload, f"expected pass-through: {goal!r}"
+            assert reason is None, (goal, reason)
+
+    def test_non_string_goal_rejected_with_distinct_reason(self):
+        """Defensive guard: a non-string `goal` rejects with reason
+        `"non-string goal"`, distinguishable from the workflow-regex
+        reject path. Counter does NOT increment because the workflow-
+        shape arms have not classified the payload; the rejection is
+        visible only through the log line and the explicit reason
+        string."""
+        for non_string in (None, 42, ["list-shaped goal"]):
+            episode, reason = _validate_episode({"goal": non_string}, user_id="u-test")
+            assert episode is None
+            assert reason == "non-string goal", (non_string, reason)
+        # Counter must reflect zero rejections under any arm because
+        # the non-string path skips the per-arm increment.
+        assert _EPISODE_VALIDATE_REJECTIONS.snapshot() == {}
 
 
 class TestValidateEpisodeIntegration:

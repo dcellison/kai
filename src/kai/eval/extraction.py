@@ -409,8 +409,12 @@ Important constraints:
 
 
 # Output schema version. Bumped when the per_probe or aggregate shape
-# changes in a way that would break a tool reading prior runs.
-_OUTPUT_SCHEMA_VERSION = "1"
+# changes in a way that would break a tool reading prior runs. v2
+# (issue #428) renamed `v5_prompt_hash`/`v6_prompt_hash` to
+# `baseline_prompt_hash`/`active_prompt_hash` because the historical
+# names lied at the new `--baseline v6` default (the field "v5" was
+# carrying a v6 hash).
+_OUTPUT_SCHEMA_VERSION = "2"
 
 
 @dataclass
@@ -560,20 +564,23 @@ async def _run_one_probe(
     config: Config,
     *,
     user_id: str,
-    baseline_prompt: str = _PROMPT_V5_PINNED,
+    baseline_prompt: str = _PROMPT_V6_PINNED,
 ) -> ProbeOutcome:
     """Run both prompt arms against a single probe and classify the
     outcome. Each arm is a sequential subprocess call so the active
     `_RULE_6_REJECTIONS` counter delta can be attributed per-arm.
 
     `baseline_prompt` selects which pinned constant the first arm
-    runs against. The variable names `v5_facts` / `v6_facts` are
-    historical (the original design measured v5 vs active=v6); when
-    `baseline_prompt=_PROMPT_V6_PINNED` the first-arm fields carry
-    v6 facts and the second-arm fields carry v7 (the new active)
-    facts. Operators reading the report should treat the v5/v6
-    labels as "first arm / second arm" and consult the per-run
-    `baseline_choice` field for which baseline was actually selected.
+    runs against. Default tracks the CLI's `--baseline` default
+    (currently `v6`) so direct programmatic callers and ad-hoc test
+    fixtures get the same baseline as the CLI rather than silently
+    regressing to v5. The `v5_facts` / `v6_facts` field names on
+    `ProbeOutcome` are historical (the original design measured v5
+    vs active=v6); when `baseline_prompt=_PROMPT_V6_PINNED` the
+    first-arm fields carry v6 facts and the second-arm fields carry
+    v7 (the new active) facts. Operators reading the report should
+    consult the per-run `baseline_choice` field for which baseline
+    was actually selected.
 
     Never raises: a subprocess crash, JSON parse failure, or any
     other exception inside either arm is caught and reported as an
@@ -850,14 +857,17 @@ async def _run_async(args: argparse.Namespace) -> int:
         "version": _OUTPUT_SCHEMA_VERSION,
         "generated_at": datetime.now(UTC).isoformat(),
         "probe_set_hash": _hash(probe_set_text),
-        # `baseline_choice` is the load-bearing field for distinguishing
-        # a v5-vs-v6 run from a v6-vs-v7 run. The v5_/v6_prompt_hash
-        # keys retain their historical names but report the actual
-        # hashes of whichever pair ran (baseline arm and active arm
-        # respectively).
+        # `baseline_choice` records which pinned constant the baseline
+        # arm ran (`v5` or `v6`); the two hash fields below report the
+        # baseline arm and active arm prompts respectively. Earlier
+        # output-schema-v1 reports carried `v5_prompt_hash` /
+        # `v6_prompt_hash` keys; v2 renamed them because the v5/v6
+        # labels lied at the new `--baseline v6` default. A downstream
+        # tool reading this output should branch on `version` (the
+        # schema version) and choose the matching key set.
         "baseline_choice": args.baseline,
-        "v5_prompt_hash": _hash(baseline_prompt),
-        "v6_prompt_hash": _hash(memory_extraction._EXTRACTION_SYSTEM_PROMPT),
+        "baseline_prompt_hash": _hash(baseline_prompt),
+        "active_prompt_hash": _hash(memory_extraction._EXTRACTION_SYSTEM_PROMPT),
         **aggregate,
         "per_probe": [asdict(o) for o in outcomes],
     }

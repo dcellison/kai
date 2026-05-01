@@ -1194,14 +1194,28 @@ class _PerArmCounter:
 _EPISODE_VALIDATE_REJECTIONS = _PerArmCounter()
 
 
-def _validate_episode(episode: dict, *, user_id: str) -> dict | None:
+def _validate_episode(episode: dict, *, user_id: str) -> tuple[dict | None, str | None]:
     """Final-gate validator for stage-2 episode generator output.
 
-    Returns the episode dict unchanged on accept, or None on reject.
-    Reject path increments a per-user, per-arm counter exposed via
-    `get_extractor_stats()`. The caller (`_generate_episode`) treats
-    None as a reject and emits a `validate_rejected` outcome on the
-    `memory.episode` log line in place of the `stored` outcome.
+    Returns `(episode, None)` on accept, or `(None, reason)` on
+    reject. The reason string is one of:
+
+    - `"workflow-event regex match"`: `goal` started with a workflow-
+      shape verb that `_EPISODE_GOAL_NOISE_RE` matched. The per-user,
+      per-arm counter increments under the matched arm
+      (`review` / `approve` / `transaction`).
+    - `"non-string goal"`: defensive guard. The stage-2 schema
+      enforces `goal` as a string, but a malformed payload (e.g. a
+      schema edit that allowed null) should reject rather than
+      crash inside the regex match call. Counter does NOT increment
+      because the workflow-shape arms have not classified the
+      payload; the rejection is visible through the log emission
+      and the explicit `reason`.
+
+    The caller (`_generate_episode`) maps each reason into the
+    `memory.episode` log line's `reason` field so an operator
+    triaging by reason sees the rejection mode without inspecting
+    the rejected payload.
 
     Defense-in-depth against the prompt at `_EXTRACTION_SYSTEM_PROMPT`
     missing workflow-event-shape episodes. The prompt is the primary
@@ -1209,24 +1223,36 @@ def _validate_episode(episode: dict, *, user_id: str) -> dict | None:
     from the 2026-04-30 hygiene-sweep audit (issue #428).
     """
     goal = episode.get("goal", "")
-    # Defensive type check: stage-2 schema enforces goal as a string,
-    # but a malformed payload (e.g. a stage-2 prompt edit that broke
-    # the schema contract) should reject rather than crash inside
-    # the regex match call. The reject path is the safe direction.
     if not isinstance(goal, str):
-        return None
+        # Schema contract says `goal` is a string; a non-string here
+        # means either a stage-2 prompt edit broke the schema or
+        # Mem0 returned a malformed payload. The reject path is the
+        # safe direction in either case. Counter is intentionally
+        # NOT incremented because the workflow-shape arms have not
+        # classified this payload; the log line is the visibility
+        # signal.
+        log.debug(
+            "_validate_episode: rejecting episode with non-string goal type=%s",
+            type(goal).__name__,
+        )
+        return None, "non-string goal"
     match = _EPISODE_GOAL_NOISE_RE.match(goal)
     if match is None:
-        return episode
+        return episode, None
+    # Direct dict lookup (not `.get`-with-default): every verb
+    # captured by group 1 of `_EPISODE_GOAL_NOISE_RE` is a key in
+    # `_ARM_FOR_VERB` by construction. A future regex edit that adds
+    # a verb without updating the map should fail loud here rather
+    # than silently miscount under an "unknown" sentinel arm.
     verb = (match.group(1) or "").lower()
-    arm = _ARM_FOR_VERB.get(verb, "unknown")
+    arm = _ARM_FOR_VERB[verb]
     _EPISODE_VALIDATE_REJECTIONS.increment(user_id=user_id, arm=arm)
     log.debug(
         "_validate_episode: rejecting workflow-shape episode goal: %r (arm=%s)",
         goal,
         arm,
     )
-    return None
+    return None, "workflow-event regex match"
 
 
 def get_extractor_stats() -> dict[str, dict]:
@@ -1971,14 +1997,17 @@ async def _generate_episode(
                 # `Approve PR`, `File issue`, `Push wiki` shapes that
                 # the v7 EPISODE IGNORE list aims to suppress at the
                 # prompt level. The reject path counts the rejection
-                # per-user-per-arm and emits a `validate_rejected`
-                # outcome on the memory.episode log line so an
-                # operator can see backstop activity without grepping
-                # logs.
-                validated = _validate_episode(episode, user_id=user_id)
+                # per-user-per-arm (when applicable) and emits a
+                # `validate_rejected` outcome on the memory.episode
+                # log line so an operator can see backstop activity
+                # without grepping logs. `_validate_episode` returns
+                # the rejection reason string directly so the
+                # workflow-regex path and the defensive non-string-
+                # goal path are distinguishable in the log line.
+                validated, reject_reason = _validate_episode(episode, user_id=user_id)
                 if validated is None:
                     outcome = "validate_rejected"
-                    reason = "goal matches workflow-event regex"
+                    reason = reject_reason
                 else:
                     episode = validated
                     # Build the metadata dict matching the Sophia
