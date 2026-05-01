@@ -297,6 +297,15 @@ async def _run_verify() -> int:
         # statements are stripped under `python -O` /
         # `PYTHONOPTIMIZE=1`. The bare `RuntimeError` cannot be
         # silently disabled.
+        #
+        # Reentrancy note: this guard also fires on a second call
+        # to `_run_verify` in the same process, because
+        # `_isolated_data_dir`'s lazy `from kai import memory`
+        # leaves the module in `sys.modules` after the first call.
+        # The CLI invokes verify once per process, so this is fine;
+        # a future caller that wants to retry verify in-process
+        # needs a fresh subprocess (or to drop the guard, but the
+        # guard is the only thing preventing the deadlock).
         if "kai.memory" in sys.modules:
             raise RuntimeError(
                 "kai.memory was imported before _run_verify could set "
