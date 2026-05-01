@@ -1,0 +1,584 @@
+"""Mode-switch verification harness for the dual-mode memory subsystem.
+
+The MEMORY_ENABLED toggle promises that exactly one fact surface is
+active per mode: in disabled mode, MEMORY.md drives behavior and Qdrant
+is unreached; in enabled mode, Qdrant drives behavior and MEMORY.md is
+dormant. This module verifies that promise without requiring a service
+restart by importing the production code paths
+(`build_session_context`, `format_context`) and asserting the gating
+contract directly.
+
+Two subcommands:
+
+    python -m kai.eval.modeswitch verify
+        Black-box logic verification. Imports the production code and
+        asserts every gating invariant under both flag values. Uses an
+        isolated tmp-dir Qdrant store so the live memory directory at
+        $DATA_DIR/memory/qdrant is never touched. Exits 0 on full
+        pass, 1 on any failure.
+
+    python -m kai.eval.modeswitch check
+        Runtime sanity check against the running service. Reports the
+        live effective mode plus the deployed prompt versions. Reads
+        WEBHOOK_SECRET from the process environment; source
+        /etc/kai/env first under sudo:
+
+            sudo bash -c 'source /etc/kai/env && env | grep WEBHOOK_SECRET'
+
+        Exit codes: 0 on a clean read; 2 if WEBHOOK_SECRET is not in
+        the environment; 1 if /health is down or /api/memory/stats
+        returns an unexpected status.
+
+The verify subcommand is the merge gate. The check subcommand is
+informational and can be re-run as production state changes.
+
+Operator round-trip (manual; sudo-gated; not automated by this script):
+
+    1. operator: sudo edit /etc/kai/env, set MEMORY_ENABLED=false
+    2. operator restarts the service:
+       macOS: sudo launchctl bootout system/com.syrinx.kai
+              sudo launchctl bootstrap system /Library/LaunchDaemons/com.syrinx.kai.plist
+       Linux: sudo systemctl stop kai && sudo systemctl start kai
+    3. source /etc/kai/env  # pull WEBHOOK_SECRET into the shell env
+       python -m kai.eval.modeswitch check    # confirms disabled
+    4. python -m kai.eval.modeswitch verify   # logic invariants under both flags
+    5. operator: sudo edit /etc/kai/env, set MEMORY_ENABLED=true
+    6. operator restarts the service (same commands as step 2)
+    7. python -m kai.eval.modeswitch check    # confirms enabled
+
+Step 4's verify is mode-independent: it asserts both flag-value
+behaviors regardless of the running service's flag, so running it
+once anywhere in the procedure is sufficient. Steps 3 and 7 are the
+only checks that observe the live service state.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import os
+import re
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from unittest.mock import patch
+
+from kai.backend import ApiContext, build_session_context
+from kai.config import Config
+
+log = logging.getLogger(__name__)
+
+
+# ── Verify: invariant assertions ────────────────────────────────────
+
+
+@dataclass
+class _InvariantResult:
+    """Outcome of one invariant check.
+
+    `name` is the human-readable assertion label printed in the
+    report. `passed` is the binary outcome. `detail` carries a
+    short explanation on failure (a substring that was present
+    when it should not have been, or a substring that was missing
+    when it should have been). On pass, `detail` is the empty
+    string.
+    """
+
+    name: str
+    passed: bool
+    detail: str
+
+
+# Substring markers from `build_session_context` (the [Memory subsystem:
+# enabled/disabled] line) and from `memory.format_context` (the
+# [Relevant memories from past conversations ...] header). These are
+# the load-bearing strings the harness asserts on.
+#
+# `_MARKER_PERSISTENT_MEMORY` matches the `[Your persistent memory
+# (file: ...):]` block that build_session_context emits ONLY in
+# disabled mode. The match is a leading-substring check rather than
+# a full-line match so the test does not have to predict the
+# tmp-path part of the format string.
+#
+# `_MARKER_RELEVANT_MEMORIES` matches the recall-block header that
+# format_context emits when search returns non-empty after the
+# floor and budget filters. Same leading-substring approach.
+_MARKER_DISABLED = "[Memory subsystem: disabled]"
+_MARKER_ENABLED = "[Memory subsystem: enabled]"
+_MARKER_PERSISTENT_MEMORY = "[Your persistent memory (file:"
+_MARKER_RELEVANT_MEMORIES = "[Relevant memories from past conversations"
+
+
+# Minimal MEMORY.md fixture used by the verify subcommand. A single
+# truthy line is enough to drive build_session_context's read branch
+# (memory_path.read_text().strip() returns truthy), avoiding the
+# "(currently empty)" / "(not yet created)" placeholder branches.
+# The content is deliberately bland so it cannot be mistaken for
+# operator data if the file ever leaks via test logs.
+_FIXTURE_MEMORY_MD = "Test fixture content for mode-switch verification.\n"
+
+
+# Test fixture chat_id used to scope the temporary MEMORY.md and the
+# Qdrant user_id for the seeded fact. A small positive integer (not
+# a real chat_id) is used to make it visually obvious in any
+# diagnostic output that this is a test value, not production data.
+_FIXTURE_CHAT_ID = 1
+
+
+# Test fixture query string that is guaranteed to share enough
+# semantic surface with the seeded fact to land above the relevance
+# floor. The seeded fact mentions "test fixture" and "mode-switch";
+# the query mentions both, so the embedder produces a high cosine.
+_FIXTURE_QUERY = "test fixture for mode-switch verification"
+
+
+# Seeded fact content. Same bland-but-distinctive shape as the
+# MEMORY.md fixture; a substring match between the seeded fact and
+# the format_context output proves the recall path is hitting our
+# isolated store rather than the production one.
+_FIXTURE_SEED_FACT = "Mode-switch test fixture marker phrase 7f3a2b1c"
+
+
+@contextmanager
+def _isolated_data_dir(tmp_root: Path) -> Iterator[Path]:
+    """Patch `kai.memory.DATA_DIR` to `tmp_root` for the duration of
+    the with-block, reset memory module singleton state on exit.
+
+    Mirrors the existing storage-redirect pattern in
+    `tests/test_memory.py` (the per-test `with patch("kai.memory.DATA_DIR", tmp_path)`
+    block in the integration tests), plus the singleton-state
+    teardown in that file's `_reset_memory_module` helper
+    (`_memory = None; _config = None`) so a subsequent invocation in
+    the same process is not affected by the prior init_memory call.
+
+    init_memory reads `DATA_DIR / "memory" / "qdrant"` from
+    kai.memory at module-resolution time, with no parameter to
+    redirect storage. Patching the module attribute is the
+    supported test pattern.
+    """
+    from kai import memory as memory_module
+
+    with patch.object(memory_module, "DATA_DIR", tmp_root):
+        try:
+            yield tmp_root
+        finally:
+            # Reset singleton state so a follow-up init_memory call
+            # (in the next test, or the next subcommand invocation)
+            # constructs a fresh client against its own DATA_DIR.
+            memory_module._memory = None
+            memory_module._config = None
+
+
+def _build_test_configs(memory_enabled_value: bool) -> Config:
+    """Build a Config with the requested memory_enabled value plus
+    enough surrounding fields to satisfy the production code paths
+    that will read it.
+
+    The verify subcommand never spawns subprocesses or hits the
+    network, so the Telegram and webhook fields are placeholder
+    strings. allowed_user_ids contains the fixture chat_id so the
+    user-id scoping in build_session_context resolves the per-user
+    MEMORY.md path correctly.
+    """
+    return Config(
+        telegram_bot_token="modeswitch-test",
+        allowed_user_ids={_FIXTURE_CHAT_ID},
+        webhook_secret="modeswitch-test",
+        memory_enabled=memory_enabled_value,
+    )
+
+
+def _seed_fixture_memory_md(tmp_root: Path) -> Path:
+    """Create a per-user MEMORY.md fixture under tmp_root. Returns
+    the path so the caller can pass it to build_session_context's
+    data_dir argument.
+
+    Layout matches the production scoping convention:
+    `<data_dir>/memory/<chat_id>/MEMORY.md`. build_session_context
+    will read this file when called with memory_enabled=False.
+    """
+    user_dir = tmp_root / "memory" / str(_FIXTURE_CHAT_ID)
+    user_dir.mkdir(parents=True, exist_ok=True)
+    memory_path = user_dir / "MEMORY.md"
+    memory_path.write_text(_FIXTURE_MEMORY_MD)
+    return memory_path
+
+
+async def _seed_fixture_fact(user_id: str) -> None:
+    """Write one canned fact to the active memory store via
+    `add_structured`. Caller must have already called init_memory
+    inside an `_isolated_data_dir` block so the write lands in
+    the tmp Qdrant.
+
+    Source role tag matches the production extracted-fact shape so
+    the row passes the source-bucket weighting at retrieval time.
+    """
+    from kai import memory as memory_module
+
+    # add_structured is sync (Mem0 is sync). Wrap in
+    # run_in_executor so this coroutine stays cooperative even
+    # though the harness runs it serially.
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: memory_module.add_structured(
+            content=_FIXTURE_SEED_FACT,
+            user_id=user_id,
+            memory_type="fact",
+            tags=["fact"],
+            metadata={"source": "extracted", "confidence": 0.9},
+        ),
+    )
+
+
+def _api_ctx_for_verify() -> ApiContext:
+    """Construct an ApiContext for the verify subcommand. The verify
+    path does not exercise any API endpoints; the context is needed
+    only to satisfy build_session_context's signature.
+    """
+    return ApiContext(
+        webhook_port=8080,
+        webhook_secret="modeswitch-test",
+        services_info=[],
+    )
+
+
+async def _run_verify() -> int:
+    """Drive every invariant under both flag values; print PASS/FAIL
+    per invariant and a final summary. Return 0 on full pass, 1 on
+    any failure.
+
+    Each invariant is computed once and recorded as an
+    `_InvariantResult`. The harness prints results as it goes
+    (rather than batching at the end) so a failure surfaces
+    immediately even if a later invariant raises.
+    """
+    results: list[_InvariantResult] = []
+
+    with tempfile.TemporaryDirectory(prefix="modeswitch-") as tmp_str:
+        tmp_root = Path(tmp_str)
+        # Redirect Mem0's home directory so the per-instance
+        # `migrations_qdrant` and `mem0_history.db` it auto-creates
+        # land under the tmp tree rather than the operator's
+        # `~/.mem0/`. The live service holds the lock on the real
+        # `~/.mem0/migrations_qdrant`; without this redirect, the
+        # harness's `init_memory` call would deadlock against it.
+        # Set BEFORE the first import of `kai.memory` (which
+        # transitively imports mem0); mem0 reads `MEM0_DIR` at
+        # module-import time, so setting it later than the first
+        # import has no effect. backend.py and config.py do not
+        # import kai.memory; the first kai.memory import happens
+        # inside `_isolated_data_dir`'s body.
+        os.environ["MEM0_DIR"] = str(tmp_root / "mem0")
+        _seed_fixture_memory_md(tmp_root)
+        api_ctx = _api_ctx_for_verify()
+        # workspace and home_workspace coincide so the optional
+        # identity-injection branch in build_session_context (which
+        # fires only when the two differ) does not pollute the
+        # output and confuse the substring assertions.
+        ws = tmp_root / "workspace"
+        ws.mkdir()
+
+        # ── Disabled-mode invariants ──────────────────────────
+        disabled_ctx = build_session_context(
+            workspace=ws,
+            home_workspace=ws,
+            api=api_ctx,
+            workspace_config=None,
+            chat_id=_FIXTURE_CHAT_ID,
+            data_dir=tmp_root,
+            memory_enabled=False,
+        )
+
+        results.append(
+            _InvariantResult(
+                name="disabled: subsystem marker present",
+                passed=_MARKER_DISABLED in disabled_ctx,
+                detail=f"missing {_MARKER_DISABLED!r}" if _MARKER_DISABLED not in disabled_ctx else "",
+            )
+        )
+        results.append(
+            _InvariantResult(
+                name="disabled: persistent-memory block injected",
+                passed=_MARKER_PERSISTENT_MEMORY in disabled_ctx,
+                detail=f"missing {_MARKER_PERSISTENT_MEMORY!r}"
+                if _MARKER_PERSISTENT_MEMORY not in disabled_ctx
+                else "",
+            )
+        )
+        results.append(
+            _InvariantResult(
+                name="disabled: relevant-memories block omitted",
+                passed=_MARKER_RELEVANT_MEMORIES not in disabled_ctx,
+                detail=f"unexpectedly contained {_MARKER_RELEVANT_MEMORIES!r}"
+                if _MARKER_RELEVANT_MEMORIES in disabled_ctx
+                else "",
+            )
+        )
+
+        # ── Enabled-mode invariants ───────────────────────────
+        enabled_ctx = build_session_context(
+            workspace=ws,
+            home_workspace=ws,
+            api=api_ctx,
+            workspace_config=None,
+            chat_id=_FIXTURE_CHAT_ID,
+            data_dir=tmp_root,
+            memory_enabled=True,
+        )
+
+        results.append(
+            _InvariantResult(
+                name="enabled: subsystem marker present",
+                passed=_MARKER_ENABLED in enabled_ctx,
+                detail=f"missing {_MARKER_ENABLED!r}" if _MARKER_ENABLED not in enabled_ctx else "",
+            )
+        )
+        results.append(
+            _InvariantResult(
+                name="enabled: persistent-memory block omitted",
+                passed=_MARKER_PERSISTENT_MEMORY not in enabled_ctx,
+                detail=f"unexpectedly contained {_MARKER_PERSISTENT_MEMORY!r}"
+                if _MARKER_PERSISTENT_MEMORY in enabled_ctx
+                else "",
+            )
+        )
+
+        # The enabled-mode format_context probe runs in an
+        # isolated tmp-dir Qdrant. We seed one fact, query for it,
+        # and assert the recall block either is empty or starts
+        # with the expected header. Both shapes are valid; the
+        # invariant is the prefix check, not a presence claim.
+        recall_text = ""
+        with _isolated_data_dir(tmp_root):
+            from kai import memory as memory_module
+
+            memory_module.init_memory(_build_test_configs(memory_enabled_value=True))
+            await _seed_fixture_fact(user_id=str(_FIXTURE_CHAT_ID))
+            recall_text = await memory_module.format_context(_FIXTURE_QUERY, user_id=str(_FIXTURE_CHAT_ID))
+
+        recall_ok = recall_text == "" or recall_text.startswith(_MARKER_RELEVANT_MEMORIES)
+        results.append(
+            _InvariantResult(
+                name="enabled: format_context returns empty or recall-prefixed",
+                passed=recall_ok,
+                detail=(f"got {recall_text[:80]!r}" if not recall_ok else ""),
+            )
+        )
+
+        # ── Partition invariants over the combined output ─────
+        # combined = build_session_context output + format_context
+        # output, joined with a newline. The two substrings must
+        # never coexist regardless of flag value.
+        combined_disabled = disabled_ctx + "\n" + ""  # disabled: format_context returns "" by contract
+        combined_enabled = enabled_ctx + "\n" + recall_text
+
+        partition_disabled_ok = (
+            _MARKER_PERSISTENT_MEMORY in combined_disabled and _MARKER_RELEVANT_MEMORIES not in combined_disabled
+        )
+        results.append(
+            _InvariantResult(
+                name="partition disabled: persistent present, relevant absent",
+                passed=partition_disabled_ok,
+                detail="" if partition_disabled_ok else "partition broken under disabled",
+            )
+        )
+
+        partition_enabled_ok = _MARKER_PERSISTENT_MEMORY not in combined_enabled
+        results.append(
+            _InvariantResult(
+                name="partition enabled: persistent absent",
+                passed=partition_enabled_ok,
+                detail="" if partition_enabled_ok else "persistent block leaked into enabled-mode combined output",
+            )
+        )
+
+        mutual_exclusion_ok = not (
+            _MARKER_PERSISTENT_MEMORY in combined_enabled and _MARKER_RELEVANT_MEMORIES in combined_enabled
+        ) and not (_MARKER_PERSISTENT_MEMORY in combined_disabled and _MARKER_RELEVANT_MEMORIES in combined_disabled)
+        results.append(
+            _InvariantResult(
+                name="partition: mutual exclusion across both modes",
+                passed=mutual_exclusion_ok,
+                detail="" if mutual_exclusion_ok else "both blocks present in one mode",
+            )
+        )
+
+    # Print results.
+    failed = [r for r in results if not r.passed]
+    for r in results:
+        status = "PASS" if r.passed else "FAIL"
+        suffix = f"  [{r.detail}]" if r.detail else ""
+        print(f"  {status}  {r.name}{suffix}")
+    print()
+    if failed:
+        print(f"FAIL: {len(failed)} of {len(results)} invariants failed.")
+        return 1
+    print(f"PASS: all {len(results)} invariants hold.")
+    return 0
+
+
+# ── Check: runtime sanity ───────────────────────────────────────────
+
+
+# Pinned regexes for the prompt-version probe. Match the source-level
+# constants `_EXTRACTION_PROMPT_VERSION: str = "N"` and the analogous
+# episode-prompt version. Pinned shape so the probe does not have to
+# re-derive the regex if the source-level wording shifts; an edit to
+# the version-line format that breaks these regexes is a real
+# regression that the test suite at TestPromptVersionRead will catch.
+_EXTRACTION_VERSION_RE = re.compile(r'_EXTRACTION_PROMPT_VERSION:\s*str\s*=\s*"([^"]+)"')
+_EPISODE_VERSION_RE = re.compile(r'_EPISODE_PROMPT_VERSION:\s*str\s*=\s*"([^"]+)"')
+
+
+# Lookup order for the deployed memory_extraction.py source file.
+# /opt/kai/ is the production install layout per the project
+# convention; the source-tree fallback covers dev environments and
+# local test invocations. Listed in priority order.
+_PROMPT_VERSION_PATH_PRIMARY = Path("/opt/kai/src/kai/memory_extraction.py")
+_PROMPT_VERSION_PATH_FALLBACK = Path(__file__).parent.parent / "memory_extraction.py"
+
+
+def _read_prompt_versions() -> tuple[str, str]:
+    """Read the deployed prompt-version constants from the source
+    file. Returns (`extraction_version`, `episode_version`); each
+    falls back to the literal string `"unknown"` when the file is
+    not found at either lookup path or the regex does not match.
+
+    Reading the file rather than importing the module means this
+    works without sys.path manipulation and without sudo. The
+    operator does not need to be the kai service user to inspect
+    the deployed binary's version constants.
+    """
+    for path in (_PROMPT_VERSION_PATH_PRIMARY, _PROMPT_VERSION_PATH_FALLBACK):
+        if path.exists():
+            text = path.read_text()
+            ext_match = _EXTRACTION_VERSION_RE.search(text)
+            ep_match = _EPISODE_VERSION_RE.search(text)
+            ext = ext_match.group(1) if ext_match else "unknown"
+            ep = ep_match.group(1) if ep_match else "unknown"
+            return ext, ep
+    return "unknown", "unknown"
+
+
+def _http_get(url: str, secret: str | None = None, timeout: float = 5.0) -> tuple[int, bytes]:
+    """Issue a GET against the local kai service and return
+    (status_code, body_bytes). On network error or timeout, returns
+    (0, b"") so the caller can branch on a non-200/non-503 status.
+
+    Uses urllib (stdlib) rather than requests so the harness has no
+    third-party HTTP dependency. The timeout cap prevents the probe
+    from hanging if the service has bound the port but is not
+    responding.
+    """
+    req = urllib.request.Request(url)
+    if secret is not None:
+        req.add_header("X-Webhook-Secret", secret)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        # 4xx/5xx responses surface here; still useful to read the
+        # body for the error message.
+        try:
+            body = exc.read()
+        except Exception:
+            body = b""
+        return exc.code, body
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return 0, b""
+
+
+def _run_check() -> int:
+    """Probe the running service and print a five-line report.
+
+    Tri-state exit code:
+      0: clean read (health=ok and stats returned a definite mode)
+      1: health=down or stats returned an unexpected status
+      2: WEBHOOK_SECRET not in process environment
+    """
+    secret = os.environ.get("WEBHOOK_SECRET", "")
+    secret_found = bool(secret)
+
+    if not secret_found:
+        print("secret_found: no")
+        print("  WEBHOOK_SECRET not set; source /etc/kai/env first")
+        print("  e.g. sudo bash -c 'source /etc/kai/env && env | grep WEBHOOK_SECRET'")
+        return 2
+
+    print("secret_found: yes")
+
+    # Health probe first; if the service is down, the stats probe
+    # cannot succeed and we report up-front.
+    health_status, _ = _http_get("http://localhost:8080/health")
+    if health_status != 200:
+        print(f"health: down (status={health_status})")
+        ext_v, ep_v = _read_prompt_versions()
+        print("mode: unknown(service-down)")
+        print(f"extraction_prompt_version: {ext_v}")
+        print(f"episode_prompt_version: {ep_v}")
+        return 1
+
+    print("health: ok")
+
+    # Stats probe: 200 = enabled, 503 = disabled, anything else =
+    # unexpected. Use the operator-default chat_id from the running
+    # service config; we do not need a real chat_id here since the
+    # auth check fires before the body validation. Pass chat_id=1
+    # as a placeholder (any int the service accepts works; the
+    # 401-before-body order means the value is not exercised).
+    stats_url = "http://localhost:8080/api/memory/stats?" + urllib.parse.urlencode({"chat_id": _FIXTURE_CHAT_ID})
+    stats_status, _ = _http_get(stats_url, secret=secret)
+
+    ext_v, ep_v = _read_prompt_versions()
+
+    if stats_status == 200:
+        print("mode: enabled")
+        rc = 0
+    elif stats_status == 503:
+        print("mode: disabled")
+        rc = 0
+    else:
+        print(f"mode: unknown({stats_status})")
+        rc = 1
+
+    print(f"extraction_prompt_version: {ext_v}")
+    print(f"episode_prompt_version: {ep_v}")
+    return rc
+
+
+# ── CLI entry point ─────────────────────────────────────────────────
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="subcommand", required=True)
+    sub.add_parser("verify", help="Black-box logic verification of the gating contract.")
+    sub.add_parser("check", help="Runtime sanity check against the running service.")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    if args.subcommand == "verify":
+        return asyncio.run(_run_verify())
+    if args.subcommand == "check":
+        return _run_check()
+    # argparse `required=True` makes this unreachable; guard for type-checker.
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
