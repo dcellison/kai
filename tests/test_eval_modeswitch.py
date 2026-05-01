@@ -205,8 +205,13 @@ class TestCheckSubcommand:
         rc = modeswitch._run_check()
         assert rc == 2
         out = capsys.readouterr().out
+        # Pin all three lines the production code emits on the
+        # missing-secret path. The example-command line is part of
+        # the diagnostic shape; dropping it would leave the operator
+        # without the actionable next step.
         assert "secret_found: no" in out
         assert "WEBHOOK_SECRET not set" in out
+        assert "sudo bash -c 'source /etc/kai/env" in out
 
     def test_check_empty_secret_exits_2_with_distinct_diagnostic(self, monkeypatch, capsys) -> None:
         """WEBHOOK_SECRET exported but set to the empty string:
@@ -224,8 +229,13 @@ class TestCheckSubcommand:
         rc = modeswitch._run_check()
         assert rc == 2
         out = capsys.readouterr().out
+        # Pin all three lines the production code emits on the
+        # empty-secret path. The "a line like" parenthetical is the
+        # actionable hint pointing at the env-file typo shape; the
+        # operator needs it to know what to look for.
         assert "secret_found: empty" in out
         assert "exported but empty" in out
+        assert "a line like" in out
         # The distinct diagnostic must NOT collapse back to the
         # not-set messaging that the operator already ruled out by
         # sourcing the env file.
