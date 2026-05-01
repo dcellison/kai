@@ -311,6 +311,11 @@ class TestCheckSubcommand:
         rc = modeswitch._run_check()
         assert rc == 0
         out = capsys.readouterr().out
+        # Pin every line the production code emits on the enabled
+        # mode path. Same shape as the disabled, health-down, and
+        # unexpected-status test cases.
+        assert "secret_found: yes" in out
+        assert "health: ok" in out
         assert "mode: enabled" in out
         assert "extraction_prompt_version: 7" in out
         assert "episode_prompt_version: 1" in out
