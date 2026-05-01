@@ -138,10 +138,15 @@ _FIXTURE_CHAT_ID = 1
 _FIXTURE_QUERY = "test fixture for mode-switch verification"
 
 
-# Seeded fact content. Same bland-but-distinctive shape as the
-# MEMORY.md fixture; a substring match between the seeded fact and
-# the format_context output proves the recall path is hitting our
-# isolated store rather than the production one.
+# Seeded fact content. The recall-path invariant the harness asserts
+# is the format_context OUTPUT SHAPE (empty string or starts with
+# the recall-block prefix); content is not asserted programmatically.
+# The real isolation guarantee is `_isolated_data_dir`'s `DATA_DIR`
+# patch + the `MEM0_DIR` env redirect at the top of `_run_verify`.
+# This string is deliberately distinctive so that if a future
+# diagnostic wants to scan the recall output for evidence the
+# isolated store is being hit (rather than the production one), the
+# substring is unique enough to find without false positives.
 _FIXTURE_SEED_FACT = "Mode-switch test fixture marker phrase 7f3a2b1c"
 
 

@@ -387,6 +387,67 @@ class TestCheckSubcommand:
         assert "extraction_prompt_version: 7" in out
         assert "episode_prompt_version: 1" in out
 
+    def test_check_webhook_port_non_integer_falls_back_to_8080(self, monkeypatch, capsys) -> None:
+        """WEBHOOK_PORT set to a non-integer string: harness prints a
+        warning, falls back to port 8080, and continues. The fallback
+        is what unblocks the rest of the report; without it, the
+        harness would crash with ValueError on a config typo."""
+        monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
+        monkeypatch.setenv("WEBHOOK_PORT", "not-an-integer")
+
+        captured_urls: list[str] = []
+
+        def _http_with_capture(url, secret=None, timeout=5.0):
+            captured_urls.append(url)
+            if "/health" in url:
+                return 200, b'{"status": "ok"}'
+            if "/api/memory/stats" in url:
+                return 200, b'{"total_count": 0}'
+            raise AssertionError(f"unexpected url: {url}")
+
+        monkeypatch.setattr(modeswitch, "_http_get", _http_with_capture)
+        monkeypatch.setattr(modeswitch, "_read_prompt_versions", lambda: ("7", "1"))
+        rc = modeswitch._run_check()
+        assert rc == 0
+        out = capsys.readouterr().out
+        # The fallback warning is printed before the report shape.
+        assert "WEBHOOK_PORT='not-an-integer' is invalid" in out
+        # Every captured URL must point at port 8080, the documented
+        # fallback. Pinning the URL is what proves the fallback ran.
+        assert all("localhost:8080" in u for u in captured_urls), captured_urls
+
+    def test_check_webhook_port_out_of_range_falls_back_to_8080(self, monkeypatch, capsys) -> None:
+        """WEBHOOK_PORT set to an out-of-range integer (>65535):
+        harness prints a warning naming the range violation, falls
+        back to port 8080, and continues. Without the range guard,
+        the harness would attempt to bind to a port the OS cannot
+        accept and report `health: down (status=0)`, which is the
+        confusing diagnostic the range guard exists to prevent."""
+        monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
+        monkeypatch.setenv("WEBHOOK_PORT", "99999")
+
+        captured_urls: list[str] = []
+
+        def _http_with_capture(url, secret=None, timeout=5.0):
+            captured_urls.append(url)
+            if "/health" in url:
+                return 200, b'{"status": "ok"}'
+            if "/api/memory/stats" in url:
+                return 200, b'{"total_count": 0}'
+            raise AssertionError(f"unexpected url: {url}")
+
+        monkeypatch.setattr(modeswitch, "_http_get", _http_with_capture)
+        monkeypatch.setattr(modeswitch, "_read_prompt_versions", lambda: ("7", "1"))
+        rc = modeswitch._run_check()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "WEBHOOK_PORT='99999' is invalid" in out
+        # The range-violation message names the bad port number so
+        # the operator can correct the env-file value without
+        # reading the source.
+        assert "out of range" in out
+        assert all("localhost:8080" in u for u in captured_urls), captured_urls
+
 
 # ── TestPromptVersionRead ───────────────────────────────────────────
 
