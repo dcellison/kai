@@ -303,6 +303,14 @@ class TestCheckSubcommand:
             if "/health" in url:
                 return 200, b'{"status": "ok"}'
             if "/api/memory/stats" in url:
+                # Same auth-header threading guard as the disabled
+                # test: a regression that drops `secret=secret` at
+                # the stats call site would let the test pass against
+                # an unauthed 200 (which the production code would
+                # never see in real life, but the test should not
+                # silently accept), masking the regression. Pinned
+                # symmetrically across all stats-touching mocks.
+                assert secret == "test-secret", f"expected secret to be threaded; got {secret!r}"
                 return 200, b'{"total_count": 42}'
             raise AssertionError(f"unexpected url: {url}")
 
@@ -332,6 +340,10 @@ class TestCheckSubcommand:
             if "/health" in url:
                 return 200, b'{"status": "ok"}'
             if "/api/memory/stats" in url:
+                # Same auth-header threading guard as the disabled
+                # and enabled tests; pinned symmetrically across
+                # all stats-touching mocks.
+                assert secret == "test-secret", f"expected secret to be threaded; got {secret!r}"
                 return 401, b'{"error": "unauthorized"}'
             raise AssertionError(f"unexpected url: {url}")
 

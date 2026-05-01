@@ -256,9 +256,14 @@ async def _run_verify() -> int:
     any failure.
 
     Each invariant is computed once and recorded as an
-    `_InvariantResult`. The harness prints results as it goes
-    (rather than batching at the end) so a failure surfaces
-    immediately even if a later invariant raises.
+    `_InvariantResult`. Results are batched in a list and printed
+    together after all invariants run (and after the
+    `MEM0_DIR`/singleton-state restoration in the `finally` block).
+    If an exception is raised mid-run, the operator sees the
+    traceback without partial-progress output; the env-state
+    restoration still fires via `finally`. Operators wanting per-
+    invariant streaming should run individual unit tests in
+    `tests/test_eval_modeswitch.py::TestVerifyInvariants` instead.
     """
     results: list[_InvariantResult] = []
 
