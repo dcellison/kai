@@ -391,7 +391,11 @@ class TestCheckSubcommand:
         """WEBHOOK_PORT set to a non-integer string: harness prints a
         warning, falls back to port 8080, and continues. The fallback
         is what unblocks the rest of the report; without it, the
-        harness would crash with ValueError on a config typo."""
+        harness would crash with ValueError on a config typo.
+
+        Mock follows the same auth-secret + chat_id-absence pattern as
+        the three other stats-touching mocks; full output shape pinned
+        per the same pattern as the four mode-reporting tests."""
         monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
         monkeypatch.setenv("WEBHOOK_PORT", "not-an-integer")
 
@@ -402,6 +406,11 @@ class TestCheckSubcommand:
             if "/health" in url:
                 return 200, b'{"status": "ok"}'
             if "/api/memory/stats" in url:
+                # Auth-secret + chat_id-absence guards parallel to
+                # _http_disabled / _http_enabled / _http_unexpected;
+                # see the disabled-test comment for the rationale.
+                assert secret == "test-secret", f"expected secret to be threaded; got {secret!r}"
+                assert "chat_id" not in url, f"stats URL must not carry a chat_id parameter; got {url!r}"
                 return 200, b'{"total_count": 0}'
             raise AssertionError(f"unexpected url: {url}")
 
@@ -415,6 +424,13 @@ class TestCheckSubcommand:
         # Every captured URL must point at port 8080, the documented
         # fallback. Pinning the URL is what proves the fallback ran.
         assert all("localhost:8080" in u for u in captured_urls), captured_urls
+        # Pin the full five-line report shape, parallel to the
+        # other mode-reporting tests in this class.
+        assert "secret_found: yes" in out
+        assert "health: ok" in out
+        assert "mode: enabled" in out
+        assert "extraction_prompt_version: 7" in out
+        assert "episode_prompt_version: 1" in out
 
     def test_check_webhook_port_out_of_range_falls_back_to_8080(self, monkeypatch, capsys) -> None:
         """WEBHOOK_PORT set to an out-of-range integer (>65535):
@@ -422,7 +438,11 @@ class TestCheckSubcommand:
         back to port 8080, and continues. Without the range guard,
         the harness would attempt to bind to a port the OS cannot
         accept and report `health: down (status=0)`, which is the
-        confusing diagnostic the range guard exists to prevent."""
+        confusing diagnostic the range guard exists to prevent.
+
+        Mock follows the same auth-secret + chat_id-absence pattern as
+        the three other stats-touching mocks; full output shape pinned
+        per the same pattern as the four mode-reporting tests."""
         monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
         monkeypatch.setenv("WEBHOOK_PORT", "99999")
 
@@ -433,6 +453,8 @@ class TestCheckSubcommand:
             if "/health" in url:
                 return 200, b'{"status": "ok"}'
             if "/api/memory/stats" in url:
+                assert secret == "test-secret", f"expected secret to be threaded; got {secret!r}"
+                assert "chat_id" not in url, f"stats URL must not carry a chat_id parameter; got {url!r}"
                 return 200, b'{"total_count": 0}'
             raise AssertionError(f"unexpected url: {url}")
 
@@ -447,6 +469,13 @@ class TestCheckSubcommand:
         # reading the source.
         assert "out of range" in out
         assert all("localhost:8080" in u for u in captured_urls), captured_urls
+        # Pin the full five-line report shape, parallel to the
+        # other mode-reporting tests in this class.
+        assert "secret_found: yes" in out
+        assert "health: ok" in out
+        assert "mode: enabled" in out
+        assert "extraction_prompt_version: 7" in out
+        assert "episode_prompt_version: 1" in out
 
 
 # ── TestPromptVersionRead ───────────────────────────────────────────
