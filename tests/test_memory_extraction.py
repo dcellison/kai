@@ -2758,12 +2758,18 @@ class TestValidateEpisodeWorkflowRegex:
 
     def test_arm2_approve(self):
         """Arm 2 maps Approve to the `approve` arm label. The
-        intervening-tokens cap admits multi-word artifact qualifiers
-        ("v3 of the foo-bar migration spec")."""
+        intervening-tokens cap (6 tokens, lazy) lets the regex still
+        find the artifact noun in goals with multi-word qualifiers
+        like "v3 of the foo-bar migration spec". The `version` and
+        `pull request` artifact nouns are exercised here as the
+        only positive coverage of those alternation entries; without
+        these, a future regex edit could silently drop either form."""
         positives = [
             "Approve the v4 specification revision",
             "Approve PR #1",
             "Approve v3 of the foo-bar migration spec",
+            "Approve the new version",
+            "Approve the pull request",
         ]
         for goal in positives:
             episode, reason = _validate_episode({"goal": goal}, user_id="u-test")
