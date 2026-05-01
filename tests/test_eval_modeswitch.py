@@ -1,11 +1,15 @@
 """Tests for the mode-switch verification harness.
 
-Three test classes:
+Test classes:
 
 - TestVerifyInvariants: exercises `build_session_context` directly under
   both flag values; the format_context-dependent invariants are covered
   with a mocked format_context to keep unit tests fast and to avoid Mem0
   Qdrant lock contention with a running production service.
+- TestRecallReasonField: switch-point-6 contract; asserts format_context
+  emits a memory.recall log line with reason='disabled' under disabled
+  mode and any non-'disabled' reason (or no reason field at all on the
+  success path) under enabled mode.
 - TestCheckSubcommand: monkeypatches the `urlopen` shim and the
   `_read_prompt_versions` helper to drive each branch of the tri-state
   exit-code contract.
@@ -15,7 +19,11 @@ Three test classes:
 
 from __future__ import annotations
 
+import ast
+import logging
 from pathlib import Path
+
+import pytest
 
 from kai.eval import modeswitch
 
@@ -178,6 +186,291 @@ class TestVerifyInvariants:
         # Stronger formulation: under enabled mode, persistent block
         # is ALWAYS absent regardless of whether recall fired.
         assert _MARKER_PERSISTENT_MEMORY not in enabled_combined
+
+
+# ── TestRecallReasonField ───────────────────────────────────────────
+
+
+class TestRecallReasonField:
+    """Switch-point-6 contract: format_context emits exactly one
+    `memory.recall` log line per call, and the line's `reason` field
+    distinguishes disabled-mode short-circuits ("disabled") from every
+    other outcome. Eval harnesses parse the `reason` field to bucket
+    log lines by short-circuit category; a regression that emitted
+    "disabled" under enabled mode (or omitted the marker under
+    disabled mode) would silently break those harnesses.
+
+    Mirrors the new `_run_verify` invariants the harness runs at the
+    operator-CLI level. The harness drives format_context against a
+    real tmp-dir Mem0 instance; the tests here use mocking to stay
+    fast and to avoid Mem0 lock contention with a running production
+    service. Both surfaces assert the same contract.
+    """
+
+    @pytest.fixture
+    def reset_memory_module(self):
+        """Save and restore `kai.memory`'s module-level singletons
+        (`_memory`, `_config`) around each test. format_context reads
+        these directly; leaving a prior test's setup live would let
+        configuration leak across tests. The teardown is unconditional
+        so a test that mutates state and then fails does not strand
+        junk for the next test.
+        """
+        from kai import memory as memory_module
+
+        prior_memory = memory_module._memory
+        prior_config = memory_module._config
+        memory_module._memory = None
+        memory_module._config = None
+        try:
+            yield
+        finally:
+            memory_module._memory = prior_memory
+            memory_module._config = prior_config
+
+    @pytest.mark.asyncio
+    async def test_recall_reason_is_disabled_under_disabled_mode(self, reset_memory_module, caplog):
+        """memory_enabled=False: init_memory short-circuits and leaves
+        the singletons unset, so format_context's first guard fires
+        (`if not is_enabled() or _config is None`) and emits a
+        memory.recall line with reason='disabled'. The harness's
+        `_parse_recall_reason` is reused so both surfaces interpret
+        the captured payload via the same code.
+        """
+        from kai import memory as memory_module
+
+        # init_memory's "if not config.memory_enabled: return" guard
+        # is the production entry into the disabled state. The fixture
+        # already cleared the singletons, but invoking init_memory
+        # explicitly mirrors the production-path entry the harness
+        # uses, so a regression that moved the guard inside init_memory
+        # would surface here as a state-mutation bug rather than a
+        # silently passing test.
+        memory_module.init_memory(modeswitch._build_test_configs(memory_enabled_value=False))
+
+        with caplog.at_level(logging.INFO, logger="kai.memory"):
+            result = await memory_module.format_context(
+                "test query",
+                user_id=str(_FIXTURE_CHAT_ID),
+            )
+
+        # format_context returns "" on the disabled short-circuit;
+        # paired with the reason assertion below, this pins both
+        # halves of the contract (return shape + log-line shape).
+        assert result == ""
+        # Assert at least one memory.recall record exists. Without
+        # this, a regression that silenced the disabled-mode log line
+        # entirely would let `_parse_recall_reason` return None,
+        # which the reason equality check below would NOT distinguish
+        # from a simple field-rename regression. The two assertions
+        # together pin presence AND correct content.
+        recall_records = [r for r in caplog.records if r.getMessage().startswith("memory.recall ")]
+        assert recall_records, "expected at least one memory.recall log line"
+        reason = modeswitch._parse_recall_reason(caplog.records)
+        assert reason == memory_module._RECALL_REASON_DISABLED, (
+            f"expected reason={memory_module._RECALL_REASON_DISABLED!r}; got {reason!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_recall_reason_is_not_disabled_under_enabled_mode(self, reset_memory_module, monkeypatch, caplog):
+        """memory_enabled=True with a search hit: format_context goes
+        through the recall path and emits a memory.recall line whose
+        `reason` field is anything OTHER than 'disabled'. On the
+        success path the field is omitted entirely (per
+        `_base_recall_payload`'s docstring: `reason` is only set on
+        short-circuit lines), so `_parse_recall_reason` returns None;
+        on the various non-disabled short-circuits (empty_query,
+        no_results, all_below_floor, budget_exhausted) it returns the
+        corresponding string. Both shapes satisfy the contract.
+
+        The test mocks `kai.memory.search` to return one canned
+        MemoryResult above the relevance floor so the recall path
+        completes without spinning up Mem0. The harness's `verify`
+        subcommand exercises the same contract against a real
+        tmp-dir Mem0 instance; the two surfaces are intentionally
+        complementary (this test is the CI gate; the harness is the
+        operator gate).
+        """
+        from kai import memory as memory_module
+
+        # Stand the singletons up by hand. Setting `_memory` to a
+        # truthy sentinel makes is_enabled() return True; `_config`
+        # supplies the budget and floor that the recall path reads.
+        # Bypassing init_memory avoids the Mem0/sentence-transformers
+        # boot cost (~80MB embedding model on first run); the
+        # production path under verification is format_context, not
+        # init_memory.
+        memory_module._memory = object()
+        memory_module._config = modeswitch._build_test_configs(memory_enabled_value=True)
+
+        canned_result = memory_module.MemoryResult(
+            id="test-fact-1",
+            text="Mode-switch test fixture marker phrase.",
+            score=0.95,
+            memory_type="fact",
+            metadata={"source": "extracted"},
+            created_at="2026-05-01T00:00:00Z",
+        )
+        # Mock the synchronous search() helper. format_context dispatches
+        # search() through `loop.run_in_executor`, so a sync mock is the
+        # correct shape; an async mock would break that wrapping.
+        monkeypatch.setattr(memory_module, "search", lambda query, *, user_id, limit=None: [canned_result])
+
+        with caplog.at_level(logging.INFO, logger="kai.memory"):
+            result = await memory_module.format_context(
+                "test fixture query",
+                user_id=str(_FIXTURE_CHAT_ID),
+            )
+
+        # The recall path should have produced a string starting with
+        # the relevant-memories header (the canned result is above the
+        # floor and within budget). This pins the success-path output
+        # shape; the reason assertion below pins the log-line shape.
+        assert result.startswith(_MARKER_RELEVANT_MEMORIES), f"expected recall-prefixed output; got {result[:80]!r}"
+        recall_records = [r for r in caplog.records if r.getMessage().startswith("memory.recall ")]
+        assert recall_records, "expected at least one memory.recall log line"
+        reason = modeswitch._parse_recall_reason(caplog.records)
+        # Negative assertion: anything OTHER than the disabled marker
+        # is acceptable. Includes None (success-path payload omits
+        # `reason`) and any of the other `_RECALL_REASON_*` constants.
+        assert reason != memory_module._RECALL_REASON_DISABLED, (
+            f"expected reason != {memory_module._RECALL_REASON_DISABLED!r}; got {reason!r}"
+        )
+
+
+# ── TestExtractionCallSiteGating ────────────────────────────────────
+
+
+class TestExtractionCallSiteGating:
+    """Switch-point-5 structural backstop (#434): every call site of
+    `memory_extraction.extract_and_store` in `src/kai/bot.py` must
+    sit inside an enclosing `if memory_is_enabled() ...:` guard.
+
+    The behavioral pair in `test_bot.py::TestHandleResponse`
+    exercises the gate with mocks; this test enforces it at the
+    AST level so a refactor that adds a SECOND call site OUTSIDE
+    the guard fails at CI rather than at runtime under disabled
+    mode. Today there is exactly one call site at
+    `bot.py`'s `_handle_response` post-response path; the test
+    asserts the gating property over every Call node, not just
+    "the one Call we know about."
+
+    Predicate shape note: the production guard is
+    `if memory_is_enabled() and chat_id is not None:`, whose
+    `If.test` is a `BoolOp(op=And(), values=[Call, Compare])`.
+    The Call to memory_is_enabled lives nested inside the
+    BoolOp's values, NOT as the direct `If.test`. The predicate
+    therefore walks `if_node.test` recursively via `ast.walk`
+    rather than comparing `if_node.test` to a Call directly.
+    """
+
+    @staticmethod
+    def _attach_parents(tree: ast.AST) -> None:
+        """Attach a `parent` attribute to every node so ancestor
+        traversal works after `ast.walk`. ast.AST does not declare
+        a `parent` field, so the assignment is silently typed as
+        `Any`; pyright tolerates it under the strict-but-permissive
+        attribute model. This is the standard pattern; the
+        alternative (a side-table dict keyed by id(node)) is more
+        verbose with no semantic gain.
+        """
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                child.parent = parent  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _guard_contains_memory_is_enabled(if_node: ast.If) -> bool:
+        """True iff `if_node.test` contains, somewhere in its
+        expression tree, a `Call` to a name `memory_is_enabled`.
+
+        Recursive-walk via `ast.walk(if_node.test)` so the
+        predicate matches the actual production shape
+        `BoolOp(And, [Call(memory_is_enabled), Compare(...)])` from
+        the `if memory_is_enabled() and chat_id is not None:`
+        guard. A direct-test predicate
+        (`isinstance(if_node.test, ast.Call) and
+        if_node.test.func.id == 'memory_is_enabled'`) would return
+        False on this shape and silently miss the gate.
+        """
+        return any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "memory_is_enabled"
+            for n in ast.walk(if_node.test)
+        )
+
+    def test_every_extract_and_store_call_site_is_inside_is_enabled_guard(self) -> None:
+        """Walk `src/kai/bot.py`'s AST. For every `Call` whose `func`
+        is an `Attribute` with `attr == "extract_and_store"`, confirm
+        that at least one ancestor `If` node has a test containing a
+        `Call` to `memory_is_enabled`. Fail with the offending line
+        number if any call site is unguarded.
+
+        `func` is checked as `Attribute` (e.g.
+        `memory_extraction.extract_and_store(...)`) per the production
+        shape; the test deliberately does NOT match `Name`-shaped
+        calls (`extract_and_store(...)` from a `from
+        kai.memory_extraction import extract_and_store`) because the
+        production code uses the module-qualified form. If a future
+        refactor introduces the `from`-import shape, this test should
+        be extended to cover both forms.
+        """
+        # Resolve the bot.py source path relative to the test file's
+        # location so the test runs cleanly under any working
+        # directory (pytest cwd, IDE runner, CI). `Path(__file__)`
+        # is `tests/test_eval_modeswitch.py`; two levels up is the
+        # repo root, then descend into `src/kai/bot.py`.
+        bot_py = Path(__file__).parent.parent / "src" / "kai" / "bot.py"
+        assert bot_py.exists(), f"expected bot.py at {bot_py}"
+
+        tree = ast.parse(bot_py.read_text())
+        self._attach_parents(tree)
+
+        # `ast.walk(tree)` traverses every node, not just top-level
+        # `Module.body`. The actual extract_and_store call site lives
+        # nested at `_handle_response > if memory_is_enabled() >
+        # async def _ingest_memory > await extract_and_store(...)`,
+        # several layers below the module root, so the deep traversal
+        # is required.
+        call_sites: list[ast.Call] = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "extract_and_store"
+            ):
+                call_sites.append(node)
+
+        # Fail loud if the production code stops invoking
+        # extract_and_store entirely. A regression that removes the
+        # call site would otherwise leave this test passing
+        # vacuously, masking the absence of the production behavior
+        # the test is meant to backstop.
+        assert call_sites, "expected at least one `extract_and_store` call site in bot.py"
+
+        ungated: list[int] = []
+        for call in call_sites:
+            # Walk the parent chain looking for an `If` whose test
+            # contains a Call to memory_is_enabled. The chain ends
+            # at the Module node which has no `parent` attribute;
+            # the loop terminates by hitting that absence.
+            node: ast.AST = call
+            guarded = False
+            while True:
+                parent = getattr(node, "parent", None)
+                if parent is None:
+                    break
+                if isinstance(parent, ast.If) and self._guard_contains_memory_is_enabled(parent):
+                    guarded = True
+                    break
+                node = parent
+            if not guarded:
+                ungated.append(call.lineno)
+
+        assert not ungated, (
+            f"extract_and_store call site(s) at lines {ungated} are NOT inside an "
+            "`if memory_is_enabled() ...` guard. Switch point 5 (#434) requires "
+            "every extract_and_store call to be gated by memory_is_enabled() so "
+            "the disabled mode does not write to Qdrant."
+        )
 
 
 # ── TestCheckSubcommand ─────────────────────────────────────────────

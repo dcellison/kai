@@ -2889,6 +2889,103 @@ class TestHandleResponse:
 
         # If we got here without hanging, the typing task was properly cancelled
 
+    @pytest.mark.asyncio
+    async def test_extraction_skipped_when_memory_disabled(self, monkeypatch):
+        """Switch point 5 (#434): under memory.is_enabled() == False,
+        the post-response ingestion guard short-circuits and
+        extract_and_store is never invoked. The fire-and-forget task
+        is gated, so no _ingest_memory task is even created.
+
+        Pinned regression: a refactor that flips the
+        `if memory_is_enabled() and chat_id is not None:` guard to
+        `if True:` (or removes it entirely) fails this test because
+        extract_and_store would then run under disabled mode and write
+        to Qdrant from a mode that promises never to write.
+        """
+        from kai.bot import _handle_response
+
+        monkeypatch.setattr("kai.memory.is_enabled", lambda: False)
+        extract_mock = AsyncMock()
+        monkeypatch.setattr("kai.memory_extraction.extract_and_store", extract_mock)
+
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Hello world")))
+        # memory_extraction_enabled=True ensures the inner config check
+        # in _ingest_memory does NOT short-circuit before reaching the
+        # extract_and_store call. The OUTER is_enabled() guard is the
+        # contract under test; the inner check would mask its failure
+        # if both were False.
+        config = _make_config(memory_extraction_enabled=True)
+        ctx = _make_context(config=config, pool=pool)
+
+        with patch.multiple("kai.bot", **self._base_patches()):
+            await _handle_response(update, ctx, 12345, "test prompt", pool, "claude-opus")
+
+        # Drain any tasks the call may have spawned. The disabled-path
+        # contract is that NO ingest task is created, so this should
+        # be a no-op; if a regression spawned a task anyway, the
+        # gather lets it run before the assertion, surfacing the bug
+        # as a failed call_count check rather than a timing-flake.
+        new_tasks = asyncio.all_tasks() - {asyncio.current_task()}
+        if new_tasks:
+            await asyncio.gather(*new_tasks, return_exceptions=True)
+
+        extract_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_extraction_invoked_when_memory_enabled(self, monkeypatch):
+        """Switch point 5 (#434): under memory.is_enabled() == True
+        plus a successful response, the post-response ingestion path
+        spawns a background _ingest_memory task that calls
+        extract_and_store exactly once.
+
+        Pinned regression: a refactor that flips the guard to
+        `if False:` (or removes the call site from the closure) fails
+        this test because extract_and_store would not run under
+        enabled mode and the Qdrant fact surface would never receive
+        new extractions.
+
+        The fire-and-forget task is awaited explicitly via
+        `asyncio.gather` over the post-call task set so the assertion
+        does not race the create_task'd coroutine.
+        """
+        from kai.bot import _handle_response
+
+        monkeypatch.setattr("kai.memory.is_enabled", lambda: True)
+        extract_mock = AsyncMock()
+        monkeypatch.setattr("kai.memory_extraction.extract_and_store", extract_mock)
+
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Hello world", session_id="sess-1")))
+        # episode_classifier_context_turns=0 skips the history fetch
+        # inside _ingest_memory (no get_recent_pairs call needed); the
+        # contract under test is the outer gate plus the inner config
+        # branch, neither of which depends on prior_pairs being
+        # non-empty. memory_extraction_enabled=True so the inner gate
+        # passes; agent_backend defaults to "claude" so the backend
+        # check passes too.
+        config = _make_config(
+            memory_extraction_enabled=True,
+            episode_classifier_context_turns=0,
+        )
+        ctx = _make_context(config=config, pool=pool)
+
+        with patch.multiple("kai.bot", **self._base_patches()):
+            await _handle_response(update, ctx, 12345, "test prompt", pool, "claude-opus")
+
+        # Wait for the fire-and-forget _ingest_memory task to run to
+        # completion. asyncio.create_task at the call site schedules
+        # the coroutine onto the event loop; the test's coroutine
+        # cannot assert until the scheduled task has had a chance to
+        # progress past its `await extract_and_store(...)` line.
+        new_tasks = asyncio.all_tasks() - {asyncio.current_task()}
+        if new_tasks:
+            await asyncio.gather(*new_tasks, return_exceptions=True)
+
+        extract_mock.assert_called_once()
+
 
 # ── _notify_if_queued ────────────────────────────────────────────────
 

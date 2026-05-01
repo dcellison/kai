@@ -2384,6 +2384,35 @@ class TestCallbackDispatch:
         toast = upd.callback_query.answer.call_args.args[0]
         assert toast == memory_command._MSG_QUERY_FAILED
 
+    @pytest.mark.asyncio
+    async def test_callback_disabled_short_circuits(self, monkeypatch, update_factory, context_factory):
+        """Switch point 4 (#434): when memory is disabled, the
+        callback handler's `if not memory.is_enabled():` early return
+        fires and the user gets the _MSG_DISABLED toast WITHOUT any
+        edit_message_text dispatch. Mirrors
+        `TestCommandDispatch::test_memory_disabled_short_circuits`
+        which covers the same contract on the slash-command side;
+        without this test, a regression that removed the callback
+        handler's early return would let the dashboard re-render fire
+        under disabled mode and confuse a user who just ran a
+        forget-flow on a now-disabled install.
+        """
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: False)
+        upd = update_factory(callback_data="mem:dash")
+        ctx = context_factory()
+        await memory_command.handle_memory_callback(upd, ctx)
+        # The disabled-mode toast is the contract: the operator
+        # tapped a button on a /memory dashboard that is no longer
+        # active, and the only acceptable response is the
+        # disabled-mode reply via query.answer().
+        upd.callback_query.answer.assert_awaited_once_with(memory_command._MSG_DISABLED)
+        # No dashboard re-render: the early return must fire BEFORE
+        # any verb dispatch reaches edit_message_text. A regression
+        # that left the answer call in place but moved it AFTER
+        # dispatch would slip past the answer assertion alone, so
+        # the negative assertion here pins the early-return shape.
+        upd.callback_query.edit_message_text.assert_not_called()
+
 
 # ── Issue #416: tag browse-axis dismantle ──────────────────────────
 
