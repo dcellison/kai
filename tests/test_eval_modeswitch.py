@@ -300,6 +300,16 @@ class TestRecallReasonField:
         # boot cost (~80MB embedding model on first run); the
         # production path under verification is format_context, not
         # init_memory.
+        #
+        # `object()` is safe ONLY because format_context never
+        # invokes attributes on `_memory` directly: `is_enabled()`
+        # checks `_memory is not None`, and every search call
+        # routes through the module-level `search()` wrapper, which
+        # is mocked below. A future refactor that called something
+        # like `_memory.client_ready()` from the hot path would
+        # break this test with a confusing `AttributeError` rather
+        # than a clean assertion failure; the sentinel would need
+        # to grow into a proper Mem0 mock at that point.
         memory_module._memory = object()
         memory_module._config = modeswitch._build_test_configs(memory_enabled_value=True)
 
