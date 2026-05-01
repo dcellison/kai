@@ -273,143 +273,187 @@ async def _run_verify() -> int:
         # Set BEFORE the first import of `kai.memory` (which
         # transitively imports mem0); mem0 reads `MEM0_DIR` at
         # module-import time, so setting it later than the first
-        # import has no effect. backend.py and config.py do not
-        # import kai.memory; the first kai.memory import happens
-        # inside `_isolated_data_dir`'s body.
+        # import has no effect.
+        #
+        # Save/restore semantics: capture the prior value (or
+        # absence) and restore on the way out so a subsequent
+        # process-shared invocation does not inherit the now-deleted
+        # tmp path. `MEM0_DIR_SENTINEL` distinguishes "was unset"
+        # from "was empty string"; the former requires `pop`, the
+        # latter requires reassignment.
+        _MEM0_DIR_SENTINEL = object()
+        prior_mem0_dir = os.environ.get("MEM0_DIR", _MEM0_DIR_SENTINEL)
         os.environ["MEM0_DIR"] = str(tmp_root / "mem0")
-        _seed_fixture_memory_md(tmp_root)
-        api_ctx = _api_ctx_for_verify()
-        # workspace and home_workspace coincide so the optional
-        # identity-injection branch in build_session_context (which
-        # fires only when the two differ) does not pollute the
-        # output and confuse the substring assertions.
-        ws = tmp_root / "workspace"
-        ws.mkdir()
 
-        # ── Disabled-mode invariants ──────────────────────────
-        disabled_ctx = build_session_context(
-            workspace=ws,
-            home_workspace=ws,
-            api=api_ctx,
-            workspace_config=None,
-            chat_id=_FIXTURE_CHAT_ID,
-            data_dir=tmp_root,
-            memory_enabled=False,
+        # Invariant guard: backend.py and config.py do not transitively
+        # import kai.memory today; the first kai.memory import happens
+        # inside `_isolated_data_dir`'s body, AFTER MEM0_DIR is set.
+        # If a future refactor pulls kai.memory into the import graph
+        # of either module, mem0 would have already captured the
+        # ORIGINAL MEM0_DIR (operator's `~/.mem0/`) and the redirect
+        # below has no effect, leaving the harness deadlocked against
+        # the live `migrations_qdrant` lock. Fail loud here rather
+        # than silently re-contending. The assertion fires once at
+        # the entry point, before any build_session_context call.
+        assert "kai.memory" not in sys.modules, (
+            "kai.memory was imported before _run_verify could set "
+            "MEM0_DIR; mem0's home-directory constant has already been "
+            "captured at the operator's ~/.mem0/ path and the tmp "
+            "redirect will not take effect. A backend.py or config.py "
+            "import path now pulls kai.memory transitively; restore "
+            "the lazy-import contract before re-running."
         )
 
-        results.append(
-            _InvariantResult(
-                name="disabled: subsystem marker present",
-                passed=_MARKER_DISABLED in disabled_ctx,
-                detail=f"missing {_MARKER_DISABLED!r}" if _MARKER_DISABLED not in disabled_ctx else "",
+        try:
+            _seed_fixture_memory_md(tmp_root)
+            api_ctx = _api_ctx_for_verify()
+            # workspace and home_workspace coincide so the optional
+            # identity-injection branch in build_session_context (which
+            # fires only when the two differ) does not pollute the
+            # output and confuse the substring assertions.
+            ws = tmp_root / "workspace"
+            ws.mkdir()
+
+            # ── Disabled-mode invariants ──────────────────────────
+            disabled_ctx = build_session_context(
+                workspace=ws,
+                home_workspace=ws,
+                api=api_ctx,
+                workspace_config=None,
+                chat_id=_FIXTURE_CHAT_ID,
+                data_dir=tmp_root,
+                memory_enabled=False,
             )
-        )
-        results.append(
-            _InvariantResult(
-                name="disabled: persistent-memory block injected",
-                passed=_MARKER_PERSISTENT_MEMORY in disabled_ctx,
-                detail=f"missing {_MARKER_PERSISTENT_MEMORY!r}"
-                if _MARKER_PERSISTENT_MEMORY not in disabled_ctx
-                else "",
+
+            results.append(
+                _InvariantResult(
+                    name="disabled: subsystem marker present",
+                    passed=_MARKER_DISABLED in disabled_ctx,
+                    detail=f"missing {_MARKER_DISABLED!r}" if _MARKER_DISABLED not in disabled_ctx else "",
+                )
             )
-        )
-        results.append(
-            _InvariantResult(
-                name="disabled: relevant-memories block omitted",
-                passed=_MARKER_RELEVANT_MEMORIES not in disabled_ctx,
-                detail=f"unexpectedly contained {_MARKER_RELEVANT_MEMORIES!r}"
-                if _MARKER_RELEVANT_MEMORIES in disabled_ctx
-                else "",
+            results.append(
+                _InvariantResult(
+                    name="disabled: persistent-memory block injected",
+                    passed=_MARKER_PERSISTENT_MEMORY in disabled_ctx,
+                    detail=f"missing {_MARKER_PERSISTENT_MEMORY!r}"
+                    if _MARKER_PERSISTENT_MEMORY not in disabled_ctx
+                    else "",
+                )
             )
-        )
-
-        # ── Enabled-mode invariants ───────────────────────────
-        enabled_ctx = build_session_context(
-            workspace=ws,
-            home_workspace=ws,
-            api=api_ctx,
-            workspace_config=None,
-            chat_id=_FIXTURE_CHAT_ID,
-            data_dir=tmp_root,
-            memory_enabled=True,
-        )
-
-        results.append(
-            _InvariantResult(
-                name="enabled: subsystem marker present",
-                passed=_MARKER_ENABLED in enabled_ctx,
-                detail=f"missing {_MARKER_ENABLED!r}" if _MARKER_ENABLED not in enabled_ctx else "",
+            results.append(
+                _InvariantResult(
+                    name="disabled: relevant-memories block omitted",
+                    passed=_MARKER_RELEVANT_MEMORIES not in disabled_ctx,
+                    detail=f"unexpectedly contained {_MARKER_RELEVANT_MEMORIES!r}"
+                    if _MARKER_RELEVANT_MEMORIES in disabled_ctx
+                    else "",
+                )
             )
-        )
-        results.append(
-            _InvariantResult(
-                name="enabled: persistent-memory block omitted",
-                passed=_MARKER_PERSISTENT_MEMORY not in enabled_ctx,
-                detail=f"unexpectedly contained {_MARKER_PERSISTENT_MEMORY!r}"
-                if _MARKER_PERSISTENT_MEMORY in enabled_ctx
-                else "",
+
+            # ── Enabled-mode invariants ───────────────────────────
+            enabled_ctx = build_session_context(
+                workspace=ws,
+                home_workspace=ws,
+                api=api_ctx,
+                workspace_config=None,
+                chat_id=_FIXTURE_CHAT_ID,
+                data_dir=tmp_root,
+                memory_enabled=True,
             )
-        )
 
-        # The enabled-mode format_context probe runs in an
-        # isolated tmp-dir Qdrant. We seed one fact, query for it,
-        # and assert the recall block either is empty or starts
-        # with the expected header. Both shapes are valid; the
-        # invariant is the prefix check, not a presence claim.
-        recall_text = ""
-        with _isolated_data_dir(tmp_root):
-            from kai import memory as memory_module
-
-            memory_module.init_memory(_build_test_configs(memory_enabled_value=True))
-            await _seed_fixture_fact(user_id=str(_FIXTURE_CHAT_ID))
-            recall_text = await memory_module.format_context(_FIXTURE_QUERY, user_id=str(_FIXTURE_CHAT_ID))
-
-        recall_ok = recall_text == "" or recall_text.startswith(_MARKER_RELEVANT_MEMORIES)
-        results.append(
-            _InvariantResult(
-                name="enabled: format_context returns empty or recall-prefixed",
-                passed=recall_ok,
-                detail=(f"got {recall_text[:80]!r}" if not recall_ok else ""),
+            results.append(
+                _InvariantResult(
+                    name="enabled: subsystem marker present",
+                    passed=_MARKER_ENABLED in enabled_ctx,
+                    detail=f"missing {_MARKER_ENABLED!r}" if _MARKER_ENABLED not in enabled_ctx else "",
+                )
             )
-        )
-
-        # ── Partition invariants over the combined output ─────
-        # combined = build_session_context output + format_context
-        # output, joined with a newline. The two substrings must
-        # never coexist regardless of flag value.
-        combined_disabled = disabled_ctx + "\n" + ""  # disabled: format_context returns "" by contract
-        combined_enabled = enabled_ctx + "\n" + recall_text
-
-        partition_disabled_ok = (
-            _MARKER_PERSISTENT_MEMORY in combined_disabled and _MARKER_RELEVANT_MEMORIES not in combined_disabled
-        )
-        results.append(
-            _InvariantResult(
-                name="partition disabled: persistent present, relevant absent",
-                passed=partition_disabled_ok,
-                detail="" if partition_disabled_ok else "partition broken under disabled",
+            results.append(
+                _InvariantResult(
+                    name="enabled: persistent-memory block omitted",
+                    passed=_MARKER_PERSISTENT_MEMORY not in enabled_ctx,
+                    detail=f"unexpectedly contained {_MARKER_PERSISTENT_MEMORY!r}"
+                    if _MARKER_PERSISTENT_MEMORY in enabled_ctx
+                    else "",
+                )
             )
-        )
 
-        partition_enabled_ok = _MARKER_PERSISTENT_MEMORY not in combined_enabled
-        results.append(
-            _InvariantResult(
-                name="partition enabled: persistent absent",
-                passed=partition_enabled_ok,
-                detail="" if partition_enabled_ok else "persistent block leaked into enabled-mode combined output",
-            )
-        )
+            # The enabled-mode format_context probe runs in an
+            # isolated tmp-dir Qdrant. We seed one fact, query for it,
+            # and assert the recall block either is empty or starts
+            # with the expected header. Both shapes are valid; the
+            # invariant is the prefix check, not a presence claim.
+            recall_text = ""
+            with _isolated_data_dir(tmp_root):
+                from kai import memory as memory_module
 
-        mutual_exclusion_ok = not (
-            _MARKER_PERSISTENT_MEMORY in combined_enabled and _MARKER_RELEVANT_MEMORIES in combined_enabled
-        ) and not (_MARKER_PERSISTENT_MEMORY in combined_disabled and _MARKER_RELEVANT_MEMORIES in combined_disabled)
-        results.append(
-            _InvariantResult(
-                name="partition: mutual exclusion across both modes",
-                passed=mutual_exclusion_ok,
-                detail="" if mutual_exclusion_ok else "both blocks present in one mode",
+                memory_module.init_memory(_build_test_configs(memory_enabled_value=True))
+                await _seed_fixture_fact(user_id=str(_FIXTURE_CHAT_ID))
+                recall_text = await memory_module.format_context(_FIXTURE_QUERY, user_id=str(_FIXTURE_CHAT_ID))
+
+            recall_ok = recall_text == "" or recall_text.startswith(_MARKER_RELEVANT_MEMORIES)
+            results.append(
+                _InvariantResult(
+                    name="enabled: format_context returns empty or recall-prefixed",
+                    passed=recall_ok,
+                    detail=(f"got {recall_text[:80]!r}" if not recall_ok else ""),
+                )
             )
-        )
+
+            # ── Partition invariants over the combined output ─────
+            # combined = build_session_context output + format_context
+            # output, joined with a newline. The two substrings must
+            # never coexist regardless of flag value. format_context
+            # returns "" under disabled mode by contract (the
+            # is_enabled() guard short-circuits before search), so the
+            # disabled-mode combined output is just the session
+            # context with a trailing newline.
+            combined_disabled = disabled_ctx + "\n"
+            combined_enabled = enabled_ctx + "\n" + recall_text
+
+            partition_disabled_ok = (
+                _MARKER_PERSISTENT_MEMORY in combined_disabled and _MARKER_RELEVANT_MEMORIES not in combined_disabled
+            )
+            results.append(
+                _InvariantResult(
+                    name="partition disabled: persistent present, relevant absent",
+                    passed=partition_disabled_ok,
+                    detail="" if partition_disabled_ok else "partition broken under disabled",
+                )
+            )
+
+            partition_enabled_ok = _MARKER_PERSISTENT_MEMORY not in combined_enabled
+            results.append(
+                _InvariantResult(
+                    name="partition enabled: persistent absent",
+                    passed=partition_enabled_ok,
+                    detail="" if partition_enabled_ok else "persistent block leaked into enabled-mode combined output",
+                )
+            )
+
+            mutual_exclusion_ok = not (
+                _MARKER_PERSISTENT_MEMORY in combined_enabled and _MARKER_RELEVANT_MEMORIES in combined_enabled
+            ) and not (
+                _MARKER_PERSISTENT_MEMORY in combined_disabled and _MARKER_RELEVANT_MEMORIES in combined_disabled
+            )
+            results.append(
+                _InvariantResult(
+                    name="partition: mutual exclusion across both modes",
+                    passed=mutual_exclusion_ok,
+                    detail="" if mutual_exclusion_ok else "both blocks present in one mode",
+                )
+            )
+        finally:
+            # Restore MEM0_DIR to its pre-call value (or remove it if
+            # it was unset). Without this, subsequent code in the same
+            # process sees MEM0_DIR pointing at the tmp path we just
+            # deleted on tempfile teardown, with no diagnostic when
+            # the next mem0-using subprocess hits the missing dir.
+            if prior_mem0_dir is _MEM0_DIR_SENTINEL:
+                os.environ.pop("MEM0_DIR", None)
+            else:
+                os.environ["MEM0_DIR"] = prior_mem0_dir
 
     # Print results.
     failed = [r for r in results if not r.passed]
@@ -515,9 +559,24 @@ def _run_check() -> int:
 
     print("secret_found: yes")
 
+    # Resolve the webhook port from the environment so the harness
+    # tracks a non-default deploy (dev instance on a different port,
+    # port-conflict resolution). Mirrors the `WEBHOOK_PORT` env var
+    # the production service reads in config.py's load_config; the
+    # default of 8080 matches the Config dataclass default. A
+    # non-integer value falls through to 8080 with a warning rather
+    # than crashing the harness.
+    port_str = os.environ.get("WEBHOOK_PORT", "8080")
+    try:
+        port = int(port_str)
+    except ValueError:
+        print(f"  WEBHOOK_PORT={port_str!r} is not an integer; falling back to 8080")
+        port = 8080
+    base_url = f"http://localhost:{port}"
+
     # Health probe first; if the service is down, the stats probe
     # cannot succeed and we report up-front.
-    health_status, _ = _http_get("http://localhost:8080/health")
+    health_status, _ = _http_get(f"{base_url}/health")
     if health_status != 200:
         print(f"health: down (status={health_status})")
         ext_v, ep_v = _read_prompt_versions()
@@ -534,7 +593,7 @@ def _run_check() -> int:
     # auth check fires before the body validation. Pass chat_id=1
     # as a placeholder (any int the service accepts works; the
     # 401-before-body order means the value is not exercised).
-    stats_url = "http://localhost:8080/api/memory/stats?" + urllib.parse.urlencode({"chat_id": _FIXTURE_CHAT_ID})
+    stats_url = f"{base_url}/api/memory/stats?" + urllib.parse.urlencode({"chat_id": _FIXTURE_CHAT_ID})
     stats_status, _ = _http_get(stats_url, secret=secret)
 
     ext_v, ep_v = _read_prompt_versions()
