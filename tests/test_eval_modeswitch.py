@@ -225,9 +225,18 @@ class TestCheckSubcommand:
         rc = modeswitch._run_check()
         assert rc == 1
         out = capsys.readouterr().out
+        # Pin every line the production code emits on the health-
+        # down path: secret_found, health, mode, and BOTH prompt
+        # versions. A regression that drops any of these lines
+        # silently (e.g., an early-return that skips the prompt-
+        # version probe) would go undetected without all four
+        # assertions; pinning the full output shape closes that
+        # gap.
         assert "secret_found: yes" in out
         assert "health: down" in out
+        assert "mode: unknown(service-down)" in out
         assert "extraction_prompt_version: 7" in out
+        assert "episode_prompt_version: 1" in out
 
     def test_check_stats_503_reports_disabled(self, monkeypatch, capsys) -> None:
         """Stats probe returns 503 (memory disabled): report
@@ -254,8 +263,13 @@ class TestCheckSubcommand:
         rc = modeswitch._run_check()
         assert rc == 0
         out = capsys.readouterr().out
+        # Pin every line the production code emits on the disabled
+        # mode path. Same shape as test_check_health_down_exits_1.
+        assert "secret_found: yes" in out
         assert "health: ok" in out
         assert "mode: disabled" in out
+        assert "extraction_prompt_version: 7" in out
+        assert "episode_prompt_version: 1" in out
 
     def test_check_stats_200_reports_enabled(self, monkeypatch, capsys) -> None:
         """Stats probe returns 200 with a stats payload (memory
@@ -298,7 +312,14 @@ class TestCheckSubcommand:
         rc = modeswitch._run_check()
         assert rc == 1
         out = capsys.readouterr().out
+        # Pin every line the production code emits on the
+        # unexpected-status path. Same shape as the disabled and
+        # health-down test cases.
+        assert "secret_found: yes" in out
+        assert "health: ok" in out
         assert "mode: unknown(401)" in out
+        assert "extraction_prompt_version: 7" in out
+        assert "episode_prompt_version: 1" in out
 
 
 # ── TestPromptVersionRead ───────────────────────────────────────────

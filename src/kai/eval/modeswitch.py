@@ -453,12 +453,19 @@ async def _run_verify() -> int:
             # the next mem0-using subprocess hits the missing dir.
             if prior_mem0_dir is _MEM0_DIR_SENTINEL:
                 os.environ.pop("MEM0_DIR", None)
-            else:
+            elif isinstance(prior_mem0_dir, str):
                 # Pyright strict cannot narrow `str | object` through
-                # an `is`-check on a non-literal sentinel; the explicit
-                # isinstance assertion narrows the type for the
+                # an `is`-check on a non-literal sentinel; the
+                # explicit isinstance check narrows the type for the
                 # `os.environ` setter, which requires `str`.
-                assert isinstance(prior_mem0_dir, str)
+                # `if isinstance` rather than `assert isinstance`
+                # because this runs in a `finally` block: a hard
+                # assert here would shadow any exception propagating
+                # out of the `try` body. The isinstance condition
+                # is structurally always true (os.environ.get returns
+                # `str` or the sentinel; the elif branch only runs
+                # when the sentinel comparison failed); the `if`
+                # form is the defensive shape for finally blocks.
                 os.environ["MEM0_DIR"] = prior_mem0_dir
 
     # Print results.
@@ -570,13 +577,18 @@ def _run_check() -> int:
     # port-conflict resolution). Mirrors the `WEBHOOK_PORT` env var
     # the production service reads in config.py's load_config; the
     # default of 8080 matches the Config dataclass default. A
-    # non-integer value falls through to 8080 with a warning rather
-    # than crashing the harness.
+    # non-integer value or out-of-range value falls through to 8080
+    # with a warning rather than crashing the harness or producing
+    # a confusing `health: down (status=0)` from a port the OS
+    # cannot bind. Range check is `1 <= port <= 65535` per the
+    # POSIX TCP/IP port-number contract.
     port_str = os.environ.get("WEBHOOK_PORT", "8080")
     try:
         port = int(port_str)
-    except ValueError:
-        print(f"  WEBHOOK_PORT={port_str!r} is not an integer; falling back to 8080")
+        if not 1 <= port <= 65535:
+            raise ValueError(f"port {port} out of range")
+    except ValueError as exc:
+        print(f"  WEBHOOK_PORT={port_str!r} is invalid ({exc}); falling back to 8080")
         port = 8080
     base_url = f"http://localhost:{port}"
 
