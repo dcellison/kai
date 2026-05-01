@@ -255,7 +255,11 @@ def _parse_recall_reason(records: list[logging.LogRecord]) -> str | None:
             continue
         try:
             payload = json.loads(msg[len(prefix) :])
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:
+            # `json.JSONDecodeError` is a subclass of `ValueError`
+            # since Python 3.5, so the bare `ValueError` covers
+            # both the well-formed-but-invalid-JSON case and the
+            # malformed-input case that JSONDecodeError raises.
             return None
         reason = payload.get("reason") if isinstance(payload, dict) else None
         return reason if isinstance(reason, str) else None
@@ -470,6 +474,16 @@ async def _run_verify() -> int:
             # log-line contract that downstream eval harnesses depend
             # on (a missing or wrongly-tagged record under disabled
             # mode would silently break those harnesses).
+            #
+            # Deferred import for the same reason `_isolated_data_dir`
+            # imports `kai.memory` lazily: a top-level import would
+            # capture `kai.memory` in `sys.modules` BEFORE the
+            # MEM0_DIR redirect at the start of `_run_verify` could
+            # take effect, deadlocking the harness against the live
+            # `~/.mem0/migrations_qdrant` lock the running service
+            # holds. The `if "kai.memory" in sys.modules:` guard at
+            # the top of `_run_verify` enforces the invariant; this
+            # deferred form preserves it.
             from kai.memory import _RECALL_REASON_DISABLED
 
             with _isolated_data_dir(tmp_root):

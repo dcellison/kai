@@ -2919,6 +2919,13 @@ class TestHandleResponse:
         config = _make_config(memory_extraction_enabled=True)
         ctx = _make_context(config=config, pool=pool)
 
+        # Snapshot the task set BEFORE the call so we can compute the
+        # delta after. A bare `asyncio.all_tasks()` post-call would
+        # also pick up unrelated tasks (pytest-asyncio fixtures,
+        # leftover work from a prior test) and gather them too,
+        # which is fragile even when it does not currently break.
+        tasks_before = asyncio.all_tasks()
+
         with patch.multiple("kai.bot", **self._base_patches()):
             await _handle_response(update, ctx, 12345, "test prompt", pool, "claude-opus")
 
@@ -2927,7 +2934,7 @@ class TestHandleResponse:
         # be a no-op; if a regression spawned a task anyway, the
         # gather lets it run before the assertion, surfacing the bug
         # as a failed call_count check rather than a timing-flake.
-        new_tasks = asyncio.all_tasks() - {asyncio.current_task()}
+        new_tasks = asyncio.all_tasks() - tasks_before - {asyncio.current_task()}
         if new_tasks:
             await asyncio.gather(*new_tasks, return_exceptions=True)
 
@@ -2972,6 +2979,11 @@ class TestHandleResponse:
         )
         ctx = _make_context(config=config, pool=pool)
 
+        # Snapshot pre-call so the post-call delta reflects only the
+        # tasks _handle_response spawned. See the disabled counterpart
+        # for the full rationale.
+        tasks_before = asyncio.all_tasks()
+
         with patch.multiple("kai.bot", **self._base_patches()):
             await _handle_response(update, ctx, 12345, "test prompt", pool, "claude-opus")
 
@@ -2980,7 +2992,7 @@ class TestHandleResponse:
         # the coroutine onto the event loop; the test's coroutine
         # cannot assert until the scheduled task has had a chance to
         # progress past its `await extract_and_store(...)` line.
-        new_tasks = asyncio.all_tasks() - {asyncio.current_task()}
+        new_tasks = asyncio.all_tasks() - tasks_before - {asyncio.current_task()}
         if new_tasks:
             await asyncio.gather(*new_tasks, return_exceptions=True)
 
