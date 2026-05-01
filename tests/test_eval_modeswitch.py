@@ -430,6 +430,17 @@ class TestExtractionCallSiteGating:
         production code uses the module-qualified form. If a future
         refactor introduces the `from`-import shape, this test should
         be extended to cover both forms.
+
+        Polarity caveat: this test is a presence check, not a
+        polarity check. An inverted guard
+        (`if not memory_is_enabled():`) would satisfy the predicate
+        because `_guard_contains_memory_is_enabled` walks the test
+        expression and finds the Call inside the `UnaryOp(Not, ...)`.
+        The behavioral pair in
+        `test_bot.py::TestHandleResponse::test_extraction_skipped_when_memory_disabled`
+        plus `test_extraction_invoked_when_memory_enabled` covers
+        polarity by asserting the correct `extract_and_store`
+        call_count under each flag value.
         """
         # Resolve the bot.py source path relative to the test file's
         # location so the test runs cleanly under any working

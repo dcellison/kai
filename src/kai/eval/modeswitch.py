@@ -271,7 +271,17 @@ def _parse_recall_reason(records: list[logging.LogRecord]) -> str | None:
             # since Python 3.5, so the bare `ValueError` covers
             # both the well-formed-but-invalid-JSON case and the
             # malformed-input case that JSONDecodeError raises.
-            return None
+            #
+            # `continue` rather than `return None` so a single
+            # malformed trailing record does not shadow earlier
+            # well-formed records. Today's callers pass a list with
+            # exactly one `memory.recall` record per capture block,
+            # but a future multi-record caller would silently
+            # observe `None` for "valid records exist but the most
+            # recent is bad," which is the wrong shape. The final
+            # `return None` outside the loop still handles the
+            # no-records case.
+            continue
         reason = payload.get("reason") if isinstance(payload, dict) else None
         return reason if isinstance(reason, str) else None
     return None
