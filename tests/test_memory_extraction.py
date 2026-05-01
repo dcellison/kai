@@ -2387,10 +2387,10 @@ class TestRule6WorkflowEventRegex:
         Catches "User/OC decided/requested to <verb>" workflow
         actions."""
         positives = [
-            "User decided to file an issue about memory.recall query truncation.",
-            "User requested to update issue #385 with the Sophia field set.",
-            "OC decided to perform a code review of PR #409.",
-            "User decided to address issue #338",
+            "User decided to file an issue about query truncation.",
+            "User requested to update issue #0 with the Sophia field set.",
+            "OC decided to perform a code review of PR #1.",
+            "User decided to address issue #2",
         ]
         for content in positives:
             assert _WORKFLOW_EVENT_RE.search(content), content
@@ -2408,9 +2408,9 @@ class TestRule6WorkflowEventRegex:
         IGNORE rules cover that shape; the regex stays scoped to
         the past-tense / received variants."""
         positives = [
-            "PR #424 received a code review verdict of approved cleanly with no blockers.",
-            "Specification 412 version 3 was approved with three sub-blocking nits.",
-            "Spec 416 (memory UI tag dismantle) version 4 received final approval.",
+            "PR #0 received a code review verdict of approved cleanly with no blockers.",
+            "Specification foo version 3 was approved with three sub-blocking nits.",
+            "Spec bar (some component) version 4 received final approval.",
         ]
         for content in positives:
             assert _WORKFLOW_EVENT_RE.search(content), content
@@ -2428,9 +2428,9 @@ class TestRule6WorkflowEventRegex:
         """Arm 4: `evaluation of (spec|specification|issue|PR) X
         (produced|was|determined) Y`."""
         positives = [
-            "The evaluation of specification 380 was written to /tmp/spec-380-evaluation-v1.md",
-            "The evaluation of spec 416 produced a verdict of 'changes requested'.",
-            "The evaluation of PR #X determined three should-fix items.",
+            "The evaluation of specification foo was written to /tmp/spec-foo-evaluation-v1.md",
+            "The evaluation of spec foo produced a verdict of 'changes requested'.",
+            "The evaluation of PR #3 determined three should-fix items.",
         ]
         for content in positives:
             assert _WORKFLOW_EVENT_RE.search(content), content
@@ -2483,11 +2483,11 @@ class TestRule6WorkflowEventRegex:
         assert after - before == 1
 
     def test_rule_6_skips_confirmed_action_rows(self):
-        """Pins B2 of the spec eval: a confirmed_action fact whose
-        content matches arm 2 ("User confirmed PR #299 was merged
-        on 2026-04-12") must NOT be rejected because the per-fact
-        skip ahead of Rule 6 trusts the existing Rule 1/2/4/4b
-        confirmation chain."""
+        """Pin the confirmed_action skip ahead of Rule 6: a
+        confirmation row whose content matches arm 2 ("User
+        confirmed PR #299 was merged on 2026-04-12") must NOT be
+        rejected, because the existing Rule 1/2/4/4b chain already
+        gates the confirmed_action path."""
         before = sum(_RULE_6_REJECTIONS.snapshot().values())
         facts = [
             {
@@ -2546,7 +2546,7 @@ class TestExtractionPromptDurability:
 
 
 class TestRunExtractorSystemPromptDefault:
-    """Pins B1's compatibility contract: `_run_extractor` accepts a
+    """Pin the compatibility contract: `_run_extractor` accepts a
     keyword-only `system_prompt` parameter that defaults to the
     active `_EXTRACTION_SYSTEM_PROMPT`. Production callers that omit
     the kwarg see byte-identical subprocess argv compared to before

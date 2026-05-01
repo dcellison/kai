@@ -969,12 +969,13 @@ _WORKFLOW_EVENT_RE = re.compile(
     # anchor only matches when the subject is at the start of the
     # fact content; a paraphrased fact like "In this exchange, User
     # decided to file an issue about X" is not caught. The active
-    # extraction prompt formats facts as third-person leading with
-    # "User ..." or "OC ..." so the anchor is the right shape for
-    # the production case; broader paraphrases are left for the
-    # prompt's IGNORE rules. A future maintainer who needs to
-    # catch non-leading subjects should drop the `^` rather than
-    # only adding more verbs.
+    # extraction prompt formats facts third-person leading with
+    # "User ..." (the canonical example in FORMAT); the operator-
+    # specific "OC" subject is included as defense-in-depth for
+    # operator history that contains it. Broader paraphrases are
+    # left for the prompt's IGNORE rules. A future maintainer who
+    # needs to catch non-leading subjects should drop the `^`
+    # rather than only adding more verbs.
     r"^(User|OC)\s+(decided|requested)\s+to\s+"
     r"(file|create|address|conduct|evaluate|perform|update|push)\b"
     r"|"
@@ -997,11 +998,10 @@ _WORKFLOW_EVENT_RE = re.compile(
     # "All N v1 findings were closed"
     r"\bAll\s+\w+\s+(v\d+\s+)?findings?\s+(were|are)\s+closed\b"
     r"|"
-    # Arm 4: "The evaluation of spec/issue/PR X
-    # produced/was/determined Y". The v1 spec proposed an "OC's vN
-    # evaluation ..." sub-arm that was dropped to keep internal
-    # review-loop vocabulary out of production source; the prompt's
-    # IGNORE rules cover the residual shape.
+    # Arm 4: "The evaluation of (spec|specification|issue|PR) X
+    # (produced|was|determined) Y". Past-tense / determined
+    # variants only; broader paraphrases are left to the prompt's
+    # IGNORE rules.
     r"\b(evaluation\s+of\s+(spec(ification)?|issue|PR)\s+\S+"
     r"\s+(produced|was|determined))\b"
     r")",
