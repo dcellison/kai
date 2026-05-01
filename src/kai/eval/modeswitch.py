@@ -283,17 +283,24 @@ async def _run_verify() -> int:
         # ORIGINAL MEM0_DIR (operator's `~/.mem0/`) and the redirect
         # below has no effect, leaving the harness deadlocked against
         # the live `migrations_qdrant` lock. Fail loud BEFORE
-        # mutating MEM0_DIR so an assertion failure leaves the
-        # environment untouched and the try/finally below is not
-        # responsible for restoring state we never changed.
-        assert "kai.memory" not in sys.modules, (
-            "kai.memory was imported before _run_verify could set "
-            "MEM0_DIR; mem0's home-directory constant has already been "
-            "captured at the operator's ~/.mem0/ path and the tmp "
-            "redirect will not take effect. A backend.py or config.py "
-            "import path now pulls kai.memory transitively; restore "
-            "the lazy-import contract before re-running."
-        )
+        # mutating MEM0_DIR so a failure leaves the environment
+        # untouched and the try/finally below is not responsible for
+        # restoring state we never changed.
+        #
+        # `if/raise` rather than `assert`: this guard is safety-
+        # critical (silent deadlock on failure), and `assert`
+        # statements are stripped under `python -O` /
+        # `PYTHONOPTIMIZE=1`. The bare `RuntimeError` cannot be
+        # silently disabled.
+        if "kai.memory" in sys.modules:
+            raise RuntimeError(
+                "kai.memory was imported before _run_verify could set "
+                "MEM0_DIR; mem0's home-directory constant has already been "
+                "captured at the operator's ~/.mem0/ path and the tmp "
+                "redirect will not take effect. A backend.py or config.py "
+                "import path now pulls kai.memory transitively; restore "
+                "the lazy-import contract before re-running."
+            )
 
         # Save/restore semantics: capture the prior value (or
         # absence) and restore on the way out so a subsequent
@@ -561,13 +568,25 @@ def _run_check() -> int:
       1: health=down or stats returned an unexpected status
       2: WEBHOOK_SECRET not in process environment
     """
-    secret = os.environ.get("WEBHOOK_SECRET", "")
-    secret_found = bool(secret)
+    # Distinguish "not exported" (None) from "exported but empty"
+    # (the empty string). Both fail the same way for /api/memory/stats
+    # auth (the request would carry no usable secret), but the
+    # diagnostic differs: a missing-from-env case wants "source
+    # /etc/kai/env first"; an empty-but-set case wants the operator
+    # to fix the env-file value. `check` is the tool operators run
+    # when debugging a config issue; a misleading diagnostic at that
+    # moment is worse than verbose accuracy.
+    secret = os.environ.get("WEBHOOK_SECRET")
 
-    if not secret_found:
+    if secret is None:
         print("secret_found: no")
         print("  WEBHOOK_SECRET not set; source /etc/kai/env first")
         print("  e.g. sudo bash -c 'source /etc/kai/env && env | grep WEBHOOK_SECRET'")
+        return 2
+    if secret == "":
+        print("secret_found: empty")
+        print("  WEBHOOK_SECRET is exported but empty; check /etc/kai/env for a typo")
+        print("  (a line like `WEBHOOK_SECRET=` with no value)")
         return 2
 
     print("secret_found: yes")

@@ -190,8 +190,8 @@ class TestCheckSubcommand:
     each branch without standing up an HTTP server."""
 
     def test_check_missing_secret_exits_2(self, monkeypatch, capsys) -> None:
-        """No WEBHOOK_SECRET in the environment: print the hint and
-        exit 2 BEFORE making any HTTP call."""
+        """WEBHOOK_SECRET not exported at all: print the
+        not-set hint and exit 2 BEFORE making any HTTP call."""
         monkeypatch.delenv("WEBHOOK_SECRET", raising=False)
 
         # _http_get must NOT be called on this path. If it is,
@@ -207,6 +207,29 @@ class TestCheckSubcommand:
         out = capsys.readouterr().out
         assert "secret_found: no" in out
         assert "WEBHOOK_SECRET not set" in out
+
+    def test_check_empty_secret_exits_2_with_distinct_diagnostic(self, monkeypatch, capsys) -> None:
+        """WEBHOOK_SECRET exported but set to the empty string:
+        report `secret_found: empty` (not `no`) and exit 2 with a
+        diagnostic that points the operator at the env-file typo,
+        not at sourcing the env file. The two cases are
+        operationally distinct: one is "you didn't source", the
+        other is "you sourced but the value is wrong"."""
+        monkeypatch.setenv("WEBHOOK_SECRET", "")
+
+        def _no_http(*args, **kwargs):
+            raise AssertionError("_http_get must not be called when secret is empty")
+
+        monkeypatch.setattr(modeswitch, "_http_get", _no_http)
+        rc = modeswitch._run_check()
+        assert rc == 2
+        out = capsys.readouterr().out
+        assert "secret_found: empty" in out
+        assert "exported but empty" in out
+        # The distinct diagnostic must NOT collapse back to the
+        # not-set messaging that the operator already ruled out by
+        # sourcing the env file.
+        assert "WEBHOOK_SECRET not set" not in out
 
     def test_check_health_down_exits_1(self, monkeypatch, capsys) -> None:
         """Health probe returns non-200: report `health: down`, skip
