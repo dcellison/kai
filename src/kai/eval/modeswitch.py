@@ -222,14 +222,25 @@ def _capture_recall_logs() -> Iterator[list[logging.LogRecord]]:
     # CLI's `logging.basicConfig(level=logging.WARNING, ...)` would
     # otherwise filter INFO-level records out before they reach the
     # handler.
+    #
+    # Disable propagation while the handler is attached so the
+    # captured records do not also fan out to the root logger. The
+    # CLI entry point's `basicConfig(level=WARNING)` already filters
+    # them, but during pytest runs the root logger may be configured
+    # at INFO and the records would appear duplicated in console
+    # output. Restored in `finally` so other code paths that rely on
+    # propagation are not affected after the with-block.
     prior_level = logger.level
+    prior_propagate = logger.propagate
     logger.setLevel(logging.INFO)
+    logger.propagate = False
     logger.addHandler(handler)
     try:
         yield records
     finally:
         logger.removeHandler(handler)
         logger.setLevel(prior_level)
+        logger.propagate = prior_propagate
 
 
 def _parse_recall_reason(records: list[logging.LogRecord]) -> str | None:

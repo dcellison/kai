@@ -322,11 +322,13 @@ class TestRecallReasonField:
                 user_id=str(_FIXTURE_CHAT_ID),
             )
 
-        # The recall path should have produced a string starting with
-        # the relevant-memories header (the canned result is above the
-        # floor and within budget). This pins the success-path output
-        # shape; the reason assertion below pins the log-line shape.
-        assert result.startswith(_MARKER_RELEVANT_MEMORIES), f"expected recall-prefixed output; got {result[:80]!r}"
+        # Reason assertion FIRST: the log-line `reason` field is the
+        # contract under test. The output-shape assertion below is a
+        # secondary sanity check; if the canned result's score (0.95)
+        # ever stops clearing the configured relevance floor, the
+        # output-shape assertion would fire and mask the actual
+        # contract test. Reason-first keeps the failure message
+        # informative under that regression class.
         recall_records = [r for r in caplog.records if r.getMessage().startswith("memory.recall ")]
         assert recall_records, "expected at least one memory.recall log line"
         reason = modeswitch._parse_recall_reason(caplog.records)
@@ -336,6 +338,12 @@ class TestRecallReasonField:
         assert reason != memory_module._RECALL_REASON_DISABLED, (
             f"expected reason != {memory_module._RECALL_REASON_DISABLED!r}; got {reason!r}"
         )
+        # Output-shape sanity check: the canned result is above the
+        # floor and within budget, so format_context should have
+        # produced the recall-prefixed string. A miss here suggests
+        # the floor was tuned above 0.95 or the budget was tightened
+        # below the single-line cost.
+        assert result.startswith(_MARKER_RELEVANT_MEMORIES), f"expected recall-prefixed output; got {result[:80]!r}"
 
 
 # ── TestExtractionCallSiteGating ────────────────────────────────────
@@ -391,6 +399,16 @@ class TestExtractionCallSiteGating:
         (`isinstance(if_node.test, ast.Call) and
         if_node.test.func.id == 'memory_is_enabled'`) would return
         False on this shape and silently miss the gate.
+
+        Limitation: this is a presence check, not a polarity check.
+        An inverted guard (`if not memory_is_enabled():`) would
+        ALSO satisfy the predicate because the Call lives inside
+        the `UnaryOp(Not, ...)` and `ast.walk` reaches it. A
+        regression that flipped the guard to `not` would have
+        inverted semantics (extract under disabled, skip under
+        enabled) but pass this structural test. The behavioral
+        pair in `test_bot.py::TestHandleResponse` is the polarity
+        check; this test's job is the call-site-existence check.
         """
         return any(
             isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "memory_is_enabled"
