@@ -275,16 +275,6 @@ async def _run_verify() -> int:
         # module-import time, so setting it later than the first
         # import has no effect.
         #
-        # Save/restore semantics: capture the prior value (or
-        # absence) and restore on the way out so a subsequent
-        # process-shared invocation does not inherit the now-deleted
-        # tmp path. `MEM0_DIR_SENTINEL` distinguishes "was unset"
-        # from "was empty string"; the former requires `pop`, the
-        # latter requires reassignment.
-        _MEM0_DIR_SENTINEL = object()
-        prior_mem0_dir = os.environ.get("MEM0_DIR", _MEM0_DIR_SENTINEL)
-        os.environ["MEM0_DIR"] = str(tmp_root / "mem0")
-
         # Invariant guard: backend.py and config.py do not transitively
         # import kai.memory today; the first kai.memory import happens
         # inside `_isolated_data_dir`'s body, AFTER MEM0_DIR is set.
@@ -292,9 +282,10 @@ async def _run_verify() -> int:
         # of either module, mem0 would have already captured the
         # ORIGINAL MEM0_DIR (operator's `~/.mem0/`) and the redirect
         # below has no effect, leaving the harness deadlocked against
-        # the live `migrations_qdrant` lock. Fail loud here rather
-        # than silently re-contending. The assertion fires once at
-        # the entry point, before any build_session_context call.
+        # the live `migrations_qdrant` lock. Fail loud BEFORE
+        # mutating MEM0_DIR so an assertion failure leaves the
+        # environment untouched and the try/finally below is not
+        # responsible for restoring state we never changed.
         assert "kai.memory" not in sys.modules, (
             "kai.memory was imported before _run_verify could set "
             "MEM0_DIR; mem0's home-directory constant has already been "
@@ -303,6 +294,16 @@ async def _run_verify() -> int:
             "import path now pulls kai.memory transitively; restore "
             "the lazy-import contract before re-running."
         )
+
+        # Save/restore semantics: capture the prior value (or
+        # absence) and restore on the way out so a subsequent
+        # process-shared invocation does not inherit the now-deleted
+        # tmp path. `MEM0_DIR_SENTINEL` distinguishes "was unset"
+        # from "was empty string"; the former requires `pop`, the
+        # latter requires reassignment.
+        _MEM0_DIR_SENTINEL: object = object()
+        prior_mem0_dir: str | object = os.environ.get("MEM0_DIR", _MEM0_DIR_SENTINEL)
+        os.environ["MEM0_DIR"] = str(tmp_root / "mem0")
 
         try:
             _seed_fixture_memory_md(tmp_root)
@@ -453,6 +454,11 @@ async def _run_verify() -> int:
             if prior_mem0_dir is _MEM0_DIR_SENTINEL:
                 os.environ.pop("MEM0_DIR", None)
             else:
+                # Pyright strict cannot narrow `str | object` through
+                # an `is`-check on a non-literal sentinel; the explicit
+                # isinstance assertion narrows the type for the
+                # `os.environ` setter, which requires `str`.
+                assert isinstance(prior_mem0_dir, str)
                 os.environ["MEM0_DIR"] = prior_mem0_dir
 
     # Print results.

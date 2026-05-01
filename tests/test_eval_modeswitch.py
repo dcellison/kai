@@ -121,8 +121,8 @@ class TestVerifyInvariants:
         # format_context returns "" under disabled mode by contract;
         # the recall path's is_enabled() guard short-circuits before
         # the search call. The combined output is just the
-        # build_session_context output.
-        combined = disabled_ctx + "\n" + ""
+        # build_session_context output with a trailing newline.
+        combined = disabled_ctx + "\n"
         assert _MARKER_PERSISTENT_MEMORY in combined
         assert _MARKER_RELEVANT_MEMORIES not in combined
 
@@ -149,7 +149,7 @@ class TestVerifyInvariants:
         valid under enabled mode. The invariant is the absence of
         MEMORY.md, not the presence of recall."""
         enabled_ctx = _build_enabled_ctx(tmp_path)
-        combined = enabled_ctx + "\n" + ""
+        combined = enabled_ctx + "\n"
         assert _MARKER_PERSISTENT_MEMORY not in combined
         # Both shapes valid: relevant-memories may or may not be
         # present. The load-bearing assertion is the absence of
@@ -168,7 +168,7 @@ class TestVerifyInvariants:
         relevant present (the MEMORY.md inject leaked into enabled
         mode). The assertion is the negation of both regressions."""
         # Disabled: persistent present, relevant absent.
-        disabled_combined = _build_disabled_ctx(tmp_path) + "\n" + ""
+        disabled_combined = _build_disabled_ctx(tmp_path) + "\n"
         assert not (_MARKER_PERSISTENT_MEMORY in disabled_combined and _MARKER_RELEVANT_MEMORIES in disabled_combined)
         # Enabled with recall: persistent absent (the regression
         # shape would be both present).
