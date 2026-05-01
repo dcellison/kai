@@ -505,15 +505,17 @@ async def _run_verify() -> int:
             # on (a missing or wrongly-tagged record under disabled
             # mode would silently break those harnesses).
             #
-            # Deferred import for the same reason `_isolated_data_dir`
-            # imports `kai.memory` lazily: a top-level import would
-            # capture `kai.memory` in `sys.modules` BEFORE the
-            # MEM0_DIR redirect at the start of `_run_verify` could
-            # take effect, deadlocking the harness against the live
-            # `~/.mem0/migrations_qdrant` lock the running service
-            # holds. The `if "kai.memory" in sys.modules:` guard at
-            # the top of `_run_verify` enforces the invariant; this
-            # deferred form preserves it.
+            # Deferred to preserve the `if "kai.memory" in sys.modules:`
+            # invariant guarded at the top of `_run_verify`. A
+            # top-level `from kai.memory import _RECALL_REASON_DISABLED`
+            # in this module would put `kai.memory` into `sys.modules`
+            # before `_run_verify` runs, tripping the assertion. The
+            # constant itself is a string literal and does not boot
+            # Mem0 or touch the migrations_qdrant lock; the deadlock
+            # concern that motivates `_isolated_data_dir`'s lazy
+            # import does not apply directly to this constant. The
+            # consistency-with-the-guard rationale is what carries
+            # the deferral.
             from kai.memory import _RECALL_REASON_DISABLED
 
             with _isolated_data_dir(tmp_root):

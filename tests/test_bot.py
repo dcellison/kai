@@ -2916,7 +2916,19 @@ class TestHandleResponse:
         # extract_and_store call. The OUTER is_enabled() guard is the
         # contract under test; the inner check would mask its failure
         # if both were False.
-        config = _make_config(memory_extraction_enabled=True)
+        #
+        # episode_classifier_context_turns=0 mirrors the enabled-mode
+        # counterpart's setup so the two tests are structurally
+        # symmetric. Under current behavior the disabled test never
+        # reaches the inner block, so the value is unread; the
+        # symmetry is defense-in-depth: if the monkeypatch ever stops
+        # taking effect or the guard moves, the inner block would
+        # otherwise execute with the default value of 3 and trigger
+        # an unstated `get_recent_pairs(12345, 4)` disk read.
+        config = _make_config(
+            memory_extraction_enabled=True,
+            episode_classifier_context_turns=0,
+        )
         ctx = _make_context(config=config, pool=pool)
 
         # Snapshot the task set BEFORE the call so we can compute the
