@@ -245,8 +245,9 @@ def _capture_recall_logs() -> Iterator[list[logging.LogRecord]]:
 
 def _parse_recall_reason(records: list[logging.LogRecord]) -> str | None:
     """Pull the `reason` field from the most-recent `memory.recall`
-    log record in `records`. Returns None if no such record exists
-    or if the record's payload is malformed.
+    log record in `records`. Returns None if no such record exists,
+    if the record's payload is malformed, or if the payload's
+    `reason` field is absent.
 
     The payload format is fixed at the producer
     (`memory._emit_recall_log`): a compact JSON object preceded by
@@ -255,9 +256,17 @@ def _parse_recall_reason(records: list[logging.LogRecord]) -> str | None:
     producer's `log.info("memory.recall %s", json.dumps(payload, ...))`.
 
     Returns the value of the `reason` field cast to `str`, or None
-    on any decode failure or shape mismatch. The harness callers
-    compare against `_RECALL_REASON_DISABLED` (or its absence) and
-    treat None as a separate-and-failing outcome.
+    on any decode failure, shape mismatch, or success-path payload
+    where `reason` is omitted entirely (per `_base_recall_payload`'s
+    docstring: `reason` is set only on short-circuit lines).
+
+    Caller-side interpretation differs by mode. The disabled-mode
+    caller compares `parsed == _RECALL_REASON_DISABLED` and treats
+    None as a failing outcome (it neither equals nor implies the
+    expected reason string). The enabled-mode caller compares
+    `parsed != _RECALL_REASON_DISABLED` and treats None as a
+    PASSING outcome, since the success-path payload omits `reason`
+    entirely and that absence is part of the documented contract.
     """
     prefix = "memory.recall "
     for record in reversed(records):

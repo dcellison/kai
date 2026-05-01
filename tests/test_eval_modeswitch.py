@@ -473,7 +473,11 @@ class TestExtractionCallSiteGating:
         # call site would otherwise leave this test passing
         # vacuously, masking the absence of the production behavior
         # the test is meant to backstop.
-        assert call_sites, "expected at least one `extract_and_store` call site in bot.py"
+        assert call_sites, (
+            "expected at least one `extract_and_store` call site in bot.py; "
+            "the production path lives in `_handle_response`'s post-response "
+            "ingestion block, gated by `if memory_is_enabled() and chat_id is not None:`"
+        )
 
         ungated: list[int] = []
         for call in call_sites:
