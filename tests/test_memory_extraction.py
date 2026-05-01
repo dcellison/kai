@@ -2364,8 +2364,8 @@ class TestExtractionPromptSoftVocab:
         token elsewhere cannot satisfy this test vacuously.
 
         v5, v6, and v7 fragments are pinned: v5 and v6 stay in source
-        unchanged across the v7 bump, and v7 was appended in this
-        spec's history block (issue #428)."""
+        unchanged across the v7 bump, and the v7 entry was appended
+        for issue #428."""
         from pathlib import Path
 
         import kai.memory_extraction

@@ -1100,13 +1100,12 @@ _RULE_6_REJECTIONS = _Counter()
 # CLASSIFICATION block under v7) is the primary gate; this regex
 # rejects workflow-event-shape episodes whose `goal` starts with the
 # canonical verbs that named ~57% of the 2026-04-30 production episode
-# snapshot. The arms catch the leading-verb shape; the per-arm noun
-# alternation is a single union list, intentionally a touch broader
-# than the spec's per-arm noun lists because the verb itself is the
-# workflow signal and the noun-list intersection is dominated by the
-# narrow per-arm cases anyway. Future maintainers tightening this
-# regex should split on individual arm regexes rather than expanding
-# the union noun list.
+# snapshot. The arms catch the leading-verb shape; the noun
+# alternation is a single union list rather than a per-verb split
+# because the verb itself is the workflow signal and a per-verb noun
+# split would only narrow false positives that are already rare.
+# Future maintainers tightening this regex should split on individual
+# arm regexes rather than expanding the union noun list.
 _EPISODE_GOAL_NOISE_RE = re.compile(
     r"^"
     # Group 1: the leading verb token. _ARM_FOR_VERB below maps the
