@@ -69,7 +69,18 @@ log = logging.getLogger(__name__)
 # as the last gate before emit. Schema unchanged; v6's bump lets
 # future-cleanup queries target rows produced under the new
 # wording (`prompt_version != "6" AND <noise pattern>`).
-_EXTRACTION_PROMPT_VERSION: str = "6"
+# v7 (2026-04-30, this issue): scoped the EPISODE CLASSIFICATION block.
+# Positive criterion 1 narrowed to "durable situation" with an
+# explicit forward reference to the new EPISODE IGNORE list. Three
+# IGNORE bullets added (workflow-loop iterations, routine workflow
+# transactions, process meta-lessons) plus an episode-scoped
+# DURABILITY TEST gate. The fact-extraction sections of the prompt
+# are unchanged from v6, so fact-storage parsing on the Python side
+# is the same; the bump is the canary that lets post-rollout log
+# analysis distinguish episodes classified under the tightened
+# wording (`prompt_version == "7"` on the extracted row produced
+# by the same call).
+_EXTRACTION_PROMPT_VERSION: str = "7"
 
 # Sibling of _EXTRACTION_PROMPT_VERSION for stage-2 episode generation.
 # Stored in each episode's metadata so future cleanups can target a
@@ -437,7 +448,12 @@ NEVER the unit being classified.
 
 Set `has_episode: true` ONLY when ALL of the following hold:
 1. The CURRENT exchange contains a stated decision, lesson, outcome,
-   or resolution. Closure must be visible in the current turn itself.
+   or resolution AT THE LEVEL OF A DURABLE SITUATION (an architectural
+   choice, an empirical finding, a design tradeoff resolved). Closure
+   must be visible in the current turn itself. A workflow-loop closure
+   (a review-round verdict, an evaluation result, a routine artifact
+   filed) is NOT a durable situation; see the EPISODE IGNORE list
+   below.
 2. The PRIOR CONTEXT (if non-empty) sets up that closure: a problem,
    a question, a deliberation, an incident in progress.
 3. You can quote a fragment from the CURRENT exchange (not from
@@ -451,6 +467,38 @@ Set `has_episode: false` when:
   acknowledgment, casual chat.
 - Closure exists in prior turns but the current turn moved on to a
   new topic.
+
+EPISODE IGNORE rules (override the false-when list above; if any of
+these match the CURRENT exchange, has_episode is false):
+
+- Workflow-loop iterations: the closure of a review round, an
+  evaluation pass, a triage cycle, or any other recurring workflow
+  rhythm. The artifact (the spec, the PR, the issue, the wiki page)
+  is durable; the recurring evaluation cycles around it are not
+  episodes. Examples to NOT classify as episodes: "approved with
+  three nits", "v3 evaluation closed cleanly", "all four findings
+  resolved", "PR review verdict approved", "ready to ship".
+
+- Routine workflow transactions: filing an issue, drafting a spec,
+  pushing a wiki commit, scheduling an agent, posting a comment.
+  These are individual transactions, not closures of a deliberation.
+  Examples to NOT classify as episodes: "filed issue #N", "drafted
+  the epic body", "pushed Memory.md to the wiki".
+
+- Process meta-lessons: situations whose only outcome is a
+  generalization about how a workflow runs (severity gradients,
+  same-class audits, convergence patterns, review-round counts).
+  The lesson belongs to a methodology document if it belongs
+  anywhere; it is not a per-situation episode.
+
+EPISODE DURABILITY TEST:
+
+Before setting has_episode: true, ask: "would a future session
+benefit from retrieving this situation, or only from the artifact
+it produced?" If the answer is "only the artifact", set
+has_episode: false. The artifact (issue, PR, spec, commit, wiki
+page) is durable on its own; an episode about the act of producing
+it is not.
 
 When in doubt, prefer false. The cost of a false negative is one
 missed episode; the cost of a false positive is a hallucinated
@@ -1045,14 +1093,163 @@ class _Counter:
 _RULE_6_REJECTIONS = _Counter()
 
 
-def get_extractor_stats() -> dict[str, dict[str, int]]:
+# ── Episode validator: workflow-shape goal rejection (issue #428) ────
+#
+# Defense-in-depth backstop on the stage-2 episode generator output.
+# Stage-1 classifier (`_EXTRACTION_SYSTEM_PROMPT`'s EPISODE
+# CLASSIFICATION block under v7) is the primary gate; this regex
+# rejects workflow-event-shape episodes whose `goal` starts with the
+# canonical verbs that named ~57% of the 2026-04-30 production episode
+# snapshot. The arms catch the leading-verb shape; the per-arm noun
+# alternation is a single union list, intentionally a touch broader
+# than the spec's per-arm noun lists because the verb itself is the
+# workflow signal and the noun-list intersection is dominated by the
+# narrow per-arm cases anyway. Future maintainers tightening this
+# regex should split on individual arm regexes rather than expanding
+# the union noun list.
+_EPISODE_GOAL_NOISE_RE = re.compile(
+    r"^"
+    # Group 1: the leading verb token. _ARM_FOR_VERB below maps the
+    # captured verb to one of three arm labels (review, approve,
+    # transaction) so per-arm rejection counts can be reported via
+    # `get_extractor_stats()`.
+    r"(Evaluate|Review|Audit|Approve|File|Push|Draft|Schedule|Post)"
+    r"\s+"
+    # 0 to 6 intervening word-shaped tokens (lazy) between the verb
+    # and the artifact noun. Catches real production goals like
+    # "Push a prepared Memory wiki page", "Approve v3 of the
+    # memory-md-to-Qdrant migration spec", and "File a tracking
+    # issue for X". Bounded explicitly so a long fact text cannot
+    # drive quadratic backtracking. The token class is alphanumerics
+    # + `#` + `-` so things like "#412", "v3", and "tag-dedup" pass
+    # through. Mirrors `_WORKFLOW_EVENT_RE` arm 2's bounded-gap
+    # pattern. Cap of 6 was chosen by probing real production
+    # goals: 5-token gaps appeared in the snapshot
+    # ("Approve v3 of the X-Y-Z migration spec"), so 6 leaves
+    # one token of headroom without expanding the false-positive
+    # surface meaningfully.
+    r"(?:[\w#-]+\s+){0,6}?"
+    # The artifact-noun alternation is the union of the three per-arm
+    # noun lists. A workflow-shape goal almost always ends with one
+    # of these nouns; the union form catches "Evaluate the wiki" and
+    # "File a revision" too, which are still workflow-shape and
+    # should be rejected.
+    r"(?:spec|specification|PR|issue|pull request|revision|version|wiki|epic|comment|reminder)"
+    r"\b",
+    re.IGNORECASE,
+)
+
+
+# Maps the lowercase verb in `_EPISODE_GOAL_NOISE_RE` group 1 to one
+# of three arm labels. The labels are the keys reported in
+# `_EPISODE_VALIDATE_REJECTIONS.snapshot()` so an operator can see
+# which workflow shape is hitting the backstop without parsing logs.
+_ARM_FOR_VERB: dict[str, str] = {
+    "evaluate": "review",
+    "review": "review",
+    "audit": "review",
+    "approve": "approve",
+    "file": "transaction",
+    "push": "transaction",
+    "draft": "transaction",
+    "schedule": "transaction",
+    "post": "transaction",
+}
+
+
+class _PerArmCounter:
+    """Per-user, per-arm rejection counter for `_validate_episode`.
+
+    Same lifecycle and exposure contract as `_Counter` (used by
+    Rule 6); the per-arm extension lets eval harnesses tell which
+    workflow shape is hitting the backstop without parsing logs.
+    """
+
+    def __init__(self) -> None:
+        # Outer dict keyed by user_id; inner by arm label. Both
+        # populated lazily on the first increment for that pair.
+        self._counts: dict[str, dict[str, int]] = {}
+
+    def increment(self, *, user_id: str, arm: str) -> None:
+        per_user = self._counts.setdefault(user_id, {})
+        per_user[arm] = per_user.get(arm, 0) + 1
+
+    def snapshot(self) -> dict[str, dict[str, int]]:
+        # Deep-copy each per-user dict so callers cannot mutate the
+        # internal state. `dict(...)` does a shallow per-user copy
+        # which is sufficient because inner values are ints.
+        return {u: dict(v) for u, v in self._counts.items()}
+
+    def _reset(self) -> None:
+        """Test-only: clear per-user counts in place. Same rationale
+        as `_Counter._reset` (downstream importers hold a reference
+        to the module-level instance; rebinding would orphan them).
+        """
+        self._counts.clear()
+
+
+# Module-level counter for `_validate_episode` rejections, keyed by
+# `user_id` then by arm label. Process-local; not persisted. Read
+# via `get_extractor_stats()`.
+_EPISODE_VALIDATE_REJECTIONS = _PerArmCounter()
+
+
+def _validate_episode(episode: dict, *, user_id: str) -> dict | None:
+    """Final-gate validator for stage-2 episode generator output.
+
+    Returns the episode dict unchanged on accept, or None on reject.
+    Reject path increments a per-user, per-arm counter exposed via
+    `get_extractor_stats()`. The caller (`_generate_episode`) treats
+    None as a reject and emits a `validate_rejected` outcome on the
+    `memory.episode` log line in place of the `stored` outcome.
+
+    Defense-in-depth against the prompt at `_EXTRACTION_SYSTEM_PROMPT`
+    missing workflow-event-shape episodes. The prompt is the primary
+    gate; this regex is narrower and only catches the canonical shapes
+    from the 2026-04-30 hygiene-sweep audit (issue #428).
+    """
+    goal = episode.get("goal", "")
+    # Defensive type check: stage-2 schema enforces goal as a string,
+    # but a malformed payload (e.g. a stage-2 prompt edit that broke
+    # the schema contract) should reject rather than crash inside
+    # the regex match call. The reject path is the safe direction.
+    if not isinstance(goal, str):
+        return None
+    match = _EPISODE_GOAL_NOISE_RE.match(goal)
+    if match is None:
+        return episode
+    verb = (match.group(1) or "").lower()
+    arm = _ARM_FOR_VERB.get(verb, "unknown")
+    _EPISODE_VALIDATE_REJECTIONS.increment(user_id=user_id, arm=arm)
+    log.debug(
+        "_validate_episode: rejecting workflow-shape episode goal: %r (arm=%s)",
+        goal,
+        arm,
+    )
+    return None
+
+
+def get_extractor_stats() -> dict[str, dict]:
     """Snapshot of in-process extractor counters.
 
-    Currently exposes Rule 6 rejection counts per user_id. Structure
-    is extensible (top-level dict keyed by counter name) so future
-    counters can land without breaking callers.
+    Exposes two counters keyed by counter name:
+
+    - `rule_6_rejections`: per-user count of `_validate_facts` Rule 6
+      rejections. Inner shape `{user_id: count}`.
+    - `episode_validate_rejections`: per-user, per-arm count of
+      `_validate_episode` rejections (issue #428). Inner shape
+      `{user_id: {arm: count}}` with arm in `review`, `approve`,
+      `transaction`.
+
+    The return type widens to `dict[str, dict]` because the two
+    inner shapes differ; callers should branch on the counter
+    name. Structure is extensible (top-level dict keyed by counter
+    name) so future counters can land without breaking callers.
     """
-    return {"rule_6_rejections": _RULE_6_REJECTIONS.snapshot()}
+    return {
+        "rule_6_rejections": _RULE_6_REJECTIONS.snapshot(),
+        "episode_validate_rejections": _EPISODE_VALIDATE_REJECTIONS.snapshot(),
+    }
 
 
 def _validate_facts(
@@ -1545,6 +1742,12 @@ def _emit_episode_log(
     and `reason IS NOT NULL` are mutually exclusive partitions of the
     log stream, instead of one being always-present-as-null and the
     other being conditional.
+
+    Documented outcome enum: `stored`, `store_failed`, `timeout`,
+    `subprocess_error`, `parse_error`, `validate_rejected`. The
+    `validate_rejected` outcome (issue #428) fires when the stage-2
+    output's `goal` matches `_EPISODE_GOAL_NOISE_RE`; per-arm
+    rejection counts are exposed via `get_extractor_stats()`.
     """
     payload: dict = {
         "user_id": user_id,
@@ -1729,7 +1932,7 @@ async def _generate_episode(
             if episode is None:
                 # Map the run-helper's failure tags onto the documented
                 # outcome enum: timeout, subprocess_error, parse_error,
-                # store_failed, stored.
+                # store_failed, validate_rejected, stored.
                 #
                 # Subprocess-level faults (exit code, is_error envelope
                 # from a budget burn or auth failure) collapse to
@@ -1762,52 +1965,71 @@ async def _generate_episode(
                     outcome = "parse_error"
                 reason = run_reason
             else:
-                # Build the metadata dict matching the Sophia schema +
-                # the `actors` Kai extension. `lessons` is optional and
-                # absent from the dict when the model omitted it (the
-                # design-doc "if anything" pattern; absence is the
-                # sentinel for "no lesson this time", not empty-string).
-                content = f"{episode['goal']}\n\n{episode['context']}"
-                extra: dict = {
-                    "source": "episode",
-                    "goal": episode["goal"],
-                    "context": episode["context"],
-                    "approach": episode["approach"],
-                    "outcome": episode["outcome"],
-                    "outcome_quality": episode["outcome_quality"],
-                    "tags": episode["tags"],
-                    "actors": episode["actors"],
-                    "session_id": session_id or "",
-                    "episode_prompt_version": _EPISODE_PROMPT_VERSION,
-                }
-                if "lessons" in episode:
-                    extra["lessons"] = episode["lessons"]
-                # add_structured is sync (Mem0 is sync). Run off the
-                # event loop so the embedding step does not block other
-                # stage-2 tasks queued behind this user's semaphore.
-                loop = asyncio.get_running_loop()
-                mem_id = await loop.run_in_executor(
-                    None,
-                    lambda: memory.add_structured(
-                        content=content,
-                        user_id=user_id,
-                        memory_type="episode",
-                        tags=episode["tags"],
-                        metadata=extra,
-                    ),
-                )
-                # add_structured returns the new memory ID on success or
-                # None when the underlying Mem0 call failed (backend
-                # error, content rejected). Branch on the return so the
-                # `store_failed` outcome is reachable; without this only
-                # success outcomes would log.
-                if mem_id is not None:
-                    outcome = "stored"
-                    memory_id = mem_id
-                    reason = None
+                # Final-gate validation: reject workflow-event-shape
+                # episodes before they reach add_structured. The
+                # backstop catches the canonical `Evaluate spec`,
+                # `Approve PR`, `File issue`, `Push wiki` shapes that
+                # the v7 EPISODE IGNORE list aims to suppress at the
+                # prompt level. The reject path counts the rejection
+                # per-user-per-arm and emits a `validate_rejected`
+                # outcome on the memory.episode log line so an
+                # operator can see backstop activity without grepping
+                # logs.
+                validated = _validate_episode(episode, user_id=user_id)
+                if validated is None:
+                    outcome = "validate_rejected"
+                    reason = "goal matches workflow-event regex"
                 else:
-                    outcome = "store_failed"
-                    reason = "add_structured returned None"
+                    episode = validated
+                    # Build the metadata dict matching the Sophia
+                    # schema + the `actors` Kai extension. `lessons`
+                    # is optional and absent from the dict when the
+                    # model omitted it (the design-doc "if anything"
+                    # pattern; absence is the sentinel for "no lesson
+                    # this time", not empty-string).
+                    content = f"{episode['goal']}\n\n{episode['context']}"
+                    extra: dict = {
+                        "source": "episode",
+                        "goal": episode["goal"],
+                        "context": episode["context"],
+                        "approach": episode["approach"],
+                        "outcome": episode["outcome"],
+                        "outcome_quality": episode["outcome_quality"],
+                        "tags": episode["tags"],
+                        "actors": episode["actors"],
+                        "session_id": session_id or "",
+                        "episode_prompt_version": _EPISODE_PROMPT_VERSION,
+                    }
+                    if "lessons" in episode:
+                        extra["lessons"] = episode["lessons"]
+                    # add_structured is sync (Mem0 is sync). Run off
+                    # the event loop so the embedding step does not
+                    # block other stage-2 tasks queued behind this
+                    # user's semaphore.
+                    loop = asyncio.get_running_loop()
+                    mem_id = await loop.run_in_executor(
+                        None,
+                        lambda: memory.add_structured(
+                            content=content,
+                            user_id=user_id,
+                            memory_type="episode",
+                            tags=episode["tags"],
+                            metadata=extra,
+                        ),
+                    )
+                    # add_structured returns the new memory ID on
+                    # success or None when the underlying Mem0 call
+                    # failed (backend error, content rejected).
+                    # Branch on the return so the `store_failed`
+                    # outcome is reachable; without this only success
+                    # outcomes would log.
+                    if mem_id is not None:
+                        outcome = "stored"
+                        memory_id = mem_id
+                        reason = None
+                    else:
+                        outcome = "store_failed"
+                        reason = "add_structured returned None"
     except asyncio.CancelledError:
         # Cooperative-shutdown signal. Re-raise so the runner knows the
         # task was cancelled (not silently completed) - same posture as
@@ -2289,6 +2511,7 @@ __all__ = [
     "_run_extractor",
     "_store_facts",
     "_strip_role_labels",
+    "_validate_episode",
     "_validate_facts",
     "extract_and_store",
 ]

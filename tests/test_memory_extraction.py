@@ -26,6 +26,7 @@ from kai.config import Config
 from kai.memory import MemoryResult
 from kai.memory_extraction import (
     _CONFIRMATION_QUOTE_MIN_CHARS,
+    _EPISODE_VALIDATE_REJECTIONS,
     _EXTRACTION_PROMPT_VERSION,
     _EXTRACTION_SYSTEM_PROMPT,
     _FACT_SCHEMA,
@@ -41,6 +42,7 @@ from kai.memory_extraction import (
     _render_candidate_source,
     _store_facts,
     _strip_role_labels,
+    _validate_episode,
     _validate_facts,
     extract_and_store,
     get_extractor_stats,
@@ -2351,7 +2353,7 @@ class TestExtractionPromptSoftVocab:
     def test_extraction_prompt_version_bumped(self):
         """The version stamp on every fact's metadata; bumped
         whenever the schema or prompt changes meaningfully."""
-        assert _EXTRACTION_PROMPT_VERSION == "6"
+        assert _EXTRACTION_PROMPT_VERSION == "7"
 
     def test_extraction_prompt_version_history_extended(self):
         """The prompt-version history comment block (the sequence
@@ -2361,9 +2363,9 @@ class TestExtractionPromptSoftVocab:
         fragments so a future unrelated edit that introduces a `vN:`
         token elsewhere cannot satisfy this test vacuously.
 
-        Both v5 and v6 fragments are pinned: v5 stays in source
-        unchanged across the v6 bump, and v6 was appended in this
-        spec's history block."""
+        v5, v6, and v7 fragments are pinned: v5 and v6 stay in source
+        unchanged across the v7 bump, and v7 was appended in this
+        spec's history block (issue #428)."""
         from pathlib import Path
 
         import kai.memory_extraction
@@ -2372,6 +2374,8 @@ class TestExtractionPromptSoftVocab:
         assert "v5: free-form tag schema (enum dropped)" in src
         assert "v6 (2026-04-30, this issue)" in src
         assert "DURABILITY TEST gate" in src
+        assert "v7 (2026-04-30, this issue)" in src
+        assert "EPISODE CLASSIFICATION block" in src
 
 
 class TestRule6WorkflowEventRegex:
@@ -2681,3 +2685,263 @@ class TestValidateFactsRule4b:
         candidate_ids = {"prior-pref"}
         candidate_metadata = {"prior-pref": {"tags": ["preference"], "source": "extracted"}}
         assert _validate_facts(facts, candidate_ids, candidate_metadata=candidate_metadata, user_id="u-test") == facts
+
+
+class TestEpisodeClassificationIgnoreList:
+    """The v7 EPISODE CLASSIFICATION block adds three IGNORE bullets
+    (workflow-loop iterations, routine workflow transactions, process
+    meta-lessons) plus an EPISODE DURABILITY TEST gate. These tests
+    pin the prompt-side wording in source so a future edit cannot
+    silently drop any of the four sections (issue #428)."""
+
+    def test_workflow_loop_iterations_bullet_present(self):
+        """The first IGNORE bullet calls out review-round verdicts and
+        evaluation-pass closures. The exact opening sentence is pinned
+        so the bullet cannot be silently softened."""
+        assert "Workflow-loop iterations: the closure of a review round" in _EXTRACTION_SYSTEM_PROMPT
+
+    def test_routine_workflow_transactions_bullet_present(self):
+        """The second IGNORE bullet covers individual transactions
+        (file/push/draft) that are not deliberation closures."""
+        assert "Routine workflow transactions: filing an issue" in _EXTRACTION_SYSTEM_PROMPT
+
+    def test_process_meta_lessons_bullet_present(self):
+        """The third IGNORE bullet rejects situations whose only
+        outcome is a generalization about how a workflow runs."""
+        assert "Process meta-lessons: situations whose only outcome" in _EXTRACTION_SYSTEM_PROMPT
+
+    def test_episode_durability_test_present(self):
+        """The episode-scoped DURABILITY TEST asks "would a future
+        session benefit from retrieving this situation, or only from
+        the artifact it produced?". Both the section header and the
+        load-bearing artifact-vs-situation phrase are pinned so a
+        future edit cannot silently drop either. The pinned answer
+        phrase `"only the artifact"` (with quotes) is the unique
+        single-line fragment of the gate's verdict clause; the
+        question phrasing wraps across lines and is not pinned
+        directly."""
+        assert "EPISODE DURABILITY TEST:" in _EXTRACTION_SYSTEM_PROMPT
+        assert "would a future session" in _EXTRACTION_SYSTEM_PROMPT
+        assert '"only the artifact"' in _EXTRACTION_SYSTEM_PROMPT
+
+
+class TestValidateEpisodeWorkflowRegex:
+    """`_validate_episode` rejects stage-2 episode outputs whose `goal`
+    matches `_EPISODE_GOAL_NOISE_RE`. The regex catches three arms
+    (review, approve, transaction); per-arm rejection counts are
+    exposed via `get_extractor_stats()` (issue #428)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_counter(self):
+        """Counter resets per test so per-arm assertions are not
+        affected by sibling tests in this class."""
+        _EPISODE_VALIDATE_REJECTIONS._reset()
+        yield
+        _EPISODE_VALIDATE_REJECTIONS._reset()
+
+    def test_arm1_evaluate_review_audit(self):
+        """Arm 1 maps Evaluate/Review/Audit verbs to the `review`
+        arm label. Sanitized artifact identifiers throughout (`#0`,
+        `foo`) so the test data carries no real spec/PR numbers."""
+        positives = [
+            "Evaluate v3 spec for issue #0",
+            "Review the v2 PR for component foo",
+            "Audit specification bar against current source",
+        ]
+        for goal in positives:
+            r = _validate_episode({"goal": goal}, user_id="u-test")
+            assert r is None, f"expected reject: {goal!r}"
+
+    def test_arm2_approve(self):
+        """Arm 2 maps Approve to the `approve` arm label. The
+        intervening-tokens cap admits multi-word artifact qualifiers
+        ("v3 of the foo-bar migration spec")."""
+        positives = [
+            "Approve the v4 specification revision",
+            "Approve PR #1",
+            "Approve v3 of the foo-bar migration spec",
+        ]
+        for goal in positives:
+            r = _validate_episode({"goal": goal}, user_id="u-test")
+            assert r is None, f"expected reject: {goal!r}"
+
+    def test_arm3_routine_transactions(self):
+        """Arm 3 covers File/Push/Draft/Schedule/Post verbs mapped
+        to the `transaction` arm label. Real production goals like
+        "Push a prepared Memory wiki page" sit at the upper end of
+        the intervening-token budget."""
+        positives = [
+            "File the GitHub issue for component bar",
+            "Push Memory wiki page",
+            "Push a prepared Memory wiki page to the kai repository",
+            "Draft an epic body for the migration",
+            "Schedule a reminder for tomorrow",
+            "Post a comment on PR #2",
+        ]
+        for goal in positives:
+            r = _validate_episode({"goal": goal}, user_id="u-test")
+            assert r is None, f"expected reject: {goal!r}"
+
+    def test_arm_counter_increments_per_user_per_arm(self):
+        """End-to-end: drive each arm once and assert the per-user,
+        per-arm counter snapshot reflects the rejections. The counter
+        is the load-bearing artifact for eval-harness assertions and
+        operator dashboards; without it, the harness cannot tell which
+        workflow shape is hitting the backstop."""
+        _validate_episode({"goal": "Evaluate spec foo"}, user_id="u1")
+        _validate_episode({"goal": "Approve PR #0"}, user_id="u1")
+        _validate_episode({"goal": "File a GitHub issue for bar"}, user_id="u1")
+        _validate_episode({"goal": "Audit specification baz"}, user_id="u2")
+        snap = _EPISODE_VALIDATE_REJECTIONS.snapshot()
+        assert snap == {
+            "u1": {"review": 1, "approve": 1, "transaction": 1},
+            "u2": {"review": 1},
+        }
+
+    def test_durable_goals_pass(self):
+        """Durable design-decision and empirical-investigation goals
+        are the load-bearing negatives. A regression that broadens
+        the regex to catch substantive content trips here first.
+        Pulled from the snapshot's 13 durable episodes (the inverse
+        of the 29-ID hygiene-sweep deletion list)."""
+        negatives = [
+            "Update wiki documentation to match the current bot command surface",
+            "Determine the correct cadence for surfacing the memory_enabled flag",
+            "Switch all persistent memory writes from MEMORY.md to the API",
+            "Confirm the five-stage memory episode pipeline fires end-to-end",
+            "Apply em-dashes consistently on an existing wiki page",
+            "Run a 10-probe eval to determine whether removing assistant-derived facts helps",
+            "Determine which iterate-epic candidate should land first",
+            "Correct two design mistakes in the memory feature plan",
+            "Establish that budget framing has no place in the claude backend",
+        ]
+        for goal in negatives:
+            r = _validate_episode({"goal": goal}, user_id="u-test")
+            assert r is not None, f"expected pass: {goal!r}"
+
+
+class TestValidateEpisodeIntegration:
+    """End-to-end behavior of the validator hookup in `_generate_episode`.
+    A workflow-shape goal returned by stage-2 must short-circuit before
+    `add_structured`, emit a `validate_rejected` outcome on the
+    memory.episode log line, and increment the per-arm counter
+    (issue #428).
+
+    Mock points:
+    - `_run_episode_extractor`: stubbed to return a known episode dict
+      so the test exercises the validate path without spawning a
+      subprocess.
+    - `memory.add_structured`: stubbed so the test does not touch a
+      real backend; reachability of this mock distinguishes accept
+      from reject paths.
+    - `_emit_episode_log`: captured to verify outcome / reason.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_counter(self):
+        _EPISODE_VALIDATE_REJECTIONS._reset()
+        yield
+        _EPISODE_VALIDATE_REJECTIONS._reset()
+
+    @pytest.mark.asyncio
+    async def test_workflow_shape_goal_rejected(self, monkeypatch):
+        """A stage-2 output whose `goal` matches arm 1 (Evaluate)
+        is rejected. Outcome is `validate_rejected`, reason names the
+        regex, the counter increments under the correct arm, and
+        `add_structured` is never called."""
+        from kai import memory_extraction
+
+        episode_payload = {
+            "goal": "Evaluate spec foo v3 for sub-issue #0",
+            "context": "ctx",
+            "approach": "ap",
+            "outcome": "out",
+            "outcome_quality": "success",
+            "tags": ["t1"],
+            "actors": ["user"],
+        }
+
+        async def _fake_runner(payload, config):
+            return episode_payload, 0.001, None
+
+        captured: dict = {}
+
+        def _fake_emit(**kwargs):
+            captured.update(kwargs)
+
+        add_structured_called = False
+
+        def _fake_add_structured(*args, **kwargs):
+            nonlocal add_structured_called
+            add_structured_called = True
+            return "should-not-reach-this-id"
+
+        monkeypatch.setattr(memory_extraction, "_run_episode_extractor", _fake_runner)
+        monkeypatch.setattr(memory_extraction, "_emit_episode_log", _fake_emit)
+        from kai import memory as memory_module
+
+        monkeypatch.setattr(memory_module, "add_structured", _fake_add_structured)
+
+        await memory_extraction._generate_episode(
+            user_text="evaluate it",
+            assistant_text="approved with three nits",
+            user_id="u-int",
+            session_id="s-1",
+            config=_cfg(),
+        )
+
+        assert captured["outcome"] == "validate_rejected"
+        assert "workflow-event regex" in (captured.get("reason") or "")
+        assert captured.get("memory_id") is None
+        assert add_structured_called is False
+        snap = _EPISODE_VALIDATE_REJECTIONS.snapshot()
+        assert snap == {"u-int": {"review": 1}}
+
+    @pytest.mark.asyncio
+    async def test_durable_goal_passes_to_storage(self, monkeypatch):
+        """A stage-2 output whose `goal` is durable shape passes
+        validation and reaches `add_structured`. Outcome is `stored`,
+        the counter does NOT increment, and the memory_id flows back
+        to the log emission."""
+        from kai import memory_extraction
+
+        episode_payload = {
+            "goal": "Lock per-user home workspace as the canonical layout",
+            "context": "ctx",
+            "approach": "ap",
+            "outcome": "out",
+            "outcome_quality": "success",
+            "tags": ["t1"],
+            "actors": ["user"],
+        }
+
+        async def _fake_runner(payload, config):
+            return episode_payload, 0.001, None
+
+        captured: dict = {}
+
+        def _fake_emit(**kwargs):
+            captured.update(kwargs)
+
+        def _fake_add_structured(*args, **kwargs):
+            return "stored-mem-id"
+
+        monkeypatch.setattr(memory_extraction, "_run_episode_extractor", _fake_runner)
+        monkeypatch.setattr(memory_extraction, "_emit_episode_log", _fake_emit)
+        from kai import memory as memory_module
+
+        monkeypatch.setattr(memory_module, "add_structured", _fake_add_structured)
+
+        await memory_extraction._generate_episode(
+            user_text="propose home layout",
+            assistant_text="locked: per-user home workspace",
+            user_id="u-int",
+            session_id="s-1",
+            config=_cfg(),
+        )
+
+        assert captured["outcome"] == "stored"
+        assert captured.get("memory_id") == "stored-mem-id"
+        assert captured.get("reason") is None
+        snap = _EPISODE_VALIDATE_REJECTIONS.snapshot()
+        assert snap == {}

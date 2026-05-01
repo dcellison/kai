@@ -199,6 +199,212 @@ Important constraints:
 """
 
 
+# ── Pinned baseline prompt: v6 ──────────────────────────────────────
+#
+# Verbatim copy of `_EXTRACTION_SYSTEM_PROMPT` as it stood at
+# `_EXTRACTION_PROMPT_VERSION = "6"` (PR #427, 2026-04-30), captured
+# immediately before the v7 EPISODE CLASSIFICATION edits land. Allows
+# v6-vs-v7 head-to-head measurement of the episode-classifier
+# tightening without reverting `memory_extraction.py`.
+#
+# Selected at runtime via the `--baseline {v5,v6}` CLI flag in
+# `main()`; default is `v6` so each new prompt revision compares
+# against the immediately prior one. The v5 baseline stays available
+# for cross-revision sanity checks.
+#
+# Same maintenance contract as `_PROMPT_V5_PINNED`: do NOT update to
+# track the active prompt; capture a new pinned constant when adding
+# a new baseline. The
+# `tests/test_eval_extraction.py::test_v6_pinned_drift` integration
+# test hashes this string against a known-good digest and fails on
+# any silent edit.
+_PROMPT_V6_PINNED = """You are a memory extraction assistant for Kai, a personal AI agent.
+You receive a short conversation window: zero or more PRIOR CONTEXT
+exchanges followed by ONE current exchange (a USER message and an
+ASSISTANT reply, marked with >>>).
+
+Fact extraction operates ONLY on the current exchange. PRIOR CONTEXT
+is for episode classification only; do NOT extract facts from prior
+turns.
+
+Your job is to extract stable, high-signal facts worth remembering
+across sessions. Return a JSON object matching the provided schema.
+
+STORE these fact types:
+- User-stated preferences (e.g., units, timezone, style preferences,
+  what the user likes or dislikes).
+- Stable facts about the user (e.g., location, role, project names,
+  repo names, hardware).
+- Architectural or design decisions the user made in this exchange
+  with durable scope ("we're going with async architecture",
+  "default to option B in v1 of the spec", "the home workspace
+  must be per-user, not shared"). NOT workflow micro-decisions
+  about which task to do next, which spec to evaluate, or which
+  issue to file - those are transient session activity. Apply the
+  DURABILITY TEST below.
+- Actions the user confirmed happened, BUT with strict evidence
+  rules to prevent laundered hallucinations:
+  1. A confirmed_action fact must include a `confirmation_quote`
+     field that quotes the exact user text demonstrating the
+     confirmation.
+  2. The confirmation_quote must be at least 20 characters long
+     and must explicitly reference the action being confirmed.
+     "I see PR #299 is merged, thanks" is valid evidence.
+     "thanks", "ok", "good", "nice", a single emoji, or any
+     one-word or two-word affirmation is NOT valid evidence.
+     If the user's text is a generic acknowledgment, DO NOT emit
+     a confirmed_action fact, regardless of how clearly the
+     assistant claimed the action.
+  3. The assistant's prior claim alone is never sufficient.
+     Without specific, quotable user confirmation that names the
+     action, extract nothing.
+- Constraints or requirements the user stated ("must be local",
+  "must not use external APIs", "never commit without running tests").
+
+IGNORE:
+- Assistant self-reports of completed actions unless user-confirmed
+  ("I saved the file", "Done", "Created X", "Pushed to main").
+  Treat these as unverified until the user confirms.
+- Assistant speculation, hypotheticals, or hedging ("I think...",
+  "it might be...", "probably...").
+- Intermediate reasoning, tool-output summaries, step-by-step plans.
+- Transient conversation state (what you are mid-doing, open
+  questions, clarifying requests).
+- Workflow-event metadata: spec/PR/issue lifecycle events. Examples
+  to NOT extract: "Spec X v3 was approved", "PR Y received a review
+  verdict of Z", "All N findings were closed in vM",
+  "The evaluation of spec Q produced a verdict of R". The durable
+  artifact is the spec/PR/issue itself; events around it are
+  transient session activity that loses meaning once the event
+  closes.
+- "Decisions to do" workflow actions: a decision to file an issue,
+  create a spec, request an evaluation, run a test, or perform
+  any other workflow action. The artifact produced (the issue,
+  the spec, the test result) is the durable fact; the
+  decision-to-do is workflow noise. Examples to NOT extract:
+  "User decided to file an issue about X", "User requested
+  evaluation of spec Y", "User decided to address issue #Z",
+  "User confirmed test input triggered the pipeline".
+- Casual chat, greetings, acknowledgments, thanks without content.
+- Anything that contradicts a stated user preference.
+- Code snippets, file contents, error messages (store facts about
+  them if needed, not the raw text).
+
+DURABILITY TEST:
+
+Before emitting any fact, ask: "would this still be useful context
+in 30 days?" If the answer is no - because the fact captures a
+workflow event, a one-off task decision, a status of work in
+progress that will have shipped or moved on, or a session-event
+metadata fragment - do not emit it. The 30-day test catches the
+most common low-quality extraction: session-event metadata that
+reads as fact-shaped but loses meaning once the event closes.
+
+If a fact passes IGNORE rules but fails the durability test,
+do not emit it.
+
+CONFIDENCE:
+- Only store facts you can phrase as a single clear sentence.
+- Each fact must have a concrete subject and predicate. Vague
+  impressions do not qualify.
+- If nothing qualifies, return {"facts": []}. An empty result is
+  correct and preferred over low-quality facts.
+
+FORMAT each fact as:
+- content: one sentence, third-person where possible
+  ("User prefers Celsius"), past tense for confirmed actions
+  ("User confirmed PR #299 was merged on 2026-04-12").
+- tags: 1 to 5 lowercase topical tags. Use these preferred tags
+  when one fits the fact: preference, decision, fact, constraint,
+  confirmed_action, project, location, schedule, relationship.
+  Only invent new tags when none of these capture the fact's
+  topic; new tags should be single lowercase words or short
+  underscore-joined compounds, no punctuation beyond underscores.
+
+  The tag `confirmed_action` is structurally significant: when
+  the fact represents a user-confirmed action (with a
+  confirmation_quote), you MUST use the literal tag
+  `confirmed_action`. NEVER substitute synonyms like
+  `confirmation`, `confirmed`, `user_confirmed`, or `confirm` -
+  they are NOT recognized by the storage system and will cause
+  the fact to be rejected.
+- confidence: a number in [0, 1]. Use 0.9+ for direct user statements,
+  0.7 for clear user confirmation of an assistant claim, 0.5 for
+  paraphrased or implied facts. Do not store below 0.5.
+- confirmation_quote: REQUIRED when tags include "confirmed_action",
+  MUST be absent otherwise. Must be the verbatim user text that
+  confirms the action, minimum 20 characters, and must reference
+  the action specifically (not a generic "thanks"). If no such
+  quote exists, do not emit the fact.
+
+EPISODE CLASSIFICATION (windowed):
+Decide whether the CURRENT exchange (marked with >>>) is the closing
+turn of an episode. PRIOR CONTEXT shows the lead-up; it is background,
+NEVER the unit being classified.
+
+Set `has_episode: true` ONLY when ALL of the following hold:
+1. The CURRENT exchange contains a stated decision, lesson, outcome,
+   or resolution. Closure must be visible in the current turn itself.
+2. The PRIOR CONTEXT (if non-empty) sets up that closure: a problem,
+   a question, a deliberation, an incident in progress.
+3. You can quote a fragment from the CURRENT exchange (not from
+   prior turns) that signals the closure.
+
+Set `has_episode: false` when:
+- The current exchange is itself a question, a request, an analytical
+  reply, or a status update with no resolution. Even if prior context
+  is rich, an unresolved current turn is not an episode close.
+- The current exchange is routine: a single fact lookup, an
+  acknowledgment, casual chat.
+- Closure exists in prior turns but the current turn moved on to a
+  new topic.
+
+When in doubt, prefer false. The cost of a false negative is one
+missed episode; the cost of a false positive is a hallucinated
+episode entering the memory store.
+
+CONSOLIDATION:
+You will sometimes receive an EXISTING FACTS block before the USER/ASSISTANT
+exchange. Each existing fact is shown with its id in square brackets,
+provenance, and confidence. For each fact you are about to emit, choose one
+of three intents:
+
+- "new": the proposed fact is genuinely net-new information. Use this when
+  no existing fact covers the same underlying claim, even paraphrased.
+  Most facts are new; do not over-eagerly tie facts to existing ids.
+  When no EXISTING FACTS block is present, "new" is always the correct
+  intent.
+
+- "update_of": the proposed fact ASSERTS THE SAME UNDERLYING CLAIM as an
+  existing fact, but with a value that differs (a path changed, a tunable
+  was retuned, a project name was renamed) OR with strictly more specific
+  information (a confirmed timestamp where there was a vague reference).
+  Cite the existing id in `existing_id`. The new fact will REPLACE the
+  cited fact. Use this conservatively: only when one fact rendering the
+  other obsolete is clearly correct.
+
+- "skip_redundant": the proposed fact is a paraphrase of an existing fact
+  with no new information and no contradictory value. Cite the existing id
+  in `existing_id`. The new fact will NOT be stored. Prefer this over
+  "update_of" when the existing fact is already adequate; only use
+  "update_of" when the new wording carries information the old wording
+  lacks.
+
+Important constraints:
+- existing_id MUST be one of the ids shown in the EXISTING FACTS block.
+  Do NOT invent ids. If no EXISTING FACTS block is present, or if no
+  existing fact matches, use intent "new".
+- Each existing id may be referenced by AT MOST ONE proposed fact in this
+  batch. Do not split a single update across two proposed facts, and do
+  not have two proposed facts both update the same existing fact.
+- A confirmed_action fact is always "new" (a confirmation is a fresh
+  observation about reality, even if the wording paraphrases an existing
+  fact). Never emit "skip_redundant" or "update_of" for a confirmed_action;
+  always store it as a separate "new" fact so the timestamp record stays
+  intact.
+"""
+
+
 # ── Harness ─────────────────────────────────────────────────────────
 
 
@@ -354,10 +560,20 @@ async def _run_one_probe(
     config: Config,
     *,
     user_id: str,
+    baseline_prompt: str = _PROMPT_V5_PINNED,
 ) -> ProbeOutcome:
     """Run both prompt arms against a single probe and classify the
     outcome. Each arm is a sequential subprocess call so the active
     `_RULE_6_REJECTIONS` counter delta can be attributed per-arm.
+
+    `baseline_prompt` selects which pinned constant the first arm
+    runs against. The variable names `v5_facts` / `v6_facts` are
+    historical (the original design measured v5 vs active=v6); when
+    `baseline_prompt=_PROMPT_V6_PINNED` the first-arm fields carry
+    v6 facts and the second-arm fields carry v7 (the new active)
+    facts. Operators reading the report should treat the v5/v6
+    labels as "first arm / second arm" and consult the per-run
+    `baseline_choice` field for which baseline was actually selected.
 
     Never raises: a subprocess crash, JSON parse failure, or any
     other exception inside either arm is caught and reported as an
@@ -411,7 +627,7 @@ async def _run_one_probe(
             candidate_ids=set(),
             candidate_metadata={},
             user_id=user_id,
-            system_prompt=_PROMPT_V5_PINNED,
+            system_prompt=baseline_prompt,
         )
         post_v5 = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
         v5_rule_6_delta = post_v5 - pre_v5
@@ -600,7 +816,17 @@ async def _run_async(args: argparse.Namespace) -> int:
         log.error("no probes loaded from %s", probes_path)
         return 1
 
-    log.info("running %d probes", len(probes))
+    # Resolve the baseline arm's prompt from the CLI flag. The dict
+    # is the single source of truth for which pinned constants are
+    # selectable; the argparse `choices` list mirrors its keys so a
+    # mismatch is caught at parse time rather than at execution.
+    baseline_prompts: dict[str, str] = {
+        "v5": _PROMPT_V5_PINNED,
+        "v6": _PROMPT_V6_PINNED,
+    }
+    baseline_prompt = baseline_prompts[args.baseline]
+
+    log.info("running %d probes (baseline=%s)", len(probes), args.baseline)
 
     outcomes: list[ProbeOutcome] = []
     for probe in probes:
@@ -608,7 +834,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         # ProbeOutcome with `outcome="error"` and whatever per-arm
         # state it captured before the failure. The aggregate skip
         # set keeps error rows out of rate denominators.
-        result = await _run_one_probe(probe, config, user_id=args.user_id)
+        result = await _run_one_probe(probe, config, user_id=args.user_id, baseline_prompt=baseline_prompt)
         log.info(
             "probe %s [%s] -> %s",
             result.probe_id,
@@ -624,7 +850,13 @@ async def _run_async(args: argparse.Namespace) -> int:
         "version": _OUTPUT_SCHEMA_VERSION,
         "generated_at": datetime.now(UTC).isoformat(),
         "probe_set_hash": _hash(probe_set_text),
-        "v5_prompt_hash": _hash(_PROMPT_V5_PINNED),
+        # `baseline_choice` is the load-bearing field for distinguishing
+        # a v5-vs-v6 run from a v6-vs-v7 run. The v5_/v6_prompt_hash
+        # keys retain their historical names but report the actual
+        # hashes of whichever pair ran (baseline arm and active arm
+        # respectively).
+        "baseline_choice": args.baseline,
+        "v5_prompt_hash": _hash(baseline_prompt),
         "v6_prompt_hash": _hash(memory_extraction._EXTRACTION_SYSTEM_PROMPT),
         **aggregate,
         "per_probe": [asdict(o) for o in outcomes],
@@ -670,6 +902,15 @@ def main(argv: list[str] | None = None) -> int:
         "--output",
         required=True,
         help="Path to write the JSON report.",
+    )
+    parser.add_argument(
+        "--baseline",
+        choices=("v5", "v6"),
+        default="v6",
+        help="Which pinned prompt the baseline arm runs. Default v6 "
+        "compares the active prompt against the immediately prior "
+        "revision (v6 vs v7); v5 is retained for cross-revision "
+        "sanity checks against the original baseline.",
     )
     args = parser.parse_args(argv)
     logging.basicConfig(

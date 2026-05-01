@@ -49,6 +49,14 @@ _TEST_CONFIG = Config(
 # `f"sha256:{_V5_PROMPT_HASH}"`).
 _V5_PROMPT_HASH = "764f249d2556a6e00489ac7ba5eac265f4a4d09f27d21dc76f612b84f0874c13"
 
+# Hash of `_PROMPT_V6_PINNED` captured at #428 landing (the v6
+# active prompt immediately before the v7 EPISODE CLASSIFICATION
+# edits). Same drift-detection contract as `_V5_PROMPT_HASH`: a
+# silent edit of the pinned constant fails this test, while an
+# intentional capture of a new baseline must update both the
+# pinned constant AND this hash.
+_V6_PROMPT_HASH = "4f1e03dd37d9d52bb39724f949f7c382343837608497ebcd2ab3ae4990d3030c"
+
 
 def test_v5_pinned_drift():
     """The pinned baseline must remain byte-identical to the v5
@@ -60,6 +68,21 @@ def test_v5_pinned_drift():
     assert h == _V5_PROMPT_HASH, (
         "Pinned v5 prompt drifted. If this is intentional (capturing "
         "a new baseline), update _V5_PROMPT_HASH above to match."
+    )
+
+
+def test_v6_pinned_drift():
+    """The pinned v6 baseline must remain byte-identical to the v6
+    prompt as captured at #428 landing. Mirror of `test_v5_pinned_drift`
+    so that the v6-vs-v7 head-to-head measurement stays reproducible
+    across machines and across future prompt revisions. A future
+    intentional update to a new baseline requires updating both the
+    pinned constant AND `_V6_PROMPT_HASH` above; an accidental edit
+    fails this test."""
+    h = hashlib.sha256(extraction._PROMPT_V6_PINNED.encode()).hexdigest()
+    assert h == _V6_PROMPT_HASH, (
+        "Pinned v6 prompt drifted. If this is intentional (capturing "
+        "a new baseline), update _V6_PROMPT_HASH above to match."
     )
 
 
@@ -79,6 +102,34 @@ def test_example_probe_fixture_loads():
         assert "user" in p.window["current"]
         assert "assistant" in p.window["current"]
         assert isinstance(p.expected, dict)
+
+
+def test_episode_classification_fixture_loads():
+    """The tracked episode-classification example fixture parses
+    end-to-end with the documented 12-probe mix (5 workflow-event,
+    4 durable, 3 borderline). The borderline probes are categorized
+    as `workflow-noise` (their `expected_has_episode` is false) so
+    the existing fact-side classifier semantics still apply; the
+    new `expected_has_episode` field is the load-bearing dimension
+    for episode-classifier measurement and is asserted present on
+    every probe (issue #428)."""
+    path = Path(__file__).parent.parent / "home" / "evals" / "episode-classification-probes.example.jsonl"
+    probes = extraction.load_probes(path)
+    assert len(probes) == 12
+    cats = [p.category for p in probes]
+    # 5 workflow-event + 3 borderline = 8 workflow-noise category;
+    # 4 durable.
+    assert cats.count("workflow-noise") == 8
+    assert cats.count("durable-content") == 4
+    for p in probes:
+        # Existing schema: window.current.{user,assistant} present.
+        assert "current" in p.window
+        assert "user" in p.window["current"]
+        assert "assistant" in p.window["current"]
+        # New dimension: every probe asserts an expected has_episode
+        # value, even if the existing fact-side classifier ignores it.
+        assert "expected_has_episode" in p.expected
+        assert isinstance(p.expected["expected_has_episode"], bool)
 
 
 def test_load_probes_malformed_json_raises_with_path_and_line(tmp_path: Path):
