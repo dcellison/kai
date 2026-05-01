@@ -2992,9 +2992,18 @@ class TestHandleResponse:
         # the coroutine onto the event loop; the test's coroutine
         # cannot assert until the scheduled task has had a chance to
         # progress past its `await extract_and_store(...)` line.
+        #
+        # NOT `return_exceptions=True`: in the positive test, a task
+        # that crashed BEFORE reaching extract_and_store (e.g., a
+        # config-guard mismatch, a missing attribute) would be
+        # silently swallowed and surface only as "expected called
+        # once, called zero times" - hiding the real cause. The
+        # disabled-mode counterpart uses return_exceptions=True
+        # because there a task appearing at all is the regression
+        # signal; here we want crashes to propagate.
         new_tasks = asyncio.all_tasks() - tasks_before - {asyncio.current_task()}
         if new_tasks:
-            await asyncio.gather(*new_tasks, return_exceptions=True)
+            await asyncio.gather(*new_tasks)
 
         extract_mock.assert_called_once()
 

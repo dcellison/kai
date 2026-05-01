@@ -376,11 +376,11 @@ class TestExtractionCallSiteGating:
     def _attach_parents(tree: ast.AST) -> None:
         """Attach a `parent` attribute to every node so ancestor
         traversal works after `ast.walk`. ast.AST does not declare
-        a `parent` field, so the assignment is silently typed as
-        `Any`; pyright tolerates it under the strict-but-permissive
-        attribute model. This is the standard pattern; the
-        alternative (a side-table dict keyed by id(node)) is more
-        verbose with no semantic gain.
+        a `parent` field, so pyright flags the assignment as an
+        attr-defined error; the `# type: ignore[attr-defined]`
+        below is load-bearing, not cosmetic. The alternative
+        (a side-table dict keyed by id(node)) is more verbose with
+        no semantic gain; this is the standard ast-walking pattern.
         """
         for parent in ast.walk(tree):
             for child in ast.iter_child_nodes(parent):
