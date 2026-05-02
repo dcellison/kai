@@ -79,3 +79,25 @@ def _isolate_history_dir(tmp_path):
     """
     with patch("kai.history._LOG_DIR", tmp_path):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_backend_data_dir(tmp_path):
+    """Redirect kai.backend.DATA_DIR to tmp_path for ALL tests.
+
+    Mirrors _isolate_history_dir in shape (autouse, redirects a
+    module-level path constant via unittest.mock.patch) and in
+    intent (prevent test runs from writing into the real DATA_DIR).
+    Without this guarantee, any test that exercises
+    resolve_home_workspace or ensure_user_home without explicitly
+    redirecting backend.DATA_DIR creates a per-user home directory
+    under the real DATA_DIR. In dev DATA_DIR equals PROJECT_ROOT,
+    so leaked chat_ids from test fixtures (e.g. 111, 222, 12345)
+    materialize as empty directories in the working tree.
+
+    Tests that need a specific DATA_DIR can still override with
+    their own patch / monkeypatch; the autouse fixture only sets
+    the safe default.
+    """
+    with patch("kai.backend.DATA_DIR", tmp_path):
+        yield
