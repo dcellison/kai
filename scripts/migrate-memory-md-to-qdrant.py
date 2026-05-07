@@ -314,7 +314,7 @@ def _do_forward_migration(args: argparse.Namespace, chunks: list[Chunk]) -> int:
 
     Returns the script exit code.
     """
-    from kai.memory import add_structured, search
+    from kai.memory import add_structured, build_migration_metadata, search
 
     user_id_str = str(args.user_id)
     scores: list[float] = []
@@ -356,11 +356,12 @@ def _do_forward_migration(args: argparse.Namespace, chunks: list[Chunk]) -> int:
                 user_id=user_id_str,
                 memory_type="fact",
                 tags=tags,
-                metadata={
-                    "source": "migration",
-                    "section": section,
-                    "subsection": subsection,
-                },
+                # build_migration_metadata centralizes the migration-
+                # row metadata shape so the writer here and the tests
+                # in tests/test_memory.py drive the same code path.
+                # The helper layers in `speaker` / `confidence` (the
+                # migration constants) on top of section / subsection.
+                metadata=build_migration_metadata(section=section, subsection=subsection),
             )
             if mid is None:
                 # add_structured returns None on store failure or

@@ -32,7 +32,7 @@ Design rationale (the part that is not obvious from the code):
   numerator and denominator.
 
 - The sweep mutates module-level state in `kai.memory`
-  (`_SOURCE_WEIGHTS`, `_SEARCH_OVERFETCH`) and replaces `_config` with
+  (`_SPEAKER_WEIGHTS`, `_SEARCH_OVERFETCH`) and replaces `_config` with
   a `dataclasses.replace(...)` clone for each grid point. Restoration
   in `try/finally` defends against a probe raising mid-sweep. The
   process is short-lived and has no other consumers of the memory
@@ -58,6 +58,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from kai.config import Config
+
 log = logging.getLogger(__name__)
 
 
@@ -74,22 +76,28 @@ log = logging.getLogger(__name__)
 _K_VALUES: tuple[int, ...] = (1, 3, 5)
 
 
-# Default sweep grid. Every grid axis multiplied gives 6*4*3 = 72
-# configurations; at typical per-call latency (50-200 ms) the full
-# sweep runs in a few minutes for a probe set of a few dozen probes.
-# Operators can narrow each axis via CLI flags.
+# Default sweep grid. Three speaker-weight axes plus floor and
+# overfetch. The full Cartesian product is 6 * 2 * 4 * 3 * 3 = 432
+# configurations; the calibration plan in spec §5 holds floor and
+# overfetch at production values, leaving 24 configurations for the
+# typical sweep run. Operators can narrow each axis via CLI flags.
 _DEFAULT_FLOOR_GRID: tuple[float, ...] = (0.15, 0.20, 0.25, 0.30, 0.35, 0.40)
-_DEFAULT_EXTRACTED_WEIGHT_GRID: tuple[float, ...] = (1.0, 1.2, 1.5, 2.0)
+_DEFAULT_USER_WEIGHT_GRID: tuple[float, ...] = (0.85, 1.0)
+_DEFAULT_ASSISTANT_WEIGHT_GRID: tuple[float, ...] = (0.5, 0.6, 0.7, 0.8)
+_DEFAULT_EPISODE_SUMMARY_WEIGHT_GRID: tuple[float, ...] = (0.7, 0.85, 1.0)
 _DEFAULT_OVERFETCH_GRID: tuple[int, ...] = (10, 20, 30)
 
 
 # Production defaults that the harness treats as the baseline
 # configuration. Used both when the operator runs a single eval
 # (no --sweep) without overrides and when computing the schema
-# example baseline.
+# example baseline. The three speaker weights map to the entries
+# in `_SPEAKER_WEIGHTS`; the legacy/extracted source-weight pair
+# the older table carried no longer exists.
 _PRODUCTION_FLOOR = 0.30
-_PRODUCTION_EXTRACTED_WEIGHT = 1.2
-_PRODUCTION_LEGACY_WEIGHT = 0.6
+_PRODUCTION_USER_WEIGHT = 1.0
+_PRODUCTION_ASSISTANT_WEIGHT = 0.7
+_PRODUCTION_EPISODE_SUMMARY_WEIGHT = 0.85
 _PRODUCTION_OVERFETCH = 20
 
 
@@ -134,17 +142,37 @@ class ConfigOverride:
 
     Each override flows into the harness's sweep loop and is the
     only mutable state per iteration: floor (replaces
-    `_config.memory_search_floor`), extracted_weight (replaces
-    `_SOURCE_WEIGHTS["extracted"]`), and overfetch (replaces
-    `_SEARCH_OVERFETCH` on the module). The legacy weight (the ""
-    bucket in `_SOURCE_WEIGHTS`, currently 0.6) is intentionally
-    fixed: the eval is for tuning the "extracted" source's relative
-    boost, not for re-tuning the legacy floor.
+    `_config.memory_search_floor`), three speaker weights (replace
+    the matching entries in `_SPEAKER_WEIGHTS`), and overfetch
+    (replaces `_SEARCH_OVERFETCH` on the module). The unknown-
+    speaker fallback weight is intentionally not part of the grid:
+    its job is to keep an unrecognized speaker class rankable, not
+    to be tuned.
     """
 
     floor: float
-    extracted_weight: float
+    user_weight: float
+    assistant_weight: float
+    episode_summary_weight: float
     overfetch: int
+
+
+@dataclass(frozen=True)
+class _Snapshot:
+    """Frozen snapshot of mutable kai.memory state captured before an
+    override is applied. Used by `_restore_overrides` to put the
+    module back in its pre-apply shape regardless of how the caller's
+    loop exits.
+
+    Stored as a frozen dataclass so the snapshot itself cannot be
+    accidentally mutated between capture and restore (the dict
+    contents are copied at capture time so future mutation of
+    `_SPEAKER_WEIGHTS` does not leak through the saved reference).
+    """
+
+    speaker_weights: dict[str, float]
+    overfetch: int
+    config: Config
 
 
 @dataclass
@@ -635,7 +663,7 @@ async def _score_against_store(
     Split out from `evaluate` so the sweep loop can pre-compute drift
     once at sweep entry and reuse it across every grid point: drift
     state (which expected_fact_ids resolve via get_by_id) does not
-    depend on the floor / extracted_weight / overfetch knobs that the
+    depend on the floor / speaker-weight / overfetch knobs that the
     sweep mutates, so re-running detect_drift per grid point would
     issue grid_size * len(probes) get_by_id calls for no new signal.
     """
@@ -673,24 +701,90 @@ async def evaluate(probes: list[Probe], user_id: str) -> Metrics:
 
 def _grid_iter(
     floors: list[float],
-    weights: list[float],
+    user_weights: list[float],
+    assistant_weights: list[float],
+    episode_summary_weights: list[float],
     overfetches: list[int],
 ) -> list[ConfigOverride]:
     """Materialize the grid as a flat list of ConfigOverride objects.
 
     Materialized (not generator) so the caller can `len()` the grid
     for progress reporting and iterate it more than once if needed.
-    The triple loop is order-stable: outer floor, middle weight,
-    inner overfetch. Operators reading the table top-to-bottom see
-    floor change slowest, which makes scanning for "what does
-    raising the floor do" easier than the reverse order would.
+    The five-deep loop is order-stable: outer floor, then the three
+    speaker-weight axes (user, assistant, episode_summary), inner
+    overfetch. Operators reading the table top-to-bottom see floor
+    change slowest, which makes scanning for "what does raising the
+    floor do" easier than the reverse order would.
     """
     out: list[ConfigOverride] = []
     for f in floors:
-        for w in weights:
-            for o in overfetches:
-                out.append(ConfigOverride(floor=f, extracted_weight=w, overfetch=o))
+        for uw in user_weights:
+            for aw in assistant_weights:
+                for ew in episode_summary_weights:
+                    for o in overfetches:
+                        out.append(
+                            ConfigOverride(
+                                floor=f,
+                                user_weight=uw,
+                                assistant_weight=aw,
+                                episode_summary_weight=ew,
+                                overfetch=o,
+                            )
+                        )
     return out
+
+
+def _apply_override(override: ConfigOverride) -> _Snapshot:
+    """Apply an override to kai.memory module state.
+
+    Mutates `_SPEAKER_WEIGHTS` in place (the dict is shared module-
+    state; in-place mutation propagates to live `_speaker_weight`
+    callers without a module-attr swap). Reassigns `_SEARCH_OVERFETCH`
+    and `_config` at module scope. Returns a frozen `_Snapshot` of
+    the prior state so `_restore_overrides` can put things back
+    regardless of whether the caller's loop ran to completion.
+
+    Note on `_config` derivation: the new `_config` is built via
+    `dataclasses.replace(snap.config, ...)`, where `snap.config` is
+    the LIVE pre-call state. At iteration N inside a sweep loop,
+    that is iteration N-1's mutated config, NOT the entry-time
+    original. For the current grid (only `memory_search_floor` is
+    mutated by `dataclasses.replace`), this is behaviorally
+    equivalent to deriving from the entry-time config because each
+    iteration overwrites the same field. If a future grid mutates
+    additional Config fields, swap to a `base_config` parameter so
+    the caller controls which baseline to derive from.
+    """
+    from kai import memory as _mem
+
+    snap = _Snapshot(
+        speaker_weights=dict(_mem._SPEAKER_WEIGHTS),
+        overfetch=_mem._SEARCH_OVERFETCH,
+        config=_mem._config,
+    )
+    _mem._SPEAKER_WEIGHTS["user"] = override.user_weight
+    _mem._SPEAKER_WEIGHTS["assistant"] = override.assistant_weight
+    _mem._SPEAKER_WEIGHTS["episode_summary"] = override.episode_summary_weight
+    _mem._SEARCH_OVERFETCH = override.overfetch
+    _mem._config = dataclasses.replace(snap.config, memory_search_floor=override.floor)
+    return snap
+
+
+def _restore_overrides(snap: _Snapshot) -> None:
+    """Restore module state from a snapshot taken by `_apply_override`.
+
+    Counterpart of `_apply_override`. Clears + re-populates
+    `_SPEAKER_WEIGHTS` in place so any module that holds a reference
+    to the dict still sees the restored mapping; reassigns
+    `_SEARCH_OVERFETCH` and `_config` directly. Idempotent: calling
+    twice with the same snapshot is a no-op.
+    """
+    from kai import memory as _mem
+
+    _mem._SPEAKER_WEIGHTS.clear()
+    _mem._SPEAKER_WEIGHTS.update(snap.speaker_weights)
+    _mem._SEARCH_OVERFETCH = snap.overfetch
+    _mem._config = snap.config
 
 
 async def run_sweep(
@@ -702,30 +796,41 @@ async def run_sweep(
 
     Mutates three pieces of `kai.memory` module state per iteration:
     `_config` (replaced via dataclasses.replace because Config is
-    frozen), `_SOURCE_WEIGHTS["extracted"]` (mutated in place; dict
-    is not frozen), and `_SEARCH_OVERFETCH` (replaced via setattr on
-    the module). A single `try/finally` wraps the entire grid loop
-    and restores all three from the entry-time snapshot in `finally`.
+    frozen), `_SPEAKER_WEIGHTS` (mutated in place; dict is not
+    frozen), and `_SEARCH_OVERFETCH` (replaced via setattr on the
+    module). A single `try/finally` wraps the entire grid loop and
+    restores all three from the entry-time snapshot in `finally`.
     Any exception from any iteration (a probe raising mid-sweep, a
     SIGINT) unwinds through the outer finally before propagating, so
     the module is left in its pre-sweep state regardless of how the
     loop exits.
 
-    Note on the snapshot vs read-back tradeoff: we snapshot the
-    originals at sweep entry and restore from the snapshot, rather
-    than restoring "whatever was there one iteration ago." If a
-    probe somehow mutates module state (it should not), the snapshot
-    restoration still leaves the module in a consistent post-sweep
-    state matching its pre-sweep state.
+    Two-snapshot pattern: the entry-time snapshot taken via
+    `_apply_override(grid[0])` would be incorrect because it would
+    apply the first override before snapshotting. Instead we capture
+    the entry-time state directly via `_apply_override`'s helper
+    `_Snapshot` constructor, then loop. Each iteration calls
+    `_apply_override` (which itself snapshots-then-mutates), and the
+    outer `finally` calls `_restore_overrides(entry_snap)` to land
+    back at the pre-sweep state regardless of "whatever was there
+    one iteration ago." If a probe somehow mutates module state (it
+    should not), the snapshot restoration still leaves the module in
+    a consistent post-sweep state matching its pre-sweep state.
     """
     from kai import memory as _mem
 
     if _mem._config is None:
         raise RuntimeError("memory not initialized; cannot sweep")
 
-    saved_config = _mem._config
-    saved_weights: dict[str, float] = dict(_mem._SOURCE_WEIGHTS)
-    saved_overfetch: int = _mem._SEARCH_OVERFETCH
+    # Capture the entry-time state directly. The per-iteration
+    # `_apply_override` calls produce their own (inner) snapshots
+    # which we discard; the entry-time outer snapshot is what feeds
+    # the `finally` restore.
+    entry_snap = _Snapshot(
+        speaker_weights=dict(_mem._SPEAKER_WEIGHTS),
+        overfetch=_mem._SEARCH_OVERFETCH,
+        config=_mem._config,
+    )
 
     # Drift detection is independent of the swept knobs: get_by_id
     # consults Mem0 row presence and source filtering, neither of
@@ -739,30 +844,18 @@ async def run_sweep(
     try:
         for i, override in enumerate(grid, start=1):
             log.info("sweep %d/%d: %s", i, len(grid), override)
-            # _SOURCE_WEIGHTS is a module-level dict consulted live
-            # in _source_weight() at format_context call time; in-
-            # place mutation propagates without a module-attr swap.
-            _mem._SOURCE_WEIGHTS["extracted"] = override.extracted_weight
-            # _SEARCH_OVERFETCH is read via the module global at call
-            # time; assigning to the module attribute is the standard
-            # way to override it from outside.
-            _mem._SEARCH_OVERFETCH = override.overfetch
-            # Config is frozen; produce a clone with the floor swapped
-            # and rebind the module-level reference. The same Config
-            # object is also passed to other modules at init time, but
-            # those modules cache nothing, so a rebind here is sufficient.
-            _mem._config = dataclasses.replace(saved_config, memory_search_floor=override.floor)
+            # Inner per-iteration snapshot is taken-and-discarded;
+            # the entry_snap above is what restores at the outer
+            # `finally`. Inline `_apply_override` here so the loop
+            # body reads as one operation per axis rather than
+            # threading a snapshot variable that goes unused.
+            _apply_override(override)
             metrics = await _score_against_store(scored, drifted, tags_by_id, user_id)
             out.append((override, metrics))
     finally:
-        # Restore from snapshot regardless of whether the loop ran to
-        # completion. Repeated assignment is cheap; the cost of a
-        # double-restore (snapshot equal to current state) is one dict
-        # copy and two attribute writes.
-        _mem._SOURCE_WEIGHTS.clear()
-        _mem._SOURCE_WEIGHTS.update(saved_weights)
-        _mem._SEARCH_OVERFETCH = saved_overfetch
-        _mem._config = saved_config
+        # Restore from entry-time snapshot regardless of whether
+        # the loop ran to completion.
+        _restore_overrides(entry_snap)
     return out
 
 
@@ -881,9 +974,9 @@ def _render_single_metrics(m: Metrics) -> str:
 def _render_sweep_table(sweep_results: list[tuple[ConfigOverride, Metrics]]) -> str:
     """ASCII table of every sweep configuration.
 
-    Columns: floor, extracted_weight, overfetch, p@1, p@3, p@5, MRR,
-    in_prompt, p50_ms, p95_ms. Sorted by precision@5 descending so
-    the operator's eye lands on the strongest configs first; ties
+    Columns: floor, user_w, asst_w, ep_w, overfetch, p@1, p@3, p@5,
+    MRR, in_prompt, p50_ms, p95_ms. Sorted by precision@5 descending
+    so the operator's eye lands on the strongest configs first; ties
     broken by lower latency.
     """
     sorted_results = sorted(
@@ -891,7 +984,7 @@ def _render_sweep_table(sweep_results: list[tuple[ConfigOverride, Metrics]]) -> 
         key=lambda t: (-t[1].precision_at_k.get(5, 0.0), t[1].latency_p50_ms),
     )
     header = (
-        f"{'floor':>6} {'ext_w':>6} {'over':>5}  "
+        f"{'floor':>6} {'usr_w':>6} {'ast_w':>6} {'ep_w':>6} {'over':>5}  "
         f"{'p@1':>6} {'p@3':>6} {'p@5':>6}  "
         f"{'MRR':>6} {'in_pr':>6}  "
         f"{'p50':>5} {'p95':>5}"
@@ -905,7 +998,9 @@ def _render_sweep_table(sweep_results: list[tuple[ConfigOverride, Metrics]]) -> 
         p3 = m.precision_at_k.get(3, 0.0)
         p5 = m.precision_at_k.get(5, 0.0)
         rows.append(
-            f"{cfg.floor:>6.2f} {cfg.extracted_weight:>6.2f} {cfg.overfetch:>5d}  "
+            f"{cfg.floor:>6.2f} {cfg.user_weight:>6.2f} "
+            f"{cfg.assistant_weight:>6.2f} {cfg.episode_summary_weight:>6.2f} "
+            f"{cfg.overfetch:>5d}  "
             f"{p1:>6.3f} {p3:>6.3f} {p5:>6.3f}  "
             f"{m.mrr:>6.3f} {m.fraction_in_prompt:>6.3f}  "
             f"{m.latency_p50_ms:>5.0f} {m.latency_p95_ms:>5.0f}"
@@ -965,10 +1060,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override the memory_search_floor sweep axis (default: 0.15..0.40).",
     )
     parser.add_argument(
-        "--extracted-weight",
+        "--user-weight",
         type=float,
         nargs="+",
-        help="Override the extracted-weight sweep axis (default: 1.0..2.0).",
+        help="Override the user-speaker-weight sweep axis (default: 0.85, 1.0).",
+    )
+    parser.add_argument(
+        "--assistant-weight",
+        type=float,
+        nargs="+",
+        help="Override the assistant-speaker-weight sweep axis (default: 0.5, 0.6, 0.7, 0.8).",
+    )
+    parser.add_argument(
+        "--episode-summary-weight",
+        type=float,
+        nargs="+",
+        help="Override the episode-summary-speaker-weight sweep axis (default: 0.7, 0.85, 1.0).",
     )
     parser.add_argument(
         "--overfetch",
@@ -1066,8 +1173,9 @@ def _build_baseline_json(
         "drift_count": metrics.n_drift,
         "config": {
             "floor": cfg.floor,
-            "extracted_weight": cfg.extracted_weight,
-            "legacy_weight": _PRODUCTION_LEGACY_WEIGHT,
+            "user_weight": cfg.user_weight,
+            "assistant_weight": cfg.assistant_weight,
+            "episode_summary_weight": cfg.episode_summary_weight,
             "overfetch": cfg.overfetch,
         },
         "metrics": metrics_block,
@@ -1105,9 +1213,23 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
     if args.sweep:
         floors = list(args.floor) if args.floor else list(_DEFAULT_FLOOR_GRID)
-        weights = list(args.extracted_weight) if args.extracted_weight else list(_DEFAULT_EXTRACTED_WEIGHT_GRID)
+        user_weights = list(args.user_weight) if args.user_weight else list(_DEFAULT_USER_WEIGHT_GRID)
+        assistant_weights = (
+            list(args.assistant_weight) if args.assistant_weight else list(_DEFAULT_ASSISTANT_WEIGHT_GRID)
+        )
+        episode_summary_weights = (
+            list(args.episode_summary_weight)
+            if args.episode_summary_weight
+            else list(_DEFAULT_EPISODE_SUMMARY_WEIGHT_GRID)
+        )
         overfetches = list(args.overfetch) if args.overfetch else list(_DEFAULT_OVERFETCH_GRID)
-        grid = _grid_iter(floors, weights, overfetches)
+        grid = _grid_iter(
+            floors,
+            user_weights,
+            assistant_weights,
+            episode_summary_weights,
+            overfetches,
+        )
         sweep_results = await run_sweep(probes, args.user_id, grid)
         print("Pareto frontier (precision@5 / latency_p50):")
         print(_render_pareto(pareto_frontier(sweep_results)))
@@ -1137,17 +1259,16 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 "drift_count": next((m.n_drift for _, m in sweep_results), 0),
                 "sweep": [
                     {
-                        # `legacy_weight` is fixed across the sweep
-                        # (the grid only varies floor/extracted_weight/
-                        # overfetch) but is included here so each per-
-                        # row config block matches the shape of the
-                        # single-config baseline's `config` envelope.
-                        # A downstream parser can read both file types
-                        # uniformly without a special case.
+                        # Each per-row config block carries the three
+                        # speaker-weight values in addition to floor
+                        # and overfetch. A downstream parser sees the
+                        # same key shape across single-config and
+                        # sweep baselines without a special case.
                         "config": {
                             "floor": cfg.floor,
-                            "extracted_weight": cfg.extracted_weight,
-                            "legacy_weight": _PRODUCTION_LEGACY_WEIGHT,
+                            "user_weight": cfg.user_weight,
+                            "assistant_weight": cfg.assistant_weight,
+                            "episode_summary_weight": cfg.episode_summary_weight,
                             "overfetch": cfg.overfetch,
                         },
                         "metrics": _metrics_to_dict(m, include_by_tag=False),
@@ -1175,7 +1296,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         cfg = ConfigOverride(
             floor=_mem._config.memory_search_floor if _mem._config else _PRODUCTION_FLOOR,
-            extracted_weight=_mem._SOURCE_WEIGHTS.get("extracted", _PRODUCTION_EXTRACTED_WEIGHT),
+            user_weight=_mem._SPEAKER_WEIGHTS.get("user", _PRODUCTION_USER_WEIGHT),
+            assistant_weight=_mem._SPEAKER_WEIGHTS.get("assistant", _PRODUCTION_ASSISTANT_WEIGHT),
+            episode_summary_weight=_mem._SPEAKER_WEIGHTS.get("episode_summary", _PRODUCTION_EPISODE_SUMMARY_WEIGHT),
             overfetch=_mem._SEARCH_OVERFETCH,
         )
         args.output.write_text(

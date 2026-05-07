@@ -68,23 +68,21 @@ def _reset_memory_module() -> None:
     """Restore memory module state between tests.
 
     Mirrors the helper in tests/test_memory.py: harness tests mutate
-    `_memory`, `_config`, `_SOURCE_WEIGHTS`, and `_SEARCH_OVERFETCH`,
+    `_memory`, `_config`, `_SPEAKER_WEIGHTS`, and `_SEARCH_OVERFETCH`,
     and a leak between tests would silently couple them.
     """
     import kai.memory as mem_mod
 
     mem_mod._memory = None
     mem_mod._config = None
-    # _SOURCE_WEIGHTS is the production default snapshot; reset both
-    # the dict contents AND _UNKNOWN_SOURCE_WEIGHT so a sweep test
-    # mutating "extracted" does not leak into the next test. Must
-    # mirror the production default in src/kai/memory.py exactly,
-    # including the "episode" entry (issue #385) and the "migration"
-    # entry (issue #406) - otherwise tests reading the dict after
-    # this fixture has run will see a stale snapshot missing entries.
-    mem_mod._SOURCE_WEIGHTS.clear()
-    mem_mod._SOURCE_WEIGHTS.update({"extracted": 1.2, "episode": 1.2, "migration": 1.0, "": 0.6})
-    mem_mod._UNKNOWN_SOURCE_WEIGHT = mem_mod._SOURCE_WEIGHTS[""]
+    # `_SPEAKER_WEIGHTS` is the production default snapshot; reset
+    # the dict contents so a sweep test mutating any speaker entry
+    # does not leak into the next test. Must mirror the production
+    # default in src/kai/memory.py exactly, otherwise tests reading
+    # the dict after this fixture has run will see a stale snapshot
+    # missing entries.
+    mem_mod._SPEAKER_WEIGHTS.clear()
+    mem_mod._SPEAKER_WEIGHTS.update({"user": 1.0, "assistant": 0.7, "episode_summary": 0.85})
     mem_mod._SEARCH_OVERFETCH = 20
 
 
@@ -303,7 +301,7 @@ class TestSweepRestoration:
         # that won't accidentally alias the dict the harness mutated.
         mem_mod._config = _BASE_CONFIG
         original_floor = mem_mod._config.memory_search_floor
-        original_weights = dict(mem_mod._SOURCE_WEIGHTS)
+        original_weights = dict(mem_mod._SPEAKER_WEIGHTS)
         original_overfetch = mem_mod._SEARCH_OVERFETCH
 
         # The sweep loop now calls `_score_against_store` per grid
@@ -334,8 +332,20 @@ class TestSweepRestoration:
             )
 
         grid = [
-            ConfigOverride(floor=0.20, extracted_weight=1.5, overfetch=10),
-            ConfigOverride(floor=0.40, extracted_weight=2.0, overfetch=30),
+            ConfigOverride(
+                floor=0.20,
+                user_weight=1.0,
+                assistant_weight=0.6,
+                episode_summary_weight=0.85,
+                overfetch=10,
+            ),
+            ConfigOverride(
+                floor=0.40,
+                user_weight=0.85,
+                assistant_weight=0.7,
+                episode_summary_weight=0.7,
+                overfetch=30,
+            ),
         ]
         with (
             patch(
@@ -355,7 +365,7 @@ class TestSweepRestoration:
 
         # The whole point of test 3: state restored despite the abort.
         assert mem_mod._config.memory_search_floor == original_floor
-        assert original_weights == mem_mod._SOURCE_WEIGHTS
+        assert original_weights == mem_mod._SPEAKER_WEIGHTS
         assert original_overfetch == mem_mod._SEARCH_OVERFETCH
 
 
@@ -484,9 +494,27 @@ class TestDriftDetection:
                 latency_p95_ms=lat,
             )
 
-        cfg_a = ConfigOverride(floor=0.2, extracted_weight=1.0, overfetch=10)
-        cfg_b = ConfigOverride(floor=0.3, extracted_weight=1.2, overfetch=20)
-        cfg_c = ConfigOverride(floor=0.4, extracted_weight=2.0, overfetch=30)
+        cfg_a = ConfigOverride(
+            floor=0.2,
+            user_weight=1.0,
+            assistant_weight=0.5,
+            episode_summary_weight=0.85,
+            overfetch=10,
+        )
+        cfg_b = ConfigOverride(
+            floor=0.3,
+            user_weight=1.0,
+            assistant_weight=0.7,
+            episode_summary_weight=0.85,
+            overfetch=20,
+        )
+        cfg_c = ConfigOverride(
+            floor=0.4,
+            user_weight=0.85,
+            assistant_weight=0.8,
+            episode_summary_weight=1.0,
+            overfetch=30,
+        )
         sweep = [(cfg_a, _m(0.8, 50)), (cfg_b, _m(0.7, 100)), (cfg_c, _m(0.9, 200))]
         front = pareto_frontier(sweep)
         front_cfgs = [c for c, _ in front]
@@ -564,3 +592,120 @@ class TestEvaluateEndToEnd:
         assert metrics.precision_at_k[5] == pytest.approx(1.0)
         assert metrics.mrr == pytest.approx(1.0)
         assert metrics.fraction_in_prompt == pytest.approx(1.0)
+
+
+class TestApplyOverride:
+    """`_apply_override` and `_restore_overrides` are the two helpers
+    `run_sweep` calls per iteration to mutate / restore module state.
+    Direct tests of the helpers stand in for the higher-level
+    `run_sweep` test by exercising the same state-touch pattern in
+    isolation, without spinning up an evaluate loop. Together they
+    pin the schema-required restore-roundtrip property the sweep
+    `finally` block depends on.
+    """
+
+    def test_apply_override_writes_three_weights(self):
+        # `_apply_override` must mutate all three speaker entries in
+        # place. The pre-mutation snapshot returned by the helper
+        # carries the prior values so a `_restore_overrides` call
+        # rolls them back exactly. Pin both sides of the contract:
+        # post-apply state matches the override, snapshot matches
+        # pre-apply state.
+        import kai.memory as mem_mod
+        from kai.eval.retrieval import _apply_override
+
+        # Install a real Config object so the helper's
+        # `dataclasses.replace(snap.config, ...)` call has something
+        # to clone from. Autouse fixture leaves _config=None.
+        mem_mod._config = _BASE_CONFIG
+
+        # Known starting state (the autouse fixture pre-fills these
+        # to production values; assert against those values rather
+        # than against literals so a default-tune retro flows through).
+        pre_user = mem_mod._SPEAKER_WEIGHTS["user"]
+        pre_assistant = mem_mod._SPEAKER_WEIGHTS["assistant"]
+        pre_episode = mem_mod._SPEAKER_WEIGHTS["episode_summary"]
+
+        override = ConfigOverride(
+            floor=0.20,
+            user_weight=0.85,
+            assistant_weight=0.6,
+            episode_summary_weight=1.0,
+            overfetch=15,
+        )
+        snap = _apply_override(override)
+
+        # Post-apply: live dict matches override.
+        assert mem_mod._SPEAKER_WEIGHTS["user"] == 0.85
+        assert mem_mod._SPEAKER_WEIGHTS["assistant"] == 0.6
+        assert mem_mod._SPEAKER_WEIGHTS["episode_summary"] == 1.0
+
+        # Snapshot: pre-apply values captured for the restore path.
+        assert snap.speaker_weights["user"] == pre_user
+        assert snap.speaker_weights["assistant"] == pre_assistant
+        assert snap.speaker_weights["episode_summary"] == pre_episode
+
+    def test_apply_override_writes_overfetch_and_floor(self):
+        # `_apply_override` mutates `_SEARCH_OVERFETCH` and rebuilds
+        # `_config` with the override's floor; the snapshot carries
+        # the pre-mutation values for both. Pin the restore path's
+        # data here so a regression that captures stale values fails
+        # this test rather than at sweep finally-time.
+        import kai.memory as mem_mod
+        from kai.eval.retrieval import _apply_override
+
+        # Install a known config so the floor swap is observable.
+        mem_mod._config = _BASE_CONFIG
+        pre_overfetch = mem_mod._SEARCH_OVERFETCH
+
+        override = ConfigOverride(
+            floor=0.42,
+            user_weight=1.0,
+            assistant_weight=0.7,
+            episode_summary_weight=0.85,
+            overfetch=11,
+        )
+        snap = _apply_override(override)
+
+        assert mem_mod._SEARCH_OVERFETCH == 11
+        assert mem_mod._config is not None
+        assert mem_mod._config.memory_search_floor == 0.42
+
+        # Snapshot captures the pre-apply values.
+        assert snap.overfetch == pre_overfetch
+        assert snap.config is _BASE_CONFIG
+
+    def test_restore_overrides_undoes_apply(self):
+        # The full round-trip: apply, mutate observable state, restore
+        # from the snapshot, assert the live module is back at its
+        # pre-apply shape. This is the contract `run_sweep`'s
+        # `finally` block depends on; testing it in isolation lets
+        # a regression in the helper trip here rather than during a
+        # mid-sweep abort path.
+        import kai.memory as mem_mod
+        from kai.eval.retrieval import _apply_override, _restore_overrides
+
+        mem_mod._config = _BASE_CONFIG
+        pre_speaker_weights = dict(mem_mod._SPEAKER_WEIGHTS)
+        pre_overfetch = mem_mod._SEARCH_OVERFETCH
+        pre_config = mem_mod._config
+
+        override = ConfigOverride(
+            floor=0.99,
+            user_weight=0.1,
+            assistant_weight=0.2,
+            episode_summary_weight=0.3,
+            overfetch=99,
+        )
+        snap = _apply_override(override)
+        # Sanity check: we are NOT testing the no-op identity path -
+        # the override must have actually mutated state for the
+        # restore assertion below to mean anything.
+        assert pre_speaker_weights != mem_mod._SPEAKER_WEIGHTS
+        assert pre_overfetch != mem_mod._SEARCH_OVERFETCH
+
+        _restore_overrides(snap)
+
+        assert pre_speaker_weights == mem_mod._SPEAKER_WEIGHTS
+        assert pre_overfetch == mem_mod._SEARCH_OVERFETCH
+        assert mem_mod._config is pre_config

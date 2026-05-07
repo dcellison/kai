@@ -2353,7 +2353,7 @@ class TestExtractionPromptSoftVocab:
     def test_extraction_prompt_version_bumped(self):
         """The version stamp on every fact's metadata; bumped
         whenever the schema or prompt changes meaningfully."""
-        assert _EXTRACTION_PROMPT_VERSION == "7"
+        assert _EXTRACTION_PROMPT_VERSION == "8"
 
     def test_extraction_prompt_version_history_extended(self):
         """The prompt-version history comment block (the sequence
@@ -2363,9 +2363,9 @@ class TestExtractionPromptSoftVocab:
         fragments so a future unrelated edit that introduces a `vN:`
         token elsewhere cannot satisfy this test vacuously.
 
-        v5, v6, and v7 fragments are pinned: v5 and v6 stay in source
-        unchanged across the v7 bump, and the v7 entry was appended
-        for issue #428."""
+        v5, v6, v7, and v8 fragments are pinned: each prior entry
+        stays in source unchanged across the next bump, and the v8
+        entry was appended for the speaker-attribution change."""
         from pathlib import Path
 
         import kai.memory_extraction
@@ -2376,6 +2376,11 @@ class TestExtractionPromptSoftVocab:
         assert "DURABILITY TEST gate" in src
         assert "v7 (2026-04-30, this issue)" in src
         assert "EPISODE CLASSIFICATION block" in src
+        # v8 entry: speaker-attribution prompt change. The literal
+        # date and "speaker attribution" phrase are pinned because
+        # both come from the v8 history comment specifically.
+        assert "v8 (2026-05-07)" in src
+        assert "speaker attribution" in src
 
 
 class TestRule6WorkflowEventRegex:
@@ -2980,3 +2985,234 @@ class TestValidateEpisodeIntegration:
         assert captured.get("reason") is None
         snap = _EPISODE_VALIDATE_REJECTIONS.snapshot()
         assert snap == {}
+
+    @pytest.mark.asyncio
+    async def test_episode_storage_sets_speaker_and_confidence(self, monkeypatch):
+        """Episode metadata carries speaker="episode_summary" and
+        confidence=1.0 at write time. The episode generator does NOT
+        emit these fields itself; `_generate_episode` pins them on
+        the metadata bundle so every successfully-stored episode
+        rides through retrieval ranking with the curated multi-stage
+        weight.
+
+        Pin both fields here so a regression that drops one (the
+        speaker entry alone, or the confidence entry alone) trips
+        this test rather than silently changing the episode bucket's
+        ranking weight in production.
+        """
+        from kai import memory_extraction
+
+        episode_payload = {
+            "goal": "Lock per-user home workspace as the canonical layout",
+            "context": "ctx",
+            "approach": "ap",
+            "outcome": "out",
+            "outcome_quality": "success",
+            "tags": ["t1"],
+            "actors": ["user"],
+        }
+
+        async def _fake_runner(payload, config):
+            return episode_payload, 0.001, None
+
+        captured_metadata: dict = {}
+
+        def _fake_add_structured(*args, **kwargs):
+            # `_generate_episode` calls add_structured with the
+            # metadata dict in `metadata=`. Capture the bundle so
+            # the test can assert on the speaker / confidence
+            # entries explicitly.
+            captured_metadata.update(kwargs.get("metadata") or {})
+            return "stored-mem-id"
+
+        def _fake_emit(**kwargs):
+            pass
+
+        monkeypatch.setattr(memory_extraction, "_run_episode_extractor", _fake_runner)
+        monkeypatch.setattr(memory_extraction, "_emit_episode_log", _fake_emit)
+        from kai import memory as memory_module
+
+        monkeypatch.setattr(memory_module, "add_structured", _fake_add_structured)
+
+        await memory_extraction._generate_episode(
+            user_text="propose home layout",
+            assistant_text="locked: per-user home workspace",
+            user_id="u-int",
+            session_id="s-1",
+            config=_cfg(),
+        )
+
+        assert captured_metadata.get("speaker") == "episode_summary"
+        assert captured_metadata.get("confidence") == 1.0
+
+
+class TestSpeakerAttribution:
+    """Tests for the per-fact speaker field added to the extractor
+    output. Three angles are covered:
+
+      - Schema preservation: a speaker value the extractor emits
+        survives the validator unchanged when the defense-in-depth
+        check has nothing to override (no quote, or quote not in
+        either window side).
+      - Defense-in-depth force: a fact whose confirmation_quote
+        substring appears verbatim in an ASSISTANT message in the
+        window has its speaker overridden to "assistant", regardless
+        of what the extractor returned.
+      - Defense-in-depth restraint: a fact whose quote appears only
+        in a USER message does NOT have its speaker promoted; the
+        validator never moves a row UP toward "user", only DOWN
+        toward "assistant".
+    """
+
+    def test_validator_preserves_extractor_speaker_user(self):
+        # Non-confirmed_action fact (no quote): defense-in-depth
+        # has nothing to act on, so the extractor's speaker survives
+        # the validator unchanged.
+        facts = [
+            {
+                "content": "User prefers Celsius",
+                "tags": ["preference"],
+                "confidence": 0.9,
+                "intent": "new",
+                "speaker": "user",
+            }
+        ]
+        out = _validate_facts(
+            facts,
+            set(),
+            candidate_metadata={},
+            user_id="u-test",
+            user_window_text="I prefer Celsius",
+            assistant_window_text="Got it.",
+        )
+        assert len(out) == 1
+        assert out[0]["speaker"] == "user"
+
+    def test_validator_preserves_extractor_speaker_assistant(self):
+        # Symmetric case: extractor returned "assistant", the
+        # validator preserves it.
+        facts = [
+            {
+                "content": "User has been bundling related changes",
+                "tags": ["pattern"],
+                "confidence": 0.7,
+                "intent": "new",
+                "speaker": "assistant",
+            }
+        ]
+        out = _validate_facts(
+            facts,
+            set(),
+            candidate_metadata={},
+            user_id="u-test",
+            user_window_text="ok",
+            assistant_window_text="You've been bundling related changes",
+        )
+        assert len(out) == 1
+        assert out[0]["speaker"] == "assistant"
+
+    def test_validator_overrides_speaker_on_assistant_quote(self):
+        # Defense-in-depth force: a fact carrying a confirmation_quote
+        # whose substring appears verbatim in the ASSISTANT side of
+        # the window gets speaker rewritten to "assistant" regardless
+        # of what the extractor returned. The fact stays in the
+        # output (only the speaker changes); the confirmation-quote
+        # rules already passed.
+        quote = "Yes, deploy on Friday at 5pm please"
+        assert len(quote) >= _CONFIRMATION_QUOTE_MIN_CHARS
+        facts = [
+            {
+                "content": "User confirmed deploy on Friday",
+                "tags": ["confirmed_action"],
+                "confidence": 0.7,
+                "intent": "new",
+                "speaker": "user",
+                "confirmation_quote": quote,
+            }
+        ]
+        # Quote appears verbatim in the assistant window; force
+        # the override.
+        out = _validate_facts(
+            facts,
+            set(),
+            candidate_metadata={},
+            user_id="u-test",
+            user_window_text="ok",
+            assistant_window_text=f"I asked: {quote}",
+        )
+        assert len(out) == 1
+        assert out[0]["speaker"] == "assistant"
+
+    def test_validator_keeps_assistant_when_extractor_says_so(self):
+        # Defense-in-depth restraint: when the extractor returned
+        # "assistant" and the quote appears in a USER message (and
+        # NOT in the assistant window), the validator leaves the
+        # value alone. The conservative-default rule wins on
+        # disagreement; the validator never promotes a fact UP to
+        # user-claimed.
+        quote = "Yes, deploy on Friday at 5pm please"
+        facts = [
+            {
+                "content": "User confirmed deploy on Friday",
+                "tags": ["confirmed_action"],
+                "confidence": 0.7,
+                "intent": "new",
+                "speaker": "assistant",
+                "confirmation_quote": quote,
+            }
+        ]
+        out = _validate_facts(
+            facts,
+            set(),
+            candidate_metadata={},
+            user_id="u-test",
+            user_window_text=quote,
+            assistant_window_text="The PR is ready for review.",
+        )
+        assert len(out) == 1
+        assert out[0]["speaker"] == "assistant"
+
+    def test_validator_quote_in_neither_keeps_extractor_value(self):
+        # Defense-in-depth no-op: when the confirmation_quote does
+        # not appear in either window side (extractor paraphrased,
+        # or the substring is split across the speaker boundary),
+        # the validator leaves the speaker alone in BOTH directions.
+        quote = "Yes, deploy on Friday at 5pm please"
+        facts = [
+            {
+                "content": "User confirmed deploy on Friday",
+                "tags": ["confirmed_action"],
+                "confidence": 0.7,
+                "intent": "new",
+                "speaker": "user",
+                "confirmation_quote": quote,
+            }
+        ]
+        out = _validate_facts(
+            facts,
+            set(),
+            candidate_metadata={},
+            user_id="u-test",
+            user_window_text="(empty user side)",
+            assistant_window_text="(empty assistant side)",
+        )
+        assert len(out) == 1
+        # Quote appears in NEITHER window; the extractor's value
+        # ("user") is preserved.
+        assert out[0]["speaker"] == "user"
+
+    def test_fact_schema_includes_speaker_required(self):
+        # Pin the schema-required contract: every emitted fact must
+        # carry a speaker field. A future schema relaxation that
+        # accidentally drops `speaker` from the required list would
+        # surface here, BEFORE the read-time helper has to absorb
+        # the missing-speaker via legacy defaulting.
+        from kai.memory_extraction import _FACT_SCHEMA
+
+        per_fact_schema = _FACT_SCHEMA["properties"]["facts"]["items"]
+        assert "speaker" in per_fact_schema["required"]
+        speaker_prop = per_fact_schema["properties"]["speaker"]
+        # Two-value enum (user / assistant); episode_summary is a
+        # third value that flows through a separate write path and
+        # is intentionally not in the extractor enum.
+        assert set(speaker_prop["enum"]) == {"user", "assistant"}

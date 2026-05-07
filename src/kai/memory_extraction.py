@@ -80,7 +80,16 @@ log = logging.getLogger(__name__)
 # analysis distinguish episodes classified under the tightened
 # wording (`prompt_version == "7"` on the extracted row produced
 # by the same call).
-_EXTRACTION_PROMPT_VERSION: str = "7"
+# v8 (2026-05-07): added per-fact speaker attribution. Fact schema
+# gains a required `speaker` enum field with values `user` and
+# `assistant`; the FORMAT section gains a paragraph documenting the
+# field plus four worked examples (two per class) showing the
+# conservative-default rule. `_validate_facts` defense-in-depth check
+# can override speaker to "assistant" when a fact's confirmation_quote
+# substring appears verbatim in an ASSISTANT message in the window.
+# The bump lets post-rollout log analysis cleanly partition facts
+# produced under the speaker-attribution prompt from earlier ones.
+_EXTRACTION_PROMPT_VERSION: str = "8"
 
 # Sibling of _EXTRACTION_PROMPT_VERSION for stage-2 episode generation.
 # Stored in each episode's metadata so future cleanups can target a
@@ -297,8 +306,19 @@ _FACT_SCHEMA: dict = {
                         "minLength": 1,
                         "maxLength": 64,
                     },
+                    # Per-fact speaker attribution. Two-value enum:
+                    # episodes use a third value ("episode_summary")
+                    # but flow through a separate write path that
+                    # does not go through the fact extractor. The
+                    # field is required so every new row carries it
+                    # explicitly; legacy rows missing it pick up the
+                    # documented default at read time.
+                    "speaker": {
+                        "type": "string",
+                        "enum": ["user", "assistant"],
+                    },
                 },
-                "required": ["content", "tags", "confidence", "intent"],
+                "required": ["content", "tags", "confidence", "intent", "speaker"],
                 "additionalProperties": False,
             },
             "maxItems": 5,
@@ -435,6 +455,31 @@ FORMAT each fact as:
 - confidence: a number in [0, 1]. Use 0.9+ for direct user statements,
   0.7 for clear user confirmation of an assistant claim, 0.5 for
   paraphrased or implied facts. Do not store below 0.5.
+- speaker: Set to `user` only when the fact is asserted directly in a
+  USER message in the window. If the fact comes from an ASSISTANT
+  message, OR if the fact summarizes information that spans both
+  speakers' messages, OR if you are uncertain which speaker contributed
+  the substantive claim, set speaker to `assistant`. The conservative
+  default is `assistant`.
+
+  Worked examples:
+
+  - USER message "I prefer concise responses to long ones" yielding
+    fact "user prefers concise responses". Speaker: `user`. Direct
+    user statement.
+  - USER message "I'm in Toronto, EST" yielding fact "user is in EST
+    timezone". Speaker: `user`. Direct self-report.
+  - ASSISTANT message "You've shipped three PRs in the last hour,
+    that's a lot" followed by USER message "yeah" yielding fact
+    "user is in a high-throughput review cycle". Speaker:
+    `assistant`. The substantive claim is the assistant's; user
+    acknowledgment alone does not promote it to user-stated.
+    Conservative default applies.
+  - ASSISTANT message "Looking at your last five messages, you tend
+    to bundle related changes into one PR rather than splitting
+    them" yielding fact "user prefers bundled PRs". Speaker:
+    `assistant`. Assistant-synthesized pattern with no corresponding
+    direct user statement in the window.
 - confirmation_quote: REQUIRED when tags include "confirmed_action",
   MUST be absent otherwise. Must be the verbatim user text that
   confirms the action, minimum 20 characters, and must reference
@@ -1283,6 +1328,8 @@ def _validate_facts(
     *,
     candidate_metadata: dict[str, dict],
     user_id: str,
+    user_window_text: str = "",
+    assistant_window_text: str = "",
 ) -> list[dict]:
     """
     Drop facts that violate confirmation-quote or consolidation rules.
@@ -1520,6 +1567,35 @@ def _validate_facts(
                 log.debug("_validate_facts: rejecting non-confirmed_action fact with quote")
                 continue
 
+        # Defense-in-depth speaker check (paired with the prompt's
+        # "conservative default is assistant" instruction). When a
+        # fact carries a `confirmation_quote`, look up where that
+        # substring appears verbatim in the conversation window:
+        #
+        #   - If the quote appears in an ASSISTANT message, force
+        #     speaker="assistant" regardless of what the extractor
+        #     returned. The substantive claim is the assistant's;
+        #     the model may have mis-attributed it to the user.
+        #   - Otherwise (quote in user only, or quote not found in
+        #     either), leave the extractor's speaker value alone.
+        #     The conservative-default rule in the prompt already
+        #     biases toward "assistant"; this check only forces a
+        #     correction in one direction (toward assistant), never
+        #     promotes a fact to user-claimed.
+        #
+        # The full-substring requirement against the schema's 20-char
+        # minimum on confirmation_quote makes coincidental cross-
+        # speaker matches rare. If the rate proves non-trivial in
+        # production, a follow-up issue weakens the override to
+        # log-only.
+        #
+        # Defense-in-depth only fires for facts carrying a
+        # confirmation_quote; non-confirmed_action facts have no
+        # quote substring to check against and rely on the prompt-
+        # side conservative default alone.
+        if isinstance(quote, str) and assistant_window_text and quote in assistant_window_text:
+            fact["speaker"] = "assistant"
+
         validated.append(fact)
     return validated
 
@@ -1568,6 +1644,8 @@ async def _run_extractor(
     candidate_metadata: dict[str, dict],
     user_id: str,
     system_prompt: str = _EXTRACTION_SYSTEM_PROMPT,
+    user_window_text: str = "",
+    assistant_window_text: str = "",
 ) -> ExtractionResult:
     """
     Spawn `claude --print` with the extractor prompt and parse the JSON.
@@ -1729,7 +1807,14 @@ async def _run_extractor(
     facts_raw = payload_root.get("facts") or []
     has_episode = bool(payload_root.get("has_episode"))
     return ExtractionResult(
-        facts=_validate_facts(facts_raw, candidate_ids, candidate_metadata=candidate_metadata, user_id=user_id),
+        facts=_validate_facts(
+            facts_raw,
+            candidate_ids,
+            candidate_metadata=candidate_metadata,
+            user_id=user_id,
+            user_window_text=user_window_text,
+            assistant_window_text=assistant_window_text,
+        ),
         has_episode=has_episode,
     )
 
@@ -2027,6 +2112,19 @@ async def _generate_episode(
                         "actors": episode["actors"],
                         "session_id": session_id or "",
                         "episode_prompt_version": _EPISODE_PROMPT_VERSION,
+                        # Speaker / confidence pinned at write time
+                        # (not produced by the episode generator).
+                        # Episodes pass two-stage validation already
+                        # (Stage 1 classifier + Stage 2 generator +
+                        # _validate_episode), so a model-supplied
+                        # confidence would be a third filter on
+                        # already-vetted content; the constant 1.0
+                        # reflects the curated multi-stage path. The
+                        # speaker enum's third value lives only on
+                        # this write path; the extractor's two-value
+                        # enum (user / assistant) does not carry it.
+                        "speaker": "episode_summary",
+                        "confidence": 1.0,
                     }
                     if "lessons" in episode:
                         extra["lessons"] = episode["lessons"]
@@ -2411,12 +2509,23 @@ async def extract_and_store(
                 candidates,
                 prior_pairs=prior_pairs,
             )
+            # Concatenate the conversation window's user-side and
+            # assistant-side text so `_validate_facts` can run the
+            # defense-in-depth speaker check (look for a fact's
+            # confirmation_quote substring in either side). Joining
+            # current-exchange + prior-pairs together with " " lets
+            # the substring search treat the whole window as one
+            # haystack without re-implementing the prior-pair walk.
+            user_window_text = " ".join([p[0] for p in (prior_pairs or [])] + [user_text])
+            assistant_window_text = " ".join([p[1] for p in (prior_pairs or [])] + [assistant_capped])
             result = await _run_extractor(
                 payload,
                 config,
                 candidate_ids=candidate_id_set,
                 candidate_metadata=candidate_metadata,
                 user_id=user_id,
+                user_window_text=user_window_text,
+                assistant_window_text=assistant_window_text,
             )
             # Restructured for stage-2 (issue #385): facts and has_episode
             # are independent. An exchange can be episode-worthy without

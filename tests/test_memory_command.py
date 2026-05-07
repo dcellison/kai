@@ -37,6 +37,7 @@ def _fact(
     tags: list[str],
     confidence: float = 0.85,
     *,
+    speaker: str | None = "user",
     confirmation_quote: str = "",
     session_id: str = "session_test",
     prompt_version: str = "v3",
@@ -46,8 +47,15 @@ def _fact(
 ) -> MemoryResult:
     """Construct a MemoryResult shaped like an extracted fact.
 
-    Defaults match what `memory_extraction.py` writes into Mem0
-    metadata. Tests override only the fields that matter to them.
+    Defaults match what post-spec `memory_extraction.py` writes into
+    Mem0 metadata: source="extracted", explicit speaker, explicit
+    confidence. Tests override only the fields that matter to them.
+
+    `speaker` defaults to "user" so the read-time helper takes the
+    explicit-fields branch (returning the metadata's own speaker and
+    confidence). Tests that want to exercise the extracted-legacy
+    branch (rows missing speaker, surfacing the documented default
+    constants) can pass `speaker=None`.
     """
     metadata: dict[str, Any] = {
         "source": "extracted",
@@ -57,6 +65,8 @@ def _fact(
         "prompt_version": prompt_version,
         "type": "fact",
     }
+    if speaker is not None:
+        metadata["speaker"] = speaker
     if confirmation_quote:
         metadata["confirmation_quote"] = confirmation_quote
     return MemoryResult(
@@ -280,6 +290,7 @@ class TestBuildFactView:
             "Never use em dashes.",
             ["preference", "constraint"],
             confidence=0.92,
+            speaker="user",
             session_id="session_abc123",
             prompt_version="v3",
             created_at="2026-04-17T14:32:00",
@@ -287,6 +298,7 @@ class TestBuildFactView:
         text, kb = memory_command._build_fact_view(f, return_to=("tag", ["preference", "0"]))
         assert '"Never use em dashes."' in text
         assert "preference, constraint" in text
+        assert "Speaker:          User" in text
         assert "Confidence:       0.92" in text
         assert "2026-04-17 14:32" in text
         assert "session_abc123" in text
@@ -318,6 +330,55 @@ class TestBuildFactView:
         )
         text, _ = memory_command._build_fact_view(f, return_to=None)
         assert "Yes, deploy on Friday" in text
+
+    def test_extracted_legacy_uses_legacy_defaults(self):
+        # An extracted fact missing both speaker and confidence (a
+        # pre-spec legacy row) renders the documented defaults via
+        # `_read_time_speaker`. The Speaker line shows the humanized
+        # legacy speaker; the Confidence line shows the legacy
+        # confidence formatted to 2dp. Pin against the bound module
+        # constants rather than literals so a swap-the-constants
+        # follow-up does not require touching this test.
+        from kai.memory import _LEGACY_CONFIDENCE, _LEGACY_SPEAKER
+
+        f = _fact("legacy", "Some legacy fact", ["preference"], speaker=None)
+        text, _ = memory_command._build_fact_view(f, return_to=None)
+        # Humanized legacy speaker (Title-cased) must appear in the
+        # Speaker line; the explicit "Speaker:" label rules out a
+        # coincidental substring match against another field.
+        assert f"Speaker:          {memory_command._humanize_speaker(_LEGACY_SPEAKER)}" in text
+        assert f"Confidence:       {_LEGACY_CONFIDENCE:.2f}" in text
+
+    def test_episode_detail_no_confidence_line(self):
+        # The episode view renders the Speaker line ("Episode summary")
+        # and omits the Confidence line. The constant 1.0 carried for
+        # episodes is structurally uninformative for operator-side
+        # review and would be visual clutter on this surface.
+        episode = MemoryResult(
+            id="ep1",
+            text="User shipped a new feature.",
+            score=0.0,
+            memory_type="episode",
+            metadata={
+                "source": "episode",
+                "type": "episode",
+                "approach": "TDD with small commits",
+                "outcome": "Merged after one review round",
+                "actors": ["user"],
+                "outcome_quality": "good",
+                "tags": ["episode"],
+            },
+            created_at="2026-04-30T10:00:00",
+            updated_at="2026-04-30T10:00:00",
+        )
+        text, _ = memory_command._build_fact_view(episode, return_to=None)
+        # Speaker line present and humanized.
+        assert "Speaker:  Episode summary" in text
+        # Confidence line ABSENT. The label match is the
+        # load-bearing assertion; checking the bare "Confidence"
+        # token alone would catch any line that happened to mention
+        # confidence in prose.
+        assert "Confidence:" not in text
 
 
 # ── Builder: forget confirmations ──────────────────────────────────
@@ -792,11 +853,15 @@ class TestFactViewMultiSource:
 
     def test_fact_view_renders_migration_with_fact_header(self):
         """Migration row renders the `Fact` header (matching extracted)
-        and the same minimal Tags + Date body it used to. The header
-        no longer calls out the extracted/migration distinction; the
-        operator-facing UI treats them as one bucket. The body shape
-        stays minimal because migration rows do not carry the four
-        extractor-only fields."""
+        and the minimal Tags + Speaker + Confidence + Date body. The
+        header no longer calls out the extracted/migration distinction;
+        the operator-facing UI treats them as one bucket. Speaker and
+        Confidence land via `_read_time_speaker` (always User / 0.9
+        for migration rows that predate the new helper); the four
+        extractor-only fields (Session, Prompt version, Confirmation,
+        and the schema-required `confidence` field on extracted rows
+        that overlapped with the new Confidence label) stay omitted.
+        """
         fact = _migration_fact(tags=["migration", "backend"])
         text, _ = memory_command._build_fact_view(fact, return_to=None)
         # Header matches extracted; the literal "Imported" string
@@ -807,10 +872,16 @@ class TestFactViewMultiSource:
         # Tags include the migration H3 slug.
         assert "migration" in text
         assert "backend" in text
+        # Speaker and Confidence render via the migration-default
+        # constants. Pin the labels but keep the value comparison
+        # tolerant by matching against the rendered string ("User"
+        # not the raw enum); this catches a regression in the helper
+        # and the humanizer at the same time.
+        assert "Speaker:  User" in text
+        assert "Confidence:  0.90" in text
         # Date renders.
         assert "Date:" in text
         # No extractor-only rows.
-        assert "Confidence:" not in text
         assert "Session:" not in text
         assert "Prompt version:" not in text
         assert "Confirmation:" not in text
@@ -1447,17 +1518,60 @@ class TestBuildFactsListView:
             assert btn.callback_data == f"mem:fact:{i}"
 
     def test_nav_buttons_use_facts_verb(self):
-        # Prev and next buttons must encode `mem:facts:<page>`, not
-        # `mem:eps:<page>`. Pin the verb so a copy-paste regression
-        # from the episode list trips here.
+        # Prev and next buttons must encode `mem:facts:<page>:<sort>`,
+        # not `mem:eps:<page>` or the legacy 2-segment shape. Pin the
+        # verb AND the sort segment so a copy-paste regression from
+        # the episode list (which has no sort axis) or a regression
+        # that drops the sort propagation through nav both trip here.
         rows = [self._row(f"f{i}", f"Fact {i}") for i in range(12)]
         # Middle page so both prev and next render.
         _, kb, _, _, _ = memory_command._build_facts_list_view(rows, 1)
         nav_row = kb.inline_keyboard[-1]
         prev_btn = next(btn for btn in nav_row if btn.text == "< prev")
         next_btn = next(btn for btn in nav_row if btn.text == "next >")
-        assert prev_btn.callback_data == "mem:facts:0"
-        assert next_btn.callback_data == "mem:facts:2"
+        # Default sort = "quality"; nav buttons preserve the active
+        # mode so paging does not silently flip the sort.
+        assert prev_btn.callback_data == "mem:facts:0:quality"
+        assert next_btn.callback_data == "mem:facts:2:quality"
+
+    def test_toggle_callback_data(self):
+        # Each toggle button carries the sort mode in its third
+        # callback segment. Pinning both segments here means a
+        # regression that loses the page-arg or the sort-arg trips
+        # this test independently of the nav-row test above.
+        rows = [self._row(f"f{i}", f"Fact {i}") for i in range(8)]
+        _, kb, _, _, _ = memory_command._build_facts_list_view(rows, 1, sort="quality")
+        # Sort row sits between the number row and the nav row.
+        sort_row = kb.inline_keyboard[1]
+        assert len(sort_row) == 2
+        # Both buttons reference the current page (1) so a tap stays
+        # on the same page and only flips the sort axis.
+        assert sort_row[0].callback_data == "mem:facts:1:quality"
+        assert sort_row[1].callback_data == "mem:facts:1:recent"
+
+    def test_toggle_button_marks_active_mode_quality(self):
+        # The button corresponding to the current sort renders with
+        # a leading checkmark; the inactive button does not. Pin
+        # against the literal "✓ Sort: Quality" / "Sort: Recent" so
+        # a regression that swaps the marker glyph or drops it from
+        # the active button trips this test.
+        rows = [self._row("f1", "Just one")]
+        _, kb, _, _, _ = memory_command._build_facts_list_view(rows, 0, sort="quality")
+        sort_row = kb.inline_keyboard[1]
+        labels = [btn.text for btn in sort_row]
+        assert labels == ["✓ Sort: Quality", "Sort: Recent"]
+
+    def test_toggle_button_marks_active_mode_recent(self):
+        # Symmetric counterpart to the quality variant: when sort
+        # is "recent", that button gets the checkmark and the
+        # quality button does not. Two separate tests rather than
+        # one parametrized test because the assertion text reads
+        # more clearly when the active mode is in the test name.
+        rows = [self._row("f1", "Just one")]
+        _, kb, _, _, _ = memory_command._build_facts_list_view(rows, 0, sort="recent")
+        sort_row = kb.inline_keyboard[1]
+        labels = [btn.text for btn in sort_row]
+        assert labels == ["Sort: Quality", "✓ Sort: Recent"]
 
 
 class TestEpsCallbackDispatch:
@@ -1557,10 +1671,11 @@ class TestFactsCallbackDispatch:
         monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
         captured: dict[str, Any] = {}
 
-        async def fake_send(update, context, chat_id, page, edit=False):
+        async def fake_send(update, context, chat_id, page, edit=False, sort="quality"):
             captured["chat_id"] = chat_id
             captured["page"] = page
             captured["edit"] = edit
+            captured["sort"] = sort
 
         monkeypatch.setattr(memory_command, "_send_facts_list", fake_send)
         upd = update_factory(callback_data="mem:facts:0")
@@ -1569,6 +1684,11 @@ class TestFactsCallbackDispatch:
         assert captured["chat_id"] == 100
         assert captured["page"] == 0
         assert captured["edit"] is True
+        # 2-segment legacy callback (no sort arg) falls through to
+        # the default "quality" sort. Pinning it explicitly so a
+        # future change that silently flips the default to "recent"
+        # fails this test.
+        assert captured["sort"] == "quality"
 
     @pytest.mark.asyncio
     async def test_facts_verb_invalid_page_falls_back_to_zero(self, monkeypatch, update_factory, context_factory):
@@ -1578,7 +1698,7 @@ class TestFactsCallbackDispatch:
         monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
         captured: dict[str, Any] = {}
 
-        async def fake_send(update, context, chat_id, page, edit=False):
+        async def fake_send(update, context, chat_id, page, edit=False, sort="quality"):
             captured["page"] = page
 
         monkeypatch.setattr(memory_command, "_send_facts_list", fake_send)
@@ -1586,6 +1706,123 @@ class TestFactsCallbackDispatch:
         ctx = context_factory()
         await memory_command.handle_memory_callback(upd, ctx)
         assert captured["page"] == 0
+
+    @pytest.mark.asyncio
+    async def test_facts_verb_dispatches_with_recent_sort(self, monkeypatch, update_factory, context_factory):
+        # 3-segment callback `mem:facts:0:recent` flows through to
+        # `_send_facts_list` with sort="recent". Pins the new arg
+        # parsing path the toggle button relies on.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        captured: dict[str, Any] = {}
+
+        async def fake_send(update, context, chat_id, page, edit=False, sort="quality"):
+            captured["sort"] = sort
+
+        monkeypatch.setattr(memory_command, "_send_facts_list", fake_send)
+        upd = update_factory(callback_data="mem:facts:0:recent")
+        ctx = context_factory()
+        await memory_command.handle_memory_callback(upd, ctx)
+        assert captured["sort"] == "recent"
+
+
+class TestSendFactsListSort:
+    """`_send_facts_list` re-sorts the fetched fact list before
+    handing it to the builder when the sort mode is "quality" (the
+    default). The "recent" mode passes through unchanged so the
+    existing `get_all_facts` ordering (newest-updated first) wins."""
+
+    def _build_row(self, fact_id: str, text: str, *, speaker: str, confidence: float) -> MemoryResult:
+        # A row carrying explicit speaker + confidence so the read-
+        # time helper takes the explicit-fields branch and the
+        # browse score is exactly speaker_weight * confidence. Tests
+        # below rely on this so the sort outcome is deterministic.
+        return MemoryResult(
+            id=fact_id,
+            text=text,
+            score=0.0,
+            memory_type="fact",
+            metadata={
+                "source": "extracted",
+                "type": "fact",
+                "speaker": speaker,
+                "confidence": confidence,
+            },
+            created_at="2026-04-29T10:00:00",
+            updated_at="2026-04-29T10:00:00",
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_sort_is_quality(self, monkeypatch, update_factory, context_factory):
+        # `_send_facts_list` called with no explicit sort kwarg
+        # re-sorts by browse_score desc. Two rows: low-quality
+        # (assistant, 0.5) and high-quality (user, 1.0). The high-
+        # quality row must reach the builder at index 0 even though
+        # `get_all_facts` returned them in the other order.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        # get_all_facts returns low-quality first; the sort step
+        # is what flips them.
+        rows = [
+            self._build_row("low", "Assistant fact", speaker="assistant", confidence=0.5),
+            self._build_row("high", "User fact", speaker="user", confidence=1.0),
+        ]
+        monkeypatch.setattr(memory_command.memory, "get_all_facts", lambda *, user_id: list(rows))
+        captured: dict[str, Any] = {}
+
+        def fake_build(facts, page, sort="quality"):
+            captured["facts"] = list(facts)
+            captured["sort"] = sort
+            # The kb value is opaque to `_send_facts_list`; a None
+            # placeholder is enough since the test stubs out the
+            # downstream `_send_or_edit` call too.
+            return ("rendered", None, [f.id for f in facts], 0, 1)
+
+        monkeypatch.setattr(memory_command, "_build_facts_list_view", fake_build)
+        # Stub _send_or_edit so the test does not need a real bot
+        # context. The sort outcome is fully observable via captured.
+
+        async def fake_send(update, text, kb, edit=False):
+            captured["edit"] = edit
+
+        monkeypatch.setattr(memory_command, "_send_or_edit", fake_send)
+        upd = update_factory(callback_data="mem:facts:0")
+        ctx = context_factory()
+        await memory_command._send_facts_list(upd, ctx, 100, 0, edit=True)
+        # High-quality user fact arrives first; low-quality assistant
+        # second. The sort key matches `_browse_score` desc.
+        assert [f.id for f in captured["facts"]] == ["high", "low"]
+        assert captured["sort"] == "quality"
+
+    @pytest.mark.asyncio
+    async def test_recent_sort_matches_legacy(self, monkeypatch, update_factory, context_factory):
+        # When sort="recent", the list is passed through unchanged.
+        # `get_all_facts` already returns newest-first, so the
+        # builder sees the input order without a quality re-sort.
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        rows = [
+            self._build_row("low", "Assistant fact", speaker="assistant", confidence=0.5),
+            self._build_row("high", "User fact", speaker="user", confidence=1.0),
+        ]
+        monkeypatch.setattr(memory_command.memory, "get_all_facts", lambda *, user_id: list(rows))
+        captured: dict[str, Any] = {}
+
+        def fake_build(facts, page, sort="quality"):
+            captured["facts"] = list(facts)
+            captured["sort"] = sort
+            return ("rendered", None, [f.id for f in facts], 0, 1)
+
+        monkeypatch.setattr(memory_command, "_build_facts_list_view", fake_build)
+
+        async def fake_send(update, text, kb, edit=False):
+            pass
+
+        monkeypatch.setattr(memory_command, "_send_or_edit", fake_send)
+        upd = update_factory(callback_data="mem:facts:0:recent")
+        ctx = context_factory()
+        await memory_command._send_facts_list(upd, ctx, 100, 0, edit=True, sort="recent")
+        # Order matches input order; the quality-flip from the
+        # default test does NOT happen here.
+        assert [f.id for f in captured["facts"]] == ["low", "high"]
+        assert captured["sort"] == "recent"
 
 
 class TestFactViewFactsReturn:

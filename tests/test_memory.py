@@ -439,33 +439,46 @@ class TestFormatContext:
         output = await format_context("history", user_id="123")
         assert "- (2026-01-15, legacy) Old pre-spec entry" in output
 
-    async def test_format_context_source_weighting_ranks_extracted_first(self):
-        """Source weighting reorders results so extracted > legacy at equal raw score.
-
-        Spec 360 removed the `user_raw` middle tier, so this test now
-        verifies the surviving 2-way ordering: extracted (1.2x) outranks
-        legacy/unset (0.6x) at the same raw score. Mem0 returns them in
-        reverse order to confirm the formatter does its own sort rather
-        than relying on input order."""
+    async def test_format_context_orders_by_weighted_score(self):
+        """At equal raw cosine, a user-speaker row ranks above an
+        assistant-speaker row. The new ranking key is `cosine *
+        speaker_weight * confidence`; with speakers = (user, assistant)
+        and confidence held equal, the speaker_weights table alone
+        decides the tie. Mem0 returns the rows in reverse order to
+        confirm the formatter does its own sort rather than relying
+        on input order.
+        """
         import kai.memory as mem_mod
         from kai.memory import format_context
 
-        # Two results with IDENTICAL raw score; only source differs.
+        # Two results with IDENTICAL raw score and confidence; only
+        # speaker differs. Both confidences are 0.9 so a difference
+        # in confidence cannot account for any reordering.
         mock_mem = MagicMock()
         mock_mem.search.return_value = {
             "results": [
                 {
                     "id": "a",
-                    "memory": "Legacy entry text",
+                    "memory": "Assistant inferred a pattern",
                     "score": 0.8,
-                    "metadata": {"type": "exchange"},  # no source -> legacy
+                    "metadata": {
+                        "type": "fact",
+                        "source": "extracted",
+                        "speaker": "assistant",
+                        "confidence": 0.9,
+                    },
                     "created_at": "2026-01-01T00:00:00",
                 },
                 {
                     "id": "c",
                     "memory": "User prefers vim for editing",
                     "score": 0.8,
-                    "metadata": {"type": "fact", "source": "extracted"},
+                    "metadata": {
+                        "type": "fact",
+                        "source": "extracted",
+                        "speaker": "user",
+                        "confidence": 0.9,
+                    },
                     "created_at": "2026-03-01T00:00:00",
                 },
             ]
@@ -476,27 +489,40 @@ class TestFormatContext:
         output = await format_context("editor", user_id="123")
         lines = output.splitlines()[1:]  # skip header
 
-        # The formatter should walk in adjusted-score order. At equal raw
-        # score the order is fixed by weight: extracted (1.2), legacy (0.6).
+        # User-speaker outranks assistant-speaker at equal cosine and
+        # equal confidence. With speaker weights at 1.0 vs 0.7 the
+        # adjusted scores are 0.72 vs 0.504, ordering: user, assistant.
         assert "User prefers vim for editing" in lines[0]
-        assert "Legacy entry text" in lines[1]
+        assert "Assistant inferred a pattern" in lines[1]
 
-    async def test_format_context_weighting_never_rescues_subthreshold(self):
-        """A sub-threshold extracted row stays filtered even after weighting."""
+    async def test_format_context_floor_applies_to_raw_cosine(self):
+        """A sub-threshold row stays filtered even though weighting
+        could in principle re-rank rows past the floor. The new
+        weights are demote-only (every value <= 1.0), so weighting
+        can only lower a row's adjusted score. The floor check runs
+        on raw cosine, BEFORE the speaker multiplier, which means a
+        sub-threshold row never reaches the walk regardless of its
+        speaker class.
+        """
         import kai.memory as mem_mod
         from kai.memory import format_context
 
-        # raw_score 0.25 < memory_search_floor (0.3); boosting by 1.2
-        # yields 0.30, but weighting happens AFTER the filter (§5.3) so this
-        # row never reaches the walk. Result must be empty.
+        # raw_score 0.25 < memory_search_floor (0.3). Even an
+        # otherwise-promotable user-speaker row (speaker_weight 1.0)
+        # cannot rescue it because the filter runs on raw cosine.
         mock_mem = MagicMock()
         mock_mem.search.return_value = {
             "results": [
                 {
                     "id": "sub",
-                    "memory": "Borderline extracted fact",
+                    "memory": "Borderline user-claimed fact",
                     "score": 0.25,
-                    "metadata": {"type": "fact", "source": "extracted"},
+                    "metadata": {
+                        "type": "fact",
+                        "source": "extracted",
+                        "speaker": "user",
+                        "confidence": 1.0,
+                    },
                     "created_at": "2026-04-01T00:00:00",
                 },
             ]
@@ -506,6 +532,64 @@ class TestFormatContext:
 
         output = await format_context("anything", user_id="123")
         assert output == ""
+
+    async def test_format_context_log_payload_carries_speaker_and_confidence(self, caplog):
+        """The per-hit log payload exposes `speaker` and `confidence`
+        siblings of `source`. For a legacy row missing both fields
+        from metadata, the logged values must be the defaulted
+        constants returned by `_read_time_speaker`, NOT a missing-
+        field marker - so a log analyst reading the line can
+        reconstruct the demote multiplier (`speaker_weight *
+        confidence`) without re-fetching the row.
+
+        This is the test that catches a regression where the per-hit
+        builder reads `r.metadata["speaker"]` directly (which would
+        be None for legacy rows) instead of going through the
+        helper. Without the helper indirection, every legacy row
+        would log speaker=null and the eval harness would lose its
+        ability to attribute ranking decisions.
+        """
+        import kai.memory as mem_mod
+        from kai.memory import (
+            _LEGACY_CONFIDENCE,
+            _LEGACY_SPEAKER,
+            format_context,
+        )
+
+        # One legacy row (no speaker/confidence in metadata, source ==
+        # "extracted"): the read-time helper falls into branch 4 and
+        # supplies the legacy defaults. The assertion below pins
+        # against the bound module constants so a swap-the-constants
+        # follow-up does not break this test.
+        mock_mem = MagicMock()
+        mock_mem.search.return_value = {
+            "results": [
+                {
+                    "id": "legacy",
+                    "memory": "Some legacy claim",
+                    "score": 0.8,
+                    "metadata": {"type": "fact", "source": "extracted"},
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            ]
+        }
+        mem_mod._memory = mock_mem
+        mem_mod._config = _make_config()
+
+        with caplog.at_level(logging.INFO, logger="kai.memory"):
+            await format_context("legacy fact", user_id="42")
+
+        payload = _parse_recall_log(caplog)
+        assert len(payload["hits"]) == 1
+        hit = payload["hits"][0]
+        # Speaker and confidence carry the defaulted values.
+        assert hit["speaker"] == _LEGACY_SPEAKER
+        assert hit["confidence"] == _LEGACY_CONFIDENCE
+        # Source still passes through as recorded on the row, NOT
+        # collapsed into the speaker default. The two fields describe
+        # different axes (write path vs whose claim) and must both
+        # remain readable.
+        assert hit["source"] == "extracted"
 
     async def test_format_context_disabled_returns_empty(self):
         """Returns empty string when memory is not initialized."""
@@ -614,6 +698,110 @@ class TestFormatContext:
             assert "(user)" not in line
 
 
+# ── Speaker weight function ────────────────────────────────────────
+
+
+class TestSpeakerWeight:
+    """Tests for `_speaker_weight`, the read-time multiplier the
+    retrieval sort uses in place of the older `_source_weight`. The
+    helper composes two factors: a speaker_weights table lookup and
+    the row's confidence value, both surfaced by `_read_time_speaker`.
+    """
+
+    def test_speaker_weight_combines_factors(self):
+        """speaker_weight * confidence is the contract; pin the
+        multiplication so a refactor that swaps order or drops a
+        factor fails immediately. Use a row carrying speaker and
+        confidence in metadata so the `_read_time_speaker` path is
+        the explicit-fields branch, not a defaulted branch.
+        """
+        from kai.memory import _SPEAKER_WEIGHTS, MemoryResult, _speaker_weight
+
+        row = MemoryResult(
+            id="x",
+            text="User prefers dark mode",
+            score=0.5,
+            memory_type="fact",
+            metadata={
+                "type": "fact",
+                "source": "extracted",
+                "speaker": "user",
+                "confidence": 0.8,
+            },
+            created_at="2026-04-01T00:00:00",
+        )
+
+        # Expected: speaker_weights["user"] * confidence
+        # Held against the table rather than literal 1.0 so the test
+        # stays honest if the calibration sweep retunes "user".
+        assert _speaker_weight(row) == _SPEAKER_WEIGHTS["user"] * 0.8
+
+    def test_speaker_weight_unknown_speaker(self):
+        """A row whose speaker value is not in the speaker_weights
+        table falls back to _UNKNOWN_SPEAKER_WEIGHT (aliased to the
+        assistant weight). Confidence is unaffected by the unknown
+        path; the multiplier is `_UNKNOWN_SPEAKER_WEIGHT * confidence`.
+
+        Pins the unknown-class fallback against the named alias rather
+        than a literal so a future change to the alias target (e.g.,
+        if the design shifts unknown back toward the legacy floor)
+        flows through automatically.
+        """
+        from kai.memory import _UNKNOWN_SPEAKER_WEIGHT, MemoryResult, _speaker_weight
+
+        row = MemoryResult(
+            id="x",
+            text="Some claim of unknown origin",
+            score=0.5,
+            memory_type="fact",
+            metadata={
+                "type": "fact",
+                "source": "extracted",
+                "speaker": "mystery_class",
+                "confidence": 0.7,
+            },
+            created_at="2026-04-01T00:00:00",
+        )
+
+        assert _speaker_weight(row) == _UNKNOWN_SPEAKER_WEIGHT * 0.7
+
+    def test_speaker_weight_demote_only(self):
+        """For every (in-enum speaker, in-range confidence) pair, the
+        combined multiplier stays in [0.0, 1.0]. This is the load-
+        bearing invariant for the floor check: as long as the weight
+        is <= 1.0, raw cosine remains an upper bound on adjusted
+        score, and a sub-threshold row (raw_score < floor) cannot be
+        rescued by a high speaker weight.
+
+        Iterates the production table directly so a calibration sweep
+        that bumps a value above 1.0 in a future tune fails this test
+        loudly rather than silently breaking the floor invariant.
+        """
+        from kai.memory import _SPEAKER_WEIGHTS, MemoryResult, _speaker_weight
+
+        # Confidence floor (0.5) and ceiling (1.0) come from the fact
+        # schema's [0.5, 1.0] range. Ceilings above 1.0 are not valid
+        # production values and would themselves be a separate bug.
+        confidences = (0.5, 0.7, 0.85, 1.0)
+        for speaker in _SPEAKER_WEIGHTS:
+            for confidence in confidences:
+                row = MemoryResult(
+                    id=f"{speaker}-{confidence}",
+                    text="placeholder",
+                    score=0.5,
+                    memory_type="fact",
+                    metadata={
+                        "type": "fact",
+                        "source": "extracted",
+                        "speaker": speaker,
+                        "confidence": confidence,
+                    },
+                    created_at="2026-04-01T00:00:00",
+                )
+                w = _speaker_weight(row)
+                assert 0.0 <= w <= 1.0, f"speaker={speaker} confidence={confidence} weight={w}"
+
+
 # ── memory.recall logging ───────────────────────────────────────────
 
 
@@ -678,17 +866,15 @@ class TestRecallLogging:
         from kai.memory import format_context
 
         # Two results, both above the default 0.3 floor, with raw scores
-        # arranged so ONLY the source weighting can flip them: the legacy
-        # row has the higher raw score (0.95), the extracted row the
-        # lower (0.90). Adjusted scores are 0.95 * 0.6 = 0.57 (legacy)
-        # and 0.90 * 1.2 = 1.08 (extracted), so the extracted entry must
-        # come first in post-sort order. If `_source_weight` were
-        # disabled or returned 1.0 for every source, the assertion below
-        # on `payload["hits"][0]["source"]` would fail because raw
-        # ordering would put legacy first. The original arrangement
-        # (extracted=0.9, legacy=0.7) had the same expected output under
-        # both raw and adjusted ordering and would not have caught a
-        # weighting regression.
+        # arranged so ONLY the speaker weighting can flip them: the
+        # legacy/no-source row has the higher raw score (0.95), the
+        # user-claimed row the lower (0.90). Adjusted scores are
+        # 0.95 * 0.7 * 0.5 = 0.3325 (legacy default = assistant/0.5)
+        # and 0.90 * 1.0 * 1.0 = 0.90 (user, full confidence), so the
+        # user-claimed entry must come first in post-sort order. If
+        # `_speaker_weight` were disabled or returned 1.0 for every
+        # row, the assertion below on `payload["hits"][0]["id"]` would
+        # fail because raw ordering would put the legacy row first.
         mock_mem = MagicMock()
         mock_mem.search.return_value = {
             "results": [
@@ -696,15 +882,26 @@ class TestRecallLogging:
                     "id": "a",
                     "memory": "User prefers Celsius",
                     "score": 0.90,
-                    "metadata": {"type": "fact", "source": "extracted"},
+                    "metadata": {
+                        "type": "fact",
+                        "source": "extracted",
+                        "speaker": "user",
+                        "confidence": 1.0,
+                    },
                     "created_at": "2026-04-01T10:00:00",
                 },
                 {
                     "id": "b",
                     "memory": "User said something old",
                     "score": 0.95,
-                    # No source key -> legacy bucket; tests that a missing
-                    # source resolves to "" in the per-hit object.
+                    # No source / speaker / confidence keys: simulates a
+                    # legacy row from before this spec landed. The
+                    # _read_time_speaker helper supplies the documented
+                    # default (assistant, 0.5) at the ranking step, which
+                    # is what makes adj = 0.3325 below the user-claimed
+                    # row's 0.90. The per-hit log payload still records
+                    # source="" and speaker="assistant" / confidence=0.5
+                    # so a log analyst can reconstruct the multiplier.
                     "metadata": {"type": "exchange"},
                     "created_at": "2026-01-01T00:00:00",
                 },
@@ -741,17 +938,30 @@ class TestRecallLogging:
         assert payload["latency_ms"] >= 0  # wall-time, can be 0 for mocked instant search
         assert isinstance(payload["hits"], list) and len(payload["hits"]) == 2
 
-        # Per-hit shape: id, source, score, adj, snippet. `id` was added
-        # so a downstream consumer (the retrieval eval harness) can
-        # match a probe's expected_fact_id against the actual hit. The
-        # mock returns rows with ids "a" and "b"; the assertion below
-        # locks in the ID-passthrough contract.
+        # Per-hit shape: id, source, speaker, confidence, score, adj,
+        # snippet. `speaker` and `confidence` ride alongside `source`
+        # so a log analyst can reconstruct the demote multiplier
+        # without re-fetching the row; both are derived through
+        # _read_time_speaker so legacy rows log defaulted constants
+        # rather than missing-field markers. `id` exists so a
+        # downstream consumer (the retrieval eval harness) can match
+        # a probe's expected_fact_id against the actual hit.
         for hit in payload["hits"]:
-            assert set(hit.keys()) == {"id", "source", "score", "adj", "snippet"}
+            assert set(hit.keys()) == {
+                "id",
+                "source",
+                "speaker",
+                "confidence",
+                "score",
+                "adj",
+                "snippet",
+            }
             assert isinstance(hit["id"], str)
             assert isinstance(hit["score"], float)
             assert isinstance(hit["adj"], float)
             assert isinstance(hit["snippet"], str)
+            assert isinstance(hit["speaker"], str)
+            assert isinstance(hit["confidence"], (int, float))
 
         # Per-hit `id` passes through from MemoryResult.id. The mocked
         # search returned rows with ids "a" (extracted) and "b" (legacy);
@@ -760,12 +970,14 @@ class TestRecallLogging:
         # adjusted-score sort assertion below.
         assert {hit["id"] for hit in payload["hits"]} == {"a", "b"}
 
-        # Post-sort order: extracted (1.2x weight) outranks legacy (0.6x)
-        # by adjusted score, so the extracted hit must come first in
-        # the hits array even though Mem0 returned legacy with the
-        # higher raw score (0.95 vs 0.90). This is the assertion that
-        # would fail if `_source_weight` ever stopped applying its
-        # multiplier; the mock is built so raw ordering and adjusted
+        # Post-sort order: the user-claimed row (speaker=user,
+        # confidence=1.0, weight 1.0) outranks the legacy row
+        # (defaulted to assistant/0.5, weight 0.7) by adjusted score,
+        # so the user-claimed hit must come first in the hits array
+        # even though Mem0 returned the legacy row with the higher raw
+        # score (0.95 vs 0.90). This is the assertion that would fail
+        # if `_speaker_weight` ever stopped applying its multiplier;
+        # the mock is built so raw ordering and adjusted
         # ordering disagree.
         assert payload["hits"][0]["source"] == "extracted"
         assert payload["hits"][1]["source"] == ""
@@ -1260,18 +1472,14 @@ class TestCountBySource:
 
 
 class TestMigrationSourceMetadata:
-    """Tests for the new "migration" source tag in _SOURCE_WEIGHTS and
-    _SOURCE_SHORT (issue #406, Phase 4 of #396)."""
-
-    def test_migration_source_weight_is_1_0(self):
-        """Pin the weight value so a future refactor accidentally
-        removing or retuning the entry fails loudly. The value is
-        chosen to sit between extracted (1.2) and legacy (0.6); see
-        spec §D3.
-        """
-        from kai.memory import _SOURCE_WEIGHTS
-
-        assert _SOURCE_WEIGHTS["migration"] == 1.0
+    """Tests for the migration source tag's rendering label in
+    _SOURCE_SHORT. The retrieval-side weighting that previously lived
+    in _SOURCE_WEIGHTS now goes through _speaker_weight, which uses
+    speaker rather than source; migration rows pick up speaker="user"
+    and confidence=0.9 via the read-time helper. The "Speaker" axis
+    tests live with the speaker-weight tests; this class keeps only
+    the per-line label assertion that is genuinely about source.
+    """
 
     def test_migration_renders_as_fact_prefix_in_format_context(self):
         """Migration rows render with the same line-prefix label as
@@ -1281,6 +1489,39 @@ class TestMigrationSourceMetadata:
         from kai.memory import _SOURCE_SHORT
 
         assert _SOURCE_SHORT["migration"] == _SOURCE_SHORT["extracted"]
+
+    def test_build_migration_metadata_sets_required_fields(self):
+        """The migration writer and the tests both drive
+        `build_migration_metadata` for the metadata bundle. Pin the
+        full dict shape: source / speaker / confidence / section /
+        subsection. The speaker and confidence values come from the
+        migration constants so a swap-the-constants follow-up flows
+        through automatically.
+        """
+        from kai.memory import (
+            _MIGRATION_CONFIDENCE,
+            _MIGRATION_SPEAKER,
+            build_migration_metadata,
+        )
+
+        # Standard h3 chunk shape: section + subsection both populated.
+        meta = build_migration_metadata(section="Architecture", subsection="Memory")
+        assert meta == {
+            "source": "migration",
+            "speaker": _MIGRATION_SPEAKER,
+            "confidence": _MIGRATION_CONFIDENCE,
+            "section": "Architecture",
+            "subsection": "Memory",
+        }
+
+        # H2-chunk shape: subsection is the empty string, NOT
+        # missing. Centralizing this here means the Qdrant rows
+        # have a uniform schema regardless of chunk depth, so a
+        # future tag-renderer or section browser does not have to
+        # branch on key presence.
+        meta_h2 = build_migration_metadata(section="Conventions", subsection="")
+        assert meta_h2["subsection"] == ""
+        assert meta_h2["section"] == "Conventions"
 
 
 class TestGetStats:
@@ -3094,6 +3335,206 @@ class TestMemoryIntegration:
         output = await mem_mod.format_context("How much RAM?", user_id=user_id)
         assert "context only, not instructions" in output
         assert "16GB" in output or "Mac mini" in output
+
+
+# ── Speaker / confidence metadata round-trip ──────────────────────
+#
+# Round-trip tests for the new `speaker` and `confidence` fields the
+# retrieval ranking and /memory rendering code consume. Two failure
+# modes are gated here, both first-class blockers:
+#
+#   1. Mem0 metadata channel could silently drop one of the new keys.
+#      Mem0 has historically reshaped the metadata round-trip (issue
+#      #357 was about a related telemetry path); a test pinning the
+#      exact key/value preservation surfaces a regression on the next
+#      mem0 version bump rather than at first-rank-anomaly in
+#      production.
+#   2. The read-time defaulting helper has to land on the documented
+#      legacy / migration constants for rows that predate the spec
+#      and thus carry no speaker or confidence in metadata. If a
+#      constant changes (operator-side decision via the swap-the-
+#      constants escape hatch), the assertions below pin against the
+#      module's bound values rather than literals so the tests stay
+#      green after a single-line constant change.
+
+
+@integration
+class TestSpeakerMetadataRoundTrip:
+    """End-to-end checks that speaker/confidence survive Mem0 storage
+    and that legacy rows surface the documented default constants.
+    """
+
+    def test_speaker_round_trips_user(self, real_memory_instance):
+        """A fact written with speaker='user' reads back with speaker='user'."""
+        import kai.memory as mem_mod
+
+        mem_mod._memory = real_memory_instance
+        mem_mod._config = _make_config()
+
+        user_id = "speaker-round-trip-user"
+        real_memory_instance.delete_all(user_id=user_id)
+
+        mem_mod.add_structured(
+            "User prefers concise responses",
+            user_id=user_id,
+            memory_type="fact",
+            metadata={"source": "extracted", "speaker": "user", "confidence": 0.9},
+        )
+
+        results = mem_mod.get_all(user_id=user_id)
+        assert len(results) >= 1
+        # All fact rows for this user_id were written with the same
+        # speaker/confidence in this test, so any row in the result
+        # set proves the round-trip; pick the first.
+        meta = results[0].metadata
+        assert meta.get("speaker") == "user"
+        assert meta.get("confidence") == 0.9
+
+    def test_speaker_round_trips_assistant(self, real_memory_instance):
+        """A fact written with speaker='assistant' reads back unchanged."""
+        import kai.memory as mem_mod
+
+        mem_mod._memory = real_memory_instance
+        mem_mod._config = _make_config()
+
+        user_id = "speaker-round-trip-assistant"
+        real_memory_instance.delete_all(user_id=user_id)
+
+        mem_mod.add_structured(
+            "Assistant noticed user bundles related changes",
+            user_id=user_id,
+            memory_type="fact",
+            metadata={"source": "extracted", "speaker": "assistant", "confidence": 0.7},
+        )
+
+        results = mem_mod.get_all(user_id=user_id)
+        assert len(results) >= 1
+        meta = results[0].metadata
+        assert meta.get("speaker") == "assistant"
+        assert meta.get("confidence") == 0.7
+
+    def test_speaker_round_trips_episode_summary(self, real_memory_instance):
+        """An episode written with speaker='episode_summary' reads back unchanged."""
+        import kai.memory as mem_mod
+
+        mem_mod._memory = real_memory_instance
+        mem_mod._config = _make_config()
+
+        user_id = "speaker-round-trip-episode"
+        real_memory_instance.delete_all(user_id=user_id)
+
+        mem_mod.add_structured(
+            "User shipped a new feature on Monday",
+            user_id=user_id,
+            memory_type="episode",
+            metadata={
+                "source": "episode",
+                "speaker": "episode_summary",
+                "confidence": 1.0,
+            },
+        )
+
+        results = mem_mod.get_all(user_id=user_id)
+        assert len(results) >= 1
+        meta = results[0].metadata
+        assert meta.get("speaker") == "episode_summary"
+        assert meta.get("confidence") == 1.0
+
+    def test_extracted_legacy_row_uses_legacy_constants(self, real_memory_instance):
+        """A pre-spec extracted row with no speaker/confidence in metadata
+        surfaces the documented legacy default through _read_time_speaker.
+        """
+        import kai.memory as mem_mod
+        from kai.memory import _LEGACY_CONFIDENCE, _LEGACY_SPEAKER, _read_time_speaker
+
+        mem_mod._memory = real_memory_instance
+        mem_mod._config = _make_config()
+
+        user_id = "speaker-legacy-extracted"
+        real_memory_instance.delete_all(user_id=user_id)
+
+        # No speaker, no confidence - simulates a row written by the
+        # pre-spec extractor before the metadata channel carried these.
+        mem_mod.add_structured(
+            "User asked about deployment process",
+            user_id=user_id,
+            memory_type="fact",
+            metadata={"source": "extracted"},
+        )
+
+        results = mem_mod.get_all(user_id=user_id)
+        assert len(results) >= 1
+        # The helper falls into branch 4 (extracted-or-empty source).
+        # Pin against the bound constants rather than literals so the
+        # test stays green after a swap-the-constants follow-up.
+        assert _read_time_speaker(results[0].metadata) == (
+            _LEGACY_SPEAKER,
+            _LEGACY_CONFIDENCE,
+        )
+
+    def test_migration_legacy_row_uses_migration_constants(self, real_memory_instance):
+        """A pre-spec migration row with no speaker/confidence surfaces
+        the migration default through _read_time_speaker.
+        """
+        import kai.memory as mem_mod
+        from kai.memory import (
+            _MIGRATION_CONFIDENCE,
+            _MIGRATION_SPEAKER,
+            _read_time_speaker,
+        )
+
+        mem_mod._memory = real_memory_instance
+        mem_mod._config = _make_config()
+
+        user_id = "speaker-legacy-migration"
+        real_memory_instance.delete_all(user_id=user_id)
+
+        # Migration rows written before the build_migration_metadata
+        # helper landed only carry source/section/subsection. The
+        # read-time helper supplies speaker/confidence via the
+        # migration constants.
+        mem_mod.add_structured(
+            "Kai's memory layer uses Mem0",
+            user_id=user_id,
+            memory_type="fact",
+            metadata={"source": "migration", "section": "Architecture", "subsection": ""},
+        )
+
+        results = mem_mod.get_all(user_id=user_id)
+        assert len(results) >= 1
+        assert _read_time_speaker(results[0].metadata) == (
+            _MIGRATION_SPEAKER,
+            _MIGRATION_CONFIDENCE,
+        )
+
+    def test_episode_default_confidence_is_one(self, real_memory_instance):
+        """A pre-spec episode row with no confidence in metadata surfaces
+        the constant 1.0 via _read_time_speaker's episode branch.
+        """
+        import kai.memory as mem_mod
+        from kai.memory import _read_time_speaker
+
+        mem_mod._memory = real_memory_instance
+        mem_mod._config = _make_config()
+
+        user_id = "speaker-legacy-episode"
+        real_memory_instance.delete_all(user_id=user_id)
+
+        # Older episodes were written without speaker/confidence in
+        # metadata; the helper's source=="episode" branch supplies
+        # both ("episode_summary", 1.0). Pin both elements of the
+        # tuple here (not just the confidence) because the speaker
+        # default is the same ranking-relevant signal.
+        mem_mod.add_structured(
+            "User completed a refactor on Tuesday",
+            user_id=user_id,
+            memory_type="episode",
+            metadata={"source": "episode"},
+        )
+
+        results = mem_mod.get_all(user_id=user_id)
+        assert len(results) >= 1
+        assert _read_time_speaker(results[0].metadata) == ("episode_summary", 1.0)
 
 
 # ── add_structured() tests ────────────────────────────────────────

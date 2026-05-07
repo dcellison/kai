@@ -70,54 +70,189 @@ _MAX_ASSISTANT_CHARS = 500
 # token budget after filtering by threshold.
 _SEARCH_OVERFETCH = 20
 
-# Retrieval weighting per source, applied AFTER the relevance threshold
-# filter and only for ranking. Provenance affects ordering among results
-# that passed the quality gate; it never rescues sub-threshold matches.
-# See spec §5.3 for the rationale. Keys:
-#   extracted - Tier 1 Haiku-filtered facts (live conversational extraction)
-#   episode   - Per-conversation episode summaries (issue #385)
-#   migration - One-shot import of operator-curated MEMORY.md content
-#               (issue #406). Slightly lower weight than extracted
-#               because the entries are not conversation-current.
-#   ""        - legacy or unset source (downweighted for future cleanup)
-# Any other source value found on a row in production fall through to
-# the unknown-source default (`_UNKNOWN_SOURCE_WEIGHT`), which maps to
-# the empty-string bucket. Such rows remain rankable, just not
-# preferentially boosted.
-_SOURCE_WEIGHTS: dict[str, float] = {
-    "extracted": 1.2,
-    # Episode rows (issue #385) carry the same boost as extracted facts:
-    # both are high-signal curated content. Equal weight in v1; if
-    # post-deploy evaluation shows one source dominates retrieval the
-    # other shouldn't, this is the one knob to retune.
-    "episode": 1.2,
-    # Migration rows (issue #406) are operator-curated but capture state
-    # from the file's authoring time, so a small de-prioritization on
-    # retrieval is appropriate. Weight chosen as 1.0: above legacy/unknown
-    # (0.6) since the content is intentional, below extracted (1.2) since
-    # it is not freshly conversational.
-    "migration": 1.0,
-    "": 0.6,
+# ── Speaker attribution: legacy and migration default constants ──────
+#
+# Two metadata fields drive retrieval-time and browse-time ranking:
+# `speaker` ("user" / "assistant" / "episode_summary") and `confidence`
+# (float in [0.5, 1.0]). The extractor and the episode pipeline both
+# write these on new rows, but two legacy populations exist where one
+# or both fields are absent:
+#
+#   - Migration rows (source == "migration"): written by the MEMORY.md
+#     -> Qdrant migration writer. By construction these are operator-
+#     authored claims, so the speaker is unambiguously "user". Older
+#     migration rows in production were written before the metadata
+#     channel carried speaker / confidence; the read-time helper
+#     defaults them to the constants below.
+#
+#   - Extracted-legacy rows (source == "extracted" but speaker absent):
+#     written by pre-spec extraction code that did not record which
+#     turn the source utterance came from. The text is also voice-
+#     stripped at extraction ("user said 'I prefer X'" becomes stored
+#     "operator prefers X"), so post-hoc classification of these rows
+#     from prose alone is not recoverable.
+#
+# Migration constants. Operator wrote the source content, so speaker is
+# "user" by construction. Confidence sits at 0.9 (not 1.0) because the
+# imported text is not freshly conversational - the operator may have
+# written aspirational or stale claims at MEMORY.md authoring time
+# that they would not assert today. A small, deliberate discount.
+_MIGRATION_SPEAKER = "user"
+_MIGRATION_CONFIDENCE = 0.9
+
+# Extracted-legacy constants. Defaults to assistant / 0.5 - the
+# conservative pre-empirical position when text alone cannot recover
+# the originating speaker. Rationale:
+#
+#   1. The pre-spec extractor produced facts indiscriminately from
+#      both speakers. There is no write-path signal to distinguish
+#      user-claimed extracted-legacy rows from assistant-claimed ones.
+#   2. Post-extraction text is voice-stripped (third-person), so the
+#      originating speaker is not recoverable from the stored row.
+#      A manual sample-and-classify pass produces noise rather than
+#      signal: nearly every legacy row reads as ambiguous under any
+#      reasonable rubric.
+#   3. The conservative default biases toward demotion of unclassifi-
+#      able content. A user-claimed fact mistakenly defaulted to
+#      assistant loses 30% of its retrieval weight; an assistant-
+#      claimed fact mistakenly defaulted to user gets fully promoted.
+#      The first error degrades; the second masks.
+#
+# If production data shows the default is wrong (e.g., a probe
+# regression traceable to legacy rows being demoted below their useful
+# ranking), swap these two constants in a same-day PR. The change is
+# purely read-side; no Qdrant rewrite is required.
+_LEGACY_SPEAKER = "assistant"
+_LEGACY_CONFIDENCE = 0.5
+
+
+def build_migration_metadata(*, section: str, subsection: str) -> dict[str, Any]:
+    """Return the metadata dict used by the MEMORY.md -> Qdrant migration.
+
+    Centralizes the speaker / confidence / source / section /
+    subsection assignment so the migration writer (the
+    migrate-memory-md script) and the test that pins migration-row
+    metadata both drive the same code path. Any future change to
+    migration-row metadata lands here, not in the hyphenated script
+    file (which the test cannot import as a module without an
+    importlib dance).
+
+    Both `section` and `subsection` are required (not Optional)
+    because the writer always passes them; `subsection` is "" for
+    h2-level chunks rather than missing. Keeping them required
+    matches the writer's actual contract and avoids a silently-
+    different metadata shape between h2 and h3 chunks.
+
+    Speaker is hardcoded to the migration constants because
+    migration content is operator-authored MEMORY.md text - the
+    speaker is "user" by construction, with confidence 0.9 to
+    reflect that imported text is not freshly conversational. See
+    `_MIGRATION_SPEAKER` / `_MIGRATION_CONFIDENCE` for the rationale.
+    """
+    return {
+        "source": "migration",
+        "speaker": _MIGRATION_SPEAKER,
+        "confidence": _MIGRATION_CONFIDENCE,
+        "section": section,
+        "subsection": subsection,
+    }
+
+
+def _read_time_speaker(metadata: dict[str, Any] | None) -> tuple[str, float]:
+    """
+    Resolve (speaker, confidence) for a row, defaulting missing values
+    based on source.
+
+    The retrieval ranking path and the /memory rendering paths both
+    read these two fields. New rows (extracted post-spec, episodes,
+    migration rows after the helper is wired in) carry both fields in
+    metadata explicitly. Legacy rows do not, and one of three default
+    branches fires depending on source.
+
+    Order of fallback:
+        1. If metadata carries both speaker and confidence, return
+           them. Cheapest path; the common case for new rows.
+        2. If source is "episode" and either field is missing, return
+           ("episode_summary", 1.0). Episodes pass two-stage validation
+           at write time, so the constant 1.0 reflects the curated
+           multi-stage path; legacy episodes that predate the metadata
+           write get the same effective ranking as new episodes.
+        3. If source is "migration", return (_MIGRATION_SPEAKER,
+           _MIGRATION_CONFIDENCE). Migration rows are operator-authored
+           MEMORY.md content; the speaker is unambiguous and does not
+           need empirical defaulting.
+        4. Otherwise (source is "extracted" or empty/missing) return
+           (_LEGACY_SPEAKER, _LEGACY_CONFIDENCE), the documented
+           conservative default for unclassifiable extracted-legacy
+           rows. The "empty source" case is the same defaulting path
+           because rows with no source are also of unknown provenance.
+
+    Returns plain (speaker, confidence) tuple rather than a dataclass:
+    callers compose it directly into ranking arithmetic, and a tuple
+    keeps the call site terse.
+    """
+    if metadata is None:
+        metadata = {}
+
+    speaker = metadata.get("speaker")
+    confidence = metadata.get("confidence")
+    if speaker is not None and confidence is not None:
+        return speaker, confidence
+
+    source = metadata.get("source") or ""
+    if source == "episode":
+        return "episode_summary", 1.0
+    if source == "migration":
+        return _MIGRATION_SPEAKER, _MIGRATION_CONFIDENCE
+    return _LEGACY_SPEAKER, _LEGACY_CONFIDENCE
+
+
+# Speaker-based ranking weights. Demote-only by design: every value is
+# in [0.0, 1.0], so raw cosine remains an upper bound on adjusted
+# score and the floor filter keeps acting on raw cosine. Replaces the
+# older _SOURCE_WEIGHTS table, which had 1.2 boosts that could mask
+# raw cosine and let a low-cosine row leapfrog a higher-cosine one.
+#
+# The values below are starting grid centers; the calibration sweep
+# (kai/eval/retrieval.py) tunes them against the Layer 1 probe set
+# before final binding. user > episode_summary > assistant tracks the
+# epic's user-input-preservation goal: assistant-derived content is
+# softly demoted, episode summaries land in the upper-middle, and
+# user-claimed content rides at full weight.
+_SPEAKER_WEIGHTS: dict[str, float] = {
+    "user": 1.0,
+    "assistant": 0.7,
+    "episode_summary": 0.85,
 }
 
-# Default weight used when a row has a source value not in _SOURCE_WEIGHTS.
-# Mapped to the "legacy" weight: unknown provenance is treated the same
-# as missing provenance for ranking purposes.
-_UNKNOWN_SOURCE_WEIGHT = _SOURCE_WEIGHTS[""]
+# Default weight for an unknown speaker class. Aliased to the
+# assistant weight: an unrecognized value (e.g. a future speaker
+# class added by an upstream change before this table is updated)
+# rides on the conservative low end rather than getting the implicit
+# 0.0 a missing key would yield. Kept as a separate name so the
+# alias intent is visible at the lookup site.
+_UNKNOWN_SPEAKER_WEIGHT = _SPEAKER_WEIGHTS["assistant"]
 
 
-def _source_weight(r: MemoryResult) -> float:
+def _speaker_weight(r: MemoryResult) -> float:
     """
-    Source-weight multiplier used to rank memories in format_context.
+    Combined speaker-and-confidence multiplier for a result row.
 
-    A missing metadata dict, or a source key missing/None within it,
-    both collapse to the empty-string bucket, which maps to the legacy
-    weight - unknown provenance is treated the same as no provenance.
+    Reads speaker and confidence via _read_time_speaker so legacy
+    rows missing the new metadata pick up the documented defaults
+    (rather than collapsing to the unknown-speaker fallback) before
+    the multiplier table lookup. Returns speaker_weight * confidence.
+
+    Both factors live in (0.0, 1.0]; their product is also in that
+    range. The retrieval sort uses raw cosine times this multiplier,
+    so a row's adjusted score never exceeds its raw cosine - which
+    is what makes the demote-only invariant load-bearing for the
+    floor check (`r.score >= floor` runs against raw cosine).
     """
-    src = r.metadata.get("source") if r.metadata else None
-    if src is None:
-        src = ""
-    return _SOURCE_WEIGHTS.get(src, _UNKNOWN_SOURCE_WEIGHT)
+    metadata = r.metadata or {}
+    speaker, confidence = _read_time_speaker(metadata)
+    weight = _SPEAKER_WEIGHTS.get(speaker, _UNKNOWN_SPEAKER_WEIGHT)
+    return weight * confidence
 
 
 # Short provenance tags used in the per-line injection header.
@@ -644,19 +779,19 @@ async def format_context(
         _emit_recall_log(payload)
         return ""
 
-    # Source-weighted adjusted score for ranking only. Sort is required
+    # Speaker-weighted adjusted score for ranking only. Sort is required
     # regardless of Mem0's incoming order; the walk order below reads
-    # adjusted_score via the sort key, not Mem0's. _source_weight is
+    # adjusted_score via the sort key, not Mem0's. _speaker_weight is
     # defined at module level so it isn't rebuilt on every call.
     #
     # Compute the per-row weight ONCE and carry it alongside the result
     # row so the same number feeds the sort key, the per-hit `adj` field
-    # in the log payload, and any future consumer. _source_weight is a
-    # pure dict lookup today; co-locating the weight with its row also
+    # in the log payload, and any future consumer. _speaker_weight is a
+    # pure helper today; co-locating the weight with its row also
     # keeps the code honest if the helper ever gains instrumentation,
     # logging, or an LRU cache that would make double-calling matter.
     weighted = sorted(
-        ((r, _source_weight(r)) for r in results),
+        ((r, _speaker_weight(r)) for r in results),
         key=lambda t: t[0].score * t[1],
         reverse=True,
     )
@@ -675,16 +810,30 @@ async def format_context(
     # matching (snippet is truncated to 80 chars and not unique).
     # Without this field, precision/recall scoring against a known
     # expected_fact_id has no honest way to identify which hit corresponds.
-    payload["hits"] = [
-        {
-            "id": r.id,
-            "source": (r.metadata.get("source") if r.metadata else None) or "",
-            "score": round(r.score, 4),
-            "adj": round(r.score * w, 4),
-            "snippet": _truncate(r.text, _RECALL_TRUNC),
-        }
-        for r, w in weighted
-    ]
+    #
+    # `speaker` and `confidence` ride alongside `source` so a log
+    # analyst can reconstruct the demote multiplier (`speaker_weight
+    # * confidence`) from the line without a re-fetch. Both fields
+    # are derived through _read_time_speaker so legacy rows log the
+    # same defaulted values that drove their ranking, rather than a
+    # missing-field marker. The `source` field stays so analysts can
+    # still distinguish episode rows from extracted rows; speaker and
+    # source describe two different axes (whose claim vs which write
+    # path) and are not redundant.
+    payload["hits"] = []
+    for r, w in weighted:
+        speaker, confidence = _read_time_speaker(r.metadata)
+        payload["hits"].append(
+            {
+                "id": r.id,
+                "source": (r.metadata.get("source") if r.metadata else None) or "",
+                "speaker": speaker,
+                "confidence": confidence,
+                "score": round(r.score, 4),
+                "adj": round(r.score * w, 4),
+                "snippet": _truncate(r.text, _RECALL_TRUNC),
+            }
+        )
 
     # Rebuild `results` in post-sort order from the weighted tuples so
     # the budget walk below stays a plain `for r in results` loop and

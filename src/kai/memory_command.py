@@ -58,7 +58,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
@@ -303,6 +303,48 @@ def _format_date(iso_str: str, with_time: bool = False) -> str:
     return iso_str[:10]
 
 
+# ── Speaker-aware browse helpers ───────────────────────────────────
+
+
+# Display labels for the speaker enum. Stored values are lower-snake
+# ("user" / "assistant" / "episode_summary"); the operator-facing UI
+# renders them title-cased and space-separated. Centralized here so
+# the fact-detail screen and any future surface use the same labels.
+_SPEAKER_DISPLAY_LABELS: dict[str, str] = {
+    "user": "User",
+    "assistant": "Assistant",
+    "episode_summary": "Episode summary",
+}
+
+
+def _humanize_speaker(speaker: str) -> str:
+    """Return the operator-facing display label for a speaker value.
+
+    Falls back to a title-cased, underscore-stripped version of the
+    raw value for any speaker class that lacks an explicit entry. The
+    fallback exists so a future addition to the speaker enum (added
+    upstream before this map is updated) renders something readable
+    instead of leaking the internal snake_case identifier.
+    """
+    label = _SPEAKER_DISPLAY_LABELS.get(speaker)
+    if label is not None:
+        return label
+    return speaker.replace("_", " ").capitalize()
+
+
+def _browse_score(fact: MemoryResult) -> float:
+    """Browse-time quality score: cosine pinned at 1.0 * speaker_weight * confidence.
+
+    Identical formula to the retrieval ranking with cosine pinned at
+    1.0; means the browse default reflects the same quality signal
+    that retrieval uses. Calls into kai.memory's `_speaker_weight`
+    helper rather than re-deriving the formula here, so a calibration
+    sweep that retunes speaker weights or changes the multiplier
+    arithmetic does not require a parallel edit in the browse path.
+    """
+    return memory._speaker_weight(fact)
+
+
 # ── Builder: dashboard ──────────────────────────────────────────────
 
 
@@ -518,6 +560,7 @@ def _build_episode_list_view(
 def _build_facts_list_view(
     facts: list[MemoryResult],
     page: int,
+    sort: Literal["quality", "recent"] = "quality",
 ) -> tuple[str, InlineKeyboardMarkup, list[str], int, int]:
     """Render a paginated facts list folding extracted and migration.
 
@@ -526,6 +569,12 @@ def _build_facts_list_view(
     memory_ids list backs the screen cache so numbered button taps
     resolve to memory ids via integer index, keeping callback data
     well under the 64-byte Telegram ceiling.
+
+    `sort` is consumed only for the toggle-button rendering: the
+    builder is purely a view layer and does NOT sort the list. The
+    caller (`_send_facts_list`) owns the sort decision so the same
+    helper can be reused from non-browse callers (tests, future
+    surfaces) without inheriting the browse-time default.
 
     Per-row layout:
         N.  <truncated text>
@@ -576,12 +625,31 @@ def _build_facts_list_view(
     number_row = [
         InlineKeyboardButton(str(i + 1), callback_data=_encode_callback("fact", str(i))) for i in range(len(window))
     ]
+    # Sort toggle row above page nav. Each button carries its own
+    # sort mode in callback_data so a tap re-renders at the same page
+    # in the new mode. The active mode shows a leading checkmark; the
+    # inactive mode renders unmarked. Marking via button text rather
+    # than a separate state key means the rendered keyboard is
+    # self-describing - a screenshot of the keyboard alone is enough
+    # to tell which mode is active.
+    quality_label = "✓ Sort: Quality" if sort == "quality" else "Sort: Quality"
+    recent_label = "✓ Sort: Recent" if sort == "recent" else "Sort: Recent"
+    sort_row = [
+        InlineKeyboardButton(
+            quality_label,
+            callback_data=_encode_callback("facts", str(clamped), "quality"),
+        ),
+        InlineKeyboardButton(
+            recent_label,
+            callback_data=_encode_callback("facts", str(clamped), "recent"),
+        ),
+    ]
     nav_row: list[InlineKeyboardButton] = []
     if clamped > 0:
         nav_row.append(
             InlineKeyboardButton(
                 "< prev",
-                callback_data=_encode_callback("facts", str(clamped - 1)),
+                callback_data=_encode_callback("facts", str(clamped - 1), sort),
             )
         )
     nav_row.append(InlineKeyboardButton("back", callback_data=_encode_callback("dash")))
@@ -589,10 +657,10 @@ def _build_facts_list_view(
         nav_row.append(
             InlineKeyboardButton(
                 "next >",
-                callback_data=_encode_callback("facts", str(clamped + 1)),
+                callback_data=_encode_callback("facts", str(clamped + 1), sort),
             )
         )
-    return text, InlineKeyboardMarkup([number_row, nav_row]), memory_ids, clamped, total
+    return text, InlineKeyboardMarkup([number_row, sort_row, nav_row]), memory_ids, clamped, total
 
 
 # ── Builder: fact view ──────────────────────────────────────────────
@@ -634,6 +702,16 @@ def _build_fact_view(
     tags = md.get("tags") or []
     source = md.get("source", "")
 
+    # Speaker (and confidence, where applicable) come from the read-
+    # time helper rather than directly from metadata so legacy rows
+    # missing the new fields display the documented defaults instead
+    # of "----" / "(none)" placeholders. The helper returns
+    # (speaker, confidence); confidence is dropped on the episode
+    # render path because the constant 1.0 is not informative for
+    # operator-side review.
+    speaker_value, confidence_value = memory._read_time_speaker(md)
+    speaker_label = _humanize_speaker(speaker_value)
+
     if source == "episode" or source == "migration":
         # Episode and migration rows share a minimal body shape with
         # none of the extractor-only rows. The episode arm splices in
@@ -645,6 +723,11 @@ def _build_fact_view(
         # so detail_lines stays empty and the body collapses to the
         # quoted text plus the Tags / Date footer.
         tags_line = f"Tags:  {', '.join(tags) if tags else '(none)'}"
+        speaker_line = f"Speaker:  {speaker_label}"
+        # Migration rows render Confidence (always 0.9 via the
+        # migration default), episode rows omit it (the constant 1.0
+        # would be operator-side noise).
+        confidence_line = f"Confidence:  {confidence_value:.2f}" if source == "migration" else None
         detail_lines: list[str] = []
         if source == "episode":
             # Episode rows surface the outcome_quality field as a
@@ -697,29 +780,43 @@ def _build_fact_view(
             # surfaces the extracted/migration distinction; the
             # data-layer `source` field stays unchanged.
             header = "Fact"
+        # Footer row order: detail_lines (episode-only Approach/Outcome
+        # /Lessons/Actors block, empty for migration), Tags, Speaker,
+        # optional Confidence (migration only), Date. Speaker sits
+        # next to Tags so the two prov/identity lines render adjacent;
+        # Confidence trails when present so the date is the last line
+        # and matches the existing migration/episode tail convention.
+        footer_lines = [tags_line, speaker_line]
+        if confidence_line is not None:
+            footer_lines.append(confidence_line)
+        footer_lines.append(f"Date:  {_format_date(fact.created_at, with_time=True)}")
         lines = [
             header,
             "",
             f'"{fact.text}"',
             "",
             *detail_lines,
-            tags_line,
-            f"Date:  {_format_date(fact.created_at, with_time=True)}",
+            *footer_lines,
         ]
     else:
         # Extracted (or any defensive fallback for an unknown source
-        # that managed to reach this view). Renders the original
-        # six-row block unchanged so existing screenshots / muscle
-        # memory stay valid.
-        confidence = md.get("confidence")
+        # that managed to reach this view). Renders the existing
+        # extractor-only block (Tags / Confidence / Date / Session /
+        # Prompt version / Confirmation) plus a Speaker line inserted
+        # between Tags and Confidence so the two ranking-signal rows
+        # are visually grouped. Confidence comes from the read-time
+        # helper rather than directly from metadata so a row missing
+        # the field (extracted-legacy) renders the documented default
+        # instead of "----".
         session_id = md.get("session_id") or ""
         prompt_version = md.get("prompt_version") or ""
         confirmation = md.get("confirmation_quote") or ""
 
-        if isinstance(confidence, (int, float)):
-            conf_str = f"{float(confidence):.2f}"
-        else:
-            conf_str = "----"
+        # _read_time_speaker always returns a numeric confidence (the
+        # legacy default for extracted-legacy rows is 0.5), so the
+        # `----` fallback the older render carried for missing-field
+        # rows is no longer reachable on this branch.
+        conf_str = f"{float(confidence_value):.2f}"
 
         # Confirmation row: verbatim quote on confirmed_action facts,
         # literal "n/a" elsewhere. The schema invariant ("confirmation
@@ -734,6 +831,7 @@ def _build_fact_view(
             f'"{fact.text}"',
             "",
             f"Tags:             {', '.join(tags) if tags else '(none)'}",
+            f"Speaker:          {speaker_label}",
             f"Confidence:       {conf_str}",
             f"Date:             {_format_date(fact.created_at, with_time=True)}",
             f"Session:          {session_id or '(none)'}",
@@ -1075,18 +1173,24 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer()
             return
         if verb == "facts":
-            # Facts list browser (extracted + migration). Same page-
-            # arg shape as `eps`; invalid integer falls back to page
-            # 0. The unknown-verb dismiss at the bottom of this
-            # handler covers any future retirement of the verb,
-            # which would silently no-op stale callbacks in chat
-            # history (same compatibility path the retired `tag`
-            # verb relies on).
+            # Facts list browser (extracted + migration). Args:
+            #   args[0] - page integer (default 0 if missing/invalid)
+            #   args[1] - sort mode "quality" or "recent" (default
+            #             "quality" when missing; legacy 2-segment
+            #             callbacks from chat history without a sort
+            #             arg get the default behavior)
+            # The unknown-verb dismiss at the bottom of this handler
+            # covers any future retirement of the verb, which would
+            # silently no-op stale callbacks in chat history (same
+            # compatibility path the retired `tag` verb relies on).
             try:
                 page = int(args[0]) if args else 0
             except ValueError:
                 page = 0
-            await _send_facts_list(update, context, chat_id, page, edit=True)
+            sort: Literal["quality", "recent"] = "quality"
+            if len(args) >= 2 and args[1] == "recent":
+                sort = "recent"
+            await _send_facts_list(update, context, chat_id, page, edit=True, sort=sort)
             await query.answer()
             return
         if verb == "fact":
@@ -1247,16 +1351,31 @@ async def _send_facts_list(
     chat_id: int,
     page: int,
     edit: bool = False,
+    sort: Literal["quality", "recent"] = "quality",
 ) -> None:
     """Render and send/edit the facts list at `page`.
 
     Fetches via `memory.get_all_facts` (the fact-bucket enumeration
-    that folds extracted and migration), builds via
-    `_build_facts_list_view`, and sets the cache screen to `"facts"`
-    so a fact opened from this list can route back to the same page
-    via `_send_fact_view`'s return_to logic. Distinct from the
-    `"fact"` (singular) sentinel, which identifies the fact-detail
-    view.
+    that folds extracted and migration), re-sorts when sort is
+    "quality" (the default), builds via `_build_facts_list_view`,
+    and sets the cache screen to `"facts"` so a fact opened from
+    this list can route back to the same page via `_send_fact_view`'s
+    return_to logic. Distinct from the `"fact"` (singular) sentinel,
+    which identifies the fact-detail view.
+
+    `sort` modes:
+        "quality": re-sort the fetched list by browse score
+            (cosine pinned at 1.0; speaker_weight * confidence)
+            descending, with `updated_at` desc as the tiebreaker.
+            Default mode; surfaces high-quality facts first.
+        "recent": pass through unchanged. `get_all_facts` already
+            returns the list in updated-at-descending order, so no
+            second sort is needed.
+
+    The sort decision lives here rather than in `_build_facts_list_view`
+    so the renderer is purely a view layer; non-browse callers
+    (tests, future surfaces) can pass a pre-sorted list to the
+    builder without inheriting the browse-time default.
     """
     try:
         facts = memory.get_all_facts(user_id=str(chat_id))
@@ -1264,7 +1383,18 @@ async def _send_facts_list(
         log.exception("get_all_facts failed: %s", exc)
         await _send_or_edit(update, _MSG_QUERY_FAILED, None, edit=edit)
         return
-    text, kb, memory_ids, clamped_page, _total = _build_facts_list_view(facts, page)
+    if sort == "quality":
+        # Quality score (descending) primary, updated_at (descending)
+        # secondary. The compound key is a single sort call: Python's
+        # sort is stable, but tuple-key descending guarantees the
+        # tiebreaker direction matches the primary direction without
+        # relying on stability semantics.
+        facts = sorted(
+            facts,
+            key=lambda f: (_browse_score(f), f.updated_at or f.created_at or ""),
+            reverse=True,
+        )
+    text, kb, memory_ids, clamped_page, _total = _build_facts_list_view(facts, page, sort=sort)
     _set_cache(
         chat_id,
         _ScreenCache(screen="facts", page=clamped_page, memory_ids=memory_ids),

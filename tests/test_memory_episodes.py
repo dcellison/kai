@@ -930,15 +930,6 @@ class TestEpisodeRetrieval:
     outcome + outcome_quality inline). The remaining Sophia fields are
     stored but not rendered inline in v1."""
 
-    def test_source_weights_include_episode(self):
-        """Unit-level guard: the retrieval weighting table has an
-        `episode` entry equal to the `extracted` weight. Both are
-        high-signal curated content and v1 weights them equally."""
-        from kai.memory import _SOURCE_WEIGHTS
-
-        assert "episode" in _SOURCE_WEIGHTS
-        assert _SOURCE_WEIGHTS["episode"] == _SOURCE_WEIGHTS["extracted"]
-
     def test_source_short_includes_episode(self):
         """Per-line provenance label for episodes is the literal
         "episode" string - distinguishes from facts' "fact" label and
@@ -1022,21 +1013,23 @@ class TestEpisodeRetrieval:
 
     @pytest.mark.asyncio
     async def test_format_context_episode_weighting_flows_through(self, monkeypatch):
-        """Integration: the source-weight multiplier on `episode` rows
-        actually flows through format_context's ranking pipeline. With
-        v1's equal weights (1.2 for both), the test sets one row's raw
-        score marginally lower so the per-source weight becomes the
-        deciding factor in ordering. Defends against a future
-        regression where _SOURCE_WEIGHTS gains an episode entry but
-        the ranking pipeline does not consume it."""
+        """Integration: the speaker-weight multiplier on `episode` rows
+        actually flows through format_context's ranking pipeline. The
+        test sets one row's raw score marginally lower so the per-row
+        weight becomes the deciding factor in ordering. Defends against
+        a future regression where the speaker map gains an
+        episode_summary entry but the ranking pipeline does not consume
+        it."""
         import kai.memory as mem_mod
         from kai.memory import format_context
 
-        # Two rows: legacy row has slightly higher RAW score (0.85) but
-        # only 0.6 source weight. Episode row has slightly lower RAW
-        # score (0.82) but 1.2 source weight. Episode wins after
-        # weighting (0.82 * 1.2 = 0.984 vs 0.85 * 0.6 = 0.51), so it
-        # appears FIRST in the rendered output.
+        # Two rows: legacy row has slightly higher RAW score (0.85)
+        # but no speaker / source signals (defaults to assistant /
+        # 0.5 -> weight 0.7 * 0.5 = 0.35, adj 0.85 * 0.35 = 0.2975).
+        # Episode row has slightly lower RAW score (0.82) but the
+        # episode_summary path returns (episode_summary, 1.0) ->
+        # weight 0.85 * 1.0 = 0.85, adj 0.82 * 0.85 = 0.697. Episode
+        # wins after weighting and appears FIRST in the output.
         mock_mem = MagicMock()
         mock_mem.search.return_value = {
             "results": [
@@ -1071,8 +1064,7 @@ class TestEpisodeRetrieval:
         legacy_pos = result.find("Legacy content text")
         assert ep_pos != -1 and legacy_pos != -1
         assert ep_pos < legacy_pos, (
-            "Episode source-weight (1.2) failed to flow through ranking. "
-            f"ep_pos={ep_pos} legacy_pos={legacy_pos}\n{result}"
+            f"Episode speaker-weight failed to flow through ranking. ep_pos={ep_pos} legacy_pos={legacy_pos}\n{result}"
         )
 
 
