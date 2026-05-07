@@ -805,6 +805,13 @@ async def format_context(
     # avoids that without losing the demote-only invariant (the
     # multiplier is still speaker_weight * confidence).
     def _resolved_row(r: MemoryResult) -> tuple[MemoryResult, float, str, float]:
+        # Duplicates the body of _speaker_weight (minus its
+        # _read_time_speaker call) so the resolved (speaker,
+        # confidence) pair is parsed once and reused for both the
+        # weight and the per-hit log payload below. If
+        # _speaker_weight ever gains a clamping or normalization
+        # step, mirror it here too: the demote-only invariant the
+        # floor filter depends on lives in both places.
         speaker, confidence = _read_time_speaker(r.metadata)
         weight = _SPEAKER_WEIGHTS.get(speaker, _UNKNOWN_SPEAKER_WEIGHT) * confidence
         return r, weight, speaker, confidence

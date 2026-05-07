@@ -807,15 +807,16 @@ async def run_sweep(
 
     Two-snapshot pattern: the entry-time snapshot taken via
     `_apply_override(grid[0])` would be incorrect because it would
-    apply the first override before snapshotting. Instead we capture
-    the entry-time state directly via `_apply_override`'s helper
-    `_Snapshot` constructor, then loop. Each iteration calls
-    `_apply_override` (which itself snapshots-then-mutates), and the
-    outer `finally` calls `_restore_overrides(entry_snap)` to land
-    back at the pre-sweep state regardless of "whatever was there
-    one iteration ago." If a probe somehow mutates module state (it
-    should not), the snapshot restoration still leaves the module in
-    a consistent post-sweep state matching its pre-sweep state.
+    apply the first override before snapshotting. Instead we
+    construct a `_Snapshot` directly before the loop rather than
+    calling `_apply_override(grid[0])` and discarding the first
+    mutation. Each iteration calls `_apply_override` (which itself
+    snapshots-then-mutates), and the outer `finally` calls
+    `_restore_overrides(entry_snap)` to land back at the pre-sweep
+    state regardless of "whatever was there one iteration ago." If
+    a probe somehow mutates module state (it should not), the
+    snapshot restoration still leaves the module in a consistent
+    post-sweep state matching its pre-sweep state.
     """
     from kai import memory as _mem
 
