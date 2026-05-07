@@ -339,9 +339,23 @@ class TestBuildFactView:
         # confidence formatted to 2dp. Pin against the bound module
         # constants rather than literals so a swap-the-constants
         # follow-up does not require touching this test.
+        #
+        # The `_fact` helper carries a default confidence (0.85) that
+        # would override the legacy default under the helper's
+        # independent-field resolution, so this test rebuilds the
+        # MemoryResult directly with neither field set in metadata
+        # to exercise the legacy-default path on both axes.
         from kai.memory import _LEGACY_CONFIDENCE, _LEGACY_SPEAKER
 
-        f = _fact("legacy", "Some legacy fact", ["preference"], speaker=None)
+        f = MemoryResult(
+            id="legacy",
+            text="Some legacy fact",
+            score=0.0,
+            memory_type="fact",
+            metadata={"source": "extracted", "tags": ["preference"], "type": "fact"},
+            created_at="2026-04-17T10:00:00",
+            updated_at="2026-04-17T10:00:00",
+        )
         text, _ = memory_command._build_fact_view(f, return_to=None)
         # Humanized legacy speaker (Title-cased) must appear in the
         # Speaker line; the explicit "Speaker:" label rules out a

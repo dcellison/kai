@@ -701,6 +701,70 @@ class TestFormatContext:
 # ── Speaker weight function ────────────────────────────────────────
 
 
+class TestReadTimeSpeaker:
+    """Tests for `_read_time_speaker`'s independent-field resolution.
+
+    The two metadata fields (`speaker`, `confidence`) are filled in
+    independently: an explicit value on either side is preserved, and
+    only the missing side falls back to a source-appropriate default.
+    Three angles need pinning:
+
+    1. Both fields present: explicit values pass through unchanged.
+    2. Speaker present, confidence missing: speaker stays, confidence
+       comes from the source default. Defends against a future write
+       path or a partial Mem0 round-trip from silently dropping the
+       explicit speaker into the legacy bucket.
+    3. Confidence present, speaker missing: confidence stays, speaker
+       comes from the source default. Symmetric protection.
+    """
+
+    def test_both_fields_present_passes_through(self):
+        from kai.memory import _read_time_speaker
+
+        # Source set to "extracted" so the source-based defaults
+        # would otherwise apply; both fields explicit so they win.
+        meta = {"source": "extracted", "speaker": "user", "confidence": 0.85}
+        assert _read_time_speaker(meta) == ("user", 0.85)
+
+    def test_speaker_present_confidence_missing_keeps_speaker(self):
+        from kai.memory import _LEGACY_CONFIDENCE, _read_time_speaker
+
+        # Speaker explicit, confidence absent. The legacy default
+        # confidence (0.5) fills in; the speaker is NOT dragged down
+        # to _LEGACY_SPEAKER. Pin against the bound constant so a
+        # swap-the-constants follow-up flows through.
+        meta = {"source": "extracted", "speaker": "user"}
+        assert _read_time_speaker(meta) == ("user", _LEGACY_CONFIDENCE)
+
+    def test_confidence_present_speaker_missing_keeps_confidence(self):
+        from kai.memory import _LEGACY_SPEAKER, _read_time_speaker
+
+        # Symmetric counterpart: confidence explicit, speaker absent.
+        # The legacy default speaker fills in; the confidence is
+        # preserved. A pre-spec extracted row carrying confidence
+        # but no speaker hits this branch in production.
+        meta = {"source": "extracted", "confidence": 0.92}
+        assert _read_time_speaker(meta) == (_LEGACY_SPEAKER, 0.92)
+
+    def test_speaker_present_episode_source_uses_episode_confidence(self):
+        from kai.memory import _read_time_speaker
+
+        # Episode-source row carries an explicit non-canonical speaker
+        # (extractor of a future write path). The speaker is preserved;
+        # the missing confidence picks up the episode default of 1.0.
+        meta = {"source": "episode", "speaker": "user"}
+        assert _read_time_speaker(meta) == ("user", 1.0)
+
+    def test_speaker_present_migration_source_uses_migration_confidence(self):
+        from kai.memory import _MIGRATION_CONFIDENCE, _read_time_speaker
+
+        # Migration-source row with an explicit speaker that does NOT
+        # match the canonical migration speaker. Speaker is preserved;
+        # confidence picks up the migration default.
+        meta = {"source": "migration", "speaker": "assistant"}
+        assert _read_time_speaker(meta) == ("assistant", _MIGRATION_CONFIDENCE)
+
+
 class TestSpeakerWeight:
     """Tests for `_speaker_weight`, the read-time multiplier the
     retrieval sort uses in place of the older `_source_weight`. The

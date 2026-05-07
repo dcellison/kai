@@ -166,45 +166,56 @@ def _read_time_speaker(metadata: dict[str, Any] | None) -> tuple[str, float]:
     The retrieval ranking path and the /memory rendering paths both
     read these two fields. New rows (extracted post-spec, episodes,
     migration rows after the helper is wired in) carry both fields in
-    metadata explicitly. Legacy rows do not, and one of three default
-    branches fires depending on source.
+    metadata explicitly. Legacy rows do not.
 
-    Order of fallback:
-        1. If metadata carries both speaker and confidence, return
-           them. Cheapest path; the common case for new rows.
-        2. If source is "episode" and either field is missing, return
-           ("episode_summary", 1.0). Episodes pass two-stage validation
-           at write time, so the constant 1.0 reflects the curated
-           multi-stage path; legacy episodes that predate the metadata
-           write get the same effective ranking as new episodes.
-        3. If source is "migration", return (_MIGRATION_SPEAKER,
-           _MIGRATION_CONFIDENCE). Migration rows are operator-authored
-           MEMORY.md content; the speaker is unambiguous and does not
-           need empirical defaulting.
-        4. Otherwise (source is "extracted" or empty/missing) return
-           (_LEGACY_SPEAKER, _LEGACY_CONFIDENCE), the documented
-           conservative default for unclassifiable extracted-legacy
-           rows. The "empty source" case is the same defaulting path
-           because rows with no source are also of unknown provenance.
+    The two fields are resolved independently. An explicit `speaker`
+    is always preserved; only the missing field falls back to a
+    source-appropriate default. This protects a future write path
+    that sets only one of the two fields (or a partial Mem0 round-
+    trip) from silently dropping the explicit speaker into the
+    legacy bucket and demoting a user-attributed row.
 
-    Returns plain (speaker, confidence) tuple rather than a dataclass:
-    callers compose it directly into ranking arithmetic, and a tuple
-    keeps the call site terse.
+    Speaker resolution:
+        1. If metadata carries `speaker`, use it.
+        2. Otherwise, source-based default: episode -> "episode_summary",
+           migration -> _MIGRATION_SPEAKER, anything else -> _LEGACY_SPEAKER.
+
+    Confidence resolution (independent of the speaker branch):
+        1. If metadata carries `confidence`, use it.
+        2. Otherwise, source-based default: episode -> 1.0,
+           migration -> _MIGRATION_CONFIDENCE, anything else ->
+           _LEGACY_CONFIDENCE (0.5).
+
+    Episodes use 1.0 because they pass two-stage validation at write
+    time; the constant reflects the curated multi-stage path.
+    Migration rows use 0.9 (the operator wrote the content but it is
+    not freshly conversational). Extracted-legacy rows use 0.5 (the
+    conservative pre-empirical default for unclassifiable content).
+
+    Returns a plain (speaker, confidence) tuple rather than a
+    dataclass: callers compose it directly into ranking arithmetic
+    and a tuple keeps the call site terse.
     """
     if metadata is None:
         metadata = {}
 
-    speaker = metadata.get("speaker")
-    confidence = metadata.get("confidence")
-    if speaker is not None and confidence is not None:
-        return speaker, confidence
-
     source = metadata.get("source") or ""
+
+    # Source-based defaults for whichever of the two fields the row
+    # is missing. Centralized so the speaker branch and the
+    # confidence branch read off the same per-source pair.
     if source == "episode":
-        return "episode_summary", 1.0
-    if source == "migration":
-        return _MIGRATION_SPEAKER, _MIGRATION_CONFIDENCE
-    return _LEGACY_SPEAKER, _LEGACY_CONFIDENCE
+        default_speaker, default_confidence = "episode_summary", 1.0
+    elif source == "migration":
+        default_speaker, default_confidence = _MIGRATION_SPEAKER, _MIGRATION_CONFIDENCE
+    else:
+        default_speaker, default_confidence = _LEGACY_SPEAKER, _LEGACY_CONFIDENCE
+
+    speaker = metadata.get("speaker") or default_speaker
+    confidence = metadata.get("confidence")
+    if confidence is None:
+        confidence = default_confidence
+    return speaker, confidence
 
 
 # Speaker-based ranking weights. Demote-only by design: every value is

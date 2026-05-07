@@ -83,6 +83,14 @@ def _reset_memory_module() -> None:
     # missing entries.
     mem_mod._SPEAKER_WEIGHTS.clear()
     mem_mod._SPEAKER_WEIGHTS.update({"user": 1.0, "assistant": 0.7, "episode_summary": 0.85})
+    # `_UNKNOWN_SPEAKER_WEIGHT` is aliased to the assistant entry
+    # at module-load time (a float copy, not a live dict reference).
+    # If a sweep test mutates `assistant` and a subsequent test
+    # reads `_UNKNOWN_SPEAKER_WEIGHT`, the alias would carry the
+    # mutated value into the next test. Re-bind explicitly to keep
+    # the documented invariant ("unknown rows ride on the assistant
+    # weight") holding across tests.
+    mem_mod._UNKNOWN_SPEAKER_WEIGHT = mem_mod._SPEAKER_WEIGHTS["assistant"]
     mem_mod._SEARCH_OVERFETCH = 20
 
 
