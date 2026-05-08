@@ -72,17 +72,29 @@ def _reset_memory_module() -> None:
     and a leak between tests would silently couple them.
     """
     import kai.memory as mem_mod
+    from kai.eval.retrieval import (
+        _PRODUCTION_ASSISTANT_WEIGHT,
+        _PRODUCTION_EPISODE_SUMMARY_WEIGHT,
+        _PRODUCTION_USER_WEIGHT,
+    )
 
     mem_mod._memory = None
     mem_mod._config = None
     # `_SPEAKER_WEIGHTS` is the production default snapshot; reset
     # the dict contents so a sweep test mutating any speaker entry
-    # does not leak into the next test. Must mirror the production
-    # default in src/kai/memory.py exactly, otherwise tests reading
-    # the dict after this fixture has run will see a stale snapshot
-    # missing entries.
+    # does not leak into the next test. Imports the per-speaker
+    # production constants from kai.eval.retrieval rather than
+    # repeating the literals so a future calibration touches the
+    # values in TWO files (memory.py + retrieval.py) instead of
+    # three.
     mem_mod._SPEAKER_WEIGHTS.clear()
-    mem_mod._SPEAKER_WEIGHTS.update({"user": 0.85, "assistant": 0.8, "episode_summary": 0.85})
+    mem_mod._SPEAKER_WEIGHTS.update(
+        {
+            "user": _PRODUCTION_USER_WEIGHT,
+            "assistant": _PRODUCTION_ASSISTANT_WEIGHT,
+            "episode_summary": _PRODUCTION_EPISODE_SUMMARY_WEIGHT,
+        }
+    )
     # `_UNKNOWN_SPEAKER_WEIGHT` is aliased to the assistant entry
     # at module-load time (a float copy, not a live dict reference).
     # If a sweep test mutates `assistant` and a subsequent test
