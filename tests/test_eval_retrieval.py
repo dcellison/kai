@@ -82,7 +82,7 @@ def _reset_memory_module() -> None:
     # the dict after this fixture has run will see a stale snapshot
     # missing entries.
     mem_mod._SPEAKER_WEIGHTS.clear()
-    mem_mod._SPEAKER_WEIGHTS.update({"user": 1.0, "assistant": 0.7, "episode_summary": 0.85})
+    mem_mod._SPEAKER_WEIGHTS.update({"user": 0.85, "assistant": 0.8, "episode_summary": 0.85})
     # `_UNKNOWN_SPEAKER_WEIGHT` is aliased to the assistant entry
     # at module-load time (a float copy, not a live dict reference).
     # If a sweep test mutates `assistant` and a subsequent test

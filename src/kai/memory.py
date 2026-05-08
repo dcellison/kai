@@ -224,15 +224,25 @@ def _read_time_speaker(metadata: dict[str, Any] | None) -> tuple[str, float]:
 # older _SOURCE_WEIGHTS table, which had 1.2 boosts that could mask
 # raw cosine and let a low-cosine row leapfrog a higher-cosine one.
 #
-# The values below are starting grid centers; the calibration sweep
-# (kai/eval/retrieval.py) tunes them against the Layer 1 probe set
-# before final binding. user > episode_summary > assistant tracks the
-# epic's user-input-preservation goal: assistant-derived content is
-# softly demoted, episode summaries land in the upper-middle, and
-# user-claimed content rides at full weight.
+# Values bound from the 2026-05-08 calibration sweep against the
+# Layer 1 26-probe baseline. Of the 24 (user x assistant x episode)
+# configurations at production floor and overfetch, three cleared
+# the §5.2 hard floor (p@1 within 0.05 of the pre-spec _SOURCE_WEIGHTS
+# baseline of 0.65) and the improvement filter (p@3 at 0.85, +0.05
+# above baseline). All three tied on the p@3+MRR sum and on the
+# larger-assistant_weight tiebreaker; episode_summary_weight had no
+# observable effect on this probe set, so the middle value (matching
+# the issue body's nominal) ships.
+#
+# The result is "non-regressive within tolerance and marginal +0.05
+# improvement on p@3" — at 20 scored probes, 0.05 deltas are
+# one-probe granularity. A future calibration with a richer probe
+# set (especially probes whose expected_fact_id is an episode
+# summary) is the way to retune episode_summary_weight against
+# real signal.
 _SPEAKER_WEIGHTS: dict[str, float] = {
-    "user": 1.0,
-    "assistant": 0.7,
+    "user": 0.85,
+    "assistant": 0.8,
     "episode_summary": 0.85,
 }
 
