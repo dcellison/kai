@@ -59,6 +59,46 @@ def _cleanup_mem0_test_dir() -> None:
     shutil.rmtree(_MEM0_TEST_DIR, ignore_errors=True)
 
 
+# ── Session-wide DATA_DIR isolation ─────────────────────────────────
+#
+# `kai.config:40` resolves DATA_DIR at module-import time: it falls
+# back to PROJECT_ROOT when KAI_DATA_DIR is unset. In dev that means
+# DATA_DIR == PROJECT_ROOT, so any code path that writes to
+# `DATA_DIR / "files"`, `DATA_DIR / "memory"`, etc. lands inside the
+# repo working tree. The per-test autouse `_isolate_backend_data_dir`
+# fixture (below) patches `kai.backend.DATA_DIR`, but `from kai.config
+# import DATA_DIR` creates a per-module binding in every importer
+# (`kai.bot`, `kai.memory`, `kai.memory_extraction`, etc.), and some
+# of those bindings are frozen further into module-level constants
+# (e.g. `kai.memory_extraction._EXTRACTOR_CWD = DATA_DIR / "memory" /
+# "extractor_cwd"` at line 188, evaluated once at import). Patching
+# `kai.backend.DATA_DIR` after the fact does not reach those.
+#
+# Setting KAI_DATA_DIR in os.environ BEFORE any kai module is
+# imported makes the import-time fallback resolve to a per-session
+# tempdir for every importer at once, which is the only mechanism
+# that catches the frozen snapshots. The autouse fixtures below stay
+# as defense-in-depth and give per-test isolation on top.
+#
+# The shape (mkdtemp + hard override + atexit) mirrors the MEM0_DIR
+# block above; the same conftest-module-top ordering guarantee
+# applies (conftest runs before pytest collects test modules, which
+# is when their `from kai.config import ...` would otherwise fire).
+_KAI_DATA_TEST_DIR = tempfile.mkdtemp(prefix="kai-test-data-")
+os.environ["KAI_DATA_DIR"] = _KAI_DATA_TEST_DIR
+
+
+@atexit.register
+def _cleanup_kai_data_test_dir() -> None:
+    """Best-effort removal of the per-run KAI_DATA_DIR.
+
+    Mirrors `_cleanup_mem0_test_dir`. Errors are swallowed so a stray
+    open file handle from a crashed worker cannot mask a real test
+    failure with a secondary traceback at interpreter shutdown.
+    """
+    shutil.rmtree(_KAI_DATA_TEST_DIR, ignore_errors=True)
+
+
 # ── Per-test history isolation ──────────────────────────────────────
 
 
