@@ -3915,6 +3915,78 @@ class TestApplySource:
         # The operator-customized destination is unchanged.
         assert (ws_claude_dst / "CLAUDE.md").read_text() == "OPERATOR EDIT"
 
+    def test_claude_md_owned_by_svc_after_row1_migration(self, tmp_path):
+        """
+        Regression guard for the order-of-operations bug in _apply_source:
+        _migrate_identity_to_claude_md (row 1) chowns CLAUDE.md to svc_uid;
+        the subsequent `_set_ownership(ws_claude_dst, 0, 0, recursive=True)`
+        clobbers that with root:root; the seed step's chown only fires
+        when the dst is missing, so without the trailing reconcile chown
+        CLAUDE.md ends up root-owned and inner Claude cannot edit it.
+
+        This test pins that the LAST chown call on CLAUDE.md is svc_uid,
+        regardless of the row-1 migration writing first and the recursive
+        ownership pass writing second. We do NOT mock _set_ownership so
+        its real implementation (which calls os.chown internally) is
+        captured by the chown spy - that's what makes the bug visible:
+        without the reconcile chown, the recursive root pass leaves the
+        last chown on CLAUDE.md as (0, 0).
+
+        Setup mirrors the production upgrade pre-state: existing
+        IDENTITY.md plus symlink, fresh source templates/ tree.
+        """
+        src = tmp_path / "source"
+        (src / "src").mkdir(parents=True)
+        (src / "src" / "module.py").write_text("code")
+        (src / "pyproject.toml").write_text("[project]")
+        ws_claude_src = src / "templates" / ".claude"
+        ws_claude_src.mkdir(parents=True)
+        (ws_claude_src / "CLAUDE.md").write_text("# Kai\n")
+
+        # Row-1 pre-state.
+        install = tmp_path / "install"
+        ws_claude_dst = install / "home" / ".claude"
+        ws_claude_dst.mkdir(parents=True)
+        identity = install / "home" / "IDENTITY.md"
+        identity.write_text("# Operator content\n")
+        claude_md = ws_claude_dst / "CLAUDE.md"
+        claude_md.symlink_to("../IDENTITY.md")
+
+        # Capture every os.chown call. Real _set_ownership (unmocked)
+        # calls os.chown internally, so the recursive (0, 0) clobbering
+        # pass shows up here in order.
+        chown_calls: list[tuple[str, int, int]] = []
+
+        def record_chown(path, uid, gid):
+            chown_calls.append((str(path), uid, gid))
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._copy_tree"),
+            patch("os.chown", side_effect=record_chown),
+        ):
+            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+
+        # Sanity: the recursive root pass on home/.claude/ MUST have
+        # happened (otherwise the test would silently pass even if the
+        # bug were re-introduced). Look for any (path, 0, 0) chown
+        # under ws_claude_dst.
+        recursive_root_pass = any(c[0].startswith(str(ws_claude_dst)) and (c[1], c[2]) == (0, 0) for c in chown_calls)
+        assert recursive_root_pass, (
+            f"Expected _set_ownership to chown some path under {ws_claude_dst} to (0, 0); got {chown_calls}"
+        )
+
+        claude_md_chown_calls = [c for c in chown_calls if c[0] == str(claude_md)]
+        assert claude_md_chown_calls, f"Expected at least one os.chown call on {claude_md}; got {chown_calls}"
+        # The LAST chown wins on the filesystem; pin it explicitly so a
+        # future refactor that reorders steps trips this assertion before
+        # production hits it.
+        _, last_uid, last_gid = claude_md_chown_calls[-1]
+        assert (last_uid, last_gid) == (1000, 1000), (
+            f"Last chown on {claude_md} was ({last_uid}, {last_gid}); expected (1000, 1000). "
+            f"All chown calls in order: {chown_calls}"
+        )
+
     def test_dry_run_predicts_seed_for_fresh_install(self, tmp_path, capsys):
         """Dry-run prediction matches the live behavior for a fresh install."""
         src = tmp_path / "source"

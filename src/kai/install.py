@@ -2910,6 +2910,18 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         os.chown(claude_md_dst, svc_uid, svc_gid)
         print("  Seeded CLAUDE.md from template")
 
+    # Reconcile CLAUDE.md ownership unconditionally. The _set_ownership
+    # call above sets root:root recursively on home/.claude/, which
+    # clobbers the svc_uid chown that _migrate_identity_to_claude_md
+    # applies in rows 1 and 2 (and, on a row-3 reinstall, an existing
+    # operator-customized CLAUDE.md). Inner Claude must be able to
+    # edit CLAUDE.md from Telegram, so it has to be svc_uid-owned.
+    # The seed step above already chowns to svc_uid in rows 4 and 6;
+    # this final chown covers rows 1, 2, 3, and 5 - everywhere a
+    # regular CLAUDE.md exists at the destination after migration.
+    if claude_md_dst.is_file() and not claude_md_dst.is_symlink():
+        os.chown(claude_md_dst, svc_uid, svc_gid)
+
 
 def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
     """
