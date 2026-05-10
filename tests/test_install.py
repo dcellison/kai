@@ -3375,20 +3375,34 @@ class TestApplyMigratePerUserPreferences:
         assert all(uid == 501 and gid == 20 for _, uid, gid in stray_calls)
 
 
-class TestPreferencesTemplateShipsViaCopyTree:
+class TestPreferencesTemplateExcludedFromGlobalCopy:
     """
-    The PREFERENCES.md template under templates/.claude/ ships into the
-    install tree as part of `_copy_tree(templates/.claude/, ...)` in
-    `_apply_source`. This test pins the contract that
-    `_HOME_CLAUDE_EXCLUDES` does NOT list the template name, so a future
-    excludes change cannot silently strip it.
+    The PREFERENCES.md template at templates/.claude/PREFERENCES.md is
+    NOT a global file; per #400/#401 the per-user PREFERENCES.md lives
+    at DATA_DIR/preferences/<chat_id>/PREFERENCES.md and is seeded by
+    _apply_migrate / backend.ensure_user_preferences directly from the
+    template path. The recursive _copy_tree(templates/.claude/, ...)
+    in _apply_source must NOT also deposit a copy at
+    install/home/.claude/PREFERENCES.md - that creates a name collision
+    that misleads anyone reading the layout and would silently shadow
+    per-user reads if a future runtime path ever resolves through it.
+
+    This test inverts the prior contract (which treated
+    `PREFERENCES.md.example` as something to ship into the install
+    tree). The rename in #442 dropped the .example suffix and turned
+    the pre-existing copy into the same global-layout artifact MEMORY.md
+    had been excluded against since #347.
     """
 
-    def test_excludes_does_not_drop_preferences_template(self):
+    def test_excludes_includes_preferences_md(self):
         from kai.install import _HOME_CLAUDE_EXCLUDES
 
-        assert "PREFERENCES.md" not in _HOME_CLAUDE_EXCLUDES, (
-            "PREFERENCES.md must ship into the install tree; adding it to _HOME_CLAUDE_EXCLUDES would silently drop it."
+        assert "PREFERENCES.md" in _HOME_CLAUDE_EXCLUDES, (
+            "PREFERENCES.md must NOT ship into the install tree as a "
+            "global file. Per-user PREFERENCES.md lives at "
+            "DATA_DIR/preferences/<chat_id>/PREFERENCES.md and is seeded "
+            "by _apply_migrate / backend.ensure_user_preferences directly "
+            "from templates/.claude/PREFERENCES.md."
         )
 
 
@@ -3986,6 +4000,99 @@ class TestApplySource:
             f"Last chown on {claude_md} was ({last_uid}, {last_gid}); expected (1000, 1000). "
             f"All chown calls in order: {chown_calls}"
         )
+
+    def test_strips_stray_global_preferences_md(self, tmp_path, capsys):
+        """
+        One-shot cleanup: hosts that ran the brief #442/PR #445 window where
+        PREFERENCES.md was missing from _HOME_CLAUDE_EXCLUDES end up with a
+        stray /opt/kai/home/.claude/PREFERENCES.md (root-owned, never read).
+        _apply_source removes it on the next install run so the layout
+        converges on the per-user-only state defined by #400/#401.
+        """
+        src = tmp_path / "source"
+        (src / "src").mkdir(parents=True)
+        (src / "src" / "module.py").write_text("code")
+        (src / "pyproject.toml").write_text("[project]")
+        ws_claude_src = src / "templates" / ".claude"
+        ws_claude_src.mkdir(parents=True)
+        (ws_claude_src / "PREFERENCES.md").write_text("# Preferences template\n")
+        (ws_claude_src / "CLAUDE.md").write_text("# Kai\n")
+
+        install = tmp_path / "install"
+        ws_claude_dst = install / "home" / ".claude"
+        ws_claude_dst.mkdir(parents=True)
+        # Pre-state: stray global PREFERENCES.md left behind by an older install.
+        stray = ws_claude_dst / "PREFERENCES.md"
+        stray.write_text("# Stray global from old install\n")
+        # Pre-existing CLAUDE.md so the seed step skips and we isolate the
+        # PREFERENCES.md cleanup.
+        (ws_claude_dst / "CLAUDE.md").write_text("# Operator content\n")
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._copy_tree"),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+
+        # Stray is gone, log line emitted.
+        assert not stray.exists()
+        out = capsys.readouterr().out
+        assert "Removed stray" in out
+        assert "PREFERENCES.md" in out
+        # CLAUDE.md untouched.
+        assert (ws_claude_dst / "CLAUDE.md").read_text() == "# Operator content\n"
+
+    def test_dry_run_predicts_stray_preferences_cleanup(self, tmp_path, capsys):
+        """Dry-run preview matches the live cleanup behavior."""
+        src = tmp_path / "source"
+        ws_claude_src = src / "templates" / ".claude"
+        ws_claude_src.mkdir(parents=True)
+        (ws_claude_src / "CLAUDE.md").write_text("# Kai\n")
+
+        install = tmp_path / "install"
+        ws_claude_dst = install / "home" / ".claude"
+        ws_claude_dst.mkdir(parents=True)
+        stray = ws_claude_dst / "PREFERENCES.md"
+        stray.write_text("stray\n")
+        (ws_claude_dst / "CLAUDE.md").write_text("# Operator content\n")
+
+        with patch("kai.install.PROJECT_ROOT", src):
+            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=True)
+
+        out = capsys.readouterr().out
+        assert "[DRY RUN] Would remove stray" in out
+        assert "PREFERENCES.md" in out
+        # Stray still exists; dry-run never touches disk.
+        assert stray.exists()
+
+    def test_no_stray_preferences_no_cleanup_message(self, tmp_path, capsys):
+        """When no stray is present, the cleanup is silent (no false-positive log)."""
+        src = tmp_path / "source"
+        (src / "src").mkdir(parents=True)
+        (src / "src" / "module.py").write_text("code")
+        (src / "pyproject.toml").write_text("[project]")
+        ws_claude_src = src / "templates" / ".claude"
+        ws_claude_src.mkdir(parents=True)
+        (ws_claude_src / "CLAUDE.md").write_text("# Kai\n")
+
+        install = tmp_path / "install"
+        ws_claude_dst = install / "home" / ".claude"
+        ws_claude_dst.mkdir(parents=True)
+        (ws_claude_dst / "CLAUDE.md").write_text("# Operator content\n")
+        # Deliberately no PREFERENCES.md at the destination.
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._copy_tree"),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+
+        out = capsys.readouterr().out
+        assert "Removed stray" not in out
 
     def test_dry_run_predicts_seed_for_fresh_install(self, tmp_path, capsys):
         """Dry-run prediction matches the live behavior for a fresh install."""

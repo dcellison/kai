@@ -88,6 +88,23 @@ _SOURCE_EXCLUDES = {"__pycache__", "*.pyc", "*.egg-info", ".git", ".venv", ".env
 #                 install/home/.claude/MEMORY.md, which would resurrect
 #                 the pre-#347 global layout and shadow the per-user
 #                 reads on every session.
+#   PREFERENCES.md - same shape as MEMORY.md per #400/#401. Read
+#                 directly by _apply_migrate and
+#                 backend.ensure_user_preferences from
+#                 templates/.claude/PREFERENCES.md, written to
+#                 DATA_DIR/preferences/<chat_id>/PREFERENCES.md. The
+#                 exclude prevents _copy_tree from depositing a global
+#                 copy at install/home/.claude/PREFERENCES.md, which
+#                 (while not currently read by any code path) creates
+#                 a name collision that misleads anyone inspecting the
+#                 install layout and would silently shadow per-user
+#                 reads if a future runtime path ever resolves through
+#                 that location. Missed in #442 because the pre-rename
+#                 file was named PREFERENCES.md.example, which had no
+#                 collision with the per-user PREFERENCES.md path; the
+#                 suffix drop turned the install copy into the same
+#                 global-layout artifact MEMORY.md had been protected
+#                 against since #347.
 #   CLAUDE.md   - per-operator regular file (gitignored); created on
 #                 first install by copying templates/.claude/CLAUDE.md
 #                 into the install tree. The exclude prevents the
@@ -95,7 +112,7 @@ _SOURCE_EXCLUDES = {"__pycache__", "*.pyc", "*.egg-info", ".git", ".venv", ".env
 #                 customized destination copy on reinstall.
 #   skills/     - downloaded skills, environment-specific.
 #   __pycache__ - byte-compile artifacts; never tracked.
-_HOME_CLAUDE_EXCLUDES = {"history", "MEMORY.md", "CLAUDE.md", "skills", "__pycache__"}
+_HOME_CLAUDE_EXCLUDES = {"history", "MEMORY.md", "PREFERENCES.md", "CLAUDE.md", "skills", "__pycache__"}
 
 
 # ── Input helpers ────────────────────────────────────────────────────
@@ -2859,6 +2876,13 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         post_migration_claude_md_exists = claude_pre_is_regular or identity_pre_exists
         if claude_md_src.is_file() and not post_migration_claude_md_exists:
             print(f"[DRY RUN] Would seed {claude_md_src} -> {claude_md_dst}")
+        # Stray-PREFERENCES.md cleanup preview, mirroring the live path
+        # below. Only fires on hosts that ran the brief #442/PR #445
+        # window where the rename created a global stray; future installs
+        # never produce one (PREFERENCES.md is now in _HOME_CLAUDE_EXCLUDES).
+        stray_preferences = ws_claude_dst / "PREFERENCES.md"
+        if stray_preferences.is_file() and not stray_preferences.is_symlink():
+            print(f"[DRY RUN] Would remove stray {stray_preferences}")
         return
 
     _copy_tree(src_src, src_dst, _SOURCE_EXCLUDES)
@@ -2897,6 +2921,23 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         _copy_tree(config_src, config_dst)
         _set_ownership(config_dst, 0, 0, recursive=True)
         print(f"  Copied config templates to {config_dst}")
+
+    # One-shot cleanup: remove any stray install/home/.claude/PREFERENCES.md
+    # left behind by an install that ran between #442/PR #445 (which renamed
+    # the source from PREFERENCES.md.example to PREFERENCES.md but did not
+    # add the new name to _HOME_CLAUDE_EXCLUDES) and this fix. The file is
+    # never read - per-user PREFERENCES.md lives at
+    # DATA_DIR/preferences/<chat_id>/PREFERENCES.md - so deletion is safe.
+    # Removed unconditionally rather than guarded by an owner check because
+    # nothing reads the path; an operator who manually placed content here
+    # was already getting no behavior from it. Future installs will not
+    # re-create the file thanks to the excludes-set entry above.
+    # Live path: dry_run already returned above. The dry-run preview lives
+    # in the dry_run block earlier in this function.
+    stray_preferences = ws_claude_dst / "PREFERENCES.md"
+    if stray_preferences.is_file() and not stray_preferences.is_symlink():
+        stray_preferences.unlink()
+        print(f"  Removed stray {stray_preferences} (per-user PREFERENCES.md lives in DATA_DIR)")
 
     # Conditional seed: the recursive copy above excluded CLAUDE.md so an
     # operator-customized destination is never overwritten. On first
