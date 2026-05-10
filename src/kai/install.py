@@ -2745,10 +2745,16 @@ def _migrate_identity_to_claude_md(
         # tarball-restore state). Both subcases need an unlink so the
         # seed step in _apply_source produces a clean regular file:
         #   - Broken target: Path.exists() returns False, so the seed
-        #     would proceed but shutil.copy2 would write through the
-        #     symlink to the missing target path (or fail outright if
-        #     the parent dir does not exist). Either way the install
-        #     ends up with a broken layout.
+        #     step would proceed and shutil.copy2 would follow the
+        #     symlink, writing the template content to the target path
+        #     (e.g. <install>/home/IDENTITY.md for the legacy
+        #     `../IDENTITY.md` target) rather than to the intended
+        #     <install>/home/.claude/CLAUDE.md. The install would
+        #     resurrect the legacy IDENTITY.md plus symlink layout
+        #     instead of retiring it. (A "fails outright" path is
+        #     possible if the target's parent dir is missing, but the
+        #     home/ parent always exists on a real install, so the
+        #     write-to-wrong-path outcome is the common one.)
         #   - Valid non-IDENTITY target: Path.exists() returns True, so
         #     the seed step would skip, and the install would keep a
         #     symlink pointing at unrelated content as the operator's
