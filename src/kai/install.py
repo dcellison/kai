@@ -2631,9 +2631,11 @@ def _migrate_identity_to_claude_md(
     home/IDENTITY.md (operator-customized) plus a home/.claude/CLAUDE.md
     symlink with target ../IDENTITY.md. This helper detects that layout
     and converts it in place WITHOUT discarding the operator's
-    customizations: the symlink-target case reads IDENTITY.md content
-    into memory before unlinking either path so a partial failure leaves
-    the originals on disk.
+    customizations: rows 1 and 2 use Path.replace (atomic rename), so
+    there is no partial-write window where the destination could be
+    half-populated and the source could then be deleted on the next
+    install pass. See the per-row comments below for full failure-mode
+    analysis.
 
     Six pre-states (full 2x3 cross of file presence and CLAUDE.md type):
 
@@ -2679,28 +2681,35 @@ def _migrate_identity_to_claude_md(
 
     if identity_exists and claude_md_is_symlink:
         # Row 1: replace the symlink with a regular CLAUDE.md holding
-        # the IDENTITY.md content. Unlink the symlink first; if we
-        # called shutil.copy2 with the symlink still in place, copy2
-        # would follow the symlink and write through to its target -
-        # which IS identity_dst, the source - producing a self-overwrite
-        # that leaves the symlink intact. After the unlink the
-        # destination path is empty, so copy2 creates a fresh regular
-        # file and (via copystat) preserves IDENTITY.md's mode bits;
-        # row 2 already preserves mode via Path.replace, so this keeps
-        # the two rows consistent. Partial-failure shape: if the unlink
-        # succeeds and the copy fails, the symlink is gone but
-        # IDENTITY.md is still on disk - the operator re-runs and the
-        # next pass enters row 2 (IDENTITY.md regular, no CLAUDE.md).
+        # the IDENTITY.md content. Done in a single atomic step via
+        # Path.replace, which on POSIX is rename(2): it operates on
+        # directory entries, not content, so there is no partial-write
+        # window where the destination is half-populated. The symlink
+        # at claude_md_dst is replaced atomically (POSIX rename on a
+        # symlink target operates on the symlink directory entry, not
+        # the target file), and identity_dst's directory entry is
+        # removed in the same call. Mode bits and ownership both ride
+        # along with the inode, so no chmod/copystat dance is needed
+        # here - only the chown to the service user.
+        #
+        # Partial-failure shape:
+        #   - rename fails: symlink intact, IDENTITY.md intact -> row 1
+        #     fires again on re-run.
+        #   - chown fails: dst is correct content + correct mode but
+        #     wrong ownership, IDENTITY.md is gone -> re-run enters
+        #     row 5 (already migrated, no-op). The broader install
+        #     ownership pass will reconcile ownership later in the
+        #     same install run.
+        # The prior shutil.copy2 implementation had a partial-write
+        # window where copy2 could leave the dst in row-3 shape (both
+        # files regular, dst partial), at which point the next install
+        # would silently delete IDENTITY.md per the row-3 rule. Switching
+        # to rename closes that data-loss path.
         if dry_run:
-            print(
-                f"[DRY RUN] Would migrate: replace symlink {claude_md_dst} "
-                f"with regular file holding {identity_dst} content"
-            )
+            print(f"[DRY RUN] Would migrate: replace symlink {claude_md_dst} with {identity_dst} (atomic rename)")
         else:
-            claude_md_dst.unlink()
-            shutil.copy2(identity_dst, claude_md_dst)
+            identity_dst.replace(claude_md_dst)
             os.chown(claude_md_dst, svc_uid, svc_gid)
-            identity_dst.unlink()
             print(f"  Migrated {identity_dst} content into regular file at {claude_md_dst}; removed {identity_dst}")
     elif identity_exists and not claude_md_dst.exists():
         # Row 2: rename IDENTITY.md to CLAUDE.md. Path.replace is atomic

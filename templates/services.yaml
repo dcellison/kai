@@ -4,7 +4,7 @@
 # external API that inner Claude can call via the local proxy endpoint.
 #
 # Setup:
-#   1. Copy this file: cp services.example.yaml services.yaml
+#   1. Copy this file to the repo root: cp templates/services.yaml services.yaml
 #   2. Uncomment the services you want to use
 #   3. Set the corresponding API key(s) in .env
 #   4. Restart Kai
