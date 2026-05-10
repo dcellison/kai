@@ -2769,10 +2769,13 @@ def _retire_install_home_claude(install_path: Path, dry_run: bool) -> None:
     WOULD happen is announced with a `[DRY RUN] Would remove ...` line
     so the dry-run preview matches the live install line-for-line.
 
-    Every removed path is logged with its byte size before deletion so
+    Every removed FILE is logged with its byte size before deletion so
     an operator who customized the dead `CLAUDE.md` content (and finds
     out post-install) can recover from the printed log if they kept a
-    backup of `<install_path>/`.
+    backup of `<install_path>/`. Empty directories under `.claude/`
+    are not enumerated individually; `shutil.rmtree` removes them with
+    the rest of the subtree, but they carry no operator content so
+    omitting them from the log surfaces no recovery information.
     """
     claude_dir = install_path / "home" / ".claude"
     identity_md = install_path / "home" / "IDENTITY.md"
@@ -2824,7 +2827,12 @@ def _retire_install_home_claude(install_path: Path, dry_run: bool) -> None:
     # the print.
     if identity_md.is_file() and not identity_md.is_symlink():
         try:
-            size = identity_md.stat().st_size
+            # lstat (rather than stat) mirrors the claude_dir loop's
+            # call site. The is_symlink() guard above means the two
+            # are equivalent here, but keeping the same call shape
+            # avoids a "why does this branch dereference differently?"
+            # question on a future read.
+            size = identity_md.lstat().st_size
         except OSError:
             size = 0
         if dry_run:
