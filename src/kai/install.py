@@ -2764,10 +2764,11 @@ def _retire_install_home_claude(install_path: Path, dry_run: bool) -> None:
     runtime reads either of the paths this helper deletes. Issue #447
     retires the scaffolding entirely.
 
-    Behavior is idempotent: an `is_dir()` / `is_file()` pre-check makes
-    a missing path a silent no-op. In dry-run mode every removal that
-    WOULD happen is announced with a `[DRY RUN] Would remove ...` line
-    so the dry-run preview matches the live install line-for-line.
+    Behavior is idempotent: pre-checks (`is_dir()` for the subtree,
+    `is_symlink() or is_file()` for IDENTITY.md) make a missing path
+    a silent no-op. In dry-run mode every removal that WOULD happen
+    is announced with a `[DRY RUN] Would remove ...` line so the
+    dry-run preview matches the live install line-for-line.
 
     Every removed FILE is logged with its byte size before deletion so
     an operator who customized the dead `CLAUDE.md` content (and finds
@@ -2817,21 +2818,19 @@ def _retire_install_home_claude(install_path: Path, dry_run: bool) -> None:
             shutil.rmtree(claude_dir)
             print(f"  Removed dead {claude_dir}; nothing reads this path post-#447")
 
-    # IDENTITY.md is a regular file at <install>/home/IDENTITY.md, never
-    # a directory. The is_symlink() guard keeps this branch off
-    # symlinks (deleting them would be safe in practice but the legacy
-    # layout always had IDENTITY.md as a regular file, with CLAUDE.md
-    # as the symlink; a symlink at the IDENTITY.md path is unexpected
-    # and warrants operator attention rather than silent removal).
-    # Past tense in the live log is correct here: unlink() runs before
-    # the print.
-    if identity_md.is_file() and not identity_md.is_symlink():
+    # The IDENTITY.md path is retired wholesale by #447. Whatever is
+    # at the path - regular file (legacy operator content), valid
+    # symlink, or broken symlink - is removed. `is_symlink() or
+    # is_file()` covers all three: is_symlink() is True for both
+    # valid and broken symlinks; is_file() follows symlinks and is
+    # True only for regular files or symlinks pointing at regular
+    # files (already caught by the is_symlink() arm). The pair
+    # excludes directories, which would be a bizarre malformed state
+    # at this path and is left for an explicit operator question
+    # rather than silent rmtree. lstat avoids tracebacking on a
+    # broken symlink target.
+    if identity_md.is_symlink() or identity_md.is_file():
         try:
-            # lstat (rather than stat) mirrors the claude_dir loop's
-            # call site. The is_symlink() guard above means the two
-            # are equivalent here, but keeping the same call shape
-            # avoids a "why does this branch dereference differently?"
-            # question on a future read.
             size = identity_md.lstat().st_size
         except OSError:
             size = 0

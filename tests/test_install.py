@@ -3937,6 +3937,38 @@ class TestRetireInstallHomeClaude:
         assert "Removed legacy" in output
         assert "IDENTITY.md" in output
 
+    def test_symlink_at_identity_md_is_removed(self, tmp_path):
+        """
+        A symlink at <install>/home/IDENTITY.md is also removed. The
+        path is retired wholesale by #447; the helper does not preserve
+        any shape at this location. Covers both valid and broken
+        symlinks: a broken symlink at the path would lstat as size=0
+        and unlink cleanly.
+        """
+        src = tmp_path / "source"
+        (src / "src").mkdir(parents=True)
+        (src / "src" / "module.py").write_text("code")
+        (src / "pyproject.toml").write_text("[project]")
+        install = tmp_path / "install"
+        (install / "home").mkdir(parents=True)
+        identity = install / "home" / "IDENTITY.md"
+        identity.symlink_to("/nonexistent/broken/target")
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._copy_tree"),
+            patch("kai.install._set_ownership"),
+            patch("shutil.copy2"),
+            patch("os.chown"),
+        ):
+            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+
+        # The symlink itself is gone (lexists test - regular exists()
+        # would follow the symlink to a non-existent target and return
+        # False even if the symlink were still in place).
+        assert not identity.is_symlink()
+        assert not identity.exists()
+
     def test_dry_run_predicts_cleanup_matches_live(self, tmp_path, capsys):
         """
         Dry-run / live parity guard. Each `[DRY RUN] Would remove ...`
