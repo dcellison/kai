@@ -4003,14 +4003,20 @@ class TestMigrateIdentityToClaudeMd:
         """
         Row 1: IDENTITY.md regular file plus CLAUDE.md symlink to
         ../IDENTITY.md. The migration replaces the symlink with a
-        regular file holding the IDENTITY.md content and removes
-        IDENTITY.md.
+        regular file holding the IDENTITY.md content (and the same
+        mode bits) and removes IDENTITY.md.
         """
         install = tmp_path / "install"
         ws_claude = install / "home" / ".claude"
         ws_claude.mkdir(parents=True)
         identity = install / "home" / "IDENTITY.md"
         identity.write_text("# Operator-customized identity\n")
+        # Set a non-default mode so we can assert it survives the
+        # migration. This guards against a future "drop copy2 for
+        # write_bytes" regression that would silently reset to
+        # 0o644 minus umask. Row 2 preserves mode via Path.replace;
+        # Row 1 must match for cross-row consistency.
+        identity.chmod(0o600)
         claude_md = ws_claude / "CLAUDE.md"
         claude_md.symlink_to("../IDENTITY.md")
 
@@ -4022,6 +4028,8 @@ class TestMigrateIdentityToClaudeMd:
         assert not claude_md.is_symlink()
         assert claude_md.read_text() == "# Operator-customized identity\n"
         assert not identity.exists()
+        # Mode bits preserved (low 9 bits to ignore the file-type bits).
+        assert (claude_md.stat().st_mode & 0o777) == 0o600
         # Single confirmation log line.
         assert "Migrated" in capsys.readouterr().out
 

@@ -2664,17 +2664,27 @@ def _migrate_identity_to_claude_md(
     claude_md_is_regular = claude_md_dst.is_file() and not claude_md_dst.is_symlink()
 
     if identity_exists and claude_md_is_symlink:
-        # Row 1: read IDENTITY.md content first so a partial failure
-        # leaves the originals on disk rather than half-migrated.
+        # Row 1: replace the symlink with a regular CLAUDE.md holding
+        # the IDENTITY.md content. Unlink the symlink first; if we
+        # called shutil.copy2 with the symlink still in place, copy2
+        # would follow the symlink and write through to its target -
+        # which IS identity_dst, the source - producing a self-overwrite
+        # that leaves the symlink intact. After the unlink the
+        # destination path is empty, so copy2 creates a fresh regular
+        # file and (via copystat) preserves IDENTITY.md's mode bits;
+        # row 2 already preserves mode via Path.replace, so this keeps
+        # the two rows consistent. Partial-failure shape: if the unlink
+        # succeeds and the copy fails, the symlink is gone but
+        # IDENTITY.md is still on disk - the operator re-runs and the
+        # next pass enters row 2 (IDENTITY.md regular, no CLAUDE.md).
         if dry_run:
             print(
                 f"[DRY RUN] Would migrate: replace symlink {claude_md_dst} "
                 f"with regular file holding {identity_dst} content"
             )
         else:
-            content = identity_dst.read_bytes()
             claude_md_dst.unlink()
-            claude_md_dst.write_bytes(content)
+            shutil.copy2(identity_dst, claude_md_dst)
             os.chown(claude_md_dst, svc_uid, svc_gid)
             identity_dst.unlink()
             print(f"  Migrated {identity_dst} content into regular file at {claude_md_dst}; removed {identity_dst}")
