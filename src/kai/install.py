@@ -2628,7 +2628,12 @@ def _migrate_identity_to_claude_md(
 
     Six pre-states (full 2x3 cross of file presence and CLAUDE.md type):
 
-      1. IDENTITY.md regular file + CLAUDE.md symlink to ../IDENTITY.md:
+      1. IDENTITY.md regular file + CLAUDE.md is a symlink (target
+         normally ../IDENTITY.md, but the guard catches any symlink
+         target; the migration treats every symlink-with-IDENTITY.md
+         pre-state as the legacy layout deliberately, since the
+         operator's IDENTITY.md content is the canonical identity to
+         preserve regardless of where the symlink originally pointed):
          replace the symlink with a regular CLAUDE.md holding the
          IDENTITY.md content; delete IDENTITY.md.
       2. IDENTITY.md regular file + CLAUDE.md missing: move IDENTITY.md
@@ -2817,8 +2822,8 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         #   Row 5 (IDENTITY missing + CLAUDE regular): unchanged -> exists.
         #   Row 6 (neither): unchanged -> empty, seed proceeds.
         # Seed runs only on rows 4 and 6.
-        identity_src_pre = install_path / "home" / "IDENTITY.md"
-        identity_pre_exists = identity_src_pre.is_file() and not identity_src_pre.is_symlink()
+        identity_dst_pre = install_path / "home" / "IDENTITY.md"
+        identity_pre_exists = identity_dst_pre.is_file() and not identity_dst_pre.is_symlink()
         claude_pre_is_regular = claude_md_dst.is_file() and not claude_md_dst.is_symlink()
         # Post-migration CLAUDE.md presence: rows 1-3 have the IDENTITY
         # content land at CLAUDE.md (when CLAUDE.md is not already a
