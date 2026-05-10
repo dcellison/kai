@@ -3754,20 +3754,33 @@ class TestApplySource:
         src = tmp_path / "source"
         ws_claude = src / "templates" / ".claude"
         ws_claude.mkdir(parents=True)
-        (ws_claude / "CLAUDE.md").write_text("identity")
+        claude_md_src = ws_claude / "CLAUDE.md"
+        claude_md_src.write_text("identity")
+        install_path = tmp_path / "install"
         with patch("kai.install.PROJECT_ROOT", src):
-            _apply_source(tmp_path / "install", svc_uid=1000, svc_gid=1000, dry_run=True)
+            _apply_source(install_path, svc_uid=1000, svc_gid=1000, dry_run=True)
         output = capsys.readouterr().out
         assert "DRY RUN" in output
-        assert "Would copy" in output
-        # The dry-run output names the new source path, never the
-        # retired home/.claude/ path or any .example suffix.
-        assert "templates/.claude" in output
-        assert "home/.claude" not in output.replace("install/home/.claude", "")
+        # Positive shape checks. Each "Would copy:" / "Would seed" line
+        # is "{src_path} -> {dst_path}"; asserting the exact source
+        # path appears on the left side of the arrow proves the dry-run
+        # is reading from templates/, not the retired home/.claude
+        # location. Avoids the prior double-negative replace pattern,
+        # which depended on the install dir being named exactly
+        # "install" and would silently invert if a tmp_path component
+        # ever contained "home/.claude" as a substring.
+        assert f"Would copy: {ws_claude} ->" in output
+        assert f"Would seed {claude_md_src} ->" in output
+        # Negative shape checks. No source-tree reference under
+        # PROJECT_ROOT/home/ should appear (the install destination
+        # under install_path/home/ is unchanged per spec §3.1; that is
+        # a different path and is allowed). And no template should be
+        # named with the retired .example suffix.
+        retired_src = src / "home" / ".claude"
+        assert str(retired_src) not in output
         assert ".example" not in output
-        assert "Would seed" in output
         # Dry run never touches disk.
-        assert not (tmp_path / "install" / "home" / ".claude").exists()
+        assert not (install_path / "home" / ".claude").exists()
 
     def test_dry_run_no_templates_dir_skips_copy(self, tmp_path, capsys):
         """Dry run with empty source: no template-copy lines."""
