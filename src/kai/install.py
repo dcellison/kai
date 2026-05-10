@@ -70,6 +70,34 @@ _LAUNCHD_LABEL = "com.syrinx.kai"
 # Excludes __pycache__, .pyc, and other build artifacts.
 _SOURCE_EXCLUDES = {"__pycache__", "*.pyc", "*.egg-info", ".git", ".venv", ".env"}
 
+# Excludes for the templates/.claude/ -> install/home/.claude/ copy.
+# Each entry has its own rationale; do NOT collapse to "things we
+# don't want in installs":
+#   history/    - conversation logs are written by history.py at runtime
+#                 into DATA_DIR/history/. The templates/ tree never has
+#                 a history/ subdir; the exclude is defensive against a
+#                 future fixture or test-leak under templates/ that
+#                 would otherwise land in install/home/.claude/history/
+#                 and be mistaken for real conversation data.
+#   MEMORY.md   - the template at templates/.claude/MEMORY.md is read
+#                 directly by _apply_migrate (install-time per-user
+#                 seed) and backend.ensure_user_memory (runtime
+#                 fallback), both of which write to
+#                 DATA_DIR/memory/<chat_id>/MEMORY.md. The exclude
+#                 prevents _copy_tree from also depositing a copy at
+#                 install/home/.claude/MEMORY.md, which would resurrect
+#                 the pre-#347 global layout and shadow the per-user
+#                 reads on every session.
+#   CLAUDE.md   - per-operator regular file (gitignored); created on
+#                 first install by copying templates/.claude/CLAUDE.md
+#                 into the install tree. The exclude prevents the
+#                 source-tree copy from clobbering an operator's
+#                 customized destination copy on reinstall.
+#   skills/     - downloaded skills, environment-specific.
+#   __pycache__ - byte-compile artifacts; never tracked.
+_HOME_CLAUDE_EXCLUDES = {"history", "MEMORY.md", "CLAUDE.md", "skills", "__pycache__"}
+
+
 # ── Input helpers ────────────────────────────────────────────────────
 
 
@@ -1253,14 +1281,13 @@ def _copy_tree(src: Path, dst: Path, excludes: set[str] | None = None) -> None:
 
     Symlink handling: shutil.copy2 follows symlinks and copies content. There
     is no symlink-recreation branch; the previous one existed solely to
-    preserve the legacy IDENTITY.md / CLAUDE.md symlink pair under the
-    install tree during the source-to-install copy, and was removed when
-    that layout was retired (issues #442, #447). Tracked symlinks under
-    templates/ or src/ would now be silently dereferenced rather than
-    recreated. This is intentional: cross-platform symlink tracking
-    (Windows) is fraught, and the source tree no longer contains any
-    symlinks. Do not "restore" the branch as an apparent bug without
-    first establishing a use case that needs cross-platform tracked
+    preserve home/.claude/CLAUDE.md -> ../IDENTITY.md during the source-to-
+    install copy, and was removed when that layout was retired (issue #442).
+    Tracked symlinks under templates/ or src/ would now be silently
+    dereferenced rather than recreated. This is intentional: cross-platform
+    symlink tracking (Windows) is fraught, and the source tree no longer
+    contains any symlinks. Do not "restore" the branch as an apparent bug
+    without first establishing a use case that needs cross-platform tracked
     symlinks.
 
     Args:
@@ -2753,108 +2780,25 @@ def _migrate_identity_to_claude_md(
     # the destination.
 
 
-def _retire_install_home_claude(install_path: Path, dry_run: bool) -> None:
-    """
-    Remove the dead `<install>/home/.claude/` subtree and any legacy
-    `<install>/home/IDENTITY.md` left behind from the pre-#442 layout.
-
-    Both paths predate the per-user `home_workspace` migration in #353.
-    Since #353 every session resolves identity from
-    `<DATA_DIR>/home/<chat_id>/.claude/CLAUDE.md`; nothing in the
-    runtime reads either of the paths this helper deletes. Issue #447
-    retires the scaffolding entirely.
-
-    Behavior is idempotent: pre-checks (`is_dir()` for the subtree,
-    `is_symlink() or is_file()` for IDENTITY.md) make a missing path
-    a silent no-op. In dry-run mode every removal that WOULD happen
-    is announced with a `[DRY RUN] Would remove ...` line so the
-    dry-run preview matches the live install line-for-line.
-
-    Every removed FILE is logged with its byte size before deletion so
-    an operator who customized the dead `CLAUDE.md` content (and finds
-    out post-install) can recover from the printed log if they kept a
-    backup of `<install_path>/`. Empty directories under `.claude/`
-    are not enumerated individually; `shutil.rmtree` removes them with
-    the rest of the subtree, but they carry no operator content so
-    omitting them from the log surfaces no recovery information.
-    """
-    claude_dir = install_path / "home" / ".claude"
-    identity_md = install_path / "home" / "IDENTITY.md"
-
-    if claude_dir.is_dir():
-        # Enumerate before deleting so the log captures every retired
-        # path plus its byte size. rglob walks symlinks-as-files (does
-        # not descend); a row-1 pre-state with CLAUDE.md as a symlink
-        # therefore reports correctly rather than tracebacking on a
-        # stat call into a possibly broken target. lstat is used
-        # instead of stat for the same reason.
-        #
-        # Verb tense: the live log uses "Removing" because the lines
-        # are printed BEFORE shutil.rmtree runs (the enumeration needs
-        # to lstat each file while it still exists). If rmtree raises
-        # OSError - permissions, mounted filesystem, etc. - the
-        # "Removing" lines accurately describe what was attempted, and
-        # the trailing "Removed dead {dir}" summary will be absent so
-        # the operator can see the deletion did not complete. A
-        # past-tense per-file line here would lie on rmtree failure.
-        for path in sorted(claude_dir.rglob("*")):
-            if path.is_file() or path.is_symlink():
-                try:
-                    size = path.lstat().st_size
-                except OSError:
-                    size = 0
-                if dry_run:
-                    print(f"[DRY RUN] Would remove {path} ({size} bytes)")
-                else:
-                    print(f"  Removing {path} ({size} bytes)")
-        if dry_run:
-            print(f"[DRY RUN] Would remove dead {claude_dir}; nothing reads this path post-#447")
-        else:
-            # No ignore_errors: the is_dir() pre-check above makes the
-            # call safe, and surfacing a real OSError (permissions,
-            # mounted FS, etc.) is preferred to silent failure. The
-            # past-tense "Removed dead" summary is correct because it
-            # fires only after rmtree returns successfully.
-            shutil.rmtree(claude_dir)
-            print(f"  Removed dead {claude_dir}; nothing reads this path post-#447")
-
-    # The IDENTITY.md path is retired wholesale by #447. Whatever is
-    # at the path - regular file (legacy operator content), valid
-    # symlink, or broken symlink - is removed. `is_symlink() or
-    # is_file()` covers all three: is_symlink() is True for both
-    # valid and broken symlinks; is_file() follows symlinks and is
-    # True only for regular files or symlinks pointing at regular
-    # files (already caught by the is_symlink() arm). The pair
-    # excludes directories, which would be a bizarre malformed state
-    # at this path and is left for an explicit operator question
-    # rather than silent rmtree. lstat avoids tracebacking on a
-    # broken symlink target.
-    if identity_md.is_symlink() or identity_md.is_file():
-        try:
-            size = identity_md.lstat().st_size
-        except OSError:
-            size = 0
-        if dry_run:
-            print(f"[DRY RUN] Would remove legacy {identity_md} ({size} bytes); content was identity baseline only")
-        else:
-            identity_md.unlink()
-            print(f"  Removed legacy {identity_md} ({size} bytes); content was identity baseline only")
-
-
 def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
     """Copy source tree and home config from PROJECT_ROOT to the install location."""
     src_src = PROJECT_ROOT / "src"
     src_dst = install_path / "src"
     pyproject_src = PROJECT_ROOT / "pyproject.toml"
     pyproject_dst = install_path / "pyproject.toml"
+    # Source-side templates live under templates/. Destination keeps
+    # the historical install layout (home/.claude/, home/config/) so
+    # runtime code paths and per-user workspaces under DATA_DIR/home/
+    # do not need to change in lockstep.
+    ws_claude_src = PROJECT_ROOT / "templates" / ".claude"
+    ws_claude_dst = install_path / "home" / ".claude"
     # Config templates (e.g. goose-config.yaml) referenced by later
     # install steps like _apply_goose_config(). Root-owned since these
-    # are static templates, not runtime data. The `home/` parent
-    # continues to exist for this one purpose post-#447; everything
-    # else previously under `<install>/home/` (the `.claude/` subtree
-    # and any legacy IDENTITY.md) is retired by `_retire_install_home_claude`.
+    # are static templates, not runtime data.
     config_src = PROJECT_ROOT / "templates" / "config"
     config_dst = install_path / "home" / "config"
+    claude_md_src = PROJECT_ROOT / "templates" / ".claude" / "CLAUDE.md"
+    claude_md_dst = install_path / "home" / ".claude" / "CLAUDE.md"
 
     # One-time: rename workspace/ to home/ at the install location.
     # The directory was renamed in the source tree; this migrates the
@@ -2869,21 +2813,52 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
             old_ws.rename(new_ws)
             print(f"  Renamed {old_ws} -> {new_ws}")
 
-    # Retire the dead <install>/home/.claude/ subtree (issue #447). This
-    # path predates #353's per-user `home_workspace` migration; nothing
-    # reads it at runtime since then. The helper also removes any legacy
-    # <install>/home/IDENTITY.md left behind from the pre-#442 layout.
-    # Runs before the rest of _apply_source so subsequent steps work
-    # against a clean state; no remaining install-step depends on the
-    # directory existing. Dry-run emits matching `[DRY RUN] Would remove`
-    # lines so the preview matches the live behavior.
-    _retire_install_home_claude(install_path, dry_run)
+    # Migrate any legacy IDENTITY.md/symlink layout to a regular
+    # CLAUDE.md regular file before the template-copy steps run. The
+    # migration runs in dry-run mode too so operators previewing an
+    # upgrade see exactly what will happen to their identity surface.
+    # See `_migrate_identity_to_claude_md` for the full state table.
+    _migrate_identity_to_claude_md(install_path, svc_uid, svc_gid, dry_run)
 
     if dry_run:
         print(f"[DRY RUN] Would copy: {src_src} -> {src_dst}")
         print(f"[DRY RUN] Would copy: {pyproject_src} -> {pyproject_dst}")
+        if ws_claude_src.is_dir():
+            print(f"[DRY RUN] Would copy: {ws_claude_src} -> {ws_claude_dst}")
         if config_src.is_dir():
             print(f"[DRY RUN] Would copy: {config_src} -> {config_dst}")
+        # Conditional seed step preview. The recursive copy above excludes
+        # CLAUDE.md (per _HOME_CLAUDE_EXCLUDES) so an operator's customized
+        # destination is never overwritten; this step explicitly handles the
+        # cases where the destination is empty after migration. The dry-run
+        # prediction has to account for what migration would do, so it
+        # computes the post-migration state of CLAUDE.md from the pre-state
+        # and walks all six rows of the migration table:
+        #   Row 1 (IDENTITY regular + CLAUDE symlink to ../IDENTITY.md):
+        #     migration replaces symlink with regular file -> exists.
+        #   Row 2 (IDENTITY regular + CLAUDE missing):
+        #     migration renames IDENTITY.md to CLAUDE.md -> exists.
+        #   Row 3 (IDENTITY regular + CLAUDE regular):
+        #     migration deletes IDENTITY.md, leaves CLAUDE -> exists.
+        #   Row 4 (IDENTITY missing + CLAUDE symlink):
+        #     migration unlinks symlink (covers broken target AND valid-but-
+        #     non-IDENTITY targets) -> empty, seed proceeds.
+        #   Row 5 (IDENTITY missing + CLAUDE regular): unchanged -> exists.
+        #   Row 6 (neither): unchanged -> empty, seed proceeds.
+        # Seed runs only on rows 4 and 6.
+        identity_dst_pre = install_path / "home" / "IDENTITY.md"
+        identity_pre_exists = identity_dst_pre.is_file() and not identity_dst_pre.is_symlink()
+        claude_pre_is_regular = claude_md_dst.is_file() and not claude_md_dst.is_symlink()
+        # Post-migration CLAUDE.md presence: True for rows 1, 2, 3, 5;
+        # False for rows 4 and 6. Rows 1-2 have IDENTITY.md content
+        # land at CLAUDE.md (atomic rename); rows 3 and 5 preserve an
+        # existing regular CLAUDE.md. The expression below collapses
+        # to that: pre-state CLAUDE.md regular survives directly, and
+        # otherwise the migration carries IDENTITY.md over to CLAUDE.md
+        # whenever IDENTITY.md is present.
+        post_migration_claude_md_exists = claude_pre_is_regular or identity_pre_exists
+        if claude_md_src.is_file() and not post_migration_claude_md_exists:
+            print(f"[DRY RUN] Would seed {claude_md_src} -> {claude_md_dst}")
         return
 
     _copy_tree(src_src, src_dst, _SOURCE_EXCLUDES)
@@ -2894,19 +2869,58 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     os.chown(pyproject_dst, 0, 0)
     print(f"  Copied {pyproject_dst}")
 
+    # Copy templates/.claude/ -> install/home/.claude/ (bot identity,
+    # memory template) excluding runtime data. Without CLAUDE.md, the
+    # bot has no identity in the home workspace and nothing to inject
+    # into foreign workspace sessions. Files inside are root-owned
+    # (read-only config), but the directory itself is service-user-owned
+    # so skills/ and other runtime dirs can be created inside it. The
+    # exclude set keeps CLAUDE.md off this copy so an operator-customized
+    # destination survives reinstalls; the explicit seed step below
+    # populates it on first install only.
+    if ws_claude_src.is_dir():
+        ws_claude_dst.parent.mkdir(parents=True, exist_ok=True)
+        _copy_tree(ws_claude_src, ws_claude_dst, _HOME_CLAUDE_EXCLUDES)
+        _set_ownership(ws_claude_dst, 0, 0, recursive=True)
+        os.chown(ws_claude_dst, svc_uid, svc_gid)
+        print(f"  Copied home config to {ws_claude_dst}")
+
     # Copy templates/config/ -> install/home/config/ (config templates
     # like goose-config.yaml). These are static templates referenced by
     # later install steps - e.g. _apply_goose_config() reads the Goose
     # extension config from here. Root-owned since they're installer
     # input, not runtime output.
     if config_src.is_dir():
-        # `home/` may not exist yet (the wholesale-cleanup above does not
-        # create it, and after #447 the `.claude/` copy that used to
-        # parent it is gone). Ensure the parent before copying.
+        # home/ may already exist from the .claude/ copy above, but
+        # ensure it's there when config/ exists without .claude/.
         config_dst.parent.mkdir(parents=True, exist_ok=True)
         _copy_tree(config_src, config_dst)
         _set_ownership(config_dst, 0, 0, recursive=True)
         print(f"  Copied config templates to {config_dst}")
+
+    # Conditional seed: the recursive copy above excluded CLAUDE.md so an
+    # operator-customized destination is never overwritten. On first
+    # install (or after a broken-symlink migration cleared the destination)
+    # there is no CLAUDE.md to preserve, so explicitly seed from the
+    # template here. Owned by the service user so inner Claude can edit
+    # the file from Telegram.
+    if claude_md_src.is_file() and not claude_md_dst.exists():
+        claude_md_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(claude_md_src, claude_md_dst)
+        os.chown(claude_md_dst, svc_uid, svc_gid)
+        print("  Seeded CLAUDE.md from template")
+
+    # Reconcile CLAUDE.md ownership unconditionally. The _set_ownership
+    # call above sets root:root recursively on home/.claude/, which
+    # clobbers the svc_uid chown that _migrate_identity_to_claude_md
+    # applies in rows 1 and 2 (and, on a row-3 reinstall, an existing
+    # operator-customized CLAUDE.md). Inner Claude must be able to
+    # edit CLAUDE.md from Telegram, so it has to be svc_uid-owned.
+    # The seed step above already chowns to svc_uid in rows 4 and 6;
+    # this final chown covers rows 1, 2, 3, and 5 - everywhere a
+    # regular CLAUDE.md exists at the destination after migration.
+    if claude_md_dst.is_file() and not claude_md_dst.is_symlink():
+        os.chown(claude_md_dst, svc_uid, svc_gid)
 
 
 def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:

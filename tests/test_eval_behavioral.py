@@ -31,7 +31,7 @@ Ten tests covering the harness's load-bearing seams, organized by concern:
 9. TestSubprocessExplicitCwd - locks the cwd= argument is passed
    explicitly to asyncio.create_subprocess_exec, preventing a future
    refactor from accidentally inheriting the harness's cwd (which would
-   leak the per-user home_workspace/.claude/CLAUDE.md into both arms).
+   leak home/.claude/CLAUDE.md into both arms).
 10. TestGeneratorEmptySystemPrompt - locks --system-prompt is followed
     by literally "" (not omitted), so the CLI's default system prompt
     cannot leak into the generator and confound the A/B measurement.
@@ -618,12 +618,12 @@ class TestSubprocessExplicitCwd:
     """The cwd= kwarg is passed explicitly to create_subprocess_exec.
 
     Without an explicit cwd, claude --print walks up from the harness's
-    cwd and picks up the per-user home_workspace/.claude/CLAUDE.md
-    (Kai's bot identity: voice rules, persona, scheduling API docs).
-    The judge would then filter every verdict through Kai's persona,
-    and the generator would receive bot-voice priming. Both confound
-    the spec's minimal-prompt measurement. This test locks the parameter
-    plumbing so a future refactor cannot quietly drop the cwd= argument.
+    cwd and picks up home/.claude/CLAUDE.md (Kai's bot identity:
+    voice rules, persona, scheduling API docs). The judge would then
+    filter every verdict through Kai's persona, and the generator would
+    receive bot-voice priming. Both confound the spec's minimal-prompt
+    measurement. This test locks the parameter plumbing so a future
+    refactor cannot quietly drop the cwd= argument.
     """
 
     def test_subprocess_passes_explicit_cwd_string(self):
@@ -661,8 +661,7 @@ class TestSubprocessExplicitCwd:
         # cwd must be passed as str(Path), not Path itself, matching
         # the extractor's pattern. If this assertion ever fails, the
         # subprocess call is inheriting the harness's cwd implicitly,
-        # which means the per-user home_workspace/.claude/CLAUDE.md is
-        # leaking into both arms.
+        # which means home/.claude/CLAUDE.md is leaking into both arms.
         assert "cwd" in captured
         assert captured["cwd"] == str(cwd)
 
