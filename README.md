@@ -74,7 +74,7 @@ Run `make config` to generate `users.yaml`, or create one manually from `templat
 
 Three layers of persistent context give the agent continuity across sessions:
 
-1. **Identity** (`home/.claude/CLAUDE.md`) - voice, rules, and operational guidelines. Lives in the home workspace. When the agent switches to a foreign workspace, Kai injects it so behavior stays consistent. In the home workspace, the agent reads it natively.
+1. **Identity** (`DATA_DIR/home/<chat_id>/.claude/CLAUDE.md`) - voice, rules, and operational guidelines. Lives in each operator's per-user home workspace. When the agent switches to a foreign workspace, Kai injects it so behavior stays consistent. In the home workspace, the agent reads it natively.
 2. **Home memory** (`DATA_DIR/memory/<chat_id>/MEMORY.md`) - per-user personal memory, always injected regardless of current workspace. Proactively updated by Kai. Each user has their own file under `memory/<chat_id>/`, scoped by Telegram chat_id so memories stay private.
 3. **Conversation history** (`DATA_DIR/history/<chat_id>/`) - JSONL logs, one file per day per user. Searchable for past conversations.
 
