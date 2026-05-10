@@ -3983,28 +3983,37 @@ class TestRetireInstallHomeClaude:
         (src / "src" / "module.py").write_text("code")
         (src / "pyproject.toml").write_text("[project]")
 
-        # Dry-run pass over the pre-state.
-        install_dry = tmp_path / "install_dry"
-        ws_claude_dry = install_dry / "home" / ".claude"
-        ws_claude_dry.mkdir(parents=True)
-        (ws_claude_dry / "CLAUDE.md").write_text("# content\n")
-        (ws_claude_dry / "MEMORY.md").write_text("# memory\n")
-        identity_dry = install_dry / "home" / "IDENTITY.md"
-        identity_dry.write_text("# operator\n")
+        # Build identical pre-states under two separate install dirs
+        # so the dry-run pass cannot mutate the live pass's input.
+        def seed_install_state(install_root: Path) -> None:
+            ws_claude = install_root / "home" / ".claude"
+            ws_claude.mkdir(parents=True)
+            (ws_claude / "CLAUDE.md").write_text("# content\n")
+            (ws_claude / "MEMORY.md").write_text("# memory\n")
+            (install_root / "home" / "IDENTITY.md").write_text("# operator\n")
 
-        with patch("kai.install.PROJECT_ROOT", src):
+        install_dry = tmp_path / "install_dry"
+        install_live = tmp_path / "install_live"
+        seed_install_state(install_dry)
+        seed_install_state(install_live)
+
+        # Both passes use the same patch set even though `dry_run=True`
+        # returns from `_apply_source` before any of the patched helpers
+        # (`_copy_tree`, `_set_ownership`, `shutil.copy2`, `os.chown`)
+        # are reached. The symmetry is defensive: it keeps a future
+        # refactor that extends the dry-run branch from accidentally
+        # mutating the filesystem via an unpatched production helper,
+        # and it makes the two passes structurally identical so the
+        # only meaningful diff between them is the `dry_run` flag.
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._copy_tree"),
+            patch("kai.install._set_ownership"),
+            patch("shutil.copy2"),
+            patch("os.chown"),
+        ):
             _apply_source(install_dry, svc_uid=1000, svc_gid=1000, dry_run=True)
         dry_output = capsys.readouterr().out
-
-        # Identical pre-state for the live pass. Two separate install
-        # dirs so the dry-run pre-state is not mutated by the live one.
-        install_live = tmp_path / "install_live"
-        ws_claude_live = install_live / "home" / ".claude"
-        ws_claude_live.mkdir(parents=True)
-        (ws_claude_live / "CLAUDE.md").write_text("# content\n")
-        (ws_claude_live / "MEMORY.md").write_text("# memory\n")
-        identity_live = install_live / "home" / "IDENTITY.md"
-        identity_live.write_text("# operator\n")
 
         with (
             patch("kai.install.PROJECT_ROOT", src),
