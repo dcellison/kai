@@ -2784,6 +2784,15 @@ def _retire_install_home_claude(install_path: Path, dry_run: bool) -> None:
         # therefore reports correctly rather than tracebacking on a
         # stat call into a possibly broken target. lstat is used
         # instead of stat for the same reason.
+        #
+        # Verb tense: the live log uses "Removing" because the lines
+        # are printed BEFORE shutil.rmtree runs (the enumeration needs
+        # to lstat each file while it still exists). If rmtree raises
+        # OSError - permissions, mounted filesystem, etc. - the
+        # "Removing" lines accurately describe what was attempted, and
+        # the trailing "Removed dead {dir}" summary will be absent so
+        # the operator can see the deletion did not complete. A
+        # past-tense per-file line here would lie on rmtree failure.
         for path in sorted(claude_dir.rglob("*")):
             if path.is_file() or path.is_symlink():
                 try:
@@ -2793,20 +2802,26 @@ def _retire_install_home_claude(install_path: Path, dry_run: bool) -> None:
                 if dry_run:
                     print(f"[DRY RUN] Would remove {path} ({size} bytes)")
                 else:
-                    print(f"  Removed {path} ({size} bytes)")
+                    print(f"  Removing {path} ({size} bytes)")
         if dry_run:
             print(f"[DRY RUN] Would remove dead {claude_dir}; nothing reads this path post-#447")
         else:
             # No ignore_errors: the is_dir() pre-check above makes the
             # call safe, and surfacing a real OSError (permissions,
-            # mounted FS, etc.) is preferred to silent failure.
+            # mounted FS, etc.) is preferred to silent failure. The
+            # past-tense "Removed dead" summary is correct because it
+            # fires only after rmtree returns successfully.
             shutil.rmtree(claude_dir)
             print(f"  Removed dead {claude_dir}; nothing reads this path post-#447")
 
     # IDENTITY.md is a regular file at <install>/home/IDENTITY.md, never
-    # a directory. The is_symlink() guard makes this branch fire only
-    # on the legacy operator-content shape; a symlink at the same path
-    # would have been handled by row 1/4 of the migration helper.
+    # a directory. The is_symlink() guard keeps this branch off
+    # symlinks (deleting them would be safe in practice but the legacy
+    # layout always had IDENTITY.md as a regular file, with CLAUDE.md
+    # as the symlink; a symlink at the IDENTITY.md path is unexpected
+    # and warrants operator attention rather than silent removal).
+    # Past tense in the live log is correct here: unlink() runs before
+    # the print.
     if identity_md.is_file() and not identity_md.is_symlink():
         try:
             size = identity_md.stat().st_size

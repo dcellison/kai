@@ -3984,22 +3984,30 @@ class TestRetireInstallHomeClaude:
             _apply_source(install_live, svc_uid=1000, svc_gid=1000, dry_run=False)
         live_output = capsys.readouterr().out
 
-        # Filter to the removal lines only. Substitute the install path
-        # so the two streams align under a common prefix; the rest of
-        # each line (filename plus byte-size) must match exactly.
-        def removal_lines(text: str, prefix: str, install_path: Path) -> list[str]:
+        # Filter to the removal-related lines only and strip the
+        # tense-marker prefix so the comparison runs on the action body.
+        # Live uses three prefixes by phase: "Removing " for the
+        # pre-rmtree per-file enumeration (so a rmtree OSError does not
+        # leave a past-tense lie in stdout), "Removed " for the
+        # post-rmtree summary and the post-unlink IDENTITY.md line.
+        # Dry-run uses one prefix ("[DRY RUN] Would remove ") for all
+        # three phases. After prefix strip the bodies must match
+        # 1:1 (path + size, or the "dead ..." / "legacy ..." trailers).
+        def removal_lines(text: str, prefixes: tuple[str, ...], install_path: Path) -> list[str]:
             placeholder = "<install>"
             stripped: list[str] = []
             for line in text.splitlines():
                 line = line.strip()
-                if line.startswith(prefix):
-                    body = line[len(prefix) :].lstrip()
-                    body = body.replace(str(install_path), placeholder)
-                    stripped.append(body)
+                for prefix in prefixes:
+                    if line.startswith(prefix):
+                        body = line[len(prefix) :].lstrip()
+                        body = body.replace(str(install_path), placeholder)
+                        stripped.append(body)
+                        break
             return stripped
 
-        dry_lines = removal_lines(dry_output, "[DRY RUN] Would remove", install_dry)
-        live_lines = removal_lines(live_output, "Removed", install_live)
+        dry_lines = removal_lines(dry_output, ("[DRY RUN] Would remove ",), install_dry)
+        live_lines = removal_lines(live_output, ("Removing ", "Removed "), install_live)
         assert dry_lines, f"Dry-run produced no removal previews; got: {dry_output!r}"
         assert dry_lines == live_lines, f"Dry-run / live parity broken.\n  Dry:  {dry_lines}\n  Live: {live_lines}"
 
