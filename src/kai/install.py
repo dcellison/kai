@@ -1270,6 +1270,17 @@ def _copy_tree(src: Path, dst: Path, excludes: set[str] | None = None) -> None:
     which destroyed ALL destination contents including runtime data that the
     excludes were meant to protect. See issue #143.
 
+    Symlink handling: shutil.copy2 follows symlinks and copies content. There
+    is no symlink-recreation branch; the previous one existed solely to
+    preserve home/.claude/CLAUDE.md -> ../IDENTITY.md during the source-to-
+    install copy, and was removed when that layout was retired (issue #442).
+    Tracked symlinks under templates/ or src/ would now be silently
+    dereferenced rather than recreated. This is intentional: cross-platform
+    symlink tracking (Windows) is fraught, and the source tree no longer
+    contains any symlinks. Do not "restore" the branch as an apparent bug
+    without first establishing a use case that needs cross-platform tracked
+    symlinks.
+
     Args:
         src: Source directory.
         dst: Destination directory (created if it doesn't exist).
@@ -2694,16 +2705,27 @@ def _migrate_identity_to_claude_md(
                 f"deleted {identity_dst}"
             )
     elif claude_md_is_symlink and not identity_exists:
-        # Row 4: broken symlink. Unlink so the seed step in _apply_source
-        # can populate a regular file. Without this branch the seed step
-        # would skip (it checks `not exists()`, which is False for a
-        # broken symlink) and the install would leave an unusable
-        # CLAUDE.md path behind.
+        # Row 4: CLAUDE.md is a symlink and IDENTITY.md is absent. Two
+        # subcases land here. Either the symlink target is missing (the
+        # legacy ../IDENTITY.md target was removed manually) or the
+        # symlink points at some other valid path (an exotic post-merge
+        # tarball-restore state). Both subcases need an unlink so the
+        # seed step in _apply_source produces a clean regular file:
+        #   - Broken target: Path.exists() returns False, so the seed
+        #     would proceed but shutil.copy2 would write through the
+        #     symlink to the missing target path (or fail outright if
+        #     the parent dir does not exist). Either way the install
+        #     ends up with a broken layout.
+        #   - Valid non-IDENTITY target: Path.exists() returns True, so
+        #     the seed step would skip, and the install would keep a
+        #     symlink pointing at unrelated content as the operator's
+        #     identity. Wrong by definition.
+        # Unlinking covers both subcases identically.
         if dry_run:
-            print(f"[DRY RUN] Would remove broken symlink at {claude_md_dst}")
+            print(f"[DRY RUN] Would remove symlink at {claude_md_dst} (no IDENTITY.md present)")
         else:
             claude_md_dst.unlink()
-            print(f"  Removed broken symlink at {claude_md_dst} ({identity_dst} target missing)")
+            print(f"  Removed symlink at {claude_md_dst} (no IDENTITY.md present)")
     elif claude_md_is_regular and not identity_exists:
         # Row 5: already migrated. Emit a positive log line on every
         # reinstall so operators get visible confirmation rather than
@@ -2769,16 +2791,30 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         # Conditional seed step preview. The recursive copy above excludes
         # CLAUDE.md (per _HOME_CLAUDE_EXCLUDES) so an operator's customized
         # destination is never overwritten; this step explicitly handles the
-        # "fresh install or post-broken-symlink" case where the destination
-        # is empty after migration. The dry-run prediction has to account
-        # for what migration would do: in row 2 of the migration table
-        # (IDENTITY.md regular file, no CLAUDE.md sibling) the migration
-        # itself populates CLAUDE.md by renaming, so no seed is needed.
+        # cases where the destination is empty after migration. The dry-run
+        # prediction has to account for what migration would do, so it
+        # computes the post-migration state of CLAUDE.md from the pre-state
+        # and walks all six rows of the migration table:
+        #   Row 1 (IDENTITY regular + CLAUDE symlink to ../IDENTITY.md):
+        #     migration replaces symlink with regular file -> exists.
+        #   Row 2 (IDENTITY regular + CLAUDE missing):
+        #     migration renames IDENTITY.md to CLAUDE.md -> exists.
+        #   Row 3 (IDENTITY regular + CLAUDE regular):
+        #     migration deletes IDENTITY.md, leaves CLAUDE -> exists.
+        #   Row 4 (IDENTITY missing + CLAUDE symlink):
+        #     migration unlinks symlink (covers broken target AND valid-but-
+        #     non-IDENTITY targets) -> empty, seed proceeds.
+        #   Row 5 (IDENTITY missing + CLAUDE regular): unchanged -> exists.
+        #   Row 6 (neither): unchanged -> empty, seed proceeds.
+        # Seed runs only on rows 4 and 6.
         identity_src_pre = install_path / "home" / "IDENTITY.md"
-        identity_would_move = (
-            identity_src_pre.is_file() and not identity_src_pre.is_symlink() and not claude_md_dst.exists()
-        )
-        if claude_md_src.is_file() and not claude_md_dst.exists() and not identity_would_move:
+        identity_pre_exists = identity_src_pre.is_file() and not identity_src_pre.is_symlink()
+        claude_pre_is_regular = claude_md_dst.is_file() and not claude_md_dst.is_symlink()
+        # Post-migration CLAUDE.md presence: rows 1-3 have the IDENTITY
+        # content land at CLAUDE.md (when CLAUDE.md is not already a
+        # regular file); rows 3 and 5 preserve the existing regular file.
+        post_migration_claude_md_exists = claude_pre_is_regular or (identity_pre_exists and not claude_pre_is_regular)
+        if claude_md_src.is_file() and not post_migration_claude_md_exists:
             print(f"[DRY RUN] Would seed {claude_md_src} -> {claude_md_dst}")
         return
 

@@ -4071,10 +4071,11 @@ class TestMigrateIdentityToClaudeMd:
 
     def test_broken_symlink_unlinks(self, tmp_path, capsys):
         """
-        Row 4: CLAUDE.md is a symlink to a missing target. The
-        migration unlinks the symlink so the seed step in _apply_source
-        can populate a regular file. CLAUDE.md must not exist after the
-        migration step (the seed is the integration test's concern).
+        Row 4 broken-target subcase: CLAUDE.md is a symlink to a missing
+        target. The migration unlinks the symlink so the seed step in
+        _apply_source can populate a regular file. CLAUDE.md must not
+        exist after the migration step (the seed is the integration
+        test's concern).
         """
         install = tmp_path / "install"
         ws_claude = install / "home" / ".claude"
@@ -4089,7 +4090,35 @@ class TestMigrateIdentityToClaudeMd:
         # would miss; pin both branches.
         assert not claude_md.is_symlink()
         assert not claude_md.exists()
-        assert "Removed broken symlink" in capsys.readouterr().out
+        assert "Removed symlink" in capsys.readouterr().out
+
+    def test_valid_non_identity_symlink_unlinks(self, tmp_path, capsys):
+        """
+        Row 4 valid-target subcase: CLAUDE.md is a symlink to some
+        valid path that is NOT IDENTITY.md (an exotic post-merge
+        tarball-restore state). Path.exists() returns True for a valid
+        symlink, so without this branch the seed step would skip and
+        the install would keep a symlink pointing at unrelated content
+        as the operator's identity. Migration unlinks the symlink so
+        the seed step produces a clean regular file.
+        """
+        install = tmp_path / "install"
+        ws_claude = install / "home" / ".claude"
+        ws_claude.mkdir(parents=True)
+        # A valid file at an unrelated path inside install/.
+        decoy = install / "home" / "DECOY.md"
+        decoy.write_text("# Unrelated content\n")
+        claude_md = ws_claude / "CLAUDE.md"
+        claude_md.symlink_to("../DECOY.md")
+
+        with patch("os.chown"):
+            _migrate_identity_to_claude_md(install, svc_uid=1000, svc_gid=1000, dry_run=False)
+
+        assert not claude_md.is_symlink()
+        assert not claude_md.exists()
+        # Decoy survives; only the symlink was unlinked.
+        assert decoy.is_file()
+        assert "Removed symlink" in capsys.readouterr().out
 
     def test_already_migrated_logs_and_noops(self, tmp_path, capsys):
         """
