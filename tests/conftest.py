@@ -84,6 +84,13 @@ def _cleanup_mem0_test_dir() -> None:
 # block above; the same conftest-module-top ordering guarantee
 # applies (conftest runs before pytest collects test modules, which
 # is when their `from kai.config import ...` would otherwise fire).
+#
+# Interaction with `tests/test_config.py:_clean_env`: that autouse
+# fixture does `monkeypatch.delenv("KAI_DATA_DIR")` per test, which
+# pytest auto-restores at fixture teardown. The session-wide value
+# set here therefore persists across test boundaries; only the test
+# body itself sees the env var as absent, which is what the
+# `TestDataDir` cases rely on to exercise the PROJECT_ROOT fallback.
 _KAI_DATA_TEST_DIR = tempfile.mkdtemp(prefix="kai-test-data-")
 os.environ["KAI_DATA_DIR"] = _KAI_DATA_TEST_DIR
 
