@@ -71,21 +71,30 @@ _LAUNCHD_LABEL = "com.syrinx.kai"
 _SOURCE_EXCLUDES = {"__pycache__", "*.pyc", "*.egg-info", ".git", ".venv", ".env"}
 
 # Excludes for the templates/.claude/ -> install/home/.claude/ copy.
-# These are runtime-generated or personal data that should not be part
-# of a clean install:
-#   history/    - conversation logs written by history.py at runtime
-#   MEMORY.md   - personal data (gitignored), user creates from template
+# Each entry has its own rationale; do NOT collapse to "things we
+# don't want in installs":
+#   history/    - conversation logs are written by history.py at runtime
+#                 into DATA_DIR/history/. The templates/ tree never has
+#                 a history/ subdir; the exclude is defensive against a
+#                 future fixture or test-leak under templates/ that
+#                 would otherwise land in install/home/.claude/history/
+#                 and be mistaken for real conversation data.
+#   MEMORY.md   - the template at templates/.claude/MEMORY.md is read
+#                 directly by _apply_migrate (install-time per-user
+#                 seed) and backend.ensure_user_memory (runtime
+#                 fallback), both of which write to
+#                 DATA_DIR/memory/<chat_id>/MEMORY.md. The exclude
+#                 prevents _copy_tree from also depositing a copy at
+#                 install/home/.claude/MEMORY.md, which would resurrect
+#                 the pre-#347 global layout and shadow the per-user
+#                 reads on every session.
 #   CLAUDE.md   - per-operator regular file (gitignored); created on
 #                 first install by copying templates/.claude/CLAUDE.md
 #                 into the install tree. The exclude prevents the
 #                 source-tree copy from clobbering an operator's
 #                 customized destination copy on reinstall.
-#   skills/     - downloaded skills, environment-specific
-# History and MEMORY.md now live in DATA_DIR, outside the install tree;
-# they remain in the excludes list because stale files may linger at the
-# source after migration (source files are preserved as backups, not
-# deleted). CLAUDE.md is excluded for a different reason - see its
-# per-entry comment above - not as a migration artifact.
+#   skills/     - downloaded skills, environment-specific.
+#   __pycache__ - byte-compile artifacts; never tracked.
 _HOME_CLAUDE_EXCLUDES = {"history", "MEMORY.md", "CLAUDE.md", "skills", "__pycache__"}
 
 
