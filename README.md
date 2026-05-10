@@ -43,7 +43,7 @@ For the full architecture, see [System Architecture](https://github.com/dcelliso
 
 Switch the agent between projects on your system with `/workspace <name>`. Names resolve relative to `WORKSPACE_BASE` (set in `.env`). Identity and memory carry over from the home workspace, so Kai retains full context regardless of what it's working on. Create new workspaces with `/workspace new <name>`. Absolute paths are not accepted - all workspaces must live under the configured base directory.
 
-Per-workspace configuration is supported via `workspaces.yaml` (or `/etc/kai/workspaces.yaml` for protected installations). Each workspace can override the model, budget, timeout, environment variables, and system prompt. See `workspaces.example.yaml` for the full format.
+Per-workspace configuration is supported via `workspaces.yaml` (or `/etc/kai/workspaces.yaml` for protected installations). Each workspace can override the model, budget, timeout, environment variables, and system prompt. See `templates/workspaces.yaml` for the full format.
 
 ### Multi-user
 
@@ -68,7 +68,7 @@ Each user gets:
 - **Per-user home workspace** - each user can have their own default workspace directory.
 - **Role-based routing** - admins receive unattributed webhook events (GitHub pushes, generic webhooks). Regular users interact only through Telegram messages.
 
-Run `make config` to generate `users.yaml`, or create one manually from `users.example.yaml`. See the [Multi-User Setup](https://github.com/dcellison/kai/wiki/Multi-User-Setup) wiki page for the full field reference. When `users.yaml` is absent, Kai falls back to `ALLOWED_USER_IDS` for backward compatibility. If neither is set, Kai refuses to start (fail-closed). The `CLAUDE_USER` env var acts as a global fallback for subprocess isolation; per-user `os_user` in `users.yaml` takes precedence when set.
+Run `make config` to generate `users.yaml`, or create one manually from `templates/users.yaml`. See the [Multi-User Setup](https://github.com/dcellison/kai/wiki/Multi-User-Setup) wiki page for the full field reference. When `users.yaml` is absent, Kai falls back to `ALLOWED_USER_IDS` for backward compatibility. If neither is set, Kai refuses to start (fail-closed). The `CLAUDE_USER` env var acts as a global fallback for subprocess isolation; per-user `os_user` in `users.yaml` takes precedence when set.
 
 ### Memory
 
@@ -188,7 +188,7 @@ cd kai
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
-cp .env.example .env
+cp templates/.env .env
 ```
 
 ### Environment variables
@@ -356,17 +356,20 @@ kai/
 │   ├── telegram_utils.py     # Telegram-specific helper functions
 │   └── workspace_utils.py    # Workspace path resolution and validation
 ├── tests/                    # Test suite
-├── home/                     # Agent home workspace
-│   ├── .claude/              # Identity and memory template
-│   └── files/                # File exchange directory (created at runtime)
+├── templates/                # Tracked seed files copied into the install on first run
+│   ├── .claude/              # Identity and memory templates (CLAUDE.md, MEMORY.md, PREFERENCES.md)
+│   ├── config/               # Static config templates (goose-config.yaml)
+│   ├── .env                  # Environment variable template
+│   ├── services.yaml         # External service config template
+│   ├── users.yaml            # Multi-user config template
+│   └── workspaces.yaml       # Per-workspace config template
 ├── kai.db                    # SQLite database (gitignored, created at runtime)
 ├── logs/                     # Daily-rotated log files (gitignored)
 ├── models/                   # Whisper and Piper model files (gitignored)
 ├── services.yaml             # External service configs (gitignored)
-├── workspaces.example.yaml   # Per-workspace config template
 ├── pyproject.toml            # Package metadata and dependencies
 ├── Makefile                  # Common dev commands
-├── .env                      # Environment variables (gitignored, copy from .env.example)
+├── .env                      # Environment variables (gitignored, copy from templates/.env)
 └── LICENSE                   # Apache 2.0
 ```
 

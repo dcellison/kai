@@ -2532,7 +2532,7 @@ class TestMemoryStats:
         """Fresh user (extracted_count == 0): confidence_* fields ship as JSON null.
 
         The handler MUST preserve None as JSON null, not coerce to 0 or
-        omit the field, because IDENTITY.md tells inner Claude that null
+        omit the field, because CLAUDE.md tells inner Claude that null
         means "no extracted facts to summarize" - changing the encoding
         would silently break that contract.
         """

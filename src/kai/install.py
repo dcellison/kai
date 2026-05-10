@@ -70,13 +70,16 @@ _LAUNCHD_LABEL = "com.syrinx.kai"
 # Excludes __pycache__, .pyc, and other build artifacts.
 _SOURCE_EXCLUDES = {"__pycache__", "*.pyc", "*.egg-info", ".git", ".venv", ".env"}
 
-# Excludes for home/.claude/ copy. These are runtime-generated or
-# personal data that should not be part of a clean install:
+# Excludes for the templates/.claude/ -> install/home/.claude/ copy.
+# These are runtime-generated or personal data that should not be part
+# of a clean install:
 #   history/    - conversation logs written by history.py at runtime
-#   MEMORY.md   - personal data (gitignored), user creates from .example
-#   CLAUDE.md   - per-operator symlink (gitignored); created idempotently
-#                 by _bootstrap_home_identity so the bootstrap path is the
-#                 single source of truth for the symlink target.
+#   MEMORY.md   - personal data (gitignored), user creates from template
+#   CLAUDE.md   - per-operator regular file (gitignored); created on
+#                 first install by copying templates/.claude/CLAUDE.md
+#                 into the install tree. The exclude prevents the
+#                 source-tree copy from clobbering an operator's
+#                 customized destination copy on reinstall.
 #   skills/     - downloaded skills, environment-specific
 # History and MEMORY.md now live in DATA_DIR, outside the install tree;
 # they remain in the excludes list because stale files may linger at the
@@ -1288,16 +1291,7 @@ def _copy_tree(src: Path, dst: Path, excludes: set[str] | None = None) -> None:
             if f not in ignored:
                 src_file = Path(src_dir) / f
                 dst_file = dst_dir / f
-                if src_file.is_symlink():
-                    # Recreate symlinks rather than following them and
-                    # copying content. Preserves relative link targets
-                    # (e.g., home/.claude/CLAUDE.md -> ../IDENTITY.md).
-                    link_target = os.readlink(src_file)
-                    if dst_file.exists() or dst_file.is_symlink():
-                        dst_file.unlink()
-                    os.symlink(link_target, dst_file)
-                else:
-                    shutil.copy2(src_file, dst_file)
+                shutil.copy2(src_file, dst_file)
 
 
 def _generate_env_file(env: dict[str, str]) -> str:
@@ -2034,47 +2028,14 @@ def _apply_migrate(
                 # Set ownership on the entire logs directory
                 _set_ownership(logs_dst, svc_uid, svc_gid, recursive=True)
 
-    # -- History migration --
-    # One-time: copy JSONL conversation logs from the source tree
-    # (home/.claude/history/, pre-DATA_DIR location) to DATA_DIR/history/.
-    # Safe on repeated runs: only copies files that
-    # don't already exist at the destination. Source files are preserved
-    # as backups (same pattern as the database and log migrations above).
-    history_src = PROJECT_ROOT / "home" / ".claude" / "history"
-    history_dst = data_path / "history"
-
-    if history_src.is_dir():
-        copied = 0
-        for f in sorted(history_src.glob("*.jsonl")):
-            dest = history_dst / f.name
-            if dest.exists():
-                continue
-            if dry_run:
-                print(f"[DRY RUN] Would copy history: {f} -> {dest}")
-            else:
-                history_dst.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(f, dest)
-                os.chown(dest, svc_uid, svc_gid)
-                copied += 1
-        if copied and not dry_run:
-            print(f"  Migrated {copied} history file(s) to {history_dst}")
-        elif not copied and not dry_run:
-            print("  History already migrated or no files to copy")
-
     # -- MEMORY.md migration --
     # One-time: land personal memory at the per-user path
     # DATA_DIR/memory/<chat_id>/MEMORY.md. The "primary operator"
     # (first entry in users.yaml, typically an admin) gets any legacy
-    # content. Two legacy source locations are handled:
-    #   1) DATA_DIR/memory/MEMORY.md  - pre-#347 global location; the
-    #      common case on existing installs.
-    #   2) PROJECT_ROOT/home/.claude/MEMORY.md - pre-DATA_DIR location
-    #      from before the DATA_DIR migration shipped.
+    # content from DATA_DIR/memory/MEMORY.md (pre-#347 global location).
     # legacy_global is moved (not copied) so the DATA_DIR global path
-    # cannot later read as stale state. legacy_src_tree is copied: it
-    # lives in a git-tracked directory and moving it would dirty the
-    # working tree on every install. If neither source exists, a
-    # per-user MEMORY.md is seeded from the home/.claude/MEMORY.md.example
+    # cannot later read as stale state. If no legacy source exists, the
+    # per-user MEMORY.md is seeded from the templates/.claude/MEMORY.md
     # template so the inner Claude has a writable starting point on
     # first message.
     # Subsequent users in users.yaml get the template, not the legacy
@@ -2087,8 +2048,7 @@ def _apply_migrate(
     memory_owners = _collect_user_memory_owners(users_yaml_path)
     memory_root = data_path / "memory"
     legacy_global = memory_root / "MEMORY.md"
-    legacy_src_tree = PROJECT_ROOT / "home" / ".claude" / "MEMORY.md"
-    example_template = PROJECT_ROOT / "home" / ".claude" / "MEMORY.md.example"
+    template = PROJECT_ROOT / "templates" / ".claude" / "MEMORY.md"
 
     # Resolve every os_user against the host's passwd database BEFORE
     # touching disk. If users.yaml names an OS user that does not exist
@@ -2129,10 +2089,8 @@ def _apply_migrate(
             if dry_run:
                 if legacy_global.is_file():
                     print(f"[DRY RUN] Would move {legacy_global} -> {primary_dst}")
-                elif legacy_src_tree.is_file():
-                    print(f"[DRY RUN] Would copy {legacy_src_tree} -> {primary_dst}")
-                elif example_template.is_file():
-                    print(f"[DRY RUN] Would seed {primary_dst} from {example_template}")
+                elif template.is_file():
+                    print(f"[DRY RUN] Would seed {primary_dst} from {template}")
                 else:
                     # Mirror the real branch's last-resort placeholder
                     # below: when none of the source files exist (minimal
@@ -2149,18 +2107,15 @@ def _apply_migrate(
                     # the per-user read once one user's subdir fills up.
                     shutil.move(str(legacy_global), str(primary_dst))
                     print(f"  Migrated MEMORY.md to {primary_dst}")
-                elif legacy_src_tree.is_file():
-                    shutil.copy2(legacy_src_tree, primary_dst)
-                    print(f"  Migrated MEMORY.md to {primary_dst}")
-                elif example_template.is_file():
-                    shutil.copy2(example_template, primary_dst)
-                    print(f"  Seeded {primary_dst} from example template")
+                elif template.is_file():
+                    shutil.copy2(template, primary_dst)
+                    print(f"  Seeded {primary_dst} from memory template")
                 else:
                     # Last-resort placeholder so the file is writable.
                     primary_dst.write_text("# Memory\n")
                     print(f"  Created empty {primary_dst}")
 
-        # Seed every other known user from the example template. Skips
+        # Seed every other known user from the memory template. Skips
         # the primary (handled above) and any user whose subdir already
         # has a MEMORY.md (idempotent across reinstalls).
         for chat_id, _os_user in memory_owners[1:]:
@@ -2171,18 +2126,18 @@ def _apply_migrate(
             if dry_run:
                 # Match the real branch below: the template may not ship
                 # with the install tree, in which case the real path
-                # writes a placeholder. Printing "from example template"
+                # writes a placeholder. Printing "from memory template"
                 # unconditionally misleads operators on hosts where the
                 # template is missing.
-                if example_template.is_file():
-                    print(f"[DRY RUN] Would seed {user_dst} from example template")
+                if template.is_file():
+                    print(f"[DRY RUN] Would seed {user_dst} from memory template")
                 else:
-                    print(f"[DRY RUN] Would create empty {user_dst} (no example template)")
+                    print(f"[DRY RUN] Would create empty {user_dst} (no memory template)")
                 continue
             user_dir.mkdir(parents=True, exist_ok=True)
-            if example_template.is_file():
-                shutil.copy2(example_template, user_dst)
-                print(f"  Seeded {user_dst} from example template")
+            if template.is_file():
+                shutil.copy2(template, user_dst)
+                print(f"  Seeded {user_dst} from memory template")
             else:
                 user_dst.write_text("# Memory\n")
                 print(f"  Created empty {user_dst}")
@@ -2277,7 +2232,7 @@ def _apply_migrate(
     # runtime (backend.ensure_user_preferences) is the fallback for
     # chat_ids added between installs.
     preferences_tree = data_path / "preferences"
-    preferences_template = PROJECT_ROOT / "home" / ".claude" / "PREFERENCES.md.example"
+    preferences_template = PROJECT_ROOT / "templates" / ".claude" / "PREFERENCES.md"
 
     for chat_id, _os_user in memory_owners:
         if chat_id is None:
@@ -2297,7 +2252,7 @@ def _apply_migrate(
         if not pref_dst.exists():
             if preferences_template.is_file():
                 shutil.copy2(preferences_template, pref_dst)
-                print(f"  Seeded {pref_dst} from PREFERENCES.md.example")
+                print(f"  Seeded {pref_dst} from preferences template")
             else:
                 # Match ensure_user_preferences() / ensure_user_memory()
                 # missing-template precedent so the subprocess always
@@ -2642,113 +2597,126 @@ def _apply_directories(
             print(f"  Created {path}")
 
 
-def _bootstrap_home_identity(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
+def _migrate_identity_to_claude_md(
+    install_path: Path,
+    svc_uid: int,
+    svc_gid: int,
+    dry_run: bool,
+) -> None:
     """
-    Ensure the install location has a working IDENTITY.md and CLAUDE.md symlink.
+    One-time migration: convert the legacy IDENTITY.md plus CLAUDE.md symlink
+    layout into a single regular CLAUDE.md file at home/.claude/CLAUDE.md.
 
-    On a fresh install (or whenever home/IDENTITY.md is missing from the source
-    checkout because it is per-operator and untracked), the operator has no seed
-    identity to copy. This function bootstraps the identity surface by falling
-    back to the tracked home/.claude/CLAUDE.md.example template, then ensures
-    home/.claude/CLAUDE.md is a symlink pointing at ../IDENTITY.md so inner
-    Claude finds the identity at the path Claude Code expects.
+    Pre-existing installs from before this change shipped a regular
+    home/IDENTITY.md (operator-customized) plus a home/.claude/CLAUDE.md
+    symlink with target ../IDENTITY.md. This helper detects that layout
+    and converts it in place WITHOUT discarding the operator's
+    customizations: the symlink-target case reads IDENTITY.md content
+    into memory before unlinking either path so a partial failure leaves
+    the originals on disk.
 
-    Behavior:
-      1. If the operator's home/IDENTITY.md is present in source, copy it to
-         the install location, overwriting any prior install copy. Source
-         is the authoritative copy when present: operators edit IDENTITY.md
-         in their checkout, then `make install` propagates those edits to
-         the install location. Direct edits to the install copy are not
-         protected against overwrite by this branch.
-      2. Else, if no IDENTITY.md exists at the install location yet, seed it
-         from home/.claude/CLAUDE.md.example. Fresh-clone path.
-      3. Else (steady state on reinstall after first bootstrap with no
-         source IDENTITY.md), leave the install copy in place. No-op.
-      4. Always reconcile home/.claude/CLAUDE.md: if it is missing or its
-         symlink target is not "../IDENTITY.md", recreate it.
+    Six pre-states (full 2x3 cross of file presence and CLAUDE.md type):
 
-    Idempotent: a second invocation with no source changes performs at most
-    a refresh copy of IDENTITY.md and is otherwise silent.
+      1. IDENTITY.md regular file + CLAUDE.md symlink to ../IDENTITY.md:
+         replace the symlink with a regular CLAUDE.md holding the
+         IDENTITY.md content; delete IDENTITY.md.
+      2. IDENTITY.md regular file + CLAUDE.md missing: move IDENTITY.md
+         to CLAUDE.md (preserves content, removes the source).
+      3. IDENTITY.md regular file + CLAUDE.md regular file (inconsistent):
+         keep CLAUDE.md (canonical going forward), delete IDENTITY.md,
+         warn the operator so they can sanity-check which copy survived.
+      4. IDENTITY.md missing + CLAUDE.md is a symlink (broken or
+         otherwise): unlink the symlink so the seed step can populate
+         a regular file cleanly.
+      5. IDENTITY.md missing + CLAUDE.md regular file: already migrated.
+         Emit a positive "already migrated; no action" log on every
+         reinstall so operators see a non-silent confirmation.
+      6. Neither exists: genuine fresh install. No-op here; the seed
+         step in `_apply_source` (the conditional CLAUDE.md copy at the
+         end) emits its own log when it copies the template.
 
     Args:
         install_path: Root of the install tree (e.g. /opt/kai).
-        svc_uid: Service user UID. The identity file and the symlink are
-            owned by the service user so inner Claude can write to them
-            from Telegram.
+        svc_uid: Service user UID. The migrated CLAUDE.md is owned by
+            the service user so inner Claude can edit it from Telegram.
         svc_gid: Service group GID.
         dry_run: If True, log the actions that would happen without doing them.
     """
-    identity_src = PROJECT_ROOT / "home" / "IDENTITY.md"
-    example_src = PROJECT_ROOT / "home" / ".claude" / "CLAUDE.md.example"
     identity_dst = install_path / "home" / "IDENTITY.md"
     claude_md_dst = install_path / "home" / ".claude" / "CLAUDE.md"
-    # Tracks whether either step took action so the steady-state path can
-    # emit a single positive "already bootstrapped" log. Without this,
-    # full-no-op reinstalls would be silent, which makes it hard for an
-    # operator to confirm the identity surface is healthy.
-    did_work = False
+    # is_file() follows symlinks, which would conflate the symlink case
+    # with the regular-file case. Pair it with `not is_symlink()` so
+    # `identity_exists` and `claude_md_is_regular` are strictly regular
+    # files, never symlinks.
+    identity_exists = identity_dst.is_file() and not identity_dst.is_symlink()
+    claude_md_is_symlink = claude_md_dst.is_symlink()
+    claude_md_is_regular = claude_md_dst.is_file() and not claude_md_dst.is_symlink()
 
-    # Step 1: ensure IDENTITY.md exists at the install location, picking the
-    # best available seed. Source IDENTITY.md is preferred when present so
-    # operator edits in their checkout still propagate; the .example is the
-    # fresh-clone fallback because IDENTITY.md is no longer tracked.
-    if identity_src.is_file():
+    if identity_exists and claude_md_is_symlink:
+        # Row 1: read IDENTITY.md content first so a partial failure
+        # leaves the originals on disk rather than half-migrated.
         if dry_run:
-            print(f"[DRY RUN] Would copy: {identity_src} -> {identity_dst}")
+            print(
+                f"[DRY RUN] Would migrate: replace symlink {claude_md_dst} "
+                f"with regular file holding {identity_dst} content"
+            )
         else:
-            identity_dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(identity_src, identity_dst)
-            os.chown(identity_dst, svc_uid, svc_gid)
-            print(f"  Copied {identity_dst}")
-        did_work = True
-    elif not identity_dst.exists() and example_src.is_file():
+            content = identity_dst.read_bytes()
+            claude_md_dst.unlink()
+            claude_md_dst.write_bytes(content)
+            os.chown(claude_md_dst, svc_uid, svc_gid)
+            identity_dst.unlink()
+            print(f"  Migrated {identity_dst} content into regular file at {claude_md_dst}; removed {identity_dst}")
+    elif identity_exists and not claude_md_dst.exists():
+        # Row 2: rename IDENTITY.md to CLAUDE.md. Path.replace is atomic
+        # within the same filesystem (the install tree always is), so
+        # there is no transient state where neither file exists.
         if dry_run:
-            print(f"[DRY RUN] Would seed {identity_dst} from {example_src}")
-        else:
-            identity_dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(example_src, identity_dst)
-            os.chown(identity_dst, svc_uid, svc_gid)
-            print(f"  Bootstrapped {identity_dst} from CLAUDE.md.example")
-        did_work = True
-    elif not identity_dst.exists():
-        # No source IDENTITY.md, no install copy, and no .example to fall
-        # back to. The .example is tracked, so missing here means a corrupt
-        # or partial source checkout. Skip the symlink step too: a symlink
-        # to a nonexistent target only obscures the underlying problem.
-        print(f"  WARNING: neither {identity_src} nor {example_src} found; cannot bootstrap {identity_dst}")
-        return
-
-    # Step 2: reconcile the CLAUDE.md symlink. The relative target keeps the
-    # symlink valid regardless of where the install tree is rooted. Detecting
-    # "already correct" via os.readlink avoids noisy unlink-and-relink work
-    # on every reinstall.
-    expected_target = "../IDENTITY.md"
-    is_correct_symlink = claude_md_dst.is_symlink() and os.readlink(claude_md_dst) == expected_target
-    if not is_correct_symlink:
-        if dry_run:
-            print(f"[DRY RUN] Would (re)create symlink {claude_md_dst} -> {expected_target}")
+            print(f"[DRY RUN] Would move {identity_dst} -> {claude_md_dst}")
         else:
             claude_md_dst.parent.mkdir(parents=True, exist_ok=True)
-            # is_symlink() catches broken symlinks that exists() misses;
-            # check both so unlink covers every pre-existing case.
-            if claude_md_dst.is_symlink() or claude_md_dst.exists():
-                claude_md_dst.unlink()
-            os.symlink(expected_target, claude_md_dst)
-            # _set_ownership picks lchown for symlinks; using the helper
-            # keeps the syscall choice in one place and lets tests mock it.
-            _set_ownership(claude_md_dst, svc_uid, svc_gid)
-            print(f"  Created symlink {claude_md_dst} -> {expected_target}")
-        did_work = True
-
-    # Steady state: install copy is present, source IDENTITY.md is absent,
-    # and the symlink target is already correct. Emit a single positive
-    # confirmation so reinstalls produce visible output rather than silent
-    # inaction. The spec calls for this log line explicitly.
-    if not did_work:
+            identity_dst.replace(claude_md_dst)
+            os.chown(claude_md_dst, svc_uid, svc_gid)
+            print(f"  Moved {identity_dst} -> {claude_md_dst}")
+    elif identity_exists and claude_md_is_regular:
+        # Row 3: inconsistent state. Two regular files - typically the
+        # remnant of an interrupted prior install. Keep CLAUDE.md (the
+        # canonical destination) and delete IDENTITY.md so reinstalls
+        # converge on a single source of truth. WARN so an operator who
+        # had real content only in IDENTITY.md notices the divergence.
         if dry_run:
-            print(f"[DRY RUN] {identity_dst} and {claude_md_dst} already valid; no action")
+            print(f"[DRY RUN] Would delete {identity_dst} ({claude_md_dst} regular file already in place)")
         else:
-            print(f"  Identity surface already bootstrapped: {identity_dst} and {claude_md_dst} are in place")
+            identity_dst.unlink()
+            print(
+                f"  WARNING: both {identity_dst} and {claude_md_dst} "
+                f"(regular file) existed; kept {claude_md_dst}, "
+                f"deleted {identity_dst}"
+            )
+    elif claude_md_is_symlink and not identity_exists:
+        # Row 4: broken symlink. Unlink so the seed step in _apply_source
+        # can populate a regular file. Without this branch the seed step
+        # would skip (it checks `not exists()`, which is False for a
+        # broken symlink) and the install would leave an unusable
+        # CLAUDE.md path behind.
+        if dry_run:
+            print(f"[DRY RUN] Would remove broken symlink at {claude_md_dst}")
+        else:
+            claude_md_dst.unlink()
+            print(f"  Removed broken symlink at {claude_md_dst} ({identity_dst} target missing)")
+    elif claude_md_is_regular and not identity_exists:
+        # Row 5: already migrated. Emit a positive log line on every
+        # reinstall so operators get visible confirmation rather than
+        # silent inaction. Mirrors the existing log discipline (see the
+        # MEMORY.md migration above).
+        if dry_run:
+            print("[DRY RUN] Identity surface already migrated; no action")
+        else:
+            print("  Identity surface already migrated; no action")
+    # else: row 6 (neither exists). Genuine fresh install. Silent at
+    # this step; the conditional seed at the end of _apply_source emits
+    # "Seeded CLAUDE.md from template" when it copies the template into
+    # the destination.
 
 
 def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
@@ -2757,13 +2725,19 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     src_dst = install_path / "src"
     pyproject_src = PROJECT_ROOT / "pyproject.toml"
     pyproject_dst = install_path / "pyproject.toml"
-    ws_claude_src = PROJECT_ROOT / "home" / ".claude"
+    # Source-side templates live under templates/. Destination keeps
+    # the historical install layout (home/.claude/, home/config/) so
+    # runtime code paths and per-user workspaces under DATA_DIR/home/
+    # do not need to change in lockstep.
+    ws_claude_src = PROJECT_ROOT / "templates" / ".claude"
     ws_claude_dst = install_path / "home" / ".claude"
     # Config templates (e.g. goose-config.yaml) referenced by later
     # install steps like _apply_goose_config(). Root-owned since these
     # are static templates, not runtime data.
-    config_src = PROJECT_ROOT / "home" / "config"
+    config_src = PROJECT_ROOT / "templates" / "config"
     config_dst = install_path / "home" / "config"
+    claude_md_src = PROJECT_ROOT / "templates" / ".claude" / "CLAUDE.md"
+    claude_md_dst = install_path / "home" / ".claude" / "CLAUDE.md"
 
     # One-time: rename workspace/ to home/ at the install location.
     # The directory was renamed in the source tree; this migrates the
@@ -2778,6 +2752,13 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
             old_ws.rename(new_ws)
             print(f"  Renamed {old_ws} -> {new_ws}")
 
+    # Migrate any legacy IDENTITY.md/symlink layout to a regular
+    # CLAUDE.md regular file before the template-copy steps run. The
+    # migration runs in dry-run mode too so operators previewing an
+    # upgrade see exactly what will happen to their identity surface.
+    # See `_migrate_identity_to_claude_md` for the full state table.
+    _migrate_identity_to_claude_md(install_path, svc_uid, svc_gid, dry_run)
+
     if dry_run:
         print(f"[DRY RUN] Would copy: {src_src} -> {src_dst}")
         print(f"[DRY RUN] Would copy: {pyproject_src} -> {pyproject_dst}")
@@ -2785,7 +2766,20 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
             print(f"[DRY RUN] Would copy: {ws_claude_src} -> {ws_claude_dst}")
         if config_src.is_dir():
             print(f"[DRY RUN] Would copy: {config_src} -> {config_dst}")
-        _bootstrap_home_identity(install_path, svc_uid, svc_gid, dry_run=True)
+        # Conditional seed step preview. The recursive copy above excludes
+        # CLAUDE.md (per _HOME_CLAUDE_EXCLUDES) so an operator's customized
+        # destination is never overwritten; this step explicitly handles the
+        # "fresh install or post-broken-symlink" case where the destination
+        # is empty after migration. The dry-run prediction has to account
+        # for what migration would do: in row 2 of the migration table
+        # (IDENTITY.md regular file, no CLAUDE.md sibling) the migration
+        # itself populates CLAUDE.md by renaming, so no seed is needed.
+        identity_src_pre = install_path / "home" / "IDENTITY.md"
+        identity_would_move = (
+            identity_src_pre.is_file() and not identity_src_pre.is_symlink() and not claude_md_dst.exists()
+        )
+        if claude_md_src.is_file() and not claude_md_dst.exists() and not identity_would_move:
+            print(f"[DRY RUN] Would seed {claude_md_src} -> {claude_md_dst}")
         return
 
     _copy_tree(src_src, src_dst, _SOURCE_EXCLUDES)
@@ -2796,12 +2790,15 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     os.chown(pyproject_dst, 0, 0)
     print(f"  Copied {pyproject_dst}")
 
-    # Copy home/.claude/ (bot identity, memory template) excluding
-    # runtime data. Without CLAUDE.md, the bot has no identity in the
-    # home workspace and nothing to inject into foreign workspace sessions.
-    # Files inside are root-owned (read-only config), but the directory
-    # itself is service-user-owned so skills/ and other runtime dirs can
-    # be created inside it.
+    # Copy templates/.claude/ -> install/home/.claude/ (bot identity,
+    # memory template) excluding runtime data. Without CLAUDE.md, the
+    # bot has no identity in the home workspace and nothing to inject
+    # into foreign workspace sessions. Files inside are root-owned
+    # (read-only config), but the directory itself is service-user-owned
+    # so skills/ and other runtime dirs can be created inside it. The
+    # exclude set keeps CLAUDE.md off this copy so an operator-customized
+    # destination survives reinstalls; the explicit seed step below
+    # populates it on first install only.
     if ws_claude_src.is_dir():
         ws_claude_dst.parent.mkdir(parents=True, exist_ok=True)
         _copy_tree(ws_claude_src, ws_claude_dst, _HOME_CLAUDE_EXCLUDES)
@@ -2809,10 +2806,11 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         os.chown(ws_claude_dst, svc_uid, svc_gid)
         print(f"  Copied home config to {ws_claude_dst}")
 
-    # Copy home/config/ (config templates like goose-config.yaml). These
-    # are static templates referenced by later install steps - e.g.
-    # _apply_goose_config() reads the Goose extension config from here.
-    # Root-owned since they're installer input, not runtime output.
+    # Copy templates/config/ -> install/home/config/ (config templates
+    # like goose-config.yaml). These are static templates referenced by
+    # later install steps - e.g. _apply_goose_config() reads the Goose
+    # extension config from here. Root-owned since they're installer
+    # input, not runtime output.
     if config_src.is_dir():
         # home/ may already exist from the .claude/ copy above, but
         # ensure it's there when config/ exists without .claude/.
@@ -2821,11 +2819,17 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         _set_ownership(config_dst, 0, 0, recursive=True)
         print(f"  Copied config templates to {config_dst}")
 
-    # Bootstrap the per-operator IDENTITY.md and the CLAUDE.md symlink.
-    # IDENTITY.md is no longer tracked, so the helper falls back to the
-    # tracked CLAUDE.md.example template on fresh clones and reconciles
-    # the symlink target on every install.
-    _bootstrap_home_identity(install_path, svc_uid, svc_gid, dry_run=False)
+    # Conditional seed: the recursive copy above excluded CLAUDE.md so an
+    # operator-customized destination is never overwritten. On first
+    # install (or after a broken-symlink migration cleared the destination)
+    # there is no CLAUDE.md to preserve, so explicitly seed from the
+    # template here. Owned by the service user so inner Claude can edit
+    # the file from Telegram.
+    if claude_md_src.is_file() and not claude_md_dst.exists():
+        claude_md_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(claude_md_src, claude_md_dst)
+        os.chown(claude_md_dst, svc_uid, svc_gid)
+        print("  Seeded CLAUDE.md from template")
 
 
 def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:

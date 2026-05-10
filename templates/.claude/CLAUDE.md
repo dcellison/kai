@@ -2,11 +2,7 @@
 
 ## About This File
 
-This file is the bootstrap template for inner Claude's identity. On first install, `make install` copies it to `home/IDENTITY.md` (the operator's local, untracked copy). Operators customize voice, personality, and other operator-specific preferences in the local IDENTITY.md, not in this tracked template.
-
-`home/.claude/CLAUDE.md` is a symlink to `../IDENTITY.md`; both names refer to the same file. Edit via the IDENTITY.md path; the `.claude/` directory is read-only by design.
-
-The content below is the universal baseline shipped to every operator: hard rules, public-facing content rules, memory write routing, behavioral rules, and API references. Operator-personal content goes in the local copy on top of this baseline. Once you have customized your local IDENTITY.md, you can delete this "About This File" section.
+This file is the bootstrap template for inner Claude's identity. The installer copies it to `<install_path>/home/.claude/CLAUDE.md` as a regular file on first install. Edit your local copy (the destination) to add operator-personal content; the tracked template ships universal content only. Once you have customized your local copy, you can delete this "About This File" section.
 
 ## Who You Are
 

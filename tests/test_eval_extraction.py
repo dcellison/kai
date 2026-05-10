@@ -89,11 +89,37 @@ def test_v6_pinned_drift():
     )
 
 
-def test_example_probe_fixture_loads():
-    """The tracked example fixture parses end-to-end and contains
-    the documented mix (2 workflow-noise + 2 durable-content)."""
-    path = Path(__file__).parent.parent / "home" / "evals" / "extraction-probes.example.jsonl"
-    probes = extraction.load_probes(path)
+def test_extraction_probe_loader_accepts_synthetic_fixture(tmp_path: Path):
+    """Loader handles a 4-probe inline fixture with a 2-2 category mix.
+
+    The repo no longer ships a tracked extraction-probe fixture file
+    (operator-personal data was the failure mode). This test pins the
+    loader contract against an obviously-synthetic Lorem-ipsum fixture
+    written to tmp_path: parses cleanly, returns the right count, and
+    splits 2 workflow-noise / 2 durable-content. Categories MUST match
+    the loader's _VALID_CATEGORIES enum (hyphens, not underscores);
+    underscored variants are rejected at load time as typos.
+    """
+    fixture = tmp_path / "extraction_probes.jsonl"
+    fixture.write_text(
+        '{"probe_id":"wf-syn-001","category":"workflow-noise",'
+        '"window":{"prior":[],"current":{"user":"Lorem ipsum dolor sit amet.",'
+        '"assistant":"Consectetur adipiscing elit."}},'
+        '"expected":{"should_extract_any":false,"must_not_contain":["lorem"]}}\n'
+        '{"probe_id":"wf-syn-002","category":"workflow-noise",'
+        '"window":{"prior":[],"current":{"user":"Sed do eiusmod tempor.",'
+        '"assistant":"Incididunt ut labore."}},'
+        '"expected":{"should_extract_any":false,"must_not_contain":["tempor"]}}\n'
+        '{"probe_id":"dur-syn-001","category":"durable-content",'
+        '"window":{"prior":[],"current":{"user":"Ut enim ad minim veniam.",'
+        '"assistant":"Quis nostrud exercitation."}},'
+        '"expected":{"should_extract_any":true,"must_contain":["minim"]}}\n'
+        '{"probe_id":"dur-syn-002","category":"durable-content",'
+        '"window":{"prior":[],"current":{"user":"Duis aute irure dolor.",'
+        '"assistant":"In reprehenderit in voluptate."}},'
+        '"expected":{"should_extract_any":true,"must_contain":["irure"]}}\n'
+    )
+    probes = extraction.load_probes(fixture)
     assert len(probes) == 4
     cats = [p.category for p in probes]
     assert cats.count("workflow-noise") == 2
@@ -107,21 +133,48 @@ def test_example_probe_fixture_loads():
         assert isinstance(p.expected, dict)
 
 
-def test_episode_classification_fixture_loads():
-    """The tracked episode-classification example fixture parses
-    end-to-end with the documented 12-probe mix (5 workflow-event,
-    4 durable, 3 borderline). The borderline probes are categorized
-    as `workflow-noise` (their `expected_has_episode` is false) so
-    the existing fact-side classifier semantics still apply; the
-    new `expected_has_episode` field is the load-bearing dimension
-    for episode-classifier measurement and is asserted present on
-    every probe (issue #428)."""
-    path = Path(__file__).parent.parent / "home" / "evals" / "episode-classification-probes.example.jsonl"
-    probes = extraction.load_probes(path)
+def test_episode_classification_loader_accepts_synthetic_fixture(tmp_path: Path):
+    """Inline episode-classification fixture: 12 probes with 8/4 category
+    mix and an `expected_has_episode` bool on every probe.
+
+    The original fixture's "workflow-event" and "borderline" sub-types
+    live INSIDE the workflow-noise bucket and are encoded via the
+    `expected_has_episode` bool, NOT as separate loader categories.
+    The 8-probe workflow-noise group carries a true/false split that
+    the episode-classifier measurement reads; the 4-probe durable-content
+    group's `expected_has_episode` field is also asserted present so
+    the classifier's per-probe loop never KeyErrors.
+    """
+    fixture = tmp_path / "episode_probes.jsonl"
+    # 8 workflow-noise probes (5 with expected_has_episode=true to
+    # mirror the original "workflow-event" sub-type, 3 with false to
+    # mirror "borderline") + 4 durable-content probes.
+    lines: list[str] = []
+    for i in range(5):
+        lines.append(
+            f'{{"probe_id":"wf-evt-{i:03d}","category":"workflow-noise",'
+            f'"window":{{"prior":[],"current":{{"user":"Lorem ipsum {i}.",'
+            f'"assistant":"Dolor sit amet {i}."}}}},'
+            f'"expected":{{"should_extract_any":false,"must_not_contain":["lorem"],"expected_has_episode":true}}}}'
+        )
+    for i in range(3):
+        lines.append(
+            f'{{"probe_id":"wf-bor-{i:03d}","category":"workflow-noise",'
+            f'"window":{{"prior":[],"current":{{"user":"Consectetur {i}.",'
+            f'"assistant":"Adipiscing elit {i}."}}}},'
+            f'"expected":{{"should_extract_any":false,"must_not_contain":["consectetur"],"expected_has_episode":false}}}}'
+        )
+    for i in range(4):
+        lines.append(
+            f'{{"probe_id":"dur-syn-{i:03d}","category":"durable-content",'
+            f'"window":{{"prior":[],"current":{{"user":"Ut enim {i}.",'
+            f'"assistant":"Veniam {i}."}}}},'
+            f'"expected":{{"should_extract_any":true,"must_contain":["enim"],"expected_has_episode":false}}}}'
+        )
+    fixture.write_text("\n".join(lines) + "\n")
+    probes = extraction.load_probes(fixture)
     assert len(probes) == 12
     cats = [p.category for p in probes]
-    # 5 workflow-event + 3 borderline = 8 workflow-noise category;
-    # 4 durable.
     assert cats.count("workflow-noise") == 8
     assert cats.count("durable-content") == 4
     for p in probes:

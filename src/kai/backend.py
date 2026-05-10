@@ -471,12 +471,12 @@ def ensure_user_memory(chat_id: int | None, data_dir: Path) -> None:
     try:
         user_memory_dir.mkdir(parents=True, exist_ok=True)
         if not user_memory_file.exists():
-            # Seed from the example template if one ships with the
-            # source tree. Copy2 preserves mode bits so a deliberately
-            # permissive example stays that way.
-            example = PROJECT_ROOT / "home" / ".claude" / "MEMORY.md.example"
-            if example.is_file():
-                shutil.copy2(example, user_memory_file)
+            # Seed from the template if one ships with the source tree.
+            # Copy2 preserves mode bits so a deliberately permissive
+            # template stays that way.
+            template = PROJECT_ROOT / "templates" / ".claude" / "MEMORY.md"
+            if template.is_file():
+                shutil.copy2(template, user_memory_file)
             else:
                 # No template available (unusual - only happens when the
                 # install tree is incomplete). Create a minimal placeholder
@@ -525,13 +525,13 @@ def ensure_user_preferences(chat_id: int | None, data_dir: Path) -> None:
     try:
         user_pref_dir.mkdir(parents=True, exist_ok=True)
         if not user_pref_file.exists():
-            # Seed from the example template if one ships with the
-            # source tree. Copy2 preserves mode bits so a deliberately
-            # permissive example stays that way. Mirrors
-            # ensure_user_memory's seed step.
-            example = PROJECT_ROOT / "home" / ".claude" / "PREFERENCES.md.example"
-            if example.is_file():
-                shutil.copy2(example, user_pref_file)
+            # Seed from the template if one ships with the source tree.
+            # Copy2 preserves mode bits so a deliberately permissive
+            # template stays that way. Mirrors ensure_user_memory's seed
+            # step.
+            template = PROJECT_ROOT / "templates" / ".claude" / "PREFERENCES.md"
+            if template.is_file():
+                shutil.copy2(template, user_pref_file)
             else:
                 # No template available (unusual - only happens when
                 # the install tree is incomplete). Create a minimal
@@ -635,9 +635,8 @@ def resolve_home_workspace(
     bot.py `/workspace home` handler and workspace listings) MUST go
     through this function rather than reading any global home field on
     Config directly - that field was removed by issue #353. The old
-    global fallback (PROJECT_ROOT / "home" / shared "/opt/kai/home/")
-    was a multi-user privacy hazard (every user landed in a directory
-    every other user could read).
+    global fallback (issue #353) was a multi-user privacy hazard
+    (every user landed in a directory every other user could read).
 
     Passing `config` (not just its admin home field) keeps the
     resolution decision local: the caller does not need to know whether

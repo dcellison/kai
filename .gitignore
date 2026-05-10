@@ -1,13 +1,13 @@
 # Environment
-.env
+/.env
 .venv/
 
 # Service config (user-specific, contains service selections)
-services.yaml
+/services.yaml
 
 # User and workspace config (contains user IDs and local paths)
-users.yaml
-workspaces.yaml
+/users.yaml
+/workspaces.yaml
 
 # Python
 __pycache__/
@@ -33,28 +33,6 @@ install.conf
 
 # Claude Code local config
 CLAUDE.md
-
-# Home workspace runtime data (Kai's state, not source code)
-# CLAUDE.md and IDENTITY.md are per-operator; bootstrapped from the
-# tracked .example by `make install`. See CLAUDE.md.example for content.
-home/*
-!home/.claude
-home/.claude/*
-!home/.claude/CLAUDE.md.example
-!home/.claude/MEMORY.md.example
-!home/.claude/PREFERENCES.md.example
-!home/config
-home/config/*
-!home/config/goose-config.yaml
-# Evaluation harness: committed examples show the schema; real
-# baselines and probe sets contain per-operator data (conversation
-# fragments, IDs specific to that store) and must stay gitignored.
-!home/evals
-home/evals/*
-!home/evals/retrieval-baseline.example.json
-!home/evals/probes.example.jsonl
-!home/evals/extraction-probes.example.jsonl
-!home/evals/episode-classification-probes.example.jsonl
 
 # OS / IDE
 .DS_Store

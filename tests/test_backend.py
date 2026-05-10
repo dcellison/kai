@@ -1000,9 +1000,9 @@ class TestEnsureUserMemory:
         """Creates memory/<chat_id>/MEMORY.md from the example template."""
         data_dir = tmp_path / "data"
         project_root = tmp_path / "project"
-        example_dir = project_root / "home" / ".claude"
-        example_dir.mkdir(parents=True)
-        (example_dir / "MEMORY.md.example").write_text("# Memory\n\n## About the User\n")
+        template_dir = project_root / "templates" / ".claude"
+        template_dir.mkdir(parents=True)
+        (template_dir / "MEMORY.md").write_text("# Memory\n\n## About the User\n")
 
         # ensure_user_memory reads PROJECT_ROOT module-level at call
         # time, so patching backend.PROJECT_ROOT is sufficient.
@@ -1018,8 +1018,8 @@ class TestEnsureUserMemory:
         """Falls back to minimal '# Memory\\n' when no example template exists."""
         data_dir = tmp_path / "data"
         project_root = tmp_path / "project"
-        # No example file under home/.claude/.
-        (project_root / "home" / ".claude").mkdir(parents=True)
+        # No template file under templates/.claude/.
+        (project_root / "templates" / ".claude").mkdir(parents=True)
 
         monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
 
@@ -1033,9 +1033,9 @@ class TestEnsureUserMemory:
         """Existing per-user MEMORY.md is preserved across repeated calls."""
         data_dir = tmp_path / "data"
         project_root = tmp_path / "project"
-        example_dir = project_root / "home" / ".claude"
-        example_dir.mkdir(parents=True)
-        (example_dir / "MEMORY.md.example").write_text("TEMPLATE")
+        template_dir = project_root / "templates" / ".claude"
+        template_dir.mkdir(parents=True)
+        (template_dir / "MEMORY.md").write_text("TEMPLATE")
 
         monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
 
@@ -1061,9 +1061,9 @@ class TestEnsureUserMemory:
         """
         data_dir = tmp_path / "data"
         project_root = tmp_path / "project"
-        example_dir = project_root / "home" / ".claude"
-        example_dir.mkdir(parents=True)
-        (example_dir / "MEMORY.md.example").write_text("# Memory\n\n## Dev\n")
+        template_dir = project_root / "templates" / ".claude"
+        template_dir.mkdir(parents=True)
+        (template_dir / "MEMORY.md").write_text("# Memory\n\n## Dev\n")
         monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
 
         ensure_user_memory(None, data_dir)
@@ -1083,9 +1083,9 @@ class TestEnsureUserMemory:
         """
         data_dir = tmp_path / "data"
         project_root = tmp_path / "project"
-        example_dir = project_root / "home" / ".claude"
-        example_dir.mkdir(parents=True)
-        (example_dir / "MEMORY.md.example").write_text("FRESH_TEMPLATE")
+        template_dir = project_root / "templates" / ".claude"
+        template_dir.mkdir(parents=True)
+        (template_dir / "MEMORY.md").write_text("FRESH_TEMPLATE")
         monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
 
         memory_dir = data_dir / "memory"
@@ -1105,7 +1105,7 @@ class TestEnsureUserMemory:
         data_dir = tmp_path / "data"
         project_root = tmp_path / "project"
         # No example template exists.
-        (project_root / "home" / ".claude").mkdir(parents=True)
+        (project_root / "templates" / ".claude").mkdir(parents=True)
         monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
 
         ensure_user_memory(None, data_dir)
@@ -1121,9 +1121,9 @@ class TestEnsureUserPreferences:
         """Creates preferences/<chat_id>/PREFERENCES.md from the example template."""
         data_dir = tmp_path / "data"
         project_root = tmp_path / "project"
-        example_dir = project_root / "home" / ".claude"
-        example_dir.mkdir(parents=True)
-        (example_dir / "PREFERENCES.md.example").write_text("# Preferences\n\n## Style\n")
+        template_dir = project_root / "templates" / ".claude"
+        template_dir.mkdir(parents=True)
+        (template_dir / "PREFERENCES.md").write_text("# Preferences\n\n## Style\n")
 
         monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
 
@@ -1137,8 +1137,8 @@ class TestEnsureUserPreferences:
         """Falls back to '# Preferences\\n' placeholder when no example template exists."""
         data_dir = tmp_path / "data"
         project_root = tmp_path / "project"
-        # Empty home/.claude/, no PREFERENCES.md.example.
-        (project_root / "home" / ".claude").mkdir(parents=True)
+        # Empty templates/.claude/, no PREFERENCES.md template.
+        (project_root / "templates" / ".claude").mkdir(parents=True)
         monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
 
         ensure_user_preferences(7, data_dir)
@@ -1151,9 +1151,9 @@ class TestEnsureUserPreferences:
         """Existing per-user PREFERENCES.md is preserved across repeated calls."""
         data_dir = tmp_path / "data"
         project_root = tmp_path / "project"
-        example_dir = project_root / "home" / ".claude"
-        example_dir.mkdir(parents=True)
-        (example_dir / "PREFERENCES.md.example").write_text("TEMPLATE")
+        template_dir = project_root / "templates" / ".claude"
+        template_dir.mkdir(parents=True)
+        (template_dir / "PREFERENCES.md").write_text("TEMPLATE")
         monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
 
         user_dir = data_dir / "preferences" / "100"
@@ -1175,9 +1175,9 @@ class TestEnsureUserPreferences:
         """
         data_dir = tmp_path / "data"
         project_root = tmp_path / "project"
-        example_dir = project_root / "home" / ".claude"
-        example_dir.mkdir(parents=True)
-        (example_dir / "PREFERENCES.md.example").write_text("TEMPLATE")
+        template_dir = project_root / "templates" / ".claude"
+        template_dir.mkdir(parents=True)
+        (template_dir / "PREFERENCES.md").write_text("TEMPLATE")
         monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
 
         ensure_user_preferences(None, data_dir)
@@ -1189,7 +1189,7 @@ class TestEnsureUserPreferences:
         """OSError raised inside the body is swallowed via log.warning, not propagated."""
         data_dir = tmp_path / "data"
         project_root = tmp_path / "project"
-        (project_root / "home" / ".claude").mkdir(parents=True)
+        (project_root / "templates" / ".claude").mkdir(parents=True)
         monkeypatch.setattr("kai.backend.PROJECT_ROOT", project_root)
 
         # Force mkdir to raise; the function must swallow rather than

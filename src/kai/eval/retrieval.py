@@ -39,8 +39,9 @@ Design rationale (the part that is not obvious from the code):
   module, so in-place mutation is safe.
 
 PII posture: probe questions and expected_fact_id values are operator
-data and remain in the gitignored probes file. The committed
-`*.example.*` fixtures use synthetic data only.
+data and remain in the gitignored probes file. The probe schema is
+documented inline in `load_probes` below; no example fixtures ship
+with the repo.
 """
 
 from __future__ import annotations
@@ -946,7 +947,7 @@ def _render_single_metrics(m: Metrics) -> str:
     Plain text, no color codes - the harness output is meant to be
     pasteable into a bug report or log without ANSI escapes. Per-tag
     breakdown is included when present; if no probes carry tags
-    (synthetic example fixture, e.g.) the section is omitted.
+    (synthetic test fixture, e.g.) the section is omitted.
     """
     lines = [
         f"Probes: {m.n_probes} total, {m.n_scored} scored, {m.n_drift} drifted",
@@ -1044,10 +1045,10 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "Write results to a JSON file. Without --sweep: a single-config "
-            "baseline matching retrieval-baseline.example.json. With --sweep: "
-            "a sweep envelope (version, generated_at, probe_set_hash, "
+            "baseline matching the schema documented in `load_probes`. With "
+            "--sweep: a sweep envelope (version, generated_at, probe_set_hash, "
             "probe_count, drift_count, sweep[]) with one row per grid point; "
-            "this shape does NOT match the baseline example schema."
+            "this shape does NOT match the documented baseline schema."
         ),
     )
     # Sweep grid override flags. Each takes one or more values; if not
@@ -1149,7 +1150,7 @@ def _build_baseline_json(
 ) -> dict[str, Any]:
     """Construct the baseline JSON envelope around a Metrics object.
 
-    Matches the schema in the committed `*.example.json` fixture.
+    Matches the documented schema in `load_probes` (this module).
     `probe_set_hash` makes a baseline file meaningful only against its
     specific probe set; comparing baselines across probe sets would
     silently produce noise that looks like quality drift.

@@ -1533,7 +1533,7 @@ def _memory_disabled_response() -> web.Response:
 
     Centralized so all four memory handlers return the identical body and
     status. The 503 contract (vs the 500 used for `add_structured` failure
-    in /api/memory/add) is documented in IDENTITY.md: 503 means the
+    in /api/memory/add) is documented in CLAUDE.md: 503 means the
     operator must enable memory, so callers should NOT retry; 500 means
     the underlying store call failed and may be transient.
     """
@@ -1817,7 +1817,7 @@ async def _handle_memory_stats(request: web.Request) -> web.Response:
     try:
         stats = memory.get_stats(user_id=user_id)
         # asdict() preserves None for the optional confidence_* fields,
-        # which become JSON null on the wire. The IDENTITY.md
+        # which become JSON null on the wire. The CLAUDE.md
         # "Memory System" section documents this so inner Claude does
         # not misread null as a store failure.
         return web.json_response(asdict(stats))

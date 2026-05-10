@@ -1500,7 +1500,7 @@ class TestMemoryEpisode:
 
     def test_model_inherits_extraction_model_when_unset(self, monkeypatch):
         """Operator changes MEMORY_EXTRACTION_MODEL only - episode
-        follows. Documented in the .env.example comment."""
+        follows. Documented in the templates/.env comment."""
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_EXTRACTION_MODEL", "claude-haiku-4-5-future")
         config = load_config()

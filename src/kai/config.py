@@ -302,7 +302,7 @@ class Config:
     """
     Immutable application configuration populated from environment variables.
 
-    All fields map to environment variables defined in .env (see .env.example for
+    All fields map to environment variables defined in .env (see templates/.env for
     reference). Required fields raise SystemExit with descriptive messages if missing.
     Optional fields have sensible defaults for single-user local deployment.
 
