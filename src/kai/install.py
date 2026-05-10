@@ -2843,10 +2843,14 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         identity_dst_pre = install_path / "home" / "IDENTITY.md"
         identity_pre_exists = identity_dst_pre.is_file() and not identity_dst_pre.is_symlink()
         claude_pre_is_regular = claude_md_dst.is_file() and not claude_md_dst.is_symlink()
-        # Post-migration CLAUDE.md presence: rows 1-3 have the IDENTITY
-        # content land at CLAUDE.md (when CLAUDE.md is not already a
-        # regular file); rows 3 and 5 preserve the existing regular file.
-        post_migration_claude_md_exists = claude_pre_is_regular or (identity_pre_exists and not claude_pre_is_regular)
+        # Post-migration CLAUDE.md presence: True for rows 1, 2, 3, 5;
+        # False for rows 4 and 6. Rows 1-2 have IDENTITY.md content
+        # land at CLAUDE.md (atomic rename); rows 3 and 5 preserve an
+        # existing regular CLAUDE.md. The expression below collapses
+        # to that: pre-state CLAUDE.md regular survives directly, and
+        # otherwise the migration carries IDENTITY.md over to CLAUDE.md
+        # whenever IDENTITY.md is present.
+        post_migration_claude_md_exists = claude_pre_is_regular or identity_pre_exists
         if claude_md_src.is_file() and not post_migration_claude_md_exists:
             print(f"[DRY RUN] Would seed {claude_md_src} -> {claude_md_dst}")
         return
