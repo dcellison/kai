@@ -4706,3 +4706,252 @@ class TestApplyGooseConfig:
 
         output = capsys.readouterr().out
         assert "WARNING" not in output
+
+
+# ── _apply_migrate per-os-user tmp dir (issue #454) ────────────────────
+
+
+class TestApplyMigratePerOsUserTmpdir:
+    """
+    _apply_migrate creates <DATA_DIR>/tmp/<os_user>/ for every distinct
+    os_user in users.yaml. The runtime (claude.py _ensure_started)
+    points the inner Claude subprocess's TMPDIR at that path so each
+    os_user has its own temp namespace; the shared /tmp default
+    otherwise causes content-hash collisions on the claude-settings
+    cache file between two os_users with the same --settings JSON.
+    See issue #454.
+    """
+
+    def _write_users_yaml(self, path: Path, entries: list[dict]) -> None:
+        path.write_text(yaml.safe_dump({"users": entries}))
+
+    def _stub_pwd_getpwnam(self):
+        # Map any os_user to fixed uid/gid. Real OS-account lookups
+        # would fail on the test host for names like "alice".
+        # chown calls are stubbed separately so the values are
+        # placeholders.
+        class _Pw:
+            pw_uid = 1234
+            pw_gid = 1234
+
+        return _Pw()
+
+    def _setup_templates(self, src: Path) -> None:
+        """Seed the templates the rest of _apply_migrate consumes."""
+        ws_claude = src / "templates" / ".claude"
+        ws_claude.mkdir(parents=True)
+        (ws_claude / "CLAUDE.md").write_text("# Kai\n")
+        (ws_claude / "MEMORY.md").write_text("# Memory\n")
+        (ws_claude / "PREFERENCES.md").write_text("# Preferences\n")
+
+    def test_creates_per_os_user_dir(self, tmp_path):
+        """Each distinct os_user gets a <DATA_DIR>/tmp/<os_user>/ directory."""
+        src = tmp_path / "source"
+        self._setup_templates(src)
+        users_yaml = tmp_path / "users.yaml"
+        self._write_users_yaml(
+            users_yaml,
+            [
+                {"telegram_id": 100, "os_user": "alice"},
+                {"telegram_id": 200, "os_user": "bob"},
+            ],
+        )
+        data_path = tmp_path / "data"
+        install_path = tmp_path / "install"
+        install_path.mkdir()
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _apply_migrate(
+                data_path,
+                install_path,
+                svc_uid=0,
+                svc_gid=0,
+                dry_run=False,
+                users_yaml_path=Path(users_yaml),
+            )
+
+        assert (data_path / "tmp" / "alice").is_dir()
+        assert (data_path / "tmp" / "bob").is_dir()
+
+    def test_per_os_user_dir_mode_is_0o700(self, tmp_path):
+        """
+        Per-os-user tmp dir must end up at exactly 0o700. The cache
+        files inside hold the target user's claude.ai session state;
+        no other identity should read them. Forced via explicit chmod
+        because mkdir(mode=) is masked by the process umask.
+        """
+        src = tmp_path / "source"
+        self._setup_templates(src)
+        users_yaml = tmp_path / "users.yaml"
+        self._write_users_yaml(users_yaml, [{"telegram_id": 100, "os_user": "alice"}])
+        data_path = tmp_path / "data"
+        install_path = tmp_path / "install"
+        install_path.mkdir()
+
+        # Hostile umask: without the explicit chmod, mkdir(0o700)
+        # would land at 0o700 anyway (masking turns bits off, not
+        # on), but a future regression that changes the mode= arg
+        # could re-introduce a leak; the explicit chmod is the only
+        # contract we rely on.
+        import stat
+
+        prev_umask = os.umask(0o077)
+        try:
+            with (
+                patch("kai.install.PROJECT_ROOT", src),
+                patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
+                patch("kai.install._set_ownership"),
+                patch("os.chown"),
+            ):
+                _apply_migrate(
+                    data_path,
+                    install_path,
+                    svc_uid=0,
+                    svc_gid=0,
+                    dry_run=False,
+                    users_yaml_path=Path(users_yaml),
+                )
+        finally:
+            os.umask(prev_umask)
+
+        user_tmp = data_path / "tmp" / "alice"
+        assert stat.S_IMODE(user_tmp.stat().st_mode) == 0o700
+
+    def test_no_dir_when_no_os_user(self, tmp_path):
+        """A users.yaml without any os_user entries creates no tmp dirs."""
+        src = tmp_path / "source"
+        self._setup_templates(src)
+        users_yaml = tmp_path / "users.yaml"
+        # No os_user fields - same-as-service-user mode for all users.
+        self._write_users_yaml(users_yaml, [{"telegram_id": 100}])
+        data_path = tmp_path / "data"
+        install_path = tmp_path / "install"
+        install_path.mkdir()
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _apply_migrate(
+                data_path,
+                install_path,
+                svc_uid=0,
+                svc_gid=0,
+                dry_run=False,
+                users_yaml_path=Path(users_yaml),
+            )
+
+        assert not (data_path / "tmp").exists()
+
+    def test_duplicate_os_users_create_one_dir_each(self, tmp_path):
+        """Multiple chats with the same os_user collapse to one tmp dir."""
+        src = tmp_path / "source"
+        self._setup_templates(src)
+        users_yaml = tmp_path / "users.yaml"
+        self._write_users_yaml(
+            users_yaml,
+            [
+                {"telegram_id": 100, "os_user": "alice"},
+                {"telegram_id": 200, "os_user": "alice"},
+                {"telegram_id": 300, "os_user": "bob"},
+            ],
+        )
+        data_path = tmp_path / "data"
+        install_path = tmp_path / "install"
+        install_path.mkdir()
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _apply_migrate(
+                data_path,
+                install_path,
+                svc_uid=0,
+                svc_gid=0,
+                dry_run=False,
+                users_yaml_path=Path(users_yaml),
+            )
+
+        # Exactly the two distinct os_users, nothing else.
+        assert sorted(p.name for p in (data_path / "tmp").iterdir()) == ["alice", "bob"]
+
+    def test_idempotent_reinstall(self, tmp_path, capsys):
+        """Second install does not re-print 'Created' for existing dirs."""
+        src = tmp_path / "source"
+        self._setup_templates(src)
+        users_yaml = tmp_path / "users.yaml"
+        self._write_users_yaml(users_yaml, [{"telegram_id": 100, "os_user": "alice"}])
+        data_path = tmp_path / "data"
+        install_path = tmp_path / "install"
+        install_path.mkdir()
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _apply_migrate(
+                data_path,
+                install_path,
+                svc_uid=0,
+                svc_gid=0,
+                dry_run=False,
+                users_yaml_path=Path(users_yaml),
+            )
+            first_output = capsys.readouterr().out
+            assert "Created" in first_output and "tmp/alice" in first_output
+
+            _apply_migrate(
+                data_path,
+                install_path,
+                svc_uid=0,
+                svc_gid=0,
+                dry_run=False,
+                users_yaml_path=Path(users_yaml),
+            )
+            second_output = capsys.readouterr().out
+
+        # Second pass touches ownership/mode but does not print
+        # "Created tmp/alice" again - the dir already exists.
+        assert "tmp/alice" not in second_output
+
+    def test_dry_run_prints_without_creating(self, tmp_path, capsys):
+        """Dry run lists what would be created and does not touch disk."""
+        src = tmp_path / "source"
+        self._setup_templates(src)
+        users_yaml = tmp_path / "users.yaml"
+        self._write_users_yaml(users_yaml, [{"telegram_id": 100, "os_user": "alice"}])
+        data_path = tmp_path / "data"
+        install_path = tmp_path / "install"
+        install_path.mkdir()
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _apply_migrate(
+                data_path,
+                install_path,
+                svc_uid=0,
+                svc_gid=0,
+                dry_run=True,
+                users_yaml_path=Path(users_yaml),
+            )
+
+        output = capsys.readouterr().out
+        assert "[DRY RUN]" in output
+        assert "tmp/alice" in output
+        # Dry run must not have created anything.
+        assert not (data_path / "tmp").exists()

@@ -2476,6 +2476,58 @@ def _apply_migrate(
         else:
             _set_ownership(claude_dir, svc_uid, svc_gid, recursive=True)
 
+    # -- Per-os-user temp directories (#454) --
+    # The inner Claude binary writes a content-hashed settings cache
+    # at $TMPDIR/claude-settings-<hex>.json. Two distinct os_users
+    # whose --settings JSON hashes to the same hex collide on the
+    # default /tmp path; the first writer owns the file at mode
+    # 0o644 and the second claude exits with EACCES on the
+    # write-open. claude.py anchors TMPDIR per-os_user under
+    # <DATA_DIR>/tmp/<os_user>/ so each identity has its own temp
+    # namespace. Create those dirs here, mode 0o700 chowned to the
+    # target os_user (only their owner needs to read them; they
+    # hold cache state for that user's claude.ai session). Parent
+    # tmp/ is service-owned mode 0o755 so the per-user subdirs
+    # are traversable for the sudo -u <os_user> subprocess.
+    #
+    # Distinct os_users are derived from memory_owners (same source
+    # as the memory/preferences/home blocks above). per_user_ids
+    # was built and pwd-validated at the top of this function; we
+    # re-look up here keyed by os_user name to dedupe because
+    # per_user_ids is keyed by str(chat_id), not os_user.
+    tmp_root = data_path / "tmp"
+    distinct_os_users: dict[str, tuple[int, int]] = {}
+    for _chat_id, os_user_name in memory_owners:
+        if os_user_name is None or os_user_name in distinct_os_users:
+            continue
+        # Already validated above in the per_user_ids build loop;
+        # this lookup cannot raise KeyError.
+        pwd_entry = pwd.getpwnam(os_user_name)
+        distinct_os_users[os_user_name] = (pwd_entry.pw_uid, pwd_entry.pw_gid)
+
+    if dry_run:
+        if distinct_os_users:
+            print(f"[DRY RUN] Would create {tmp_root} (mode 0o755, {svc_uid}:{svc_gid})")
+            for name, (uid, gid) in distinct_os_users.items():
+                print(f"[DRY RUN]   {tmp_root / name} (mode 0o700, {uid}:{gid})")
+    elif distinct_os_users:
+        # Parent dir: service-owned, 0o755 so sudo -u <target>
+        # subprocesses can traverse into their own subdir.
+        tmp_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        os.chmod(tmp_root, 0o755)
+        _set_ownership(tmp_root, svc_uid, svc_gid, recursive=False)
+        for name, (uid, gid) in distinct_os_users.items():
+            user_tmp = tmp_root / name
+            new_dir = not user_tmp.exists()
+            user_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # mkdir mode is masked by umask; force the explicit bits
+            # to correct drift across reinstalls and override any
+            # weaker bits a previously-run install left behind.
+            os.chmod(user_tmp, 0o700)
+            _set_ownership(user_tmp, uid, gid, recursive=False)
+            if new_dir:
+                print(f"  Created {user_tmp}")
+
 
 def _cmd_apply() -> None:
     """

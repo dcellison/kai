@@ -156,7 +156,7 @@ class TestCommandConstruction:
             assert cmd[1] == "-H"
             assert cmd[2] == "-u"
             assert cmd[3] == "daniel"
-            assert cmd[4] == "--preserve-env=KAI_WEBHOOK_SECRET"
+            assert cmd[4] == "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR"
             assert cmd[5] == "--"
             assert cmd[6] == "claude"
 
@@ -231,7 +231,7 @@ class TestCommandConstruction:
             assert cmd[1] == "-H"
             assert cmd[2] == "-u"
             assert cmd[3] == "some_other_user"
-            assert cmd[4] == "--preserve-env=KAI_WEBHOOK_SECRET"
+            assert cmd[4] == "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR"
             assert cmd[5] == "--"
             assert args[1].get("start_new_session") is True
 
@@ -279,7 +279,7 @@ class TestCommandConstruction:
             await claude._ensure_started()
 
             cmd = mock_exec.call_args[0]
-            assert "--preserve-env=KAI_WEBHOOK_SECRET" in cmd
+            assert "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR" in cmd
             # Secret is also in the env dict (unchanged behavior).
             env = mock_exec.call_args[1]["env"]
             assert env["KAI_WEBHOOK_SECRET"] == "s3cret"
@@ -299,7 +299,63 @@ class TestCommandConstruction:
 
             cmd = mock_exec.call_args[0]
             assert "sudo" not in cmd
-            assert "--preserve-env=KAI_WEBHOOK_SECRET" not in cmd
+            assert not any(str(arg).startswith("--preserve-env=") for arg in cmd)
+
+    @pytest.mark.asyncio
+    async def test_tmpdir_anchored_per_os_user_in_cross_user_mode(self, monkeypatch):
+        """
+        Regression for issue #454: when claude_user is set, the subprocess
+        env must include TMPDIR=<DATA_DIR>/tmp/<os_user>/ so the inner
+        claude binary writes its content-hashed --settings cache
+        (`claude-settings-<hex>.json`) into a per-os-user namespace
+        rather than the shared system /tmp. Without TMPDIR, two distinct
+        os_users with the same --settings JSON collide on the same /tmp
+        file path and the second spawn fails with EACCES on write.
+        """
+        from kai.config import DATA_DIR as runtime_data_dir
+
+        claude = _make_claude(claude_user="some_other_user")
+        mock_pw = MagicMock(pw_name="kai")
+        with (
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("kai.config.pwd.getpwuid", return_value=mock_pw),
+        ):
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            cmd = mock_exec.call_args[0]
+            env = mock_exec.call_args[1]["env"]
+            assert env["TMPDIR"] == str(runtime_data_dir / "tmp" / "some_other_user")
+            assert "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR" in cmd
+
+    @pytest.mark.asyncio
+    async def test_tmpdir_not_injected_in_single_user_mode(self, monkeypatch):
+        """
+        Single-user mode (no claude_user, or claude_user == service user)
+        runs claude directly without sudo and therefore without a cross-
+        os-user temp collision risk. The bot must NOT inject TMPDIR in
+        that case so the inner claude inherits the system default.
+        """
+        # Ensure the parent env has no TMPDIR so any value showing up
+        # in the subprocess env can only have come from our code path.
+        monkeypatch.delenv("TMPDIR", raising=False)
+
+        claude = _make_claude()  # no claude_user → no sudo wrapper
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            env = mock_exec.call_args[1]["env"]
+            assert "TMPDIR" not in env
 
     @pytest.mark.asyncio
     async def test_max_context_window_in_cmd(self):
