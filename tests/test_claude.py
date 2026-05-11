@@ -25,7 +25,7 @@ import pytest
 
 from kai.backend import StreamEvent
 from kai.claude import ClaudeCodeBackend
-from kai.config import WorkspaceConfig
+from kai.config import DATA_DIR, WorkspaceConfig
 
 # ── Shared helpers ───────────────────────────────────────────────────
 
@@ -312,8 +312,6 @@ class TestCommandConstruction:
         os_users with the same --settings JSON collide on the same /tmp
         file path and the second spawn fails with EACCES on write.
         """
-        from kai.config import DATA_DIR as runtime_data_dir
-
         claude = _make_claude(claude_user="some_other_user")
         mock_pw = MagicMock(pw_name="kai")
         with (
@@ -329,7 +327,7 @@ class TestCommandConstruction:
 
             cmd = mock_exec.call_args[0]
             env = mock_exec.call_args[1]["env"]
-            assert env["TMPDIR"] == str(runtime_data_dir / "tmp" / "some_other_user")
+            assert env["TMPDIR"] == str(DATA_DIR / "tmp" / "some_other_user")
             assert "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR" in cmd
 
     @pytest.mark.asyncio

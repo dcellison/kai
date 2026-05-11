@@ -4783,8 +4783,18 @@ class TestApplyMigratePerOsUserTmpdir:
         """
         Per-os-user tmp dir must end up at exactly 0o700. The cache
         files inside hold the target user's claude.ai session state;
-        no other identity should read them. Forced via explicit chmod
-        because mkdir(mode=) is masked by the process umask.
+        no other identity should read them.
+
+        Two assertions, paired deliberately. The end-state check is
+        the user-facing contract (mode is 0o700 after install). The
+        chmod-call check is the regression guard: it pins that the
+        production code makes an EXPLICIT chmod with the target
+        mode, so a future change to the `mode=` arg of mkdir (or
+        the removal of the chmod under the assumption that mkdir's
+        own arg is sufficient) is caught. Without the explicit
+        chmod, a hardened service umask that masks any bit in
+        0o700 would silently drop those bits and break dir
+        traversal for the inner subprocess.
         """
         src = tmp_path / "source"
         self._setup_templates(src)
@@ -4794,32 +4804,43 @@ class TestApplyMigratePerOsUserTmpdir:
         install_path = tmp_path / "install"
         install_path.mkdir()
 
-        # Hostile umask: without the explicit chmod, mkdir(0o700)
-        # would land at 0o700 anyway (masking turns bits off, not
-        # on), but a future regression that changes the mode= arg
-        # could re-introduce a leak; the explicit chmod is the only
-        # contract we rely on.
-        prev_umask = os.umask(0o077)
-        try:
-            with (
-                patch("kai.install.PROJECT_ROOT", src),
-                patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
-                patch("kai.install._set_ownership"),
-                patch("os.chown"),
-            ):
-                _apply_migrate(
-                    data_path,
-                    install_path,
-                    svc_uid=0,
-                    svc_gid=0,
-                    dry_run=False,
-                    users_yaml_path=Path(users_yaml),
-                )
-        finally:
-            os.umask(prev_umask)
+        # Spy on os.chmod calls inside install.py so we can assert
+        # the per-user tmp dir gets an explicit chmod(0o700) (the
+        # load-bearing call) without having to perturb the process
+        # umask and break the unrelated mkdir paths in
+        # _apply_migrate.
+        chmod_calls: list[tuple[str, int]] = []
+        real_chmod = os.chmod
+
+        def spy_chmod(path, mode, *args, **kwargs):
+            chmod_calls.append((str(path), mode))
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+            patch("kai.install.os.chmod", side_effect=spy_chmod),
+        ):
+            _apply_migrate(
+                data_path,
+                install_path,
+                svc_uid=0,
+                svc_gid=0,
+                dry_run=False,
+                users_yaml_path=Path(users_yaml),
+            )
 
         user_tmp = data_path / "tmp" / "alice"
+        # End-state contract: dir ends up at exactly 0o700.
         assert stat.S_IMODE(user_tmp.stat().st_mode) == 0o700
+        # Regression guard: production code makes an explicit
+        # chmod(user_tmp, 0o700). Pinning the (path, mode) pair
+        # means a future refactor cannot satisfy the end-state
+        # assertion by accident (e.g. by changing only the
+        # mkdir mode= and dropping the chmod).
+        assert (str(user_tmp), 0o700) in chmod_calls
 
     def test_no_dir_when_no_os_user(self, tmp_path):
         """A users.yaml without any os_user entries creates no tmp dirs."""
