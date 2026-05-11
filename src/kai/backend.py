@@ -642,10 +642,15 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
             # Without this, a service running under umask 0o027 lands
             # the .claude/ subdir at 0o750, which blocks group-traverse
             # for distinct-os_user subprocesses (sudo -H -u <os_user>)
-            # and silently breaks identity reads. ensure_user_memory and
-            # ensure_user_preferences have the same pre-existing gap on
-            # their seeded subdirs; addressing those is out of scope for
-            # this PR but worth a follow-up.
+            # and silently breaks identity reads. ensure_user_memory
+            # and ensure_user_preferences create their per-user parent
+            # dirs without an explicit chmod and so have the same
+            # pre-existing umask gap on `data_dir/memory/<chat_id>/`
+            # and `data_dir/preferences/<chat_id>/`. ensure_user_home
+            # already chmods its own per-user parent at line 617; the
+            # call here closes the matching gap on the .claude/ subdir
+            # it creates. Closing the sibling-function gaps is out of
+            # scope for this PR but worth a follow-up.
             os.chmod(claude_dir, 0o755)
             template = PROJECT_ROOT / "templates" / ".claude" / "CLAUDE.md"
             if template.is_file():

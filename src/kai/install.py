@@ -2437,13 +2437,15 @@ def _apply_migrate(
         #
         # The chown runs UNCONDITIONALLY on every install, even when
         # the seed step skipped because CLAUDE.md already existed.
-        # This matches the established MEMORY.md / PREFERENCES.md
-        # ownership-pass pattern at the bottom of those seed blocks:
-        # the seed half is idempotent (never overwrites operator
-        # content), but the ownership half corrects drift when an
-        # operator changes os_user in users.yaml between installs.
-        # Without the unconditional reset, a chat_id whose os_user
-        # changed would keep its old ownership and the new subprocess
+        # Functionally mirrors the MEMORY.md / PREFERENCES.md
+        # ownership reconciliation: idempotent per-install reset
+        # corrects os_user drift. (Structurally those blocks use a
+        # separate iterdir-based pass over the whole tree; this block
+        # inlines the chown into the per-user seed loop because the
+        # tree we care about is one .claude/ subdir per chat_id,
+        # which iterdir would walk anyway.) Without the unconditional
+        # reset, a chat_id whose os_user changed in users.yaml between
+        # installs would keep its old ownership and the new subprocess
         # could not write the identity file.
         if str(chat_id) in per_user_ids:
             uid, gid = per_user_ids[str(chat_id)]
