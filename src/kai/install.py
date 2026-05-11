@@ -2427,6 +2427,17 @@ def _apply_migrate(
         # the inner subprocess (sudo -H -u <os_user>) could read but
         # not write CLAUDE.md - the same #347 regression the per-user
         # memory pattern fixed.
+        #
+        # The chown runs UNCONDITIONALLY on every install, even when
+        # the seed step skipped because CLAUDE.md already existed.
+        # This matches the established MEMORY.md / PREFERENCES.md
+        # ownership-pass pattern at the bottom of those seed blocks:
+        # the seed half is idempotent (never overwrites operator
+        # content), but the ownership half corrects drift when an
+        # operator changes os_user in users.yaml between installs.
+        # Without the unconditional reset, a chat_id whose os_user
+        # changed would keep its old ownership and the new subprocess
+        # could not write the identity file.
         if str(chat_id) in per_user_ids:
             uid, gid = per_user_ids[str(chat_id)]
             _set_ownership(claude_dir, uid, gid, recursive=True)
@@ -2886,8 +2897,16 @@ def _retire_install_home_claude(install_path: Path, dry_run: bool) -> None:
             # call safe, and surfacing a real OSError (permissions,
             # mounted FS, etc.) is preferred to silent failure. The
             # past-tense "Removed dead" summary is correct because it
-            # fires only after rmtree returns successfully.
-            shutil.rmtree(claude_dir)
+            # fires only after rmtree returns successfully. Catch the
+            # OSError just long enough to print a clear operator-readable
+            # error line so the traceback is not the first signal, then
+            # re-raise to abort the install (a partial cleanup that
+            # leaves stale content visible is worse than aborting).
+            try:
+                shutil.rmtree(claude_dir)
+            except OSError as exc:
+                print(f"  ERROR: could not remove {claude_dir}: {exc}")
+                raise
             print(f"  Removed dead {claude_dir}; nothing reads this path post-#447")
 
     # The IDENTITY.md path is retired wholesale by #447. Whatever is

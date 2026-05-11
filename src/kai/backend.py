@@ -637,6 +637,16 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
         claude_dst = claude_dir / "CLAUDE.md"
         if not claude_dst.exists():
             claude_dir.mkdir(parents=True, exist_ok=True)
+            # mkdir's mode= is masked by umask; force the bits to 0o755
+            # explicitly the same way the parent `path` does above.
+            # Without this, a service running under umask 0o027 lands
+            # the .claude/ subdir at 0o750, which blocks group-traverse
+            # for distinct-os_user subprocesses (sudo -H -u <os_user>)
+            # and silently breaks identity reads. ensure_user_memory and
+            # ensure_user_preferences have the same pre-existing gap on
+            # their seeded subdirs; addressing those is out of scope for
+            # this PR but worth a follow-up.
+            os.chmod(claude_dir, 0o755)
             template = PROJECT_ROOT / "templates" / ".claude" / "CLAUDE.md"
             if template.is_file():
                 shutil.copy2(template, claude_dst)
