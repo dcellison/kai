@@ -2408,6 +2408,13 @@ def _apply_migrate(
         # `not exists()` is the same guard ensure_user_memory and
         # ensure_user_preferences use; matches the seed-step contract.
         claude_dir.mkdir(parents=True, exist_ok=True)
+        # mkdir's mode= is masked by umask; force 0o755 explicitly so a
+        # service running under umask 0o027 does not land the subdir at
+        # 0o750 (which would block group-traverse for distinct-os_user
+        # subprocesses). Mirrors the chmod in
+        # `backend.ensure_user_home`'s lazy seed branch and the
+        # parent-dir chmod in the home-creation loop above.
+        os.chmod(claude_dir, 0o755)
         if not claude_dst.exists():
             if home_template.is_file():
                 shutil.copy2(home_template, claude_dst)
@@ -2866,11 +2873,18 @@ def _retire_install_home_claude(install_path: Path, dry_run: bool) -> None:
 
     if claude_dir.is_dir():
         # Enumerate before deleting so the log captures every retired
-        # path plus its byte size. rglob walks symlinks-as-files (does
-        # not descend); a row-1 pre-state with CLAUDE.md as a symlink
-        # therefore reports correctly rather than tracebacking on a
-        # stat call into a possibly broken target. lstat is used
-        # instead of stat for the same reason.
+        # path plus its byte size. The lstat() (not stat()) below avoids
+        # tracebacking on a broken file-symlink target - the row-1
+        # pre-state has CLAUDE.md as a symlink that may point at a
+        # removed IDENTITY.md. The contents of <install>/home/.claude/
+        # in any pre-state we expect (regular files, file symlinks,
+        # `skills/` and `history/` subdirs) do not include directory
+        # symlinks, so rglob's directory-symlink-following behavior
+        # (which varies across Python versions) does not affect this
+        # helper in practice; if a future operator drops a directory
+        # symlink under .claude/ they will see its target's files in
+        # the log but `shutil.rmtree` removes the symlink itself
+        # without descending, so the target is left intact.
         #
         # Verb tense: the live log uses "Removing" because the lines
         # are printed BEFORE shutil.rmtree runs (the enumeration needs
