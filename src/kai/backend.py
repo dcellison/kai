@@ -623,17 +623,18 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
     # the intended bits explicitly - this is the same pattern install.py
     # `_apply_migrate` uses after its mkdir calls.
     #
-    # Swallow OSError because in a multi-user install the directory has
-    # already been chowned to the user's os_user (different from the
-    # service user) by install.py `_apply_migrate`, and macOS chmod(2)
-    # returns EPERM for any non-owner non-root caller even when the
-    # target mode equals the current mode. The umask defense only
-    # matters when *this* call creates the directory; a pre-existing
-    # dir is the install's responsibility to set perms on, and the
-    # sibling bootstraps below already use the same swallow pattern.
+    # Swallow PermissionError because in a multi-user install the
+    # directory has already been chowned to the user's os_user
+    # (different from the service user) by install.py `_apply_migrate`,
+    # and macOS chmod(2) returns EPERM for any non-owner non-root caller
+    # even when the target mode equals the current mode. The umask
+    # defense only matters when *this* call creates the directory; a
+    # pre-existing dir is the install's responsibility to set perms on.
+    # Narrow to PermissionError rather than bare OSError so unrelated
+    # failure modes (ENOENT, ENOTDIR, EIO) still propagate.
     try:
         os.chmod(path, 0o755)
-    except OSError:
+    except PermissionError:
         pass
 
     # Lazy bootstrap of `<home>/.claude/CLAUDE.md`. Parallel to

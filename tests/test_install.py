@@ -4582,6 +4582,49 @@ class TestApplySudoersDryRun:
         assert "DRY RUN" in output
         assert "sudoers" in output.lower() or "visudo" in output.lower()
 
+    def test_warns_when_claude_bin_missing(self, tmp_path, capsys, monkeypatch):
+        """Warning printed when the rule's claude binary path doesn't exist."""
+        svc_home = tmp_path / "home" / "kai"
+        svc_home.mkdir(parents=True)
+        # Intentionally do NOT create svc_home/.local/bin/claude.
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
+
+        _apply_sudoers("kai", dry_run=True, users_yaml_path=users_yaml)
+
+        captured = capsys.readouterr()
+        assert "Warning" in captured.err
+        assert str(svc_home / ".local" / "bin" / "claude") in captured.err
+
+    def test_no_warning_when_no_target_users(self, tmp_path, capsys, monkeypatch):
+        """No warning when there are no per-user rules to emit."""
+        svc_home = tmp_path / "home" / "kai"
+        svc_home.mkdir(parents=True)
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users: []\n")
+
+        _apply_sudoers("kai", dry_run=True, users_yaml_path=users_yaml)
+
+        captured = capsys.readouterr()
+        assert "Warning" not in captured.err
+
+    def test_no_warning_when_claude_bin_exists(self, tmp_path, capsys, monkeypatch):
+        """Path exists -> silent."""
+        svc_home = tmp_path / "home" / "kai"
+        bin_dir = svc_home / ".local" / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "claude").write_text("#!/bin/sh\n")
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
+
+        _apply_sudoers("kai", dry_run=True, users_yaml_path=users_yaml)
+
+        captured = capsys.readouterr()
+        assert "Warning" not in captured.err
+
 
 # ── _apply_service dry run ───────────────────────────────────────────
 
