@@ -1635,3 +1635,187 @@ class TestMemorySearchFloor:
         monkeypatch.setenv("MEMORY_SEARCH_FLOOR", "high")
         with pytest.raises(SystemExit, match="must be a number"):
             load_config()
+
+
+# ── Per-user allowed_workspaces (issue #460) ─────────────────────────
+
+
+class TestPerUserAllowedWorkspacesYaml:
+    """
+    Parse `allowed_workspaces:` from per-user users.yaml entries.
+
+    Pre-#460 the field was silently dropped by the loader (no
+    UserConfig field, no parser branch). These tests pin the
+    happy path, edge cases (missing field, empty list, non-list,
+    nonexistent path, duplicates), and the field's downstream
+    visibility on the resulting UserConfig.
+    """
+
+    def _load_with_yaml(self, monkeypatch, users_data):
+        """
+        Drive _load_user_configs against an in-memory yaml dict.
+        Patches _read_protected_yaml so the loader does not hit
+        /etc/kai or PROJECT_ROOT during the test.
+        """
+        from kai.config import _load_user_configs
+
+        monkeypatch.setattr("kai.config._read_protected_yaml", lambda _name: users_data)
+        return _load_user_configs(global_backend="claude", global_llm_provider="anthropic")
+
+    def test_missing_field_yields_empty_list(self, monkeypatch):
+        """
+        Default: a users.yaml entry without an `allowed_workspaces:`
+        key produces an empty list on the resulting UserConfig.
+        Mirrors the github_repos default behavior.
+        """
+        users_data = {
+            "users": [
+                {"telegram_id": 123, "name": "alice"},
+            ],
+        }
+        configs = self._load_with_yaml(monkeypatch, users_data)
+        assert configs is not None
+        assert configs[123].allowed_workspaces == []
+
+    def test_parses_well_formed_list(self, monkeypatch, tmp_path):
+        """
+        A list of absolute path strings parses into a list of
+        resolved Path objects. The directories must exist on the
+        host (we tmp_path-create them) since the loader drops
+        nonexistent entries.
+        """
+        a = tmp_path / "alpha"
+        a.mkdir()
+        b = tmp_path / "beta"
+        b.mkdir()
+        users_data = {
+            "users": [
+                {
+                    "telegram_id": 123,
+                    "name": "alice",
+                    "allowed_workspaces": [str(a), str(b)],
+                },
+            ],
+        }
+        configs = self._load_with_yaml(monkeypatch, users_data)
+        assert configs is not None
+        assert configs[123].allowed_workspaces == [a.resolve(), b.resolve()]
+
+    def test_drops_nonexistent_paths_with_warning(self, monkeypatch, tmp_path, caplog):
+        """
+        A path that does not exist on the host is dropped from the
+        list with a WARNING log line. Matches the workspace_base /
+        home_workspace precedent: the loader does not fail the
+        whole user entry on a single missing directory (could be
+        on an unmounted drive or about to be created).
+        """
+        real_path = tmp_path / "alpha"
+        real_path.mkdir()
+        users_data = {
+            "users": [
+                {
+                    "telegram_id": 123,
+                    "name": "alice",
+                    "allowed_workspaces": [str(real_path), str(tmp_path / "does-not-exist")],
+                },
+            ],
+        }
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            configs = self._load_with_yaml(monkeypatch, users_data)
+
+        assert configs is not None
+        # Only the real path survives.
+        assert configs[123].allowed_workspaces == [real_path.resolve()]
+        assert "allowed_workspaces entry for alice not found" in caplog.text
+
+    def test_non_list_field_yields_empty_with_warning(self, monkeypatch, caplog):
+        """
+        If `allowed_workspaces:` is set to something other than a
+        list (e.g., a string), the loader emits a WARNING and the
+        field falls back to empty. Same pattern as github_repos.
+        """
+        users_data = {
+            "users": [
+                {
+                    "telegram_id": 123,
+                    "name": "alice",
+                    "allowed_workspaces": "/just/one/path",
+                },
+            ],
+        }
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            configs = self._load_with_yaml(monkeypatch, users_data)
+
+        assert configs is not None
+        assert configs[123].allowed_workspaces == []
+        assert "allowed_workspaces for alice must be a list" in caplog.text
+
+    def test_empty_strings_dropped_silently(self, monkeypatch, tmp_path):
+        """
+        Empty-string entries (yaml `- ""` or whitespace) are dropped
+        without warning - matches the workspace_base empty-string
+        handling. A user with only whitespace entries gets an
+        empty list, same as if they had no field at all.
+        """
+        real_path = tmp_path / "alpha"
+        real_path.mkdir()
+        users_data = {
+            "users": [
+                {
+                    "telegram_id": 123,
+                    "name": "alice",
+                    "allowed_workspaces": ["", "   ", str(real_path)],
+                },
+            ],
+        }
+        configs = self._load_with_yaml(monkeypatch, users_data)
+        assert configs is not None
+        assert configs[123].allowed_workspaces == [real_path.resolve()]
+
+    def test_duplicates_deduplicated_at_load_time(self, monkeypatch, tmp_path):
+        """
+        A user listing the same path twice is almost certainly a
+        typo. The loader collapses duplicates so the per-user list
+        is clean for downstream consumers (source-attribution
+        listings, the /workspaces keyboard).
+        """
+        real_path = tmp_path / "alpha"
+        real_path.mkdir()
+        users_data = {
+            "users": [
+                {
+                    "telegram_id": 123,
+                    "name": "alice",
+                    "allowed_workspaces": [str(real_path), str(real_path)],
+                },
+            ],
+        }
+        configs = self._load_with_yaml(monkeypatch, users_data)
+        assert configs is not None
+        assert configs[123].allowed_workspaces == [real_path.resolve()]
+
+    def test_expands_user_tilde(self, monkeypatch, tmp_path):
+        """
+        `~/path` style entries get expanded via Path.expanduser().
+        Mirrors workspace_base / home_workspace handling.
+        """
+        # Build a fake HOME under tmp_path so ~ resolves into the
+        # test sandbox rather than the developer's actual home.
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        ws = fake_home / "ws"
+        ws.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        users_data = {
+            "users": [
+                {
+                    "telegram_id": 123,
+                    "name": "alice",
+                    "allowed_workspaces": ["~/ws"],
+                },
+            ],
+        }
+        configs = self._load_with_yaml(monkeypatch, users_data)
+        assert configs is not None
+        assert configs[123].allowed_workspaces == [ws.resolve()]

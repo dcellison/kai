@@ -2023,8 +2023,16 @@ async def _handle_workspace_allowed(
     # would query the DB twice. Only this handler needs attribution.
     db_paths = await sessions.get_allowed_workspaces(chat_id)
     db_path_set = {p.resolve() for p in db_paths}
+    # Per-user yaml allowed_workspaces tier (#460). Tracked
+    # separately from db_path_set so the source attribution
+    # below can distinguish "your yaml" from "your DB entries".
+    yaml_path_set: set[Path] = set()
+    if user_config and user_config.allowed_workspaces:
+        yaml_path_set = {p.resolve() for p in user_config.allowed_workspaces}
 
-    # Combined list: DB first, then global, deduplicated
+    # Combined list: DB > yaml-per-user > global. Same order as
+    # resolve_workspace_access so this view matches what name
+    # resolution actually traverses.
     seen: set[Path] = set()
     allowed: list[Path] = []
     for p in db_paths:
@@ -2032,6 +2040,12 @@ async def _handle_workspace_allowed(
         if resolved not in seen:
             seen.add(resolved)
             allowed.append(resolved)
+    if user_config and user_config.allowed_workspaces:
+        for p in user_config.allowed_workspaces:
+            resolved = p.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                allowed.append(resolved)
     for p in config.allowed_workspaces:
         resolved = p.resolve()
         if resolved not in seen:
@@ -2048,7 +2062,17 @@ async def _handle_workspace_allowed(
         lines.append("")
         lines.append("Allowed workspaces:")
         for p in allowed:
-            source = "you" if p in db_path_set else "global"
+            # Source attribution priority matches the union order:
+            # DB beats yaml beats global. A path could in principle
+            # appear in multiple tiers (operator pinned via
+            # /workspace allow AND listed in users.yaml); the most
+            # specific tier wins the label.
+            if p in db_path_set:
+                source = "you"
+            elif p in yaml_path_set:
+                source = "yaml"
+            else:
+                source = "global"
             lines.append(f"  {p} ({source})")
     elif base:
         lines.append("\nNo additional allowed paths beyond workspace base.")

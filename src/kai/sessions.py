@@ -911,25 +911,35 @@ async def resolve_workspace_access(chat_id: int, config: Config) -> tuple[Path |
     Resolve per-user workspace_base and allowed_workspaces.
 
     Returns (workspace_base, allowed_workspaces) with per-user config
-    applied. The allowed list is the union of user-added DB entries and
-    the global ALLOWED_WORKSPACES env var, deduplicated by resolved path.
+    applied. The allowed list is the union of:
+      1. The per-chat DB `allowed_workspaces` table (set via
+         `/workspace allow` from Telegram).
+      2. The per-user `allowed_workspaces` field in users.yaml
+         (admin-set baseline; see issue #460).
+      3. The global `Config.allowed_workspaces` (env var
+         ALLOWED_WORKSPACES + workspaces.yaml entries).
+    Deduplicated by resolved path; earlier tiers win on collision.
 
     Precedence for workspace_base:
         1. users.yaml workspace_base (admin-set per user)
         2. Global WORKSPACE_BASE env var
 
     Precedence for allowed_workspaces:
-        Union of DB entries (user-managed) and global config (admin-set).
-        Deduplicated; DB entries appear first in the list.
+        DB > yaml-per-user > global. DB first so user-added
+        workspaces appear at the top of the /workspaces keyboard
+        and /workspace allowed list; yaml-per-user before global
+        because the user-specific tier is more relevant to the
+        user than the bot-wide tier.
     """
     user_config = config.get_user_config(chat_id)
 
     # workspace_base: users.yaml > env
     base = user_config.workspace_base if user_config and user_config.workspace_base else config.workspace_base
 
-    # allowed_workspaces: union of DB + global, deduplicated.
-    # DB entries first so user-added workspaces appear at the top
-    # of the /workspaces keyboard and /workspace allowed list.
+    # allowed_workspaces: union of DB + yaml-per-user + global,
+    # deduplicated. Resolved paths are the dedup key so the same
+    # directory expressed two different ways (symlink, relative
+    # form) collapses to a single entry.
     db_allowed = await get_allowed_workspaces(chat_id)
     seen: set[Path] = set()
     combined: list[Path] = []
@@ -939,6 +949,18 @@ async def resolve_workspace_access(chat_id: int, config: Config) -> tuple[Path |
         if resolved not in seen:
             seen.add(resolved)
             combined.append(resolved)
+
+    # Per-user yaml allowed_workspaces (#460). The loader already
+    # resolved each path at load time, but re-resolve here for
+    # symmetry with the other tiers - cheap and protects against
+    # a stale Path object if the loader is ever changed to keep
+    # the raw form.
+    if user_config and user_config.allowed_workspaces:
+        for p in user_config.allowed_workspaces:
+            resolved = p.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                combined.append(resolved)
 
     for p in config.allowed_workspaces:
         resolved = p.resolve()

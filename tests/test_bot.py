@@ -2012,6 +2012,82 @@ class TestHandleWorkspaceAllowed:
         reply = update.message.reply_text.call_args[0][0]
         assert f"Workspace base: {tmp_path}" in reply
 
+    @pytest.mark.asyncio
+    async def test_shows_yaml_per_user_tier(self, tmp_path):
+        """
+        Per-user yaml `allowed_workspaces:` entries (#460) appear in
+        the listing with a `(yaml)` source label, distinct from the
+        existing `(you)` (DB) and `(global)` tiers. Pre-#460 these
+        entries were silently dropped by the config loader; with the
+        loader fix in place this UI test pins the user-visible
+        result of the change.
+        """
+        from kai.config import UserConfig
+
+        yaml_ws = tmp_path / "yaml-ws"
+        yaml_ws.mkdir()
+        db_ws = tmp_path / "db-ws"
+        db_ws.mkdir()
+        global_ws = tmp_path / "global-ws"
+        global_ws.mkdir()
+
+        uc = UserConfig(
+            telegram_id=123,
+            name="alice",
+            allowed_workspaces=[yaml_ws.resolve()],
+        )
+        config = _make_config(
+            user_configs={123: uc},
+            allowed_workspaces=[global_ws.resolve()],
+        )
+        update = _make_update(chat_id=123)
+        ctx = _make_context(config=config)
+        with patch(
+            "kai.bot.sessions.get_allowed_workspaces",
+            new_callable=AsyncMock,
+            return_value=[db_ws],
+        ):
+            await _handle_workspace_allowed(update, ctx)
+
+        reply = update.message.reply_text.call_args[0][0]
+        # All three source tiers attributed correctly.
+        assert f"{db_ws.resolve()} (you)" in reply
+        assert f"{yaml_ws.resolve()} (yaml)" in reply
+        assert f"{global_ws.resolve()} (global)" in reply
+
+    @pytest.mark.asyncio
+    async def test_yaml_tier_priority_when_in_db_too(self, tmp_path):
+        """
+        A path listed in BOTH the per-user yaml and the DB collapses
+        to a single line; the `(you)` (DB) label wins because the
+        DB tier appears earlier in the union. Same priority order
+        as `resolve_workspace_access`.
+        """
+        from kai.config import UserConfig
+
+        shared = tmp_path / "shared-ws"
+        shared.mkdir()
+        uc = UserConfig(
+            telegram_id=123,
+            name="alice",
+            allowed_workspaces=[shared.resolve()],
+        )
+        config = _make_config(user_configs={123: uc})
+        update = _make_update(chat_id=123)
+        ctx = _make_context(config=config)
+        with patch(
+            "kai.bot.sessions.get_allowed_workspaces",
+            new_callable=AsyncMock,
+            return_value=[shared],
+        ):
+            await _handle_workspace_allowed(update, ctx)
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert f"{shared.resolve()} (you)" in reply
+        # Exactly one occurrence of the path in the output: no
+        # duplicate listing under the yaml tier.
+        assert reply.count(str(shared.resolve())) == 1
+
 
 # ── /workspace allow/deny routing via handle_workspace ──────────────
 

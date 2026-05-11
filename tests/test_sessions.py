@@ -883,6 +883,136 @@ class TestResolveWorkspaceAccess:
         assert allowed[0] == db_path.resolve()
         assert allowed[1] == global_path.resolve()
 
+    # -- Per-user yaml allowed_workspaces (issue #460) -------------------
+
+    async def test_yaml_per_user_allowed_visible(self, db, tmp_path):
+        """
+        A path listed only under per-user `allowed_workspaces:` in
+        users.yaml is in the combined list. Pre-#460, the field
+        was silently dropped by the config loader and this list
+        was always empty.
+        """
+        from kai.config import UserConfig
+
+        yaml_path = tmp_path / "yaml-repo"
+        yaml_path.mkdir()
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            allowed_workspaces=[yaml_path.resolve()],
+        )
+        config = self._make_config(user_configs={111: uc})
+        _base, allowed = await sessions.resolve_workspace_access(111, config)
+        assert yaml_path.resolve() in allowed
+
+    async def test_yaml_per_user_unioned_with_db_and_global(self, db, tmp_path):
+        """
+        Effective list is the union of all three tiers: DB,
+        yaml-per-user, global. Each path appears exactly once.
+        """
+        from kai.config import UserConfig
+
+        db_path = tmp_path / "db-repo"
+        db_path.mkdir()
+        yaml_path = tmp_path / "yaml-repo"
+        yaml_path.mkdir()
+        global_path = tmp_path / "global-repo"
+        global_path.mkdir()
+
+        await sessions.add_allowed_workspace(111, str(db_path.resolve()))
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            allowed_workspaces=[yaml_path.resolve()],
+        )
+        config = self._make_config(
+            user_configs={111: uc},
+            allowed_workspaces=[global_path.resolve()],
+        )
+        _base, allowed = await sessions.resolve_workspace_access(111, config)
+        assert len(allowed) == 3
+        assert db_path.resolve() in allowed
+        assert yaml_path.resolve() in allowed
+        assert global_path.resolve() in allowed
+
+    async def test_yaml_per_user_ordering_db_yaml_global(self, db, tmp_path):
+        """
+        The combined list orders entries DB > yaml-per-user > global.
+        The keyboard and the /workspace allowed listing both depend
+        on this ordering for the source-attribution labels.
+        """
+        from kai.config import UserConfig
+
+        db_path = tmp_path / "db-repo"
+        db_path.mkdir()
+        yaml_path = tmp_path / "yaml-repo"
+        yaml_path.mkdir()
+        global_path = tmp_path / "global-repo"
+        global_path.mkdir()
+
+        await sessions.add_allowed_workspace(111, str(db_path.resolve()))
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            allowed_workspaces=[yaml_path.resolve()],
+        )
+        config = self._make_config(
+            user_configs={111: uc},
+            allowed_workspaces=[global_path.resolve()],
+        )
+        _base, allowed = await sessions.resolve_workspace_access(111, config)
+        assert allowed[0] == db_path.resolve()
+        assert allowed[1] == yaml_path.resolve()
+        assert allowed[2] == global_path.resolve()
+
+    async def test_yaml_per_user_dedup_with_db(self, db, tmp_path):
+        """
+        Same path in both the DB and the per-user yaml list collapses
+        to a single entry; the DB tier wins the slot (earlier in
+        the iteration order).
+        """
+        from kai.config import UserConfig
+
+        shared = tmp_path / "shared-repo"
+        shared.mkdir()
+        resolved = shared.resolve()
+
+        await sessions.add_allowed_workspace(111, str(resolved))
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            allowed_workspaces=[resolved],
+        )
+        config = self._make_config(user_configs={111: uc})
+        _base, allowed = await sessions.resolve_workspace_access(111, config)
+        assert len(allowed) == 1
+        assert allowed[0] == resolved
+
+    async def test_yaml_per_user_dedup_with_global(self, db, tmp_path):
+        """
+        Same path in both per-user yaml and global config collapses
+        to a single entry; the per-user tier wins the slot
+        (earlier in the iteration order).
+        """
+        from kai.config import UserConfig
+
+        shared = tmp_path / "shared-repo"
+        shared.mkdir()
+        resolved = shared.resolve()
+
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            allowed_workspaces=[resolved],
+        )
+        config = self._make_config(
+            user_configs={111: uc},
+            allowed_workspaces=[resolved],
+        )
+        _base, allowed = await sessions.resolve_workspace_access(111, config)
+        assert len(allowed) == 1
+        assert allowed[0] == resolved
+
 
 # ── Effective repos ───────────────────────────────────────────────
 

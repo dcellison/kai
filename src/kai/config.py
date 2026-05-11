@@ -281,6 +281,16 @@ class UserConfig:
     timeout: int | None = None
     context_window: int | None = None
     workspace_base: Path | None = None
+    # Per-user allowed workspaces from users.yaml. Distinct from the
+    # global `Config.allowed_workspaces` (env var / workspaces.yaml)
+    # and from the per-chat DB `allowed_workspaces` table (set via
+    # `/workspace allow`): this list is admin-set in users.yaml for
+    # workspaces a specific user should access by name without having
+    # to run `/workspace allow` first. Resolved at load time
+    # (.expanduser().resolve()); paths that don't exist on the host
+    # are dropped with a warning rather than failing the whole
+    # config load. See issue #460.
+    allowed_workspaces: list[Path] = field(default_factory=list)
     # Per-user backend/provider override. Admin-controlled via users.yaml,
     # not user-configurable via /settings. None = use global config.
     agent_backend: str | None = None
@@ -1171,6 +1181,52 @@ def _load_user_configs(
                     )
                     user_workspace_base = None
 
+        # Parse optional per-user allowed_workspaces (#460). Distinct
+        # from the global `allowed_workspaces` config field (env var
+        # + workspaces.yaml) and from the per-chat DB
+        # `allowed_workspaces` table (set via `/workspace allow`):
+        # this is the admin's per-user yaml grant of additional
+        # paths accessible by name.
+        #
+        # Each entry: strip, expanduser, resolve. Empty strings are
+        # dropped silently. Paths that don't exist are dropped with
+        # a warning - matches the `workspace_base` / `home_workspace`
+        # precedent of "warn but don't fail the load" (a missing
+        # directory may be on an unmounted drive or about to be
+        # created; failing the whole config load would block the
+        # operator from any access). Non-list values produce a
+        # warning and an empty list. The runtime resolver
+        # (`sessions.resolve_workspace_access`) reads this field
+        # and unions it with the DB and global sources.
+        user_allowed_workspaces: list[Path] = []
+        raw_user_allowed = entry.get("allowed_workspaces", [])
+        if isinstance(raw_user_allowed, list):
+            for raw_ws in raw_user_allowed:
+                ws_str = str(raw_ws).strip()
+                if not ws_str:
+                    continue
+                ws_path = Path(ws_str).expanduser().resolve()
+                if not ws_path.is_dir():
+                    log.warning(
+                        "users.yaml: allowed_workspaces entry for %s not found: %s; dropping",
+                        name,
+                        ws_path,
+                    )
+                    continue
+                # Dedup at load time: a user listing the same path
+                # twice is almost certainly a typo, and the union
+                # in resolve_workspace_access dedupes anyway, but
+                # catching it here keeps the per-user list clean
+                # for downstream consumers (e.g., `/workspace allowed`
+                # source attribution).
+                if ws_path not in user_allowed_workspaces:
+                    user_allowed_workspaces.append(ws_path)
+        else:
+            log.warning(
+                "users.yaml: allowed_workspaces for %s must be a list (ignoring)",
+                name,
+            )
+
         # Parse optional github_repos list (list of "owner/repo" strings).
         # Validate format but don't verify repo existence (that would
         # require network calls during config loading).
@@ -1246,6 +1302,7 @@ def _load_user_configs(
             timeout=user_timeout,
             context_window=user_context_window,
             workspace_base=user_workspace_base,
+            allowed_workspaces=user_allowed_workspaces,
             agent_backend=user_backend,
             llm_provider=user_provider,
             github_repos=github_repos,
