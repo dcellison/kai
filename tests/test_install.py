@@ -3789,7 +3789,7 @@ class TestApplySource:
         assert "templates/config" not in output
 
     def test_copies_templates_config(self, tmp_path):
-        """templates/config/ is copied to <install>/config/ (post-#452)."""
+        """templates/config/ is copied to <install>/config/."""
         src = tmp_path / "source"
         (src / "src").mkdir(parents=True)
         (src / "src" / "module.py").write_text("code")
@@ -3967,11 +3967,11 @@ class TestRetireInstallHomeClaude:
 
 class TestRetireInstallHomeDir:
     """
-    Pins the wholesale retirement of `<install>/home/` (issue #452)
-    after the `<install>/home/config/` relocation to `<install>/config/`.
-    Three cases: directory missing (no-op), empty parent (clean
-    removal), and the existing-install upgrade where only the
-    orphaned `home/config/goose-config.yaml` remains.
+    Pins the wholesale retirement of `<install>/home/` after the
+    `<install>/home/config/` relocation to `<install>/config/`. Three
+    cases: directory missing (no-op), empty parent (clean removal),
+    and the existing-install upgrade where only the orphaned
+    `home/config/goose-config.yaml` remains.
     """
 
     def test_no_op_when_home_dir_missing(self, tmp_path):
@@ -3989,13 +3989,13 @@ class TestRetireInstallHomeDir:
         assert not (install / "home").exists()
         output = capsys.readouterr().out
         assert "Removed retired" in output
-        assert "<install>/config/" in output
+        assert str(install / "home") in output
 
     def test_removes_orphan_goose_config(self, tmp_path, capsys):
         """
         Existing-install upgrade: `<install>/home/config/goose-config.yaml`
-        still exists (from a pre-#452 install). The helper removes the
-        orphan file and the empty home/ parent, logging the file's
+        still exists (from before the relocation). The helper removes
+        the orphan file and the empty home/ parent, logging the file's
         byte size before deletion.
         """
         install = tmp_path / "install"
