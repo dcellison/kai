@@ -453,17 +453,11 @@ class TestGenerateSudoers:
         Each per-target ruleset includes a NOPASSWD rule for the kill
         binary alongside the claude binary rule. The bot uses this to
         escalate signals to the inner claude grandchild via
-        `sudo -n -u <target> kill -<sig> <pid>` in cross-user mode,
-        because POSIX signal permissions prevent the service user
-        from signaling a target-user process directly.
+        `sudo -n -u <target> /bin/kill -<sig> <pid>` in cross-user
+        mode, because POSIX signal permissions prevent the service
+        user from signaling a target-user process directly.
         """
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
-        real_which = shutil.which
-        monkeypatch.setattr(
-            shutil,
-            "which",
-            lambda n: "/bin/kill" if n == "kill" else real_which(n),
-        )
         result = _generate_sudoers("kai", os_users=["alice", "bob"])
         assert "kai ALL=(alice) NOPASSWD: /bin/kill" in result
         assert "kai ALL=(bob) NOPASSWD: /bin/kill" in result
@@ -482,12 +476,6 @@ class TestGenerateSudoers:
         claude rule keeps SETENV (for KAI_WEBHOOK_SECRET, TMPDIR).
         """
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
-        real_which = shutil.which
-        monkeypatch.setattr(
-            shutil,
-            "which",
-            lambda n: "/bin/kill" if n == "kill" else real_which(n),
-        )
         result = _generate_sudoers("kai", os_users=["alice"])
         # The kill rule line itself has no SETENV: token.
         kill_lines = [line for line in result.splitlines() if "kill" in line]
@@ -498,21 +486,30 @@ class TestGenerateSudoers:
         assert len(claude_lines) == 1
         assert "SETENV" in claude_lines[0]
 
-    def test_kill_rule_falls_back_to_bin_kill(self, monkeypatch):
+    def test_kill_rule_path_is_hardcoded(self, monkeypatch):
         """
-        When shutil.which("kill") returns None (e.g. install runs
-        under sudo with a stripped PATH), the rule falls back to
-        /bin/kill which is present on both macOS and Linux.
+        The kill rule must always emit /bin/kill regardless of what
+        shutil.which("kill") would resolve to on the install host.
+        Pre-fix the generator used `shutil.which("kill") or
+        "/bin/kill"` which on Linux could bake `/usr/bin/kill` into
+        the sudoers rule; the runtime invokes `/bin/kill` literally,
+        and a path mismatch causes sudo to silently fail the
+        escalation (recreating the orphan-leak bug this PR aims to
+        close). Regression guard: even when shutil.which would have
+        returned a different path, the rule still says /bin/kill.
         """
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
         real_which = shutil.which
+        # shutil.which returns the "wrong" absolute path on this
+        # host; the generator must ignore it.
         monkeypatch.setattr(
             shutil,
             "which",
-            lambda n: None if n == "kill" else real_which(n),
+            lambda n: "/usr/bin/kill" if n == "kill" else real_which(n),
         )
         result = _generate_sudoers("kai", os_users=["alice"])
         assert "kai ALL=(alice) NOPASSWD: /bin/kill" in result
+        assert "/usr/bin/kill" not in result
 
 
 class TestCollectOsUsersFromYaml:

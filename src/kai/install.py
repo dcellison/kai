@@ -1670,13 +1670,19 @@ def _generate_sudoers(
         svc_home = _user_home(service_user)
         claude_bin = f"{svc_home}/.local/bin/claude"
         # kill(1) for the cross-user kill escalation (#456). The bot
-        # runs `sudo -n -u <target> kill -<sig> <pid>` against the
-        # inner claude grandchild because POSIX signal permissions
+        # runs `sudo -n -u <target> /bin/kill -<sig> <pid>` against
+        # the inner claude grandchild because POSIX signal permissions
         # prevent the service user from signaling a target-user
-        # process directly. Resolve via shutil.which() so we pick up
-        # /bin/kill (macOS) or /usr/bin/kill (Linux); fall back to
-        # /bin/kill which exists on both.
-        kill_bin = shutil.which("kill") or "/bin/kill"
+        # process directly. The runtime invocation pins the absolute
+        # path /bin/kill so sudo's secure_path resolution cannot
+        # silently pick a different binary than the rule names; the
+        # sudoers rule must match the runtime path exactly. /bin/kill
+        # is canonical on macOS and on Linux with merged-usr
+        # (/bin -> /usr/bin); on older Linux without merged-usr,
+        # /bin/kill is a real binary and behaves the same for the
+        # `kill -<sig> <pid>` calls we use here. Same anchoring
+        # rationale as the claude_bin fix in PR #455.
+        kill_bin = "/bin/kill"
         # SETENV: allows the service user to pass env vars (e.g.,
         # KAI_WEBHOOK_SECRET) through sudo to the claude process.
         # Scoped to the claude rule only; the kill rule does not

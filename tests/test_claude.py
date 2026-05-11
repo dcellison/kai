@@ -642,11 +642,11 @@ class TestProcessSignals:
         ):
             claude._send_signal(signal.SIGKILL)
 
-            # sudo -n -u daniel kill -<sig> 99999
+            # sudo -n -u daniel /bin/kill -<sig> 99999
             assert mock_run.call_count == 1
             args, kwargs = mock_run.call_args
             cmd = args[0]
-            assert cmd[:5] == ["sudo", "-n", "-u", "daniel", "kill"]
+            assert cmd[:5] == ["sudo", "-n", "-u", "daniel", "/bin/kill"]
             assert cmd[5] == f"-{signal.SIGKILL}"
             assert cmd[6] == "99999"
             assert kwargs.get("check") is False
@@ -2150,9 +2150,10 @@ class TestKill:
         cmds = [call.args[0] for call in mock_run.call_args_list]
         final_cleanup = [c for c in cmds if c[-2] == "-9" and c[-1] == "99999"]
         assert final_cleanup, f"no final sudo kill -9 99999 in calls: {cmds}"
-        # Every call must target the saved sudo user.
+        # Every call must target the saved sudo user with the
+        # absolute /bin/kill path.
         for cmd in cmds:
-            assert cmd[:5] == ["sudo", "-n", "-u", "daniel", "kill"]
+            assert cmd[:5] == ["sudo", "-n", "-u", "daniel", "/bin/kill"]
 
     @pytest.mark.asyncio
     async def test_kill_skips_sudo_when_inner_pid_unknown(self):
