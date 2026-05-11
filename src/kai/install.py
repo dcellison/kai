@@ -2960,7 +2960,16 @@ def _retire_install_home_claude(install_path: Path, dry_run: bool) -> None:
         if dry_run:
             print(f"[DRY RUN] Would remove legacy {identity_md} ({size} bytes); content was identity baseline only")
         else:
-            identity_md.unlink()
+            # Same try/except surface as the rmtree above: surface an
+            # operator-readable error line BEFORE the traceback aborts
+            # the install. Likelihood is low (install runs as root and
+            # the pre-check is a short window), but the asymmetry would
+            # be surprising given rmtree's wrap.
+            try:
+                identity_md.unlink()
+            except OSError as exc:
+                print(f"  ERROR: could not remove {identity_md}: {exc}")
+                raise
             print(f"  Removed legacy {identity_md} ({size} bytes); content was identity baseline only")
 
 
