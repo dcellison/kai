@@ -2383,9 +2383,10 @@ class TestLookupInnerClaudePid:
 def _fake_async_proc(returncode: int, stdout: bytes = b"", stderr: bytes = b""):
     """
     Build a fake asyncio.subprocess.Process for tests that patch
-    asyncio.create_subprocess_exec. Returns a MagicMock with the
-    methods _async_lookup_inner_claude_pid / _async_sudo_kill
-    actually call: communicate(), wait(), kill().
+    asyncio.create_subprocess_exec. Returns a MagicMock that surfaces
+    the communicate(), wait(), and kill() interface that
+    _async_lookup_inner_claude_pid and _async_sudo_kill actually
+    invoke.
     """
     proc = MagicMock()
     proc.returncode = returncode
@@ -2458,6 +2459,30 @@ class TestAsyncLookupInnerClaudePid:
             assert await claude._async_lookup_inner_claude_pid() is None
         # Hung pgrep must be reaped, not leaked.
         fake.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_timeout_handler_swallows_process_lookup_error_on_kill(self):
+        """
+        Regression for PR #461 review M-1: if pgrep exits between
+        wait_for timing out and the proc.kill() call,
+        asyncio.subprocess.Process.kill() raises ProcessLookupError
+        (via os.kill on a dead PID). The handler must swallow
+        because the outcome we wanted (process gone) is already
+        true; otherwise the exception propagates out of _kill /
+        shutdown and crashes the caller.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+
+        fake = MagicMock()
+        fake.communicate = AsyncMock(side_effect=TimeoutError)
+        fake.kill = MagicMock(side_effect=ProcessLookupError)
+        fake.wait = AsyncMock()
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            # Must NOT raise. Returns None like any other failure mode.
+            assert await claude._async_lookup_inner_claude_pid() is None
 
     @pytest.mark.asyncio
     async def test_handles_oserror_on_spawn(self):
@@ -2547,6 +2572,25 @@ class TestAsyncSudoKill:
 
         assert "timed out" in caplog.text
         fake.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_timeout_handler_swallows_process_lookup_error_on_kill(self):
+        """
+        Regression for PR #461 review M-1: if sudo exits between
+        wait_for timing out and proc.kill(), kill() raises
+        ProcessLookupError. The handler must swallow because the
+        outcome we wanted (process gone) is already true; otherwise
+        the exception propagates out of _kill / shutdown and crashes
+        the caller.
+        """
+        claude = _make_claude(claude_user="daniel")
+        fake = MagicMock()
+        fake.communicate = AsyncMock(side_effect=TimeoutError)
+        fake.kill = MagicMock(side_effect=ProcessLookupError)
+        fake.wait = AsyncMock()
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            # Must NOT raise.
+            await claude._async_sudo_kill("daniel", 99999, int(signal.SIGKILL))
 
     @pytest.mark.asyncio
     async def test_swallows_oserror_on_spawn(self):

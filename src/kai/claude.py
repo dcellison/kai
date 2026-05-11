@@ -459,7 +459,18 @@ class ClaudeCodeBackend(AgentBackend):
         except TimeoutError:
             # pgrep is hung; reap it so we do not leak a child and
             # return None as if no PID was found.
-            proc.kill()
+            #
+            # Guard proc.kill() against the race where pgrep exits
+            # between wait_for timing out and the kill() call:
+            # asyncio.subprocess.Process.kill() delegates to
+            # os.kill(pid, SIGKILL), which raises
+            # ProcessLookupError (an OSError subclass) on an
+            # already-dead PID. Swallow because the outcome we
+            # wanted (process gone) is already true.
+            try:
+                proc.kill()
+            except OSError:
+                pass
             try:
                 await proc.wait()
             except OSError:
@@ -488,7 +499,7 @@ class ClaudeCodeBackend(AgentBackend):
            is fine).
         3. Single-user mode: `_proc.send_signal` (also non-blocking).
 
-        Steps 1's blocking surface is moved off the event loop; the
+        Step 1's blocking surface is moved off the event loop; the
         sync `_send_signal` remains for `force_kill` (which is sync
         by public-API contract).
         """
@@ -551,7 +562,15 @@ class ClaudeCodeBackend(AgentBackend):
         try:
             _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=5)
         except TimeoutError:
-            proc.kill()
+            # Same race guard as _async_lookup_inner_claude_pid:
+            # proc.kill() can raise ProcessLookupError if sudo
+            # exited between wait_for timing out and the kill()
+            # call. Swallow because the outcome we wanted
+            # (process gone) is already true.
+            try:
+                proc.kill()
+            except OSError:
+                pass
             try:
                 await proc.wait()
             except OSError:
