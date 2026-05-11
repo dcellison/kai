@@ -477,12 +477,15 @@ class TestGenerateSudoers:
         """
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
         result = _generate_sudoers("kai", os_users=["alice"])
-        # The kill rule line itself has no SETENV: token.
-        kill_lines = [line for line in result.splitlines() if "kill" in line]
+        # Filter to actual sudoers rule lines (skip the comment
+        # block above the per-target rules - it mentions "kill" in
+        # English explaining the scope tradeoff).
+        rule_lines = [line for line in result.splitlines() if line.startswith("kai ALL=")]
+        kill_lines = [line for line in rule_lines if "kill" in line]
         assert len(kill_lines) == 1
         assert "SETENV" not in kill_lines[0]
         # The claude rule still has SETENV (unchanged by #456).
-        claude_lines = [line for line in result.splitlines() if "claude" in line and "ALL=" in line]
+        claude_lines = [line for line in rule_lines if "claude" in line]
         assert len(claude_lines) == 1
         assert "SETENV" in claude_lines[0]
 
