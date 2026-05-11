@@ -502,9 +502,16 @@ class TestGenerateSudoers:
         returned a different path, the rule still says /bin/kill.
         """
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
+        # Guard: the production code no longer calls
+        # shutil.which("kill") - kill_bin is the literal
+        # "/bin/kill". This monkeypatch is intentionally a no-op
+        # against the current implementation; it exists so that
+        # if a future change re-introduces the `shutil.which("kill")
+        # or "/bin/kill"` pattern that PR #458 removed, this
+        # assertion would catch the resulting path mismatch
+        # (which would silently break cross-user kill escalation
+        # on Linux hosts where shutil.which returns /usr/bin/kill).
         real_which = shutil.which
-        # shutil.which returns the "wrong" absolute path on this
-        # host; the generator must ignore it.
         monkeypatch.setattr(
             shutil,
             "which",

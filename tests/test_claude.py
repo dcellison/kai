@@ -2482,6 +2482,133 @@ class TestShutdown:
         assert claude._proc is None
         assert claude._pgid is None
 
+    # -- Issue #456: cross-user kill escalation in shutdown ----------
+
+    @pytest.mark.asyncio
+    async def test_shutdown_primes_inner_pid_cache_before_signaling(self):
+        """
+        shutdown must look up the inner claude PID BEFORE the first
+        signal, same as _kill. Once killpg reaps the sudo wrapper,
+        pgrep on the dead sudo PID returns nothing; the cache primed
+        here is the only handle the final-cleanup pass has on the
+        orphaned grandchild.
+
+        Parallel to _kill's test of the same invariant - the two
+        async kill paths share the same orphan-leak failure mode,
+        and a regression in either would silently leak processes
+        on cross-user setups.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+        claude._pgid = 12345
+        claude._effective_claude_user = "daniel"
+
+        call_order: list[str] = []
+
+        def lookup_records():
+            call_order.append("lookup")
+            return 99999
+
+        with (
+            patch.object(claude, "_lookup_inner_claude_pid", side_effect=lookup_records),
+            patch("kai.claude.subprocess.run") as mock_run,
+            patch("os.killpg") as mock_killpg,
+        ):
+            mock_killpg.side_effect = lambda *_a, **_k: call_order.append("killpg")
+            mock_run.side_effect = lambda *_a, **_k: call_order.append("sudo_kill")
+            await claude.shutdown()
+
+        assert call_order[0] == "lookup"
+        assert "killpg" in call_order
+        assert call_order.index("lookup") < call_order.index("killpg")
+
+    @pytest.mark.asyncio
+    async def test_shutdown_final_cleanup_escalates_via_sudo(self):
+        """
+        After the main shutdown signal/wait sequence, the final
+        cleanup issues `sudo -n -u <target> /bin/kill -9 <pid>` for
+        the cached inner claude PID. This catches the daniel-owned
+        grandchild that survived the killpg (POSIX signal-permission
+        gap on cross-user spawn).
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+        claude._pgid = 12345
+        claude._effective_claude_user = "daniel"
+
+        with (
+            patch.object(claude, "_lookup_inner_claude_pid", return_value=99999),
+            patch("kai.claude.subprocess.run") as mock_run,
+            patch("os.killpg"),
+        ):
+            await claude.shutdown()
+
+        cmds = [call.args[0] for call in mock_run.call_args_list]
+        final_cleanup = [c for c in cmds if c[-2] == "-9" and c[-1] == "99999"]
+        assert final_cleanup, f"no final sudo /bin/kill -9 99999 in calls: {cmds}"
+        # Every call must use the absolute /bin/kill path so the
+        # sudoers rule match cannot be evaded by PATH manipulation.
+        for cmd in cmds:
+            assert cmd[:5] == ["sudo", "-n", "-u", "daniel", "/bin/kill"]
+
+    @pytest.mark.asyncio
+    async def test_shutdown_skips_sudo_when_inner_pid_unknown(self):
+        """
+        If _lookup_inner_claude_pid never returns a PID (sudo died
+        before forking, or pgrep failed every time), the final
+        cleanup must not call sudo. killpg still fires as a best-
+        effort wrapper reap.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+        claude._pgid = 12345
+        claude._effective_claude_user = "daniel"
+
+        with (
+            patch.object(claude, "_lookup_inner_claude_pid", return_value=None),
+            patch("kai.claude.subprocess.run") as mock_run,
+            patch("os.killpg") as mock_killpg,
+        ):
+            await claude.shutdown()
+
+        mock_run.assert_not_called()
+        assert mock_killpg.called
+
+    @pytest.mark.asyncio
+    async def test_shutdown_skips_sudo_in_single_user_mode(self):
+        """
+        Single-user mode (no _effective_claude_user) takes the
+        non-sudo path entirely. No pgrep lookup, no sudo kill.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+        claude._pgid = 12345
+        # _effective_claude_user stays None - mirrors single-user
+        # mode where resolve_claude_user() short-circuits sudo.
+        claude._effective_claude_user = None
+
+        with (
+            patch.object(claude, "_lookup_inner_claude_pid") as mock_lookup,
+            patch("kai.claude.subprocess.run") as mock_run,
+            patch("os.killpg"),
+        ):
+            await claude.shutdown()
+
+        mock_lookup.assert_not_called()
+        mock_run.assert_not_called()
+
 
 # ── _save_prompt ─────────────────────────────────────────────────────
 
