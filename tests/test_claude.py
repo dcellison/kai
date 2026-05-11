@@ -302,7 +302,7 @@ class TestCommandConstruction:
             assert not any(str(arg).startswith("--preserve-env=") for arg in cmd)
 
     @pytest.mark.asyncio
-    async def test_tmpdir_anchored_per_os_user_in_cross_user_mode(self, monkeypatch):
+    async def test_tmpdir_anchored_per_os_user_in_cross_user_mode(self):
         """
         Regression for issue #454: when claude_user is set, the subprocess
         env must include TMPDIR=<DATA_DIR>/tmp/<os_user>/ so the inner

@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -4798,8 +4799,6 @@ class TestApplyMigratePerOsUserTmpdir:
         # on), but a future regression that changes the mode= arg
         # could re-introduce a leak; the explicit chmod is the only
         # contract we rely on.
-        import stat
-
         prev_umask = os.umask(0o077)
         try:
             with (
