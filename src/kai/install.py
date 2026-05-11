@@ -2975,19 +2975,33 @@ def _retire_install_home_claude(install_path: Path, dry_run: bool) -> None:
 
 def _retire_install_home_dir(install_path: Path, dry_run: bool) -> None:
     """
-    Remove the `<install>/home/` directory after its contents are gone.
+    Remove the `<install>/home/` directory if (and only if) it contains
+    nothing more than an orphan `config/goose-config.yaml`.
 
-    The directory previously held the `.claude/` subtree, a legacy
-    `IDENTITY.md`, and a `config/goose-config.yaml` template.
+    `<install>/home/` previously held the `.claude/` subtree, a legacy
+    `IDENTITY.md`, a `config/goose-config.yaml` template, and a
+    `files/` tree used by the pre-DATA_DIR uploaded-files migration.
     `_retire_install_home_claude` (called earlier in `_apply_source`)
     removes the first two; the goose-config template now lives at
-    `<install>/config/goose-config.yaml`. With nothing remaining,
-    `<install>/home/` is vestigial.
+    `<install>/config/goose-config.yaml`. The `files/` tree is still
+    read by `_apply_migrate`'s legacy uploaded-files block as a
+    backup source on hosts that have not yet migrated.
 
-    The cleanup catches both end states:
+    The helper enforces the conservative guardrail from the originating
+    issue: remove only when the directory contains nothing more than
+    the orphan `config/` subdir (which may hold at most
+    `goose-config.yaml`). If anything else is present - a leftover
+    `files/` backup tree, an operator-placed file, a future code
+    change leaving fresh content - the helper logs the unexpected
+    paths and refuses to remove. The dir persists, the operator can
+    investigate, and no data is destroyed.
+
+    The cleanup catches three end states:
       - Clean install: the directory never existed; silent no-op.
-      - Existing-install upgrade: an orphan `home/config/goose-config.yaml`
-        remains; remove that orphan and the empty `home/` parent.
+      - Existing-install upgrade with only orphan `home/config/goose-config.yaml`:
+        remove the orphan and the empty `home/` parent.
+      - Existing-install upgrade with extra content (e.g., un-migrated
+        `home/files/`): refuse, log the unexpected paths, return.
 
     Logging every removed file with its byte size before rmtree is
     symmetric with `_retire_install_home_claude` and matches the
@@ -2997,10 +3011,34 @@ def _retire_install_home_dir(install_path: Path, dry_run: bool) -> None:
     if not home_dir.exists():
         return
 
-    # Enumerate surviving files first so the log captures byte sizes
-    # before rmtree runs. rglob handles arbitrary content defensively
-    # in case a future code change leaves something other than the
-    # expected orphan behind.
+    # Per the issue contract: only `config/` is an allowed top-level
+    # entry, and only `goose-config.yaml` is allowed inside it.
+    # Anything else means refuse-and-log; do not destroy.
+    top_unexpected = sorted(entry.name for entry in home_dir.iterdir() if entry.name != "config")
+    config_subdir = home_dir / "config"
+    config_unexpected: list[str] = []
+    if config_subdir.is_dir():
+        config_unexpected = sorted(entry.name for entry in config_subdir.iterdir() if entry.name != "goose-config.yaml")
+
+    if top_unexpected or config_unexpected:
+        # Single refusal line names everything unexpected so the
+        # operator can locate it without re-running the install with
+        # extra logging. Dry-run and live both emit the same message
+        # because no deletion happens either way.
+        prefix = "[DRY RUN] " if dry_run else "  "
+        unexpected_paths: list[str] = []
+        unexpected_paths.extend(str(home_dir / name) for name in top_unexpected)
+        unexpected_paths.extend(str(config_subdir / name) for name in config_unexpected)
+        print(
+            f"{prefix}Refusing to remove {home_dir}: unexpected content present "
+            f"({', '.join(unexpected_paths)}). Investigate and remove manually if intended."
+        )
+        return
+
+    # Safe to remove: directory is either empty or contains exactly
+    # `config/[goose-config.yaml]`. Enumerate any surviving file (the
+    # orphan goose-config) first so the log captures its byte size
+    # before rmtree runs.
     for path in sorted(home_dir.rglob("*")):
         if path.is_file() or path.is_symlink():
             try:

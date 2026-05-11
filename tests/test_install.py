@@ -4027,8 +4027,8 @@ class TestRetireInstallHomeDir:
         assert "goose-config.yaml" in output
         assert "[DRY RUN] Would remove retired" in output
 
-    def test_idempotent_on_repeated_install(self, tmp_path, capsys):
-        """Second call over the cleaned state is a silent no-op."""
+    def test_silent_on_second_call(self, tmp_path, capsys):
+        """After a successful removal, the second call's no-op path is silent."""
         install = tmp_path / "install"
         (install / "home").mkdir(parents=True)
         _retire_install_home_dir(install, dry_run=False)
@@ -4037,6 +4037,86 @@ class TestRetireInstallHomeDir:
         assert not (install / "home").exists()
         second_output = capsys.readouterr().out
         assert "Removed retired" not in second_output
+
+    def test_refuses_when_files_subdir_present(self, tmp_path, capsys):
+        """
+        Existing-install upgrade with an un-migrated `home/files/` backup
+        tree: the helper must refuse to remove (the pre-DATA_DIR
+        uploaded-files migration in `_apply_migrate` still reads from
+        this path; destroying it before that migration runs would be
+        data loss). The directory is preserved and the operator sees
+        a clear refusal log naming the unexpected path.
+        """
+        install = tmp_path / "install"
+        files_dir = install / "home" / "files"
+        files_dir.mkdir(parents=True)
+        (files_dir / "uploaded.png").write_bytes(b"\x89PNG")
+        # Coexisting orphan goose-config does not change the outcome -
+        # the unexpected files/ subdir is the blocker.
+        (install / "home" / "config").mkdir()
+        (install / "home" / "config" / "goose-config.yaml").write_text("extensions: {}\n")
+
+        _retire_install_home_dir(install, dry_run=False)
+
+        # Directory and its contents are intact.
+        assert files_dir.is_dir()
+        assert (files_dir / "uploaded.png").is_file()
+        output = capsys.readouterr().out
+        assert "Refusing to remove" in output
+        assert "files" in output
+
+    def test_refuses_when_unexpected_top_level_entry(self, tmp_path, capsys):
+        """
+        Any top-level entry other than `config/` blocks removal. Covers
+        the future-code-change case where a new install step deposits
+        something under `<install>/home/`.
+        """
+        install = tmp_path / "install"
+        home_dir = install / "home"
+        home_dir.mkdir(parents=True)
+        (home_dir / "skills").mkdir()
+        (home_dir / "skills" / "example.md").write_text("# skill\n")
+
+        _retire_install_home_dir(install, dry_run=False)
+
+        assert (home_dir / "skills").is_dir()
+        output = capsys.readouterr().out
+        assert "Refusing to remove" in output
+        assert "skills" in output
+
+    def test_refuses_when_unexpected_file_in_config(self, tmp_path, capsys):
+        """
+        `home/config/` is allowed to contain only `goose-config.yaml`.
+        An extra file here also triggers refusal (an operator-placed
+        config override, a future template that should land under
+        `<install>/config/` instead, etc.).
+        """
+        install = tmp_path / "install"
+        config_dir = install / "home" / "config"
+        config_dir.mkdir(parents=True)
+        (config_dir / "goose-config.yaml").write_text("extensions: {}\n")
+        (config_dir / "claude-config.yaml").write_text("model: opus\n")
+
+        _retire_install_home_dir(install, dry_run=False)
+
+        assert (config_dir / "goose-config.yaml").is_file()
+        assert (config_dir / "claude-config.yaml").is_file()
+        output = capsys.readouterr().out
+        assert "Refusing to remove" in output
+        assert "claude-config.yaml" in output
+
+    def test_dry_run_predicts_refusal(self, tmp_path, capsys):
+        """Dry-run on a refusal pre-state emits the same message; no disk mutation."""
+        install = tmp_path / "install"
+        files_dir = install / "home" / "files"
+        files_dir.mkdir(parents=True)
+        (files_dir / "uploaded.png").write_bytes(b"\x89PNG")
+
+        _retire_install_home_dir(install, dry_run=True)
+
+        assert files_dir.is_dir()
+        output = capsys.readouterr().out
+        assert "[DRY RUN] Refusing to remove" in output
 
 
 # ── Per-user CLAUDE.md seed (in _apply_migrate's home block) ─────────
