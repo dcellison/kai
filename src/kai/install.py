@@ -2973,6 +2973,65 @@ def _retire_install_home_claude(install_path: Path, dry_run: bool) -> None:
             print(f"  Removed legacy {identity_md} ({size} bytes); content was identity baseline only")
 
 
+def _retire_install_home_dir(install_path: Path, dry_run: bool) -> None:
+    """
+    Remove the `<install>/home/` directory after its contents are gone.
+
+    Pre-#452 this directory held three things:
+      - `home/.claude/` (retired by `_retire_install_home_claude` per #447)
+      - `home/IDENTITY.md` (also retired by `_retire_install_home_claude`)
+      - `home/config/goose-config.yaml` (relocated to `<install>/config/` by #452)
+
+    With all three retired/relocated, `<install>/home/` is vestigial and
+    can be removed. The cleanup catches both end states:
+      - On a clean install: the directory never existed; silent no-op.
+      - On an existing-install upgrade: the `_apply_source` flow above
+        has already retired `.claude/`/`IDENTITY.md` and copied the
+        new `<install>/config/`, leaving an orphan `home/config/`
+        whose only file is `goose-config.yaml`. Remove that orphan
+        and the empty `home/` parent.
+
+    `home/config/goose-config.yaml` is install-time scaffolding (input
+    to `_apply_goose_config`, which writes the runtime config to
+    `~/.config/goose/config.yaml`); operators do not edit it. Logging
+    the removal with byte size is symmetric with
+    `_retire_install_home_claude` and consistent with the established
+    install-time loud-removal contract.
+    """
+    home_dir = install_path / "home"
+    if not home_dir.exists():
+        return
+
+    # Enumerate any surviving files first so the log captures byte
+    # sizes before rmtree runs. The only thing we expect to find is
+    # `home/config/goose-config.yaml` on the existing-install upgrade
+    # path; rglob handles arbitrary content defensively in case a
+    # future code change leaves something else behind.
+    for path in sorted(home_dir.rglob("*")):
+        if path.is_file() or path.is_symlink():
+            try:
+                size = path.lstat().st_size
+            except OSError:
+                size = 0
+            if dry_run:
+                print(f"[DRY RUN] Would remove {path} ({size} bytes)")
+            else:
+                print(f"  Removing {path} ({size} bytes)")
+
+    if dry_run:
+        print(f"[DRY RUN] Would remove retired {home_dir}; <install>/config/ holds the relocated content post-#452")
+    else:
+        # Same try/except discipline as the rmtree in
+        # `_retire_install_home_claude`: surface an operator-readable
+        # error line BEFORE the traceback aborts the install.
+        try:
+            shutil.rmtree(home_dir)
+        except OSError as exc:
+            print(f"  ERROR: could not remove {home_dir}: {exc}")
+            raise
+        print(f"  Removed retired {home_dir}; <install>/config/ holds the relocated content post-#452")
+
+
 def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
     """Copy source tree and home config from PROJECT_ROOT to the install location."""
     src_src = PROJECT_ROOT / "src"
@@ -2981,15 +3040,16 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     pyproject_dst = install_path / "pyproject.toml"
     # Config templates (e.g. goose-config.yaml) referenced by later
     # install steps like _apply_goose_config(). Root-owned since these
-    # are static templates, not runtime data. The `home/` parent
-    # continues to exist for this one purpose post-#447; everything
-    # else previously under `<install>/home/` (the `.claude/` subtree
-    # and any legacy IDENTITY.md) is retired by `_retire_install_home_claude`.
-    # The per-user `<DATA_DIR>/home/<chat_id>/.claude/CLAUDE.md` is
-    # seeded by `_apply_migrate`'s home block (eager) and
-    # `backend.ensure_user_home` (lazy, first-message fallback).
+    # are static templates, not runtime data. Issue #452 relocated
+    # this destination from `<install>/home/config/` to
+    # `<install>/config/`; the old `home/` parent is fully retired by
+    # `_retire_install_home_dir` below now that no install step
+    # writes under it. Per-user runtime CLAUDE.md is seeded by
+    # `_apply_migrate`'s home block (eager) and
+    # `backend.ensure_user_home` (lazy, first-message fallback);
+    # neither touches the install tree.
     config_src = PROJECT_ROOT / "templates" / "config"
-    config_dst = install_path / "home" / "config"
+    config_dst = install_path / "config"
 
     # One-time: rename workspace/ to home/ at the install location.
     # The directory was renamed in the source tree; this migrates the
@@ -3019,6 +3079,11 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         print(f"[DRY RUN] Would copy: {pyproject_src} -> {pyproject_dst}")
         if config_src.is_dir():
             print(f"[DRY RUN] Would copy: {config_src} -> {config_dst}")
+        # Issue #452: dry-run preview for the empty-home cleanup.
+        # Matches the live cleanup at the end of this function so the
+        # operator sees what would happen on an existing-install
+        # upgrade where `<install>/home/config/` still exists.
+        _retire_install_home_dir(install_path, dry_run=True)
         return
 
     _copy_tree(src_src, src_dst, _SOURCE_EXCLUDES)
@@ -3029,19 +3094,28 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     os.chown(pyproject_dst, 0, 0)
     print(f"  Copied {pyproject_dst}")
 
-    # Copy templates/config/ -> install/home/config/ (config templates
-    # like goose-config.yaml). These are static templates referenced by
+    # Copy templates/config/ -> install/config/ (config templates like
+    # goose-config.yaml). These are static templates referenced by
     # later install steps - e.g. _apply_goose_config() reads the Goose
     # extension config from here. Root-owned since they're installer
     # input, not runtime output.
     if config_src.is_dir():
-        # `home/` may not exist yet (the retirement step above does not
-        # create it, and after #447 the `.claude/` copy that used to
-        # parent it is gone). Ensure the parent before copying.
+        # `<install>/config/` may not exist yet on a fresh install.
+        # Pre-#452 this lived under `<install>/home/config/`; the
+        # parent mkdir below creates the new top-level location.
         config_dst.parent.mkdir(parents=True, exist_ok=True)
         _copy_tree(config_src, config_dst)
         _set_ownership(config_dst, 0, 0, recursive=True)
         print(f"  Copied config templates to {config_dst}")
+
+    # Issue #452: retire the now-empty `<install>/home/` directory.
+    # Pre-#452 it held `home/.claude/` (retired by #447), `home/IDENTITY.md`
+    # (retired by #447), and `home/config/` (relocated to `<install>/config/`
+    # by this change). On a clean install nothing under `<install>/home/`
+    # exists; on an existing-install upgrade the migration above has
+    # already removed `.claude/` and `IDENTITY.md`, and the relocation
+    # left an orphan `home/config/`. Cleanup catches both end states.
+    _retire_install_home_dir(install_path, dry_run=False)
 
 
 def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
@@ -3213,15 +3287,15 @@ def _apply_goose_config(
     """
     Deploy the Goose extension config to the service user's home.
 
-    Copies home/config/goose-config.yaml from the install tree to
-    ~/.config/goose/config.yaml so that `goose acp` picks up the
+    Copies config/goose-config.yaml from the install tree to
+    `~/.config/goose/config.yaml` so that `goose acp` picks up the
     right extension settings. The directory is created if it does
     not exist. Only called when AGENT_BACKEND=goose.
     """
     svc_home = Path(_user_home(service_user))
     goose_dir = svc_home / ".config" / "goose"
     dst = goose_dir / "config.yaml"
-    src = install_path / "home" / "config" / "goose-config.yaml"
+    src = install_path / "config" / "goose-config.yaml"
 
     # Check before dry_run so a missing template is caught during
     # pre-validation, not only on the real install run.
