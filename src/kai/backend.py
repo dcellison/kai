@@ -621,8 +621,20 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
     # instead of 0o755. That blocks group traversal and can break the
     # inner subprocess when sudo -u targets a different identity. Force
     # the intended bits explicitly - this is the same pattern install.py
-    # `_apply_migrate` uses after its mkdir calls. Idempotent on reuse.
-    os.chmod(path, 0o755)
+    # `_apply_migrate` uses after its mkdir calls.
+    #
+    # Swallow OSError because in a multi-user install the directory has
+    # already been chowned to the user's os_user (different from the
+    # service user) by install.py `_apply_migrate`, and macOS chmod(2)
+    # returns EPERM for any non-owner non-root caller even when the
+    # target mode equals the current mode. The umask defense only
+    # matters when *this* call creates the directory; a pre-existing
+    # dir is the install's responsibility to set perms on, and the
+    # sibling bootstraps below already use the same swallow pattern.
+    try:
+        os.chmod(path, 0o755)
+    except OSError:
+        pass
 
     # Lazy bootstrap of `<home>/.claude/CLAUDE.md`. Parallel to
     # ensure_user_memory and ensure_user_preferences: stat, possible

@@ -8,6 +8,7 @@ and the ApiContext/AgentResponse/StreamEvent data types. These functions are pur
 """
 
 import logging
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -803,6 +804,46 @@ class TestEnsureUserHome:
         assert claude_dst.is_file()
         # Placeholder mirrors the MEMORY.md / PREFERENCES.md precedent.
         assert claude_dst.read_text() == "# Identity\n"
+
+    def test_chmod_eperm_does_not_crash(self, tmp_path):
+        """
+        Regression for issue #454-adjacent install bug: when the per-user
+        home directory already exists owned by a different OS user
+        (because install.py `_apply_migrate` chowned it to the user's
+        `os_user`), the chmod call must NOT propagate EPERM. macOS
+        chmod(2) returns EPERM for any non-owner non-root caller, even
+        when the target mode equals the current mode, so the chmod-as-
+        no-op trick is not safe in a multi-user install.
+
+        Without the swallow, `pool.get` → `_create_instance` →
+        `resolve_home_workspace` → `ensure_user_home` raises, the bot
+        cannot create the per-user backend, and every Telegram message
+        for that chat fails with "Claude process died" with no further
+        diagnostic.
+        """
+        # The directory exists when ensure_user_home is called (parents=
+        # True + exist_ok=True mirrors that path). chmod then raises.
+        target = tmp_path / "home" / "12345"
+        target.mkdir(parents=True)
+
+        real_chmod = os.chmod
+
+        def chmod_eperm(path, mode, **kwargs):
+            # Match the production failure shape: EPERM only on the
+            # per-user dir we are trying to harden; let any other chmod
+            # call (e.g. inside the .claude/ seed branch via shutil.copy2)
+            # fall through to the real implementation. The **kwargs catch
+            # is needed because shutil.copy2 passes follow_symlinks=True.
+            if str(path) == str(target):
+                raise PermissionError(1, "Operation not permitted", str(path))
+            real_chmod(path, mode, **kwargs)
+
+        with patch("kai.backend.os.chmod", side_effect=chmod_eperm):
+            # Must not raise. The caller depends on this returning the
+            # path so the session context build can proceed.
+            result = ensure_user_home(12345, tmp_path)
+
+        assert result == target
 
     def test_seed_swallows_oserror(self, tmp_path):
         """

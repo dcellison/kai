@@ -348,20 +348,43 @@ class TestGenerateSudoers:
         result = _generate_sudoers("kai")
         assert "claude" not in result
 
-    def test_claude_user_rule_with_which(self, monkeypatch):
-        """Uses shutil.which to resolve the claude binary location."""
-        real_which = shutil.which
-        monkeypatch.setattr(shutil, "which", lambda n: "/usr/local/bin/claude" if n == "claude" else real_which(n))
-        result = _generate_sudoers("kai", claude_user="alice")
-        assert "kai ALL=(alice) SETENV: NOPASSWD: /usr/local/bin/claude" in result
-
-    def test_claude_user_rule_fallback(self, monkeypatch):
-        """Falls back to service user home when claude is not on PATH."""
+    def test_claude_user_rule_anchored_to_service_user_home(self, monkeypatch):
+        """
+        The rule's claude binary path is anchored to the SERVICE user's
+        home (~/.local/bin/claude under the service user, NOT the target
+        user), because the bot's runtime spawn is `sudo -u <target> --
+        claude` and sudo resolves the bare `claude` against the caller's
+        (service user's) PATH. The rule path must match what sudo will
+        actually try to execute.
+        """
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
-        real_which = shutil.which
-        monkeypatch.setattr(shutil, "which", lambda n: None if n == "claude" else real_which(n))
         result = _generate_sudoers("kai", claude_user="alice")
         assert "kai ALL=(alice) SETENV: NOPASSWD: /home/kai/.local/bin/claude" in result
+
+    def test_claude_bin_ignores_caller_path(self, monkeypatch):
+        """
+        Regression for issue #454-adjacent install bug: the rule's claude
+        binary path must NOT depend on whatever PATH the install caller
+        happens to have. Pre-fix, `shutil.which("claude")` resolved
+        against root's PATH at install time and silently baked a
+        non-service-user binary path into the rule (e.g. when `sudo make
+        install` was launched from a shell with another user's
+        `~/.local/bin` on PATH), breaking the bot's sudo dispatch on
+        every subsequent message.
+        """
+        monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
+        # Caller's PATH would resolve `claude` to a completely different
+        # location; the generator must ignore this and anchor on the
+        # service user's home.
+        real_which = shutil.which
+        monkeypatch.setattr(
+            shutil,
+            "which",
+            lambda n: "/some/other/users/local/bin/claude" if n == "claude" else real_which(n),
+        )
+        result = _generate_sudoers("kai", claude_user="alice")
+        assert "/home/kai/.local/bin/claude" in result
+        assert "/some/other/users/local/bin/claude" not in result
 
     # -- Issue #341: per-user rules from users.yaml -----------------------
 
@@ -375,28 +398,23 @@ class TestGenerateSudoers:
     def test_one_os_user_emits_one_rule(self, monkeypatch):
         """Acceptance (b): one os_user → one matching rule."""
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
-        real_which = shutil.which
-        monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/claude" if n == "claude" else real_which(n))
         result = _generate_sudoers("kai", os_users=["sellison"])
-        assert result.count("SETENV: NOPASSWD: /usr/bin/claude") == 1
-        assert "kai ALL=(sellison) SETENV: NOPASSWD: /usr/bin/claude" in result
+        assert result.count("SETENV: NOPASSWD: /home/kai/.local/bin/claude") == 1
+        assert "kai ALL=(sellison) SETENV: NOPASSWD: /home/kai/.local/bin/claude" in result
 
     def test_multiple_os_users_emit_one_rule_each(self, monkeypatch):
         """Acceptance (c): multiple distinct os_users → one rule each."""
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
-        real_which = shutil.which
-        monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/claude" if n == "claude" else real_which(n))
         result = _generate_sudoers("kai", os_users=["sellison", "bob", "carol"])
-        assert "kai ALL=(sellison) SETENV: NOPASSWD: /usr/bin/claude" in result
-        assert "kai ALL=(bob) SETENV: NOPASSWD: /usr/bin/claude" in result
-        assert "kai ALL=(carol) SETENV: NOPASSWD: /usr/bin/claude" in result
-        assert result.count("SETENV: NOPASSWD: /usr/bin/claude") == 3
+        bin_path = "/home/kai/.local/bin/claude"
+        assert f"kai ALL=(sellison) SETENV: NOPASSWD: {bin_path}" in result
+        assert f"kai ALL=(bob) SETENV: NOPASSWD: {bin_path}" in result
+        assert f"kai ALL=(carol) SETENV: NOPASSWD: {bin_path}" in result
+        assert result.count(f"SETENV: NOPASSWD: {bin_path}") == 3
 
     def test_duplicate_os_users_deduped(self, monkeypatch):
         """Acceptance (c, dedupe): repeated os_user values produce one rule."""
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
-        real_which = shutil.which
-        monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/claude" if n == "claude" else real_which(n))
         result = _generate_sudoers("kai", os_users=["sellison", "sellison", "bob"])
         assert result.count("(sellison)") == 1
         assert result.count("(bob)") == 1
@@ -404,20 +422,17 @@ class TestGenerateSudoers:
     def test_os_user_matching_service_user_skipped(self, monkeypatch):
         """Acceptance (d): os_user == service_user → no rule (self-sudo path)."""
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
-        real_which = shutil.which
-        monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/claude" if n == "claude" else real_which(n))
         result = _generate_sudoers("kai", os_users=["kai", "sellison"])
         # No self-sudo rule: kai ALL=(kai) would be a dead rule, since
         # resolve_claude_user() short-circuits the sudo wrapper at runtime.
         assert "kai ALL=(kai)" not in result
-        assert "kai ALL=(sellison) SETENV: NOPASSWD: /usr/bin/claude" in result
-        assert result.count("SETENV: NOPASSWD: /usr/bin/claude") == 1
+        bin_path = "/home/kai/.local/bin/claude"
+        assert f"kai ALL=(sellison) SETENV: NOPASSWD: {bin_path}" in result
+        assert result.count(f"SETENV: NOPASSWD: {bin_path}") == 1
 
     def test_legacy_claude_user_combined_with_os_users(self, monkeypatch):
         """Legacy CLAUDE_USER and yaml os_users coexist; deduped."""
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
-        real_which = shutil.which
-        monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/claude" if n == "claude" else real_which(n))
         # claude_user and os_users overlap on "alice"; should produce one rule.
         result = _generate_sudoers("kai", claude_user="alice", os_users=["alice", "bob"])
         assert result.count("(alice)") == 1

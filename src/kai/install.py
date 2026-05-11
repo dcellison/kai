@@ -1657,11 +1657,18 @@ def _generate_sudoers(
         target_users.append(candidate)
 
     if target_users:
-        # Resolve the actual binary location; fall back to the native installer's
-        # default path under the service user's home if claude is not on PATH
-        # (e.g., when running under sudo with a stripped environment).
+        # Anchor the rule path to the SERVICE user's claude install. The
+        # bot spawns `sudo -u <target> -- claude` and sudo resolves the
+        # bare `claude` against the caller's PATH (the service user's,
+        # not the target's), so the rule must reference the service
+        # user's binary. shutil.which("claude") used to be the first
+        # half of this expression but resolved against whatever PATH
+        # root happened to have when `sudo make install` ran - which
+        # picked up any user's `~/.local/bin/claude` that happened to
+        # be on PATH at install time, baking the wrong path into the
+        # rule and breaking the bot's sudo dispatch.
         svc_home = _user_home(service_user)
-        claude_bin = shutil.which("claude") or f"{svc_home}/.local/bin/claude"
+        claude_bin = f"{svc_home}/.local/bin/claude"
         # SETENV: allows the service user to pass env vars (e.g.,
         # KAI_WEBHOOK_SECRET) through sudo to the claude process.
         # Scoped to per-user rules only; cat/tee rules remain locked down.
