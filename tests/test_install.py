@@ -4929,7 +4929,8 @@ class TestApplyMigratePerOsUserTmpdir:
                 users_yaml_path=Path(users_yaml),
             )
             first_output = capsys.readouterr().out
-            assert "Created" in first_output and "tmp/alice" in first_output
+            assert "Created" in first_output
+            assert "tmp/alice" in first_output
 
             _apply_migrate(
                 data_path,
