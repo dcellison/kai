@@ -1669,11 +1669,22 @@ def _generate_sudoers(
         # rule and breaking the bot's sudo dispatch.
         svc_home = _user_home(service_user)
         claude_bin = f"{svc_home}/.local/bin/claude"
+        # kill(1) for the cross-user kill escalation (#456). The bot
+        # runs `sudo -n -u <target> kill -<sig> <pid>` against the
+        # inner claude grandchild because POSIX signal permissions
+        # prevent the service user from signaling a target-user
+        # process directly. Resolve via shutil.which() so we pick up
+        # /bin/kill (macOS) or /usr/bin/kill (Linux); fall back to
+        # /bin/kill which exists on both.
+        kill_bin = shutil.which("kill") or "/bin/kill"
         # SETENV: allows the service user to pass env vars (e.g.,
         # KAI_WEBHOOK_SECRET) through sudo to the claude process.
-        # Scoped to per-user rules only; cat/tee rules remain locked down.
+        # Scoped to the claude rule only; the kill rule does not
+        # need SETENV (kill ignores env entirely), and the cat/tee
+        # config-read rules above remain locked down.
         for target in target_users:
             rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {claude_bin}\n"
+            rules += f"{service_user} ALL=({target}) NOPASSWD: {kill_bin}\n"
 
     return rules
 

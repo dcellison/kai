@@ -17,6 +17,7 @@ import json
 import os
 import pwd
 import signal
+import subprocess
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -615,6 +616,146 @@ class TestProcessSignals:
 
         # Should not raise
         claude.force_kill()
+
+    # -- Issue #456: cross-user signal escalation ------------------------
+
+    def test_send_signal_cross_user_escalates_via_sudo(self):
+        """
+        Cross-user mode: when _effective_claude_user is set and
+        _lookup_inner_claude_pid returns a PID, _send_signal calls
+        `sudo -n -u <target> kill -<sig> <pid>` BEFORE the killpg of
+        the sudo wrapper. Without this, killpg reaps sudo and leaves
+        the daniel-owned claude grandchild orphaned to init because
+        the kai service user cannot signal it under POSIX rules.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+        claude._pgid = 12345
+        claude._effective_claude_user = "daniel"
+
+        with (
+            patch.object(claude, "_lookup_inner_claude_pid", return_value=99999),
+            patch("kai.claude.subprocess.run") as mock_run,
+            patch("os.killpg") as mock_killpg,
+        ):
+            claude._send_signal(signal.SIGKILL)
+
+            # sudo -n -u daniel kill -<sig> 99999
+            assert mock_run.call_count == 1
+            args, kwargs = mock_run.call_args
+            cmd = args[0]
+            assert cmd[:5] == ["sudo", "-n", "-u", "daniel", "kill"]
+            assert cmd[5] == f"-{signal.SIGKILL}"
+            assert cmd[6] == "99999"
+            assert kwargs.get("check") is False
+            # Wrapper still gets killpg.
+            mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
+
+    def test_send_signal_cross_user_no_inner_pid_falls_through(self):
+        """
+        When _lookup_inner_claude_pid returns None (sudo hasn't forked
+        yet, or pgrep failed), the sudo-kill is skipped and only the
+        wrapper killpg fires. This is the pre-spawn race window or
+        the "sudo died with no child" case.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+        claude._pgid = 12345
+        claude._effective_claude_user = "daniel"
+
+        with (
+            patch.object(claude, "_lookup_inner_claude_pid", return_value=None),
+            patch("kai.claude.subprocess.run") as mock_run,
+            patch("os.killpg") as mock_killpg,
+        ):
+            claude._send_signal(signal.SIGKILL)
+
+            mock_run.assert_not_called()
+            mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
+
+    def test_send_signal_cross_user_caches_inner_pid(self):
+        """
+        _lookup_inner_claude_pid is called only once across multiple
+        _send_signal invocations - the result is cached on
+        _inner_claude_pid so a later signal after sudo is reaped (and
+        pgrep can no longer find the child) still has the handle.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+        claude._pgid = 12345
+        claude._effective_claude_user = "daniel"
+
+        with (
+            patch.object(claude, "_lookup_inner_claude_pid", return_value=99999) as mock_lookup,
+            patch("kai.claude.subprocess.run"),
+            patch("os.killpg"),
+        ):
+            claude._send_signal(signal.SIGTERM)
+            claude._send_signal(signal.SIGKILL)
+
+            # pgrep happened on the first signal only; second reused
+            # the cached _inner_claude_pid (which survives sudo death).
+            mock_lookup.assert_called_once()
+
+    def test_send_signal_single_user_does_not_call_subprocess(self):
+        """
+        Single-user mode (no _effective_claude_user): the sudo-kill
+        path is skipped entirely. No pgrep, no subprocess.run. This
+        is the back-compat case for installs without an os_user
+        configured for a chat.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+        claude._pgid = 12345
+        # _effective_claude_user left as None - single-user-equivalent
+        # path even though _pgid is set (e.g., a stale instance after
+        # restart from cross-user to same-user mode).
+        claude._effective_claude_user = None
+
+        with (
+            patch.object(claude, "_lookup_inner_claude_pid") as mock_lookup,
+            patch("kai.claude.subprocess.run") as mock_run,
+            patch("os.killpg") as mock_killpg,
+        ):
+            claude._send_signal(signal.SIGKILL)
+
+            mock_lookup.assert_not_called()
+            mock_run.assert_not_called()
+            mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
+
+    def test_send_signal_sudo_kill_swallows_failures(self):
+        """
+        subprocess.run raising TimeoutExpired or OSError must not
+        propagate - the killpg fallback must still fire. These cover
+        the cases where the kill binary hangs (system pathology) or
+        the sudoers rule is missing from an old install.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+        claude._pgid = 12345
+        claude._effective_claude_user = "daniel"
+
+        with (
+            patch.object(claude, "_lookup_inner_claude_pid", return_value=99999),
+            patch(
+                "kai.claude.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd="sudo", timeout=5),
+            ),
+            patch("os.killpg") as mock_killpg,
+        ):
+            # Must not raise.
+            claude._send_signal(signal.SIGKILL)
+            mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
 
 
 # ── Properties ───────────────────────────────────────────────────────
@@ -1938,6 +2079,225 @@ class TestKill:
 
             # No additional killpg calls from the second _kill()
             assert mock_killpg.call_count == first_call_count
+
+    # -- Issue #456: cross-user kill escalation ----------------------
+
+    @pytest.mark.asyncio
+    async def test_kill_primes_inner_pid_cache_before_signaling(self):
+        """
+        _kill must look up the inner claude PID BEFORE the first
+        signal. Once killpg reaps the sudo wrapper, pgrep on the
+        dead sudo PID returns nothing - the cache primed here is
+        the only handle the final-cleanup pass has on the orphaned
+        grandchild.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+        claude._pgid = 12345
+        claude._effective_claude_user = "daniel"
+
+        # Track the order: lookup must come before send_signal/killpg.
+        call_order: list[str] = []
+
+        def lookup_records():
+            call_order.append("lookup")
+            return 99999
+
+        with (
+            patch.object(claude, "_lookup_inner_claude_pid", side_effect=lookup_records),
+            patch("kai.claude.subprocess.run") as mock_run,
+            patch("os.killpg") as mock_killpg,
+        ):
+            mock_killpg.side_effect = lambda *_a, **_k: call_order.append("killpg")
+            mock_run.side_effect = lambda *_a, **_k: call_order.append("sudo_kill")
+            await claude._kill()
+
+        # First event must be the lookup; killpg must come after.
+        assert call_order[0] == "lookup"
+        assert "killpg" in call_order
+        assert call_order.index("lookup") < call_order.index("killpg")
+
+    @pytest.mark.asyncio
+    async def test_kill_final_cleanup_escalates_via_sudo(self):
+        """
+        After the main _send_signal/wait/killpg sequence finishes,
+        _kill issues a final `sudo -n -u <target> kill -9 <pid>`
+        for the cached inner claude PID. This is the belt-and-
+        suspenders pass that catches a daniel-owned grandchild that
+        survived the killpg above (POSIX signal-permission gap).
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+        claude._pgid = 12345
+        claude._effective_claude_user = "daniel"
+
+        with (
+            patch.object(claude, "_lookup_inner_claude_pid", return_value=99999),
+            patch("kai.claude.subprocess.run") as mock_run,
+            patch("os.killpg"),
+        ):
+            await claude._kill()
+
+        # subprocess.run called at least twice: once during
+        # _send_signal's per-signal escalation, once at the final
+        # cleanup. The final-cleanup invocation uses SIGKILL (-9).
+        cmds = [call.args[0] for call in mock_run.call_args_list]
+        final_cleanup = [c for c in cmds if c[-2] == "-9" and c[-1] == "99999"]
+        assert final_cleanup, f"no final sudo kill -9 99999 in calls: {cmds}"
+        # Every call must target the saved sudo user.
+        for cmd in cmds:
+            assert cmd[:5] == ["sudo", "-n", "-u", "daniel", "kill"]
+
+    @pytest.mark.asyncio
+    async def test_kill_skips_sudo_when_inner_pid_unknown(self):
+        """
+        If _lookup_inner_claude_pid never returns a PID (sudo died
+        before forking, or pgrep failed every time), the final
+        cleanup must not call sudo - there is no target PID to
+        pass. killpg still fires as a best-effort wrapper reap.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+        claude._pgid = 12345
+        claude._effective_claude_user = "daniel"
+
+        with (
+            patch.object(claude, "_lookup_inner_claude_pid", return_value=None),
+            patch("kai.claude.subprocess.run") as mock_run,
+            patch("os.killpg") as mock_killpg,
+        ):
+            await claude._kill()
+
+        mock_run.assert_not_called()
+        # killpg still fires (initial + final) so any signalable
+        # process in the group (the sudo wrapper) gets reaped.
+        assert mock_killpg.called
+
+    @pytest.mark.asyncio
+    async def test_kill_skips_sudo_in_single_user_mode(self):
+        """
+        Single-user mode (no _effective_claude_user) takes the
+        non-sudo path entirely. The whole _send_signal cross-user
+        branch is bypassed and no subprocess.run is issued.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+        claude._pgid = 12345
+        # _effective_claude_user stays None - this models a stale
+        # instance where the spawn flow never set it (legacy code
+        # path), or single-user mode where resolve_claude_user()
+        # short-circuited the sudo wrapper.
+        claude._effective_claude_user = None
+
+        with (
+            patch.object(claude, "_lookup_inner_claude_pid") as mock_lookup,
+            patch("kai.claude.subprocess.run") as mock_run,
+            patch("os.killpg"),
+        ):
+            await claude._kill()
+
+        mock_lookup.assert_not_called()
+        mock_run.assert_not_called()
+
+
+# ── _lookup_inner_claude_pid ─────────────────────────────────────────
+
+
+class TestLookupInnerClaudePid:
+    """
+    pgrep-based PID discovery for the cross-user kill escalation
+    (#456). The bot spawns `sudo -u <target> -- claude`; sudo
+    fork+execs claude as its sole child, so pgrep -P <sudo_pid>
+    returns the claude PID.
+    """
+
+    def test_returns_none_when_proc_is_none(self):
+        """No subprocess -> no PID to look up."""
+        claude = _make_claude(claude_user="daniel")
+        assert claude._lookup_inner_claude_pid() is None
+
+    def test_parses_pgrep_stdout(self):
+        """A single PID line from pgrep is parsed to an int."""
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+
+        completed = MagicMock(returncode=0, stdout="99999\n")
+        with patch("kai.claude.subprocess.run", return_value=completed):
+            assert claude._lookup_inner_claude_pid() == 99999
+
+    def test_returns_none_on_pgrep_nonzero_exit(self):
+        """pgrep returns 1 when no child matches; we treat as 'no PID'."""
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+
+        completed = MagicMock(returncode=1, stdout="")
+        with patch("kai.claude.subprocess.run", return_value=completed):
+            assert claude._lookup_inner_claude_pid() is None
+
+    def test_returns_none_on_empty_stdout(self):
+        """pgrep success but no output (race: sudo not yet forked)."""
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+
+        completed = MagicMock(returncode=0, stdout="   \n")
+        with patch("kai.claude.subprocess.run", return_value=completed):
+            assert claude._lookup_inner_claude_pid() is None
+
+    def test_handles_pgrep_timeout(self):
+        """A hung pgrep must not propagate."""
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+
+        with patch(
+            "kai.claude.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="pgrep", timeout=2),
+        ):
+            assert claude._lookup_inner_claude_pid() is None
+
+    def test_handles_pgrep_oserror(self):
+        """OSError (e.g., pgrep binary missing) returns None silently."""
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+
+        with patch("kai.claude.subprocess.run", side_effect=OSError("no pgrep")):
+            assert claude._lookup_inner_claude_pid() is None
+
+    def test_first_line_when_pgrep_returns_multiple(self):
+        """
+        pgrep should return one child for sudo (it execs a single
+        target), but be defensive: take the first line if multiple
+        come back.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+
+        completed = MagicMock(returncode=0, stdout="99999\n11111\n")
+        with patch("kai.claude.subprocess.run", return_value=completed):
+            assert claude._lookup_inner_claude_pid() == 99999
 
 
 # ── shutdown ─────────────────────────────────────────────────────────

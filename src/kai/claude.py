@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -168,6 +169,8 @@ class ClaudeCodeBackend(AgentBackend):
 
         self._proc: asyncio.subprocess.Process | None = None
         self._pgid: int | None = None  # Process group ID for reliable signal delivery
+        self._inner_claude_pid: int | None = None  # Cross-user mode: PID of the claude grandchild under sudo (#456)
+        self._effective_claude_user: str | None = None  # Cross-user mode: the resolved sudo target (#456)
         self._lock = asyncio.Lock()  # Serializes all message sends
         self._session_id: str | None = None
         self._fresh_session = True  # True until the first message is sent
@@ -349,6 +352,16 @@ class ClaudeCodeBackend(AgentBackend):
         else:
             self._pgid = None
 
+        # Remember the resolved sudo target for cross-user signal escalation
+        # in _send_signal / _kill (#456). os.killpg from the service user
+        # cannot signal a target-user claude grandchild (POSIX EPERM); we
+        # need to escalate via `sudo -n -u <target> kill ...` instead, which
+        # requires us to know who to sudo to at signal time. _inner_claude_pid
+        # is reset to None here so a recycled instance does not carry a
+        # stale PID from a previous spawn into a fresh process tree.
+        self._effective_claude_user = effective_claude_user
+        self._inner_claude_pid = None
+
         # Drain stderr in background to prevent pipe buffer deadlock
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
@@ -371,6 +384,47 @@ class ClaudeCodeBackend(AgentBackend):
                 log.warning("Unexpected error in stderr drain", exc_info=True)
                 break
 
+    def _lookup_inner_claude_pid(self) -> int | None:
+        """
+        Find the inner claude subprocess PID in cross-user mode (#456).
+
+        In cross-user mode the bot spawns `sudo -u <target> -- claude ...`
+        and self._proc tracks the sudo wrapper. sudo fork+exec's claude
+        as its sole child, so pgrep -P <sudo_pid> returns the claude
+        PID. Returns None when:
+        - no sudo wrapper is alive (single-user mode, or sudo already
+          reaped),
+        - sudo has not yet forked (very early in the spawn lifecycle,
+          before claude exists), or
+        - pgrep is not available / errors out.
+
+        The result is cached on self._inner_claude_pid; callers that
+        need to signal after sudo has been killed must rely on the
+        cache (pgrep returns nothing on a reaped sudo). _kill primes
+        the cache before its first signal for this reason.
+        """
+        if self._proc is None:
+            return None
+        try:
+            result = subprocess.run(
+                ["pgrep", "-P", str(self._proc.pid)],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        first_line = result.stdout.strip().split("\n", 1)[0] if result.stdout.strip() else ""
+        if not first_line:
+            return None
+        try:
+            return int(first_line)
+        except ValueError:
+            return None
+
     def _send_signal(self, sig: int) -> None:
         """
         Send a signal to the Claude process (or process group if claude_user).
@@ -384,12 +438,57 @@ class ClaudeCodeBackend(AgentBackend):
         - claude_user path: os.killpg() raises OSError if the group is gone
         - direct path: send_signal() calls os.kill() which raises OSError
 
+        Cross-user mode (#456): os.killpg from the service user cannot
+        signal a target-user claude grandchild (POSIX signal permission
+        rules: real or effective UID must match real or saved set-user-ID
+        of the target). killpg succeeds for the sudo wrapper (real UID is
+        the service user) but the inner claude (real, effective, and
+        saved UIDs = target) survives and gets orphaned to init. To
+        avoid this, we escalate via `sudo -n -u <target> kill -<sig>
+        <pid>` for the inner claude BEFORE killpg reaps the sudo
+        wrapper. install.py's `_generate_sudoers` emits a per-target
+        `NOPASSWD: /bin/kill` rule for this path.
+
         Args:
             sig: Signal to send (e.g., signal.SIGTERM, signal.SIGKILL).
         """
         if self._pgid is not None:
-            # claude_user mode: signal the entire process group (sudo + claude)
-            # using the PGID saved at spawn time
+            # Cross-user mode: signal the inner claude through sudo
+            # escalation FIRST so killpg's reap of the sudo wrapper
+            # does not orphan it. Only attempt the lookup when we
+            # actually have a sudo target to escalate to; without
+            # _effective_claude_user there is no target to pass to
+            # `sudo -u` and pgrep would be a wasted call.
+            if self._effective_claude_user is not None:
+                if self._inner_claude_pid is None:
+                    self._inner_claude_pid = self._lookup_inner_claude_pid()
+                if self._inner_claude_pid is not None:
+                    try:
+                        subprocess.run(
+                            [
+                                "sudo",
+                                "-n",
+                                "-u",
+                                self._effective_claude_user,
+                                "kill",
+                                f"-{sig}",
+                                str(self._inner_claude_pid),
+                            ],
+                            capture_output=True,
+                            timeout=5,
+                            check=False,
+                        )
+                    except (subprocess.TimeoutExpired, OSError):
+                        # Inner claude already dead, sudo not allowed
+                        # (sudoers rule missing on an old install), or
+                        # the kill binary times out. Fall through to
+                        # killpg below - we did our best on the inner
+                        # process; the wrapper still needs reaping.
+                        pass
+            # Wrapper cleanup: signal the entire process group so
+            # the sudo parent is reaped regardless of whether the
+            # inner claude is signal-deliverable from the service
+            # user. Same OSError-swallow pattern as before.
             try:
                 os.killpg(self._pgid, sig)
             except OSError:
@@ -948,6 +1047,20 @@ class ClaudeCodeBackend(AgentBackend):
             # where sudo dies but claude survives the initial SIGKILL).
             saved_pgid = self._pgid
 
+            # Prime the inner-claude-PID cache BEFORE any signal goes
+            # out. Once the killpg below reaps the sudo wrapper,
+            # pgrep -P <dead_sudo_pid> returns nothing and we lose
+            # the only handle on the orphaned grandchild. The cache
+            # survives the _send_signal->killpg sequence so the
+            # final-cleanup sudo-kill below can still reach the
+            # inner claude. See issue #456. Only attempt when we
+            # actually have a sudo target to escalate to; without
+            # _effective_claude_user the lookup result is useless.
+            saved_user = self._effective_claude_user
+            if saved_user is not None and self._inner_claude_pid is None:
+                self._inner_claude_pid = self._lookup_inner_claude_pid()
+            saved_inner_pid = self._inner_claude_pid
+
             self._send_signal(signal.SIGKILL)
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
@@ -966,6 +1079,8 @@ class ClaudeCodeBackend(AgentBackend):
 
             self._proc = None
             self._pgid = None
+            self._inner_claude_pid = None
+            self._effective_claude_user = None
             self._session_id = None
             self._session_started_at = None
 
@@ -978,6 +1093,35 @@ class ClaudeCodeBackend(AgentBackend):
                 try:
                     os.killpg(saved_pgid, signal.SIGKILL)
                 except OSError:
+                    pass
+
+            # Final cross-user cleanup: even after the killpg above,
+            # the inner claude grandchild may still be alive because
+            # the service user cannot signal a target-user process
+            # (#456). Escalate via sudo to kill the captured PID
+            # directly. Skipped silently when:
+            # - single-user mode (no saved_user / saved_inner_pid),
+            # - pgrep failed to find a child PID at any point
+            #   (sudo never forked, or sudo died with no child),
+            # - the inner claude is already dead (sudo kill returns
+            #   ESRCH; sudo exits 1; we ignore via check=False).
+            if saved_user is not None and saved_inner_pid is not None:
+                try:
+                    subprocess.run(
+                        [
+                            "sudo",
+                            "-n",
+                            "-u",
+                            saved_user,
+                            "kill",
+                            "-9",
+                            str(saved_inner_pid),
+                        ],
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                    )
+                except (subprocess.TimeoutExpired, OSError):
                     pass
 
     async def shutdown(self) -> None:
@@ -1005,6 +1149,8 @@ class ClaudeCodeBackend(AgentBackend):
         # Note: _kill() (called from _send_locked error paths) does
         # NOT acquire _lock, so there is no deadlock risk.
         saved_pgid = None
+        saved_inner_pid: int | None = None
+        saved_user: str | None = None
         async with self._lock:
             if self._proc:
                 try:
@@ -1013,6 +1159,17 @@ class ClaudeCodeBackend(AgentBackend):
                     log.warning("save_prompt failed during shutdown; proceeding with termination", exc_info=True)
 
                 saved_pgid = self._pgid
+
+                # Prime the inner-claude-PID cache BEFORE the SIGTERM
+                # so the post-killpg cleanup below can still escalate
+                # via sudo even after the wrapper is reaped. Same
+                # rationale as _kill; see issue #456. Gated on
+                # _effective_claude_user because without a sudo
+                # target the lookup result is useless.
+                saved_user = self._effective_claude_user
+                if saved_user is not None and self._inner_claude_pid is None:
+                    self._inner_claude_pid = self._lookup_inner_claude_pid()
+                saved_inner_pid = self._inner_claude_pid
 
                 self._send_signal(signal.SIGTERM)
                 try:
@@ -1036,6 +1193,8 @@ class ClaudeCodeBackend(AgentBackend):
             # _proc=None and starts a fresh process via _ensure_started.
             self._proc = None
             self._pgid = None
+            self._inner_claude_pid = None
+            self._effective_claude_user = None
             self._session_started_at = None
 
         # Final cleanup: signal the saved process group one more time
@@ -1046,4 +1205,29 @@ class ClaudeCodeBackend(AgentBackend):
             try:
                 os.killpg(saved_pgid, signal.SIGKILL)
             except OSError:
+                pass
+
+        # Final cross-user cleanup: signal the captured inner claude
+        # PID via sudo escalation. See _kill for the full rationale;
+        # in summary, the service user cannot signal a target-user
+        # process directly, so killpg above can leave the inner
+        # claude orphaned to init. Skipped silently when the spawn
+        # was not in cross-user mode or pgrep never found a child.
+        if saved_user is not None and saved_inner_pid is not None:
+            try:
+                subprocess.run(
+                    [
+                        "sudo",
+                        "-n",
+                        "-u",
+                        saved_user,
+                        "kill",
+                        "-9",
+                        str(saved_inner_pid),
+                    ],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            except (subprocess.TimeoutExpired, OSError):
                 pass
