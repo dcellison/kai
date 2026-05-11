@@ -642,12 +642,19 @@ class TestProcessSignals:
         ):
             claude._send_signal(signal.SIGKILL)
 
-            # sudo -n -u daniel /bin/kill -<sig> 99999
+            # sudo -n -u daniel /bin/kill -9 99999. The "-9"
+            # literal (not f"-{signal.SIGKILL}") so the assertion
+            # is independent of the IntEnum __format__ change in
+            # Python 3.11: on older Pythons an f-string of
+            # signal.SIGKILL produces "Signals.SIGKILL", which
+            # would silently agree with a buggy production code
+            # path that did the same thing. The literal pins the
+            # intended POSIX numeric signal spec.
             assert mock_run.call_count == 1
             args, kwargs = mock_run.call_args
             cmd = args[0]
             assert cmd[:5] == ["sudo", "-n", "-u", "daniel", "/bin/kill"]
-            assert cmd[5] == f"-{signal.SIGKILL}"
+            assert cmd[5] == "-9"
             assert cmd[6] == "99999"
             assert kwargs.get("check") is False
             # Wrapper still gets killpg.
