@@ -2381,6 +2381,10 @@ def _apply_migrate(
     # the right ownership (chowned to their os_user via the
     # _set_ownership call) instead of service-owned-via-mkdir.
     home_template = PROJECT_ROOT / "templates" / ".claude" / "CLAUDE.md"
+    # Cache the template existence check once; the path is fixed for
+    # the duration of the loop and is_file() would otherwise stat the
+    # same inode N times for N users.
+    home_template_exists = home_template.is_file()
 
     for chat_id, _os_user in memory_owners:
         if chat_id is None:
@@ -2398,7 +2402,7 @@ def _apply_migrate(
 
         if dry_run:
             if not claude_dst.exists():
-                if home_template.is_file():
+                if home_template_exists:
                     print(f"[DRY RUN] Would seed {claude_dst} from {home_template}")
                 else:
                     print(f"[DRY RUN] Would seed {claude_dst} with placeholder (template missing)")
@@ -2416,15 +2420,27 @@ def _apply_migrate(
         # parent-dir chmod in the home-creation loop above.
         os.chmod(claude_dir, 0o755)
         if not claude_dst.exists():
-            if home_template.is_file():
-                shutil.copy2(home_template, claude_dst)
-                print(f"  Seeded {claude_dst} from CLAUDE.md template")
-            else:
-                # Last-resort placeholder so the inner Claude has
-                # something to read. Mirrors MEMORY.md / PREFERENCES.md
-                # missing-template precedent above.
-                claude_dst.write_text("# Identity\n")
-                print(f"  WARNING: {home_template} not found; wrote placeholder to {claude_dst}")
+            # Wrap the actual file write in try/except so an OSError
+            # (broken symlink at claude_dst, mounted FS, permissions)
+            # surfaces with a clear operator-readable line BEFORE the
+            # traceback aborts the install. Matches the rmtree wrap
+            # in `_retire_install_home_claude`; install-time policy
+            # is to abort loudly on a real error, not log-and-continue
+            # (that swallow is `backend.ensure_user_home`'s contract
+            # for the runtime path where session-init cannot crash).
+            try:
+                if home_template_exists:
+                    shutil.copy2(home_template, claude_dst)
+                    print(f"  Seeded {claude_dst} from CLAUDE.md template")
+                else:
+                    # Last-resort placeholder so the inner Claude has
+                    # something to read. Mirrors MEMORY.md / PREFERENCES.md
+                    # missing-template precedent above.
+                    claude_dst.write_text("# Identity\n")
+                    print(f"  WARNING: {home_template} not found; wrote placeholder to {claude_dst}")
+            except OSError as exc:
+                print(f"  ERROR: could not seed {claude_dst}: {exc}")
+                raise
 
         # Recursive chown over the .claude/ subdir so both the
         # directory and the freshly-seeded CLAUDE.md land on the
