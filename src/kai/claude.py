@@ -480,7 +480,7 @@ class ClaudeCodeBackend(AgentBackend):
                         # Production runs 3.13 so the f-string would
                         # do the right thing here, but the int()
                         # cast is the contract regardless of version.
-                        subprocess.run(
+                        result = subprocess.run(
                             [
                                 "sudo",
                                 "-n",
@@ -494,6 +494,24 @@ class ClaudeCodeBackend(AgentBackend):
                             timeout=5,
                             check=False,
                         )
+                        # Surface non-zero sudo exits at WARNING.
+                        # The original orphan-leak (#456) was
+                        # invisible at INFO because the inherited
+                        # OSError swallow had no log line; the
+                        # check=False + silent return on a missing
+                        # NOPASSWD rule would recreate the same
+                        # blind spot here. ESRCH from a kill on
+                        # an already-dead PID is the most common
+                        # benign nonzero, but it is uncommon
+                        # enough on a healthy spawn that flagging
+                        # it is cheaper than the next "we did not
+                        # know it was orphaning" forensic round.
+                        if result.returncode != 0:
+                            log.warning(
+                                "sudo kill escalation failed (rc=%d, stderr=%r); inner claude may orphan",
+                                result.returncode,
+                                result.stderr[:200].decode(errors="replace") if result.stderr else "",
+                            )
                     except (subprocess.TimeoutExpired, OSError):
                         # Inner claude already dead, sudo not allowed
                         # (sudoers rule missing on an old install), or
@@ -1126,7 +1144,7 @@ class ClaudeCodeBackend(AgentBackend):
                     # /bin/kill (not bare "kill") so sudo cannot
                     # resolve to a different binary than the
                     # sudoers rule names. See #458 review.
-                    subprocess.run(
+                    result = subprocess.run(
                         [
                             "sudo",
                             "-n",
@@ -1140,6 +1158,13 @@ class ClaudeCodeBackend(AgentBackend):
                         timeout=5,
                         check=False,
                     )
+                    if result.returncode != 0:
+                        log.warning(
+                            "final-cleanup sudo kill -9 failed (rc=%d, stderr=%r); inner claude pid=%d may orphan",
+                            result.returncode,
+                            result.stderr[:200].decode(errors="replace") if result.stderr else "",
+                            saved_inner_pid,
+                        )
                 except (subprocess.TimeoutExpired, OSError):
                     pass
 
@@ -1237,7 +1262,7 @@ class ClaudeCodeBackend(AgentBackend):
                 # /bin/kill absolute path so sudo's secure_path
                 # resolution matches the sudoers rule exactly.
                 # See #458 review.
-                subprocess.run(
+                result = subprocess.run(
                     [
                         "sudo",
                         "-n",
@@ -1251,5 +1276,12 @@ class ClaudeCodeBackend(AgentBackend):
                     timeout=5,
                     check=False,
                 )
+                if result.returncode != 0:
+                    log.warning(
+                        "shutdown sudo kill -9 failed (rc=%d, stderr=%r); inner claude pid=%d may orphan",
+                        result.returncode,
+                        result.stderr[:200].decode(errors="replace") if result.stderr else "",
+                        saved_inner_pid,
+                    )
             except (subprocess.TimeoutExpired, OSError):
                 pass

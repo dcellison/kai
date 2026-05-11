@@ -2113,13 +2113,19 @@ class TestKill:
             call_order.append("lookup")
             return 99999
 
+        # Return a returncode=0 mock from subprocess.run so the new
+        # diagnostic-log check in production code does not trip on
+        # MagicMock's default truthiness for an unset attribute.
+        def run_records(*_a, **_k):
+            call_order.append("sudo_kill")
+            return MagicMock(returncode=0)
+
         with (
             patch.object(claude, "_lookup_inner_claude_pid", side_effect=lookup_records),
-            patch("kai.claude.subprocess.run") as mock_run,
+            patch("kai.claude.subprocess.run", side_effect=run_records),
             patch("os.killpg") as mock_killpg,
         ):
             mock_killpg.side_effect = lambda *_a, **_k: call_order.append("killpg")
-            mock_run.side_effect = lambda *_a, **_k: call_order.append("sudo_kill")
             await claude._kill()
 
         # First event must be the lookup; killpg must come after.
@@ -2519,13 +2525,19 @@ class TestShutdown:
             call_order.append("lookup")
             return 99999
 
+        # Return a returncode=0 mock so the new diagnostic-log
+        # check in production does not trip on MagicMock's default
+        # truthiness for an unset attribute.
+        def run_records(*_a, **_k):
+            call_order.append("sudo_kill")
+            return MagicMock(returncode=0)
+
         with (
             patch.object(claude, "_lookup_inner_claude_pid", side_effect=lookup_records),
-            patch("kai.claude.subprocess.run") as mock_run,
+            patch("kai.claude.subprocess.run", side_effect=run_records),
             patch("os.killpg") as mock_killpg,
         ):
             mock_killpg.side_effect = lambda *_a, **_k: call_order.append("killpg")
-            mock_run.side_effect = lambda *_a, **_k: call_order.append("sudo_kill")
             await claude.shutdown()
 
         assert call_order[0] == "lookup"
