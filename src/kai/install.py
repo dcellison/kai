@@ -3073,7 +3073,7 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
         # live cleanup at the end of this function so the operator
         # sees what would happen on an existing-install upgrade
         # where `<install>/home/config/` still exists.
-        _retire_install_home_dir(install_path, dry_run=True)
+        _retire_install_home_dir(install_path, dry_run=dry_run)
         return
 
     _copy_tree(src_src, src_dst, _SOURCE_EXCLUDES)
@@ -3101,8 +3101,10 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     # install nothing under it exists; on an existing-install upgrade
     # the cleanup above has already removed `.claude/` and `IDENTITY.md`,
     # and the goose-config relocation left an orphan `home/config/`.
-    # The helper handles both end states.
-    _retire_install_home_dir(install_path, dry_run=False)
+    # The helper handles both end states. `dry_run` is propagated
+    # rather than hardcoded so a future restructure of the early
+    # return above cannot silently suppress dry-run output here.
+    _retire_install_home_dir(install_path, dry_run=dry_run)
 
 
 def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
