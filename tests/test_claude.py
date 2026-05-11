@@ -2106,23 +2106,22 @@ class TestKill:
         claude._pgid = 12345
         claude._effective_claude_user = "daniel"
 
-        # Track the order: lookup must come before send_signal/killpg.
+        # Track the order: lookup must come before sudo_kill/killpg.
+        # #459 routed _kill through the async helpers, so we patch
+        # the async versions (and _async_sudo_kill so the final-
+        # cleanup pass is recorded too).
         call_order: list[str] = []
 
-        def lookup_records():
+        async def lookup_records():
             call_order.append("lookup")
             return 99999
 
-        # Return a returncode=0 mock from subprocess.run so the new
-        # diagnostic-log check in production code does not trip on
-        # MagicMock's default truthiness for an unset attribute.
-        def run_records(*_a, **_k):
+        async def sudo_kill_records(*_a, **_k):
             call_order.append("sudo_kill")
-            return MagicMock(returncode=0)
 
         with (
-            patch.object(claude, "_lookup_inner_claude_pid", side_effect=lookup_records),
-            patch("kai.claude.subprocess.run", side_effect=run_records),
+            patch.object(claude, "_async_lookup_inner_claude_pid", side_effect=lookup_records),
+            patch.object(claude, "_async_sudo_kill", side_effect=sudo_kill_records),
             patch("os.killpg") as mock_killpg,
         ):
             mock_killpg.side_effect = lambda *_a, **_k: call_order.append("killpg")
@@ -2136,11 +2135,13 @@ class TestKill:
     @pytest.mark.asyncio
     async def test_kill_final_cleanup_escalates_via_sudo(self):
         """
-        After the main _send_signal/wait/killpg sequence finishes,
-        _kill issues a final `sudo -n -u <target> kill -9 <pid>`
-        for the cached inner claude PID. This is the belt-and-
-        suspenders pass that catches a daniel-owned grandchild that
-        survived the killpg above (POSIX signal-permission gap).
+        After the main signal/wait/killpg sequence finishes, _kill
+        issues a final `sudo -n -u <target> /bin/kill -9 <pid>` for
+        the cached inner claude PID. This is the belt-and-
+        suspenders pass that catches a daniel-owned grandchild
+        that survived the killpg above (POSIX signal-permission
+        gap). #459 moved this off the event loop; we assert the
+        async helper is invoked with the right args.
         """
         claude = _make_claude(claude_user="daniel")
         mock_proc = MagicMock()
@@ -2150,31 +2151,33 @@ class TestKill:
         claude._pgid = 12345
         claude._effective_claude_user = "daniel"
 
+        mock_sudo_kill = AsyncMock()
         with (
-            patch.object(claude, "_lookup_inner_claude_pid", return_value=99999),
-            patch("kai.claude.subprocess.run") as mock_run,
+            patch.object(claude, "_async_lookup_inner_claude_pid", new=AsyncMock(return_value=99999)),
+            patch.object(claude, "_async_sudo_kill", new=mock_sudo_kill),
             patch("os.killpg"),
         ):
             await claude._kill()
 
-        # subprocess.run called at least twice: once during
-        # _send_signal's per-signal escalation, once at the final
-        # cleanup. The final-cleanup invocation uses SIGKILL (-9).
-        cmds = [call.args[0] for call in mock_run.call_args_list]
-        final_cleanup = [c for c in cmds if c[-2] == "-9" and c[-1] == "99999"]
-        assert final_cleanup, f"no final sudo kill -9 99999 in calls: {cmds}"
-        # Every call must target the saved sudo user with the
-        # absolute /bin/kill path.
-        for cmd in cmds:
-            assert cmd[:5] == ["sudo", "-n", "-u", "daniel", "/bin/kill"]
+        # _async_sudo_kill called at least twice: once during the
+        # per-signal escalation (in _async_send_signal_for_close)
+        # and once at the final cleanup. Both go to daniel with
+        # SIGKILL and PID 99999.
+        calls = mock_sudo_kill.await_args_list
+        assert len(calls) >= 2, f"expected >= 2 sudo-kill calls, got {len(calls)}: {calls}"
+        for call in calls:
+            args = call.args
+            assert args[0] == "daniel"
+            assert args[1] == 99999
+            assert args[2] == int(signal.SIGKILL)
 
     @pytest.mark.asyncio
     async def test_kill_skips_sudo_when_inner_pid_unknown(self):
         """
-        If _lookup_inner_claude_pid never returns a PID (sudo died
-        before forking, or pgrep failed every time), the final
-        cleanup must not call sudo - there is no target PID to
-        pass. killpg still fires as a best-effort wrapper reap.
+        If _async_lookup_inner_claude_pid never returns a PID (sudo
+        died before forking, or pgrep failed every time), neither
+        the per-signal escalation nor the final cleanup call sudo.
+        killpg still fires as a best-effort wrapper reap.
         """
         claude = _make_claude(claude_user="daniel")
         mock_proc = MagicMock()
@@ -2184,24 +2187,82 @@ class TestKill:
         claude._pgid = 12345
         claude._effective_claude_user = "daniel"
 
+        mock_sudo_kill = AsyncMock()
         with (
-            patch.object(claude, "_lookup_inner_claude_pid", return_value=None),
-            patch("kai.claude.subprocess.run") as mock_run,
+            patch.object(claude, "_async_lookup_inner_claude_pid", new=AsyncMock(return_value=None)),
+            patch.object(claude, "_async_sudo_kill", new=mock_sudo_kill),
             patch("os.killpg") as mock_killpg,
         ):
             await claude._kill()
 
-        mock_run.assert_not_called()
+        mock_sudo_kill.assert_not_called()
         # killpg still fires (initial + final) so any signalable
         # process in the group (the sudo wrapper) gets reaped.
         assert mock_killpg.called
 
     @pytest.mark.asyncio
+    async def test_kill_does_not_block_event_loop_on_slow_pgrep(self):
+        """
+        Acceptance test for #459: _kill awaits the async pgrep
+        helper so the event loop is not stalled while pgrep runs.
+        We verify by running a parallel coroutine that increments
+        a counter every 10ms; if _kill held the loop for the full
+        pgrep duration, the counter would not advance.
+
+        Pre-#459, _lookup_inner_claude_pid used synchronous
+        subprocess.run which DID block the event loop. This test
+        would have failed on that implementation - the counter
+        would be 0 after _kill completed.
+        """
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+        claude._pgid = 12345
+        claude._effective_claude_user = "daniel"
+
+        # Slow pgrep mock: takes ~150ms to return, simulating a
+        # pathological host where pgrep is sluggish but not hung.
+        async def slow_lookup():
+            await asyncio.sleep(0.15)
+            return 99999
+
+        counter = 0
+
+        async def ticker():
+            nonlocal counter
+            while True:
+                counter += 1
+                await asyncio.sleep(0.01)
+
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            with (
+                patch.object(claude, "_async_lookup_inner_claude_pid", side_effect=slow_lookup),
+                patch.object(claude, "_async_sudo_kill", new=AsyncMock()),
+                patch("os.killpg"),
+            ):
+                await claude._kill()
+        finally:
+            ticker_task.cancel()
+            try:
+                await ticker_task
+            except asyncio.CancelledError:
+                pass
+
+        # In 150ms with a 10ms tick interval, the ticker should
+        # have run ~15 times. Use a conservative lower bound (8)
+        # to absorb scheduler jitter on a loaded test host. A
+        # blocking implementation would yield 0 - 1.
+        assert counter >= 8, f"event loop appears blocked: ticker only reached {counter}"
+
+    @pytest.mark.asyncio
     async def test_kill_skips_sudo_in_single_user_mode(self):
         """
         Single-user mode (no _effective_claude_user) takes the
-        non-sudo path entirely. The whole _send_signal cross-user
-        branch is bypassed and no subprocess.run is issued.
+        non-sudo path entirely. The whole cross-user branch is
+        bypassed - no pgrep lookup, no sudo kill.
         """
         claude = _make_claude(claude_user="daniel")
         mock_proc = MagicMock()
@@ -2215,15 +2276,17 @@ class TestKill:
         # short-circuited the sudo wrapper.
         claude._effective_claude_user = None
 
+        mock_lookup = AsyncMock()
+        mock_sudo_kill = AsyncMock()
         with (
-            patch.object(claude, "_lookup_inner_claude_pid") as mock_lookup,
-            patch("kai.claude.subprocess.run") as mock_run,
+            patch.object(claude, "_async_lookup_inner_claude_pid", new=mock_lookup),
+            patch.object(claude, "_async_sudo_kill", new=mock_sudo_kill),
             patch("os.killpg"),
         ):
             await claude._kill()
 
         mock_lookup.assert_not_called()
-        mock_run.assert_not_called()
+        mock_sudo_kill.assert_not_called()
 
 
 # ── _lookup_inner_claude_pid ─────────────────────────────────────────
@@ -2312,6 +2375,186 @@ class TestLookupInnerClaudePid:
         completed = MagicMock(returncode=0, stdout="99999\n11111\n")
         with patch("kai.claude.subprocess.run", return_value=completed):
             assert claude._lookup_inner_claude_pid() == 99999
+
+
+# ── async helpers introduced by #459 ─────────────────────────────────
+
+
+def _fake_async_proc(returncode: int, stdout: bytes = b"", stderr: bytes = b""):
+    """
+    Build a fake asyncio.subprocess.Process for tests that patch
+    asyncio.create_subprocess_exec. Returns a MagicMock with the
+    methods _async_lookup_inner_claude_pid / _async_sudo_kill
+    actually call: communicate(), wait(), kill().
+    """
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.communicate = AsyncMock(return_value=(stdout, stderr))
+    proc.wait = AsyncMock(return_value=returncode)
+    proc.kill = MagicMock()
+    return proc
+
+
+class TestAsyncLookupInnerClaudePid:
+    """
+    Async pgrep equivalent of TestLookupInnerClaudePid. Verifies
+    `_async_lookup_inner_claude_pid` (#459) returns the same set
+    of values as its sync sibling across the same edge cases,
+    without blocking the event loop on the underlying pgrep call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_proc_is_none(self):
+        claude = _make_claude(claude_user="daniel")
+        assert await claude._async_lookup_inner_claude_pid() is None
+
+    @pytest.mark.asyncio
+    async def test_parses_pgrep_stdout(self):
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+
+        fake = _fake_async_proc(returncode=0, stdout=b"99999\n")
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            assert await claude._async_lookup_inner_claude_pid() == 99999
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_nonzero_exit(self):
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+
+        fake = _fake_async_proc(returncode=1, stdout=b"")
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            assert await claude._async_lookup_inner_claude_pid() is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_empty_stdout(self):
+        """pgrep success but no output (race: sudo not yet forked)."""
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+
+        fake = _fake_async_proc(returncode=0, stdout=b"   \n")
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            assert await claude._async_lookup_inner_claude_pid() is None
+
+    @pytest.mark.asyncio
+    async def test_handles_pgrep_timeout(self):
+        """A hung pgrep must not propagate; reaped via proc.kill()."""
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+
+        fake = MagicMock()
+        fake.communicate = AsyncMock(side_effect=TimeoutError)
+        fake.kill = MagicMock()
+        fake.wait = AsyncMock()
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            assert await claude._async_lookup_inner_claude_pid() is None
+        # Hung pgrep must be reaped, not leaked.
+        fake.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_handles_oserror_on_spawn(self):
+        """OSError (e.g., pgrep binary missing) returns None silently."""
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(side_effect=OSError("no pgrep"))):
+            assert await claude._async_lookup_inner_claude_pid() is None
+
+    @pytest.mark.asyncio
+    async def test_first_line_when_pgrep_returns_multiple(self):
+        """Defensive: take the first line if multiple come back."""
+        claude = _make_claude(claude_user="daniel")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        claude._proc = mock_proc
+
+        fake = _fake_async_proc(returncode=0, stdout=b"99999\n11111\n")
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            assert await claude._async_lookup_inner_claude_pid() == 99999
+
+
+class TestAsyncSudoKill:
+    """
+    Async sudo-kill helper (#459). Verifies command shape,
+    diagnostic-log behavior on non-zero exit, and timeout/OSError
+    handling parallel to the sync subprocess.run-based equivalent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_calls_sudo_with_bin_kill_and_int_sig(self):
+        """Argument order, /bin/kill anchor, and int(sig) all correct."""
+        claude = _make_claude(claude_user="daniel")
+        fake = _fake_async_proc(returncode=0)
+        spawn = AsyncMock(return_value=fake)
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            await claude._async_sudo_kill("daniel", 99999, int(signal.SIGKILL))
+
+        args = spawn.call_args.args
+        assert args[:5] == ("sudo", "-n", "-u", "daniel", "/bin/kill")
+        assert args[5] == f"-{int(signal.SIGKILL)}"
+        assert args[6] == "99999"
+
+    @pytest.mark.asyncio
+    async def test_logs_warning_on_nonzero_exit(self, caplog):
+        """ESRCH, missing sudoers rule, etc. surface at WARNING."""
+        claude = _make_claude(claude_user="daniel")
+        fake = _fake_async_proc(returncode=1, stderr=b"sudo: a password is required")
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)),
+            caplog.at_level("WARNING", logger="kai.claude"),
+        ):
+            await claude._async_sudo_kill("daniel", 99999, int(signal.SIGKILL))
+
+        assert "sudo kill escalation failed" in caplog.text
+        assert "99999" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_silent_on_zero_exit(self, caplog):
+        """Happy path: no log noise."""
+        claude = _make_claude(claude_user="daniel")
+        fake = _fake_async_proc(returncode=0)
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)),
+            caplog.at_level("WARNING", logger="kai.claude"),
+        ):
+            await claude._async_sudo_kill("daniel", 99999, int(signal.SIGKILL))
+
+        assert "escalation failed" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_logs_warning_on_timeout(self, caplog):
+        """Hung sudo logs a timeout warning and reaps the subprocess."""
+        claude = _make_claude(claude_user="daniel")
+        fake = MagicMock()
+        fake.communicate = AsyncMock(side_effect=TimeoutError)
+        fake.kill = MagicMock()
+        fake.wait = AsyncMock()
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)),
+            caplog.at_level("WARNING", logger="kai.claude"),
+        ):
+            await claude._async_sudo_kill("daniel", 99999, int(signal.SIGKILL))
+
+        assert "timed out" in caplog.text
+        fake.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_swallows_oserror_on_spawn(self):
+        """Missing sudo binary -> silent return; no propagation."""
+        claude = _make_claude(claude_user="daniel")
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(side_effect=OSError("no sudo"))):
+            # Must not raise.
+            await claude._async_sudo_kill("daniel", 99999, int(signal.SIGKILL))
 
 
 # ── shutdown ─────────────────────────────────────────────────────────
@@ -2519,22 +2762,21 @@ class TestShutdown:
         claude._pgid = 12345
         claude._effective_claude_user = "daniel"
 
+        # #459: shutdown now routes through the async helpers, so the
+        # patches target the async variants. Same ordering invariant
+        # as the _kill version of this test.
         call_order: list[str] = []
 
-        def lookup_records():
+        async def lookup_records():
             call_order.append("lookup")
             return 99999
 
-        # Return a returncode=0 mock so the new diagnostic-log
-        # check in production does not trip on MagicMock's default
-        # truthiness for an unset attribute.
-        def run_records(*_a, **_k):
+        async def sudo_kill_records(*_a, **_k):
             call_order.append("sudo_kill")
-            return MagicMock(returncode=0)
 
         with (
-            patch.object(claude, "_lookup_inner_claude_pid", side_effect=lookup_records),
-            patch("kai.claude.subprocess.run", side_effect=run_records),
+            patch.object(claude, "_async_lookup_inner_claude_pid", side_effect=lookup_records),
+            patch.object(claude, "_async_sudo_kill", side_effect=sudo_kill_records),
             patch("os.killpg") as mock_killpg,
         ):
             mock_killpg.side_effect = lambda *_a, **_k: call_order.append("killpg")
@@ -2548,10 +2790,12 @@ class TestShutdown:
     async def test_shutdown_final_cleanup_escalates_via_sudo(self):
         """
         After the main shutdown signal/wait sequence, the final
-        cleanup issues `sudo -n -u <target> /bin/kill -9 <pid>` for
-        the cached inner claude PID. This catches the daniel-owned
-        grandchild that survived the killpg (POSIX signal-permission
-        gap on cross-user spawn).
+        cleanup invokes the async sudo-kill helper with SIGKILL
+        for the cached inner claude PID. This catches the daniel-
+        owned grandchild that survived the killpg (POSIX signal-
+        permission gap on cross-user spawn). #459 moved this off
+        the event loop; we assert the async helper is invoked with
+        the right args.
         """
         claude = _make_claude(claude_user="daniel")
         mock_proc = MagicMock()
@@ -2561,28 +2805,34 @@ class TestShutdown:
         claude._pgid = 12345
         claude._effective_claude_user = "daniel"
 
+        mock_sudo_kill = AsyncMock()
         with (
-            patch.object(claude, "_lookup_inner_claude_pid", return_value=99999),
-            patch("kai.claude.subprocess.run") as mock_run,
+            patch.object(claude, "_async_lookup_inner_claude_pid", new=AsyncMock(return_value=99999)),
+            patch.object(claude, "_async_sudo_kill", new=mock_sudo_kill),
             patch("os.killpg"),
         ):
             await claude.shutdown()
 
-        cmds = [call.args[0] for call in mock_run.call_args_list]
-        final_cleanup = [c for c in cmds if c[-2] == "-9" and c[-1] == "99999"]
-        assert final_cleanup, f"no final sudo /bin/kill -9 99999 in calls: {cmds}"
-        # Every call must use the absolute /bin/kill path so the
-        # sudoers rule match cannot be evaded by PATH manipulation.
-        for cmd in cmds:
-            assert cmd[:5] == ["sudo", "-n", "-u", "daniel", "/bin/kill"]
+        # _async_sudo_kill called at least twice: once during the
+        # per-signal escalation (in _async_send_signal_for_close)
+        # and once at the final cleanup. The final-cleanup pass
+        # uses SIGKILL even when the initial signal was SIGTERM.
+        calls = mock_sudo_kill.await_args_list
+        assert len(calls) >= 2, f"expected >= 2 sudo-kill calls, got {len(calls)}: {calls}"
+        sigs_seen = {call.args[2] for call in calls}
+        assert int(signal.SIGKILL) in sigs_seen, f"no SIGKILL final cleanup in: {calls}"
+        for call in calls:
+            args = call.args
+            assert args[0] == "daniel"
+            assert args[1] == 99999
 
     @pytest.mark.asyncio
     async def test_shutdown_skips_sudo_when_inner_pid_unknown(self):
         """
-        If _lookup_inner_claude_pid never returns a PID (sudo died
-        before forking, or pgrep failed every time), the final
-        cleanup must not call sudo. killpg still fires as a best-
-        effort wrapper reap.
+        If _async_lookup_inner_claude_pid never returns a PID (sudo
+        died before forking, or pgrep failed every time), neither
+        the per-signal escalation nor the final cleanup calls sudo.
+        killpg still fires as a best-effort wrapper reap.
         """
         claude = _make_claude(claude_user="daniel")
         mock_proc = MagicMock()
@@ -2592,14 +2842,15 @@ class TestShutdown:
         claude._pgid = 12345
         claude._effective_claude_user = "daniel"
 
+        mock_sudo_kill = AsyncMock()
         with (
-            patch.object(claude, "_lookup_inner_claude_pid", return_value=None),
-            patch("kai.claude.subprocess.run") as mock_run,
+            patch.object(claude, "_async_lookup_inner_claude_pid", new=AsyncMock(return_value=None)),
+            patch.object(claude, "_async_sudo_kill", new=mock_sudo_kill),
             patch("os.killpg") as mock_killpg,
         ):
             await claude.shutdown()
 
-        mock_run.assert_not_called()
+        mock_sudo_kill.assert_not_called()
         assert mock_killpg.called
 
     @pytest.mark.asyncio
@@ -2618,15 +2869,17 @@ class TestShutdown:
         # mode where resolve_claude_user() short-circuits sudo.
         claude._effective_claude_user = None
 
+        mock_lookup = AsyncMock()
+        mock_sudo_kill = AsyncMock()
         with (
-            patch.object(claude, "_lookup_inner_claude_pid") as mock_lookup,
-            patch("kai.claude.subprocess.run") as mock_run,
+            patch.object(claude, "_async_lookup_inner_claude_pid", new=mock_lookup),
+            patch.object(claude, "_async_sudo_kill", new=mock_sudo_kill),
             patch("os.killpg"),
         ):
             await claude.shutdown()
 
         mock_lookup.assert_not_called()
-        mock_run.assert_not_called()
+        mock_sudo_kill.assert_not_called()
 
 
 # ── _save_prompt ─────────────────────────────────────────────────────
@@ -2847,9 +3100,15 @@ class TestSavePrompt:
         async def tracking_save():
             call_order.append("save_prompt")
 
+        async def tracking_send(sig):
+            call_order.append(f"signal_{int(sig)}")
+
+        # #459 routes shutdown's per-signal dispatch through the
+        # async helper rather than the sync _send_signal; patch the
+        # async variant to record SIGTERM/SIGKILL order.
         with (
             patch.object(claude, "_save_prompt", side_effect=tracking_save),
-            patch.object(claude, "_send_signal", side_effect=lambda s: call_order.append(f"signal_{s}")),
+            patch.object(claude, "_async_send_signal_for_close", side_effect=tracking_send),
         ):
             await claude.shutdown()
 

@@ -402,6 +402,12 @@ class ClaudeCodeBackend(AgentBackend):
         need to signal after sudo has been killed must rely on the
         cache (pgrep returns nothing on a reaped sudo). _kill primes
         the cache before its first signal for this reason.
+
+        Synchronous variant used by the sync `_send_signal` path
+        (which is called from `force_kill`, also sync). The async
+        sites (`_kill`, `shutdown`) call `_async_lookup_inner_claude_pid`
+        instead so they do not block the event loop on the pgrep
+        invocation. See #459.
         """
         if self._proc is None:
             return None
@@ -424,6 +430,146 @@ class ClaudeCodeBackend(AgentBackend):
             return int(first_line)
         except ValueError:
             return None
+
+    async def _async_lookup_inner_claude_pid(self) -> int | None:
+        """
+        Async pgrep equivalent of `_lookup_inner_claude_pid` (#459).
+
+        Same semantics as the synchronous version - returns the inner
+        claude PID by querying pgrep against the sudo wrapper's PID -
+        but uses `asyncio.create_subprocess_exec` so the event loop
+        is not blocked while pgrep runs. Called from `_kill` and
+        `shutdown`; the sync variant remains for the `force_kill`
+        path. The 2s ceiling matches the sync version's timeout.
+        """
+        if self._proc is None:
+            return None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "pgrep",
+                "-P",
+                str(self._proc.pid),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except (OSError, FileNotFoundError):
+            return None
+        try:
+            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+        except TimeoutError:
+            # pgrep is hung; reap it so we do not leak a child and
+            # return None as if no PID was found.
+            proc.kill()
+            try:
+                await proc.wait()
+            except OSError:
+                pass
+            return None
+        if proc.returncode != 0:
+            return None
+        first_line = stdout_bytes.decode(errors="replace").strip().split("\n", 1)[0]
+        if not first_line:
+            return None
+        try:
+            return int(first_line)
+        except ValueError:
+            return None
+
+    async def _async_send_signal_for_close(self, sig: int) -> None:
+        """
+        Async equivalent of `_send_signal` used by `_kill` and
+        `shutdown` (#459).
+
+        Same three-step structure as the sync version:
+        1. Cross-user mode: prime the inner-claude-PID cache (async
+           pgrep) and signal the inner claude through `sudo -n -u
+           <target> /bin/kill` (async subprocess).
+        2. Wrapper reap via `os.killpg` (non-blocking syscall, sync
+           is fine).
+        3. Single-user mode: `_proc.send_signal` (also non-blocking).
+
+        Steps 1's blocking surface is moved off the event loop; the
+        sync `_send_signal` remains for `force_kill` (which is sync
+        by public-API contract).
+        """
+        if self._pgid is not None:
+            if self._effective_claude_user is not None:
+                if self._inner_claude_pid is None:
+                    self._inner_claude_pid = await self._async_lookup_inner_claude_pid()
+                if self._inner_claude_pid is not None:
+                    await self._async_sudo_kill(
+                        self._effective_claude_user,
+                        self._inner_claude_pid,
+                        int(sig),
+                    )
+            try:
+                os.killpg(self._pgid, sig)
+            except OSError:
+                pass
+        elif self._proc is not None:
+            try:
+                self._proc.send_signal(sig)
+            except OSError:
+                pass
+
+    async def _async_sudo_kill(self, target_user: str, pid: int, sig: int) -> None:
+        """
+        Run `sudo -n -u <target> /bin/kill -<sig> <pid>` without blocking
+        the event loop (#459).
+
+        Equivalent to the synchronous `subprocess.run` call inside
+        `_send_signal` and the final-cleanup blocks of `_kill`/
+        `shutdown`, but uses `asyncio.create_subprocess_exec` so a
+        long-running sudo or kill (system pathology) does not stall
+        other coroutines. The 5s ceiling matches the sync ceiling.
+
+        Logs at WARNING when sudo returns non-zero so a missing
+        sudoers rule, an ESRCH on a double-kill, or any other
+        failure mode surfaces in the operator-facing log instead
+        of silently leaking an orphan (same diagnostic contract
+        the sync path adopts in #458/M1).
+
+        Silent on TimeoutError and OSError: same failure-mode
+        swallow as the sync path. The caller has no remedy for
+        a hung sudo or a missing /bin/kill; logging the timeout
+        once at WARNING is the best we can do.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "sudo",
+                "-n",
+                "-u",
+                target_user,
+                "/bin/kill",
+                f"-{int(sig)}",
+                str(pid),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except (OSError, FileNotFoundError):
+            return
+        try:
+            _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=5)
+        except TimeoutError:
+            proc.kill()
+            try:
+                await proc.wait()
+            except OSError:
+                pass
+            log.warning(
+                "async sudo kill timed out after 5s (target=%s, pid=%d, sig=%d); inner claude may orphan",
+                target_user,
+                pid,
+                int(sig),
+            )
+            return
+        if proc.returncode != 0:
+            log.warning(
+                "sudo kill escalation failed (rc=%d, stderr=%r); inner claude pid=%d may orphan",
+                proc.returncode,
+                stderr_bytes[:200].decode(errors="replace") if stderr_bytes else "",
+                pid,
+            )
 
     def _send_signal(self, sig: int) -> None:
         """
@@ -1085,17 +1231,25 @@ class ClaudeCodeBackend(AgentBackend):
             # out. Once the killpg below reaps the sudo wrapper,
             # pgrep -P <dead_sudo_pid> returns nothing and we lose
             # the only handle on the orphaned grandchild. The cache
-            # survives the _send_signal->killpg sequence so the
-            # final-cleanup sudo-kill below can still reach the
-            # inner claude. See issue #456. Only attempt when we
-            # actually have a sudo target to escalate to; without
+            # survives the per-signal escalation + killpg sequence
+            # so the final-cleanup sudo-kill below can still reach
+            # the inner claude. See issue #456. Only attempt when
+            # we actually have a sudo target to escalate to; without
             # _effective_claude_user the lookup result is useless.
+            #
+            # Async pgrep variant so the event loop is not blocked
+            # waiting for the lookup. See #459.
             saved_user = self._effective_claude_user
             if saved_user is not None and self._inner_claude_pid is None:
-                self._inner_claude_pid = self._lookup_inner_claude_pid()
+                self._inner_claude_pid = await self._async_lookup_inner_claude_pid()
             saved_inner_pid = self._inner_claude_pid
 
-            self._send_signal(signal.SIGKILL)
+            # Cross-user escalation (#456) + wrapper killpg / single-
+            # user direct signal. Routed through the async helper so
+            # the event loop stays responsive while sudo + kill
+            # complete. See #459.
+            await self._async_send_signal_for_close(signal.SIGKILL)
+
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except TimeoutError:
@@ -1138,35 +1292,13 @@ class ClaudeCodeBackend(AgentBackend):
             # - pgrep failed to find a child PID at any point
             #   (sudo never forked, or sudo died with no child),
             # - the inner claude is already dead (sudo kill returns
-            #   ESRCH; sudo exits 1; we ignore via check=False).
+            #   ESRCH; sudo exits 1; logged at WARNING by
+            #   _async_sudo_kill).
+            #
+            # Async sudo-kill so the event loop is not blocked on the
+            # 5s ceiling. See #459.
             if saved_user is not None and saved_inner_pid is not None:
-                try:
-                    # /bin/kill (not bare "kill") so sudo cannot
-                    # resolve to a different binary than the
-                    # sudoers rule names. See #458 review.
-                    result = subprocess.run(
-                        [
-                            "sudo",
-                            "-n",
-                            "-u",
-                            saved_user,
-                            "/bin/kill",
-                            "-9",
-                            str(saved_inner_pid),
-                        ],
-                        capture_output=True,
-                        timeout=5,
-                        check=False,
-                    )
-                    if result.returncode != 0:
-                        log.warning(
-                            "final-cleanup sudo kill -9 failed (rc=%d, stderr=%r); inner claude pid=%d may orphan",
-                            result.returncode,
-                            result.stderr[:200].decode(errors="replace") if result.stderr else "",
-                            saved_inner_pid,
-                        )
-                except (subprocess.TimeoutExpired, OSError):
-                    pass
+                await self._async_sudo_kill(saved_user, saved_inner_pid, int(signal.SIGKILL))
 
     async def shutdown(self) -> None:
         """
@@ -1210,16 +1342,24 @@ class ClaudeCodeBackend(AgentBackend):
                 # rationale as _kill; see issue #456. Gated on
                 # _effective_claude_user because without a sudo
                 # target the lookup result is useless.
+                #
+                # Async pgrep variant so the event loop stays
+                # responsive while pgrep runs. See #459.
                 saved_user = self._effective_claude_user
                 if saved_user is not None and self._inner_claude_pid is None:
-                    self._inner_claude_pid = self._lookup_inner_claude_pid()
+                    self._inner_claude_pid = await self._async_lookup_inner_claude_pid()
                 saved_inner_pid = self._inner_claude_pid
 
-                self._send_signal(signal.SIGTERM)
+                # Per-signal cross-user escalation runs ASYNC here so
+                # the event loop is not stalled while sudo + kill
+                # complete. killpg is a non-blocking syscall and
+                # stays sync; single-user fallback uses _proc.
+                # send_signal (also non-blocking). See #459.
+                await self._async_send_signal_for_close(signal.SIGTERM)
                 try:
                     await asyncio.wait_for(self._proc.wait(), timeout=5)
                 except TimeoutError:
-                    self._send_signal(signal.SIGKILL)
+                    await self._async_send_signal_for_close(signal.SIGKILL)
                     try:
                         await asyncio.wait_for(self._proc.wait(), timeout=5)
                     except TimeoutError:
@@ -1257,31 +1397,8 @@ class ClaudeCodeBackend(AgentBackend):
         # process directly, so killpg above can leave the inner
         # claude orphaned to init. Skipped silently when the spawn
         # was not in cross-user mode or pgrep never found a child.
+        #
+        # Async sudo-kill so the event loop is not blocked on the
+        # 5s ceiling. See #459.
         if saved_user is not None and saved_inner_pid is not None:
-            try:
-                # /bin/kill absolute path so sudo's secure_path
-                # resolution matches the sudoers rule exactly.
-                # See #458 review.
-                result = subprocess.run(
-                    [
-                        "sudo",
-                        "-n",
-                        "-u",
-                        saved_user,
-                        "/bin/kill",
-                        "-9",
-                        str(saved_inner_pid),
-                    ],
-                    capture_output=True,
-                    timeout=5,
-                    check=False,
-                )
-                if result.returncode != 0:
-                    log.warning(
-                        "shutdown sudo kill -9 failed (rc=%d, stderr=%r); inner claude pid=%d may orphan",
-                        result.returncode,
-                        result.stderr[:200].decode(errors="replace") if result.stderr else "",
-                        saved_inner_pid,
-                    )
-            except (subprocess.TimeoutExpired, OSError):
-                pass
+            await self._async_sudo_kill(saved_user, saved_inner_pid, int(signal.SIGKILL))
