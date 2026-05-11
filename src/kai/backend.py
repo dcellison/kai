@@ -589,9 +589,17 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
     `_apply_migrate` uses the same ownership rules). Isolation comes
     from ownership, not mode bits.
 
-    Unlike ensure_user_memory this does NOT seed a template file. The
-    home workspace is an empty directory that the user populates
-    themselves (cloning a repo, dropping notes, etc.).
+    Like ensure_user_memory and ensure_user_preferences, this seeds
+    `<home>/.claude/CLAUDE.md` from `templates/.claude/CLAUDE.md` when
+    the file is absent. Without that seed, a user added to users.yaml
+    AFTER install (or any dev / single-user path without an install
+    pass) gets an empty home workspace and the bot's identity-injection
+    path in `build_session_context` silently fails on the missing file -
+    the gap PR #449 inadvertently exposed and #450 reverted. The
+    install-time eager pass in `install.py:_apply_migrate` covers
+    users present in users.yaml at install time so their CLAUDE.md
+    lands with the right per-user ownership; this lazy fallback
+    bootstraps anyone else on their first message.
     """
     # chat_id of None means we have no real Telegram session to key on
     # (test runs, health checks, smoke runs without users.yaml). Use a
@@ -615,6 +623,36 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
     # the intended bits explicitly - this is the same pattern install.py
     # `_apply_migrate` uses after its mkdir calls. Idempotent on reuse.
     os.chmod(path, 0o755)
+
+    # Lazy bootstrap of `<home>/.claude/CLAUDE.md`. Parallel to
+    # ensure_user_memory and ensure_user_preferences: stat, possible
+    # mkdir, possible copy2. The OSError swallow matches the sibling
+    # bootstraps - a permissions issue here must not prevent the bot
+    # from answering a message. The read path in
+    # build_session_context already handles missing files gracefully,
+    # so a failed seed degrades to the silent-no-identity behavior we
+    # had before #447 rather than crashing the session.
+    try:
+        claude_dir = path / ".claude"
+        claude_dst = claude_dir / "CLAUDE.md"
+        if not claude_dst.exists():
+            claude_dir.mkdir(parents=True, exist_ok=True)
+            template = PROJECT_ROOT / "templates" / ".claude" / "CLAUDE.md"
+            if template.is_file():
+                shutil.copy2(template, claude_dst)
+            else:
+                # No template on this host (incomplete install tree).
+                # Match ensure_user_memory's `# Memory\n` /
+                # ensure_user_preferences' `# Preferences\n` last-resort
+                # placeholder so the inner Claude has a writable file.
+                claude_dst.write_text("# Identity\n")
+    except OSError:
+        log.warning(
+            "ensure_user_home: could not seed CLAUDE.md at %s",
+            path,
+            exc_info=True,
+        )
+
     return path
 
 

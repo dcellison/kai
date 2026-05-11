@@ -2,7 +2,7 @@
 
 ## About This File
 
-This file is the bootstrap template for inner Claude's identity. The installer copies it to `<install_path>/home/.claude/CLAUDE.md` as a regular file on first install. Edit your local copy (the destination) to add operator-personal content; the tracked template ships universal content only. Once you have customized your local copy, you can delete this "About This File" section.
+This file is the bootstrap template for inner Claude's identity. The installer copies it to `<DATA_DIR>/home/<chat_id>/.claude/CLAUDE.md` for every user in `users.yaml` at install time; `backend.ensure_user_home` lazily seeds it for users added later on first message. Edit your per-user copy (the destination) to add operator-personal content; the tracked template ships universal content only. Once you have customized your per-user copy, you can delete this "About This File" section there.
 
 ## Who You Are
 

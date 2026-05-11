@@ -741,6 +741,103 @@ class TestEnsureUserHome:
         mode = stat.S_IMODE(result.stat().st_mode)
         assert mode == 0o755, f"expected 0o755, got {oct(mode)}"
 
+    def test_seeds_claude_md_from_template(self, tmp_path):
+        """
+        Lazy bootstrap: ensure_user_home seeds <home>/.claude/CLAUDE.md
+        from templates/.claude/CLAUDE.md when absent. Without this seed,
+        a user added to users.yaml AFTER install (or any dev path
+        without an install pass) gets an empty home workspace and the
+        bot's identity-injection path silently fails on the missing
+        file. Parallel to ensure_user_memory's MEMORY.md seed.
+        """
+        # Build a fake source tree under tmp_path so we can patch
+        # PROJECT_ROOT to it. The real PROJECT_ROOT has a template, but
+        # using the real path would make this test order-dependent on
+        # whether the template currently exists in the working tree.
+        fake_root = tmp_path / "src_root"
+        template_dir = fake_root / "templates" / ".claude"
+        template_dir.mkdir(parents=True)
+        template = template_dir / "CLAUDE.md"
+        template.write_text("# Kai template\n")
+
+        data_dir = tmp_path / "data"
+        with patch("kai.backend.PROJECT_ROOT", fake_root):
+            home = ensure_user_home(99, data_dir)
+
+        claude_dst = home / ".claude" / "CLAUDE.md"
+        assert claude_dst.is_file(), f"Expected lazy seed at {claude_dst}"
+        assert claude_dst.read_text() == "# Kai template\n"
+
+    def test_seed_is_idempotent(self, tmp_path):
+        """An existing per-user CLAUDE.md is never overwritten on later calls."""
+        fake_root = tmp_path / "src_root"
+        template_dir = fake_root / "templates" / ".claude"
+        template_dir.mkdir(parents=True)
+        (template_dir / "CLAUDE.md").write_text("# UPSTREAM\n")
+
+        data_dir = tmp_path / "data"
+        with patch("kai.backend.PROJECT_ROOT", fake_root):
+            home = ensure_user_home(99, data_dir)
+
+        # Operator customizes after first seed.
+        claude_dst = home / ".claude" / "CLAUDE.md"
+        claude_dst.write_text("# OPERATOR CUSTOMIZED\n")
+
+        # Second call must leave the customized content alone.
+        with patch("kai.backend.PROJECT_ROOT", fake_root):
+            ensure_user_home(99, data_dir)
+
+        assert claude_dst.read_text() == "# OPERATOR CUSTOMIZED\n"
+
+    def test_seed_writes_placeholder_when_template_missing(self, tmp_path):
+        """Missing template: last-resort placeholder so the file is writable."""
+        fake_root = tmp_path / "src_root"
+        # Intentionally do not create templates/.claude/CLAUDE.md.
+        (fake_root / "templates" / ".claude").mkdir(parents=True)
+
+        data_dir = tmp_path / "data"
+        with patch("kai.backend.PROJECT_ROOT", fake_root):
+            home = ensure_user_home(99, data_dir)
+
+        claude_dst = home / ".claude" / "CLAUDE.md"
+        assert claude_dst.is_file()
+        # Placeholder mirrors the MEMORY.md / PREFERENCES.md precedent.
+        assert claude_dst.read_text() == "# Identity\n"
+
+    def test_seed_swallows_oserror(self, tmp_path):
+        """
+        A permissions issue creating the seed must not crash the session
+        init - the read path in build_session_context already handles
+        missing files gracefully. Matches ensure_user_memory's OSError
+        swallow contract.
+        """
+        # Build the source tree before patching so the setup mkdirs do
+        # not hit the patched failure.
+        fake_root = tmp_path / "src_root"
+        (fake_root / "templates" / ".claude").mkdir(parents=True)
+        (fake_root / "templates" / ".claude" / "CLAUDE.md").write_text("# Kai\n")
+
+        def boom(*_args, **_kwargs) -> None:
+            raise OSError("simulated permission denied")
+
+        data_dir = tmp_path / "data"
+        # Patch the seed step's copy2 to raise. The outer path.mkdir
+        # for data_dir/home/<chat_id>/ runs cleanly (the function-
+        # under-test handles its own dir creation before reaching the
+        # seed branch); only the seed copy fails. Must not raise: the
+        # function returns the path even when the seed fails, and the
+        # caller may still write into the directory later.
+        with (
+            patch("kai.backend.PROJECT_ROOT", fake_root),
+            patch("kai.backend.shutil.copy2", side_effect=boom),
+        ):
+            result = ensure_user_home(99, data_dir)
+
+        assert result == data_dir / "home" / "99"
+        # The seed file should NOT have been written; the OSError
+        # handler should have logged and continued silently.
+        assert not (result / ".claude" / "CLAUDE.md").exists()
+
 
 class TestResolveHomeWorkspace:
     """

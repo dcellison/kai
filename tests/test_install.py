@@ -38,6 +38,7 @@ from kai.install import (
     _generate_systemd_unit,
     _generate_users_yaml,
     _migrate_identity_to_claude_md,
+    _retire_install_home_claude,
     _set_ownership,
     _src_checksum,
     _start_service,
@@ -3375,23 +3376,6 @@ class TestApplyMigratePerUserPreferences:
         assert all(uid == 501 and gid == 20 for _, uid, gid in stray_calls)
 
 
-class TestPreferencesTemplateShipsViaCopyTree:
-    """
-    The PREFERENCES.md template under templates/.claude/ ships into the
-    install tree as part of `_copy_tree(templates/.claude/, ...)` in
-    `_apply_source`. This test pins the contract that
-    `_HOME_CLAUDE_EXCLUDES` does NOT list the template name, so a future
-    excludes change cannot silently strip it.
-    """
-
-    def test_excludes_does_not_drop_preferences_template(self):
-        from kai.install import _HOME_CLAUDE_EXCLUDES
-
-        assert "PREFERENCES.md" not in _HOME_CLAUDE_EXCLUDES, (
-            "PREFERENCES.md must ship into the install tree; adding it to _HOME_CLAUDE_EXCLUDES would silently drop it."
-        )
-
-
 class TestGitignoreRuntimePreferencesDir:
     """
     The runtime preferences/ directory must stay gitignored under
@@ -3741,290 +3725,67 @@ class TestGenerateLauncherScript:
 
 class TestApplySource:
     """
-    _apply_source copies templates/.claude/ and templates/config/ into
-    the install tree, calls _migrate_identity_to_claude_md to convert
-    legacy IDENTITY.md/symlink layouts, and explicitly seeds CLAUDE.md
-    from the template on first install. The tests below pin those
-    contracts; the migration helper itself is tested directly in
-    TestMigrateIdentityToClaudeMd below.
+    _apply_source copies src/, pyproject.toml, and templates/config/
+    into the install tree, and retires the dead <install>/home/.claude/
+    subtree (and any legacy IDENTITY.md) via _retire_install_home_claude.
+    Post-#447 the install tree carries no CLAUDE.md; the per-user
+    runtime <DATA_DIR>/home/<chat_id>/.claude/CLAUDE.md is seeded by
+    _apply_migrate (eager, install-time) and backend.ensure_user_home
+    (lazy, first-message fallback). The retirement helper has its own
+    pinned contracts in TestRetireInstallHomeClaude below; the
+    migration helper that ran before #447 is no longer called from
+    _apply_source but is unit-tested directly in
+    TestMigrateIdentityToClaudeMd.
     """
 
-    def test_dry_run_mentions_template_paths(self, tmp_path, capsys):
-        """Dry run prints the templates/ source paths and seeds nothing."""
+    def test_dry_run_does_not_mention_retired_template_paths(self, tmp_path, capsys):
+        """Dry-run output never names the retired template-copy or seed steps."""
         src = tmp_path / "source"
         ws_claude = src / "templates" / ".claude"
         ws_claude.mkdir(parents=True)
-        claude_md_src = ws_claude / "CLAUDE.md"
-        claude_md_src.write_text("identity")
+        # Even if a stray template CLAUDE.md were to exist (it does post-
+        # this PR's redo: the template is the source-of-truth for per-user
+        # seeding via _apply_migrate, NOT for any install-tree copy),
+        # the dry-run path must not preview an install-tree copy or seed
+        # from it. The negative-shape pin guards against a regression
+        # that reintroduces the retired blocks.
+        (ws_claude / "CLAUDE.md").write_text("identity")
+        # Pre-existing dead subtree at the install destination. The
+        # cleanup helper should emit a "Would remove dead ..." line.
         install_path = tmp_path / "install"
+        (install_path / "home" / ".claude").mkdir(parents=True)
+        (install_path / "home" / ".claude" / "stale").write_text("stale")
         with patch("kai.install.PROJECT_ROOT", src):
             _apply_source(install_path, svc_uid=1000, svc_gid=1000, dry_run=True)
         output = capsys.readouterr().out
-        assert "DRY RUN" in output
-        # Positive shape checks. Each "Would copy:" / "Would seed" line
-        # is "{src_path} -> {dst_path}"; asserting the exact source
-        # path appears on the left side of the arrow proves the dry-run
-        # is reading from templates/, not the retired home/.claude
-        # location. Avoids the prior double-negative replace pattern,
-        # which depended on the install dir being named exactly
-        # "install" and would silently invert if a tmp_path component
-        # ever contained "home/.claude" as a substring.
-        assert f"Would copy: {ws_claude} ->" in output
-        assert f"Would seed {claude_md_src} ->" in output
-        # Negative shape checks. No source-tree reference under
-        # PROJECT_ROOT/home/ should appear (the install destination
-        # under install_path/home/ is unchanged per spec §3.1; that is
-        # a different path and is allowed). And no template should be
-        # named with the retired .example suffix.
-        retired_src = src / "home" / ".claude"
-        assert str(retired_src) not in output
-        assert ".example" not in output
+        # Negative shape: no install-tree copy preview of the
+        # templates/.claude source directory and no "Would seed" line
+        # for an install-tree destination. The retired blocks would
+        # have emitted both; their absence is the contract.
+        assert f"Would copy: {ws_claude}" not in output
+        assert "Would seed" not in output
+        # Negative shape: no IDENTITY.md migration line (the migration
+        # helper is not called from _apply_source post-#447).
+        assert "IDENTITY.md" not in output
+        # Positive shape: the cleanup helper announces the pre-existing
+        # dead subtree.
+        assert "[DRY RUN] Would remove dead" in output
         # Dry run never touches disk.
-        assert not (install_path / "home" / ".claude").exists()
+        assert (install_path / "home" / ".claude").exists()
 
-    def test_dry_run_no_templates_dir_skips_copy(self, tmp_path, capsys):
-        """Dry run with empty source: no template-copy lines."""
+    def test_dry_run_no_templates_or_config_dir_skips_both(self, tmp_path, capsys):
+        """Dry run with empty source: no template-copy lines for either subtree."""
         with patch("kai.install.PROJECT_ROOT", tmp_path):
             _apply_source(tmp_path / "install", svc_uid=1000, svc_gid=1000, dry_run=True)
         output = capsys.readouterr().out
         assert "DRY RUN" in output
-        # Without templates/.claude/, the copy line should not appear.
-        # The migration helper still runs (its row-6 fresh-install path
-        # is silent), so the only printed line is whatever workspace
-        # rename / src copy / pyproject copy preview emits.
+        # Both subtree preview lines must be absent. The templates/.claude
+        # half is structural post-#447 (no install-tree copy step exists
+        # at all, so the preview cannot fire). The templates/config half
+        # is conditional on the source dir existing; with tmp_path as
+        # PROJECT_ROOT, neither subtree exists.
         assert "templates/.claude" not in output
         assert "templates/config" not in output
-
-    def test_actual_copies_templates_and_seeds_claude_md(self, tmp_path):
-        """
-        Fresh install path: copies src/, pyproject.toml, templates/.claude/,
-        and seeds <install>/home/.claude/CLAUDE.md from the template.
-        """
-        src = tmp_path / "source"
-        (src / "src").mkdir(parents=True)
-        (src / "src" / "module.py").write_text("code")
-        (src / "pyproject.toml").write_text("[project]")
-        ws_claude = src / "templates" / ".claude"
-        ws_claude.mkdir(parents=True)
-        (ws_claude / "CLAUDE.md").write_text("# Kai\n")
-        install = tmp_path / "install"
-        install.mkdir()
-
-        with (
-            patch("kai.install.PROJECT_ROOT", src),
-            patch("kai.install._copy_tree") as mock_copy,
-            patch("kai.install._set_ownership"),
-            patch("shutil.copy2") as mock_cp,
-            patch("os.chown") as mock_chown,
-        ):
-            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
-
-        # _copy_tree fires twice: once for src/, once for templates/.claude/.
-        # The mock prevents the seed step from finding the destination
-        # CLAUDE.md, so the explicit seed at the end of _apply_source
-        # also fires (visible via shutil.copy2 below).
-        assert mock_copy.call_count == 2
-        # shutil.copy2 fires for pyproject.toml AND for the seed step
-        # copying templates/.claude/CLAUDE.md -> install/home/.claude/CLAUDE.md.
-        assert mock_cp.call_count == 2
-        claude_md_dst = install / "home" / ".claude" / "CLAUDE.md"
-        chown_calls = mock_chown.call_args_list
-        assert any(c.args == (claude_md_dst, 1000, 1000) for c in chown_calls), (
-            f"Expected os.chown({claude_md_dst}, 1000, 1000); got {chown_calls}"
-        )
-
-    def test_actual_no_templates_dir(self, tmp_path):
-        """No templates/: copies source only, no error."""
-        src = tmp_path / "source"
-        (src / "src").mkdir(parents=True)
-        (src / "src" / "module.py").write_text("code")
-        (src / "pyproject.toml").write_text("[project]")
-        install = tmp_path / "install"
-        install.mkdir()
-
-        with (
-            patch("kai.install.PROJECT_ROOT", src),
-            patch("kai.install._copy_tree") as mock_copy,
-            patch("kai.install._set_ownership") as mock_own,
-            patch("shutil.copy2") as mock_cp,
-            patch("os.chown"),
-        ):
-            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
-
-        # Only one _copy_tree call (src/), no template copies.
-        mock_copy.assert_called_once()
-        mock_own.assert_called_once()
-        # pyproject.toml only; the seed step skips (no template source).
-        mock_cp.assert_called_once()
-
-    def test_templates_claude_uses_excludes(self, tmp_path):
-        """templates/.claude/ -> install copy uses _HOME_CLAUDE_EXCLUDES."""
-        from kai.install import _HOME_CLAUDE_EXCLUDES
-
-        src = tmp_path / "source"
-        (src / "src").mkdir(parents=True)
-        (src / "src" / "module.py").write_text("code")
-        (src / "pyproject.toml").write_text("[project]")
-        ws_claude = src / "templates" / ".claude"
-        ws_claude.mkdir(parents=True)
-        (ws_claude / "CLAUDE.md").write_text("identity")
-        install = tmp_path / "install"
-        install.mkdir()
-
-        with (
-            patch("kai.install.PROJECT_ROOT", src),
-            patch("kai.install._copy_tree") as mock_copy,
-            patch("kai.install._set_ownership"),
-            patch("shutil.copy2"),
-            patch("os.chown"),
-        ):
-            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
-
-        # Second _copy_tree call is for templates/.claude/ -> install/home/.claude/.
-        ws_call = mock_copy.call_args_list[1]
-        assert ws_call[0][2] == _HOME_CLAUDE_EXCLUDES
-
-    def test_existing_install_preserves_customized_claude_md(self, tmp_path):
-        """
-        Reinstall path: an operator-customized CLAUDE.md survives.
-        _HOME_CLAUDE_EXCLUDES skips it during the recursive copy and the
-        explicit seed step's `not exists()` guard skips it again.
-        """
-        src = tmp_path / "source"
-        (src / "src").mkdir(parents=True)
-        (src / "src" / "module.py").write_text("code")
-        (src / "pyproject.toml").write_text("[project]")
-        ws_claude_src = src / "templates" / ".claude"
-        ws_claude_src.mkdir(parents=True)
-        (ws_claude_src / "CLAUDE.md").write_text("TEMPLATE")
-
-        # Pre-existing operator-customized destination.
-        install = tmp_path / "install"
-        ws_claude_dst = install / "home" / ".claude"
-        ws_claude_dst.mkdir(parents=True)
-        (ws_claude_dst / "CLAUDE.md").write_text("OPERATOR EDIT")
-
-        with (
-            patch("kai.install.PROJECT_ROOT", src),
-            patch("kai.install._copy_tree"),
-            patch("kai.install._set_ownership"),
-            patch("os.chown"),
-        ):
-            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
-
-        # The operator-customized destination is unchanged.
-        assert (ws_claude_dst / "CLAUDE.md").read_text() == "OPERATOR EDIT"
-
-    def test_claude_md_owned_by_svc_after_row1_migration(self, tmp_path):
-        """
-        Regression guard for the order-of-operations bug in _apply_source:
-        _migrate_identity_to_claude_md (row 1) chowns CLAUDE.md to svc_uid;
-        the subsequent `_set_ownership(ws_claude_dst, 0, 0, recursive=True)`
-        clobbers that with root:root; the seed step's chown only fires
-        when the dst is missing, so without the trailing reconcile chown
-        CLAUDE.md ends up root-owned and inner Claude cannot edit it.
-
-        This test pins that the LAST chown call on CLAUDE.md is svc_uid,
-        regardless of the row-1 migration writing first and the recursive
-        ownership pass writing second. We do NOT mock _set_ownership so
-        its real implementation (which calls os.chown internally) is
-        captured by the chown spy - that's what makes the bug visible:
-        without the reconcile chown, the recursive root pass leaves the
-        last chown on CLAUDE.md as (0, 0).
-
-        Setup mirrors the production upgrade pre-state: existing
-        IDENTITY.md plus symlink, fresh source templates/ tree.
-        """
-        src = tmp_path / "source"
-        (src / "src").mkdir(parents=True)
-        (src / "src" / "module.py").write_text("code")
-        (src / "pyproject.toml").write_text("[project]")
-        ws_claude_src = src / "templates" / ".claude"
-        ws_claude_src.mkdir(parents=True)
-        (ws_claude_src / "CLAUDE.md").write_text("# Kai\n")
-
-        # Row-1 pre-state.
-        install = tmp_path / "install"
-        ws_claude_dst = install / "home" / ".claude"
-        ws_claude_dst.mkdir(parents=True)
-        identity = install / "home" / "IDENTITY.md"
-        identity.write_text("# Operator content\n")
-        claude_md = ws_claude_dst / "CLAUDE.md"
-        claude_md.symlink_to("../IDENTITY.md")
-
-        # Capture every os.chown call. Real _set_ownership (unmocked)
-        # calls os.chown internally, so the recursive (0, 0) clobbering
-        # pass shows up here in order.
-        chown_calls: list[tuple[str, int, int]] = []
-
-        def record_chown(path, uid, gid):
-            chown_calls.append((str(path), uid, gid))
-
-        with (
-            patch("kai.install.PROJECT_ROOT", src),
-            patch("kai.install._copy_tree"),
-            patch("os.chown", side_effect=record_chown),
-        ):
-            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
-
-        # Sanity: the recursive root pass on home/.claude/ MUST have
-        # happened (otherwise the test would silently pass even if the
-        # bug were re-introduced). Look for any (path, 0, 0) chown
-        # under ws_claude_dst.
-        recursive_root_pass = any(c[0].startswith(str(ws_claude_dst)) and (c[1], c[2]) == (0, 0) for c in chown_calls)
-        assert recursive_root_pass, (
-            f"Expected _set_ownership to chown some path under {ws_claude_dst} to (0, 0); got {chown_calls}"
-        )
-
-        claude_md_chown_calls = [c for c in chown_calls if c[0] == str(claude_md)]
-        assert claude_md_chown_calls, f"Expected at least one os.chown call on {claude_md}; got {chown_calls}"
-        # The LAST chown wins on the filesystem; pin it explicitly so a
-        # future refactor that reorders steps trips this assertion before
-        # production hits it.
-        _, last_uid, last_gid = claude_md_chown_calls[-1]
-        assert (last_uid, last_gid) == (1000, 1000), (
-            f"Last chown on {claude_md} was ({last_uid}, {last_gid}); expected (1000, 1000). "
-            f"All chown calls in order: {chown_calls}"
-        )
-
-    def test_dry_run_predicts_seed_for_fresh_install(self, tmp_path, capsys):
-        """Dry-run prediction matches the live behavior for a fresh install."""
-        src = tmp_path / "source"
-        ws_claude = src / "templates" / ".claude"
-        ws_claude.mkdir(parents=True)
-        (ws_claude / "CLAUDE.md").write_text("# Kai\n")
-        with patch("kai.install.PROJECT_ROOT", src):
-            _apply_source(tmp_path / "install", svc_uid=1000, svc_gid=1000, dry_run=True)
-        output = capsys.readouterr().out
-        # Dry-run never writes IDENTITY.md or names the .example suffix
-        # (the migration helper has not seen any pre-state to migrate).
-        assert "IDENTITY.md" not in output
-        assert ".example" not in output
-        # The seed-step preview line names the source template path.
-        assert "Would seed" in output
-        assert "templates/.claude/CLAUDE.md" in output
-
-    def test_dry_run_predicts_no_seed_when_identity_md_will_move(self, tmp_path, capsys):
-        """
-        Row 2 of the migration table: IDENTITY.md regular file exists with
-        no CLAUDE.md sibling. The migration moves IDENTITY.md to CLAUDE.md,
-        so the seed step has no work to do. Dry-run reflects that.
-        """
-        src = tmp_path / "source"
-        ws_claude = src / "templates" / ".claude"
-        ws_claude.mkdir(parents=True)
-        (ws_claude / "CLAUDE.md").write_text("# Kai\n")
-        install = tmp_path / "install"
-        (install / "home").mkdir(parents=True)
-        (install / "home" / "IDENTITY.md").write_text("# Operator content")
-
-        with patch("kai.install.PROJECT_ROOT", src):
-            _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=True)
-        output = capsys.readouterr().out
-        # Migration row 2 dry-run line.
-        assert "Would move" in output
-        # No seed prediction; the rename will populate CLAUDE.md.
-        assert "Would seed" not in output
 
     def test_copies_templates_config(self, tmp_path):
         """templates/config/ is copied to install/home/config/."""
@@ -4071,6 +3832,311 @@ class TestApplySource:
         assert "templates/config" in output
         # Should not create the directory during dry run
         assert not (tmp_path / "install" / "home" / "config").exists()
+
+
+# ── _retire_install_home_claude ──────────────────────────────────────
+
+
+class TestRetireInstallHomeClaude:
+    """
+    Pins the wholesale-directory cleanup of <install>/home/.claude/ and
+    the legacy <install>/home/IDENTITY.md. Both paths predate the
+    per-user home_workspace migration in #353; nothing in the runtime
+    reads either path. Issue #447 retires both.
+    """
+
+    def test_fresh_install_no_install_home_claude_dir(self, tmp_path):
+        """Fresh install: no pre-existing dirs, helper is a no-op."""
+        install = tmp_path / "install"
+        install.mkdir()
+        _retire_install_home_claude(install, dry_run=False)
+        assert not (install / "home" / ".claude").exists()
+        assert not (install / "home" / "IDENTITY.md").exists()
+
+    def test_existing_install_home_claude_dir_is_removed(self, tmp_path, capsys):
+        """Existing <install>/home/.claude/ with content is removed wholesale."""
+        install = tmp_path / "install"
+        ws_claude = install / "home" / ".claude"
+        ws_claude.mkdir(parents=True)
+        (ws_claude / "CLAUDE.md").write_text("# Operator content\n")
+        (ws_claude / "MEMORY.md").write_text("# Memory\n")
+        (ws_claude / "skills").mkdir()
+        (ws_claude / "skills" / "example.md").write_text("# skill")
+
+        _retire_install_home_claude(install, dry_run=False)
+
+        assert not ws_claude.exists()
+        output = capsys.readouterr().out
+        assert "CLAUDE.md" in output
+        assert "MEMORY.md" in output
+        assert "example.md" in output
+        assert "Removed dead" in output
+        assert "nothing reads this path post-#447" in output
+
+    def test_legacy_identity_md_regular_file_is_removed(self, tmp_path, capsys):
+        """A bare regular-file <install>/home/IDENTITY.md is removed."""
+        install = tmp_path / "install"
+        (install / "home").mkdir(parents=True)
+        identity = install / "home" / "IDENTITY.md"
+        identity.write_text("# Operator content\n")
+
+        _retire_install_home_claude(install, dry_run=False)
+
+        assert not identity.exists()
+        output = capsys.readouterr().out
+        assert "Removed legacy" in output
+        assert "IDENTITY.md" in output
+
+    def test_symlink_at_identity_md_is_removed(self, tmp_path):
+        """A broken or valid symlink at IDENTITY.md is removed too."""
+        install = tmp_path / "install"
+        (install / "home").mkdir(parents=True)
+        identity = install / "home" / "IDENTITY.md"
+        identity.symlink_to("/nonexistent/broken/target")
+
+        _retire_install_home_claude(install, dry_run=False)
+
+        assert not identity.is_symlink()
+        assert not identity.exists()
+
+    def test_dry_run_predicts_cleanup_matches_live(self, tmp_path, capsys):
+        """Dry-run / live parity: each removal line corresponds 1:1."""
+
+        def seed_install_state(install_root: Path) -> None:
+            ws_claude = install_root / "home" / ".claude"
+            ws_claude.mkdir(parents=True)
+            (ws_claude / "CLAUDE.md").write_text("# content\n")
+            (ws_claude / "MEMORY.md").write_text("# memory\n")
+            (install_root / "home" / "IDENTITY.md").write_text("# operator\n")
+
+        install_dry = tmp_path / "install_dry"
+        install_live = tmp_path / "install_live"
+        seed_install_state(install_dry)
+        seed_install_state(install_live)
+
+        _retire_install_home_claude(install_dry, dry_run=True)
+        dry_output = capsys.readouterr().out
+
+        _retire_install_home_claude(install_live, dry_run=False)
+        live_output = capsys.readouterr().out
+
+        # Filter to the removal-related lines and strip the tense-marker
+        # prefix so the comparison runs on the action body. Live uses
+        # "Removing " for per-file (before rmtree, so a rmtree OSError
+        # does not leave a past-tense lie in stdout) and "Removed " for
+        # the post-rmtree summary and post-unlink IDENTITY.md line.
+        # Dry-run uses a single "[DRY RUN] Would remove " prefix for
+        # all three phases.
+        def removal_lines(text: str, prefixes: tuple[str, ...], install_path: Path) -> list[str]:
+            placeholder = "<install>"
+            stripped: list[str] = []
+            for line in text.splitlines():
+                line = line.strip()
+                for prefix in prefixes:
+                    if line.startswith(prefix):
+                        body = line[len(prefix) :].lstrip()
+                        body = body.replace(str(install_path), placeholder)
+                        stripped.append(body)
+                        break
+            return stripped
+
+        dry_lines = removal_lines(dry_output, ("[DRY RUN] Would remove ",), install_dry)
+        live_lines = removal_lines(live_output, ("Removing ", "Removed "), install_live)
+        assert dry_lines, f"Dry-run produced no removal previews; got: {dry_output!r}"
+        assert dry_lines == live_lines, f"Dry-run / live parity broken.\n  Dry:  {dry_lines}\n  Live: {live_lines}"
+
+    def test_idempotent_on_repeated_install(self, tmp_path, capsys):
+        """Second call over the cleaned state is a silent no-op."""
+        install = tmp_path / "install"
+        install.mkdir()
+
+        _retire_install_home_claude(install, dry_run=False)
+        capsys.readouterr()  # discard first run
+        _retire_install_home_claude(install, dry_run=False)
+
+        second_output = capsys.readouterr().out
+        assert not (install / "home" / ".claude").exists()
+        assert "Removed dead" not in second_output
+        assert "Removed legacy" not in second_output
+
+
+# ── Per-user CLAUDE.md seed (in _apply_migrate's home block) ─────────
+
+
+class TestApplyMigrateClaudeMdSeed:
+    """
+    _apply_migrate's home block seeds <DATA_DIR>/home/<chat_id>/.claude/
+    CLAUDE.md from templates/.claude/CLAUDE.md for every users.yaml
+    entry. Without this seed, a new user's home workspace is an empty
+    directory and the bot has no baseline identity to read. The pattern
+    mirrors the MEMORY.md / PREFERENCES.md seed blocks above this one
+    in the same function. Lazy bootstrap (backend.ensure_user_home) is
+    the fallback for chat_ids added between installs and is covered by
+    its own test module.
+    """
+
+    def _write_users_yaml(self, path: Path, entries: list[dict]) -> None:
+        path.write_text(yaml.safe_dump({"users": entries}))
+
+    def _stub_pwd_getpwnam(self):
+        # Map any os_user to a fixed uid/gid pair. _apply_migrate
+        # validates os_user existence up front via pwd.getpwnam; in
+        # tests we redirect to a stub so we do not need real OS
+        # accounts on the test host. The chown calls inside the
+        # function are themselves stubbed out via patch("os.chown")
+        # in each test, so the uid/gid values here are placeholders.
+        class _Pw:
+            pw_uid = 1234
+            pw_gid = 1234
+
+        return _Pw()
+
+    def test_fresh_install_seeds_per_user_claude_md(self, tmp_path):
+        """A users.yaml entry produces a populated CLAUDE.md at the per-user path."""
+        src = tmp_path / "source"
+        ws_claude = src / "templates" / ".claude"
+        ws_claude.mkdir(parents=True)
+        (ws_claude / "CLAUDE.md").write_text("# Kai template\n")
+        # The seed loop is shared with MEMORY.md / PREFERENCES.md; supply
+        # those templates too so the rest of _apply_migrate does not
+        # diverge into placeholder branches.
+        (ws_claude / "MEMORY.md").write_text("# Memory\n")
+        (ws_claude / "PREFERENCES.md").write_text("# Preferences\n")
+        users_yaml = tmp_path / "users.yaml"
+        self._write_users_yaml(users_yaml, [{"telegram_id": 12345, "os_user": "alice"}])
+
+        data_path = tmp_path / "data"
+        install_path = tmp_path / "install"
+        install_path.mkdir()
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _apply_migrate(
+                data_path,
+                install_path,
+                svc_uid=0,
+                svc_gid=0,
+                dry_run=False,
+                users_yaml_path=Path(users_yaml),
+            )
+
+        claude_dst = data_path / "home" / "12345" / ".claude" / "CLAUDE.md"
+        assert claude_dst.is_file(), f"Expected seed at {claude_dst}"
+        assert claude_dst.read_text() == "# Kai template\n"
+
+    def test_existing_per_user_claude_md_survives_reinstall(self, tmp_path):
+        """Idempotent: an operator-customized destination is never overwritten."""
+        src = tmp_path / "source"
+        ws_claude = src / "templates" / ".claude"
+        ws_claude.mkdir(parents=True)
+        (ws_claude / "CLAUDE.md").write_text("# Kai template\n")
+        (ws_claude / "MEMORY.md").write_text("# Memory\n")
+        (ws_claude / "PREFERENCES.md").write_text("# Preferences\n")
+        users_yaml = tmp_path / "users.yaml"
+        self._write_users_yaml(users_yaml, [{"telegram_id": 12345, "os_user": "alice"}])
+
+        data_path = tmp_path / "data"
+        claude_dir = data_path / "home" / "12345" / ".claude"
+        claude_dir.mkdir(parents=True)
+        claude_dst = claude_dir / "CLAUDE.md"
+        claude_dst.write_text("# OPERATOR CUSTOMIZED\n")
+
+        install_path = tmp_path / "install"
+        install_path.mkdir()
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _apply_migrate(
+                data_path,
+                install_path,
+                svc_uid=0,
+                svc_gid=0,
+                dry_run=False,
+                users_yaml_path=Path(users_yaml),
+            )
+
+        # Customized content survives.
+        assert claude_dst.read_text() == "# OPERATOR CUSTOMIZED\n"
+
+    def test_missing_template_writes_placeholder(self, tmp_path):
+        """Missing template: last-resort placeholder so the file is writable."""
+        src = tmp_path / "source"
+        ws_claude = src / "templates" / ".claude"
+        ws_claude.mkdir(parents=True)
+        # CLAUDE.md template intentionally absent; MEMORY.md / PREFERENCES.md
+        # present so the rest of _apply_migrate runs normally.
+        (ws_claude / "MEMORY.md").write_text("# Memory\n")
+        (ws_claude / "PREFERENCES.md").write_text("# Preferences\n")
+        users_yaml = tmp_path / "users.yaml"
+        self._write_users_yaml(users_yaml, [{"telegram_id": 12345, "os_user": "alice"}])
+
+        data_path = tmp_path / "data"
+        install_path = tmp_path / "install"
+        install_path.mkdir()
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _apply_migrate(
+                data_path,
+                install_path,
+                svc_uid=0,
+                svc_gid=0,
+                dry_run=False,
+                users_yaml_path=Path(users_yaml),
+            )
+
+        claude_dst = data_path / "home" / "12345" / ".claude" / "CLAUDE.md"
+        assert claude_dst.is_file()
+        assert claude_dst.read_text() == "# Identity\n"
+
+    def test_dry_run_predicts_seed(self, tmp_path, capsys):
+        """Dry-run names the source and destination for the seed it would write."""
+        src = tmp_path / "source"
+        ws_claude = src / "templates" / ".claude"
+        ws_claude.mkdir(parents=True)
+        (ws_claude / "CLAUDE.md").write_text("# Kai template\n")
+        (ws_claude / "MEMORY.md").write_text("# Memory\n")
+        (ws_claude / "PREFERENCES.md").write_text("# Preferences\n")
+        users_yaml = tmp_path / "users.yaml"
+        self._write_users_yaml(users_yaml, [{"telegram_id": 12345, "os_user": "alice"}])
+
+        data_path = tmp_path / "data"
+        install_path = tmp_path / "install"
+        install_path.mkdir()
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
+        ):
+            _apply_migrate(
+                data_path,
+                install_path,
+                svc_uid=0,
+                svc_gid=0,
+                dry_run=True,
+                users_yaml_path=Path(users_yaml),
+            )
+
+        output = capsys.readouterr().out
+        expected_dst = data_path / "home" / "12345" / ".claude" / "CLAUDE.md"
+        # Dry-run preview names the per-user destination path. The
+        # template source path is in the same line; pin one substring
+        # so a path-format change does not flake the test.
+        assert f"Would seed {expected_dst}" in output
+        # Dry run never touches disk.
+        assert not expected_dst.exists()
 
 
 # ── _migrate_identity_to_claude_md ───────────────────────────────────

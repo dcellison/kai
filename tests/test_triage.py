@@ -1271,9 +1271,12 @@ class TestTriageErrorContent:
             labels=[],
         )
 
-        # Substituted post-#353 because /opt/kai/home/.claude/CLAUDE.md
+        # Substituted post-#353 because <install>/home/.claude/CLAUDE.md
         # no longer exists on production installs (the shared home was
-        # removed; CLAUDE.md is per-user under DATA_DIR/memory/).
+        # removed; CLAUDE.md is per-user under
+        # <DATA_DIR>/home/<chat_id>/.claude/, seeded by _apply_migrate
+        # eagerly and ensure_user_home lazily, and after #447 the
+        # install tree no longer holds any CLAUDE.md at all).
         # /etc/kai/env is the production secrets file - if its path ever
         # leaked into a user-facing error notification it would expose
         # the location of TELEGRAM_BOT_TOKEN and other secrets, which
