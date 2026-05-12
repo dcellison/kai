@@ -2353,7 +2353,7 @@ class TestExtractionPromptSoftVocab:
     def test_extraction_prompt_version_bumped(self):
         """The version stamp on every fact's metadata; bumped
         whenever the schema or prompt changes meaningfully."""
-        assert _EXTRACTION_PROMPT_VERSION == "8"
+        assert _EXTRACTION_PROMPT_VERSION == "9"
 
     def test_extraction_prompt_version_history_extended(self):
         """The prompt-version history comment block (the sequence
@@ -2363,9 +2363,10 @@ class TestExtractionPromptSoftVocab:
         fragments so a future unrelated edit that introduces a `vN:`
         token elsewhere cannot satisfy this test vacuously.
 
-        v5, v6, v7, and v8 fragments are pinned: each prior entry
-        stays in source unchanged across the next bump, and the v8
-        entry was appended for the speaker-attribution change."""
+        v5, v6, v7, v8, and v9 fragments are pinned: each prior entry
+        stays in source unchanged across the next bump, and the v9
+        entry was appended for the QUALITY TEST positive-criterion
+        swap."""
         from pathlib import Path
 
         import kai.memory_extraction
@@ -2376,11 +2377,14 @@ class TestExtractionPromptSoftVocab:
         assert "DURABILITY TEST gate" in src
         assert "v7 (2026-04-30, this issue)" in src
         assert "EPISODE CLASSIFICATION block" in src
-        # v8 entry: speaker-attribution prompt change. The literal
-        # date and "speaker attribution" phrase are pinned because
-        # both come from the v8 history comment specifically.
+        # v8 entry: speaker-attribution prompt change.
         assert "v8 (2026-05-07)" in src
         assert "speaker attribution" in src
+        # v9 entry: positive-criterion swap. The literal date and
+        # "QUALITY TEST" phrase are pinned because both come from the
+        # v9 history comment specifically.
+        assert "v9 (2026-05-12)" in src
+        assert "QUALITY TEST" in src
 
 
 class TestRule6WorkflowEventRegex:
@@ -2530,28 +2534,19 @@ class TestRule6WorkflowEventRegex:
 
 
 class TestExtractionPromptDurability:
-    """Pins the v6 prompt content additions: STORE / Decisions
-    refinement, two new IGNORE bullets, and the DURABILITY TEST
-    section header. Substring assertions only; the exact wording
-    is captured byte-for-byte by the source-text history-fragment
-    test in TestExtractionPromptSoftVocab."""
+    """Pins the v6 STORE-decisions refinement that survives the v9
+    swap. The v6 IGNORE bullets and DURABILITY TEST that this class
+    used to pin were retired by the v9 positive-criterion swap; their
+    replacements live in `tests/test_extraction_prompt.py`. The
+    `durable scope` and `NOT workflow micro-decisions` clauses in the
+    STORE block are unchanged across v6 -> v9 and are still pinned
+    here because they remain the only on-prompt distinction between
+    durable design decisions and workflow micro-decisions in the
+    STORE classification path."""
 
     def test_store_decisions_scoped_to_durable(self):
         assert "durable scope" in _EXTRACTION_SYSTEM_PROMPT
         assert "NOT workflow micro-decisions" in _EXTRACTION_SYSTEM_PROMPT
-
-    def test_ignore_bullets_added(self):
-        assert "Workflow-event metadata" in _EXTRACTION_SYSTEM_PROMPT
-        assert "Decisions to do" in _EXTRACTION_SYSTEM_PROMPT
-        # Concrete examples carried in the bullets so the model has
-        # specific noise patterns to match against.
-        assert "Spec X v3 was approved" in _EXTRACTION_SYSTEM_PROMPT
-        assert "User decided to file an issue about X" in _EXTRACTION_SYSTEM_PROMPT
-
-    def test_durability_test_section_present(self):
-        assert "DURABILITY TEST:" in _EXTRACTION_SYSTEM_PROMPT
-        # The 30-day frame is the operationally usable phrasing.
-        assert "30 days" in _EXTRACTION_SYSTEM_PROMPT
 
 
 class TestRunExtractorSystemPromptDefault:
