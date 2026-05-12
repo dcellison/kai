@@ -2456,6 +2456,31 @@ def _apply_migrate(
                     print(f"[DRY RUN] Would seed {claude_dst} from {home_template}")
                 else:
                     print(f"[DRY RUN] Would seed {claude_dst} with placeholder (template missing)")
+            else:
+                # Migration preview for an existing per-user copy. The
+                # seed branch above only fires when claude_dst is
+                # missing; the migration branch fires when claude_dst
+                # exists and the sentinel header may or may not be in
+                # place. Three sub-cases (sentinel missing -> would
+                # append; sentinel present -> already-migrated message;
+                # claude_dst unreadable -> warning handled inside the
+                # helper). Inspecting claude_dst here, before the
+                # `continue` below, ensures the dry-run preview reaches
+                # parity with what the live branch will do; without
+                # this branch, the dry-run output would silently omit
+                # the migration step the live install would execute.
+                if home_template_exists and _migrate_recalled_memory_section(claude_dst, home_template, dry_run=True):
+                    print(f"[DRY RUN] Would append Reading Recalled Memory section to {claude_dst}")
+                elif home_template_exists:
+                    # The helper returned False with sentinel present;
+                    # surface the no-op explicitly so the operator sees
+                    # the migration was considered and skipped, not
+                    # silently omitted.
+                    print(
+                        f"[DRY RUN] {claude_dst}: Reading Recalled Memory section already present, no migration needed"
+                    )
+                # else: template missing; the helper already printed a
+                # warning. No additional preview line needed.
             continue
 
         # Idempotent: never overwrite an operator-customized destination.
@@ -2491,6 +2516,19 @@ def _apply_migrate(
             except OSError as exc:
                 print(f"  ERROR: could not seed {claude_dst}: {exc}")
                 raise
+
+        # Append the Reading Recalled Memory section to pre-existing
+        # per-user CLAUDE.md copies that predate the section. Lands
+        # AFTER the seed step (so a fresh-seeded file from the current
+        # template carries the section already, and the helper's
+        # sentinel check is a clean no-op) and BEFORE the
+        # `_set_ownership` chown step below (so the migration's
+        # atomic `Path.replace`, which produces a new inode owned by
+        # the install runner, gets reconciled back to the per-user
+        # `os_user` in the same iteration; the chown comment block
+        # below names the #347 regression shape this prevents).
+        if home_template_exists and _migrate_recalled_memory_section(claude_dst, home_template, dry_run=False):
+            print(f"  Appended Reading Recalled Memory section to {claude_dst}")
 
         # Recursive chown over the .claude/ subdir so both the
         # directory and the freshly-seeded CLAUDE.md land on the
@@ -2958,6 +2996,188 @@ def _migrate_identity_to_claude_md(
     # this step; the conditional seed at the end of _apply_source emits
     # "Seeded CLAUDE.md from template" when it copies the template into
     # the destination.
+
+
+# Sentinel header used by `_migrate_recalled_memory_section` to detect
+# whether a per-user CLAUDE.md already carries the Reading Recalled
+# Memory section. Module-level constant so the migration helper, the
+# dry-run preview branch in the per-user CLAUDE.md seed loop, and the
+# unit tests in test_install.py all read the same literal. A drift in
+# this string would let the migration re-append on every install
+# (sentinel always missing) and silently double-write the section.
+_RECALLED_MEMORY_SECTION_HEADER = "## Reading Recalled Memory"
+
+
+def _migrate_recalled_memory_section(
+    claude_dst: Path,
+    template_path: Path,
+    *,
+    dry_run: bool,
+) -> bool:
+    """
+    Idempotently append the Reading Recalled Memory section from the
+    tracked CLAUDE.md template to an existing per-user CLAUDE.md copy.
+
+    Returns True when the file was modified (or would be in dry-run),
+    False when the section was already present, the destination is
+    missing, or the template is unreadable / missing the section header.
+
+    The section is identified by its header line
+    (`## Reading Recalled Memory`, the module-level
+    `_RECALLED_MEMORY_SECTION_HEADER` constant). If the header already
+    appears as a line in the per-user copy (operator added it manually,
+    a previous migration ran, or the seed step just copied a current
+    template), the function is a no-op. Otherwise the section text is
+    extracted from the template by header-bounded scan (header line
+    through the next `## ` line or EOF) and appended verbatim with a
+    single blank-line separator.
+
+    Atomic via Path.replace on a temp file in the same directory. The
+    rename closes the partial-write window where a crash or signal
+    mid-write could leave the per-user copy half-populated. The temp
+    file lives in claude_dst's parent so the rename stays within one
+    filesystem and is a true atomic operation (cross-filesystem renames
+    fall back to copy+unlink, which is NOT atomic).
+
+    Ownership reconciliation rides on the caller. Path.replace is
+    rename(2); the post-rename file inherits the temp file's ownership
+    (the install runner, typically root via `sudo make install`), not
+    the per-user `os_user` the inner Claude subprocess writes as. The
+    per-user CLAUDE.md seed loop calls this helper BEFORE the
+    `_set_ownership` chown step, so the appended file's ownership is
+    reconciled in the same iteration; the comment block at the chown
+    site documents the #347 regression shape this prevents.
+
+    No in-source cleanup window. The helper is idempotent on every
+    install (sentinel check returns False on a no-op iteration with
+    no file IO past the existence + read), and is short enough that
+    keeping it indefinitely is cheaper than tracking a removal date.
+    Removal is a follow-up PR when the operator decides the population
+    of pre-migration per-user copies is empirically zero.
+
+    Args:
+        claude_dst: The per-user CLAUDE.md to append to. Path returned
+            by the per-user seed loop's resolution of
+            `<DATA_DIR>/home/<chat_id>/.claude/CLAUDE.md`.
+        template_path: The tracked template
+            (`templates/.claude/CLAUDE.md`). Section text is extracted
+            from here on every call so a future revision to the
+            section's wording in the template propagates to the next
+            install's migration run.
+        dry_run: If True, return the would-be modification status
+            without writing anything; the caller's dry-run preview
+            branch consumes the bool to print the appropriate preview
+            line.
+    """
+    # Skip if the per-user copy does not exist. The seed step earlier
+    # in the loop just wrote a fresh copy from the current template if
+    # claude_dst was missing, so by the time live execution reaches
+    # this helper, claude_dst should exist; the explicit check guards
+    # the dry-run branch (where the seed is a preview-only print) and
+    # the operator-managed-override branch (where the seed is skipped
+    # entirely).
+    if not claude_dst.is_file():
+        return False
+
+    # Read the per-user copy and check for the sentinel header on a
+    # full-line basis. Substring match against the file body would
+    # false-positive on a future section like "## Reading Recalled
+    # Memory Notes" that starts with the same prefix; line-strip-equal
+    # is the precise check that matches what the migration's own
+    # append produces.
+    try:
+        existing = claude_dst.read_text()
+    except OSError as exc:
+        # Broken symlink, permissions, mount issue. Match the
+        # ensure_user_home swallow pattern: surface to operator log,
+        # continue the install rather than abort. The next install
+        # retries; the lazy seed path will also retry on first message.
+        print(f"  WARNING: could not read {claude_dst} for migration: {exc}")
+        return False
+
+    for line in existing.splitlines():
+        if line.strip() == _RECALLED_MEMORY_SECTION_HEADER:
+            return False  # Sentinel present; nothing to do.
+
+    # Read the template and extract the section by header-bounded scan.
+    # Reading template_path on every call (rather than caching at module
+    # import) keeps the helper testable with arbitrary template paths
+    # via tmp_path fixtures.
+    try:
+        template_text = template_path.read_text()
+    except OSError as exc:
+        print(f"  WARNING: could not read template {template_path}: {exc}")
+        return False
+
+    template_lines = template_text.splitlines(keepends=True)
+    section_start = None
+    for i, line in enumerate(template_lines):
+        if line.strip() == _RECALLED_MEMORY_SECTION_HEADER:
+            section_start = i
+            break
+
+    if section_start is None:
+        # Template predates the migration or has been edited to remove
+        # the section. The migration cannot reconstruct content that is
+        # not in the template; warn so the operator notices and either
+        # restores the template or removes this helper from the install
+        # flow. Mirrors the placeholder-warning shape the per-user
+        # CLAUDE.md seed loop uses ("WARNING: <template> not found").
+        print(
+            f"  WARNING: {template_path} is missing the "
+            f"{_RECALLED_MEMORY_SECTION_HEADER!r} section; "
+            f"cannot migrate {claude_dst}"
+        )
+        return False
+
+    # Find the section terminator: the next top-level `## ` line after
+    # the header, or EOF. The header itself is excluded from the
+    # `## ` scan via the `section_start + 1` start so it does not match
+    # itself as its own terminator.
+    section_end = len(template_lines)
+    for i in range(section_start + 1, len(template_lines)):
+        if template_lines[i].startswith("## "):
+            section_end = i
+            break
+
+    # Strip trailing blank lines from the extracted section so the
+    # append produces exactly one trailing newline, matching the
+    # tracked template's overall file shape (no trailing blank lines).
+    section_text = "".join(template_lines[section_start:section_end]).rstrip() + "\n"
+
+    if dry_run:
+        # Caller's dry-run preview branch prints the operator-facing
+        # line; this helper only signals "would modify" by returning
+        # True. Returning early before the temp-file write means a
+        # dry-run pass has zero filesystem side effects.
+        return True
+
+    # Append with a single blank-line separator. The rstrip() drops any
+    # trailing whitespace from the existing per-user copy so the
+    # separator is always exactly one blank line regardless of whether
+    # the source file ended in zero, one, or multiple newlines.
+    new_content = existing.rstrip() + "\n\n" + section_text
+
+    # Atomic write via temp file + Path.replace in the same directory.
+    # The temp file's name pairs the destination's name with a `.tmp`
+    # suffix; deterministic enough that a crash-interrupted earlier run
+    # leaves a recoverable artifact at a known path rather than a random
+    # mkstemp name. The try/except cleans up the temp file when
+    # write_text fails partway, so a partial-write does not leave debris
+    # in the .claude/ directory.
+    temp_path = claude_dst.parent / (claude_dst.name + ".tmp")
+    try:
+        temp_path.write_text(new_content)
+        temp_path.replace(claude_dst)
+    except OSError as exc:
+        # Clean up the partial temp file before propagating so a retry
+        # is not blocked by a stale .tmp file. unlink(missing_ok=True)
+        # handles the case where write_text never created the file.
+        temp_path.unlink(missing_ok=True)
+        print(f"  ERROR: could not migrate {claude_dst}: {exc}")
+        raise
+
+    return True
 
 
 def _retire_install_home_claude(install_path: Path, dry_run: bool) -> None:
