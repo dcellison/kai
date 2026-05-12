@@ -3099,8 +3099,8 @@ def _migrate_recalled_memory_section(
             install's migration run.
         dry_run: If True, return the would-be modification status
             without writing anything; the caller's dry-run preview
-            branch consumes the bool to print the appropriate preview
-            line.
+            branch consumes the three-state return to print the
+            appropriate preview line.
     """
     # Skip if the per-user copy does not exist. The seed step earlier
     # in the loop just wrote a fresh copy from the current template if
