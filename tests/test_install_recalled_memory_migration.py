@@ -192,7 +192,12 @@ class TestMigrateRecalledMemorySection:
     # ── Case 4: template missing the section header ──
 
     def test_skip_with_warning_when_template_missing_section(self, tmp_path, capsys):
-        """Template lacks the section: skip, warn, do not modify per-user copy."""
+        """Template lacks the section: skip, warn, do not modify per-user copy.
+
+        Returns None (failure path), not False (no-op). The dry-run preview
+        relies on this distinction to avoid printing "already present" when
+        the helper has actually warned about a different problem.
+        """
         template = tmp_path / "template.md"
         template.write_text(_TEMPLATE_WITHOUT_SECTION)
         per_user = tmp_path / "per_user.md"
@@ -200,7 +205,7 @@ class TestMigrateRecalledMemorySection:
 
         result = _migrate_recalled_memory_section(per_user, template, dry_run=False)
 
-        assert result is False
+        assert result is None
         # Per-user copy is byte-for-byte unchanged.
         assert per_user.read_text() == _STALE_PER_USER_COPY
         # Warning surfaces to operator stdout per the placeholder-warning
@@ -213,18 +218,22 @@ class TestMigrateRecalledMemorySection:
     # ── Case 5: per-user copy is a broken symlink ──
 
     def test_skip_with_warning_on_broken_symlink(self, tmp_path, capsys):
-        """Broken symlink at claude_dst: skip with warning, no exception escapes."""
+        """Broken symlink at claude_dst: skip with warning, no exception escapes.
+
+        Returns None (failure path) so the dry-run preview can suppress the
+        "already present" line that would otherwise mislead the operator.
+        """
         template = tmp_path / "template.md"
         template.write_text(_TEMPLATE_WITH_SECTION)
         per_user = tmp_path / "per_user.md"
         # Point the symlink at a path that does not exist. is_file()
         # returns False for a broken symlink, so the helper's existence
-        # guard hits first and returns False cleanly.
+        # guard hits first and returns None cleanly.
         per_user.symlink_to(tmp_path / "nonexistent.md")
 
         result = _migrate_recalled_memory_section(per_user, template, dry_run=False)
 
-        assert result is False
+        assert result is None
         # The symlink itself is untouched (still a broken symlink).
         assert per_user.is_symlink()
         # No write occurred at the symlink target.
@@ -394,6 +403,54 @@ class TestApplyMigrateRecalledMemoryIntegration:
         assert claude_dst.read_text() == _TEMPLATE_WITH_SECTION
         output = capsys.readouterr().out
         assert "Reading Recalled Memory section already present" in output
+
+    # ── Case D: dry-run when the tracked template is missing entirely ──
+
+    def test_dry_run_surfaces_template_missing_when_claude_dst_exists(self, tmp_path, capsys):
+        """claude_dst exists + template absent + dry-run: surface the gap.
+
+        Without an explicit preview line for this case the dry-run output
+        would silently omit the migration step the operator might assume
+        would run. The seed branch above only fires when claude_dst is
+        missing, so under the (claude_dst exists, template missing)
+        combination the operator would otherwise see no relevant output.
+        """
+        src, data_path, install_path, users_yaml = self._build_install_layout(
+            tmp_path,
+            # Note: _build_install_layout normally writes a CLAUDE.md
+            # template; passing None here is not how the helper is set
+            # up. We rebuild the layout manually to omit the template.
+            template_content=_TEMPLATE_WITH_SECTION,
+            claude_dst_content=_STALE_PER_USER_COPY,
+        )
+        # Remove the CLAUDE.md template so home_template_exists is False
+        # at the seed-loop's check. MEMORY.md and PREFERENCES.md templates
+        # remain so the sibling seed blocks do not emit unrelated noise.
+        (src / "templates" / ".claude" / "CLAUDE.md").unlink()
+
+        with (
+            patch("kai.install.PROJECT_ROOT", src),
+            patch("kai.install.pwd.getpwnam", return_value=self._stub_pwd_getpwnam()),
+            patch("kai.install._set_ownership"),
+            patch("os.chown"),
+        ):
+            _apply_migrate(
+                data_path,
+                install_path,
+                svc_uid=0,
+                svc_gid=0,
+                dry_run=True,
+                users_yaml_path=Path(users_yaml),
+            )
+
+        claude_dst = data_path / "home" / "12345" / ".claude" / "CLAUDE.md"
+        # File unchanged in dry-run mode.
+        assert claude_dst.read_text() == _STALE_PER_USER_COPY
+        # The dry-run preview names the failure explicitly so the operator
+        # knows the migration was considered and could not proceed.
+        output = capsys.readouterr().out
+        assert "cannot evaluate migration" in output
+        assert "template missing" in output
 
     # ── Case C: stale + live install ──
 

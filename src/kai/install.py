@@ -2459,28 +2459,41 @@ def _apply_migrate(
             else:
                 # Migration preview for an existing per-user copy. The
                 # seed branch above only fires when claude_dst is
-                # missing; the migration branch fires when claude_dst
+                # missing; the migration preview fires when claude_dst
                 # exists and the sentinel header may or may not be in
-                # place. Three sub-cases (sentinel missing -> would
-                # append; sentinel present -> already-migrated message;
-                # claude_dst unreadable -> warning handled inside the
-                # helper). Inspecting claude_dst here, before the
+                # place. Inspecting claude_dst here, before the
                 # `continue` below, ensures the dry-run preview reaches
                 # parity with what the live branch will do; without
                 # this branch, the dry-run output would silently omit
                 # the migration step the live install would execute.
-                if home_template_exists and _migrate_recalled_memory_section(claude_dst, home_template, dry_run=True):
-                    print(f"[DRY RUN] Would append Reading Recalled Memory section to {claude_dst}")
-                elif home_template_exists:
-                    # The helper returned False with sentinel present;
-                    # surface the no-op explicitly so the operator sees
-                    # the migration was considered and skipped, not
-                    # silently omitted.
-                    print(
-                        f"[DRY RUN] {claude_dst}: Reading Recalled Memory section already present, no migration needed"
-                    )
-                # else: template missing; the helper already printed a
-                # warning. No additional preview line needed.
+                #
+                # The helper's three-state return is the structural
+                # distinction that lets the preview print accurate text
+                # per case. Truthy/falsy alone would conflate sentinel-
+                # present (False) with the failure paths (None), producing
+                # a misleading "already present" line when the helper had
+                # actually warned about a different problem.
+                if home_template_exists:
+                    migration_result = _migrate_recalled_memory_section(claude_dst, home_template, dry_run=True)
+                    if migration_result is True:
+                        print(f"[DRY RUN] Would append Reading Recalled Memory section to {claude_dst}")
+                    elif migration_result is False:
+                        # Sentinel present; surface the no-op explicitly so
+                        # the operator sees the migration was considered.
+                        print(
+                            f"[DRY RUN] {claude_dst}: Reading Recalled Memory "
+                            f"section already present, no migration needed"
+                        )
+                    # else: migration_result is None; the helper already
+                    # printed its own WARNING for the specific failure path.
+                    # No additional preview line needed.
+                else:
+                    # Template missing entirely; the helper is never called
+                    # because of the short-circuit above, so no warning has
+                    # been printed in this iteration. Surface the gap so the
+                    # dry-run preview is honest about what the install can
+                    # and cannot do for this user.
+                    print(f"[DRY RUN] {claude_dst}: cannot evaluate migration (template missing at {home_template})")
             continue
 
         # Idempotent: never overwrite an operator-customized destination.
@@ -2527,7 +2540,7 @@ def _apply_migrate(
         # the install runner, gets reconciled back to the per-user
         # `os_user` in the same iteration; the chown comment block
         # below names the #347 regression shape this prevents).
-        if home_template_exists and _migrate_recalled_memory_section(claude_dst, home_template, dry_run=False):
+        if home_template_exists and _migrate_recalled_memory_section(claude_dst, home_template, dry_run=False) is True:
             print(f"  Appended Reading Recalled Memory section to {claude_dst}")
 
         # Recursive chown over the .claude/ subdir so both the
@@ -3002,9 +3015,9 @@ def _migrate_identity_to_claude_md(
 # whether a per-user CLAUDE.md already carries the Reading Recalled
 # Memory section. Module-level constant so the migration helper, the
 # dry-run preview branch in the per-user CLAUDE.md seed loop, and the
-# unit tests in test_install.py all read the same literal. A drift in
-# this string would let the migration re-append on every install
-# (sentinel always missing) and silently double-write the section.
+# sibling install tests all read the same literal. A drift in this
+# string would let the migration re-append on every install (sentinel
+# always missing) and silently double-write the section.
 _RECALLED_MEMORY_SECTION_HEADER = "## Reading Recalled Memory"
 
 
@@ -3013,22 +3026,39 @@ def _migrate_recalled_memory_section(
     template_path: Path,
     *,
     dry_run: bool,
-) -> bool:
+) -> bool | None:
     """
     Idempotently append the Reading Recalled Memory section from the
     tracked CLAUDE.md template to an existing per-user CLAUDE.md copy.
 
-    Returns True when the file was modified (or would be in dry-run),
-    False when the section was already present, the destination is
-    missing, or the template is unreadable / missing the section header.
+    Three return states so the dry-run preview can distinguish the
+    legitimate no-op from any failure path:
+
+    - True: the section would be (or was) appended. Sentinel absent in
+      claude_dst, template present and well-formed.
+    - False: the section is already present in claude_dst (sentinel
+      header matched line-strip-equal). Nothing to do; not an error.
+    - None: helper could not proceed. Failure paths include claude_dst
+      not a regular file, claude_dst unreadable, template_path
+      unreadable, and template missing the section header. Each path
+      prints its own operator-facing warning before returning None, so
+      the caller does not need to surface additional output.
+
+    The three-state return is the structural distinction that lets the
+    dry-run preview branch in `_apply_migrate` print accurate operator-
+    facing text per case without re-checking the sentinel separately;
+    truthiness alone (the prior bool return) conflated sentinel-present
+    with the failure paths and produced a misleading "section already
+    present" line when the helper had actually warned about a different
+    problem.
 
     The section is identified by its header line
     (`## Reading Recalled Memory`, the module-level
     `_RECALLED_MEMORY_SECTION_HEADER` constant). If the header already
     appears as a line in the per-user copy (operator added it manually,
     a previous migration ran, or the seed step just copied a current
-    template), the function is a no-op. Otherwise the section text is
-    extracted from the template by header-bounded scan (header line
+    template), the function returns False. Otherwise the section text
+    is extracted from the template by header-bounded scan (header line
     through the next `## ` line or EOF) and appended verbatim with a
     single blank-line separator.
 
@@ -3036,8 +3066,11 @@ def _migrate_recalled_memory_section(
     rename closes the partial-write window where a crash or signal
     mid-write could leave the per-user copy half-populated. The temp
     file lives in claude_dst's parent so the rename stays within one
-    filesystem and is a true atomic operation (cross-filesystem renames
-    fall back to copy+unlink, which is NOT atomic).
+    filesystem; `Path.replace` delegates to `os.replace`, which calls
+    `rename(2)` and surfaces `EXDEV` as `OSError` for cross-filesystem
+    targets. No silent fallback to copy+unlink (that is `shutil.move`'s
+    behavior, not `Path.replace`'s); the colocation here is a hard
+    requirement for the rename to succeed at all.
 
     Ownership reconciliation rides on the caller. Path.replace is
     rename(2); the post-rename file inherits the temp file's ownership
@@ -3077,7 +3110,7 @@ def _migrate_recalled_memory_section(
     # the operator-managed-override branch (where the seed is skipped
     # entirely).
     if not claude_dst.is_file():
-        return False
+        return None
 
     # Read the per-user copy and check for the sentinel header on a
     # full-line basis. Substring match against the file body would
@@ -3093,11 +3126,11 @@ def _migrate_recalled_memory_section(
         # continue the install rather than abort. The next install
         # retries; the lazy seed path will also retry on first message.
         print(f"  WARNING: could not read {claude_dst} for migration: {exc}")
-        return False
+        return None
 
     for line in existing.splitlines():
         if line.strip() == _RECALLED_MEMORY_SECTION_HEADER:
-            return False  # Sentinel present; nothing to do.
+            return False  # Sentinel present; legitimate no-op.
 
     # Read the template and extract the section by header-bounded scan.
     # Reading template_path on every call (rather than caching at module
@@ -3107,7 +3140,7 @@ def _migrate_recalled_memory_section(
         template_text = template_path.read_text()
     except OSError as exc:
         print(f"  WARNING: could not read template {template_path}: {exc}")
-        return False
+        return None
 
     template_lines = template_text.splitlines(keepends=True)
     section_start = None
@@ -3128,15 +3161,17 @@ def _migrate_recalled_memory_section(
             f"{_RECALLED_MEMORY_SECTION_HEADER!r} section; "
             f"cannot migrate {claude_dst}"
         )
-        return False
+        return None
 
     # Find the section terminator: the next top-level `## ` line after
     # the header, or EOF. The header itself is excluded from the
     # `## ` scan via the `section_start + 1` start so it does not match
-    # itself as its own terminator.
+    # itself as its own terminator. lstrip().startswith matches the
+    # whitespace-tolerant strip-equal check the sentinel scan uses,
+    # so a future indented top-level header still terminates the section.
     section_end = len(template_lines)
     for i in range(section_start + 1, len(template_lines)):
-        if template_lines[i].startswith("## "):
+        if template_lines[i].lstrip().startswith("## "):
             section_end = i
             break
 

@@ -57,7 +57,7 @@ Three modes apply per row, graded by how much the row covers the user's question
 
 A partial match is evidence of an open question, not a basis for a confident answer. When you would otherwise answer confidently from a row that does not fully cover the question, switch to the inference or partial-match shape above.
 
-The source tag in a row prefix names the row's provenance, not its credibility. Extracted facts and operator-imported (migration) facts both render as `fact`, so the agent cannot read one as more trustworthy than the other. Rows tagged `legacy` lack a source field entirely; older data, not lower quality. Episode rows (`episode, <quality>`) carry a different shape and apply the three-mode taxonomy the same way as fact rows.
+The source tag in a row prefix names the row's provenance, not its credibility. Extracted facts and operator-imported (migration) facts both render as `fact`, so the agent cannot read one as more trustworthy than the other. Rows tagged `legacy` lack a source field entirely, or carry a source the renderer does not recognize; older data or future schema drift, not lower quality. Episode rows (`episode, <quality>`) carry a different shape and apply the three-mode taxonomy the same way as fact rows.
 
 This rule applies to the recalled-memory block and the persistent-memory block. It does not apply to the user's current message, the chat history block, or any other context surface; those have their own contracts.
 
