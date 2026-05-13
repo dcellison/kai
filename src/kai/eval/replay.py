@@ -153,6 +153,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "the store."
         ),
     )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help=(
+            "If set, attach an INFO-level FileHandler to the root logger "
+            "so structured Kai log lines (memory.consolidate.intent, "
+            "memory.extract:, etc.) are captured. Without this flag the "
+            "replay only writes its preamble and summary to stderr; the "
+            "per-fact intent log (dropped_duplicate fires, update_of "
+            "decisions, store outcomes) is silently dropped. Set this "
+            "for any run whose results need to be analyzed downstream."
+        ),
+    )
     return parser
 
 
@@ -356,6 +370,35 @@ async def _run_replay(
     return counters, dry_run_samples
 
 
+def _attach_log_file(path: Path) -> None:
+    """Attach an INFO-level FileHandler to the root logger.
+
+    Mirrors `kai.main.setup_logging`'s formatter and level so log lines
+    from a replay are byte-shape-compatible with production kai.log
+    lines: same `%(asctime)s %(name)s %(levelname)s %(message)s` shape,
+    same INFO threshold. Downstream parsers that already chew
+    production logs (grep for `memory.consolidate.intent`, jq the JSON
+    payload) work unmodified on a replay log.
+
+    Parent directory is created if missing. Append mode so a re-run of
+    the replay with the same `--log-file` accumulates rather than
+    clobbers; operators who want a clean file should delete it first
+    (the same posture as the production logger's daily-rotation file).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+    handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    handler.setFormatter(formatter)
+    handler.setLevel(logging.INFO)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    # Match `setup_logging`'s noise suppression so a replay file does
+    # not balloon with per-request HTTP and APScheduler tick chatter.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+
+
 async def _reset_sandbox(user_id: str) -> None:
     """Delete all facts for the sandbox `user_id`. No-op safe."""
     # Late import to keep replay-module import cheap and to let tests
@@ -451,6 +494,17 @@ async def _async_main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+    # Wire structured logs to a file when --log-file is set. Without
+    # this, `_emit_intent_log` (INFO level) and the per-extraction
+    # summary line both vanish because the replay module never calls
+    # the bot's `setup_logging`, and Python's default last-resort
+    # handler suppresses anything below WARNING. The cost of dropping
+    # those signals is invisible until an operator tries to count
+    # gate-fires or correlate outcomes across a sweep - so the gate
+    # must be explicit: pass --log-file to capture, omit to skip.
+    if args.log_file is not None:
+        _attach_log_file(args.log_file)
 
     # Resolve history_dir and config_turns from production config when
     # not supplied. Loaded here (not at top) so a test can run without

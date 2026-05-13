@@ -415,6 +415,145 @@ class TestInitMemory:
         init_mock.assert_called_once_with(config_mock)
 
 
+# ── --log-file structured-log capture ───────────────────────────────
+
+
+class TestLogFileCapture:
+    """`--log-file` MUST attach an INFO-level FileHandler to the root
+    logger so structured Kai log lines (`memory.consolidate.intent`,
+    `memory.extract:`, etc.) land in a file instead of being dropped
+    by Python's WARNING-only last-resort handler.
+
+    This test exists because that bug actually shipped: the #465
+    five-T sweep ran ~6 hours of compute and produced zero
+    gate-fire-count data because the replay module never configured
+    logging. The deterministic gate-fire signal the spec named as
+    PR-body evidence was silently dropped at the logger boundary. The
+    fix is the `--log-file` flag; this test pins the contract."""
+
+    def _make_history(self, tmp_path: Path) -> Path:
+        """One-pair synthetic history so the replay walks but the
+        extractor and store are stubbed before any subprocess fires."""
+        history_dir = tmp_path / "history" / str(_CHAT_ID)
+        history_dir.mkdir(parents=True)
+        _write_jsonl(
+            history_dir / "2026-05-12.jsonl",
+            [_rec("user", "hi"), _rec("assistant", "hello")],
+        )
+        return history_dir
+
+    @pytest.mark.asyncio
+    async def test_log_file_flag_captures_intent_log_lines(self, tmp_path):
+        """End-to-end: an INFO-level `memory.consolidate.intent` line
+        emitted via the production `_emit_intent_log` helper must
+        appear in the file the operator named. The replay loop is
+        short-circuited (no real extraction) and we directly emit a
+        synthetic intent log from inside the patched extract path so
+        the test is fast and deterministic."""
+        history_dir = self._make_history(tmp_path)
+        log_path = tmp_path / "replay-with-logs.log"
+
+        # Drive a synthetic intent log line from inside the patched
+        # extract path. _emit_intent_log is the production helper that
+        # `_store_facts` calls on every branch; emitting through it
+        # verifies the same call shape production uses, not a stub.
+        async def _fake_extract(*args, **kwargs):
+            from kai.memory_extraction import _emit_intent_log
+
+            _emit_intent_log(
+                user_id=kwargs["user_id"],
+                intent="new",
+                original_intent=None,
+                new_id="test-id",
+                replaced_id=None,
+                outcome="stored",
+            )
+            return 1
+
+        config_mock = MagicMock()
+        config_mock.episode_classifier_context_turns = 3
+
+        with (
+            patch("kai.config.load_config", return_value=config_mock),
+            patch("kai.memory.init_memory"),
+            patch("kai.memory.delete_all"),
+            patch("kai.memory.get_all_facts", return_value=[]),
+            patch("kai.memory_extraction.extract_and_store", side_effect=_fake_extract),
+        ):
+            rc = await replay._async_main(
+                [
+                    "--chat-id",
+                    str(_CHAT_ID),
+                    "--user-id",
+                    "sandbox-log-test",
+                    "--history-dir",
+                    str(history_dir),
+                    "--log-file",
+                    str(log_path),
+                ]
+            )
+
+        assert rc == 0
+        assert log_path.exists(), "log file was not created"
+        captured = log_path.read_text(encoding="utf-8")
+        # The intent log line carries the literal marker the spec
+        # documents as the wire format. Asserting the substring (not
+        # the exact line) keeps the test resilient to formatter
+        # adjustments while pinning the load-bearing tag.
+        assert "memory.consolidate.intent" in captured
+        # The JSON payload's outcome field MUST be preserved verbatim
+        # so a downstream `jq '.outcome'` parse over a real sweep log
+        # produces usable counts. This is the assertion that prevents
+        # a future "summarize before write" refactor from breaking
+        # gate-fire analysis.
+        assert '"outcome":"stored"' in captured
+
+    def _root_handler_count(self) -> int:
+        """Snapshot of the root logger's handler count so the
+        no-flag test can assert no permanent global mutation."""
+        import logging
+
+        return len(logging.getLogger().handlers)
+
+    @pytest.mark.asyncio
+    async def test_log_file_default_attaches_no_handler(self, tmp_path):
+        """Regression guard: without `--log-file` the replay must NOT
+        attach a handler to the root logger. The previous behavior
+        (no logging) was a bug, but the FIX must be explicit (the
+        flag), not silent. A future refactor that auto-enables logging
+        could leak handlers across test runs or surprise an operator
+        whose terminal session was previously quiet."""
+        history_dir = self._make_history(tmp_path)
+        before = self._root_handler_count()
+
+        config_mock = MagicMock()
+        config_mock.episode_classifier_context_turns = 3
+
+        with (
+            patch("kai.config.load_config", return_value=config_mock),
+            patch("kai.memory.init_memory"),
+            patch("kai.memory.delete_all"),
+            patch("kai.memory.get_all_facts", return_value=[]),
+            patch("kai.memory_extraction.extract_and_store", AsyncMock(return_value=0)),
+        ):
+            rc = await replay._async_main(
+                [
+                    "--chat-id",
+                    str(_CHAT_ID),
+                    "--user-id",
+                    "sandbox-no-log-test",
+                    "--history-dir",
+                    str(history_dir),
+                ]
+            )
+
+        assert rc == 0
+        # Handler count unchanged: the replay did not silently attach
+        # logging machinery. Operators who omit --log-file get the
+        # same (broken-but-documented) behavior as before the fix.
+        assert self._root_handler_count() == before
+
+
 # ── PRIOR CONTEXT truncation deferred to extract_and_store ──────────
 
 
