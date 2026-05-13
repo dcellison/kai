@@ -804,6 +804,13 @@ def _cmd_config() -> None:
     memory_episode_timeout_s = "120"
     memory_token_budget = "2000"
     memory_search_limit = "10"
+    # Pre-init for the extraction-time paraphrase-dedup threshold.
+    # Mirrors the other extraction tunables above: the value is set
+    # only when the wizard reaches the prompt (claude backend AND
+    # extraction enabled). Non-claude installs keep the dataclass
+    # default at runtime via load_config, so the env entry stays
+    # suppressed by the delta-from-default check below.
+    memory_duplicate_threshold = "0.9"
     if memory_enabled:
         # Haiku extraction only fires when the active backend is Claude
         # (bot.py:3609 silently skips it otherwise - no startup error,
@@ -932,6 +939,28 @@ def _cmd_config() -> None:
                     except ValueError:
                         pass
                     print("  Must be an integer of at least 10.")
+                # Write-time paraphrase-dedup threshold. Sits inside
+                # the extraction-enabled guard because the gate only
+                # fires in `_store_facts` on the extraction write
+                # path. Inline range check rather than a dedicated
+                # helper: the [0.3, 1.01] band is unique to this
+                # field (lower bound = operator floor for cosine
+                # similarity, upper bound permits 1.01 as an
+                # unambiguous disable sentinel). The same bound is
+                # re-validated in load_config so a hand-edited
+                # install.conf still fails fast at next daemon start.
+                while True:
+                    memory_duplicate_threshold = _prompt(
+                        "Paraphrase-dedup threshold (cosine; 1.0 effectively disables, 1.01 unambiguously)",
+                        existing_env.get("MEMORY_DUPLICATE_THRESHOLD", "0.9"),
+                    )
+                    try:
+                        val = float(memory_duplicate_threshold)
+                        if 0.3 <= val <= 1.01:
+                            break
+                    except ValueError:
+                        pass
+                    print("  Must be a number between 0.3 and 1.01.")
         while True:
             memory_token_budget = _prompt(
                 "Memory context token budget per turn",
@@ -1125,6 +1154,12 @@ def _cmd_config() -> None:
                 env["MEMORY_EPISODE_BUDGET_USD"] = memory_episode_budget_usd
             if int(memory_episode_timeout_s) != 120:
                 env["MEMORY_EPISODE_TIMEOUT_S"] = memory_episode_timeout_s
+            # Paraphrase-dedup threshold. Same delta-from-default gate
+            # as the other extraction tunables; numeric compare so
+            # "0.90" or "0.9 " do not produce a spurious entry equal
+            # to the dataclass default.
+            if float(memory_duplicate_threshold) != 0.9:
+                env["MEMORY_DUPLICATE_THRESHOLD"] = memory_duplicate_threshold
         if int(memory_token_budget) != 2000:
             env["MEMORY_TOKEN_BUDGET"] = memory_token_budget
         # Search limit applies to retrieval (read path), not extraction
@@ -1156,6 +1191,12 @@ def _cmd_config() -> None:
         env.pop("MEMORY_EPISODE_MODEL", None)
         env.pop("MEMORY_EPISODE_BUDGET_USD", None)
         env.pop("MEMORY_EPISODE_TIMEOUT_S", None)
+        # Paraphrase-dedup threshold is consulted by `_store_facts`,
+        # which only runs under the Haiku extraction path. Same
+        # lifecycle as the other extraction keys: dropped on a
+        # claude→non-claude backend flip so a stale value does not
+        # mislead an operator after the flip.
+        env.pop("MEMORY_DUPLICATE_THRESHOLD", None)
 
     # Build and write install.conf
     conf = {

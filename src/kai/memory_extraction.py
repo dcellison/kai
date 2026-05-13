@@ -907,6 +907,12 @@ def _emit_intent_log(
     new_id: str | None,
     replaced_id: str | None,
     outcome: str,
+    # Populated by the dedup gate fire path. Other outcomes
+    # (stored, skipped, dropped_backend, the update_of family)
+    # pass None and the payload dict elides the keys, so existing
+    # emit sites produce byte-identical log lines.
+    cosine: float | None = None,
+    content_preview: str | None = None,
     level: int = logging.INFO,
 ) -> None:
     """
@@ -921,11 +927,17 @@ def _emit_intent_log(
     is WARNING for the `add_failed_after_delete` outcome, where the old
     fact was deleted but the new one never landed.
 
+    `cosine` and `content_preview` carry audit detail on the dedup
+    fire path (the surviving neighbor's score and the dropped
+    candidate's content). Both default to None and are conditionally
+    elided from the JSON payload so the four other emit sites stay
+    byte-identical with the pre-extension wire format.
+
     JSON compact separators (`,:`) match the `_emit_recall_log` convention
     so downstream parsers see the same wire format across every
     structured log line in the memory subsystem.
     """
-    payload = {
+    payload: dict = {
         "user_id": user_id,
         "intent": intent,
         "original_intent": original_intent,
@@ -933,6 +945,16 @@ def _emit_intent_log(
         "replaced_id": replaced_id,
         "outcome": outcome,
     }
+    # Conditional-elide invariant: keys are added ONLY when the
+    # caller passed a non-None value. The dedup-fire path is the
+    # only current caller that supplies these; every other emit
+    # site omits the kwargs and the payload stays at the original
+    # six keys, preserving the pre-extension JSON wire format for
+    # downstream parsers and dashboards.
+    if cosine is not None:
+        payload["cosine"] = cosine
+    if content_preview is not None:
+        payload["content_preview"] = content_preview
     log.log(level, "memory.consolidate.intent %s", json.dumps(payload, separators=(",", ":")))
 
 
@@ -1606,25 +1628,37 @@ def _validate_facts(
     return validated
 
 
-def _is_duplicate(content: str, user_id: str, threshold: float = 0.9) -> bool:
+def _paraphrase_neighbor(content: str, user_id: str, threshold: float) -> MemoryResult | None:
     """
-    Top-1 semantic-search dedup.
+    Top-1 semantic-search dedup gate.
 
-    Returns True if the nearest existing user-scoped memory scores at
-    or above `threshold` against `content`. Used at write time before
-    each add_structured() call so the store does not accumulate ten
-    near-identical "User prefers Celsius" facts when a user repeats
-    a preference across conversations.
+    Returns the nearest existing user-scoped memory when its cosine
+    score meets or exceeds `threshold` against `content`. Returns None
+    when no neighbor reaches the threshold, when the store is empty,
+    when memory is disabled, or when the search call raises.
 
-    Dedup-at-write is strictly cheaper than dedup-at-read: it pays once
-    at extraction time rather than on every retrieval. Restored from
-    the seed machinery removed in #321 (originally from #317).
+    Returning the matched `MemoryResult` (vs the prior `bool`) lets the
+    caller log the neighbor's id and cosine score on a fire without
+    running a second `memory.search` against the same content. The
+    strict-greater-or-equal boundary (`score >= threshold`) is
+    preserved from the prior boolean form so the threshold's
+    documented meaning (the lowest score that still counts as a
+    duplicate) is unchanged.
 
-    Returns False on any failure (memory disabled, search error) so
-    extraction continues to succeed on a store with broken search.
+    Used at write time inside `_store_facts`, before each
+    `add_structured()` call on the `intent="new"` branch, so the store
+    does not accumulate ten near-identical "User prefers Celsius"
+    facts when a user repeats a preference across conversations.
+    Dedup-at-write is strictly cheaper than dedup-at-read: it pays
+    once at extraction time rather than on every retrieval.
+
+    The None-on-failure posture (vs raising) means a broken store does
+    not strand extraction; the candidate falls through to
+    `add_structured` and the operator sees the `dropped_backend`
+    outcome instead if Mem0 is the actual problem.
     """
     if not memory.is_enabled():
-        return False
+        return None
     try:
         # memory.search is sync (Mem0 is sync). Called in an executor
         # at the public-API layer; this helper is called from inside
@@ -1632,11 +1666,13 @@ def _is_duplicate(content: str, user_id: str, threshold: float = 0.9) -> bool:
         # runs off the hot path, so a direct sync call is fine here.
         results = memory.search(content, user_id=user_id, limit=1)
     except Exception:
-        log.debug("_is_duplicate: search failed; treating as non-duplicate", exc_info=True)
-        return False
+        log.debug("_paraphrase_neighbor: search failed; treating as non-duplicate", exc_info=True)
+        return None
     if not results:
-        return False
-    return results[0].score >= threshold
+        return None
+    if results[0].score >= threshold:
+        return results[0]
+    return None
 
 
 # ── Subprocess wiring ───────────────────────────────────────────────
@@ -2187,6 +2223,7 @@ def _store_facts(
     *,
     user_id: str,
     session_id: str | None,
+    config: Config,
 ) -> tuple[int, int, int]:
     """
     Persist validated facts via memory.add_structured, branching on intent.
@@ -2203,13 +2240,20 @@ def _store_facts(
     - `skipped`: facts the extractor classified as `skip_redundant`.
       No storage call, but we record the decision for the summary log.
 
+    `config` carries the runtime threshold for the dedup gate
+    (`memory_duplicate_threshold`). Threaded in from `extract_and_store`
+    rather than re-loaded here so a test or a per-call override can
+    flow through the same code path; also avoids an in-loop
+    `load_config()` cost.
+
     Each intent branch emits exactly one `memory.consolidate.intent`
     line via `_emit_intent_log`. The `intent="new"` branch keeps the
-    existing `_is_duplicate` defense-in-depth gate against the case
-    where the extractor returns `new` for a near-verbatim duplicate
-    (the candidate set is capped at N=8, so the extractor may not see
-    the duplicating fact). `update_of` skips `_is_duplicate` because
-    consolidation already happened upstream at the extractor layer.
+    existing `_paraphrase_neighbor` defense-in-depth gate against the
+    case where the extractor returns `new` for a near-verbatim
+    duplicate (the candidate set is capped at N=8, so the extractor
+    may not see the duplicating fact). `update_of` skips
+    `_paraphrase_neighbor` because consolidation already happened
+    upstream at the extractor layer.
 
     Mem0 exposes no atomic replace primitive: `update_of` is implemented
     as `delete_by_id` followed by `add_structured`. The race window is
@@ -2269,16 +2313,16 @@ def _store_facts(
             # `stored` to `delete_failed_added_anyway` so the log carries
             # the operational signal.
             #
-            # We deliberately do NOT run `_is_duplicate` against the new
-            # content here. Reasoning: the extractor already decided this
-            # is a consolidation-of-existing, having seen the top-N
-            # candidate window. If the new content happens to near-match
-            # a *different* fact outside that window, it can land
-            # un-deduped. At N=8 (2x the per-call fact cap) the case is
-            # vanishingly rare; if a duplicate spike appears in
+            # We deliberately do NOT run `_paraphrase_neighbor` against
+            # the new content here. Reasoning: the extractor already
+            # decided this is a consolidation-of-existing, having seen
+            # the top-N candidate window. If the new content happens to
+            # near-match a *different* fact outside that window, it can
+            # land un-deduped. At N=8 (2x the per-call fact cap) the
+            # case is vanishingly rare; if a duplicate spike appears in
             # production, raise N rather than re-introducing the
-            # _is_duplicate gate here (which would silently drop the
-            # consolidation and leave the stale fact in place).
+            # _paraphrase_neighbor gate here (which would silently drop
+            # the consolidation and leave the stale fact in place).
             delete_ok = memory.delete_by_id(user_id=user_id, memory_id=existing_id)
             memory_id = memory.add_structured(
                 content,
@@ -2323,19 +2367,31 @@ def _store_facts(
         if intent != "new":
             continue
 
-        if _is_duplicate(content, user_id):
+        neighbor = _paraphrase_neighbor(
+            content,
+            user_id,
+            threshold=config.memory_duplicate_threshold,
+        )
+        if neighbor is not None:
             log.debug("_store_facts: skipping duplicate %r", content[:80])
             # `dropped_duplicate`: dedup gate fired correctly. Healthy
             # signal at volume - distinguished from `dropped_backend`
             # (below) so a dashboard alert on backend failure does not
-            # also fire on benign deduplication.
+            # also fire on benign deduplication. The extended payload
+            # (replaced_id, cosine, content_preview) carries the
+            # surviving neighbor's id, the rounded cosine score, and
+            # the dropped candidate's text so an operator scanning the
+            # log can audit the gate's behavior without re-running a
+            # search by hand.
             _emit_intent_log(
                 user_id=user_id,
                 intent="new",
                 original_intent=None,
                 new_id=None,
-                replaced_id=None,
+                replaced_id=neighbor.id,
                 outcome="dropped_duplicate",
+                cosine=round(neighbor.score, 3),
+                content_preview=content[:100],
             )
             continue
 
@@ -2469,7 +2525,7 @@ async def extract_and_store(
                         ),
                     )
                 except Exception:
-                    # Match `_is_duplicate`'s search-failure posture: a
+                    # Match `_paraphrase_neighbor`'s search-failure posture: a
                     # broken store does not strand extraction. The
                     # candidate list stays empty and the extractor
                     # falls back to the all-`new` branch via the
@@ -2550,7 +2606,12 @@ async def extract_and_store(
                 # embeds each fact.
                 stored, replaced, skipped = await loop.run_in_executor(
                     None,
-                    lambda: _store_facts(result.facts, user_id=user_id, session_id=session_id),
+                    lambda: _store_facts(
+                        result.facts,
+                        user_id=user_id,
+                        session_id=session_id,
+                        config=config,
+                    ),
                 )
             else:
                 stored = replaced = skipped = 0
@@ -2647,7 +2708,7 @@ __all__ = [
     "_capped_assistant",
     "_emit_intent_log",
     "_get_semaphore",
-    "_is_duplicate",
+    "_paraphrase_neighbor",
     "_per_user_semaphores",
     "_render_candidate_line",
     "_render_candidate_source",

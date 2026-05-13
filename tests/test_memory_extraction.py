@@ -37,7 +37,7 @@ from kai.memory_extraction import (
     _capped_assistant,
     _emit_intent_log,
     _get_semaphore,
-    _is_duplicate,
+    _paraphrase_neighbor,
     _render_candidate_line,
     _render_candidate_source,
     _store_facts,
@@ -506,55 +506,195 @@ class TestValidateFacts:
         assert result == [good]
 
 
-# ── _is_duplicate ───────────────────────────────────────────────────
+# ── _paraphrase_neighbor ────────────────────────────────────────────
 
 
-class TestIsDuplicate:
-    """Spec §13.1: threshold-based dedup. Score >= 0.9 is duplicate;
-    strictly below is not. Tested on the boundary because off-by-one
-    here causes either silent duplicate accumulation (too lax) or
-    silent fact drops (too strict)."""
+class TestParaphraseGate:
+    """Threshold-based dedup gate. Score >= threshold returns the
+    neighbor (the candidate is dropped at the call site); strictly
+    below returns None (candidate lands). The strict-ge boundary is
+    load-bearing: off-by-one here causes either silent duplicate
+    accumulation (too lax) or silent fact drops (too strict). Replaces
+    the prior `_is_duplicate` boolean form; the richer return lets
+    `_store_facts` log the surviving neighbor's id and cosine without
+    a second search call."""
 
-    def test_returns_false_when_memory_disabled(self, monkeypatch):
-        monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: False)
-        assert not _is_duplicate("anything", "user-1")
+    def test_gate_does_not_fire_on_empty_store(self, monkeypatch):
+        """Empty `memory.search` result means there's nothing to merge
+        against; the candidate must pass through to add_structured."""
+        monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
+        monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [])
+        assert _paraphrase_neighbor("x", "user-1", threshold=0.9) is None
 
-    def test_above_threshold_is_duplicate(self, monkeypatch):
+    def test_gate_does_not_fire_below_threshold(self, monkeypatch):
+        """A near-but-not-paraphrase neighbor (score = T - 0.05) is
+        evidence of similarity but NOT enough to collapse the
+        candidate. The strict-ge boundary says "below means land."
+        """
         monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
         fake = MagicMock()
-        fake.score = 0.95
+        fake.score = 0.85
         monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [fake])
-        assert _is_duplicate("x", "user-1")
+        assert _paraphrase_neighbor("x", "user-1", threshold=0.9) is None
 
-    def test_at_threshold_is_duplicate(self, monkeypatch):
+    def test_gate_fires_at_threshold(self, monkeypatch):
+        """Boundary case: score exactly equal to threshold fires the
+        gate (strict-ge preserved from the prior bool form). The
+        returned neighbor is the same object the search call produced,
+        so `replaced_id` carries the right Mem0 id downstream."""
         monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
         fake = MagicMock()
         fake.score = 0.9
+        fake.id = "neighbor-id"
         monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [fake])
-        assert _is_duplicate("x", "user-1")
+        result = _paraphrase_neighbor("x", "user-1", threshold=0.9)
+        assert result is fake
 
-    def test_below_threshold_is_not_duplicate(self, monkeypatch):
+    def test_gate_fires_above_threshold(self, monkeypatch):
+        """Score comfortably above threshold (T + 0.05) is the expected
+        fire path. Returns the neighbor (not just True) so the caller
+        can extract id + score for the audit log."""
         monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
         fake = MagicMock()
-        fake.score = 0.89
+        fake.score = 0.95
+        fake.id = "neighbor-id"
         monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [fake])
-        assert not _is_duplicate("x", "user-1")
+        result = _paraphrase_neighbor("x", "user-1", threshold=0.9)
+        assert result is fake
 
-    def test_empty_results_not_duplicate(self, monkeypatch):
+    def test_gate_skipped_on_update_of_intent(self, monkeypatch):
+        """`update_of` facts bypass the gate entirely (consolidation
+        already happened at the extractor layer). The gate function
+        itself doesn't know about intent; `_store_facts`'s branch
+        table is what enforces the skip. This test pins the branch
+        contract by failing if is_enabled runs on an update_of fact."""
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.is_enabled",
+            lambda: pytest.fail("_paraphrase_neighbor must not run on update_of"),
+        )
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.delete_by_id",
+            lambda *, user_id, memory_id: True,
+        )
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda content, **kw: "new-id",
+        )
+        facts = [
+            {
+                "content": "User prefers Earl Grey",
+                "tags": ["preference"],
+                "confidence": 0.9,
+                "intent": "update_of",
+                "existing_id": "old-id",
+            }
+        ]
+        stored, replaced, _ = _store_facts(facts, user_id="u1", session_id="s1", config=_cfg())
+        assert (stored, replaced) == (1, 1)
+
+    def test_gate_skipped_on_skip_redundant_intent(self, monkeypatch):
+        """`skip_redundant` facts also bypass the gate. The extractor
+        cited an existing fact; no storage call should run AT ALL, so
+        is_enabled must NOT be consulted on this path."""
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.is_enabled",
+            lambda: pytest.fail("_paraphrase_neighbor must not run on skip_redundant"),
+        )
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda *a, **kw: pytest.fail("add_structured must not run on skip_redundant"),
+        )
+        facts = [
+            {
+                "content": "User prefers Earl Grey",
+                "tags": ["preference"],
+                "confidence": 0.9,
+                "intent": "skip_redundant",
+                "existing_id": "old-id",
+            }
+        ]
+        stored, _, skipped = _store_facts(facts, user_id="u1", session_id="s1", config=_cfg())
+        assert (stored, skipped) == (0, 1)
+
+    def test_gate_threshold_from_config(self, monkeypatch, caplog):
+        """The threshold flows from `config.memory_duplicate_threshold`
+        through `_store_facts` into the gate. A neighbor scored just
+        below the config'd threshold must NOT fire the gate; a stub
+        memory.search returning that score plus `add_structured`
+        succeeding is the load-bearing assertion - if the threshold
+        was hard-coded inside _paraphrase_neighbor, the gate would
+        misfire."""
         monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
-        monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [])
-        assert not _is_duplicate("x", "user-1")
+        fake = MagicMock()
+        fake.score = 0.79  # 0.01 below the cfg'd threshold of 0.80
+        fake.id = "neighbor"
+        monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [fake])
+        add_calls: list = []
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda content, **kw: add_calls.append(content) or "new-id",
+        )
+        facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "new"}]
+        cfg = _cfg(memory_duplicate_threshold=0.80)
+        stored, _, _ = _store_facts(facts, user_id="u1", session_id="s1", config=cfg)
+        assert stored == 1
+        assert add_calls == ["x"]
 
-    def test_search_exception_not_duplicate(self, monkeypatch):
+    def test_gate_disabled_at_threshold_1_01(self, monkeypatch):
+        """At T=1.01 (the unambiguous-disable sentinel) even a perfect
+        cosine match of 1.0 must NOT fire the gate, because 1.0 <
+        1.01. This is the contract operators rely on when they need a
+        "gate is OFF" guarantee."""
+        monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
+        fake = MagicMock()
+        fake.score = 1.0
+        monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [fake])
+        assert _paraphrase_neighbor("x", "user-1", threshold=1.01) is None
+
+    def test_gate_search_failure_returns_none(self, monkeypatch):
         """A broken search layer must not block extraction. Treat
-        errors as 'no duplicate found' so new facts still land."""
+        errors as 'no neighbor found' so new facts still land. Pre-
+        rename this was the documented `_is_duplicate` posture; the
+        rename preserves it."""
         monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
 
         def _boom(*a, **kw):
             raise RuntimeError("qdrant down")
 
         monkeypatch.setattr("kai.memory_extraction.memory.search", _boom)
-        assert not _is_duplicate("x", "user-1")
+        assert _paraphrase_neighbor("x", "user-1", threshold=0.9) is None
+
+    def test_gate_log_shape(self, monkeypatch, caplog):
+        """When the gate fires inside `_store_facts`, the intent log
+        line MUST carry the surviving neighbor's id, the rounded
+        cosine score, and a content_preview of the dropped candidate.
+        These three fields are what makes the audit procedure tractable
+        without rerunning a search by hand on every drop."""
+        monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
+        fake = MagicMock()
+        fake.score = 0.9234567
+        fake.id = "surviving-neighbor"
+        monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [fake])
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda *a, **kw: pytest.fail("add_structured must not run on gate fire"),
+        )
+        facts = [
+            {
+                "content": "A" * 150,  # Exceeds the 100-char preview cap.
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "new",
+            }
+        ]
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            _store_facts(facts, user_id="u1", session_id="s1", config=_cfg())
+        record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
+        payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
+        assert payload["outcome"] == "dropped_duplicate"
+        assert payload["replaced_id"] == "surviving-neighbor"
+        assert payload["cosine"] == 0.923
+        assert payload["content_preview"] == "A" * 100
 
 
 # ── _get_semaphore (LRU) ────────────────────────────────────────────
@@ -1078,9 +1218,9 @@ class TestPerUserSemaphore:
 
 
 class TestStoreFactsDedup:
-    """Dedup at write time uses _is_duplicate (top-1, threshold=0.9).
-    A duplicate must NOT be stored, and must NOT abort the rest of the
-    batch."""
+    """Dedup at write time uses _paraphrase_neighbor (top-1, threshold
+    from config.memory_duplicate_threshold). A duplicate must NOT be
+    stored, and must NOT abort the rest of the batch."""
 
     @pytest.mark.asyncio
     async def test_duplicate_fact_skipped(self, monkeypatch):
@@ -1109,6 +1249,10 @@ class TestStoreFactsDedup:
         def _fake_search(query, *, user_id, limit):
             fake = MagicMock()
             fake.score = 0.95 if "Celsius" in query else 0.3
+            # The dedup gate's log emit reads neighbor.id, which the
+            # JSON encoder must serialize; an auto-generated MagicMock
+            # attribute is not serializable, so pin a real string here.
+            fake.id = "neighbor-id"
             return [fake]
 
         monkeypatch.setattr("kai.memory_extraction.memory.search", _fake_search)
@@ -1635,7 +1779,7 @@ class TestStoreFactsIntent:
         )
         facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "new"}]
         with caplog.at_level("INFO", logger="kai.memory_extraction"):
-            stored, replaced, skipped = _store_facts(facts, user_id="u1", session_id="s1")
+            stored, replaced, skipped = _store_facts(facts, user_id="u1", session_id="s1", config=_cfg())
         assert (stored, replaced, skipped) == (1, 0, 0)
         record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
         payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
@@ -1646,9 +1790,12 @@ class TestStoreFactsIntent:
 
     def test_new_with_duplicate_dropped(self, monkeypatch, caplog):
         monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
-        # _is_duplicate path: search returns a high-score hit.
+        # _paraphrase_neighbor path: search returns a high-score hit.
         fake = MagicMock()
         fake.score = 0.95
+        # JSON-serializable id - the dedup-fire log line carries
+        # neighbor.id verbatim and chokes on a default MagicMock.
+        fake.id = "neighbor-id"
         monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [fake])
         # add_structured must NOT be called.
         monkeypatch.setattr(
@@ -1657,7 +1804,7 @@ class TestStoreFactsIntent:
         )
         facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "new"}]
         with caplog.at_level("INFO", logger="kai.memory_extraction"):
-            stored, _, _ = _store_facts(facts, user_id="u1", session_id="s1")
+            stored, _, _ = _store_facts(facts, user_id="u1", session_id="s1", config=_cfg())
         assert stored == 0
         record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
         payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
@@ -1675,7 +1822,7 @@ class TestStoreFactsIntent:
         a dashboard alert on store-health actionable - bare `dropped` would
         aggregate healthy dedup with sick-backend signals."""
         monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
-        # _is_duplicate's search returns no hits; we proceed to add_structured.
+        # _paraphrase_neighbor's search returns no hits; we proceed to add_structured.
         monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [])
         # add_structured returns None - the documented "storage disabled
         # OR Mem0's internal try/except swallowed an exception" outcome.
@@ -1685,7 +1832,7 @@ class TestStoreFactsIntent:
         )
         facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "new"}]
         with caplog.at_level("INFO", logger="kai.memory_extraction"):
-            stored, replaced, skipped = _store_facts(facts, user_id="u1", session_id="s1")
+            stored, replaced, skipped = _store_facts(facts, user_id="u1", session_id="s1", config=_cfg())
         # Nothing actually landed - all three counters must be zero.
         assert (stored, replaced, skipped) == (0, 0, 0)
         record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
@@ -1695,11 +1842,12 @@ class TestStoreFactsIntent:
         assert payload["new_id"] is None
 
     def test_update_of_happy_path(self, monkeypatch, caplog):
-        """Delete-then-add both succeed. _is_duplicate must NOT run for
-        the update_of branch (consolidation already happened upstream)."""
+        """Delete-then-add both succeed. _paraphrase_neighbor must NOT
+        run for the update_of branch (consolidation already happened
+        upstream)."""
         monkeypatch.setattr(
             "kai.memory_extraction.memory.is_enabled",
-            lambda: pytest.fail("is_duplicate must not run on update_of"),
+            lambda: pytest.fail("_paraphrase_neighbor must not run on update_of"),
         )
         delete_calls: list = []
         monkeypatch.setattr(
@@ -1721,7 +1869,7 @@ class TestStoreFactsIntent:
             }
         ]
         with caplog.at_level("INFO", logger="kai.memory_extraction"):
-            stored, replaced, skipped = _store_facts(facts, user_id="u1", session_id="s1")
+            stored, replaced, skipped = _store_facts(facts, user_id="u1", session_id="s1", config=_cfg())
         # Delete and add both ran; outcome is `stored`.
         assert delete_calls == [("u1", "old-id")]
         assert len(add_calls) == 1
@@ -1752,7 +1900,7 @@ class TestStoreFactsIntent:
             }
         ]
         with caplog.at_level("INFO", logger="kai.memory_extraction"):
-            stored, replaced, _ = _store_facts(facts, user_id="u1", session_id="s1")
+            stored, replaced, _ = _store_facts(facts, user_id="u1", session_id="s1", config=_cfg())
         # The new fact landed; replaced is still incremented because the
         # update_of intent succeeded structurally.
         assert (stored, replaced) == (1, 1)
@@ -1779,7 +1927,7 @@ class TestStoreFactsIntent:
             }
         ]
         with caplog.at_level("DEBUG", logger="kai.memory_extraction"):
-            stored, replaced, _ = _store_facts(facts, user_id="u1", session_id="s1")
+            stored, replaced, _ = _store_facts(facts, user_id="u1", session_id="s1", config=_cfg())
         assert (stored, replaced) == (0, 0)
         record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
         assert record.levelname == "WARNING"
@@ -1807,7 +1955,7 @@ class TestStoreFactsIntent:
             }
         ]
         with caplog.at_level("INFO", logger="kai.memory_extraction"):
-            stored, replaced, skipped = _store_facts(facts, user_id="u1", session_id="s1")
+            stored, replaced, skipped = _store_facts(facts, user_id="u1", session_id="s1", config=_cfg())
         assert (stored, replaced, skipped) == (0, 0, 1)
         record = next(r for r in caplog.records if "memory.consolidate.intent" in r.getMessage())
         payload = json.loads(record.getMessage().split("memory.consolidate.intent ", 1)[1])
@@ -1994,8 +2142,8 @@ class TestExtractAndStoreConsolidation:
 
     @pytest.mark.asyncio
     async def test_search_failure_falls_back_to_empty_candidates(self, monkeypatch, caplog):
-        """Match `_is_duplicate`'s search-failure posture: a broken
-        store does not strand extraction."""
+        """Match `_paraphrase_neighbor`'s search-failure posture: a
+        broken store does not strand extraction."""
 
         def _boom(*a, **kw):
             raise RuntimeError("qdrant down")

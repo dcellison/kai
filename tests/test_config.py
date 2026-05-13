@@ -63,6 +63,7 @@ _CONFIG_ENV_VARS = [
     "MEMORY_EPISODE_BUDGET_USD",
     "MEMORY_EPISODE_TIMEOUT_S",
     "MEMORY_SEARCH_FLOOR",
+    "MEMORY_DUPLICATE_THRESHOLD",
     "KAI_DATA_DIR",
     "KAI_INSTALL_DIR",
 ]
@@ -1633,6 +1634,69 @@ class TestMemorySearchFloor:
     def test_rejects_non_number(self, monkeypatch):
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_SEARCH_FLOOR", "high")
+        with pytest.raises(SystemExit, match="must be a number"):
+            load_config()
+
+
+# ── Memory duplicate threshold ───────────────────────────────────────
+
+
+class TestMemoryDuplicateThreshold:
+    """The MEMORY_DUPLICATE_THRESHOLD env var: cosine threshold for the
+    write-time paraphrase-dedup gate in `_store_facts`. Range [0.3,
+    1.01]: the lower bound matches `memory_search_floor`'s operator
+    floor (cosine below 0.3 is near-everything-is-a-dup territory),
+    and 1.01 is the unambiguous-disable sentinel since a literal
+    `score == 1.0` can rarely fire on non-identical text under the
+    embedding model."""
+
+    def test_default_is_0_9(self, monkeypatch):
+        """Default preserves the prior hard-coded constant from the
+        boolean `_is_duplicate` era. The dataclass default IS the
+        operator-validated production value; upgraders not setting
+        this env var inherit the production default."""
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.memory_duplicate_threshold == 0.9
+
+    def test_override(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_DUPLICATE_THRESHOLD", "0.85")
+        config = load_config()
+        assert config.memory_duplicate_threshold == 0.85
+
+    def test_accepts_lower_bound(self, monkeypatch):
+        """0.3 is the floor (matches memory_search_floor's operator
+        recommendation). Accepted but pathologically aggressive."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_DUPLICATE_THRESHOLD", "0.3")
+        config = load_config()
+        assert config.memory_duplicate_threshold == 0.3
+
+    def test_accepts_upper_bound(self, monkeypatch):
+        """1.01 is the unambiguous-disable sentinel: at this value
+        even a perfect-cosine 1.0 neighbor fails the strict-ge check,
+        guaranteeing no fires regardless of the embedding model."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_DUPLICATE_THRESHOLD", "1.01")
+        config = load_config()
+        assert config.memory_duplicate_threshold == 1.01
+
+    def test_rejects_below_lower_bound(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_DUPLICATE_THRESHOLD", "0.2")
+        with pytest.raises(SystemExit, match=r"between 0\.3 and 1\.01"):
+            load_config()
+
+    def test_rejects_above_upper_bound(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_DUPLICATE_THRESHOLD", "1.5")
+        with pytest.raises(SystemExit, match=r"between 0\.3 and 1\.01"):
+            load_config()
+
+    def test_rejects_non_number(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_DUPLICATE_THRESHOLD", "tight")
         with pytest.raises(SystemExit, match="must be a number"):
             load_config()
 

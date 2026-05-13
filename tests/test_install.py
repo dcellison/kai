@@ -1552,6 +1552,7 @@ class TestCmdConfig:
             # branch, type a different model literal here.
             "claude-haiku-4-5-20251001",  # episode model (explicit override)
             "60",  # episode timeout seconds (non-default)
+            "0.85",  # paraphrase-dedup threshold (non-default, exercises emission)
             "3000",  # token budget
             "20",  # search limit (#345)
         ]
@@ -1580,6 +1581,9 @@ class TestCmdConfig:
         assert env["MEMORY_EPISODE_MODEL"] == "claude-haiku-4-5-20251001"
         assert "MEMORY_EPISODE_BUDGET_USD" not in env
         assert env["MEMORY_EPISODE_TIMEOUT_S"] == "60"
+        # Paraphrase-dedup threshold: operator picked 0.85 (non-default),
+        # so the emission gate fires and the env entry is written.
+        assert env["MEMORY_DUPLICATE_THRESHOLD"] == "0.85"
         assert env["MEMORY_TOKEN_BUDGET"] == "3000"
         assert env["MEMORY_SEARCH_LIMIT"] == "20"
 
@@ -1613,6 +1617,7 @@ class TestCmdConfig:
             "3",  # episode classifier context turns (#392, dataclass default; suppressed)
             "",  # episode model: accept wizard default = claude-sonnet-4-6
             "120",  # episode timeout (dataclass default; suppressed)
+            "0.9",  # paraphrase-dedup threshold (dataclass default; suppressed)
             "2000",  # token budget (dataclass default; suppressed)
             "10",  # search limit (dataclass default; suppressed)
         ]
@@ -1636,6 +1641,8 @@ class TestCmdConfig:
         # Episode-classifier context window (#392) at default 3 is
         # also suppressed by the emission gate.
         assert "EPISODE_CLASSIFIER_CONTEXT_TURNS" not in env
+        # Paraphrase-dedup threshold at default 0.9 is also suppressed.
+        assert "MEMORY_DUPLICATE_THRESHOLD" not in env
 
     def test_memory_round_trip_through_env_file(self, tmp_path, monkeypatch):
         """Wizard-captured memory vars survive _generate_env_file()."""
@@ -1655,6 +1662,7 @@ class TestCmdConfig:
             "7",  # episode classifier context turns (#392, non-default)
             "claude-haiku-4-5-future",
             "90",
+            "0.8",  # paraphrase-dedup threshold (non-default)
             "2500",
             "15",
         ]
@@ -1907,6 +1915,7 @@ class TestCmdConfig:
             "5",  # episode classifier context turns (#392, non-default)
             "",  # episode model (accept Sonnet wizard default)
             "120",  # episode timeout (default; suppressed)
+            "0.9",  # paraphrase-dedup threshold (default; suppressed)
             "2000",  # token budget (default; suppressed)
             "10",  # search limit (default; suppressed)
         ]
@@ -1936,6 +1945,7 @@ class TestCmdConfig:
             "3",  # episode classifier context turns (#392, dataclass default)
             "",  # episode model (Sonnet default)
             "120",  # episode timeout (default)
+            "0.9",  # paraphrase-dedup threshold (default)
             "2000",  # token budget (default)
             "10",  # search limit (default)
         ]

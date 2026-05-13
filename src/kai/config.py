@@ -537,7 +537,7 @@ class Config:
     # omitted from the Haiku payload, and the extractor falls back to
     # always emitting intent="new" (anchored by the CONSOLIDATION
     # prompt section, which is retained even when the data block is
-    # empty). Storage then uses the existing _is_duplicate semantics.
+    # empty). Storage then uses the existing _paraphrase_neighbor semantics.
     # Tradeoff: each candidate adds ~50-100 chars to the Haiku payload
     # and contributes to per-call cache-creation tokens. Default 8 is
     # 2x the per-call fact cap (5), which gives the model enough to
@@ -594,6 +594,20 @@ class Config:
     # divergence between "what the user sees in /memory search" and
     # "what Kai pulls into context" after a config change.
     memory_search_floor: float = 0.3
+
+    # Write-time semantic-similarity dedup threshold. The extractor's
+    # `_paraphrase_neighbor` helper compares each `intent="new"`
+    # candidate against the top-1 nearest existing fact (per user) and
+    # drops the candidate when the cosine score meets or exceeds this
+    # value. Lowering the threshold catches more paraphrase clusters at
+    # the cost of more false merges; raising it preserves more facts at
+    # the cost of duplicate accumulation. Range [0.3, 1.01]: the lower
+    # bound matches `memory_search_floor`'s operator floor; 1.0 fires
+    # only on exact-cosine matches (effectively disabled), and 1.01 is
+    # the unambiguous-disable sentinel. The dataclass default is the
+    # operator-validated production value; upgraders inherit it
+    # without re-running `make config`.
+    memory_duplicate_threshold: float = 0.9
 
     def get_workspace_config(self, workspace: Path) -> WorkspaceConfig | None:
         """
@@ -1677,6 +1691,23 @@ def load_config() -> Config:
     except ValueError:
         raise SystemExit("MEMORY_SEARCH_FLOOR must be a number") from None
 
+    # Write-time paraphrase-dedup threshold. Range [0.3, 1.01]: the
+    # lower bound matches the existing `memory_search_floor` operator
+    # floor (a threshold below 0.3 produces near-everything-is-a-dup
+    # behavior under cosine similarity), and the upper bound permits
+    # 1.01 as the unambiguous-disable sentinel (since `score == 1.0`
+    # can rarely fire on non-identical text under the embedding model,
+    # 1.0 alone is "effectively disabled" but not "guaranteed
+    # disabled"). Same try/except shape as the other memory_* numeric
+    # vars so a bad env value fails fast at startup rather than
+    # surfacing later as silent dedup misbehavior.
+    try:
+        memory_duplicate_threshold = float(os.environ.get("MEMORY_DUPLICATE_THRESHOLD", "0.9"))
+        if memory_duplicate_threshold < 0.3 or memory_duplicate_threshold > 1.01:
+            raise SystemExit("MEMORY_DUPLICATE_THRESHOLD must be between 0.3 and 1.01")
+    except ValueError:
+        raise SystemExit("MEMORY_DUPLICATE_THRESHOLD must be a number") from None
+
     # Per-workspace configuration. Loaded after ALLOWED_WORKSPACES so
     # YAML-defined workspaces can be merged into the allowed set.
     workspace_configs = _load_workspace_configs()
@@ -1841,4 +1872,5 @@ def load_config() -> Config:
         memory_episode_budget_usd=memory_episode_budget_usd,
         memory_episode_timeout_s=memory_episode_timeout_s,
         memory_search_floor=memory_search_floor,
+        memory_duplicate_threshold=memory_duplicate_threshold,
     )
