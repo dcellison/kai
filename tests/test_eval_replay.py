@@ -309,7 +309,7 @@ class TestDryRun:
         store_mock = AsyncMock(return_value=0)
 
         with patch("kai.memory_extraction.extract_and_store", store_mock):
-            counters = await replay._run_replay(
+            counters, samples = await replay._run_replay(
                 pairs,
                 user_id="sandbox-test",
                 context_turns=3,
@@ -323,6 +323,19 @@ class TestDryRun:
         # run would have processed.
         assert counters["pairs_processed"] == 3
         assert counters["facts_stored"] == 0
+        # Dry-run captures payload-shape samples for the first
+        # `_DRY_RUN_SAMPLE_LIMIT` pairs (3 here, with all 3 pairs
+        # sampled). Verbatim text is not captured; only structural
+        # shape (prior depth + char counts) lands in the sample.
+        assert len(samples) == 3
+        assert samples[0] == {
+            "index": 1,
+            "prior_count": 0,
+            "user_chars": 2,
+            "assistant_chars": 2,
+        }
+        assert samples[1]["prior_count"] == 1
+        assert samples[2]["prior_count"] == 2
 
 
 # ── Reset flag ──────────────────────────────────────────────────────
@@ -384,6 +397,7 @@ class TestInitMemory:
             patch("kai.config.load_config", return_value=config_mock),
             patch("kai.memory.init_memory", init_mock),
             patch("kai.memory.delete_all"),
+            patch("kai.memory.get_all_facts", return_value=[]),
             patch("kai.memory_extraction.extract_and_store", AsyncMock(return_value=0)),
         ):
             rc = await replay._async_main(
@@ -451,3 +465,121 @@ class TestPriorContextTruncationDeferred:
         assert len(captured_prior) == 2
         assert captured_prior[0] == []
         assert captured_prior[1] == [(long_user, long_assistant)]
+
+
+# ── Summary breakdowns (spec §4.2 step 6) ───────────────────────────
+
+
+class TestFormatBreakdowns:
+    """`_format_breakdowns` produces the per-tag / per-speaker /
+    per-prompt-version aggregation of a sandbox user's post-replay
+    fact set. Spec §4.2 step 6 names these three groupings as the
+    summary the operator inspects. The unit test pins the grouping
+    rules (tags fan out, speaker and prompt_version are single-valued)
+    and the deterministic sort order (count desc, name asc) so two
+    runs with the same fact multiset render byte-identical output."""
+
+    def _fact(self, *, tags: list[str], speaker: str, prompt_version: str):
+        # Lightweight stub mirroring `MemoryResult.metadata` access.
+        # The format helper only reads `metadata`, not the other
+        # MemoryResult fields, so a SimpleNamespace suffices here.
+        from types import SimpleNamespace
+
+        return SimpleNamespace(metadata={"tags": tags, "speaker": speaker, "prompt_version": prompt_version})
+
+    def test_groups_by_tag_speaker_and_prompt_version(self):
+        facts = [
+            self._fact(tags=["preference"], speaker="user", prompt_version="9"),
+            self._fact(tags=["preference", "location"], speaker="user", prompt_version="9"),
+            self._fact(tags=["fact"], speaker="assistant", prompt_version="9"),
+        ]
+        out = replay._format_breakdowns(facts)
+        # Tag fan-out: "preference" appears in 2 facts, contributes
+        # twice; "location" appears in 1 fact, once; "fact" in 1, once.
+        assert "preference: 2" in out
+        assert "location: 1" in out
+        assert "fact: 1" in out
+        # Speaker single-valued: 2 user + 1 assistant.
+        assert "user: 2" in out
+        assert "assistant: 1" in out
+        # Prompt-version single-valued: all 3 on v9.
+        assert "9: 3" in out
+
+    def test_empty_facts_renders_none_buckets(self):
+        # A zero-fact run is the normal output of an extraction-
+        # disabled or all-suppressed window. The summary section must
+        # still render (parseable empty block) rather than crash or
+        # skip.
+        out = replay._format_breakdowns([])
+        assert "by tag (0 distinct):" in out
+        assert "by speaker (0 distinct):" in out
+        assert "by prompt_version (0 distinct):" in out
+        assert "(none)" in out
+
+    def test_missing_metadata_fields_default_to_unknown(self):
+        # Older fact rows predating the speaker / prompt_version
+        # fields land in the store with those keys absent. The format
+        # helper should bucket them under "unknown" rather than KeyError.
+        from types import SimpleNamespace
+
+        facts = [SimpleNamespace(metadata={"tags": ["fact"]})]
+        out = replay._format_breakdowns(facts)
+        assert "unknown: 1" in out
+
+    def test_sort_order_is_count_desc_then_name_asc(self):
+        facts = [
+            self._fact(tags=["alpha"], speaker="user", prompt_version="9"),
+            self._fact(tags=["beta"], speaker="user", prompt_version="9"),
+            self._fact(tags=["beta"], speaker="user", prompt_version="9"),
+            self._fact(tags=["gamma"], speaker="user", prompt_version="9"),
+        ]
+        out = replay._format_breakdowns(facts)
+        # beta (count=2) precedes alpha (count=1, comes before gamma
+        # alphabetically). gamma trails alpha.
+        beta_pos = out.index("beta:")
+        alpha_pos = out.index("alpha:")
+        gamma_pos = out.index("gamma:")
+        assert beta_pos < alpha_pos < gamma_pos
+
+
+# ── Dry-run payload-shape sample (spec §4.2) ────────────────────────
+
+
+class TestFormatDryRunSamples:
+    """`_format_dry_run_samples` answers the spec §4.2 `--dry-run`
+    contract: "report the would-be pair count AND a sample of payload
+    shapes." The pair count is in the top-level summary; this helper
+    renders the per-pair structural sample. Verbatim text is NOT in
+    the output (operator-personal history could land in stdout
+    otherwise); only structural shape: prior depth, user/assistant
+    character counts."""
+
+    def test_renders_one_pair(self):
+        samples = [{"index": 1, "prior_count": 0, "user_chars": 12, "assistant_chars": 200}]
+        out = replay._format_dry_run_samples(samples)
+        assert "first 1 pair(s)" in out
+        assert "pair 1: prior_pairs=0 user_chars=12 assistant_chars=200" in out
+
+    def test_renders_three_pairs(self):
+        samples = [
+            {"index": 1, "prior_count": 0, "user_chars": 10, "assistant_chars": 20},
+            {"index": 2, "prior_count": 1, "user_chars": 30, "assistant_chars": 40},
+            {"index": 3, "prior_count": 2, "user_chars": 50, "assistant_chars": 60},
+        ]
+        out = replay._format_dry_run_samples(samples)
+        assert "first 3 pair(s)" in out
+        assert out.count("pair ") == 3
+
+    def test_no_verbatim_text_in_output(self):
+        # The sample dict deliberately carries no verbatim text;
+        # confirm `_format_dry_run_samples` does not introduce any.
+        # The "no operator-personal stdout leak" property is what
+        # the helper's docstring promises.
+        samples = [{"index": 1, "prior_count": 0, "user_chars": 5, "assistant_chars": 5}]
+        out = replay._format_dry_run_samples(samples)
+        for forbidden in ("user_text", "assistant_text", "content="):
+            assert forbidden not in out
+
+    def test_empty_samples_does_not_crash(self):
+        out = replay._format_dry_run_samples([])
+        assert "no pairs to sample" in out

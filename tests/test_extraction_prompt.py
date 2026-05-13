@@ -76,6 +76,37 @@ def test_durability_test_appears_once():
     assert _EXTRACTION_SYSTEM_PROMPT.count("DURABILITY TEST:") == 1
 
 
+def test_store_block_does_not_reference_durability_test():
+    """The fact-side STORE block must not direct the model to a
+    DURABILITY TEST that no longer exists.
+
+    The colon-suffixed `DURABILITY TEST:` header check above is too
+    narrow: a bare-form `DURABILITY TEST below` inside the STORE block
+    leaves the model pointing at a section that was deleted in the v9
+    swap. The PR #467 review (M-1) flagged exactly this: the STORE
+    block's "Apply the DURABILITY TEST below" reference survived the
+    swap because the spec's deletion range was line-based and the
+    STORE block sat outside it.
+
+    Pinning the absence of any "DURABILITY TEST" substring in the
+    fact-side STORE block - regardless of suffix - closes the
+    recurrence path. The episode-side `EPISODE DURABILITY TEST` is
+    after this block, so a substring search bounded to the fact-side
+    STORE region is safe.
+    """
+    # Bound the search to the fact-side region: from "STORE these
+    # fact types:" through (but not including) "EPISODE
+    # CLASSIFICATION" (the episode-side header that opens the
+    # DURABILITY TEST surface we DO want to keep).
+    store_idx = _EXTRACTION_SYSTEM_PROMPT.index("STORE these fact types:")
+    episode_idx = _EXTRACTION_SYSTEM_PROMPT.index("EPISODE CLASSIFICATION")
+    fact_side = _EXTRACTION_SYSTEM_PROMPT[store_idx:episode_idx]
+    assert "DURABILITY TEST" not in fact_side, (
+        "fact-side STORE/QUALITY TEST region must not reference DURABILITY TEST; "
+        "the section was deleted in v9 and any reference is an orphan pointer"
+    )
+
+
 def test_prompt_version_bumped():
     """Version stamp matches the prompt revision."""
     assert _EXTRACTION_PROMPT_VERSION == "9"
@@ -121,16 +152,21 @@ def test_positive_worked_examples_present():
 
 
 def test_negative_worked_examples_present():
-    """The three negative (do-not-emit) worked examples are in the block.
+    """The four negative (do-not-emit) worked examples are in the block.
 
-    Same pinning rationale as the positive set. The three negatives
-    cover three of the four classes the prior IGNORE list targeted
-    (workflow-event metadata, decision-to-do, assistant self-report).
+    Same pinning rationale as the positive set. The four negatives
+    cover the four classes the prior IGNORE list targeted: workflow-
+    event metadata, decision-to-do, assistant self-report, and
+    in-progress task state ("ephemeral state"). PR #467 review (W-2)
+    added the ephemeral-state example to reconcile the spec prose
+    that named four classes against the original block which only
+    carried three.
     """
     block = _extract_quality_test_block()
     for snippet in (
         '"Spec X v3 was approved"',
         '"Let\'s file an issue about X."',
         '"I\'m extracting facts now"',
+        '"I\'m writing the spec now."',
     ):
         assert snippet in block, f"negative worked example missing: {snippet}"

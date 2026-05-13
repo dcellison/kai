@@ -376,7 +376,7 @@ STORE these fact types:
   must be per-user, not shared"). NOT workflow micro-decisions
   about which task to do next, which spec to evaluate, or which
   issue to file - those are transient session activity. Apply the
-  DURABILITY TEST below.
+  QUALITY TEST below.
 - Actions the user confirmed happened, BUT with strict evidence
   rules to prevent laundered hallucinations:
   1. A confirmed_action fact must include a `confirmation_quote`
@@ -426,6 +426,8 @@ Worked examples (emit / do not emit):
 - Assistant says "I'm extracting facts now" with no user response.
   -> do not emit. Assistant self-report, not a fact about the user
   or the world.
+- User says "I'm writing the spec now." -> do not emit. In-progress
+  task state; loses meaning once the spec is shipped.
 
 If a candidate fact passes this test, proceed to STORE-block
 classification (above). If it fails, return an empty facts list
@@ -1047,7 +1049,7 @@ _CONSOLIDATION_INTENTS: frozenset[str] = frozenset({"new", "update_of", "skip_re
 # whose content is pure session-event metadata: spec/PR/issue
 # lifecycle events and "User decided/requested to <workflow-action>"
 # wordings. Pattern is intentionally narrower than the prompt's
-# IGNORE rules; the prompt is the primary gate, this regex is
+# QUALITY TEST; the prompt is the primary gate, this regex is
 # defense-in-depth for the cases where the model emits noise despite
 # the prompt. The model can defeat the regex by paraphrasing; a
 # future broader pattern (or per-extractor model upgrade) can be
@@ -1070,7 +1072,7 @@ _WORKFLOW_EVENT_RE = re.compile(
     # "User ..." (the canonical example in FORMAT); the operator-
     # specific "OC" subject is included as defense-in-depth for
     # operator history that contains it. Broader paraphrases are
-    # left for the prompt's IGNORE rules. A future maintainer who
+    # left for the prompt's QUALITY TEST. A future maintainer who
     # needs to catch non-leading subjects should drop the `^`
     # rather than only adding more verbs.
     r"^(User|OC)\s+(decided|requested)\s+to\s+"
@@ -1098,7 +1100,7 @@ _WORKFLOW_EVENT_RE = re.compile(
     # Arm 4: "The evaluation of (spec|specification|issue|PR) X
     # (produced|was|determined) Y". Past-tense / determined
     # variants only; broader paraphrases are left to the prompt's
-    # IGNORE rules.
+    # QUALITY TEST.
     r"\b(evaluation\s+of\s+(spec(ification)?|issue|PR)\s+\S+"
     r"\s+(produced|was|determined))\b"
     r")",
@@ -1525,7 +1527,7 @@ def _validate_facts(
             continue
 
         # Rule 6: reject workflow-event-shaped content. Defense-in-depth
-        # against the prompt's IGNORE rules missing edge cases. The
+        # against the prompt's QUALITY TEST missing edge cases. The
         # rejection is logged at INFO (not DEBUG) because the rate of
         # Rule 6 rejections is itself an operational signal: if Rule 6
         # fires often the prompt is leaking, and the prompt should be

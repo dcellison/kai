@@ -272,6 +272,9 @@ def _build_pairs(records: list[dict[str, Any]]) -> list[tuple[str, str]]:
     return _pair_records_chronologically(records)
 
 
+_DRY_RUN_SAMPLE_LIMIT = 3
+
+
 async def _run_replay(
     pairs: list[tuple[str, str]],
     *,
@@ -279,15 +282,20 @@ async def _run_replay(
     context_turns: int,
     config: Any,
     dry_run: bool,
-) -> dict[str, int]:
+) -> tuple[dict[str, int], list[dict]]:
     """
     Walk pairs, maintain rolling prior buffer, call `extract_and_store`.
 
-    Returns a counters dict for the summary print. Counts are: pairs
-    processed, facts stored (sum of `extract_and_store` returns;
-    `extract_and_store` already buckets stored / replaced / skipped
-    internally but exposes only the stored count to callers, which is
-    what we report).
+    Returns `(counters, dry_run_samples)`:
+    - counters: pairs processed, facts stored (sum of
+      `extract_and_store` returns; `extract_and_store` already buckets
+      stored / replaced / skipped internally but exposes only the
+      stored count to callers, which is what we report).
+    - dry_run_samples: structural shape (`index`, `prior_count`,
+      `user_chars`, `assistant_chars`) for the first
+      `_DRY_RUN_SAMPLE_LIMIT` pairs when `dry_run=True`. Empty list
+      under a live run. Verbatim text is intentionally NOT captured;
+      see `_format_dry_run_samples` for the rationale.
     """
     # Late import so the test suite can monkeypatch `extract_and_store`
     # at the call site without touching the replay module's top-level
@@ -296,6 +304,7 @@ async def _run_replay(
     from kai.memory_extraction import extract_and_store
 
     counters: dict[str, int] = {"pairs_processed": 0, "facts_stored": 0}
+    dry_run_samples: list[dict] = []
     # Rolling prior buffer. The current pair is NOT included; only the
     # previous `context_turns` pairs are passed as PRIOR CONTEXT, which
     # matches production semantics where `bot.py`'s `_ingest_memory`
@@ -305,6 +314,21 @@ async def _run_replay(
     for user_text, assistant_text in pairs:
         if dry_run:
             counters["pairs_processed"] += 1
+            if len(dry_run_samples) < _DRY_RUN_SAMPLE_LIMIT:
+                # Capture structural shape only (no verbatim text):
+                # operator sees what the payload would look like
+                # without dumping potentially-personal history to a
+                # log artifact. The prior_count snapshot is taken
+                # BEFORE the rolling buffer is updated so it matches
+                # what `extract_and_store` would have seen.
+                dry_run_samples.append(
+                    {
+                        "index": counters["pairs_processed"],
+                        "prior_count": len(prior),
+                        "user_chars": len(user_text),
+                        "assistant_chars": len(assistant_text),
+                    }
+                )
             prior.append((user_text, assistant_text))
             if len(prior) > context_turns:
                 prior.pop(0)
@@ -329,7 +353,7 @@ async def _run_replay(
             # window is bounded so older pairs cannot indirectly survive
             # into a future iteration's PRIOR CONTEXT via the buffer.
             prior.pop(0)
-    return counters
+    return counters, dry_run_samples
 
 
 async def _reset_sandbox(user_id: str) -> None:
@@ -343,8 +367,79 @@ async def _reset_sandbox(user_id: str) -> None:
 
 
 def _format_summary(counters: dict[str, int]) -> str:
-    """Operator-readable run summary."""
+    """Operator-readable run summary (top-level scalar counts)."""
     return f"replay summary: pairs_processed={counters['pairs_processed']}, facts_stored={counters['facts_stored']}"
+
+
+def _format_breakdowns(facts: list) -> str:
+    """Operator-readable per-tag / per-speaker / per-prompt-version
+    breakdown of the sandbox user's post-replay fact set.
+
+    Spec §4.2 step 6 names these three groupings as the post-run
+    summary the operator inspects. They are also the fact-set
+    characteristics the PR-body comparison consumes, so this surface
+    and the PR-body comparison share their input shape.
+
+    Argument is the list returned by `memory.get_all_facts`; sortable
+    by `MemoryResult.metadata.get("tags")` (list), `metadata.speaker`
+    (string), and `metadata.prompt_version` (string). Empty input
+    returns an empty-grouping block rather than skipping the section,
+    so a zero-fact run still produces a parseable summary."""
+    from collections import Counter
+
+    by_tag: Counter[str] = Counter()
+    by_speaker: Counter[str] = Counter()
+    by_prompt_version: Counter[str] = Counter()
+    for f in facts:
+        # `metadata.tags` is a list; count each tag occurrence so a
+        # fact with three tags contributes to three buckets. This
+        # gives the operator "how many facts mention this tag" rather
+        # than "how many facts have this tag as their primary."
+        for tag in f.metadata.get("tags") or []:
+            by_tag[tag] += 1
+        speaker = f.metadata.get("speaker") or "unknown"
+        by_speaker[speaker] += 1
+        version = f.metadata.get("prompt_version") or "unknown"
+        by_prompt_version[version] += 1
+
+    def _fmt(counter: Counter[str]) -> str:
+        # Descending by count, alphabetical on ties, so two runs that
+        # produced the same multiset render byte-identical output.
+        if not counter:
+            return "  (none)"
+        items = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+        return "\n".join(f"  {name}: {count}" for name, count in items)
+
+    return (
+        f"by tag ({len(by_tag)} distinct):\n{_fmt(by_tag)}\n"
+        f"by speaker ({len(by_speaker)} distinct):\n{_fmt(by_speaker)}\n"
+        f"by prompt_version ({len(by_prompt_version)} distinct):\n{_fmt(by_prompt_version)}"
+    )
+
+
+def _format_dry_run_samples(samples: list[dict]) -> str:
+    """Operator-readable structural sample of dry-run payload shapes.
+
+    Spec §4.2 names `--dry-run` as the operator's pre-flight check:
+    walk the history without spending wall-clock on extraction, and
+    report what the payloads would look like. The pair-count alone
+    answers "how many" but not "what shape," so the dry-run prints a
+    structural sample for the first N pairs: the prior-buffer depth
+    that pair would have seen and the user/assistant character lengths
+    that drive the payload size.
+
+    Verbatim text is NOT dumped: even a sandbox dry-run can include
+    operator-personal history, and stdout becomes a log artifact. The
+    character counts give the operator the shape signal they need."""
+    if not samples:
+        return "dry-run payload samples: (no pairs to sample)"
+    lines = [f"dry-run payload samples (first {len(samples)} pair(s)):"]
+    for s in samples:
+        lines.append(
+            f"  pair {s['index']}: prior_pairs={s['prior_count']} "
+            f"user_chars={s['user_chars']} assistant_chars={s['assistant_chars']}"
+        )
+    return "\n".join(lines)
 
 
 async def _async_main(argv: list[str] | None = None) -> int:
@@ -364,13 +459,6 @@ async def _async_main(argv: list[str] | None = None) -> int:
     from kai.memory import init_memory
 
     config = load_config()
-    # Initialize the memory store. Without this the module-level
-    # `_memory` in kai.memory is None, and every storage call
-    # (search, add_structured, delete_all) short-circuits to a silent
-    # no-op. Extractions still run via the subprocess, but every fact
-    # is dropped, surfacing as outcome=dropped_backend in the
-    # consolidation log.
-    init_memory(config)
     history_dir: Path = args.history_dir or (DATA_DIR / "history" / str(args.chat_id))
     context_turns: int = (
         args.context_turns if args.context_turns is not None else config.episode_classifier_context_turns
@@ -382,6 +470,16 @@ async def _async_main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    # Initialize the memory store. Without this the module-level
+    # `_memory` in kai.memory is None, and every storage call
+    # (search, add_structured, delete_all) short-circuits to a silent
+    # no-op. Extractions still run via the subprocess, but every fact
+    # is dropped, surfacing as outcome=dropped_backend in the
+    # consolidation log. Placed AFTER argument validation so a bad
+    # `--context-turns` does not trigger the first-run Mem0 embedding-
+    # model download (~80MB) only to exit immediately.
+    init_memory(config)
 
     file_paths = _iter_history_files(history_dir, args.start_date, args.end_date)
     if not file_paths:
@@ -399,7 +497,7 @@ async def _async_main(argv: list[str] | None = None) -> int:
         # inspect, and any side effect violates the contract.
         await _reset_sandbox(args.user_id)
 
-    counters = await _run_replay(
+    counters, dry_run_samples = await _run_replay(
         pairs,
         user_id=args.user_id,
         context_turns=context_turns,
@@ -407,6 +505,21 @@ async def _async_main(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run,
     )
     print(_format_summary(counters))
+    if args.dry_run:
+        # Dry-run skips storage, so the by-tag / by-speaker /
+        # by-prompt-version breakdowns would always be empty. The
+        # payload-shape sample replaces them in the dry-run path.
+        print(_format_dry_run_samples(dry_run_samples))
+    else:
+        # Live run: query the sandbox user's post-run fact set and
+        # print the three breakdowns spec §4.2 step 6 named.
+        # `get_all_facts` is the standard read-side primitive; the
+        # late import keeps the unit-test surface free of the memory
+        # module unless the live path is actually exercised.
+        from kai.memory import get_all_facts
+
+        facts = get_all_facts(user_id=args.user_id)
+        print(_format_breakdowns(facts))
     return 0
 
 
