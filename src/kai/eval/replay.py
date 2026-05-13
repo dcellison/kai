@@ -361,8 +361,16 @@ async def _async_main(argv: list[str] | None = None) -> int:
     # not supplied. Loaded here (not at top) so a test can run without
     # /etc/kai/env or a populated DATA_DIR.
     from kai.config import DATA_DIR, load_config
+    from kai.memory import init_memory
 
     config = load_config()
+    # Initialize the memory store. Without this the module-level
+    # `_memory` in kai.memory is None, and every storage call
+    # (search, add_structured, delete_all) short-circuits to a silent
+    # no-op. Extractions still run via the subprocess, but every fact
+    # is dropped, surfacing as outcome=dropped_backend in the
+    # consolidation log.
+    init_memory(config)
     history_dir: Path = args.history_dir or (DATA_DIR / "history" / str(args.chat_id))
     context_turns: int = (
         args.context_turns if args.context_turns is not None else config.episode_classifier_context_turns

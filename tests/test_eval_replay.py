@@ -342,6 +342,65 @@ class TestReset:
         delete_mock.assert_called_once_with(user_id="sandbox-test")
 
 
+# ── Memory store initialization ─────────────────────────────────────
+
+
+class TestInitMemory:
+    """`_async_main` MUST initialize the memory store before invoking the
+    replay loop. Without this, the module-level `_memory` handle in
+    `kai.memory` stays None, every storage primitive
+    (`search`, `add_structured`, `delete_all`) short-circuits to a
+    silent no-op, and the replay extracts facts via `claude --print`
+    only to discard them. The failure mode is invisible at the unit
+    level - `extract_and_store` returns 0 stored per pair, the summary
+    line reports `facts_stored=0`, and no exception is raised - so the
+    only place the regression can be caught structurally is here, by
+    asserting the init call happens. This test exists because that bug
+    actually shipped pre-init-fix: a 93-pair sandbox replay produced
+    zero stored facts because `_memory` was None, and the symptom was
+    only diagnosable by reading the `consolidate.intent` log lines for
+    `outcome=dropped_backend`."""
+
+    @pytest.mark.asyncio
+    async def test_async_main_initializes_memory(self, tmp_path):
+        # Create a history file with one valid pair so the replay walks
+        # but does not block on missing files.
+        history_dir = tmp_path / "history" / str(_CHAT_ID)
+        history_dir.mkdir(parents=True)
+        _write_jsonl(
+            history_dir / "2026-05-12.jsonl",
+            [_rec("user", "hi"), _rec("assistant", "hello")],
+        )
+
+        init_mock = MagicMock()
+        config_mock = MagicMock()
+        config_mock.episode_classifier_context_turns = 3
+        # Patch every dependency reached after init_memory so the unit
+        # test cannot reach a real config / store / subprocess. The
+        # only assertion is that init_memory was invoked with the
+        # config object - the call shape protecting against the silent
+        # storage no-op.
+        with (
+            patch("kai.config.load_config", return_value=config_mock),
+            patch("kai.memory.init_memory", init_mock),
+            patch("kai.memory.delete_all"),
+            patch("kai.memory_extraction.extract_and_store", AsyncMock(return_value=0)),
+        ):
+            rc = await replay._async_main(
+                [
+                    "--chat-id",
+                    str(_CHAT_ID),
+                    "--user-id",
+                    "sandbox-init-test",
+                    "--history-dir",
+                    str(history_dir),
+                ]
+            )
+
+        assert rc == 0
+        init_mock.assert_called_once_with(config_mock)
+
+
 # ── PRIOR CONTEXT truncation deferred to extract_and_store ──────────
 
 
