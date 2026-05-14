@@ -27,9 +27,6 @@ Usage:
 
     # Rollback (deletes all migration-source rows for the user):
     python scripts/migrate-memory-md-to-qdrant.py --user-id 123 --rollback
-
-See home/specs/406-memory-md-qdrant-migration-v3.md for the full
-design rationale and acceptance criteria.
 """
 
 from __future__ import annotations

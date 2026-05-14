@@ -48,9 +48,6 @@ their purpose is enumeration, not multi-source admission. The
 duplication of source literals is deliberate so that a future
 change to the shared admit list cannot silently broaden either
 enumeration.
-
-See `home/specs/310-memory-command.md` for the canonical UX flows
-and design rationale.
 """
 
 from __future__ import annotations
