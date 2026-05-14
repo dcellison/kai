@@ -49,6 +49,7 @@ from kai.config import (
     PROVIDER_MODELS,
     VALID_BACKENDS,
     VALID_PROVIDERS,
+    validate_model_for_provider,
 )
 
 # Config file written by `config`, read by `apply`.
@@ -140,6 +141,49 @@ def _prompt_bool(label: str, default: bool = False) -> bool:
     default_str = "true" if default else "false"
     value = _prompt_choice(label, ["true", "false"], default_str)
     return value == "true"
+
+
+def _prompt_default_model(eff_provider: str, default_val: str) -> str:
+    """
+    Prompt for DEFAULT_MODEL, dispatching on the effective provider.
+
+    Two shapes of provider need different prompts:
+    - Curated providers (anthropic, openai, google, copilot, ...) carry a
+      fixed model list in PROVIDER_MODELS; the operator picks from the
+      list via _prompt_choice.
+    - Open-ended providers (openrouter, ollama, and any provider in
+      VALID_PROVIDERS without a PROVIDER_MODELS entry) accept arbitrary
+      model identifiers; the operator types one via _prompt(required=True).
+
+    The required=True on the open-ended branch forces the operator to
+    commit to a concrete model string. load_config falls back to "sonnet"
+    when DEFAULT_MODEL is empty or missing, and "sonnet" is anthropic-only;
+    letting the operator leave the field blank on an open-ended provider
+    would set them up for a startup-time validation failure that load_config
+    surfaces with a less helpful error message than this wizard can.
+
+    Args:
+        eff_provider: The effective provider (anthropic for the claude
+            backend; the configured llm_provider otherwise).
+        default_val: Prefill for the prompt. Callers should pass a value
+            that is valid for eff_provider (e.g. PROVIDER_DEFAULTS[eff_provider]
+            when re-prompting after rejecting an invalid existing value).
+
+    Returns:
+        The chosen model identifier. Always non-empty.
+    """
+    provider_models = PROVIDER_MODELS.get(eff_provider)
+    if provider_models and eff_provider not in OPEN_ENDED_PROVIDERS:
+        return _prompt_choice(
+            "Default model",
+            sorted(provider_models.keys()),
+            default_val,
+        )
+    return _prompt(
+        "Default model ID",
+        default_val,
+        required=True,
+    )
 
 
 def _validate_user_ids(value: str) -> bool:
@@ -469,31 +513,40 @@ def _cmd_config() -> None:
         print("  Model, timeout, budget, and context window are now per-user.")
         print("  Set defaults in users.yaml or let users configure via /settings.")
         # Read DEFAULT_MODEL, falling back to CLAUDE_MODEL for backward compat
-        model = existing_env.get("DEFAULT_MODEL", existing_env.get("CLAUDE_MODEL", ""))
+        existing_model = existing_env.get("DEFAULT_MODEL", existing_env.get("CLAUDE_MODEL", ""))
+        # Re-validate the existing value against the (possibly newly chosen)
+        # effective provider. Empty existing_model fails validation for any
+        # curated provider, including anthropic ("" is not in PROVIDER_MODELS).
+        # Open-ended providers always validate True, so empty + open-ended
+        # would silently pass; the _prompt(required=True) branch in
+        # _prompt_default_model handles that case by forcing the operator
+        # to commit to a model string.
+        if existing_model and validate_model_for_provider(existing_model, eff_provider):
+            model = existing_model
+        else:
+            if existing_model:
+                print(
+                    f"  DEFAULT_MODEL '{existing_model}' is not valid for provider "
+                    f"'{eff_provider}'. Please choose a new default."
+                )
+            # Prefill always uses PROVIDER_DEFAULTS for the effective provider
+            # rather than existing_env["DEFAULT_MODEL"]. We entered this branch
+            # because the existing value is missing or invalid for the effective
+            # provider; offering it as the prefill would let the operator
+            # accept the just-rejected value with Enter, since _prompt_choice
+            # returns its default parameter without validating it against
+            # the choices list.
+            model = _prompt_default_model(eff_provider, PROVIDER_DEFAULTS.get(eff_provider, ""))
         timeout = existing_env.get("CLAUDE_TIMEOUT_SECONDS", "")
         budget = existing_env.get("BUDGET_CEILING", existing_env.get("CLAUDE_MAX_BUDGET_USD", ""))
         max_context_window = existing_env.get("CLAUDE_MAX_CONTEXT_WINDOW", "")
     else:
         print("-- Claude --")
-        # Show provider-aware model choices
-        provider_models = PROVIDER_MODELS.get(eff_provider)
         default_model_val = existing_env.get(
             "DEFAULT_MODEL",
             existing_env.get("CLAUDE_MODEL", PROVIDER_DEFAULTS.get(eff_provider, "")),
         )
-        if provider_models and eff_provider not in OPEN_ENDED_PROVIDERS:
-            model = _prompt_choice(
-                "Default model",
-                sorted(provider_models.keys()),
-                default_model_val,
-            )
-        else:
-            # Open-ended provider - free-text model ID
-            model = _prompt(
-                "Default model ID",
-                default_model_val,
-                required=True,
-            )
+        model = _prompt_default_model(eff_provider, default_model_val)
 
         while True:
             timeout = _prompt(
@@ -1033,10 +1086,20 @@ def _cmd_config() -> None:
     if agent_backend != "claude" and budget:
         env["BUDGET_CEILING"] = budget
 
-    # Deprecated per-user vars: only include without users.yaml
-    # (legacy single-user mode). With users.yaml, these are noise.
+    # DEFAULT_MODEL is always emitted. The model is global (per-user
+    # values in users.yaml are overrides on top of it, not replacements),
+    # and load_config validates DEFAULT_MODEL against the effective
+    # provider at startup. The load_config fallback ("sonnet") is
+    # anthropic-only, so omitting the key on non-anthropic backends
+    # produces a startup-time SystemExit; emitting it unconditionally
+    # makes the env file self-describing and forces the wizard layer
+    # to own the validation responsibility.
+    env["DEFAULT_MODEL"] = model
+
+    # CLAUDE_TIMEOUT_SECONDS remains gated on the legacy single-user
+    # path; per-user timeouts live in users.yaml and override the
+    # global default at runtime.
     if not users_yaml_exists:
-        env["DEFAULT_MODEL"] = model
         env["CLAUDE_TIMEOUT_SECONDS"] = timeout
 
     # Context window tuning - only include if non-default.
@@ -2706,6 +2769,45 @@ def _cmd_apply() -> None:
         svc_gid = user_info.pw_gid
     except KeyError:
         raise SystemExit(f"Service user '{service_user}' does not exist on this system.") from None
+
+    # Defensive validation: refuse to apply an install.conf whose
+    # (DEFAULT_MODEL, effective_provider) pair would fail load_config's
+    # startup check. Without this gate, apply would stop the service,
+    # rewrite /etc/kai/env, then the next service start would crash with
+    # an inscrutable message; the operator would see a partial-state
+    # installation and a dead bot.
+    #
+    # Normalize the same way load_config does (config.py reads both env
+    # vars through .strip().lower() before validating). A hand-edited
+    # install.conf with "AGENT_BACKEND": "Claude" or trailing whitespace
+    # would otherwise compute the wrong effective provider here, pass
+    # the apply gate, and then fail at startup.
+    #
+    # Resolve the same fallback load_config uses ("" -> "sonnet"). An
+    # empty or missing DEFAULT_MODEL is silently promoted at runtime;
+    # if we do not mirror that promotion here, the apply gate misses
+    # the missing-key case that is precisely what this gate exists for.
+    default_model_raw = env.get("DEFAULT_MODEL", "")
+    agent_backend_raw = env.get("AGENT_BACKEND", "claude").strip().lower()
+    llm_provider_raw = env.get("LLM_PROVIDER", "").strip().lower()
+    eff_provider_for_check = "anthropic" if agent_backend_raw == "claude" else llm_provider_raw
+    resolved_model = default_model_raw or "sonnet"
+    if not validate_model_for_provider(resolved_model, eff_provider_for_check):
+        valid_models = sorted(PROVIDER_MODELS.get(eff_provider_for_check, {}).keys())
+        if default_model_raw:
+            msg = (
+                f"install.conf has DEFAULT_MODEL='{default_model_raw}' which is not "
+                f"valid for provider '{eff_provider_for_check}'."
+            )
+        else:
+            msg = (
+                f"install.conf has no DEFAULT_MODEL; the load_config fallback "
+                f"'sonnet' is not valid for provider '{eff_provider_for_check}'."
+            )
+        valid_list = ", ".join(valid_models) or "(provider has no curated list)"
+        raise SystemExit(
+            f"{msg} Re-run 'python -m kai install config' to pick a compatible model. Valid models: {valid_list}"
+        )
 
     dry_run = os.environ.get("DRY_RUN", "").strip() in ("1", "true", "yes")
     if dry_run:
