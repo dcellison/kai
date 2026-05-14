@@ -13,6 +13,7 @@ Covers:
 """
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -366,6 +367,54 @@ class TestHandshake:
         call_kwargs = mock_exec.call_args[1]
         # "sonnet" passed through as-is, not mapped to "claude-sonnet-4-6"
         assert call_kwargs["env"]["GOOSE_MODEL"] == "sonnet"
+
+    @pytest.mark.asyncio
+    async def test_provider_env_var_set(self):
+        """
+        GOOSE_PROVIDER env var is set during startup.
+
+        The goose binary reads GOOSE_PROVIDER to pick which provider API
+        to call; without it, session/new fails with "Internal error" on
+        any fresh install that has no provider configured in
+        ~/.config/goose/config.yaml. This test guards the translation
+        from Kai's self.provider field to the goose-prefixed env var.
+        """
+        g = _make_goose(model="gpt-5.4-mini", provider="openai")
+        proc = _make_mock_proc(_handshake_lines())
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await g._ensure_started()
+
+        call_kwargs = mock_exec.call_args[1]
+        assert call_kwargs["env"]["GOOSE_PROVIDER"] == "openai"
+
+    @pytest.mark.asyncio
+    async def test_provider_env_var_omitted_when_empty(self):
+        """
+        GOOSE_PROVIDER is not exported when self.provider is empty.
+
+        Exporting GOOSE_PROVIDER="" would confuse the goose binary more
+        than omitting it; the empty default exists for the claude backend
+        pre-wiring path and any test fixtures that do not specify a
+        provider. The guard mirrors GOOSE_MODEL's truthiness check.
+        """
+        g = _make_goose(model="sonnet", provider="")
+        proc = _make_mock_proc(_handshake_lines())
+
+        # Scrub GOOSE_PROVIDER from the inherited parent environment so the
+        # absence is attributable to the truthiness guard, not to the host
+        # shell. Without this scrub the test would silently pass on hosts
+        # that happen to export GOOSE_PROVIDER and silently fail on hosts
+        # that do not, making the regression invisible to local runs.
+        with (
+            patch.dict(os.environ, {}, clear=False) as _env,
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec,
+        ):
+            os.environ.pop("GOOSE_PROVIDER", None)
+            await g._ensure_started()
+
+        call_kwargs = mock_exec.call_args[1]
+        assert "GOOSE_PROVIDER" not in call_kwargs["env"]
 
 
 # ── Stream parsing ─────────────────────────────────────────────────

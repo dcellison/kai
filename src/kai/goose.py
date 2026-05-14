@@ -164,9 +164,10 @@ class GooseBackend(AgentBackend):
         # Build the subprocess environment. Merge order:
         # 1. Base environment (inherited from parent process)
         # 2. GOOSE_MODEL (translated from self.model)
-        # 3. Per-workspace env_file values
-        # 4. Per-workspace inline env values (override env_file)
-        # 5. Webhook secret (LAST - workspace env can't override it)
+        # 3. GOOSE_PROVIDER (mirrors self.provider)
+        # 4. Per-workspace env_file values
+        # 5. Per-workspace inline env values (override env_file)
+        # 6. Webhook secret (LAST - workspace env can't override it)
         env = os.environ.copy()
         # Kai's logical model names ("sonnet", "opus", "haiku") only apply
         # to the Anthropic provider. Other providers require full model IDs
@@ -177,6 +178,20 @@ class GooseBackend(AgentBackend):
             mapped = self.model
         if mapped:
             env["GOOSE_MODEL"] = mapped
+        # GOOSE_PROVIDER tells the goose binary which provider backend to
+        # talk to (openai, anthropic, google, etc.). Without it, session/new
+        # fails with "Internal error" against a binary that has no default
+        # provider configured. Kai's wizard writes LLM_PROVIDER to
+        # /etc/kai/env for its own bookkeeping, but the goose binary reads
+        # the GOOSE_-prefixed name; the translation happens here so the
+        # two layers stay decoupled. Guarded on truthiness because
+        # self.provider can be the empty-string default for the claude
+        # backend pre-wiring path, and exporting GOOSE_PROVIDER="" would
+        # confuse goose more than omitting it. Placed before the
+        # workspace_config merge so a per-workspace env_file or inline env
+        # can override it, matching GOOSE_MODEL's override semantics.
+        if self.provider:
+            env["GOOSE_PROVIDER"] = self.provider
         if self.workspace_config:
             if self.workspace_config.env_file:
                 env.update(parse_env_file(self.workspace_config.env_file))

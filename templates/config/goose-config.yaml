@@ -4,10 +4,11 @@
 # AGENT_BACKEND=goose. Controls which Goose extensions are loaded
 # in ACP mode (`goose acp`).
 #
-# GOOSE_MODEL and GOOSE_PROVIDER are intentionally omitted here -
-# both are set at runtime via environment variables. GOOSE_MODEL is
-# managed by Kai's model switching (/model command). GOOSE_PROVIDER
-# is set during `make config` and written to /etc/kai/env.
+# GOOSE_MODEL and GOOSE_PROVIDER are intentionally omitted here;
+# both are set at runtime by GooseBackend when launching `goose acp`,
+# translated from the effective per-user model and llm_provider.
+# Workspace config (workspaces.yaml env / env_file) can override
+# either one for per-workspace provider or model pinning.
 
 extensions:
   developer:
