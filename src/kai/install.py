@@ -148,12 +148,13 @@ def _prompt_default_model(eff_provider: str, default_val: str) -> str:
     Prompt for DEFAULT_MODEL, dispatching on the effective provider.
 
     Two shapes of provider need different prompts:
-    - Curated providers (anthropic, openai, google, copilot, ...) carry a
-      fixed model list in PROVIDER_MODELS; the operator picks from the
-      list via _prompt_choice.
-    - Open-ended providers (openrouter, ollama, and any provider in
-      VALID_PROVIDERS without a PROVIDER_MODELS entry) accept arbitrary
-      model identifiers; the operator types one via _prompt(required=True).
+    - Curated providers (those with an entry in PROVIDER_MODELS, currently
+      anthropic, openai, google) ship a fixed model list; the operator
+      picks from the list via _prompt_choice.
+    - Open-ended providers (those in OPEN_ENDED_PROVIDERS, currently
+      openrouter and ollama; also any provider in VALID_PROVIDERS without
+      a PROVIDER_MODELS entry) accept arbitrary model identifiers; the
+      operator types one via _prompt(required=True).
 
     The required=True on the open-ended branch forces the operator to
     commit to a concrete model string. load_config falls back to "sonnet"

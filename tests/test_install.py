@@ -2193,9 +2193,9 @@ class TestCmdConfigDefaultModelDispatch:
 
     def test_reprompts_on_provider_flip_with_users_yaml(self, tmp_path, monkeypatch):
         """
-        Acceptance 1: with users.yaml present and DEFAULT_MODEL=sonnet, flipping
-        to goose+openai prompts for a new model and the chosen value lands in
-        install.conf.
+        With users.yaml present and DEFAULT_MODEL=sonnet, flipping to
+        goose+openai prompts for a new model and the chosen value lands
+        in install.conf.
         """
         self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_MODEL": "sonnet"})
         helper, env = self._run(
@@ -2211,9 +2211,9 @@ class TestCmdConfigDefaultModelDispatch:
 
     def test_no_reprompt_when_claude_backend_unchanged(self, tmp_path, monkeypatch):
         """
-        Acceptance 2: with users.yaml present, DEFAULT_MODEL=sonnet, and the
-        wizard kept on claude, no model prompt fires AND install.conf still
-        emits DEFAULT_MODEL=sonnet (the unconditional-emission half of the fix).
+        With users.yaml present, DEFAULT_MODEL=sonnet, and the wizard kept
+        on claude, no model prompt fires AND install.conf still emits
+        DEFAULT_MODEL=sonnet (the unconditional-emission half of the fix).
         """
         self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_MODEL": "sonnet"})
         helper, env = self._run(
@@ -2227,10 +2227,10 @@ class TestCmdConfigDefaultModelDispatch:
 
     def test_reprompts_on_empty_existing_model_claude(self, tmp_path, monkeypatch):
         """
-        Acceptance 3 / edge case 5: users.yaml present, no DEFAULT_MODEL in
-        existing env, backend stays claude. Empty existing model fails
-        validate_model_for_provider (empty is not in PROVIDER_MODELS["anthropic"]),
-        so the dispatch re-prompts.
+        users.yaml present, no DEFAULT_MODEL in existing env, backend stays
+        claude. Empty existing model fails validate_model_for_provider
+        (empty is not in PROVIDER_MODELS["anthropic"]), so the dispatch
+        re-prompts.
         """
         self._setup(monkeypatch, tmp_path, existing_env={})
         helper, env = self._run(
@@ -2245,9 +2245,9 @@ class TestCmdConfigDefaultModelDispatch:
 
     def test_reprompts_on_empty_existing_model_openai(self, tmp_path, monkeypatch):
         """
-        Edge case 5 on a non-anthropic provider. Empty existing model + flip
-        to goose+openai: dispatch re-prompts, helper fires with eff_provider
-        equal to "openai".
+        Empty-existing-model path on a non-anthropic provider: flip to
+        goose+openai with no DEFAULT_MODEL in existing env, dispatch
+        re-prompts, helper fires with eff_provider equal to "openai".
         """
         self._setup(monkeypatch, tmp_path, existing_env={})
         helper, env = self._run(
@@ -2262,9 +2262,9 @@ class TestCmdConfigDefaultModelDispatch:
 
     def test_reprompt_prefill_is_provider_default_not_invalid_existing(self, tmp_path, monkeypatch):
         """
-        Acceptance 10: when re-prompting because the existing model is
-        invalid for the new provider, the prefill is PROVIDER_DEFAULTS for
-        the new provider, NOT the just-rejected value. Guards against
+        When re-prompting because the existing model is invalid for the
+        new provider, the prefill is PROVIDER_DEFAULTS for the new
+        provider, NOT the just-rejected value. Guards against
         _prompt_choice's default-passthrough behavior (it returns its
         `default` parameter on empty input without validating it against
         the `choices` list); if the dispatch passed the invalid model as
@@ -2343,8 +2343,8 @@ class TestCmdApplyDefaultModelGate:
 
     def test_rejects_incompatible_default_model(self, tmp_path, monkeypatch):
         """
-        Acceptance 4: model + provider mismatch raises SystemExit before
-        any side effect. Error names both the bad value and the provider.
+        Model + provider mismatch raises SystemExit before any side effect.
+        Error names both the bad value and the provider.
         """
         monkeypatch.setattr("os.geteuid", lambda: 0)
         conf_path = self._write_install_conf(
@@ -2364,8 +2364,8 @@ class TestCmdApplyDefaultModelGate:
 
     def test_rejects_missing_default_model_on_non_anthropic(self, tmp_path, monkeypatch):
         """
-        Acceptance 5: missing DEFAULT_MODEL on non-anthropic provider
-        raises SystemExit naming the load_config 'sonnet' fallback so the
+        Missing DEFAULT_MODEL on a non-anthropic provider raises
+        SystemExit naming the load_config 'sonnet' fallback so the
         operator understands why an unset key is a problem.
         """
         monkeypatch.setattr("os.geteuid", lambda: 0)
@@ -2386,9 +2386,9 @@ class TestCmdApplyDefaultModelGate:
 
     def test_accepts_missing_default_model_on_anthropic(self, tmp_path, monkeypatch):
         """
-        Edge case 1b on anthropic: a missing DEFAULT_MODEL resolves to
-        'sonnet' via the load_config fallback; sonnet is valid for
-        anthropic so the gate passes and apply proceeds past _stop_service.
+        Missing DEFAULT_MODEL on anthropic: resolves to 'sonnet' via the
+        load_config fallback; sonnet is valid for anthropic so the gate
+        passes and apply proceeds past _stop_service.
         """
         monkeypatch.setattr("os.geteuid", lambda: 0)
         conf_path = self._write_install_conf(
@@ -2407,9 +2407,9 @@ class TestCmdApplyDefaultModelGate:
 
     def test_accepts_open_ended_provider(self, tmp_path, monkeypatch):
         """
-        Edge case 2: open-ended providers (openrouter, ollama) accept any
-        non-empty model. validate_model_for_provider returns True for them,
-        so the gate does not block regardless of the model string.
+        Open-ended providers (openrouter, ollama) accept any non-empty
+        model. validate_model_for_provider returns True for them, so the
+        gate does not block regardless of the model string.
         """
         monkeypatch.setattr("os.geteuid", lambda: 0)
         conf_path = self._write_install_conf(
@@ -2429,9 +2429,9 @@ class TestCmdApplyDefaultModelGate:
 
     def test_dry_run_still_validates(self, tmp_path, monkeypatch):
         """
-        Acceptance 7: DRY_RUN=1 does not bypass the gate. Validation runs
-        before the dry-run flag is even read, so a bad config exits with
-        the same SystemExit it would emit on a non-dry-run apply.
+        DRY_RUN=1 does not bypass the gate. Validation runs before the
+        dry-run flag is even read, so a bad config exits with the same
+        SystemExit it would emit on a non-dry-run apply.
         """
         monkeypatch.setattr("os.geteuid", lambda: 0)
         monkeypatch.setenv("DRY_RUN", "1")
@@ -2449,31 +2449,47 @@ class TestCmdApplyDefaultModelGate:
         assert "openai" in msg
         stop_service.assert_not_called()
 
-    def test_normalizes_agent_backend_case_and_whitespace(self, tmp_path, monkeypatch):
+    def test_normalizes_llm_provider_case_and_whitespace(self, tmp_path, monkeypatch):
         """
         Mirrors load_config's .strip().lower() normalization on
-        AGENT_BACKEND and LLM_PROVIDER. A hand-edited install.conf
-        carrying 'Claude ' (mixed case + trailing space) must compute
-        the same effective provider load_config will at startup.
+        AGENT_BACKEND and LLM_PROVIDER. The test relies on a code path
+        where normalized and un-normalized lookups produce DIFFERENT
+        gate outcomes, so that the test fails if either transformation
+        is dropped from the gate.
+
+        Setup: AGENT_BACKEND="goose", LLM_PROVIDER=" OpenAI ", DEFAULT_MODEL="sonnet".
+        - With .strip().lower() applied: eff_provider="openai",
+          validate("sonnet", "openai") returns False (sonnet is not in
+          PROVIDER_MODELS["openai"]) -> SystemExit.
+        - Without .strip().lower(): eff_provider=" OpenAI ", which is
+          not in PROVIDER_MODELS or OPEN_ENDED_PROVIDERS. The validator
+          falls through the unknown-provider branch (which returns True
+          with a warning) and the gate silently accepts.
+
+        Asserting SystemExit therefore captures BOTH transformations:
+        dropping .strip() leaves " OpenAI " unknown; dropping .lower()
+        leaves "OpenAI" unknown; either way the gate would silently
+        accept and the test would fail.
         """
         monkeypatch.setattr("os.geteuid", lambda: 0)
         conf_path = self._write_install_conf(
             tmp_path,
-            {"DEFAULT_MODEL": "opus", "AGENT_BACKEND": "Claude "},
+            {
+                "DEFAULT_MODEL": "sonnet",
+                "AGENT_BACKEND": "goose",
+                "LLM_PROVIDER": " OpenAI ",
+            },
         )
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         stop_service = self._patch_side_effects(monkeypatch)
-        monkeypatch.setenv("DRY_RUN", "1")
 
-        # Without normalization the gate would resolve to ("opus", "")
-        # and pass (empty provider triggers the unknown-provider warning
-        # branch in validate_model_for_provider, which returns True).
-        # With normalization the gate resolves to ("opus", "anthropic"),
-        # opus is valid, and the apply proceeds. This indirectly verifies
-        # that both .strip() and .lower() are applied by checking that
-        # the apply reaches _stop_service (i.e. the gate accepted).
-        _cmd_apply()
-        stop_service.assert_called_once()
+        with pytest.raises(SystemExit) as excinfo:
+            _cmd_apply()
+        # The error message should name the normalized provider, not the
+        # raw input, so operator-facing output stays consistent with the
+        # load_config error wording.
+        assert "openai" in str(excinfo.value).lower()
+        stop_service.assert_not_called()
 
 
 # ── Directory creation ───────────────────────────────────────────────
