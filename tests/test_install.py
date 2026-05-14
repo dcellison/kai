@@ -884,7 +884,10 @@ class TestPromptChoice:
         assert "[xyz]" not in recorded_prompts[0]
 
     def test_suffix_present_when_default_in_choices(self, monkeypatch):
-        """Pairs with test 3 to lock both directions of the suffix display."""
+        """
+        Pairs with `test_suffix_omitted_when_default_not_in_choices` to
+        lock both directions of the suffix display.
+        """
         recorded_prompts: list[str] = []
         inputs = iter([""])
 
@@ -908,6 +911,21 @@ class TestPromptChoice:
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
         result = _prompt_choice("Pick", ["a", "b"], default="")
         assert result == "a"
+
+    def test_empty_default_with_empty_input_reprompts(self, monkeypatch):
+        """
+        Locks the unset-default row of the behavior matrix: empty input
+        with no default re-prompts rather than returning a falsy value.
+        The single-Enter iterator runs the loop once; the second input()
+        call exhausts the iterator and raises StopIteration, which proves
+        the loop is iterating (it would return without a second read if
+        the empty-input branch were incorrectly returning the empty
+        default).
+        """
+        inputs = iter([""])
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        with pytest.raises(StopIteration):
+            _prompt_choice("Pick", ["a", "b"], default="")
 
     def test_lowercases_and_strips_input(self, monkeypatch):
         """
