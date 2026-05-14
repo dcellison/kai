@@ -106,22 +106,42 @@ def _prompt_choice(label: str, choices: list[str], default: str = "") -> str:
     """
     Prompt the user to pick from a list of valid choices.
 
-    Rejects input not in the choices list and re-prompts.
+    Rejects input not in the choices list and re-prompts. If the caller
+    supplies a `default` that is not in `choices`, the function behaves
+    as if no default were supplied: the suffix is not shown, and empty
+    input re-prompts rather than returning the invalid value. This guards
+    against call sites that read `default` from operator-facing state
+    (existing_env, install.conf) whose values can drift out of `choices`
+    when a sibling setting changes.
+
+    Membership is case-sensitive against `choices`. A `default` whose
+    case or whitespace does not match a canonical entry is treated as
+    out-of-list and re-prompted. This is consistent with the apply-time
+    normalization in load_config and stops a hand-edited install.conf
+    from re-selecting a near-miss value on Enter.
 
     Args:
         label: The prompt text shown to the user.
         choices: List of valid string values.
-        default: Default value if the user presses Enter.
+        default: Default value if the user presses Enter. Ignored if not
+            in `choices`.
 
     Returns:
-        The chosen value (guaranteed to be in choices).
+        The chosen value, guaranteed to be in `choices`.
     """
     choices_str = "/".join(choices)
-    suffix = f" [{default}]" if default else ""
+    # An out-of-list default is treated as no default. The empty-input
+    # path previously returned the value unchecked, violating the
+    # function's "Returns a value in choices" contract. Recomputing here
+    # keeps the suffix display and the empty-input branch consistent so
+    # the prompt never advertises an option the function would not accept
+    # via typed input.
+    effective_default = default if default in choices else ""
+    suffix = f" [{effective_default}]" if effective_default else ""
     while True:
         value = input(f"{label} ({choices_str}){suffix}: ").strip().lower()
-        if not value and default:
-            return default
+        if not value and effective_default:
+            return effective_default
         if value in choices:
             return value
         print(f"  Please choose one of: {choices_str}")

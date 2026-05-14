@@ -39,6 +39,7 @@ from kai.install import (
     _generate_systemd_unit,
     _generate_users_yaml,
     _migrate_identity_to_claude_md,
+    _prompt_choice,
     _retire_install_home_claude,
     _retire_install_home_dir,
     _set_ownership,
@@ -818,6 +819,120 @@ class TestGenerateSystemdUnit:
     def test_network_dependency(self):
         result = _generate_systemd_unit("/opt/kai", "/var/lib/kai", "kai")
         assert "network-online.target" in result
+
+
+# ── Prompt helpers ───────────────────────────────────────────────────
+
+
+class TestPromptChoice:
+    """
+    `_prompt_choice` defends its "returns a value in `choices`" contract.
+
+    The empty-input branch previously returned the caller's `default`
+    without checking membership; an out-of-list default could leak back
+    to the caller on Enter. The helper now treats an out-of-list default
+    as if no default were supplied: the suffix is omitted and empty input
+    re-prompts.
+    """
+
+    def test_returns_default_when_in_choices(self, monkeypatch):
+        """Regression guard for the no-behavior-change case."""
+        # Empty input simulates the operator pressing Enter at the prompt.
+        inputs = iter([""])
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        result = _prompt_choice("Pick", ["a", "b"], default="a")
+        assert result == "a"
+
+    def test_rejects_empty_input_when_default_not_in_choices(self, monkeypatch, capsys):
+        """
+        With a default that is not in choices, pressing Enter re-prompts
+        rather than returning the invalid value. The "Please choose one
+        of" notice is printed to stdout (via print(), captured by capsys).
+        """
+        # First Enter triggers the re-prompt; the second response ("a")
+        # is in choices so the function returns it. Pre-fix behavior
+        # would have returned "xyz" on the first Enter without re-prompting.
+        inputs = iter(["", "a"])
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        result = _prompt_choice("Pick", ["a", "b"], default="xyz")
+        assert result == "a"
+        captured = capsys.readouterr().out
+        assert "Please choose one of: a/b" in captured
+
+    def test_suffix_omitted_when_default_not_in_choices(self, monkeypatch):
+        """
+        The `[default]` suffix in the prompt string is dropped when the
+        default is out-of-list, so the function does not advertise a
+        value it will not accept on Enter. Couples the suffix display to
+        the empty-input branch via the shared `effective_default` variable.
+        """
+        # Record the exact string passed to input() so we can assert on
+        # the suffix. The bare lambda used in test_returns_default does
+        # not preserve the prompt argument; capsys also will not catch
+        # it because the mock replaces input() entirely and never writes
+        # to stdout. A side-effecting list is the structural analog of
+        # MagicMock.call_args_list for this case.
+        recorded_prompts: list[str] = []
+        inputs = iter(["a"])
+
+        def mock_input(prompt: str) -> str:
+            recorded_prompts.append(prompt)
+            return next(inputs)
+
+        monkeypatch.setattr("builtins.input", mock_input)
+        _prompt_choice("Pick", ["a", "b"], default="xyz")
+        assert "[xyz]" not in recorded_prompts[0]
+
+    def test_suffix_present_when_default_in_choices(self, monkeypatch):
+        """Pairs with test 3 to lock both directions of the suffix display."""
+        recorded_prompts: list[str] = []
+        inputs = iter([""])
+
+        def mock_input(prompt: str) -> str:
+            recorded_prompts.append(prompt)
+            return next(inputs)
+
+        monkeypatch.setattr("builtins.input", mock_input)
+        _prompt_choice("Pick", ["a", "b"], default="a")
+        assert "[a]" in recorded_prompts[0]
+
+    def test_empty_default_with_invalid_input_reprompts(self, monkeypatch):
+        """
+        Regression guard for the empty-default case: invalid typed input
+        re-prompts (not the empty-input path), valid typed input is
+        accepted on the second iteration.
+        """
+        # "bad" is not in choices; "a" is. The function should loop until
+        # it gets a value in choices.
+        inputs = iter(["bad", "a"])
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        result = _prompt_choice("Pick", ["a", "b"], default="")
+        assert result == "a"
+
+    def test_lowercases_and_strips_input(self, monkeypatch):
+        """
+        Existing behavior, kept as a load-bearing regression guard since
+        callers depend on the .strip().lower() normalization to accept
+        operator input in any case.
+        """
+        inputs = iter([" A "])
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        result = _prompt_choice("Pick", ["a", "b"], default="")
+        assert result == "a"
+
+    def test_rejects_case_mismatched_default(self, monkeypatch):
+        """
+        Direct regression test for the case-sensitivity claim in the
+        docstring. "A" is not byte-identical to any entry in ["a", "b"],
+        so the default is treated as out-of-list; the typed "a" is
+        accepted on the next iteration. If a future change relaxes the
+        membership check to be case-insensitive, this test will fail and
+        the docstring claim should be revisited.
+        """
+        inputs = iter(["", "a"])
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        result = _prompt_choice("Pick", ["a", "b"], default="A")
+        assert result == "a"
 
 
 # ── Config subcommand ────────────────────────────────────────────────
