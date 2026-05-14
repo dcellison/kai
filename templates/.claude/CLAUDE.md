@@ -46,7 +46,7 @@ Specifically do NOT save these classes:
 - In-progress task state ("user is evaluating specification X", "user is working on file Y v4").
 - Workflow blocker counts or review-round status ("v2 has three nits", "all four findings resolved", "three blocker fixes applied").
 
-The artifact itself (the spec, the PR, the issue) is durable on its own; status notes about it lose meaning the moment the next version ships, the next review round runs, or the artifact merges. Apply the same counterfactual the extractor's QUALITY TEST applies: would this fact help a future conversation that does not include the current turn? If no, do not save it.
+The artifact itself (the spec, the PR, the issue) is durable on its own; status notes about it lose meaning the moment the next version ships, the next review round runs, or the artifact merges. Apply this counterfactual: would this fact help a future conversation that does not include the current turn? If no, do not save it.
 
 ### Rules go to PREFERENCES.md, but only on explicit instruction
 
