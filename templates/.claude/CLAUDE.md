@@ -39,6 +39,15 @@ Never write to MEMORY.md and Qdrant in the same turn.
 
 **Proactive fact saves (authorized exception to the explicit-instruction rule):** periodically update fact memory on your own when you notice information worth persisting (operator personal facts, corrections, decisions, recurring interests). Do this quietly without announcing it. Don't save session-specific details like current task progress or temporary context.
 
+Specifically do NOT save these classes:
+
+- PR status, review verdicts, or merge state ("PR #N maintains default X", "PR #N implements the feature", "v3 evaluation closed cleanly").
+- Version pointers to specification or design artifacts ("specification X v3 is located at...", "the evaluation is at /tmp/...").
+- In-progress task state ("user is evaluating specification X", "user is working on file Y v4").
+- Workflow blocker counts or review-round status ("v2 has three nits", "all four findings resolved", "three blocker fixes applied").
+
+The artifact itself (the spec, the PR, the issue) is durable on its own; status notes about it lose meaning the moment the next version ships, the next review round runs, or the artifact merges. Apply the same counterfactual the extractor's QUALITY TEST applies: would this fact help a future conversation that does not include the current turn? If no, do not save it.
+
 ### Rules go to PREFERENCES.md, but only on explicit instruction
 
 The `[Your personal preferences (file: ...):]` block injects PREFERENCES.md, the curated always-on rule layer. It is NOT a target for proactive saves. Treat it like CLAUDE.md: read every turn, edited deliberately, never silently appended.
