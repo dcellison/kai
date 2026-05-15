@@ -628,46 +628,48 @@ def _extract_codex_text(stdout: str) -> str:
     """
     Walk codex's NDJSON event stream and return the agent message text.
 
-    `codex exec --json` emits one JSON event per line. A streaming run
-    can produce two representations of the same message: incremental
-    chunks (delta events) and a single terminal/complete event that
-    carries the full consolidated text. Accumulating across both
-    representations would double the message; this parser prefers
-    the terminal text and only falls back to delta accumulation when
-    no terminal event appears in the stream.
+    `codex exec --json` emits one JSON event per line. Each event has
+    a top-level `type` tag from the ThreadEvent enum:
+    `thread.started`, `turn.started`, `turn.completed`, `turn.failed`,
+    `item.started`, `item.updated`, `item.completed`, `error`. (Note
+    the DOT separator; the app-server protocol uses slashes
+    instead. Same data model, different wire encoding.)
 
-    The exact event name and field path are not yet pinned by smoke
-    test, so this parser is defensive about field names:
+    For triage we only care about the agent's final natural-language
+    response. The `item.completed` event for an agent_message item
+    carries the full consolidated text:
 
-    - Each line is attempted as JSON; non-JSON lines are skipped.
-    - Terminal/complete events are recognized by their FIELD PATH
-      rather than by an event-name string. Any of these signals a
-      complete message: top-level "content" as a string, top-level
-      "content" as a list of {"type":"text", "text":...} blocks, or
-      "item.content" with the same list shape. When multiple
-      terminal events appear, the last one wins (matches the
-      streaming convention that "completed" supersedes prior partials).
-    - Chunk/delta events use "delta.text" or a top-level "text"
-      field. Chunks accumulate in order. Used only when the stream
-      contains no terminal event.
-    - On any genuine schema mismatch the result is the empty string;
-      `_parse_triage_json` then raises a clearer error than a
-      doubled-up partial would.
+        {"type": "item.completed",
+         "item": {"id": "...", "type": "agent_message", "text": "..."}}
 
-    The smoke test against a real codex CLI will reveal which of
-    these field paths actually fire for the pinned version; the
-    others remain as fallbacks for schema drift.
+    Schema reference: codex-rs/exec/src/exec_events.rs in the codex
+    repo. The `ThreadItemDetails` enum is `#[serde(tag = "type",
+    rename_all = "snake_case")]` so the discriminator is
+    `"agent_message"` (snake_case), and `text` is a flat field on
+    the item object (the inner enum is `#[serde(flatten)]`).
+
+    A streaming run may emit `item.updated` events for the same
+    agent_message id before its `item.completed`. We trust the
+    completed event as authoritative; if no completed event arrived
+    (e.g. truncated stream) we fall back to the latest updated text
+    so triage gets something rather than nothing.
+
+    Schema-drift posture: a future codex release that adds new event
+    types or item types must not break extraction. Unknown shapes
+    are silently skipped. A `turn.failed` event short-circuits to an
+    empty result so the caller raises a clearer error than a partial
+    body would.
 
     Args:
         stdout: The full stdout from `codex exec --json`.
 
     Returns:
-        The agent message text. Terminal text if any terminal event
-        was found; otherwise the accumulated delta/chunk text. Empty
-        string if no recognizable text was found in any event.
+        The agent_message text from the last `item.completed`
+        event, or the latest `item.updated` text as a fallback.
+        Empty string if no agent_message was emitted.
     """
-    terminal_text: str | None = None
-    accumulated_chunks: list[str] = []
+    completed_text: str | None = None
+    latest_updated_text: str | None = None
     for line in stdout.splitlines():
         line = line.strip()
         if not line:
@@ -676,80 +678,41 @@ def _extract_codex_text(stdout: str) -> str:
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
-        # Terminal event wins; the most recent terminal event
-        # supersedes earlier ones (a streaming run that emits
-        # interim consolidated events before the final one ends
-        # up with the latest version).
-        terminal = _recover_terminal_text(obj)
-        if terminal is not None:
-            terminal_text = terminal
-            continue
-        # Delta/chunk events accumulate, but only matter when no
-        # terminal event ever fires.
-        chunk = _recover_chunk_text(obj)
-        if chunk is not None:
-            accumulated_chunks.append(chunk)
-    if terminal_text is not None:
-        return terminal_text.strip()
-    return "".join(accumulated_chunks).strip()
+        event_type = obj.get("type")
+        # `turn.failed` is a terminal failure - no body text to
+        # extract; let the caller see an empty string and surface
+        # a clearer error than a half-event would.
+        if event_type == "turn.failed":
+            return ""
+        if event_type in ("item.completed", "item.updated"):
+            text = _recover_agent_message_text(obj)
+            if text is None:
+                continue
+            if event_type == "item.completed":
+                completed_text = text
+            else:
+                latest_updated_text = text
+    if completed_text is not None:
+        return completed_text.strip()
+    if latest_updated_text is not None:
+        return latest_updated_text.strip()
+    return ""
 
 
-def _recover_terminal_text(obj: dict) -> str | None:
+def _recover_agent_message_text(obj: dict) -> str | None:
     """
-    Pull a complete/terminal agent message from one codex event.
+    Pull `item.text` from a codex exec event when the item is an
+    agent_message; return None otherwise.
 
-    Recognized field paths for a complete message:
-    - Top-level "content" as a string (single-block shape).
-    - Top-level "content" as a list of {"type":"text", "text":...} blocks.
-    - "item.content" with the same list-of-blocks shape (events
-      wrapped in an "item" object).
-
-    Returns the consolidated text string, or None if the event has
-    none of these paths (and is therefore either a chunk/delta or
-    pure metadata).
+    The wire shape is `{..., "item": {"id": "...", "type": "agent_message", "text": "..."}}`
+    because ThreadItemDetails is serde-flattened onto ThreadItem.
     """
-    content = obj.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = [
-            block["text"]
-            for block in content
-            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
-        ]
-        if parts:
-            return "".join(parts)
     item = obj.get("item")
-    if isinstance(item, dict):
-        i_content = item.get("content")
-        if isinstance(i_content, list):
-            parts = [
-                block["text"]
-                for block in i_content
-                if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
-            ]
-            if parts:
-                return "".join(parts)
-    return None
-
-
-def _recover_chunk_text(obj: dict) -> str | None:
-    """
-    Pull a streaming chunk/delta text fragment from one codex event.
-
-    Recognized field paths for an incremental chunk:
-    - "delta.text" (the conventional streaming-delta shape).
-    - Top-level "text" string (an alternate shape some CLI versions emit).
-
-    Returns the fragment text, or None if the event has no chunk-style
-    text field.
-    """
-    delta = obj.get("delta")
-    if isinstance(delta, dict):
-        d_text = delta.get("text")
-        if isinstance(d_text, str):
-            return d_text
-    text = obj.get("text")
+    if not isinstance(item, dict):
+        return None
+    if item.get("type") != "agent_message":
+        return None
+    text = item.get("text")
     if isinstance(text, str):
         return text
     return None

@@ -1,33 +1,40 @@
 """
 OpenAI Codex CLI subprocess backend.
 
-Implements the AgentBackend ABC for Codex's JSON-RPC 2.0 protocol over
-a persistent `codex app-server` subprocess. Structurally equivalent to
-GooseBackend: one subprocess per user, kept alive across messages,
-restarted on /new or workspace switch. The wire protocol is JSON-RPC
-2.0 (same family as goose's ACP), but the message types and event
-vocabulary are codex-specific.
+Implements the AgentBackend ABC for the `codex app-server` JSON-RPC
+protocol. Persistent subprocess per user, kept alive across messages,
+restarted on /new or workspace switch. The wire framing is newline-
+delimited JSON (NDJSON); each message is a JSON-RPC 2.0 envelope (the
+`"jsonrpc":"2.0"` header may be omitted on the wire).
 
-The codex protocol (per pinned codex CLI version):
-    Startup:  initialize -> session/new (handshake)
-    Input:    session/prompt (JSON-RPC request with sessionId + prompt)
-    Output:   session/update (streaming notifications, no id field)
-    Finish:   JSON-RPC result with matching id
+The codex app-server protocol uses its own thread/turn/item vocabulary
+- NOT the session/* / agent_message_chunk shape goose uses. The
+authoritative reference is `codex-rs/app-server/README.md` in the
+openai/codex repo:
 
-Schema-drift posture: the documented codex event names are known to be
-out of sync with actual CLI output (openai/codex#4776). This module
-matches the goose ACP envelope (session/update notifications carrying
-an agent_message_chunk payload) because that envelope is what JSON-RPC
-2.0 servers conventionally emit; the first smoke test against a real
-codex binary will reveal whatever variations exist for the pinned
-version, and the unknown-event branches log at DEBUG and skip rather
-than aborting. The codex CLI version is captured in install metadata
-so a future bump triggers a re-pin pass.
+    Handshake (per connection):
+      1. client `initialize` request (clientInfo + capabilities)
+      2. server response (userAgent, codexHome, platformFamily, platformOs)
+      3. client `initialized` notification (no id)
+      4. client `thread/start` request -> thread object with thread.id
 
-This module does NOT take a dependency on OpenAI's Codex Python SDK.
-The decision matches goose.py: keeping the wire protocol in our own
-code keeps Kai's release schedule decoupled from a vendor SDK's
-versioning and avoids inheriting transitive dependencies.
+    Per-message:
+      - client `turn/start` request (threadId, input[], optional model/cwd)
+      - server streams notifications: item/started -> N x
+        item/agentMessage/delta -> item/completed -> turn/completed.
+      - text is accumulated from item/agentMessage/delta `delta` fields
+        per itemId; the item/completed event carries the authoritative
+        full text and overrides our delta accumulation when present.
+
+Schema-drift posture: unknown notification methods and unrecognized
+item types are logged at DEBUG and skipped rather than aborting the
+stream. A future codex release that adds new item types must not
+break the conversational stream. The codex CLI version is captured
+in install metadata so a bump triggers a re-pin pass.
+
+This module does NOT depend on OpenAI's Codex Python SDK; the wire
+protocol is implemented directly to keep Kai's release schedule
+decoupled from a vendor SDK's versioning.
 """
 
 import asyncio
@@ -75,9 +82,11 @@ class CodexBackend(AgentBackend):
     AgentBackend implementation for OpenAI Codex CLI's JSON-RPC protocol.
 
     Manages the lifecycle of a persistent `codex app-server` subprocess:
-    starting with a two-step handshake (initialize + session/new),
-    sending prompts via session/prompt, streaming responses from
-    session/update notifications, and killing/restarting on demand.
+    starting with the initialize / initialized / thread/start handshake,
+    sending prompts via turn/start, streaming responses from the
+    item/* and turn/* notifications until turn/completed arrives, and
+    killing/restarting on demand. self._session_id stores the codex
+    `thread.id` for ABC consistency with the other backends.
 
     All message sends are serialized via an internal asyncio lock to
     prevent interleaving. Tool auto-approval is handled by codex's own
@@ -292,42 +301,62 @@ class CodexBackend(AgentBackend):
         self._effective_codex_user = effective_codex_user
         self._inner_codex_pid = None
 
-        # Step 1: initialize - establish protocol version
+        # Handshake per the codex app-server protocol:
+        #   1. Client `initialize` request (clientInfo + optional
+        #      capabilities). NO protocolVersion field; the server
+        #      reports the protocol it speaks via its response and
+        #      via per-method error messages, not a version echo.
+        #   2. Server response: userAgent, codexHome, platformFamily,
+        #      platformOs. We do not need any of these at runtime;
+        #      reading the result is purely a handshake gate.
+        #   3. Client `initialized` notification (no id). Required
+        #      before any other request on the connection. Skipping
+        #      this would have all subsequent calls rejected with
+        #      "Not initialized".
+        #   4. Client `thread/start` request. Returns a thread object
+        #      whose `id` field is the persistent session handle the
+        #      bot uses for every subsequent turn/start.
+        # The optOutNotificationMethods list suppresses streams the
+        # bot does not consume - remoteControl status pings, MCP
+        # startup chatter, and thread/started which we already get
+        # via the thread/start response itself.
         self._next_id = 1
         await self._write_rpc(
             "initialize",
             {
-                "protocolVersion": "v1",
                 "clientInfo": {"name": "kai", "version": kai.__version__},
+                "capabilities": {
+                    "optOutNotificationMethods": [
+                        "remoteControl/status/changed",
+                        "mcpServer/startupStatus/updated",
+                        "thread/started",
+                        "thread/tokenUsage/updated",
+                    ],
+                },
             },
         )
         await self._read_result(expected_id=1)
 
-        # Step 2: session/new - create a session with workspace cwd.
-        # Field shape mirrors the goose ACP convention; if the pinned
-        # codex version's actual schema differs, the smoke test will
-        # surface the error and this call needs adjustment.
-        await self._write_rpc(
-            "session/new",
-            {
-                "cwd": str(self.workspace),
-            },
-        )
+        await self._write_notification("initialized")
+
+        thread_params: dict = {"cwd": str(self.workspace)}
+        if self.model:
+            thread_params["model"] = self.model
+        await self._write_rpc("thread/start", thread_params)
         result = await self._read_result(expected_id=2)
-        # Accept either camelCase or snake_case to tolerate codex CLI
-        # schema variants observed across versions. Both absent is a
-        # loud failure: a None session_id would otherwise flow into
-        # the next session/prompt as "sessionId": None and surface as
-        # a confusing downstream prompt error rather than a clear
-        # handshake mismatch. Fail at the boundary instead.
-        session_id = result.get("sessionId") or result.get("session_id")
-        if not session_id:
+
+        # The thread.id is the conversational handle for all
+        # subsequent turn/start calls. We reuse the existing
+        # self._session_id attribute (ABC-mandated) to hold it;
+        # naming stays "session_id" for cross-backend consistency
+        # but the value is codex's thread UUID.
+        thread = result.get("thread", {})
+        thread_id = thread.get("id")
+        if not thread_id:
             raise RuntimeError(
-                "Codex session/new returned no session id "
-                "(expected 'sessionId' or 'session_id' in result); "
-                "pinned codex CLI schema may differ from this build."
+                "Codex thread/start returned no thread.id; the pinned codex CLI may have an incompatible schema."
             )
-        self._session_id = session_id
+        self._session_id = thread_id
         self._fresh_session = True
 
     async def _drain_stderr(self) -> None:
@@ -351,13 +380,14 @@ class CodexBackend(AgentBackend):
 
     # ── JSON-RPC helpers ───────────────────────────────────────────
 
-    async def _write_rpc(self, method: str, params: dict) -> None:
+    async def _write_rpc(self, method: str, params: dict) -> int:
         """
         Write a JSON-RPC 2.0 request to the subprocess stdin.
 
         Increments the monotonic request ID, serializes the message
-        with a trailing newline, and flushes. Raises RuntimeError if
-        the process or its stdin pipe is gone.
+        with a trailing newline, and flushes. Returns the request id
+        so callers can correlate the response. Raises if the process
+        or its stdin pipe is gone.
         """
         assert self._proc is not None and self._proc.stdin is not None
         request_id = self._next_id
@@ -374,6 +404,22 @@ class CodexBackend(AgentBackend):
             + "\n"
         )
         self._proc.stdin.write(msg.encode())
+        await self._proc.stdin.drain()
+        return request_id
+
+    async def _write_notification(self, method: str, params: dict | None = None) -> None:
+        """
+        Write a JSON-RPC 2.0 notification (no id, no response expected).
+
+        Used for the `initialized` handshake step: the codex app-server
+        spec requires the client to send `initialized` between the
+        `initialize` response and any other request on that connection.
+        """
+        assert self._proc is not None and self._proc.stdin is not None
+        body: dict = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            body["params"] = params
+        self._proc.stdin.write((json.dumps(body) + "\n").encode())
         await self._proc.stdin.drain()
 
     async def _read_result(self, expected_id: int) -> dict:
@@ -503,20 +549,26 @@ class CodexBackend(AgentBackend):
             if not rpc_prompt:
                 rpc_prompt = [{"type": "text", "text": "(empty prompt)"}]
 
-        # Send the session/prompt request
+        # Send the turn/start request. The codex app-server protocol
+        # uses `input` (array of typed content blocks) plus `threadId`;
+        # the JSON-RPC response carries the new turn's id, and the
+        # actual model output streams as item/* and turn/* notifications
+        # until a final turn/completed arrives.
         assert self._proc is not None
         assert self._proc.stdin is not None
         assert self._proc.stdout is not None
 
         try:
-            prompt_id = self._next_id
-            await self._write_rpc(
-                "session/prompt",
-                {
-                    "sessionId": self._session_id,
-                    "prompt": rpc_prompt,
-                },
-            )
+            turn_params: dict = {
+                "threadId": self._session_id,
+                "input": rpc_prompt,
+            }
+            # Pin model per-turn so workspace_config overrides or
+            # /model switches take effect on the next message without
+            # restarting the thread.
+            if self.model:
+                turn_params["model"] = self.model
+            prompt_id = await self._write_rpc("turn/start", turn_params)
         except OSError as e:
             log.error("Failed to write to Codex process: %s", e)
             await self._kill()
@@ -606,42 +658,114 @@ class CodexBackend(AgentBackend):
                     log.debug("Skipping non-JSON line: %s", line[:200])
                     continue
 
-                # Streaming notifications (no id field) - accumulate
-                # message chunks; log everything else at DEBUG and
-                # skip. The agent_message_chunk envelope mirrors goose
-                # ACP; the smoke test confirms or corrects this name.
-                if msg.get("method") == "session/update":
-                    update = msg.get("params", {}).get("update", {})
-                    event_type = update.get("sessionUpdate") or update.get("event") or update.get("type")
-                    if event_type == "agent_message_chunk":
-                        text = update.get("content", {}).get("text", "")
-                        if text:
-                            accumulated += text
+                # Codex app-server event vocabulary (per the protocol
+                # README at codex-rs/app-server/README.md):
+                #
+                #   - turn/start RESPONSE: matched by id, returns the
+                #     turn object. We acknowledge it but do not finish
+                #     here; the turn is still streaming.
+                #   - turn/started NOTIFICATION: opted out via
+                #     initialize.capabilities so it never arrives.
+                #   - item/started: full ThreadItem with type and id.
+                #     We only care about agentMessage items for the
+                #     conversational stream; other item types (reasoning,
+                #     commandExecution, fileChange, etc.) are logged at
+                #     DEBUG. We capture the agentMessage item id so
+                #     subsequent deltas can be tied back to the right
+                #     stream.
+                #   - item/agentMessage/delta: streaming text chunks.
+                #     Concatenate `delta` per itemId. Codex emits text
+                #     in roughly token-sized chunks.
+                #   - item/completed: authoritative final state of the
+                #     item. For agentMessage this carries the full
+                #     accumulated `text`; we trust this over our own
+                #     concatenation in case any delta was missed.
+                #   - turn/completed: terminal event. Carries turn
+                #     status (`completed` / `interrupted` / `failed`)
+                #     and an optional error payload on failure. This
+                #     is the signal to yield the final StreamEvent.
+                #   - error notification: mid-turn error; may precede
+                #     a failed turn/completed. We treat it as terminal.
+                method = msg.get("method")
+                if method == "item/started":
+                    item = msg.get("params", {}).get("item", {})
+                    log.debug("Codex: item/started type=%s id=%s", item.get("type"), item.get("id"))
+
+                elif method == "item/agentMessage/delta":
+                    delta_text = msg.get("params", {}).get("delta", "")
+                    if delta_text:
+                        accumulated += delta_text
+                        yield StreamEvent(text_so_far=accumulated)
+
+                elif method == "item/completed":
+                    item = msg.get("params", {}).get("item", {})
+                    if item.get("type") == "agentMessage":
+                        # Authoritative full text; trust it over our
+                        # delta-accumulation in case any delta was
+                        # missed or arrived out of order.
+                        final_text = item.get("text", "")
+                        if final_text and final_text != accumulated:
+                            accumulated = final_text
                             yield StreamEvent(text_so_far=accumulated)
                     else:
-                        # Unknown event - log and skip. Schema-drift
-                        # defense: a future codex version emitting a
-                        # new event type (e.g. tool_call_update) does
-                        # not break the conversational stream.
-                        log.debug("Codex: skipping session/update event=%s", event_type)
+                        log.debug("Codex: item/completed type=%s", item.get("type"))
 
-                # Final result for our prompt (has matching id)
-                elif msg.get("id") == prompt_id and "result" in msg:
-                    response = AgentResponse(
-                        success=True,
-                        text=accumulated,
-                        session_id=self._session_id,
-                        cost_usd=0.0,  # subscription auth; codex reports no per-call cost
-                        duration_ms=0,
-                    )
+                elif method == "turn/completed":
+                    turn = msg.get("params", {}).get("turn", {})
+                    status = turn.get("status")
+                    if status == "completed":
+                        yield StreamEvent(
+                            text_so_far=accumulated,
+                            done=True,
+                            response=AgentResponse(
+                                success=True,
+                                text=accumulated,
+                                session_id=self._session_id,
+                                cost_usd=0.0,
+                                duration_ms=0,
+                            ),
+                        )
+                        return
+                    # Non-completed terminal: interrupted or failed.
+                    # turn.error carries the diagnostic when present.
+                    err_obj = turn.get("error") or {}
+                    err_msg = err_obj.get("message") or f"Codex turn ended with status={status}"
                     yield StreamEvent(
                         text_so_far=accumulated,
                         done=True,
-                        response=response,
+                        response=AgentResponse(
+                            success=False,
+                            text=accumulated,
+                            error=err_msg,
+                        ),
                     )
                     return
 
-                # JSON-RPC error for our prompt
+                elif method == "error":
+                    # Mid-turn error notification. Treat as terminal;
+                    # the subsequent turn/completed with status=failed
+                    # would be redundant.
+                    err_obj = msg.get("params", {}).get("error", {})
+                    err_msg = err_obj.get("message") or "Codex error"
+                    yield StreamEvent(
+                        text_so_far=accumulated,
+                        done=True,
+                        response=AgentResponse(
+                            success=False,
+                            text=accumulated,
+                            error=err_msg,
+                        ),
+                    )
+                    return
+
+                # Response to our turn/start (id-matched). The result
+                # carries the initial turn object; we acknowledge it
+                # but the stream continues until turn/completed.
+                elif msg.get("id") == prompt_id and "result" in msg:
+                    log.debug("Codex: turn/start acknowledged for id=%s", prompt_id)
+
+                # JSON-RPC error matched on our turn/start id - request
+                # never made it to streaming, so finish here.
                 elif msg.get("id") == prompt_id and "error" in msg:
                     err = msg["error"].get("message", "unknown codex error")
                     yield StreamEvent(
@@ -656,9 +780,15 @@ class CodexBackend(AgentBackend):
                     return
 
                 else:
-                    # Unknown top-level message shape. Schema-drift
-                    # defense: log and skip rather than abort.
-                    log.debug("Codex: skipping unrecognized message id=%s method=%s", msg.get("id"), msg.get("method"))
+                    # Unknown method or unmatched id. Schema-drift
+                    # defense: a new codex release adding extra
+                    # notification types must not break the
+                    # conversational stream.
+                    log.debug(
+                        "Codex: skipping unrecognized message id=%s method=%s",
+                        msg.get("id"),
+                        method,
+                    )
 
         except Exception as e:
             log.exception("Unexpected error reading Codex stream")

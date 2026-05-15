@@ -66,64 +66,90 @@ def _initialize_result() -> bytes:
     )
 
 
-def _session_new_result(session_id: str = "codex-session-1") -> bytes:
-    """Build the server's response to a session/new request."""
+def _thread_start_result(thread_id: str = "codex-thread-1") -> bytes:
+    """Build the server's response to a thread/start request."""
     return _json_line(
         {
             "jsonrpc": "2.0",
             "id": 2,
-            "result": {"sessionId": session_id},
-        }
-    )
-
-
-def _agent_message_chunk(text: str, session_id: str = "codex-session-1") -> bytes:
-    """
-    Build a session/update notification carrying an agent_message_chunk.
-
-    Schema mirrors goose ACP. The pinned codex CLI version's actual
-    event names may differ; the schema-drift defense in the parser
-    treats unknown event types as skip-and-log, not as errors.
-    """
-    return _json_line(
-        {
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": text},
+            "result": {
+                "thread": {
+                    "id": thread_id,
+                    "sessionId": thread_id,
+                    "modelProvider": "openai",
+                    "cwd": "/tmp/test-workspace",
                 },
+                "model": "gpt-5.4-mini",
             },
         }
     )
 
 
-def _unknown_event(event_name: str, session_id: str = "codex-session-1") -> bytes:
-    """Build a session/update with a deliberately unrecognized event type."""
+def _agent_message_delta(text: str, item_id: str = "item-1") -> bytes:
+    """Build an item/agentMessage/delta notification (streaming text chunk)."""
     return _json_line(
         {
             "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": event_name,
-                    "content": {"type": "text", "text": "should be ignored"},
-                },
-            },
+            "method": "item/agentMessage/delta",
+            "params": {"itemId": item_id, "delta": text},
         }
     )
 
 
-def _completion_result(prompt_id: int = 3) -> bytes:
-    """Build a completion result for the given prompt id."""
+def _item_started_agent(item_id: str = "item-1") -> bytes:
+    """Build an item/started notification for an agentMessage item."""
+    return _json_line(
+        {
+            "jsonrpc": "2.0",
+            "method": "item/started",
+            "params": {"item": {"id": item_id, "type": "agentMessage", "text": ""}},
+        }
+    )
+
+
+def _item_completed_agent(text: str, item_id: str = "item-1") -> bytes:
+    """Build an item/completed notification for an agentMessage item."""
+    return _json_line(
+        {
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {"item": {"id": item_id, "type": "agentMessage", "text": text}},
+        }
+    )
+
+
+def _unknown_event(method_name: str) -> bytes:
+    """Build a deliberately unrecognized notification."""
+    return _json_line(
+        {
+            "jsonrpc": "2.0",
+            "method": method_name,
+            "params": {"foo": "bar"},
+        }
+    )
+
+
+def _turn_completed(status: str = "completed", error_msg: str | None = None) -> bytes:
+    """Build a terminal turn/completed notification."""
+    turn: dict = {"id": "turn-1", "status": status, "items": []}
+    if error_msg is not None:
+        turn["error"] = {"message": error_msg}
+    return _json_line(
+        {
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {"turn": turn},
+        }
+    )
+
+
+def _turn_start_ack(prompt_id: int = 3) -> bytes:
+    """Build the JSON-RPC response to a turn/start (acknowledgement, not terminal)."""
     return _json_line(
         {
             "jsonrpc": "2.0",
             "id": prompt_id,
-            "result": {"stopReason": "end_turn"},
+            "result": {"turn": {"id": "turn-1", "status": "inProgress", "items": [], "error": None}},
         }
     )
 
@@ -157,9 +183,15 @@ def _make_mock_proc(stdout_lines: list[bytes]) -> MagicMock:
     return proc
 
 
-def _handshake_lines(session_id: str = "codex-session-1") -> list[bytes]:
-    """Return the two stdout lines for a successful handshake."""
-    return [_initialize_result(), _session_new_result(session_id)]
+def _handshake_lines(thread_id: str = "codex-thread-1") -> list[bytes]:
+    """Return the two stdout lines for a successful handshake.
+
+    The codex app-server handshake is:
+      1. client `initialize` -> server response (id=1)
+      2. client `initialized` notification (no response)
+      3. client `thread/start` -> server response (id=2)
+    """
+    return [_initialize_result(), _thread_start_result(thread_id)]
 
 
 async def _collect_events(c: CodexBackend, prompt: str | list = "test") -> list[StreamEvent]:
@@ -277,11 +309,11 @@ class TestProperties:
 
 
 class TestHandshake:
-    """Verify _ensure_started() runs the initialize + session/new handshake."""
+    """Verify _ensure_started() runs the initialize + initialized + thread/start handshake."""
 
     @pytest.mark.asyncio
     async def test_successful_handshake(self):
-        """Handshake sets _session_id from session/new result."""
+        """Handshake sets _session_id from thread/start result.thread.id."""
         c = _make_codex()
         proc = _make_mock_proc(_handshake_lines("test-codex-42"))
 
@@ -292,19 +324,33 @@ class TestHandshake:
         assert c._fresh_session is True
         assert c.is_alive is True
 
-        # Verify the two handshake messages were written
+        # Three stdin writes: initialize (request), initialized
+        # (notification, no id), thread/start (request).
         writes = proc.stdin.write.call_args_list
-        assert len(writes) == 2
+        assert len(writes) == 3
 
         init_msg = json.loads(writes[0][0][0].decode())
         assert init_msg["method"] == "initialize"
         assert init_msg["id"] == 1
         assert init_msg["params"]["clientInfo"]["name"] == "kai"
+        # protocolVersion must NOT be sent; the field is not part of
+        # the codex app-server initialize schema.
+        assert "protocolVersion" not in init_msg["params"]
+        # opt-out list ships in capabilities to suppress noisy
+        # notifications we never consume.
+        opt_out = init_msg["params"]["capabilities"]["optOutNotificationMethods"]
+        assert "remoteControl/status/changed" in opt_out
+        assert "mcpServer/startupStatus/updated" in opt_out
 
-        session_msg = json.loads(writes[1][0][0].decode())
-        assert session_msg["method"] == "session/new"
-        assert session_msg["id"] == 2
-        assert session_msg["params"]["cwd"] == "/tmp/test-workspace"
+        initialized_msg = json.loads(writes[1][0][0].decode())
+        assert initialized_msg["method"] == "initialized"
+        assert "id" not in initialized_msg  # Notifications carry no id.
+
+        thread_msg = json.loads(writes[2][0][0].decode())
+        assert thread_msg["method"] == "thread/start"
+        assert thread_msg["id"] == 2
+        assert thread_msg["params"]["cwd"] == "/tmp/test-workspace"
+        assert thread_msg["params"]["model"] == "gpt-5.4"
 
     @pytest.mark.asyncio
     async def test_argv_invokes_codex_app_server(self):
@@ -366,53 +412,29 @@ class TestHandshake:
             await c._ensure_started()
 
     @pytest.mark.asyncio
-    async def test_handshake_missing_session_id_raises(self):
+    async def test_handshake_missing_thread_id_raises(self):
         """
-        session/new without a recognizable session-id key raises
-        RuntimeError at the handshake boundary.
-
-        A silent None session_id would otherwise flow into the next
-        session/prompt as `"sessionId": None`, producing a confusing
-        downstream prompt error instead of a clear handshake mismatch.
-        Fail loudly at the schema boundary.
+        thread/start without a thread.id raises RuntimeError at the
+        handshake boundary. A silent None thread_id would otherwise
+        flow into turn/start as `"threadId": None`, producing a
+        confusing downstream error instead of a clear handshake
+        mismatch. Fail loudly at the schema boundary.
         """
-        bad_session_result = _json_line(
+        bad_thread_result = _json_line(
             {
                 "jsonrpc": "2.0",
                 "id": 2,
-                "result": {"someOtherKey": "value"},
+                "result": {"thread": {"sessionId": "no-id-here"}},
             }
         )
-        proc = _make_mock_proc([_initialize_result(), bad_session_result])
+        proc = _make_mock_proc([_initialize_result(), bad_thread_result])
         c = _make_codex()
 
         with (
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
-            pytest.raises(RuntimeError, match="no session id"),
+            pytest.raises(RuntimeError, match=r"no thread\.id"),
         ):
             await c._ensure_started()
-
-    @pytest.mark.asyncio
-    async def test_handshake_accepts_snake_case_session_id(self):
-        """
-        session/new result with `session_id` (snake_case) is accepted
-        alongside camelCase `sessionId`. Tolerates codex CLI schema
-        variants observed across versions.
-        """
-        snake_case_result = _json_line(
-            {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "result": {"session_id": "snake-case-session"},
-            }
-        )
-        proc = _make_mock_proc([_initialize_result(), snake_case_result])
-        c = _make_codex()
-
-        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
-            await c._ensure_started()
-
-        assert c._session_id == "snake-case-session"
 
     @pytest.mark.asyncio
     async def test_model_env_var_set(self):
@@ -474,9 +496,9 @@ class TestStreamParsing:
         c = _make_codex()
         c._proc = _make_mock_proc(
             [
-                _agent_message_chunk("Hello"),
-                _agent_message_chunk(" world"),
-                _completion_result(prompt_id=3),
+                _agent_message_delta("Hello"),
+                _agent_message_delta(" world"),
+                _turn_completed("completed"),
             ]
         )
         c._session_id = "test-session"
@@ -506,8 +528,8 @@ class TestStreamParsing:
         c._proc = _make_mock_proc(
             [
                 _unknown_event("future.unknown.thing"),
-                _agent_message_chunk("real text"),
-                _completion_result(prompt_id=3),
+                _agent_message_delta("real text"),
+                _turn_completed("completed"),
             ]
         )
         c._session_id = "test-session"
@@ -529,8 +551,8 @@ class TestStreamParsing:
         c._proc = _make_mock_proc(
             [
                 b"some random output\n",
-                _agent_message_chunk("hello"),
-                _completion_result(prompt_id=3),
+                _agent_message_delta("hello"),
+                _turn_completed("completed"),
             ]
         )
         c._session_id = "test-session"
@@ -568,8 +590,8 @@ class TestStreamParsing:
         c._proc = _make_mock_proc(
             [
                 weird_event,
-                _agent_message_chunk("real"),
-                _completion_result(prompt_id=3),
+                _agent_message_delta("real"),
+                _turn_completed("completed"),
             ]
         )
         c._session_id = "test-session"
@@ -593,8 +615,8 @@ class TestCompletion:
         c = _make_codex()
         c._proc = _make_mock_proc(
             [
-                _agent_message_chunk("answer"),
-                _completion_result(prompt_id=3),
+                _agent_message_delta("answer"),
+                _turn_completed("completed"),
             ]
         )
         c._session_id = "test-session"
@@ -617,7 +639,7 @@ class TestCompletion:
         c = _make_codex()
         c._proc = _make_mock_proc(
             [
-                _agent_message_chunk("partial"),
+                _agent_message_delta("partial"),
                 b"",  # EOF
             ]
         )
@@ -677,7 +699,7 @@ class TestRpcError:
         c = _make_codex()
         c._proc = _make_mock_proc(
             [
-                _agent_message_chunk("partial"),
+                _agent_message_delta("partial"),
                 _error_result(prompt_id=3, message="cut off"),
             ]
         )
@@ -710,8 +732,8 @@ class TestContextInjection:
         )
         c._proc = _make_mock_proc(
             [
-                _agent_message_chunk("ok"),
-                _completion_result(prompt_id=3),
+                _agent_message_delta("ok"),
+                _turn_completed("completed"),
             ]
         )
         c._session_id = "test-session"
@@ -723,7 +745,7 @@ class TestContextInjection:
 
         write_calls = c._proc.stdin.write.call_args_list
         prompt_msg = json.loads(write_calls[-1][0][0].decode())
-        prompt_text = prompt_msg["params"]["prompt"][0]["text"]
+        prompt_text = prompt_msg["params"]["input"][0]["text"]
         assert prompt_text.startswith("[CONTEXT]")
         assert "hello" in prompt_text
 
@@ -733,8 +755,8 @@ class TestContextInjection:
         c = _make_codex(workspace=Path("/tmp/ws"), home_workspace=Path("/tmp/ws"))
         c._proc = _make_mock_proc(
             [
-                _agent_message_chunk("ok"),
-                _completion_result(prompt_id=3),
+                _agent_message_delta("ok"),
+                _turn_completed("completed"),
             ]
         )
         c._session_id = "test-session"
@@ -757,7 +779,7 @@ class TestPromptCoercion:
     async def test_string_prompt(self):
         """A string prompt becomes a single text block."""
         c = _make_codex()
-        c._proc = _make_mock_proc([_agent_message_chunk("ok"), _completion_result(prompt_id=3)])
+        c._proc = _make_mock_proc([_agent_message_delta("ok"), _turn_completed("completed")])
         c._session_id = "test-session"
         c._fresh_session = False
         c._next_id = 3
@@ -766,13 +788,13 @@ class TestPromptCoercion:
 
         write_calls = c._proc.stdin.write.call_args_list
         prompt_msg = json.loads(write_calls[-1][0][0].decode())
-        assert prompt_msg["params"]["prompt"] == [{"type": "text", "text": "hello"}]
+        assert prompt_msg["params"]["input"] == [{"type": "text", "text": "hello"}]
 
     @pytest.mark.asyncio
     async def test_list_prompt_text_only(self):
         """A list of text blocks passes through unchanged."""
         c = _make_codex()
-        c._proc = _make_mock_proc([_agent_message_chunk("ok"), _completion_result(prompt_id=3)])
+        c._proc = _make_mock_proc([_agent_message_delta("ok"), _turn_completed("completed")])
         c._session_id = "test-session"
         c._fresh_session = False
         c._next_id = 3
@@ -782,13 +804,13 @@ class TestPromptCoercion:
 
         write_calls = c._proc.stdin.write.call_args_list
         prompt_msg = json.loads(write_calls[-1][0][0].decode())
-        assert prompt_msg["params"]["prompt"] == blocks
+        assert prompt_msg["params"]["input"] == blocks
 
     @pytest.mark.asyncio
     async def test_list_prompt_drops_non_text_blocks(self):
         """Non-text blocks are dropped with a warning; text blocks preserved."""
         c = _make_codex()
-        c._proc = _make_mock_proc([_agent_message_chunk("ok"), _completion_result(prompt_id=3)])
+        c._proc = _make_mock_proc([_agent_message_delta("ok"), _turn_completed("completed")])
         c._session_id = "test-session"
         c._fresh_session = False
         c._next_id = 3
@@ -802,13 +824,13 @@ class TestPromptCoercion:
         write_calls = c._proc.stdin.write.call_args_list
         prompt_msg = json.loads(write_calls[-1][0][0].decode())
         # Image block dropped; text block kept
-        assert prompt_msg["params"]["prompt"] == [{"type": "text", "text": "keep"}]
+        assert prompt_msg["params"]["input"] == [{"type": "text", "text": "keep"}]
 
     @pytest.mark.asyncio
     async def test_empty_list_prompt_synthesizes_placeholder(self):
         """An all-non-text list yields a single placeholder text block."""
         c = _make_codex()
-        c._proc = _make_mock_proc([_agent_message_chunk("ok"), _completion_result(prompt_id=3)])
+        c._proc = _make_mock_proc([_agent_message_delta("ok"), _turn_completed("completed")])
         c._session_id = "test-session"
         c._fresh_session = False
         c._next_id = 3
@@ -818,7 +840,7 @@ class TestPromptCoercion:
 
         write_calls = c._proc.stdin.write.call_args_list
         prompt_msg = json.loads(write_calls[-1][0][0].decode())
-        assert prompt_msg["params"]["prompt"] == [{"type": "text", "text": "(empty prompt)"}]
+        assert prompt_msg["params"]["input"] == [{"type": "text", "text": "(empty prompt)"}]
 
 
 # ── Restart / force_kill / shutdown / change_workspace ────────────
@@ -960,7 +982,7 @@ class TestSendLock:
     async def test_lock_serializes_sends(self):
         """The lock is held across the entire send() generator."""
         c = _make_codex()
-        c._proc = _make_mock_proc([_agent_message_chunk("first"), _completion_result(prompt_id=3)])
+        c._proc = _make_mock_proc([_agent_message_delta("first"), _turn_completed("completed")])
         c._session_id = "test-session"
         c._fresh_session = False
         c._next_id = 3

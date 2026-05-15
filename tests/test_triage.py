@@ -664,19 +664,19 @@ class TestRunTriageCodex:
     @staticmethod
     def _codex_ndjson(text: str) -> str:
         """
-        Build a minimal NDJSON stream that _extract_codex_text resolves
-        to the given final text. Uses the "content" list-of-blocks
-        shape (the JSON-RPC convention goose ACP uses) since the
-        actual codex schema is not yet pinned.
+        Build a minimal NDJSON stream that mirrors the real
+        `codex exec --json` schema (codex-rs/exec/src/exec_events.rs):
+        each event has a top-level `type` tag; item.completed for an
+        agent_message item carries the full consolidated `text`.
         """
         events = [
-            {"event": "thread.started"},
-            {"event": "turn.started"},
+            {"type": "thread.started", "thread_id": "thr_test"},
+            {"type": "turn.started"},
             {
-                "event": "item.message.completed",
-                "content": [{"type": "text", "text": text}],
+                "type": "item.completed",
+                "item": {"id": "item_1", "type": "agent_message", "text": text},
             },
-            {"event": "turn.completed"},
+            {"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}},
         ]
         return "\n".join(json.dumps(e) for e in events) + "\n"
 
@@ -811,32 +811,35 @@ class TestRunTriageCodex:
             await run_triage("prompt", agent_backend="codex")
 
     @pytest.mark.asyncio
-    async def test_codex_handles_streaming_deltas_plus_terminal(self):
+    async def test_codex_completed_supersedes_updated(self):
         """
         End-to-end through run_triage: a stream that contains both
-        delta chunks AND a terminal consolidated message returns the
-        terminal JSON exactly once, parseable by _parse_triage_json.
+        item.updated events (interim consolidated text) AND a final
+        item.completed returns the completed text exactly once,
+        parseable by _parse_triage_json.
 
-        This is the integration counterpart to
-        TestExtractCodexText::test_terminal_text_wins_over_accumulated_deltas.
-        Without the terminal-wins rule, the triage path would return
-        a doubled JSON string (`{"labels":[]}{"labels":[]}`) and the
-        downstream parser would fail on every codex run that streams.
+        Without the completed-wins rule, the triage path could
+        accumulate or return stale interim text and the downstream
+        parser would fail on every codex run that streams.
         """
         expected_json = '{"labels": ["bug"], "summary": "ok"}'
         events = [
-            {"event": "delta", "delta": {"text": '{"labels":'}},
-            {"event": "delta", "delta": {"text": ' ["bug"], "summary": "ok"}'}},
+            {"type": "thread.started", "thread_id": "thr_test"},
+            {"type": "turn.started"},
+            {"type": "item.started", "item": {"id": "i1", "type": "agent_message", "text": ""}},
+            {"type": "item.updated", "item": {"id": "i1", "type": "agent_message", "text": '{"labels":'}},
             {
-                "event": "item.message.completed",
-                "item": {"content": [{"type": "text", "text": expected_json}]},
+                "type": "item.updated",
+                "item": {"id": "i1", "type": "agent_message", "text": '{"labels": ["bug"], "summa'},
             },
+            {"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": expected_json}},
+            {"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}},
         ]
         stream = "\n".join(json.dumps(e) for e in events) + "\n"
         mock_proc = _mock_subprocess(stdout=stream)
         with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc):
             result = await run_triage("prompt", agent_backend="codex")
-        # Exactly the terminal JSON, not deltas + terminal concatenated.
+        # Exactly the completed text, not interim updates concatenated.
         assert result == expected_json
 
 
@@ -844,11 +847,11 @@ class TestExtractCodexText:
     """
     Unit tests for the _extract_codex_text NDJSON parser.
 
-    The codex CLI schema is not yet pinned by smoke test; the parser
-    accepts multiple field paths (top-level "text"; "content" as
-    string or list-of-blocks; "delta.text"; "item.content") so a
-    schema variant the docs do not describe still yields the agent
-    message. These tests lock each path independently.
+    The codex exec --json schema (codex-rs/exec/src/exec_events.rs):
+    each event has top-level `type` discriminator; agent_message
+    items carry their full text in `item.text`. item.completed is
+    authoritative; item.updated is interim. turn.failed terminates
+    extraction with an empty result.
     """
 
     def test_empty_input(self):
@@ -857,110 +860,74 @@ class TestExtractCodexText:
 
     def test_skips_non_json_lines(self):
         """Non-JSON lines are silently skipped."""
-        stream = "not-json\n" + json.dumps({"text": "hello"}) + "\n"
+        valid = json.dumps({"type": "item.completed", "item": {"id": "i", "type": "agent_message", "text": "hello"}})
+        stream = "not-json\n" + valid + "\n"
         assert _extract_codex_text(stream) == "hello"
 
-    def test_extracts_top_level_text(self):
-        """Events with a top-level 'text' field contribute that string."""
-        stream = json.dumps({"event": "delta", "text": "abc"}) + "\n"
-        assert _extract_codex_text(stream) == "abc"
-
-    def test_extracts_delta_text(self):
-        """Events with 'delta.text' (alternate streaming shape) work."""
-        stream = json.dumps({"event": "delta", "delta": {"text": "abc"}}) + "\n"
-        assert _extract_codex_text(stream) == "abc"
-
-    def test_extracts_content_string(self):
-        """Events with 'content' as a string contribute that string."""
-        stream = json.dumps({"event": "msg", "content": "hello"}) + "\n"
+    def test_extracts_item_completed_agent_message(self):
+        """item.completed for an agent_message returns item.text."""
+        event = {"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": "hello"}}
+        stream = json.dumps(event) + "\n"
         assert _extract_codex_text(stream) == "hello"
 
-    def test_extracts_content_list_of_text_blocks(self):
-        """Events with 'content' as a list of {type:text, text:...} blocks work."""
-        event = {
-            "event": "msg",
-            "content": [
-                {"type": "text", "text": "part-A"},
-                {"type": "text", "text": " part-B"},
-            ],
-        }
+    def test_ignores_non_agent_message_items(self):
+        """item.completed for non-agent_message items (e.g. reasoning) contributes nothing."""
+        event = {"type": "item.completed", "item": {"id": "i1", "type": "reasoning", "text": "thinking..."}}
         stream = json.dumps(event) + "\n"
-        assert _extract_codex_text(stream) == "part-A part-B"
-
-    def test_extracts_item_content(self):
-        """Events with text inside 'item.content[...]' work."""
-        event = {"event": "item.message.completed", "item": {"content": [{"type": "text", "text": "from item"}]}}
-        stream = json.dumps(event) + "\n"
-        assert _extract_codex_text(stream) == "from item"
-
-    def test_ignores_unknown_event_types(self):
-        """An event with no recognizable text payload contributes nothing."""
-        stream = json.dumps({"event": "thread.started", "metadata": {"foo": "bar"}}) + "\n"
         assert _extract_codex_text(stream) == ""
 
-    def test_accumulates_across_events(self):
-        """Text from multiple events accumulates in order."""
+    def test_ignores_lifecycle_events(self):
+        """thread.started, turn.started, turn.completed contribute nothing."""
         events = [
-            {"event": "delta", "text": "Hello"},
-            {"event": "delta", "text": " "},
-            {"event": "delta", "text": "world"},
+            {"type": "thread.started", "thread_id": "thr_1"},
+            {"type": "turn.started"},
+            {"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}},
         ]
         stream = "\n".join(json.dumps(e) for e in events) + "\n"
-        assert _extract_codex_text(stream) == "Hello world"
+        assert _extract_codex_text(stream) == ""
 
     def test_strips_outer_whitespace(self):
         """The accumulated result has leading/trailing whitespace stripped."""
-        stream = json.dumps({"text": "  hello  "}) + "\n"
+        event = {"type": "item.completed", "item": {"id": "i", "type": "agent_message", "text": "  hello  "}}
+        stream = json.dumps(event) + "\n"
         assert _extract_codex_text(stream) == "hello"
 
-    def test_terminal_text_wins_over_accumulated_deltas(self):
-        """
-        A stream with both delta chunks and a terminal consolidated
-        message returns the terminal text exactly once, NOT the
-        deltas concatenated with the terminal.
-
-        Without the terminal-wins rule, the parser would yield
-        `"HelloHello"` for the worked example below: triage's JSON
-        parser then fails because `{"labels":[]}{"labels":[]}` is
-        not a single JSON object, breaking the triage path on
-        every codex run that streams. This regression guard
-        protects against a future refactor that re-introduces
-        accumulate-across-representations.
-        """
+    def test_completed_wins_over_updated(self):
+        """item.completed text supersedes any earlier item.updated text."""
         events = [
-            {"event": "delta", "delta": {"text": "Hel"}},
-            {"event": "delta", "delta": {"text": "lo"}},
-            {"event": "item.message.completed", "item": {"content": [{"type": "text", "text": "Hello"}]}},
+            {"type": "item.updated", "item": {"id": "i", "type": "agent_message", "text": "partial"}},
+            {"type": "item.updated", "item": {"id": "i", "type": "agent_message", "text": "partial more"}},
+            {"type": "item.completed", "item": {"id": "i", "type": "agent_message", "text": "FINAL"}},
         ]
         stream = "\n".join(json.dumps(e) for e in events) + "\n"
-        assert _extract_codex_text(stream) == "Hello"
+        assert _extract_codex_text(stream) == "FINAL"
 
-    def test_last_terminal_wins_on_multiple_terminals(self):
-        """
-        When a stream emits more than one terminal/complete event
-        (e.g. an interim consolidated text followed by a final one),
-        the most recent terminal text wins. Mirrors the streaming
-        convention that "completed" supersedes prior partials.
-        """
+    def test_last_completed_wins(self):
+        """Multiple item.completed events (rare): last one wins."""
         events = [
-            {"item": {"content": [{"type": "text", "text": "first"}]}},
-            {"item": {"content": [{"type": "text", "text": "final"}]}},
+            {"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": "first"}},
+            {"type": "item.completed", "item": {"id": "i2", "type": "agent_message", "text": "second"}},
         ]
         stream = "\n".join(json.dumps(e) for e in events) + "\n"
-        assert _extract_codex_text(stream) == "final"
+        assert _extract_codex_text(stream) == "second"
 
-    def test_deltas_only_when_no_terminal(self):
-        """
-        With no terminal event, delta chunks accumulate as the result.
-        Locks the fallback behavior the terminal-wins rule does not
-        short-circuit when no terminal text was emitted.
-        """
+    def test_updated_fallback_when_no_completed(self):
+        """If only item.updated events arrive (truncated stream), use the latest one."""
         events = [
-            {"event": "delta", "delta": {"text": "Hel"}},
-            {"event": "delta", "delta": {"text": "lo"}},
+            {"type": "item.updated", "item": {"id": "i", "type": "agent_message", "text": "first"}},
+            {"type": "item.updated", "item": {"id": "i", "type": "agent_message", "text": "second"}},
         ]
         stream = "\n".join(json.dumps(e) for e in events) + "\n"
-        assert _extract_codex_text(stream) == "Hello"
+        assert _extract_codex_text(stream) == "second"
+
+    def test_turn_failed_short_circuits(self):
+        """A turn.failed event terminates extraction with the empty string."""
+        events = [
+            {"type": "item.completed", "item": {"id": "i", "type": "agent_message", "text": "ignored"}},
+            {"type": "turn.failed", "error": {"message": "model unavailable"}},
+        ]
+        stream = "\n".join(json.dumps(e) for e in events) + "\n"
+        assert _extract_codex_text(stream) == ""
 
 
 class TestResolveGooseModelTriage:
