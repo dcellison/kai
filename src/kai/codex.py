@@ -362,7 +362,7 @@ class CodexBackend(AgentBackend):
         thread_params: dict = {
             "cwd": str(self.workspace),
             "approvalPolicy": "never",
-            "sandbox": "workspaceWrite",
+            "sandbox": "workspace-write",
         }
         if self.model:
             thread_params["model"] = self.model
