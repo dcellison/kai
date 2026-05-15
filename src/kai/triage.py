@@ -413,6 +413,58 @@ async def run_triage(
     Raises:
         RuntimeError: If the subprocess fails or times out.
     """
+    if agent_backend == "codex":
+        # Codex one-shot mode: --json emits NDJSON events on stdout
+        # (thread.started, turn.started, item.*, turn.completed, error).
+        # The final agent message text is recovered by walking the
+        # events and accumulating any text content; see
+        # _extract_codex_text() below for the schema-defensive parser.
+        # No sudo: codex on subscription auth uses the service user's
+        # own ~/.codex/auth.json; per-user OAuth isolation is the
+        # os_user lever in users.yaml (post-#353), not a sudo wrap.
+        # No --max-budget-usd: codex on subscription auth has no
+        # per-call billing; runaway protection comes from
+        # _TRIAGE_TIMEOUT at the asyncio.wait_for below.
+        triage_model = get_model_for(
+            ModelRole.ISSUE_TRIAGE,
+            agent_backend,
+            override=os.environ.get("ISSUE_TRIAGE_MODEL_CODEX", ""),
+        )
+        cmd = [
+            "codex",
+            "exec",
+            "--json",
+            "--model",
+            triage_model,
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=prompt.encode()),
+                timeout=_TRIAGE_TIMEOUT,
+            )
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from None
+
+        if proc.returncode != 0:
+            error = stderr.decode().strip()
+            raise RuntimeError(f"Triage subprocess failed (exit {proc.returncode}): {error}")
+
+        # Codex emits NDJSON; extract the final agent message text and
+        # return it (mirrors the contract the claude / goose branches
+        # already satisfy: a single string the caller hands to
+        # _parse_triage_json).
+        return _extract_codex_text(stdout.decode())
+
     if agent_backend == "goose":
         if not provider:
             raise ValueError(
@@ -535,6 +587,92 @@ async def run_triage(
         raise RuntimeError(f"Triage subprocess failed (exit {proc.returncode}): {error}")
 
     return stdout.decode().strip()
+
+
+def _extract_codex_text(stdout: str) -> str:
+    """
+    Walk codex's NDJSON event stream and return the agent message text.
+
+    `codex exec --json` emits one JSON event per line. The relevant
+    payload (the agent's final response) lives inside an item event;
+    the exact event name and field path are not yet pinned by smoke
+    test, so this parser is defensive about field names:
+
+    - Each line is attempted as JSON; non-JSON lines are skipped.
+    - Within each parsed object, text content is recovered from any
+      of: top-level "text"; "content" as a string; "content" as a
+      list of {"type": "text", "text": ...} blocks (the JSON-RPC
+      convention used by goose ACP); "delta.text"; "item.content"
+      with the same list shape.
+    - All recovered text is concatenated in order; partial recoveries
+      are returned rather than raising, on the assumption that the
+      caller's JSON parser will surface a clearer error if the
+      result is malformed.
+
+    The smoke test against a real codex CLI will reveal which of
+    these field paths actually fire for the pinned version; the
+    others remain as fallbacks for schema drift.
+
+    Args:
+        stdout: The full stdout from `codex exec --json`.
+
+    Returns:
+        The accumulated agent message text. Empty string if no
+        recognizable text content was found in any event.
+    """
+    chunks: list[str] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        chunks.extend(_recover_text_from_event(obj))
+    return "".join(chunks).strip()
+
+
+def _recover_text_from_event(obj: dict) -> list[str]:
+    """
+    Pull text content out of one codex NDJSON event.
+
+    Defensive: tries multiple field paths the codex CLI is observed
+    or documented to use, and returns whatever text it finds. An
+    event with no recognizable text payload contributes nothing.
+    """
+    out: list[str] = []
+    # Top-level text field (common shape for "delta" events)
+    text = obj.get("text")
+    if isinstance(text, str):
+        out.append(text)
+    # delta.text (alternate streaming shape)
+    delta = obj.get("delta")
+    if isinstance(delta, dict):
+        d_text = delta.get("text")
+        if isinstance(d_text, str):
+            out.append(d_text)
+    # content as a string OR as a list of {type: text, text: ...} blocks
+    content = obj.get("content")
+    if isinstance(content, str):
+        out.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                b_text = block.get("text")
+                if isinstance(b_text, str):
+                    out.append(b_text)
+    # item.content for events wrapped in an "item" object
+    item = obj.get("item")
+    if isinstance(item, dict):
+        i_content = item.get("content")
+        if isinstance(i_content, list):
+            for block in i_content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    b_text = block.get("text")
+                    if isinstance(b_text, str):
+                        out.append(b_text)
+    return out
 
 
 def _parse_triage_json(raw: str) -> dict:
