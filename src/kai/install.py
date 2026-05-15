@@ -895,6 +895,14 @@ def _cmd_config() -> None:
         print("  Semantic memory currently requires the claude backend.")
         print("  Disabling semantic memory for this codex install.")
         memory_enabled = False
+        # Zero memory_extraction_enabled explicitly here too. The
+        # unconditional `memory_extraction_enabled = False` a few lines
+        # down also covers this case, but a future refactor that moves
+        # or reorders the extraction prompt could silently reintroduce
+        # the exact bug the spec hardened against over multiple review
+        # rounds. The explicit assignment makes the guard refactor-safe
+        # and matches the comment's "force both flags off" claim.
+        memory_extraction_enabled = False
     # Defaults match the dataclass values in config.py. Only non-defaults
     # (or memory_enabled=true itself) are written to the env dict below.
     memory_extraction_enabled = False

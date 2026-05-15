@@ -2281,6 +2281,39 @@ class TestCmdConfigDefaultModelDispatch:
         ]
 
     @staticmethod
+    def _inputs_for_codex_subscription(memory_enabled: str = "false") -> list[str]:
+        """
+        Input chain for the users_yaml_exists=True + codex+subscription path.
+
+        Codex bypasses the legacy provider/key block (VALID_PROVIDERS["codex"]
+        is intentionally absent), so no llm_provider or API key prompts fire.
+        autocompact_pct and effort_level are claude-only and suppressed.
+        The codex auth-mode prompt is the new line vs the goose chain.
+        """
+        return [
+            "/opt/kai",  # install dir
+            "/var/lib/kai",  # data dir
+            "kai",  # service user
+            "darwin",  # platform
+            "fake-token",  # bot token
+            "polling",  # transport
+            "codex",  # agent backend
+            "subscription",  # codex auth mode
+            # No OPENAI_API_KEY prompt in subscription mode
+            # No llm_provider prompt (VALID_PROVIDERS["codex"] is None)
+            # No autocompact_pct / effort_level prompts (claude-only)
+            # Model prompt handled by the _prompt_default_model mock
+            "8080",  # webhook port
+            "test-secret",  # webhook secret
+            "900",  # pr review subprocess timeout
+            "1.0",  # pr review subprocess budget (non-claude only)
+            "false",  # voice
+            "false",  # tts
+            memory_enabled,  # memory enabled
+            "",  # perplexity key
+        ]
+
+    @staticmethod
     def _inputs_for_goose_openai() -> list[str]:
         """Input chain for the users_yaml_exists=True + goose+openai path."""
         return [
@@ -2416,6 +2449,50 @@ class TestCmdConfigDefaultModelDispatch:
         assert helper.call_args.args[1] == "gpt-5.4"
         assert helper.call_args.args[1] != "opus"
         assert env["DEFAULT_MODEL"] == "gpt-5.4-mini"
+
+    def test_codex_install_zeroes_both_memory_flags(self, tmp_path, monkeypatch):
+        """
+        Codex installs must force MEMORY_ENABLED=false AND
+        MEMORY_EXTRACTION_ENABLED=false. The Haiku extraction pipeline
+        bypasses the agent backend abstraction and shells out to
+        claude directly; running it on a codex-backed install would
+        either inject a [Memory subsystem: enabled] marker into the
+        inner codex agent's session context against a subsystem that
+        cannot service its requests, or attempt to spawn a claude
+        binary that may not be installed.
+
+        The operator says yes to "Enable semantic memory" at the
+        prompt; the guard catches it. Neither flag should appear in
+        the resulting install.conf env (codex emits memory keys only
+        when they are non-default, and both default to false).
+        """
+        # Seed install.conf with existing_env that has BOTH memory flags
+        # set to true. The guard's pre-check reads MEMORY_EXTRACTION_ENABLED
+        # before it can be zeroed by the unconditional reset later in the
+        # function, so the guard message fires.
+        self._setup(
+            monkeypatch,
+            tmp_path,
+            existing_env={
+                "DEFAULT_MODEL": "gpt-5.4",
+                "MEMORY_ENABLED": "true",
+                "MEMORY_EXTRACTION_ENABLED": "true",
+            },
+        )
+        _, env = self._run(
+            monkeypatch,
+            tmp_path,
+            # Operator answers "true" at the memory_enabled prompt; the
+            # guard overrides it. Without the guard, MEMORY_ENABLED=true
+            # would land in the resulting install.conf.
+            self._inputs_for_codex_subscription(memory_enabled="true"),
+            helper_return="gpt-5.4",
+        )
+        # Both memory keys must be absent from the emitted env (the
+        # emission code only writes them when true; the guard forced
+        # both flags false).
+        assert "MEMORY_ENABLED" not in env
+        assert "MEMORY_EXTRACTION_ENABLED" not in env
 
 
 class TestCmdApplyDefaultModelGate:

@@ -233,7 +233,20 @@ class CodexBackend(AgentBackend):
             },
         )
         result = await self._read_result(expected_id=2)
-        self._session_id = result.get("sessionId") or result.get("session_id")
+        # Accept either camelCase or snake_case to tolerate codex CLI
+        # schema variants observed across versions. Both absent is a
+        # loud failure: a None session_id would otherwise flow into
+        # the next session/prompt as "sessionId": None and surface as
+        # a confusing downstream prompt error rather than a clear
+        # handshake mismatch. Fail at the boundary instead.
+        session_id = result.get("sessionId") or result.get("session_id")
+        if not session_id:
+            raise RuntimeError(
+                "Codex session/new returned no session id "
+                "(expected 'sessionId' or 'session_id' in result); "
+                "pinned codex CLI schema may differ from this build."
+            )
+        self._session_id = session_id
         self._fresh_session = True
 
     async def _drain_stderr(self) -> None:

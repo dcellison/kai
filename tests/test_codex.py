@@ -365,6 +365,55 @@ class TestHandshake:
             await c._ensure_started()
 
     @pytest.mark.asyncio
+    async def test_handshake_missing_session_id_raises(self):
+        """
+        session/new without a recognizable session-id key raises
+        RuntimeError at the handshake boundary.
+
+        A silent None session_id would otherwise flow into the next
+        session/prompt as `"sessionId": None`, producing a confusing
+        downstream prompt error instead of a clear handshake mismatch.
+        Fail loudly at the schema boundary.
+        """
+        bad_session_result = _json_line(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"someOtherKey": "value"},
+            }
+        )
+        proc = _make_mock_proc([_initialize_result(), bad_session_result])
+        c = _make_codex()
+
+        with (
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(RuntimeError, match="no session id"),
+        ):
+            await c._ensure_started()
+
+    @pytest.mark.asyncio
+    async def test_handshake_accepts_snake_case_session_id(self):
+        """
+        session/new result with `session_id` (snake_case) is accepted
+        alongside camelCase `sessionId`. Tolerates codex CLI schema
+        variants observed across versions.
+        """
+        snake_case_result = _json_line(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"session_id": "snake-case-session"},
+            }
+        )
+        proc = _make_mock_proc([_initialize_result(), snake_case_result])
+        c = _make_codex()
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            await c._ensure_started()
+
+        assert c._session_id == "snake-case-session"
+
+    @pytest.mark.asyncio
     async def test_model_env_var_set(self):
         """CODEX_MODEL env var is set during startup."""
         c = _make_codex(model="gpt-5.4-mini")
