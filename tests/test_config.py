@@ -1973,6 +1973,36 @@ class TestModelRegistry:
         assert "pr_review" in str(excinfo.value)
         assert "claude" in str(excinfo.value)
 
+    def test_codex_row_must_be_in_codex_models(self, monkeypatch):
+        """
+        A codex registry row pointing at a model the codex CLI does not
+        expose (e.g. gpt-5.4-nano, kept in PROVIDER_MODELS["openai"] for
+        goose) must fail load_config-time. Without this guard the
+        per-user fix was silent: a future operator could re-introduce a
+        nano row in MODEL_REGISTRY because PROVIDER_MODELS still
+        accepts it for goose, and the codex behavioral path would fall
+        over at first invocation.
+        """
+        monkeypatch.setitem(MODEL_REGISTRY, ("codex", ModelRole.BEHAVIORAL_JUDGE), "gpt-5.4-nano")
+        with pytest.raises(SystemExit) as excinfo:
+            _check_model_registry_complete("codex")
+        msg = str(excinfo.value)
+        assert "gpt-5.4-nano" in msg
+        assert "behavioral_judge" in msg
+
+    def test_codex_behavioral_judge_is_valid_codex_model(self):
+        """
+        Lock the runtime invariant: whatever model the codex behavioral
+        judge resolves to MUST be a member of CODEX_MODELS. This is a
+        belt-and-braces check sitting next to the synthetic-corruption
+        test above; the registry row itself is the variable that
+        operators touch when calibrating, and a regression here is the
+        exact failure the synthetic test simulates.
+        """
+        from kai.config import CODEX_MODELS
+
+        assert MODEL_REGISTRY[("codex", ModelRole.BEHAVIORAL_JUDGE)] in CODEX_MODELS
+
     # ── Claude row equals prior constant (Phase 1 invariant) ──────
 
     def test_claude_pr_review_row_matches_prior_constant(self):

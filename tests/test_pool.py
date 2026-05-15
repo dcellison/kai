@@ -238,6 +238,39 @@ class TestPerUserBackendRouting:
             # "opus" is invalid for openai - should be ignored, model stays at gpt-5.4
             assert instance.model == "gpt-5.4"
 
+    def test_codex_user_on_claude_global_install_gets_codex_default(self):
+        """
+        Per-user `agent_backend: codex` on a globally-claude install
+        must NOT fall through to the global default_model ("sonnet"),
+        which codex CLI rejects. Without the
+        get_user_backend_and_provider routing in _create_instance,
+        effective_provider was "" for these users, the cascade
+        skipped the per-backend default branch, and the instance
+        ended up running codex with sonnet.
+        """
+        from kai.codex import CodexBackend
+
+        user = UserConfig(
+            telegram_id=111,
+            name="alice",
+            agent_backend="codex",
+            # NO llm_provider, NO model - tests the bare codex-override case.
+        )
+        # Globally-claude install (the failure surface from PR #489 review).
+        config = _make_config(
+            agent_backend="claude",
+            llm_provider="anthropic",
+            default_model="sonnet",
+            user_configs={111: user},
+        )
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+        # Routes to codex, not claude.
+        assert isinstance(instance, CodexBackend)
+        # And uses codex's own default, not the global "sonnet".
+        assert instance.model == "gpt-5.5"
+        assert instance.provider == "openai"
+
 
 # ── Per-user actions ────────────────────────────────────────────────
 
@@ -545,6 +578,67 @@ class TestWorkspaceRestoration:
         ):
             await pool._restore_workspace(111, pool.get(111))
             mock_delete.assert_called_once_with("workspace:111")
+
+    @pytest.mark.asyncio
+    async def test_rejected_workspace_model_does_not_block_db_model(self, tmp_path):
+        """
+        A workspaces.yaml override invalid for the active backend (e.g.
+        codex workspace pinning model=gpt-5.4-nano, which codex CLI
+        rejects) is dropped by apply_workspace_model() but the original
+        WorkspaceConfig object is still stored on instance.workspace_config
+        with the invalid model field. The precedence guard in
+        _restore_workspace must NOT treat that stored field as
+        "workspace model applied"; otherwise a perfectly valid per-user
+        DB model (gpt-5.4-mini) gets silently suppressed by a never-
+        applied workspace override. Re-validate ws_model against the
+        active backend before treating it as precedence-bearing.
+        """
+        from kai.codex import CodexBackend
+        from kai.config import WorkspaceConfig
+
+        # Workspace config pins gpt-5.4-nano, which is in PROVIDER_MODELS
+        # ["openai"] but NOT in CODEX_MODELS - codex CLI rejects it.
+        ws = (tmp_path / "ws").resolve()
+        ws.mkdir()
+        ws_config = WorkspaceConfig(path=ws, model="gpt-5.4-nano")
+        user = UserConfig(
+            telegram_id=111,
+            name="alice",
+            agent_backend="codex",
+            home_workspace=ws,
+        )
+        config = _make_config(
+            agent_backend="codex",
+            llm_provider="openai",
+            default_model="gpt-5.5",
+            user_configs={111: user},
+        )
+        # get_workspace_config resolves the lookup key, so the stored key
+        # must match what `.resolve()` returns.
+        config.workspace_configs[ws] = ws_config
+
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+        assert isinstance(instance, CodexBackend)
+        # apply_workspace_model rejected the nano override at __init__,
+        # so the instance kept the codex default. The WorkspaceConfig
+        # object still has model="gpt-5.4-nano" on it.
+        assert instance.model == "gpt-5.5"
+        assert instance.workspace_config is not None
+        assert instance.workspace_config.model == "gpt-5.4-nano"
+
+        # DB has a valid per-user model override: gpt-5.4-mini.
+        db_settings = {"model": "gpt-5.4-mini"}
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value=db_settings),
+            patch.object(instance, "restart", new_callable=AsyncMock) as mock_restart,
+        ):
+            await pool._restore_workspace(111, instance)
+            # The DB model wins because the workspace model was never
+            # actually applied (rejected by apply_workspace_model).
+            assert instance.model == "gpt-5.4-mini"
+            mock_restart.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_restore_workspace_under_user_base(self, tmp_path):

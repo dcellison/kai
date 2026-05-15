@@ -191,7 +191,13 @@ MODEL_REGISTRY: dict[tuple[str, ModelRole], str] = {
     ("claude", ModelRole.BEHAVIORAL_GEN): "sonnet",
     ("codex", ModelRole.PR_REVIEW): "gpt-5.4-mini",
     ("codex", ModelRole.ISSUE_TRIAGE): "gpt-5.4-mini",
-    ("codex", ModelRole.BEHAVIORAL_JUDGE): "gpt-5.4-nano",
+    # gpt-5.4-mini for the judge role: the closest analog to the
+    # claude haiku tier (small, fast, cheap). gpt-5.4-nano would have
+    # matched the editorial "cheaper than mini" intent but the codex
+    # CLI does not expose it, so it would fail at first behavioral
+    # eval. _check_model_registry_complete validates registry rows
+    # against CODEX_MODELS so future drift gets caught at startup.
+    ("codex", ModelRole.BEHAVIORAL_JUDGE): "gpt-5.4-mini",
     ("codex", ModelRole.BEHAVIORAL_GEN): "gpt-5.4-mini",
 }
 
@@ -229,12 +235,14 @@ def get_model_for(role: ModelRole, backend: str, override: str = "") -> str:
 
 def _check_model_registry_complete(backend: str) -> None:
     """
-    Verify MODEL_REGISTRY has a row for every role the active backend uses.
+    Verify MODEL_REGISTRY has a row for every role the active backend uses,
+    AND that each codex row names a model the codex CLI actually exposes.
 
-    Runs once at load_config() time. Raises SystemExit on a missing
-    row so the bug surfaces at startup rather than at a per-request
-    LookupError (which would otherwise crash a single agent invocation
-    silently if a future role were added without its registry rows).
+    Runs once at load_config() time. Raises SystemExit on a missing or
+    invalid row so the bug surfaces at startup rather than at a per-
+    request LookupError (which would otherwise crash a single agent
+    invocation silently if a future role were added without its
+    registry rows, or with a codex-incompatible model).
 
     Goose is exempt: goose-side model resolution lives in module-level
     _GOOSE_AGENT_MODELS dicts that this registry does not subsume.
@@ -247,6 +255,23 @@ def _check_model_registry_complete(backend: str) -> None:
         raise SystemExit(
             f"MODEL_REGISTRY is missing rows for backend '{backend}': {names}. Update MODEL_REGISTRY in config.py."
         )
+    # Validate codex rows against the CLI's actual model surface so a
+    # future drift (operator updates CODEX_MODELS without touching
+    # MODEL_REGISTRY, or vice versa) fails fast at startup rather
+    # than at the first behavioral / triage / review run.
+    if backend == "codex":
+        invalid = [
+            (role, MODEL_REGISTRY[(backend, role)])
+            for role in ModelRole
+            if MODEL_REGISTRY[(backend, role)] not in CODEX_MODELS
+        ]
+        if invalid:
+            valid_list = ", ".join(sorted(CODEX_MODELS.keys()))
+            details = ", ".join(f"{role.value}={model}" for role, model in invalid)
+            raise SystemExit(
+                f"MODEL_REGISTRY has codex rows naming models the codex CLI does not expose: {details}. "
+                f"Valid codex models: {valid_list}. Update MODEL_REGISTRY in config.py."
+            )
 
 
 def get_effective_provider(backend: str, llm_provider: str) -> str:
