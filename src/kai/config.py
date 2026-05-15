@@ -17,6 +17,7 @@ import os
 import pwd
 import subprocess
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 
 import yaml
@@ -105,6 +106,122 @@ OPEN_ENDED_PROVIDERS: frozenset[str] = frozenset({"openrouter", "ollama"})
 # config validation where the provider is unknown (workspaces can be
 # used by users on different providers).
 _ALL_CURATED_MODELS: frozenset[str] = frozenset(model for models in PROVIDER_MODELS.values() for model in models)
+
+
+# ── Per-role model registry ──────────────────────────────────────────
+#
+# Maps (backend, role) -> the model identifier each backend's CLI
+# accepts as --model for that role. Centralizes per-function defaults
+# so codex and any future backend can declare its mapping in one place
+# instead of scattered _TRIAGE_MODEL / _REVIEW_MODEL / _DEFAULT_*
+# constants across modules.
+#
+# Scope: only the four one-shot agent roles whose model strings move
+# between backends in the codex epic. CONVERSATION is excluded
+# deliberately: conversational model selection is owned by pool.py +
+# DEFAULT_MODEL + PROVIDER_DEFAULTS, and routing it through the
+# registry would collide with the per-user override layer that
+# users.yaml / /settings already provide. FACT_EXTRACTION /
+# EPISODE_EXTRACTION are also excluded; they are owned by
+# config.memory_extraction_model / memory_episode_model with the
+# load_config inheritance sentinel below, and the future
+# backend-agnostic memory epic will introduce them to this enum
+# alongside their codex consumer.
+
+
+class ModelRole(StrEnum):
+    """
+    Logical role tag for a model-selection lookup.
+
+    Each role corresponds to a specific agent-invocation site
+    (triage.py, review.py, eval/behavioral.py) whose model string
+    differs by backend. The registry MODEL_REGISTRY pairs each
+    (backend, role) with the vendor-specific identifier to pass to
+    that backend's CLI as --model.
+    """
+
+    PR_REVIEW = "pr_review"
+    ISSUE_TRIAGE = "issue_triage"
+    BEHAVIORAL_JUDGE = "behavioral_judge"
+    BEHAVIORAL_GEN = "behavioral_gen"
+
+
+# Values are exactly what each backend's CLI accepts as --model.
+# Claude rows match today's inline constants verbatim so the registry
+# migration is no-behavior-change:
+# - triage.py _TRIAGE_MODEL = "sonnet"
+# - review.py _REVIEW_MODEL = "sonnet"
+# - eval/behavioral.py _DEFAULT_JUDGE_MODEL = "claude-haiku-4-5-20251001"
+# - eval/behavioral.py _DEFAULT_GEN_MODEL = "sonnet"
+# Codex rows reflect editorial tier mapping: nano for cheap high-volume
+# work (judge), mini for balanced default generation (gen, triage, review).
+# Goose entries are intentionally absent: goose's model identifier
+# depends on llm_provider (the _GOOSE_AGENT_MODELS dicts in triage.py /
+# review.py already encode that per-provider resolution), which would
+# need a third axis the registry does not carry today.
+MODEL_REGISTRY: dict[tuple[str, ModelRole], str] = {
+    ("claude", ModelRole.PR_REVIEW): "sonnet",
+    ("claude", ModelRole.ISSUE_TRIAGE): "sonnet",
+    ("claude", ModelRole.BEHAVIORAL_JUDGE): "claude-haiku-4-5-20251001",
+    ("claude", ModelRole.BEHAVIORAL_GEN): "sonnet",
+    ("codex", ModelRole.PR_REVIEW): "gpt-5.4-mini",
+    ("codex", ModelRole.ISSUE_TRIAGE): "gpt-5.4-mini",
+    ("codex", ModelRole.BEHAVIORAL_JUDGE): "gpt-5.4-nano",
+    ("codex", ModelRole.BEHAVIORAL_GEN): "gpt-5.4-mini",
+}
+
+
+def get_model_for(role: ModelRole, backend: str, override: str = "") -> str:
+    """
+    Resolve the model identifier for a (role, backend) pair.
+
+    Override precedence: if `override` is truthy, it wins (used by
+    per-role env vars like ISSUE_TRIAGE_MODEL_CODEX or by CLI flags
+    like --judge-model). Otherwise the registry value is returned.
+
+    Raises LookupError on a missing (backend, role) row. Total in the
+    steady state because _check_model_registry_complete() runs at
+    startup and fails fast (SystemExit) if any role is missing for
+    the active backend. The runtime LookupError exists for defensive
+    parsing: a request-path bug should surface as a 5xx, not a
+    process-wide SystemExit.
+
+    Args:
+        role: The ModelRole the caller wants a model for.
+        backend: The active backend string ("claude" or "codex").
+        override: Caller-supplied override string. Empty disables.
+
+    Returns:
+        The model identifier to pass to the backend's CLI.
+    """
+    if override:
+        return override
+    try:
+        return MODEL_REGISTRY[(backend, role)]
+    except KeyError:
+        raise LookupError(f"No registry entry for (backend={backend}, role={role.value})") from None
+
+
+def _check_model_registry_complete(backend: str) -> None:
+    """
+    Verify MODEL_REGISTRY has a row for every role the active backend uses.
+
+    Runs once at load_config() time. Raises SystemExit on a missing
+    row so the bug surfaces at startup rather than at a per-request
+    LookupError (which would otherwise crash a single agent invocation
+    silently if a future role were added without its registry rows).
+
+    Goose is exempt: goose-side model resolution lives in module-level
+    _GOOSE_AGENT_MODELS dicts that this registry does not subsume.
+    """
+    if backend not in ("claude", "codex"):
+        return
+    missing = [role for role in ModelRole if (backend, role) not in MODEL_REGISTRY]
+    if missing:
+        names = ", ".join(role.value for role in missing)
+        raise SystemExit(
+            f"MODEL_REGISTRY is missing rows for backend '{backend}': {names}. Update MODEL_REGISTRY in config.py."
+        )
 
 
 def get_effective_provider(backend: str, llm_provider: str) -> str:
@@ -1569,6 +1686,13 @@ def load_config() -> Config:
         raise SystemExit(
             f"AGENT_BACKEND '{agent_backend}' is not valid (must be one of: {', '.join(sorted(VALID_BACKENDS))})"
         )
+
+    # Verify the per-role model registry has rows for every role the
+    # active backend will look up. Goose is exempt (its model resolution
+    # uses _GOOSE_AGENT_MODELS dicts, not the registry). Raises
+    # SystemExit on a missing row so the bug surfaces at startup rather
+    # than as a per-request LookupError.
+    _check_model_registry_complete(agent_backend)
 
     # LLM provider - validated against the backend's supported set.
     # Only required for non-Claude backends.

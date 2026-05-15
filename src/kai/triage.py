@@ -35,15 +35,11 @@ from pathlib import Path
 
 import aiohttp
 
-from kai.config import resolve_claude_user
+from kai.config import ModelRole, get_model_for, resolve_claude_user
 from kai.prompt_utils import make_boundary
 
 log = logging.getLogger(__name__)
 
-
-# Triage model - Sonnet, same reasoning as PR review. Background task,
-# no need for Opus tokens. Sonnet handles classification and analysis well.
-_TRIAGE_MODEL = "sonnet"
 
 # Per-triage budget cap in USD. Vestigial after #390: --max-budget-usd
 # is no longer emitted to claude --print argv on the claude branch
@@ -473,11 +469,23 @@ async def run_triage(
         # it has notionally produced. _TRIAGE_BUDGET_USD stays defined for
         # symmetry with the other budget defaults in this codebase; cleanup
         # is deferred to a separate refactor.
+        # Model identifier comes from the per-role registry so the
+        # codex backend (and any future backend) can override the
+        # mid-tier "sonnet" default without modifying this branch.
+        # The override env var ISSUE_TRIAGE_MODEL_<BACKEND> is read here
+        # rather than in load_config because the override surface grows
+        # with ModelRole; threading every entry through Config would
+        # inflate the dataclass for a passthrough to a typed lookup.
+        triage_model = get_model_for(
+            ModelRole.ISSUE_TRIAGE,
+            agent_backend,
+            override=os.environ.get(f"ISSUE_TRIAGE_MODEL_{agent_backend.upper()}", ""),
+        )
         cmd = [
             "claude",
             "--print",
             "--model",
-            _TRIAGE_MODEL,
+            triage_model,
         ]
 
         # Resolve self-sudo: skip sudo when claude_user matches the bot

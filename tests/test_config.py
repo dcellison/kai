@@ -9,7 +9,17 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kai.config import Config, UserConfig, _read_protected_file, load_config, resolve_claude_user
+from kai.config import (
+    MODEL_REGISTRY,
+    Config,
+    ModelRole,
+    UserConfig,
+    _check_model_registry_complete,
+    _read_protected_file,
+    get_model_for,
+    load_config,
+    resolve_claude_user,
+)
 
 # All env vars that load_config reads
 _CONFIG_ENV_VARS = [
@@ -1883,3 +1893,108 @@ class TestPerUserAllowedWorkspacesYaml:
         configs = self._load_with_yaml(monkeypatch, users_data)
         assert configs is not None
         assert configs[123].allowed_workspaces == [ws.resolve()]
+
+
+# ── Per-role model registry ─────────────────────────────────────────
+
+
+class TestModelRegistry:
+    """
+    Verify get_model_for and the MODEL_REGISTRY shape.
+
+    The registry centralizes per-function model defaults so codex (and
+    future backends) can declare their mapping in one place. These tests
+    cover the lookup contract (override precedence, missing-row error,
+    startup completeness check) and the claude-row-equals-prior-constant
+    invariant that makes the Phase 1 migration no-behavior-change.
+    """
+
+    def test_lookup_returns_registry_value_when_no_override(self):
+        """Default path: empty override returns the registry value."""
+        result = get_model_for(ModelRole.PR_REVIEW, "claude")
+        assert result == "sonnet"
+
+    def test_override_wins_over_registry(self):
+        """A truthy override short-circuits the registry lookup."""
+        result = get_model_for(ModelRole.PR_REVIEW, "claude", override="opus")
+        assert result == "opus"
+
+    def test_empty_override_falls_through(self):
+        """
+        Empty-string override is treated as no override.
+
+        This is the contract eval/behavioral.py relies on:
+        `args.judge_model or ""` yields "" when the flag is unset, and
+        the registry takes over. If empty short-circuited the registry,
+        the codex behavioral path would never reach the gpt-5.4-nano row.
+        """
+        result = get_model_for(ModelRole.PR_REVIEW, "claude", override="")
+        assert result == "sonnet"
+
+    def test_missing_row_raises_lookup_error(self):
+        """
+        Per-request handler safety: a missing registry row raises
+        LookupError (5xx-shape) rather than SystemExit (process-wide
+        teardown). The startup completeness check is supposed to
+        prevent this from ever firing in production; the runtime guard
+        exists so a packaging bug surfaces as a contained per-request
+        failure if it does.
+        """
+        with pytest.raises(LookupError, match="No registry entry"):
+            get_model_for(ModelRole.PR_REVIEW, "no-such-backend")
+
+    def test_completeness_check_passes_for_claude(self):
+        """Claude has rows for every role; no exception."""
+        _check_model_registry_complete("claude")  # no raise
+
+    def test_completeness_check_passes_for_codex(self):
+        """Codex has rows for every role; no exception."""
+        _check_model_registry_complete("codex")  # no raise
+
+    def test_completeness_check_skips_goose(self):
+        """
+        Goose model resolution lives in _GOOSE_AGENT_MODELS dicts inside
+        triage.py / review.py, not in MODEL_REGISTRY. The completeness
+        check skips goose explicitly so a goose-backed install does
+        not fail at startup just because the registry has no goose rows.
+        """
+        _check_model_registry_complete("goose")  # no raise
+
+    def test_completeness_check_raises_on_missing_row(self, monkeypatch):
+        """
+        Synthetic missing-row case: remove a registry entry for the
+        active backend and assert load_config-time SystemExit fires
+        with a clear message. Uses monkeypatch.delitem so the change
+        is reverted between tests.
+        """
+        monkeypatch.delitem(MODEL_REGISTRY, ("claude", ModelRole.PR_REVIEW))
+        with pytest.raises(SystemExit) as excinfo:
+            _check_model_registry_complete("claude")
+        assert "pr_review" in str(excinfo.value)
+        assert "claude" in str(excinfo.value)
+
+    # ── Claude row equals prior constant (Phase 1 invariant) ──────
+
+    def test_claude_pr_review_row_matches_prior_constant(self):
+        """review.py used _REVIEW_MODEL = "sonnet" pre-Phase-1."""
+        assert get_model_for(ModelRole.PR_REVIEW, "claude") == "sonnet"
+
+    def test_claude_issue_triage_row_matches_prior_constant(self):
+        """triage.py used _TRIAGE_MODEL = "sonnet" pre-Phase-1."""
+        assert get_model_for(ModelRole.ISSUE_TRIAGE, "claude") == "sonnet"
+
+    def test_claude_behavioral_judge_row_matches_prior_constant(self):
+        """
+        eval/behavioral.py used _DEFAULT_JUDGE_MODEL =
+        "claude-haiku-4-5-20251001" pre-Phase-1. Locks the byte-identical
+        invariant the M1 fix from the v4 review depends on.
+        """
+        from kai.eval.behavioral import _DEFAULT_JUDGE_MODEL
+
+        assert get_model_for(ModelRole.BEHAVIORAL_JUDGE, "claude") == _DEFAULT_JUDGE_MODEL
+
+    def test_claude_behavioral_gen_row_matches_prior_constant(self):
+        """eval/behavioral.py used _DEFAULT_GEN_MODEL = "sonnet" pre-Phase-1."""
+        from kai.eval.behavioral import _DEFAULT_GEN_MODEL
+
+        assert get_model_for(ModelRole.BEHAVIORAL_GEN, "claude") == _DEFAULT_GEN_MODEL

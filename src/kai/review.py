@@ -35,7 +35,7 @@ from pathlib import Path
 
 import aiohttp
 
-from kai.config import resolve_claude_user
+from kai.config import ModelRole, get_model_for, resolve_claude_user
 from kai.prompt_utils import make_boundary
 
 log = logging.getLogger(__name__)
@@ -45,11 +45,6 @@ log = logging.getLogger(__name__)
 # a note so Claude knows the review is partial. 100K chars is well within
 # Claude's context window while leaving room for the prompt frame.
 _MAX_DIFF_CHARS = 100_000
-
-# Review model - hardcoded to Sonnet per design decision #10 in the PR
-# review discussion. Reviews are a background task; no reason to burn
-# Opus tokens. Sonnet is more than capable for code review.
-_REVIEW_MODEL = "sonnet"
 
 # Default per-review budget cap in USD. Vestigial after #390:
 # --max-budget-usd is no longer emitted to claude --print argv on the
@@ -758,11 +753,24 @@ async def run_review(
         # signature is unused on every currently-exercised path - see the
         # comment on the parameter declaration above for the full rationale
         # and why cleanup is deferred to a separate refactor.
+        # Model identifier comes from the per-role registry so the
+        # codex backend (and any future backend) can override the
+        # mid-tier "sonnet" default without modifying this branch.
+        # The override env var PR_REVIEW_MODEL_<BACKEND> is read here
+        # rather than in load_config because the override surface
+        # grows with ModelRole; threading every entry through Config
+        # would inflate the dataclass for a passthrough to a typed
+        # lookup.
+        review_model = get_model_for(
+            ModelRole.PR_REVIEW,
+            agent_backend,
+            override=os.environ.get(f"PR_REVIEW_MODEL_{agent_backend.upper()}", ""),
+        )
         cmd = [
             "claude",
             "--print",
             "--model",
-            _REVIEW_MODEL,
+            review_model,
         ]
 
         # Resolve self-sudo: skip sudo when claude_user matches the bot

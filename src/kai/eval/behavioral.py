@@ -94,6 +94,7 @@ from typing import Any
 # Import from the Layer 1 sibling module so the two layers stay aligned
 # on probe schema, drift detection, and probe-set-hash semantics. If
 # Layer 1's drift bucketing changes, Layer 2 follows automatically.
+from kai.config import ModelRole, get_model_for
 from kai.eval.retrieval import (
     Probe,
     detect_drift,
@@ -1818,8 +1819,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--judge-model",
-        default=_DEFAULT_JUDGE_MODEL,
-        help=f"Model for the judge call (default: {_DEFAULT_JUDGE_MODEL}).",
+        # default=None so an unset flag is distinguishable from an
+        # explicit pass; the BehavioralConfig construction below uses
+        # this distinction to fall through to MODEL_REGISTRY's
+        # BEHAVIORAL_JUDGE row for the active backend. With argparse
+        # carrying _DEFAULT_JUDGE_MODEL as the default, every unset
+        # invocation against the codex backend would hand the codex
+        # CLI a Claude alias.
+        default=None,
+        help=f"Model for the judge call (default for claude: {_DEFAULT_JUDGE_MODEL}; codex uses MODEL_REGISTRY's BEHAVIORAL_JUDGE row).",
     )
     parser.add_argument(
         "--judge-budget-usd",
@@ -1835,8 +1843,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--gen-model",
-        default=_DEFAULT_GEN_MODEL,
-        help=f"Model for the generation arms (default: {_DEFAULT_GEN_MODEL}).",
+        # See --judge-model above for the rationale on default=None.
+        default=None,
+        help=f"Model for the generation arms (default for claude: {_DEFAULT_GEN_MODEL}; codex uses MODEL_REGISTRY's BEHAVIORAL_GEN row).",
     )
     parser.add_argument(
         "--gen-budget-usd",
@@ -2017,11 +2026,32 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
     # Materialize the per-run config from CLI args. Done here (not in
     # _build_parser) because _resolve_seed needs the loaded probes.
+    #
+    # Resolve judge_model and gen_model against the per-role registry.
+    # argparse default=None for --judge-model / --gen-model (see
+    # _build_parser) means an unset flag yields override="" and the
+    # registry value is returned. An explicit --judge-model claude_haiku
+    # invocation still wins via the override. This indirection prevents
+    # the codex backend from receiving Claude aliases when no flag is
+    # passed; on the claude backend the registry row is byte-identical
+    # to _DEFAULT_JUDGE_MODEL / _DEFAULT_GEN_MODEL so behavior is
+    # unchanged.
+    eval_backend = os.environ.get("AGENT_BACKEND", "claude").strip().lower()
+    resolved_judge_model = get_model_for(
+        ModelRole.BEHAVIORAL_JUDGE,
+        eval_backend,
+        override=args.judge_model or "",
+    )
+    resolved_gen_model = get_model_for(
+        ModelRole.BEHAVIORAL_GEN,
+        eval_backend,
+        override=args.gen_model or "",
+    )
     config = BehavioralConfig(
-        judge_model=args.judge_model,
+        judge_model=resolved_judge_model,
         judge_budget_usd=args.judge_budget_usd,
         judge_timeout_s=args.judge_timeout_s,
-        gen_model=args.gen_model,
+        gen_model=resolved_gen_model,
         gen_budget_usd=args.gen_budget_usd,
         gen_timeout_s=args.gen_timeout_s,
         seed=_resolve_seed(cli_seed=args.seed, probes=probes, user_id=args.user_id),
