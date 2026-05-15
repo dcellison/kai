@@ -688,13 +688,35 @@ class TestRunTriageCodex:
         boundary: the codex triage branch never spawns claude.
         """
         mock_proc = _mock_subprocess(stdout=self._codex_ndjson('{"labels": []}'))
-        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
+        ):
+            os.environ.pop("CODEX_BIN", None)
             await run_triage("prompt", agent_backend="codex")
         cmd = mock_exec.call_args[0]
         assert cmd[0] == "codex"
         assert cmd[1] == "exec"
         assert "--json" in cmd
         assert "--print" not in cmd  # No claude flag
+
+    @pytest.mark.asyncio
+    async def test_codex_argv_uses_codex_bin_env_var(self):
+        """
+        CODEX_BIN env var overrides bare "codex" in the triage argv.
+        Same install-time lever the persistent backend honors; needed
+        for multi-user installs where codex lives in a per-os_user
+        home not on the service user's PATH.
+        """
+        mock_proc = _mock_subprocess(stdout=self._codex_ndjson("{}"))
+        with (
+            patch.dict(os.environ, {"CODEX_BIN": "/Users/daniel/.npm-global/bin/codex"}),
+            patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
+        ):
+            await run_triage("prompt", agent_backend="codex")
+        cmd = mock_exec.call_args[0]
+        assert cmd[0] == "/Users/daniel/.npm-global/bin/codex"
+        assert cmd[1] == "exec"
 
     @pytest.mark.asyncio
     async def test_codex_argv_uses_registry_model(self):

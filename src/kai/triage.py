@@ -433,8 +433,14 @@ async def run_triage(
             agent_backend,
             override=os.environ.get("ISSUE_TRIAGE_MODEL_CODEX", ""),
         )
+        # Pin the absolute codex path when CODEX_BIN is set; same
+        # rationale as codex.py - sudo cannot resolve bare `codex`
+        # when the binary lives in a per-os_user home that isn't on
+        # the service user's PATH. Falls back to bare "codex" for
+        # installs where codex is on PATH.
+        codex_bin = os.environ.get("CODEX_BIN") or "codex"
         codex_cmd = [
-            "codex",
+            codex_bin,
             "exec",
             "--json",
             "--model",

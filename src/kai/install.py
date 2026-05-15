@@ -1152,6 +1152,19 @@ def _cmd_config() -> None:
             env["CODEX_AUTH_MODE"] = codex_auth_mode
         if codex_api_key:
             env["OPENAI_API_KEY"] = codex_api_key
+        # Persist the resolved codex binary path so the running bot
+        # invokes the same absolute path as the sudoers rule. Sudo
+        # uses the service user's PATH to resolve bare command names,
+        # and on multi-user installs codex usually lives in a per-
+        # os_user home that isn't on the service PATH - the spawn
+        # then fails with "a password is required" because sudo
+        # can't find a binary to match the rule against. Only
+        # emitted when explicitly set via CODEX_BIN at install time,
+        # otherwise the runtime falls back to bare "codex" (correct
+        # for single-user installs where it's on PATH).
+        codex_bin = os.environ.get("CODEX_BIN")
+        if codex_bin:
+            env["CODEX_BIN"] = codex_bin
 
     # Remove stale renamed keys if present - leaving both the old and
     # new key causes silent confusion (the deprecation warning is

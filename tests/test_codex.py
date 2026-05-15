@@ -362,11 +362,35 @@ class TestHandshake:
         c = _make_codex()
         proc = _make_mock_proc(_handshake_lines())
 
-        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec,
+        ):
+            os.environ.pop("CODEX_BIN", None)
             await c._ensure_started()
 
         argv = mock_exec.call_args[0]
         assert argv[0] == "codex"
+        assert argv[1] == "app-server"
+
+    @pytest.mark.asyncio
+    async def test_argv_uses_codex_bin_env_var(self):
+        """
+        CODEX_BIN env var overrides the bare "codex" argv[0]. Locks
+        the absolute-path invocation needed when codex lives in a
+        per-os_user home not on the service user's PATH.
+        """
+        c = _make_codex()
+        proc = _make_mock_proc(_handshake_lines())
+
+        with (
+            patch.dict(os.environ, {"CODEX_BIN": "/Users/daniel/.npm-global/bin/codex"}),
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec,
+        ):
+            await c._ensure_started()
+
+        argv = mock_exec.call_args[0]
+        assert argv[0] == "/Users/daniel/.npm-global/bin/codex"
         assert argv[1] == "app-server"
 
     @pytest.mark.asyncio

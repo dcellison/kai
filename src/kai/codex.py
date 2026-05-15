@@ -238,7 +238,16 @@ class CodexBackend(AgentBackend):
         # an unnecessary self-sudo) and the value unchanged otherwise.
         effective_codex_user = resolve_claude_user(self.codex_user)
 
-        codex_argv = ["codex", "app-server"]
+        # Resolve the codex binary path. When `codex` is not on the
+        # service user's PATH (multi-user installs where codex lives
+        # in a per-os_user home, e.g. /Users/daniel/.npm-global/bin),
+        # sudo cannot find the bare name and the spawn dies with
+        # "a password is required". The CODEX_BIN env var lets the
+        # install (or operator) pin an absolute path that the sudoers
+        # rule also names exactly. Falls back to bare "codex" so
+        # single-user installs with codex on PATH still work.
+        codex_bin = os.environ.get("CODEX_BIN") or "codex"
+        codex_argv = [codex_bin, "app-server"]
         if effective_codex_user:
             # -H sets HOME to <codex_user>'s pw entry so codex reads
             # auth from ~<codex_user>/.codex/auth.json, not the bot's
