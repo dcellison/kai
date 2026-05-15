@@ -1,5 +1,5 @@
 """
-PR review agent - one-shot subprocess (Claude or Goose) for automated code review.
+PR review agent - one-shot subprocess (Claude, Codex, or Goose) for automated code review.
 
 Provides functionality to:
 1. Fetch PR diffs and metadata via the GitHub CLI
@@ -19,9 +19,11 @@ repeated. If the relevant code has materially changed, the agent may
 re-evaluate a prior finding.
 
 The LLM subprocess runs in one-shot mode (non-interactive, no tools, no
-streaming): `claude --print` for Claude, `goose run -i -` for Goose.
-The prompt goes in via stdin to handle large diffs without hitting shell
-argument length limits. Output is captured as plain text.
+streaming): `claude --print` for Claude, `codex exec --json` for Codex,
+`goose run -i -` for Goose. The prompt goes in via stdin to handle
+large diffs without hitting shell argument length limits. Output is
+captured as plain text (NDJSON for codex; the agent_message text is
+extracted by kai.codex_exec.extract_codex_text).
 """
 
 import asyncio
@@ -35,6 +37,7 @@ from pathlib import Path
 
 import aiohttp
 
+from kai.codex_exec import extract_codex_text
 from kai.config import ModelRole, get_model_for, resolve_claude_user
 from kai.prompt_utils import make_boundary
 
@@ -673,24 +676,33 @@ async def run_review(
     """
     Spawn a one-shot LLM subprocess to perform the review.
 
-    Dispatches to either Claude (`claude --print`) or Goose
-    (`goose run -i -`) based on agent_backend. Both read from stdin
-    and write plain text to stdout; the prompt and output handling
-    are identical regardless of backend.
+    Dispatches to Claude (`claude --print`), Codex (`codex exec
+    --json`), or Goose (`goose run -i -`) based on agent_backend.
+    All three read the prompt from stdin and return a single string
+    of review text; the prompt and output handling are identical
+    regardless of backend.
 
     Claude path: supports sudo -u for OS-level isolation, process
     group kills for cleanup, and per-run budget caps.
+
+    Codex path: sudo -H -u when claude_user is set (codex needs
+    HOME pointing at the user's home so it reads the right
+    ~/.codex/auth.json); subprocess emits NDJSON which is collapsed
+    to the final agent_message text by extract_codex_text.
 
     Goose path: no sudo (Goose has no user isolation), simple
     proc.kill() for cleanup, --max-turns 1 as the safety limit.
 
     Args:
         prompt: The complete review prompt (from build_review_prompt).
-        claude_user: Optional OS user to run Claude as (via sudo -u).
-            Ignored when agent_backend is "goose".
-        agent_backend: Which LLM backend to use ("claude" or "goose").
+        claude_user: Optional OS user to run the subprocess as (via
+            sudo -u for claude, sudo -H -u for codex). Ignored when
+            agent_backend is "goose".
+        agent_backend: Which LLM backend to use ("claude", "codex",
+            or "goose").
         provider: LLM provider name (e.g. "anthropic", "openai").
-            Only used when agent_backend is "goose".
+            Only used when agent_backend is "goose"; codex always
+            uses openai, claude always uses anthropic.
 
     Returns:
         The review text output from the LLM.
@@ -698,6 +710,102 @@ async def run_review(
     Raises:
         RuntimeError: If the subprocess fails or times out.
     """
+    if agent_backend == "codex":
+        # Codex one-shot mode: --json emits NDJSON events on stdout
+        # (thread.started, turn.started, item.*, turn.completed,
+        # turn.failed, error). The final agent message text is
+        # recovered by walking the events and accumulating any text
+        # content; extract_codex_text in kai.codex_exec is the
+        # schema-defensive parser shared with triage.py.
+        # Per-user OAuth isolation: when claude_user is set (the
+        # webhook handler passes the same os_user value to both
+        # backends through this parameter), wrap the codex argv in
+        # `sudo -H -u <user>` so codex reads ~<user>/.codex/auth.json
+        # instead of the service user's home. The parameter name is
+        # claude-historical; rename is out of scope for this fix.
+        # No --max-budget-usd: codex on subscription auth has no
+        # per-call billing; runaway protection comes from
+        # timeout_s at the asyncio.wait_for below.
+        review_model = get_model_for(
+            ModelRole.PR_REVIEW,
+            agent_backend,
+            override=os.environ.get("PR_REVIEW_MODEL_CODEX", ""),
+        )
+        # Pin the absolute codex path when CODEX_BIN is set; same
+        # rationale as codex.py and triage.py - sudo cannot resolve
+        # bare `codex` when the binary lives in a per-os_user home
+        # that isn't on the service user's PATH. Falls back to bare
+        # "codex" for installs where codex is on PATH.
+        codex_bin = os.environ.get("CODEX_BIN") or "codex"
+        codex_cmd = [
+            codex_bin,
+            "exec",
+            "--json",
+            "--model",
+            review_model,
+        ]
+
+        # Resolve self-sudo: skip the sudo wrap when claude_user
+        # matches the bot process user. Mirrors the triage codex
+        # branch's pattern.
+        effective_user = resolve_claude_user(claude_user)
+        if effective_user:
+            # -H sets HOME to <effective_user>'s pw entry so codex
+            # reads auth from the right home. --preserve-env passes
+            # KAI_WEBHOOK_SECRET through sudo's env_reset (the SETENV:
+            # sudoers rule allows this). Same shape claude uses.
+            cmd = [
+                "sudo",
+                "-H",
+                "-u",
+                effective_user,
+                "--preserve-env=KAI_WEBHOOK_SECRET",
+                "--",
+            ] + codex_cmd
+        else:
+            cmd = codex_cmd
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            # New session group in cross-user mode so killing sudo
+            # also kills the codex grandchild (mirrors claude branch
+            # and the triage codex branch).
+            start_new_session=bool(effective_user),
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=prompt.encode()),
+                timeout=timeout_s,
+            )
+        except TimeoutError:
+            # Kill the subprocess tree if it exceeds the timeout. In
+            # cross-user mode (effective_user set) the process is in
+            # a new group (PGID == PID); kill the group so both sudo
+            # and the codex grandchild die, preventing orphans.
+            if effective_user:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # Already dead
+            else:
+                proc.kill()
+            await proc.wait()
+            raise RuntimeError(f"Review subprocess timed out after {timeout_s}s") from None
+
+        if proc.returncode != 0:
+            error = stderr.decode().strip()
+            raise RuntimeError(f"Review subprocess failed (exit {proc.returncode}): {error}")
+
+        # Codex emits NDJSON; extract the final agent message text and
+        # return it (mirrors the contract the claude / goose branches
+        # already satisfy: a single string the caller hands back to
+        # the webhook handler for posting as a PR comment).
+        return extract_codex_text(stdout.decode())
+
     if agent_backend == "goose":
         if not provider:
             raise ValueError(

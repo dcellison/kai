@@ -715,6 +715,221 @@ class TestRunReview:
         assert call_kwargs[1]["input"] == b"the review prompt"
 
 
+# ── run_review (Codex backend) ─────────────────────────────────────
+
+
+class TestRunReviewCodex:
+    """
+    Tests for the codex branch of run_review.
+
+    Mirrors TestRunTriageCodex in test_triage.py: the two codex
+    branches share the same pattern (codex exec --json + sudo -H -u
+    wrap + NDJSON parse) and the same kai.codex_exec parser. Locks
+    the "no overlap" guarantee at the subprocess boundary - a codex-
+    backed review never spawns claude or goose.
+    """
+
+    @staticmethod
+    def _codex_ndjson(text: str) -> bytes:
+        """
+        Build a minimal NDJSON stream that mirrors the real
+        `codex exec --json` schema: each event has a top-level `type`
+        tag; item.completed for an agent_message carries the full
+        consolidated `text` field. Returns bytes (the review tests'
+        _mock_process expects bytes via communicate()).
+        """
+        events = [
+            {"type": "thread.started", "thread_id": "thr_test"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {"id": "item_1", "type": "agent_message", "text": text},
+            },
+            {"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}},
+        ]
+        return ("\n".join(json.dumps(e) for e in events) + "\n").encode()
+
+    @pytest.mark.asyncio
+    async def test_codex_argv_uses_codex_exec(self):
+        """
+        Argv is `codex exec --json --model <model>`, never claude or
+        goose. Locks the "no overlap" guarantee at the subprocess
+        boundary: the codex review branch never spawns claude.
+        """
+        mock_proc = _mock_process(stdout=self._codex_ndjson("review body"))
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
+        ):
+            os.environ.pop("CODEX_BIN", None)
+            await run_review("prompt", agent_backend="codex")
+        cmd = mock_exec.call_args[0]
+        assert cmd[0] == "codex"
+        assert cmd[1] == "exec"
+        assert "--json" in cmd
+        assert "--print" not in cmd  # No claude flag
+
+    @pytest.mark.asyncio
+    async def test_codex_argv_uses_codex_bin_env_var(self):
+        """
+        CODEX_BIN env var overrides bare "codex" in the review argv.
+        Same install-time lever the persistent backend and the codex
+        triage branch honor; needed for multi-user installs where
+        codex lives in a per-os_user home not on the service user's
+        PATH.
+        """
+        mock_proc = _mock_process(stdout=self._codex_ndjson(""))
+        with (
+            patch.dict(os.environ, {"CODEX_BIN": "/Users/daniel/.npm-global/bin/codex"}),
+            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
+        ):
+            await run_review("prompt", agent_backend="codex")
+        cmd = mock_exec.call_args[0]
+        assert cmd[0] == "/Users/daniel/.npm-global/bin/codex"
+        assert cmd[1] == "exec"
+
+    @pytest.mark.asyncio
+    async def test_codex_argv_uses_registry_model(self):
+        """
+        With agent_backend=codex and no env override, the --model
+        argv slot matches the registry's (codex, PR_REVIEW) row
+        ("gpt-5.4-mini"). Locks the registry as the source of truth
+        for the codex side.
+        """
+        mock_proc = _mock_process(stdout=self._codex_ndjson(""))
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review("prompt", agent_backend="codex")
+        cmd = mock_exec.call_args[0]
+        i = cmd.index("--model")
+        assert cmd[i + 1] == "gpt-5.4-mini"
+
+    @pytest.mark.asyncio
+    async def test_codex_env_override_honored_at_call_site(self, monkeypatch):
+        """
+        PR_REVIEW_MODEL_CODEX in the environment overrides the
+        registry value at the call site. Same end-to-end env-override
+        wiring as the claude path.
+        """
+        monkeypatch.setenv("PR_REVIEW_MODEL_CODEX", "gpt-5.4")
+        mock_proc = _mock_process(stdout=self._codex_ndjson(""))
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review("prompt", agent_backend="codex")
+        cmd = mock_exec.call_args[0]
+        i = cmd.index("--model")
+        assert cmd[i + 1] == "gpt-5.4"
+
+    @pytest.mark.asyncio
+    async def test_codex_no_sudo_when_user_unset(self):
+        """
+        With no claude_user passed, codex runs as the bot process
+        user directly: argv begins with "codex", no "sudo" wrap.
+        """
+        mock_proc = _mock_process(stdout=self._codex_ndjson(""))
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review("prompt", agent_backend="codex")
+        cmd = mock_exec.call_args[0]
+        assert cmd[0] == "codex"
+        assert "sudo" not in cmd
+
+    @pytest.mark.asyncio
+    async def test_codex_wraps_sudo_when_user_set(self):
+        """
+        With claude_user set to a non-self user, codex argv is wrapped
+        in `sudo -H -u <user> --preserve-env=KAI_WEBHOOK_SECRET --`.
+        The per-user os_user lever is what makes a multi-user install
+        spawn codex as each user, reading their per-user
+        ~/.codex/auth.json.
+
+        Same fake-username trick as the triage codex tests: pass a
+        username implausible enough to never match the test runner's
+        user, so resolve_claude_user does NOT short-circuit to no-sudo.
+        """
+        mock_proc = _mock_process(stdout=self._codex_ndjson(""))
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review("prompt", agent_backend="codex", claude_user="ci-fake-user")
+        cmd = mock_exec.call_args[0]
+        assert cmd[0] == "sudo"
+        assert "-H" in cmd
+        i = cmd.index("-u")
+        assert cmd[i + 1] == "ci-fake-user"
+        assert any(arg.startswith("--preserve-env=") and "KAI_WEBHOOK_SECRET" in arg for arg in cmd)
+        assert "codex" in cmd
+        codex_i = cmd.index("codex")
+        assert cmd[codex_i + 1] == "exec"
+
+    @pytest.mark.asyncio
+    async def test_codex_no_max_budget_flag(self):
+        """
+        --max-budget-usd is not emitted on the codex branch. Codex on
+        subscription auth has no per-call billing; runaway protection
+        comes from the asyncio.wait_for timeout. Mirror of the
+        existing claude-side absence assertion.
+        """
+        mock_proc = _mock_process(stdout=self._codex_ndjson(""))
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review("prompt", agent_backend="codex")
+        cmd = mock_exec.call_args[0]
+        assert "--max-budget-usd" not in cmd
+
+    @pytest.mark.asyncio
+    async def test_codex_extracts_final_text_from_ndjson(self):
+        """
+        Return value is the agent message text extracted from the
+        NDJSON event stream, not the raw stdout. The downstream
+        webhook handler posts the returned text directly as a PR
+        comment; it must not see multi-line NDJSON.
+        """
+        body = "## Review\n\nLooks good."
+        mock_proc = _mock_process(stdout=self._codex_ndjson(body))
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await run_review("prompt", agent_backend="codex")
+        assert result == body
+
+    @pytest.mark.asyncio
+    async def test_codex_subprocess_failure_raises(self):
+        """Non-zero exit from codex raises RuntimeError with stderr."""
+        mock_proc = _mock_process(returncode=1, stderr=b"auth failed")
+        with (
+            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
+            pytest.raises(RuntimeError, match="auth failed"),
+        ):
+            await run_review("prompt", agent_backend="codex")
+
+    @pytest.mark.asyncio
+    async def test_codex_timeout_kills_process_group(self):
+        """
+        On TimeoutError with claude_user set, the subprocess group is
+        killed via os.killpg(PID, SIGKILL) so both sudo and the codex
+        grandchild die. Mirror of the claude branch's process-group
+        teardown.
+        """
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(side_effect=TimeoutError())
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.pid = 99999  # Fake PID for killpg
+        with (
+            patch("kai.review.asyncio.create_subprocess_exec", return_value=proc),
+            patch("kai.review.os.killpg") as mock_killpg,
+            pytest.raises(RuntimeError, match="timed out"),
+        ):
+            await run_review("prompt", agent_backend="codex", claude_user="ci-fake-user", timeout_s=1)
+        mock_killpg.assert_called_once_with(99999, signal.SIGKILL)
+
+    @pytest.mark.asyncio
+    async def test_codex_stdin_carries_prompt(self):
+        """
+        Codex one-shot mode reads the review prompt from stdin (the
+        prompt is too large for argv on real diffs). Mirrors the
+        existing claude- and goose-side stdin assertions.
+        """
+        mock_proc = _mock_process(stdout=self._codex_ndjson(""))
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
+            await run_review("the review prompt", agent_backend="codex")
+        mock_proc.communicate.assert_called_once()
+        assert mock_proc.communicate.call_args.kwargs["input"] == b"the review prompt"
+
+
 # ── run_review (Goose backend) ─────────────────────────────────────
 
 
