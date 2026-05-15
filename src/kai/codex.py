@@ -348,7 +348,22 @@ class CodexBackend(AgentBackend):
 
         await self._write_notification("initialized")
 
-        thread_params: dict = {"cwd": str(self.workspace)}
+        # `approvalPolicy: "never"` is load-bearing for an unattended
+        # Telegram bot. Codex's default is "on-request", which makes
+        # the server emit approval-request notifications and wait for
+        # a client response before any tool call. Kai has no human
+        # in the loop to approve from Telegram, so on-request gates
+        # silently: codex waits forever, the bot's stdout-readline
+        # ceiling fires, the operator sees "Codex timed out". The
+        # `sandbox: "workspaceWrite"` policy mirrors the claude side
+        # (BashTool / Edit / Write all enabled in the workspace);
+        # codex would otherwise refuse file writes under the default
+        # readOnly sandbox.
+        thread_params: dict = {
+            "cwd": str(self.workspace),
+            "approvalPolicy": "never",
+            "sandbox": "workspaceWrite",
+        }
         if self.model:
             thread_params["model"] = self.model
         await self._write_rpc("thread/start", thread_params)
