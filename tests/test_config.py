@@ -1987,7 +1987,10 @@ class TestModelRegistry:
         """
         eval/behavioral.py used _DEFAULT_JUDGE_MODEL =
         "claude-haiku-4-5-20251001" pre-Phase-1. Locks the byte-identical
-        invariant the M1 fix from the v4 review depends on.
+        invariant the behavioral codex path depends on: the claude
+        BEHAVIORAL_JUDGE row must equal _DEFAULT_JUDGE_MODEL so an
+        unset --judge-model on claude resolves to the same string the
+        pre-Phase-1 argparse default emitted.
         """
         from kai.eval.behavioral import _DEFAULT_JUDGE_MODEL
 

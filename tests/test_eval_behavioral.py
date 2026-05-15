@@ -929,10 +929,14 @@ class TestBackendAwareModelResolution:
         return args
 
     @staticmethod
-    def _run_with_captured_config(args, monkeypatch):
+    def _run_with_captured_config(args):
         """
         Invoke _run_cli with heavyweight machinery mocked, capturing
         the BehavioralConfig that gets handed to _run_all_probes.
+
+        Callers apply monkeypatch.setenv("AGENT_BACKEND", ...) before
+        calling this helper; the env is already set by the time
+        _run_cli reads it.
         """
         captured: dict[str, BehavioralConfig] = {}
 
@@ -963,7 +967,7 @@ class TestBackendAwareModelResolution:
         """
         monkeypatch.setenv("AGENT_BACKEND", "goose")
         args = self._make_args(tmp_path)  # judge_model=None, gen_model=None
-        config = self._run_with_captured_config(args, monkeypatch)
+        config = self._run_with_captured_config(args)
         assert config.judge_model == behavioral._DEFAULT_JUDGE_MODEL
         assert config.gen_model == behavioral._DEFAULT_GEN_MODEL
 
@@ -974,7 +978,7 @@ class TestBackendAwareModelResolution:
         """
         monkeypatch.setenv("AGENT_BACKEND", "goose")
         args = self._make_args(tmp_path, judge_model="opus", gen_model="haiku")
-        config = self._run_with_captured_config(args, monkeypatch)
+        config = self._run_with_captured_config(args)
         assert config.judge_model == "opus"
         assert config.gen_model == "haiku"
 
@@ -988,7 +992,7 @@ class TestBackendAwareModelResolution:
         """
         monkeypatch.setenv("AGENT_BACKEND", "claude")
         args = self._make_args(tmp_path)
-        config = self._run_with_captured_config(args, monkeypatch)
+        config = self._run_with_captured_config(args)
         assert config.judge_model == behavioral._DEFAULT_JUDGE_MODEL
         assert config.gen_model == behavioral._DEFAULT_GEN_MODEL
 
@@ -996,7 +1000,7 @@ class TestBackendAwareModelResolution:
         """Explicit flag wins on claude too, exercising the override path."""
         monkeypatch.setenv("AGENT_BACKEND", "claude")
         args = self._make_args(tmp_path, judge_model="opus", gen_model="sonnet")
-        config = self._run_with_captured_config(args, monkeypatch)
+        config = self._run_with_captured_config(args)
         assert config.judge_model == "opus"
         assert config.gen_model == "sonnet"
 
