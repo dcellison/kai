@@ -41,8 +41,9 @@ PROJECT_ROOT = Path(os.environ.get("KAI_INSTALL_DIR") or str(_FILE_ROOT))
 DATA_DIR = Path(os.environ.get("KAI_DATA_DIR") or str(PROJECT_ROOT))
 
 # Valid agent backend choices. "claude" uses Claude Code CLI,
-# "goose" uses Goose ACP. Shared between load_config() and install.py.
-VALID_BACKENDS = {"claude", "goose"}
+# "goose" uses Goose ACP, "codex" uses OpenAI Codex CLI's app-server
+# JSON-RPC protocol. Shared between load_config() and install.py.
+VALID_BACKENDS = {"claude", "goose", "codex"}
 
 # Valid LLM providers per backend. Claude always uses Anthropic
 # (hardcoded in get_effective_provider), so it has no entry here.
@@ -506,6 +507,13 @@ class Config:
     # _VALID_EFFORT_LEVELS so a typo fails fast rather than at the
     # subprocess startup of the next chat session.
     claude_effort_level: str = "high"
+
+    # Codex backend auth mode. "subscription" (default): the codex CLI
+    # uses ~/.codex/auth.json populated by an interactive `codex login`.
+    # "api_key": codex reads OPENAI_API_KEY from the environment, the
+    # same way goose+openai does. Only consulted when AGENT_BACKEND=codex;
+    # ignored on every other backend.
+    codex_auth_mode: str = "subscription"
 
     # Database - uses DATA_DIR so the db lands in the writable data directory
     session_db_path: Path = field(default_factory=lambda: DATA_DIR / "kai.db")
@@ -1620,6 +1628,12 @@ def load_config() -> Config:
     # way to fail. SystemExit on bad input mirrors how the surrounding
     # CLAUDE_* parsing blocks signal config-load failure, keeping the
     # operator-visible behavior consistent across the cluster.
+    # Codex auth mode validation: "subscription" (default) or "api_key".
+    # An unknown value is a typo in /etc/kai/env; fail fast at startup.
+    codex_auth_mode = os.environ.get("CODEX_AUTH_MODE", "subscription").strip().lower() or "subscription"
+    if codex_auth_mode not in ("subscription", "api_key"):
+        raise SystemExit(f"CODEX_AUTH_MODE must be 'subscription' or 'api_key', got {codex_auth_mode!r}")
+
     claude_effort_level = os.environ.get("CLAUDE_EFFORT_LEVEL", "high").strip().lower() or "high"
     if claude_effort_level not in _VALID_EFFORT_LEVELS:
         # Use the ordered tuple, not sorted(_VALID_EFFORT_LEVELS) - the
@@ -1958,6 +1972,7 @@ def load_config() -> Config:
         claude_max_context_window=claude_max_context_window,
         claude_autocompact_pct=claude_autocompact_pct,
         claude_effort_level=claude_effort_level,
+        codex_auth_mode=codex_auth_mode,
         webhook_port=webhook_port,
         webhook_secret=os.environ.get("WEBHOOK_SECRET", ""),
         voice_enabled=os.environ.get("VOICE_ENABLED", "").lower() in ("1", "true", "yes"),

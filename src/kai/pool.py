@@ -180,8 +180,9 @@ class SubprocessPool:
         # clarity of two separate resolution calls is worth it.
         home_ws = resolve_home_workspace(chat_id, self._config)
 
-        # Backend selection: "goose" uses Goose ACP, anything else
-        # (including the default "claude") uses Claude Code CLI.
+        # Backend selection: "goose" uses Goose ACP, "codex" uses
+        # OpenAI Codex CLI's app-server JSON-RPC protocol, anything
+        # else (including the default "claude") uses Claude Code CLI.
         if backend == "goose":
             return GooseBackend(
                 model=model,
@@ -198,8 +199,30 @@ class SubprocessPool:
                 memory_enabled=self._config.memory_enabled,
             )
 
+        if backend == "codex":
+            # Import locally so codex.py is only imported on a
+            # codex-active install. Mirrors the goose pattern above
+            # (imported at module top) but keeps the import optional
+            # for installs where codex CLI is not available.
+            from kai.codex import CodexBackend
+
+            return CodexBackend(
+                model=model,
+                workspace=workspace,
+                home_workspace=home_ws,
+                webhook_port=self._config.webhook_port,
+                webhook_secret=self._config.webhook_secret,
+                max_budget_usd=budget,
+                timeout_seconds=timeout,
+                services_info=self._services_info,
+                workspace_config=ws_config,
+                max_context_window=context_window,
+                provider="openai",
+                memory_enabled=self._config.memory_enabled,
+            )
+
         # os_user for sudo -u isolation. None = run as bot user.
-        # Only relevant for ClaudeCodeBackend (Goose doesn't use sudo).
+        # Only relevant for ClaudeCodeBackend (Goose / Codex don't use sudo).
         os_user = user.os_user if user else self._config.claude_user
 
         return ClaudeCodeBackend(

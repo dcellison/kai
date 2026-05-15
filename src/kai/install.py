@@ -497,8 +497,33 @@ def _cmd_config() -> None:
         existing_env.get("AGENT_BACKEND", "claude"),
     )
 
+    # Codex auth handling runs BEFORE the legacy provider/key block so
+    # subscription mode is not gated on an OPENAI_API_KEY the operator
+    # does not need. VALID_PROVIDERS["codex"] is intentionally unset
+    # (codex is openai-only and has its own auth model), so the
+    # legacy block below skips codex entirely - same path claude
+    # follows today.
+    codex_auth_mode = ""
+    codex_api_key = ""
+    if agent_backend == "codex":
+        codex_auth_mode = _prompt_choice(
+            "Codex auth mode",
+            ["subscription", "api_key"],
+            existing_env.get("CODEX_AUTH_MODE", "subscription"),
+        )
+        if codex_auth_mode == "subscription":
+            print("  After install, run 'codex login' as the service user.")
+        else:
+            codex_api_key = _prompt(
+                "OPENAI_API_KEY",
+                existing_env.get("OPENAI_API_KEY", ""),
+                required=True,
+            )
+
     # Non-Claude backends: provider and API key. The provider choice
     # determines which env var to prompt for (or none for ollama).
+    # Codex is intentionally absent from VALID_PROVIDERS, so this block
+    # only fires for goose; codex is handled in the dedicated branch above.
     llm_provider = ""
     llm_api_key_var = ""
     llm_api_key = ""
@@ -849,6 +874,27 @@ def _cmd_config() -> None:
         "Enable semantic memory (Mem0 + Qdrant)",
         existing_env.get("MEMORY_ENABLED", "false").lower() in ("1", "true", "yes"),
     )
+    # Codex backend cannot use semantic memory in v1 - the Haiku
+    # extraction pipeline shells out to `claude --print` and lives in
+    # the claude vertical. bot.py's effective_backend == "claude" gate
+    # already prevents extraction from running on a codex install, but
+    # the wizard zeroes both flags here as defense in depth: a
+    # MEMORY_ENABLED=true env var on a codex install would still
+    # inject the [Memory subsystem: enabled] marker into the inner
+    # codex agent's session context (build_session_context reads
+    # memory_enabled, not effective_backend) and trigger inner-agent
+    # behavior that has nowhere to land. Force both flags off so the
+    # codex agent never advertises a memory subsystem that cannot
+    # service its requests.
+    memory_extraction_enabled_pre_guard = existing_env.get("MEMORY_EXTRACTION_ENABLED", "false").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if agent_backend == "codex" and (memory_enabled or memory_extraction_enabled_pre_guard):
+        print("  Semantic memory currently requires the claude backend.")
+        print("  Disabling semantic memory for this codex install.")
+        memory_enabled = False
     # Defaults match the dataclass values in config.py. Only non-defaults
     # (or memory_enabled=true itself) are written to the env dict below.
     memory_extraction_enabled = False
@@ -1087,6 +1133,17 @@ def _cmd_config() -> None:
         env["LLM_PROVIDER"] = llm_provider
     if llm_api_key_var and llm_api_key:
         env[llm_api_key_var] = llm_api_key
+
+    # Codex auth mode + optional api_key. Only written on codex
+    # installs; the load_config default ("subscription") fires
+    # otherwise. OPENAI_API_KEY is emitted only in api_key mode and
+    # only if the operator supplied one, mirroring the
+    # llm_api_key_var emission above for goose.
+    if agent_backend == "codex":
+        if codex_auth_mode and codex_auth_mode != "subscription":
+            env["CODEX_AUTH_MODE"] = codex_auth_mode
+        if codex_api_key:
+            env["OPENAI_API_KEY"] = codex_api_key
 
     # Remove stale renamed keys if present - leaving both the old and
     # new key causes silent confusion (the deprecation warning is
@@ -2942,6 +2999,16 @@ def _cmd_apply() -> None:
                 "\nYou can safely delete it now that secrets are in /etc/kai/env."
                 "\nTo reconfigure later, re-run: python -m kai install config"
             )
+
+        # Codex subscription auth requires an interactive `codex login`
+        # run AS the service user (so the token lands in the service
+        # user's ~/.codex/auth.json, not the operator's). Surface this
+        # explicitly so the operator does not start the service and
+        # then chase silent auth failures on the first message.
+        if env.get("AGENT_BACKEND") == "codex" and env.get("CODEX_AUTH_MODE", "subscription") == "subscription":
+            print("\nCodex subscription auth required:")
+            print(f"  sudo -u {service_user} codex login")
+            print("Run this before the service starts handling messages.")
 
 
 def _apply_directories(
