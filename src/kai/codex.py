@@ -34,6 +34,8 @@ import asyncio
 import json
 import logging
 import os
+import signal
+import subprocess
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -157,6 +159,19 @@ class CodexBackend(AgentBackend):
         self._fresh_session: bool = True  # True until the first message is sent
         self._stderr_task: asyncio.Task | None = None  # Background stderr drain
 
+        # Cross-user teardown apparatus (#456-equivalent for codex).
+        # When effective_codex_user is set in _ensure_started, the
+        # subprocess is the sudo wrapper, not codex itself; signalling
+        # only the wrapper orphans the codex grandchild because POSIX
+        # signal permission rules forbid a service-user-owned killpg
+        # from reaching a target-user grandchild. The escalation path
+        # uses `sudo -n -u <target> /bin/kill ...` against the cached
+        # inner-codex PID. See _send_signal for the full rationale and
+        # claude.py for the original implementation this mirrors.
+        self._pgid: int | None = None
+        self._inner_codex_pid: int | None = None
+        self._effective_codex_user: str | None = None
+
     @property
     def is_alive(self) -> bool:
         """True if the codex subprocess is running and hasn't exited."""
@@ -246,14 +261,36 @@ class CodexBackend(AgentBackend):
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.workspace),
             env=env,
-            # Cross-user mode: new session group so the entire tree
-            # (sudo + codex) can be killed via SIGKILL. Without this,
-            # killing sudo orphans the codex grandchild. Same shape
-            # claude.py uses.
+            # Cross-user mode: new session group so the sudo wrapper
+            # is the session leader (PGID == PID). os.killpg later
+            # reaps the wrapper after the inner-codex sudo escalation
+            # in _send_signal / _async_send_signal_for_close has
+            # signalled the grandchild directly. Without the
+            # escalation, killpg alone would orphan the codex
+            # grandchild (POSIX permission rules: service user
+            # cannot signal a process whose UIDs are all the
+            # target user). See _send_signal for the full chain.
             start_new_session=bool(effective_codex_user),
             limit=1024 * 1024,  # 1MB per-line buffer
         )
         self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+        # Save the process group ID for reliable signal delivery.
+        # When effective_codex_user is set, start_new_session=True
+        # made the wrapper a session leader so PGID == PID. We save
+        # it now because os.getpgid() fails after the process exits,
+        # but os.killpg() works as long as any group member survives.
+        if effective_codex_user:
+            self._pgid = self._proc.pid
+        else:
+            self._pgid = None
+
+        # Remember the resolved sudo target for the #456-equivalent
+        # cross-user signal escalation. _inner_codex_pid is reset to
+        # None here so a recycled instance does not carry a stale
+        # PID from a previous spawn into the fresh tree.
+        self._effective_codex_user = effective_codex_user
+        self._inner_codex_pid = None
 
         # Step 1: initialize - establish protocol version
         self._next_id = 1
@@ -638,19 +675,256 @@ class CodexBackend(AgentBackend):
 
     # ── Kill / restart / shutdown ──────────────────────────────────
 
+    def _lookup_inner_codex_pid(self) -> int | None:
+        """
+        Find the inner codex subprocess PID in cross-user mode.
+
+        In cross-user mode the bot spawns `sudo -u <target> -- codex
+        app-server` and self._proc tracks the sudo wrapper. sudo
+        fork+exec's codex as its sole child, so pgrep -P <sudo_pid>
+        returns the codex PID. Returns None when no sudo wrapper is
+        alive, sudo has not yet forked, or pgrep fails. The result
+        is cached on self._inner_codex_pid; callers that need to
+        signal after sudo has been killed must rely on the cache.
+        Synchronous variant used by the sync force_kill path.
+        Mirrors claude.py's _lookup_inner_claude_pid (#456/#459).
+        """
+        if self._proc is None:
+            return None
+        try:
+            result = subprocess.run(
+                ["pgrep", "-P", str(self._proc.pid)],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        first_line = result.stdout.strip().split("\n", 1)[0] if result.stdout.strip() else ""
+        if not first_line:
+            return None
+        try:
+            return int(first_line)
+        except ValueError:
+            return None
+
+    async def _async_lookup_inner_codex_pid(self) -> int | None:
+        """
+        Async pgrep equivalent of `_lookup_inner_codex_pid`.
+
+        Same semantics, but uses asyncio.create_subprocess_exec so
+        the event loop is not blocked while pgrep runs. Called from
+        the async _kill / shutdown paths; the sync variant remains
+        for force_kill. 2s ceiling matches the sync version. Mirrors
+        claude.py's _async_lookup_inner_claude_pid (#459).
+        """
+        if self._proc is None:
+            return None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "pgrep",
+                "-P",
+                str(self._proc.pid),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except (OSError, FileNotFoundError):
+            return None
+        try:
+            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+        except TimeoutError:
+            # pgrep hung; reap it so we do not leak a child. The
+            # kill() guard handles the race where pgrep exited
+            # between wait_for timing out and the kill() call:
+            # ProcessLookupError is a benign already-dead signal.
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                await proc.wait()
+            except OSError:
+                pass
+            return None
+        if proc.returncode != 0:
+            return None
+        first_line = stdout_bytes.decode(errors="replace").strip().split("\n", 1)[0]
+        if not first_line:
+            return None
+        try:
+            return int(first_line)
+        except ValueError:
+            return None
+
+    async def _async_sudo_kill(self, target_user: str, pid: int, sig: int) -> None:
+        """
+        Run `sudo -n -u <target> /bin/kill -<sig> <pid>` without blocking.
+
+        Equivalent to the synchronous subprocess.run inside _send_signal,
+        but uses asyncio.create_subprocess_exec so a hung sudo or kill
+        does not stall other coroutines. Logs at WARNING on non-zero
+        exit and on timeout so a missing sudoers rule or other failure
+        mode surfaces in the operator log instead of silently leaking
+        an orphan. Mirrors claude.py's _async_sudo_kill (#459).
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "sudo",
+                "-n",
+                "-u",
+                target_user,
+                "/bin/kill",
+                f"-{int(sig)}",
+                str(pid),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except (OSError, FileNotFoundError):
+            return
+        try:
+            _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=5)
+        except TimeoutError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                await proc.wait()
+            except OSError:
+                pass
+            log.warning(
+                "async sudo kill timed out after 5s (target=%s, pid=%d, sig=%d); inner codex may orphan",
+                target_user,
+                pid,
+                int(sig),
+            )
+            return
+        if proc.returncode != 0:
+            log.warning(
+                "sudo kill escalation failed (rc=%d, stderr=%r); inner codex pid=%d may orphan",
+                proc.returncode,
+                stderr_bytes[:200].decode(errors="replace") if stderr_bytes else "",
+                pid,
+            )
+
+    def _send_signal(self, sig: int) -> None:
+        """
+        Send a signal to the codex process (or process group + sudo
+        escalation when running cross-user).
+
+        Cross-user mode: os.killpg from the service user cannot signal
+        a target-user codex grandchild because POSIX signal permission
+        rules require real or effective UID to match real or saved
+        set-user-ID of the target. killpg succeeds for the sudo
+        wrapper (real UID is the service user) but the inner codex
+        (UIDs = target) survives and gets orphaned to init. We
+        escalate via `sudo -n -u <target> /bin/kill -<sig> <pid>` for
+        the inner codex BEFORE killpg reaps the sudo wrapper.
+        install.py's _generate_sudoers emits a per-target
+        NOPASSWD: /bin/kill rule for this path.
+
+        Mirrors claude.py's _send_signal (#456/#458). Deliberately
+        does NOT check self._proc.returncode: when codex_user is set
+        self._proc tracks the sudo wrapper, not codex, and checking
+        returncode would skip delivery if sudo exited first.
+        """
+        if self._pgid is not None:
+            if self._effective_codex_user is not None:
+                if self._inner_codex_pid is None:
+                    self._inner_codex_pid = self._lookup_inner_codex_pid()
+                if self._inner_codex_pid is not None:
+                    try:
+                        # Absolute /bin/kill path so sudo's secure_path
+                        # resolution cannot silently pick a different
+                        # binary than the sudoers rule names. The
+                        # install.py rule also pins /bin/kill; the two
+                        # must match exactly. int(sig) explicit because
+                        # IntEnum f-string behavior changed in 3.11;
+                        # cast is the contract regardless of version.
+                        result = subprocess.run(
+                            [
+                                "sudo",
+                                "-n",
+                                "-u",
+                                self._effective_codex_user,
+                                "/bin/kill",
+                                f"-{int(sig)}",
+                                str(self._inner_codex_pid),
+                            ],
+                            capture_output=True,
+                            timeout=5,
+                            check=False,
+                        )
+                        if result.returncode != 0:
+                            log.warning(
+                                "sudo kill escalation failed (rc=%d, stderr=%r); inner codex may orphan",
+                                result.returncode,
+                                result.stderr[:200].decode(errors="replace") if result.stderr else "",
+                            )
+                    except (subprocess.TimeoutExpired, OSError):
+                        # Inner codex already dead, sudoers rule
+                        # missing on an old install, or kill timed
+                        # out. Fall through to killpg; the wrapper
+                        # still needs reaping.
+                        pass
+            try:
+                os.killpg(self._pgid, sig)
+            except OSError:
+                pass
+        elif self._proc is not None:
+            try:
+                self._proc.send_signal(sig)
+            except OSError:
+                pass
+
+    async def _async_send_signal_for_close(self, sig: int) -> None:
+        """
+        Async equivalent of `_send_signal` used by `_kill` and `shutdown`.
+
+        Same three-step structure as the sync version: prime the
+        inner-codex-PID cache (async pgrep), signal the inner codex
+        through sudo (async subprocess), then reap the wrapper via
+        os.killpg (a non-blocking syscall, sync is fine). The
+        single-user fallback uses _proc.send_signal (also non-
+        blocking). Mirrors claude.py's _async_send_signal_for_close.
+        """
+        if self._pgid is not None:
+            if self._effective_codex_user is not None:
+                if self._inner_codex_pid is None:
+                    self._inner_codex_pid = await self._async_lookup_inner_codex_pid()
+                if self._inner_codex_pid is not None:
+                    await self._async_sudo_kill(
+                        self._effective_codex_user,
+                        self._inner_codex_pid,
+                        int(sig),
+                    )
+            try:
+                os.killpg(self._pgid, sig)
+            except OSError:
+                pass
+        elif self._proc is not None:
+            try:
+                self._proc.send_signal(sig)
+            except OSError:
+                pass
+
     def force_kill(self) -> None:
         """
         Kill the subprocess immediately via SIGKILL.
 
         Safe to call without holding the lock. Called by /stop to abort
-        an in-flight response. Does NOT null _proc - full cleanup
+        an in-flight response. Cross-user mode goes through
+        _send_signal so the codex grandchild is sudo-escalated before
+        the wrapper is killpg'd, avoiding the #456 orphan leak.
+        Single-user mode falls back to _proc.kill() via the
+        _send_signal else-branch. Does NOT null _proc - full cleanup
         happens in _kill() when the read loop detects EOF.
         """
         if self._proc is not None:
-            try:
-                self._proc.kill()
-            except OSError:
-                pass
+            self._send_signal(signal.SIGKILL)
         if self._stderr_task:
             self._stderr_task.cancel()
             self._stderr_task = None
@@ -659,17 +933,25 @@ class CodexBackend(AgentBackend):
         """
         Kill the subprocess and clean up all process state.
 
-        Sends SIGKILL, waits up to 5 seconds for exit, then nulls
-        all process references. Idempotent.
+        Sends SIGKILL via the async escalation path (so cross-user
+        installs do not orphan the codex grandchild), waits up to 5
+        seconds for exit, then nulls all process references.
+        Idempotent.
         """
         if self._proc:
-            self.force_kill()
+            await self._async_send_signal_for_close(signal.SIGKILL)
+            if self._stderr_task:
+                self._stderr_task.cancel()
+                self._stderr_task = None
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except TimeoutError:
                 pass
             self._proc = None
             self._session_id = None
+            self._pgid = None
+            self._inner_codex_pid = None
+            self._effective_codex_user = None
 
     async def restart(self) -> None:
         """
@@ -713,27 +995,27 @@ class CodexBackend(AgentBackend):
         """
         Graceful shutdown. No save prompt - codex CLI has no equivalent.
 
-        Sends SIGTERM first and waits up to 5 seconds for clean exit.
-        Falls back to SIGKILL if the process doesn't terminate in time.
+        Sends SIGTERM first via the async escalation path so the
+        target-user codex grandchild gets sudo-signalled before the
+        wrapper is reaped; waits up to 5 seconds for clean exit.
+        Falls back to SIGKILL (also through the escalation path) if
+        the process doesn't terminate in time.
         """
         if self._proc:
+            await self._async_send_signal_for_close(signal.SIGTERM)
             try:
-                self._proc.terminate()
-            except OSError:
-                # Process already exited between the _proc check and
-                # terminate(). Fall through to cleanup below.
-                pass
-            else:
+                await asyncio.wait_for(self._proc.wait(), timeout=5)
+            except TimeoutError:
+                await self._async_send_signal_for_close(signal.SIGKILL)
                 try:
                     await asyncio.wait_for(self._proc.wait(), timeout=5)
                 except TimeoutError:
-                    self.force_kill()
-                    try:
-                        await asyncio.wait_for(self._proc.wait(), timeout=5)
-                    except TimeoutError:
-                        log.warning("CodexBackend: process did not exit after SIGKILL")
+                    log.warning("CodexBackend: process did not exit after SIGKILL")
         if self._stderr_task:
             self._stderr_task.cancel()
             self._stderr_task = None
         self._proc = None
         self._session_id = None
+        self._pgid = None
+        self._inner_codex_pid = None
+        self._effective_codex_user = None

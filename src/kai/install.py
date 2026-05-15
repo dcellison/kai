@@ -1859,14 +1859,24 @@ def _generate_sudoers(
         # rule and breaking the bot's sudo dispatch.
         svc_home = _user_home(service_user)
         claude_bin = f"{svc_home}/.local/bin/claude"
-        # Codex binary path: resolved against the service user's PATH
-        # (the same PATH sudo will use when dispatching the rule).
-        # Falls back to a likely Homebrew location so the install
-        # doesn't break when codex isn't on root's PATH at apply time.
-        # Operators who installed codex via npm or to a non-standard
-        # path may need to edit /etc/sudoers.d/kai post-install; the
-        # smoke-test phase reveals this.
-        codex_bin = shutil.which("codex") or "/opt/homebrew/bin/codex"
+        # Codex binary path: anchored deterministically to the same
+        # location codex installs to under the operator's account
+        # (npm's global prefix on macOS is /opt/homebrew, on Linux
+        # is usually /usr/local). We pick the Homebrew prefix as the
+        # default because the smoke-test target is an Apple-Silicon
+        # Mac mini; Linux operators get an override via the
+        # CODEX_BIN env var read at install time. We deliberately
+        # do NOT call shutil.which("codex"): _generate_sudoers runs
+        # under `sudo make install` (root context), and shutil.which
+        # would resolve against root's install-time PATH, exactly
+        # the failure mode PR #455 removed for claude_bin (any
+        # user's ~/.local/bin/codex on root's PATH would bake the
+        # wrong path into the rule). The runtime invocation in
+        # codex.py / triage.py runs bare `codex`; sudo resolves it
+        # against the service user's secure_path, which must
+        # therefore include the directory naming this rule's
+        # binary. The smoke test reveals path mismatches.
+        codex_bin = os.environ.get("CODEX_BIN") or "/opt/homebrew/bin/codex"
         # kill(1) for the cross-user kill escalation (#456). The bot
         # runs `sudo -n -u <target> /bin/kill -<sig> <pid>` against
         # the inner claude grandchild because POSIX signal permissions
@@ -1882,10 +1892,10 @@ def _generate_sudoers(
         # rationale as the claude_bin fix in PR #455.
         kill_bin = "/bin/kill"
         # SETENV: allows the service user to pass env vars (e.g.,
-        # KAI_WEBHOOK_SECRET) through sudo to the claude process.
-        # Scoped to the claude rule only; the kill rule does not
-        # need SETENV (kill ignores env entirely), and the cat/tee
-        # config-read rules above remain locked down.
+        # KAI_WEBHOOK_SECRET) through sudo to claude and codex.
+        # Scoped to the claude and codex rules; the kill rule does
+        # not need SETENV (kill ignores env entirely), and the
+        # cat/tee config-read rules above remain locked down.
         #
         # Scope note for the generated rules below (also surfaced
         # as an inline comment in /etc/sudoers.d/kai itself so
@@ -1893,24 +1903,24 @@ def _generate_sudoers(
         # the kill rule allows the service user to run /bin/kill
         # as <target> with ANY arguments, which means it can
         # signal any <target>-owned process - not just the inner
-        # claude grandchild. A PID-locked rule would be tighter
-        # but sudoers argument matching is not safe per the
-        # sudo(8) manual (Defaults entries warn against it; a
+        # claude/codex grandchild. A PID-locked rule would be
+        # tighter but sudoers argument matching is not safe per
+        # the sudo(8) manual (Defaults entries warn against it; a
         # crafted argument can bypass the pattern). In practice
-        # the scope delta is zero: the claude rule above already
-        # grants arbitrary code execution as <target>, so an
-        # attacker with the service user can already `claude
-        # bash -c "kill -9 -1"`. The kill rule just adds a faster
-        # path for the bot's normal cleanup flow.
+        # the scope delta is zero: the claude/codex rules above
+        # already grant arbitrary code execution as <target>, so
+        # an attacker with the service user can already
+        # `claude bash -c "kill -9 -1"`. The kill rule just adds
+        # a faster path for the bot's normal cleanup flow.
         rules += textwrap.dedent("""\
 
-            # Per-target sudoers rules for the cross-os-user inner Claude spawn.
-            # The claude rule grants arbitrary code execution as <target> (claude has
-            # Bash/Read/Write tools); the kill rule grants signal delivery to any
-            # <target>-owned process. The kill rule's scope is broader than a
-            # PID-locked rule because sudoers argument matching is not safe per
-            # sudo(8). The kill rule is a strict subset of capabilities the claude
-            # rule already provides; the practical delta is zero. See PR #458.
+            # Per-target sudoers rules for the cross-os-user inner agent spawn.
+            # The claude and codex rules grant arbitrary code execution as <target>
+            # (both agents have Bash/Read/Write tools); the kill rule grants signal
+            # delivery to any <target>-owned process. The kill rule's scope is
+            # broader than a PID-locked rule because sudoers argument matching is
+            # not safe per sudo(8). The kill rule is a strict subset of capabilities
+            # the agent rules already provide; the practical delta is zero. See PR #458.
         """)
         for target in target_users:
             rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {claude_bin}\n"

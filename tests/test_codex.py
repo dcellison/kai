@@ -23,6 +23,7 @@ import asyncio
 import inspect
 import json
 import os
+import signal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -859,7 +860,7 @@ class TestForceKill:
         """force_kill cancels and nulls the stderr drain task."""
         c = _make_codex()
         proc = MagicMock()
-        proc.kill = MagicMock()
+        proc.send_signal = MagicMock()
         task = MagicMock()
         task.cancel = MagicMock()
         c._proc = proc
@@ -867,9 +868,10 @@ class TestForceKill:
 
         c.force_kill()
 
-        # _stderr_task is nulled by force_kill, so assert against the
-        # captured reference rather than the attribute.
-        proc.kill.assert_called_once()
+        # Single-user mode (no _pgid set) routes through _send_signal's
+        # else-branch -> proc.send_signal(SIGKILL). _stderr_task is
+        # nulled by force_kill, so assert against the captured reference.
+        proc.send_signal.assert_called_once_with(signal.SIGKILL)
         task.cancel.assert_called_once()
         assert c._stderr_task is None
 
@@ -927,17 +929,19 @@ class TestShutdown:
 
     @pytest.mark.asyncio
     async def test_shutdown_sends_sigterm(self):
-        """shutdown() calls terminate() first."""
+        """shutdown() routes SIGTERM through _send_signal."""
         c = _make_codex()
         proc = _make_mock_proc([])
         proc.returncode = None
-        proc.terminate = MagicMock()
+        proc.send_signal = MagicMock()
         c._proc = proc
 
         await c.shutdown()
 
-        # _proc is nulled by shutdown; assert against the captured reference.
-        proc.terminate.assert_called_once()
+        # Single-user mode -> async escalation path falls to
+        # proc.send_signal(SIGTERM). _proc is nulled by shutdown,
+        # so assert against the captured reference.
+        proc.send_signal.assert_called_once_with(signal.SIGTERM)
 
     @pytest.mark.asyncio
     async def test_shutdown_no_proc(self):
@@ -1077,9 +1081,10 @@ class TestCodexUserSudoWrap:
     @pytest.mark.asyncio
     async def test_start_new_session_when_codex_user_set(self):
         """
-        Cross-user mode uses start_new_session=True so killing sudo
-        also kills the codex grandchild (otherwise the codex process
-        orphans when sudo dies).
+        Cross-user mode uses start_new_session=True so the sudo wrapper
+        is a session leader (PGID == PID). os.killpg in
+        _send_signal then reaps the wrapper after the sudo escalation
+        has already signalled the inner codex grandchild directly.
         """
         c = _make_codex(codex_user="ci-fake-user")
         proc = _make_mock_proc(_handshake_lines())
@@ -1095,3 +1100,216 @@ class TestCodexUserSudoWrap:
         with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
             await c._ensure_started()
         assert mock_exec.call_args[1]["start_new_session"] is False
+
+    @pytest.mark.asyncio
+    async def test_pgid_and_user_captured_when_codex_user_set(self):
+        """
+        After _ensure_started in cross-user mode, _pgid equals the
+        sudo wrapper PID and _effective_codex_user holds the resolved
+        target. These drive the teardown escalation.
+        """
+        c = _make_codex(codex_user="ci-fake-user")
+        proc = _make_mock_proc(_handshake_lines())
+        proc.pid = 12345
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            await c._ensure_started()
+        assert c._pgid == 12345
+        assert c._effective_codex_user == "ci-fake-user"
+        # Fresh spawn must reset any stale cached grandchild PID.
+        assert c._inner_codex_pid is None
+
+    @pytest.mark.asyncio
+    async def test_pgid_unset_when_codex_user_unset(self):
+        """Single-user mode leaves _pgid None so _send_signal takes the direct-send branch."""
+        c = _make_codex()
+        proc = _make_mock_proc(_handshake_lines())
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            await c._ensure_started()
+        assert c._pgid is None
+        assert c._effective_codex_user is None
+
+
+class TestCodexCrossUserTeardown:
+    """
+    Verify the #456-equivalent kill-escalation for codex.
+
+    In cross-user mode the codex grandchild runs as the target user
+    while self._proc tracks the service-user-owned sudo wrapper. A
+    plain proc.kill() reaches only the wrapper; the grandchild
+    survives because POSIX signal permission rules forbid killpg from
+    the service user. The escalation calls `sudo -n -u <target>
+    /bin/kill -<sig> <pid>` against the cached inner PID before
+    killpg reaps the wrapper. These tests exercise the sync
+    (force_kill) and async (_kill / shutdown) paths.
+    """
+
+    def test_force_kill_cross_user_escalates_then_killpg(self):
+        """force_kill in cross-user mode looks up the inner codex PID, sudo-kills it, then killpgs the wrapper."""
+        c = _make_codex(codex_user="ci-fake-user")
+        proc = MagicMock()
+        proc.pid = 12345
+        c._proc = proc
+        c._pgid = 12345
+        c._effective_codex_user = "ci-fake-user"
+        c._inner_codex_pid = None  # Force a lookup
+        c._stderr_task = MagicMock()
+
+        # Mock pgrep returning the inner codex PID 67890.
+        pgrep_result = MagicMock()
+        pgrep_result.returncode = 0
+        pgrep_result.stdout = "67890\n"
+        # Mock the sudo /bin/kill returning success.
+        sudo_kill_result = MagicMock()
+        sudo_kill_result.returncode = 0
+        sudo_kill_result.stderr = b""
+
+        with (
+            patch("kai.codex.subprocess.run", side_effect=[pgrep_result, sudo_kill_result]) as mock_run,
+            patch("kai.codex.os.killpg") as mock_killpg,
+        ):
+            c.force_kill()
+
+        # First call: pgrep -P 12345 to find the grandchild.
+        assert mock_run.call_args_list[0][0][0] == ["pgrep", "-P", "12345"]
+        # Second call: sudo -n -u ci-fake-user /bin/kill -9 67890.
+        sudo_argv = mock_run.call_args_list[1][0][0]
+        assert sudo_argv[:5] == ["sudo", "-n", "-u", "ci-fake-user", "/bin/kill"]
+        assert sudo_argv[5] == f"-{int(signal.SIGKILL)}"
+        assert sudo_argv[6] == "67890"
+        # Then killpg reaps the wrapper.
+        mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
+        # Cache primed for any subsequent _send_signal call.
+        assert c._inner_codex_pid == 67890
+
+    def test_force_kill_uses_cached_inner_pid(self):
+        """If _inner_codex_pid is already cached, force_kill skips the pgrep lookup."""
+        c = _make_codex(codex_user="ci-fake-user")
+        c._proc = MagicMock()
+        c._proc.pid = 12345
+        c._pgid = 12345
+        c._effective_codex_user = "ci-fake-user"
+        c._inner_codex_pid = 67890  # Pre-cached
+        c._stderr_task = MagicMock()
+
+        sudo_kill_result = MagicMock()
+        sudo_kill_result.returncode = 0
+        sudo_kill_result.stderr = b""
+
+        with (
+            patch("kai.codex.subprocess.run", return_value=sudo_kill_result) as mock_run,
+            patch("kai.codex.os.killpg"),
+        ):
+            c.force_kill()
+
+        # Only the sudo-kill call - no pgrep.
+        assert mock_run.call_count == 1
+        sudo_argv = mock_run.call_args_list[0][0][0]
+        assert sudo_argv[:5] == ["sudo", "-n", "-u", "ci-fake-user", "/bin/kill"]
+
+    def test_force_kill_single_user_skips_escalation(self):
+        """Single-user mode (no _pgid) takes the direct proc.send_signal branch."""
+        c = _make_codex()
+        proc = MagicMock()
+        proc.send_signal = MagicMock()
+        c._proc = proc
+        c._stderr_task = MagicMock()
+        # _pgid is None, _effective_codex_user is None (default).
+
+        with (
+            patch("kai.codex.subprocess.run") as mock_run,
+            patch("kai.codex.os.killpg") as mock_killpg,
+        ):
+            c.force_kill()
+
+        # Neither escalation nor killpg should run.
+        mock_run.assert_not_called()
+        mock_killpg.assert_not_called()
+        proc.send_signal.assert_called_once_with(signal.SIGKILL)
+
+    def test_force_kill_logs_when_sudo_kill_fails(self, caplog):
+        """A non-zero sudo /bin/kill return logs at WARNING (orphan-leak diagnostic)."""
+        c = _make_codex(codex_user="ci-fake-user")
+        c._proc = MagicMock()
+        c._proc.pid = 12345
+        c._pgid = 12345
+        c._effective_codex_user = "ci-fake-user"
+        c._inner_codex_pid = 67890
+        c._stderr_task = MagicMock()
+
+        sudo_kill_result = MagicMock()
+        sudo_kill_result.returncode = 1
+        sudo_kill_result.stderr = b"a password is required"
+
+        with (
+            patch("kai.codex.subprocess.run", return_value=sudo_kill_result),
+            patch("kai.codex.os.killpg"),
+            caplog.at_level("WARNING", logger="kai.codex"),
+        ):
+            c.force_kill()
+
+        assert any("sudo kill escalation failed" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_async_kill_cross_user_escalates(self):
+        """_kill (async path used by recycle / change_workspace) runs the async escalation."""
+        c = _make_codex(codex_user="ci-fake-user")
+        proc = MagicMock()
+        proc.pid = 12345
+        proc.wait = AsyncMock(return_value=0)
+        c._proc = proc
+        c._pgid = 12345
+        c._effective_codex_user = "ci-fake-user"
+        c._inner_codex_pid = 67890  # Pre-cached -> skip pgrep
+        c._stderr_task = MagicMock()
+
+        sudo_proc = MagicMock()
+        sudo_proc.returncode = 0
+        sudo_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        with (
+            patch("kai.codex.asyncio.create_subprocess_exec", AsyncMock(return_value=sudo_proc)) as mock_exec,
+            patch("kai.codex.os.killpg") as mock_killpg,
+        ):
+            await c._kill()
+
+        # Async escalation: sudo -n -u ci-fake-user /bin/kill -SIGKILL 67890.
+        sudo_argv = mock_exec.call_args[0]
+        assert sudo_argv[:5] == ("sudo", "-n", "-u", "ci-fake-user", "/bin/kill")
+        assert sudo_argv[5] == f"-{int(signal.SIGKILL)}"
+        assert sudo_argv[6] == "67890"
+        mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
+        # State cleared after _kill.
+        assert c._proc is None
+        assert c._pgid is None
+        assert c._inner_codex_pid is None
+        assert c._effective_codex_user is None
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cross_user_escalates_sigterm_then_sigkill(self):
+        """shutdown() routes SIGTERM through the escalation, falls back to SIGKILL if wait times out."""
+        c = _make_codex(codex_user="ci-fake-user")
+        proc = MagicMock()
+        proc.pid = 12345
+        # First wait times out (forces SIGKILL fallback); second returns 0.
+        proc.wait = AsyncMock(side_effect=[TimeoutError(), 0])
+        c._proc = proc
+        c._pgid = 12345
+        c._effective_codex_user = "ci-fake-user"
+        c._inner_codex_pid = 67890
+        c._stderr_task = MagicMock()
+
+        sudo_proc = MagicMock()
+        sudo_proc.returncode = 0
+        sudo_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        with (
+            patch("kai.codex.asyncio.create_subprocess_exec", AsyncMock(return_value=sudo_proc)) as mock_exec,
+            patch("kai.codex.os.killpg"),
+        ):
+            await c.shutdown()
+
+        # Two escalations: SIGTERM then SIGKILL.
+        sigterm_call = mock_exec.call_args_list[0][0]
+        sigkill_call = mock_exec.call_args_list[1][0]
+        assert sigterm_call[5] == f"-{int(signal.SIGTERM)}"
+        assert sigkill_call[5] == f"-{int(signal.SIGKILL)}"
