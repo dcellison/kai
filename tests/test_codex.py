@@ -542,6 +542,77 @@ class TestStreamParsing:
         assert events[2].response.cost_usd == 0.0
 
     @pytest.mark.asyncio
+    async def test_multi_agent_message_items_join_with_blank_line(self):
+        """
+        A single turn can emit multiple agentMessage items (e.g. preamble
+        before a tool call, post-tool summary after). The visible text must
+        commit each item's content with a blank-line separator; item N's
+        completion must NEVER override prior items' accumulated text
+        (the bug that produced "summary here.The..." truncations during
+        the live smoke test).
+        """
+        c = _make_codex()
+        c._proc = _make_mock_proc(
+            [
+                _item_started_agent(item_id="item-1"),
+                _agent_message_delta("Hello", item_id="item-1"),
+                _agent_message_delta(" world.", item_id="item-1"),
+                _item_completed_agent("Hello world.", item_id="item-1"),
+                _item_started_agent(item_id="item-2"),
+                _agent_message_delta("Next, ", item_id="item-2"),
+                _agent_message_delta("more text.", item_id="item-2"),
+                _item_completed_agent("Next, more text.", item_id="item-2"),
+                _turn_completed("completed"),
+            ]
+        )
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        events = await _collect_events(c)
+
+        final = events[-1]
+        assert final.done is True
+        assert final.response is not None
+        assert final.response.success is True
+        # Items joined with a blank-line separator; item 2's text is
+        # appended, NOT substituted for item 1's. This is the regression
+        # guard for the smoke-test overwrite bug.
+        assert final.response.text == "Hello world.\n\nNext, more text."
+
+    @pytest.mark.asyncio
+    async def test_item_completed_overrides_only_current_item(self):
+        """
+        item/completed's `text` field is authoritative for THAT item only.
+        A drift between accumulated deltas and the completed text for
+        item 2 must not erase item 1's previously committed content.
+        """
+        c = _make_codex()
+        c._proc = _make_mock_proc(
+            [
+                _item_started_agent(item_id="item-1"),
+                _agent_message_delta("first item content.", item_id="item-1"),
+                _item_completed_agent("first item content.", item_id="item-1"),
+                _item_started_agent(item_id="item-2"),
+                # Deltas accumulate "partial..." but completion says
+                # the canonical text is "Second item." - the override
+                # must apply to current item only.
+                _agent_message_delta("partial accumulated text", item_id="item-2"),
+                _item_completed_agent("Second item.", item_id="item-2"),
+                _turn_completed("completed"),
+            ]
+        )
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        events = await _collect_events(c)
+
+        final = events[-1]
+        assert final.response is not None
+        assert final.response.text == "first item content.\n\nSecond item."
+
+    @pytest.mark.asyncio
     async def test_unknown_event_type_skipped(self):
         """
         Schema-drift defense: an unrecognized sessionUpdate event type
