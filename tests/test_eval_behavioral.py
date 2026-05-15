@@ -890,6 +890,117 @@ class TestOutputWriteFailure:
         assert exit_code == 1
 
 
+class TestBackendAwareModelResolution:
+    """
+    Verify the backend-aware dispatch in _run_cli for judge/gen models.
+
+    The resolution shape:
+    - On claude / codex, get_model_for(role, backend, override=args.x or "")
+      handles the lookup. Unset flag yields the registry default;
+      explicit flag wins via override.
+    - On goose (and any future non-registry backend), the legacy
+      _DEFAULT_JUDGE_MODEL / _DEFAULT_GEN_MODEL constants are used
+      when the flag is unset, mirroring pre-Phase-1 behavior. Without
+      this fallback, get_model_for would raise LookupError on the
+      missing (goose, BEHAVIORAL_*) row and crash the eval CLI.
+    """
+
+    @staticmethod
+    def _make_args(tmp_path: Path, *, judge_model=None, gen_model=None):
+        """Minimal args.Namespace mock for _run_cli."""
+        probes_file = tmp_path / "probes.jsonl"
+        probes_file.write_text(
+            json.dumps({"question": "q1", "expected_fact_id": "f1"}) + "\n",
+            encoding="utf-8",
+        )
+        args = MagicMock()
+        args.probes = probes_file
+        args.user_id = "user-1"
+        args.output = None
+        args.judge_model = judge_model
+        args.judge_budget_usd = 0.05
+        args.judge_timeout_s = 60
+        args.gen_model = gen_model
+        args.gen_budget_usd = 0.10
+        args.gen_timeout_s = 120
+        args.seed = None
+        args.max_concurrency = 1
+        args.pollution_lines = 0
+        return args
+
+    @staticmethod
+    def _run_with_captured_config(args, monkeypatch):
+        """
+        Invoke _run_cli with heavyweight machinery mocked, capturing
+        the BehavioralConfig that gets handed to _run_all_probes.
+        """
+        captured: dict[str, BehavioralConfig] = {}
+
+        async def fake_run_all_probes(**kwargs):
+            captured["config"] = kwargs["config"]
+            return []
+
+        with (
+            patch.object(behavioral, "_initialize_memory", return_value=Path("/tmp")),
+            patch.object(
+                behavioral,
+                "detect_drift",
+                return_value=([Probe(question="q1", expected_fact_id="f1")], [], {"f1": ()}),
+            ),
+            patch.object(behavioral, "_run_all_probes", new=fake_run_all_probes),
+            patch.object(behavioral, "_resolve_ground_truth", return_value={"f1": "gold"}),
+            patch.object(behavioral, "_capture_claude_cli_version", return_value="2.1.118"),
+        ):
+            asyncio.run(behavioral._run_cli(args))
+        return captured["config"]
+
+    def test_goose_unset_flag_falls_back_to_legacy_constant(self, tmp_path, monkeypatch):
+        """
+        On a goose-backed install, an unset --judge-model must NOT trigger
+        get_model_for("goose", BEHAVIORAL_JUDGE) (no registry row, would
+        raise LookupError). The fallback path uses _DEFAULT_JUDGE_MODEL,
+        matching pre-Phase-1 behavior.
+        """
+        monkeypatch.setenv("AGENT_BACKEND", "goose")
+        args = self._make_args(tmp_path)  # judge_model=None, gen_model=None
+        config = self._run_with_captured_config(args, monkeypatch)
+        assert config.judge_model == behavioral._DEFAULT_JUDGE_MODEL
+        assert config.gen_model == behavioral._DEFAULT_GEN_MODEL
+
+    def test_goose_explicit_flag_wins(self, tmp_path, monkeypatch):
+        """
+        Explicit --judge-model still wins on goose. The fallback only
+        kicks in for an unset (None) flag value.
+        """
+        monkeypatch.setenv("AGENT_BACKEND", "goose")
+        args = self._make_args(tmp_path, judge_model="opus", gen_model="haiku")
+        config = self._run_with_captured_config(args, monkeypatch)
+        assert config.judge_model == "opus"
+        assert config.gen_model == "haiku"
+
+    def test_claude_unset_flag_uses_registry(self, tmp_path, monkeypatch):
+        """
+        On the claude backend, an unset flag resolves through the
+        registry to the BEHAVIORAL_JUDGE / BEHAVIORAL_GEN row. The
+        registry rows are byte-identical to the legacy constants by
+        Phase 1's no-behavior-change invariant, so the resolved values
+        must equal the pre-Phase-1 defaults.
+        """
+        monkeypatch.setenv("AGENT_BACKEND", "claude")
+        args = self._make_args(tmp_path)
+        config = self._run_with_captured_config(args, monkeypatch)
+        assert config.judge_model == behavioral._DEFAULT_JUDGE_MODEL
+        assert config.gen_model == behavioral._DEFAULT_GEN_MODEL
+
+    def test_claude_explicit_flag_wins(self, tmp_path, monkeypatch):
+        """Explicit flag wins on claude too, exercising the override path."""
+        monkeypatch.setenv("AGENT_BACKEND", "claude")
+        args = self._make_args(tmp_path, judge_model="opus", gen_model="sonnet")
+        config = self._run_with_captured_config(args, monkeypatch)
+        assert config.judge_model == "opus"
+        assert config.gen_model == "sonnet"
+
+
 class TestProbeIdMatchesSourcePosition:
     """per_probe[].probe_id reflects position in the source probes file,
     not position in the (scored + drift) concatenated outcomes list.

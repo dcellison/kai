@@ -518,6 +518,21 @@ class TestRunReview:
         assert "sonnet" in cmd
 
     @pytest.mark.asyncio
+    async def test_claude_env_override_honored_at_call_site(self, monkeypatch):
+        """
+        PR_REVIEW_MODEL_CLAUDE in the environment overrides the registry
+        value at the call site. The override env var is read here rather
+        than in load_config; this test verifies the wiring end-to-end.
+        """
+        monkeypatch.setenv("PR_REVIEW_MODEL_CLAUDE", "opus")
+        mock_proc = _mock_process(stdout=b"ok")
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review("prompt")
+        cmd = mock_exec.call_args[0]
+        i = cmd.index("--model")
+        assert cmd[i + 1] == "opus"
+
+    @pytest.mark.asyncio
     async def test_max_budget_usd_flag_absent_on_claude_backend(self):
         """
         --max-budget-usd must NOT be emitted to claude --print argv

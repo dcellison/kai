@@ -2027,26 +2027,38 @@ async def _run_cli(args: argparse.Namespace) -> int:
     # Materialize the per-run config from CLI args. Done here (not in
     # _build_parser) because _resolve_seed needs the loaded probes.
     #
-    # Resolve judge_model and gen_model against the per-role registry.
+    # Resolve judge_model and gen_model with backend-aware dispatch.
     # argparse default=None for --judge-model / --gen-model (see
-    # _build_parser) means an unset flag yields override="" and the
-    # registry value is returned. An explicit --judge-model claude_haiku
-    # invocation still wins via the override. This indirection prevents
-    # the codex backend from receiving Claude aliases when no flag is
-    # passed; on the claude backend the registry row is byte-identical
-    # to _DEFAULT_JUDGE_MODEL / _DEFAULT_GEN_MODEL so behavior is
-    # unchanged.
+    # _build_parser) means an unset flag yields override="" so the
+    # branch below picks the right backend-appropriate default.
+    #
+    # The registry only covers claude and codex; goose's model
+    # resolution lives in _GOOSE_AGENT_MODELS dicts inside triage.py
+    # and review.py, not in MODEL_REGISTRY. For goose (and any future
+    # non-registry backend) we preserve the pre-Phase-1 behavior:
+    # explicit --judge-model / --gen-model wins, otherwise the legacy
+    # _DEFAULT_JUDGE_MODEL / _DEFAULT_GEN_MODEL constants are used.
+    # This keeps the goose path byte-identical to today rather than
+    # crashing with a LookupError on an unset flag.
     eval_backend = os.environ.get("AGENT_BACKEND", "claude").strip().lower()
-    resolved_judge_model = get_model_for(
-        ModelRole.BEHAVIORAL_JUDGE,
-        eval_backend,
-        override=args.judge_model or "",
-    )
-    resolved_gen_model = get_model_for(
-        ModelRole.BEHAVIORAL_GEN,
-        eval_backend,
-        override=args.gen_model or "",
-    )
+    if eval_backend in ("claude", "codex"):
+        resolved_judge_model = get_model_for(
+            ModelRole.BEHAVIORAL_JUDGE,
+            eval_backend,
+            override=args.judge_model or "",
+        )
+        resolved_gen_model = get_model_for(
+            ModelRole.BEHAVIORAL_GEN,
+            eval_backend,
+            override=args.gen_model or "",
+        )
+    else:
+        # Non-registry backend (goose). Preserve pre-Phase-1 behavior:
+        # explicit flag wins, otherwise the legacy _DEFAULT_* constant
+        # is used. Codex-aware behavioral wiring on non-registry
+        # backends is Phase 5 scope.
+        resolved_judge_model = args.judge_model or _DEFAULT_JUDGE_MODEL
+        resolved_gen_model = args.gen_model or _DEFAULT_GEN_MODEL
     config = BehavioralConfig(
         judge_model=resolved_judge_model,
         judge_budget_usd=args.judge_budget_usd,

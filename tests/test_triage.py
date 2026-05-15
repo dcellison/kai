@@ -316,6 +316,40 @@ class TestRunTriage:
         assert result == expected
 
     @pytest.mark.asyncio
+    async def test_claude_argv_uses_registry_model(self):
+        """
+        With agent_backend=claude and no env override, the --model
+        argv slot matches the registry's (claude, ISSUE_TRIAGE) row.
+        Locks the Phase 1 byte-identical invariant at the call site:
+        Phase 1 removed the _TRIAGE_MODEL constant, so this test is
+        the place the resolved string is observable.
+        """
+        mock_proc = _mock_subprocess(returncode=0, stdout='{"labels": []}')
+        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_triage("prompt", agent_backend="claude")
+        cmd = mock_exec.call_args[0]
+        # --model is followed immediately by the model identifier in
+        # the argv vector; index +1 gives the actual model string.
+        i = cmd.index("--model")
+        assert cmd[i + 1] == "sonnet"
+
+    @pytest.mark.asyncio
+    async def test_claude_env_override_honored_at_call_site(self, monkeypatch):
+        """
+        ISSUE_TRIAGE_MODEL_CLAUDE in the environment overrides the
+        registry value at the call site. The override env var is
+        read here rather than in load_config; this test verifies the
+        wiring end-to-end.
+        """
+        monkeypatch.setenv("ISSUE_TRIAGE_MODEL_CLAUDE", "opus")
+        mock_proc = _mock_subprocess(returncode=0, stdout='{"labels": []}')
+        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_triage("prompt", agent_backend="claude")
+        cmd = mock_exec.call_args[0]
+        i = cmd.index("--model")
+        assert cmd[i + 1] == "opus"
+
+    @pytest.mark.asyncio
     async def test_max_budget_usd_flag_absent_on_claude_backend(self):
         """
         --max-budget-usd must NOT be emitted to claude --print argv on
