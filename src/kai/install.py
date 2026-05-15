@@ -2986,6 +2986,17 @@ def _cmd_apply() -> None:
         _apply_models(install_path, dry_run)
 
         # -- Step 5: Write secrets --
+        # Inject CODEX_BIN from the apply-time env so a multi-user
+        # codex install can pin an absolute codex path without
+        # round-tripping through the wizard. Apply-time env wins over
+        # any stale value already in install.conf so the operator's
+        # explicit `sudo CODEX_BIN=... kai install apply` is honored.
+        # Only codex installs care; on other backends the var is
+        # ignored at runtime so writing it is harmless but noisy -
+        # skip the write to keep /etc/kai/env clean.
+        env_codex_bin = os.environ.get("CODEX_BIN")
+        if env_codex_bin and env.get("AGENT_BACKEND") == "codex":
+            env["CODEX_BIN"] = env_codex_bin
         _apply_secrets(env, dry_run)
 
         # -- Step 6: Deploy Goose config (if backend=goose) --
