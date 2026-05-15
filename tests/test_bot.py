@@ -4077,6 +4077,39 @@ class TestHandleSettings:
         # Instance model should be reverted to the config default
         assert instance.model == config.default_model
 
+    @pytest.mark.asyncio
+    async def test_reset_reverts_codex_install_to_default(self):
+        """
+        /settings reset model on a wizard-generated codex install with
+        LLM_PROVIDER unset must revert to the wizard's DEFAULT_MODEL
+        (e.g. gpt-5.5), not PROVIDER_DEFAULTS["openai"] (gpt-5.4).
+        Regression for PR #489 re-review: get_effective_provider had
+        to be taught the codex->openai rule so _revert_instance_field
+        sees provider==effective_global and lands on config.default_model
+        rather than the provider-default fallback branch.
+        """
+        update = _make_update(text="/settings reset model")
+        config = _make_config(
+            agent_backend="codex",
+            llm_provider="",
+            default_model="gpt-5.5",
+        )
+        pool = _make_mock_claude(provider="openai")
+        instance = MagicMock()
+        instance.model = "gpt-5.4-mini"
+        instance.provider = "openai"
+        pool.get_if_exists = MagicMock(return_value=instance)
+        ctx = _make_context(config=config, pool=pool, args=["reset", "model"])
+        mock_sessions = self._mock_sessions()
+
+        with self._patches(mock_sessions):
+            await handle_settings(update, ctx)
+
+        # Reverts to the wizard's codex DEFAULT_MODEL, NOT PROVIDER_DEFAULTS
+        # ["openai"] (gpt-5.4), which would silently move the user off
+        # gpt-5.5 on a stock codex install.
+        assert instance.model == "gpt-5.5"
+
     # ── 18. Reset all reverts all instance fields ─────────────────
 
     @pytest.mark.asyncio

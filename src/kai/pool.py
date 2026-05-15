@@ -123,13 +123,15 @@ class SubprocessPool:
         # resolver so codex always reports provider="openai" even when
         # llm_provider is unset, matching the same cascade bot.py and
         # the install-time validator use. Without this, a user with
-        # `agent_backend: codex` on a globally-claude install ends up
-        # with effective_provider="" and the fallback below dispatches
+        # `agent_backend: codex` on a globally-claude install ended up
+        # with effective_provider="" and the fallback below dispatched
         # the global default_model ("sonnet"), which codex CLI rejects.
         backend, effective_provider = get_user_backend_and_provider(user, self._config)
+        # get_effective_provider hardcodes the backend->provider rule for
+        # claude (anthropic) and codex (openai) so global_provider lines
+        # up with effective_provider whenever the user has not overridden
+        # the backend; no codex-specific patch needed here.
         global_provider = get_effective_provider(self._config.agent_backend, self._config.llm_provider)
-        if self._config.agent_backend == "codex":
-            global_provider = "openai"
 
         # Per-user model. When the user's effective backend differs
         # from the global one, the global default_model may not be

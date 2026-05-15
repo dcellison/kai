@@ -277,11 +277,20 @@ def _check_model_registry_complete(backend: str) -> None:
 def get_effective_provider(backend: str, llm_provider: str) -> str:
     """Derive the effective provider from backend + llm_provider.
 
-    The Claude backend always uses Anthropic models. All other
-    backends use whatever provider is configured.
+    Claude is always anthropic; codex is always openai (codex CLI has
+    no other provider surface, so a wizard-generated codex install with
+    LLM_PROVIDER unset still needs the runtime to know its provider is
+    openai). Goose is the only backend that consults the raw
+    llm_provider, because it routes to whatever provider the user
+    configured. Kept identical to the backend->provider rule
+    get_user_backend_and_provider uses so the two cascade helpers do
+    not drift; any caller resolving an effective provider for a
+    backend gets the same answer regardless of which helper it uses.
     """
     if backend == "claude":
         return "anthropic"
+    if backend == "codex":
+        return "openai"
     return llm_provider
 
 
