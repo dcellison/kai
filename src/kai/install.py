@@ -1792,10 +1792,14 @@ def _generate_sudoers(
     Falls back to /bin/cat and /usr/bin/tee if the binaries aren't found
     in the current PATH (e.g., when running in a minimal environment).
 
-    Per-user `(target_user) SETENV: NOPASSWD:` rules for the claude binary are
-    emitted for every distinct user in `os_users` and `claude_user` combined.
-    Users matching `service_user` are skipped (the runtime detects self-sudo
-    via resolve_claude_user() and spawns claude directly without sudo).
+    Per-user `(target_user) SETENV: NOPASSWD:` rules for the claude and codex
+    binaries (plus a `NOPASSWD: /bin/kill` rule for the cross-user kill
+    escalation) are emitted for every distinct user in `os_users` and
+    `claude_user` combined. Users matching `service_user` are skipped (the
+    runtime detects self-sudo via resolve_claude_user() and spawns the agent
+    directly without sudo). The codex binary path defaults to
+    /opt/homebrew/bin/codex; Linux installs override with the CODEX_BIN env
+    var at install time.
 
     Args:
         service_user: The OS username that runs the Kai service.
