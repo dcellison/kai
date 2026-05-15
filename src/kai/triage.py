@@ -593,21 +593,31 @@ def _extract_codex_text(stdout: str) -> str:
     """
     Walk codex's NDJSON event stream and return the agent message text.
 
-    `codex exec --json` emits one JSON event per line. The relevant
-    payload (the agent's final response) lives inside an item event;
-    the exact event name and field path are not yet pinned by smoke
+    `codex exec --json` emits one JSON event per line. A streaming run
+    can produce two representations of the same message: incremental
+    chunks (delta events) and a single terminal/complete event that
+    carries the full consolidated text. Accumulating across both
+    representations would double the message; this parser prefers
+    the terminal text and only falls back to delta accumulation when
+    no terminal event appears in the stream.
+
+    The exact event name and field path are not yet pinned by smoke
     test, so this parser is defensive about field names:
 
     - Each line is attempted as JSON; non-JSON lines are skipped.
-    - Within each parsed object, text content is recovered from any
-      of: top-level "text"; "content" as a string; "content" as a
-      list of {"type": "text", "text": ...} blocks (the JSON-RPC
-      convention used by goose ACP); "delta.text"; "item.content"
-      with the same list shape.
-    - All recovered text is concatenated in order; partial recoveries
-      are returned rather than raising, on the assumption that the
-      caller's JSON parser will surface a clearer error if the
-      result is malformed.
+    - Terminal/complete events are recognized by their FIELD PATH
+      rather than by an event-name string. Any of these signals a
+      complete message: top-level "content" as a string, top-level
+      "content" as a list of {"type":"text", "text":...} blocks, or
+      "item.content" with the same list shape. When multiple
+      terminal events appear, the last one wins (matches the
+      streaming convention that "completed" supersedes prior partials).
+    - Chunk/delta events use "delta.text" or a top-level "text"
+      field. Chunks accumulate in order. Used only when the stream
+      contains no terminal event.
+    - On any genuine schema mismatch the result is the empty string;
+      `_parse_triage_json` then raises a clearer error than a
+      doubled-up partial would.
 
     The smoke test against a real codex CLI will reveal which of
     these field paths actually fire for the pinned version; the
@@ -617,10 +627,12 @@ def _extract_codex_text(stdout: str) -> str:
         stdout: The full stdout from `codex exec --json`.
 
     Returns:
-        The accumulated agent message text. Empty string if no
-        recognizable text content was found in any event.
+        The agent message text. Terminal text if any terminal event
+        was found; otherwise the accumulated delta/chunk text. Empty
+        string if no recognizable text was found in any event.
     """
-    chunks: list[str] = []
+    terminal_text: str | None = None
+    accumulated_chunks: list[str] = []
     for line in stdout.splitlines():
         line = line.strip()
         if not line:
@@ -629,50 +641,83 @@ def _extract_codex_text(stdout: str) -> str:
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
-        chunks.extend(_recover_text_from_event(obj))
-    return "".join(chunks).strip()
+        # Terminal event wins; the most recent terminal event
+        # supersedes earlier ones (a streaming run that emits
+        # interim consolidated events before the final one ends
+        # up with the latest version).
+        terminal = _recover_terminal_text(obj)
+        if terminal is not None:
+            terminal_text = terminal
+            continue
+        # Delta/chunk events accumulate, but only matter when no
+        # terminal event ever fires.
+        chunk = _recover_chunk_text(obj)
+        if chunk is not None:
+            accumulated_chunks.append(chunk)
+    if terminal_text is not None:
+        return terminal_text.strip()
+    return "".join(accumulated_chunks).strip()
 
 
-def _recover_text_from_event(obj: dict) -> list[str]:
+def _recover_terminal_text(obj: dict) -> str | None:
     """
-    Pull text content out of one codex NDJSON event.
+    Pull a complete/terminal agent message from one codex event.
 
-    Defensive: tries multiple field paths the codex CLI is observed
-    or documented to use, and returns whatever text it finds. An
-    event with no recognizable text payload contributes nothing.
+    Recognized field paths for a complete message:
+    - Top-level "content" as a string (single-block shape).
+    - Top-level "content" as a list of {"type":"text", "text":...} blocks.
+    - "item.content" with the same list-of-blocks shape (events
+      wrapped in an "item" object).
+
+    Returns the consolidated text string, or None if the event has
+    none of these paths (and is therefore either a chunk/delta or
+    pure metadata).
     """
-    out: list[str] = []
-    # Top-level text field (common shape for "delta" events)
-    text = obj.get("text")
-    if isinstance(text, str):
-        out.append(text)
-    # delta.text (alternate streaming shape)
-    delta = obj.get("delta")
-    if isinstance(delta, dict):
-        d_text = delta.get("text")
-        if isinstance(d_text, str):
-            out.append(d_text)
-    # content as a string OR as a list of {type: text, text: ...} blocks
     content = obj.get("content")
     if isinstance(content, str):
-        out.append(content)
-    elif isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                b_text = block.get("text")
-                if isinstance(b_text, str):
-                    out.append(b_text)
-    # item.content for events wrapped in an "item" object
+        return content
+    if isinstance(content, list):
+        parts = [
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
+        ]
+        if parts:
+            return "".join(parts)
     item = obj.get("item")
     if isinstance(item, dict):
         i_content = item.get("content")
         if isinstance(i_content, list):
-            for block in i_content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    b_text = block.get("text")
-                    if isinstance(b_text, str):
-                        out.append(b_text)
-    return out
+            parts = [
+                block["text"]
+                for block in i_content
+                if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
+            ]
+            if parts:
+                return "".join(parts)
+    return None
+
+
+def _recover_chunk_text(obj: dict) -> str | None:
+    """
+    Pull a streaming chunk/delta text fragment from one codex event.
+
+    Recognized field paths for an incremental chunk:
+    - "delta.text" (the conventional streaming-delta shape).
+    - Top-level "text" string (an alternate shape some CLI versions emit).
+
+    Returns the fragment text, or None if the event has no chunk-style
+    text field.
+    """
+    delta = obj.get("delta")
+    if isinstance(delta, dict):
+        d_text = delta.get("text")
+        if isinstance(d_text, str):
+            return d_text
+    text = obj.get("text")
+    if isinstance(text, str):
+        return text
+    return None
 
 
 def _parse_triage_json(raw: str) -> dict:

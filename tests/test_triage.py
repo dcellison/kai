@@ -778,6 +778,35 @@ class TestRunTriageCodex:
         ):
             await run_triage("prompt", agent_backend="codex")
 
+    @pytest.mark.asyncio
+    async def test_codex_handles_streaming_deltas_plus_terminal(self):
+        """
+        End-to-end through run_triage: a stream that contains both
+        delta chunks AND a terminal consolidated message returns the
+        terminal JSON exactly once, parseable by _parse_triage_json.
+
+        This is the integration counterpart to
+        TestExtractCodexText::test_terminal_text_wins_over_accumulated_deltas.
+        Without the terminal-wins rule, the triage path would return
+        a doubled JSON string (`{"labels":[]}{"labels":[]}`) and the
+        downstream parser would fail on every codex run that streams.
+        """
+        expected_json = '{"labels": ["bug"], "summary": "ok"}'
+        events = [
+            {"event": "delta", "delta": {"text": '{"labels":'}},
+            {"event": "delta", "delta": {"text": ' ["bug"], "summary": "ok"}'}},
+            {
+                "event": "item.message.completed",
+                "item": {"content": [{"type": "text", "text": expected_json}]},
+            },
+        ]
+        stream = "\n".join(json.dumps(e) for e in events) + "\n"
+        mock_proc = _mock_subprocess(stdout=stream)
+        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await run_triage("prompt", agent_backend="codex")
+        # Exactly the terminal JSON, not deltas + terminal concatenated.
+        assert result == expected_json
+
 
 class TestExtractCodexText:
     """
@@ -851,6 +880,55 @@ class TestExtractCodexText:
         """The accumulated result has leading/trailing whitespace stripped."""
         stream = json.dumps({"text": "  hello  "}) + "\n"
         assert _extract_codex_text(stream) == "hello"
+
+    def test_terminal_text_wins_over_accumulated_deltas(self):
+        """
+        A stream with both delta chunks and a terminal consolidated
+        message returns the terminal text exactly once, NOT the
+        deltas concatenated with the terminal.
+
+        Without the terminal-wins rule, the parser would yield
+        `"HelloHello"` for the worked example below: triage's JSON
+        parser then fails because `{"labels":[]}{"labels":[]}` is
+        not a single JSON object, breaking the triage path on
+        every codex run that streams. This regression guard
+        protects against a future refactor that re-introduces
+        accumulate-across-representations.
+        """
+        events = [
+            {"event": "delta", "delta": {"text": "Hel"}},
+            {"event": "delta", "delta": {"text": "lo"}},
+            {"event": "item.message.completed", "item": {"content": [{"type": "text", "text": "Hello"}]}},
+        ]
+        stream = "\n".join(json.dumps(e) for e in events) + "\n"
+        assert _extract_codex_text(stream) == "Hello"
+
+    def test_last_terminal_wins_on_multiple_terminals(self):
+        """
+        When a stream emits more than one terminal/complete event
+        (e.g. an interim consolidated text followed by a final one),
+        the most recent terminal text wins. Mirrors the streaming
+        convention that "completed" supersedes prior partials.
+        """
+        events = [
+            {"item": {"content": [{"type": "text", "text": "first"}]}},
+            {"item": {"content": [{"type": "text", "text": "final"}]}},
+        ]
+        stream = "\n".join(json.dumps(e) for e in events) + "\n"
+        assert _extract_codex_text(stream) == "final"
+
+    def test_deltas_only_when_no_terminal(self):
+        """
+        With no terminal event, delta chunks accumulate as the result.
+        Locks the fallback behavior the terminal-wins rule does not
+        short-circuit when no terminal text was emitted.
+        """
+        events = [
+            {"event": "delta", "delta": {"text": "Hel"}},
+            {"event": "delta", "delta": {"text": "lo"}},
+        ]
+        stream = "\n".join(json.dumps(e) for e in events) + "\n"
+        assert _extract_codex_text(stream) == "Hello"
 
 
 class TestResolveGooseModelTriage:
