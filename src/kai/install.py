@@ -1859,6 +1859,14 @@ def _generate_sudoers(
         # rule and breaking the bot's sudo dispatch.
         svc_home = _user_home(service_user)
         claude_bin = f"{svc_home}/.local/bin/claude"
+        # Codex binary path: resolved against the service user's PATH
+        # (the same PATH sudo will use when dispatching the rule).
+        # Falls back to a likely Homebrew location so the install
+        # doesn't break when codex isn't on root's PATH at apply time.
+        # Operators who installed codex via npm or to a non-standard
+        # path may need to edit /etc/sudoers.d/kai post-install; the
+        # smoke-test phase reveals this.
+        codex_bin = shutil.which("codex") or "/opt/homebrew/bin/codex"
         # kill(1) for the cross-user kill escalation (#456). The bot
         # runs `sudo -n -u <target> /bin/kill -<sig> <pid>` against
         # the inner claude grandchild because POSIX signal permissions
@@ -1906,6 +1914,7 @@ def _generate_sudoers(
         """)
         for target in target_users:
             rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {claude_bin}\n"
+            rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {codex_bin}\n"
             rules += f"{service_user} ALL=({target}) NOPASSWD: {kill_bin}\n"
 
     return rules

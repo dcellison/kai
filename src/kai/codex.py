@@ -50,7 +50,7 @@ from kai.backend import (
     ensure_user_preferences,
     prepend_to_prompt,
 )
-from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file
+from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +96,17 @@ class CodexBackend(AgentBackend):
         workspace_config: WorkspaceConfig | None = None,
         max_context_window: int = 0,
         provider: str = "openai",
+        # Optional OS user to run codex as via `sudo -H -u <user>`. When
+        # set, the codex subprocess runs as <codex_user> and reads its
+        # auth token from ~<codex_user>/.codex/auth.json, NOT the kai
+        # service user's home. This is the multi-user OAuth-isolation
+        # lever: a kai install that runs as service user "kai" but has
+        # users.yaml entries with os_user="daniel" / os_user="scott"
+        # spawns a codex subprocess as the per-user os_user, picking
+        # up that user's own codex login. Mirrors ClaudeCodeBackend's
+        # claude_user kwarg. Default None means "run as the service
+        # user" (single-user install or test fixture).
+        codex_user: str | None = None,
         # Operator-intent flag for the memory subsystem (Config.
         # memory_enabled). Drives the [Memory subsystem: ...] marker
         # emission and gates MEMORY.md inject in build_session_context.
@@ -115,6 +126,7 @@ class CodexBackend(AgentBackend):
         self.workspace_config = workspace_config
         self.max_context_window = max_context_window
         self.provider = provider  # ABC-mandated; bot.py reads this
+        self.codex_user = codex_user
         self.memory_enabled = memory_enabled
 
         # API context for session injection (passed to build_session_context)
@@ -193,20 +205,52 @@ class CodexBackend(AgentBackend):
         if self._api_context.webhook_secret:
             env["KAI_WEBHOOK_SECRET"] = self._api_context.webhook_secret
 
+        # Build the argv. Codex runs either as the bot's process user
+        # (single-user install or self-sudo) or as a per-user os_user
+        # (multi-user install where each users.yaml entry has its own
+        # ~/.codex/auth.json). resolve_claude_user is named claude-
+        # historically but its body is backend-agnostic: it returns
+        # None when codex_user matches the bot's own user (skipping
+        # an unnecessary self-sudo) and the value unchanged otherwise.
+        effective_codex_user = resolve_claude_user(self.codex_user)
+
+        codex_argv = ["codex", "app-server"]
+        if effective_codex_user:
+            # -H sets HOME to <codex_user>'s pw entry so codex reads
+            # auth from ~<codex_user>/.codex/auth.json, not the bot's
+            # home. --preserve-env passes KAI_WEBHOOK_SECRET and
+            # TMPDIR through sudo's env_reset (the SETENV: sudoers
+            # rule allows this). Mirrors claude.py's sudo construction.
+            argv: list[str] = [
+                "sudo",
+                "-H",
+                "-u",
+                effective_codex_user,
+                "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR",
+                "--",
+            ] + codex_argv
+        else:
+            argv = codex_argv
+
         log.info(
-            "Starting persistent Codex app-server process (model=%s, provider=%s)",
+            "Starting persistent Codex app-server process (model=%s, provider=%s, user=%s)",
             self.model,
             self.provider,
+            effective_codex_user or "(same as bot)",
         )
 
         self._proc = await asyncio.create_subprocess_exec(
-            "codex",
-            "app-server",
+            *argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.workspace),
             env=env,
+            # Cross-user mode: new session group so the entire tree
+            # (sudo + codex) can be killed via SIGKILL. Without this,
+            # killing sudo orphans the codex grandchild. Same shape
+            # claude.py uses.
+            start_new_session=bool(effective_codex_user),
             limit=1024 * 1024,  # 1MB per-line buffer
         )
         self._stderr_task = asyncio.create_task(self._drain_stderr())

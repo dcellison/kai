@@ -418,12 +418,15 @@ class TestGenerateSudoers:
         """Acceptance (c, dedupe): repeated os_user values produce one ruleset each."""
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
         result = _generate_sudoers("kai", os_users=["sellison", "sellison", "bob"])
-        # Each target gets two rules now (claude + kill, #456). Count
-        # the claude rules specifically to verify dedup at the target
-        # level - the kill rules add their own occurrences of "(name)"
-        # so a bare count("(name)") would double.
-        assert result.count("kai ALL=(sellison) SETENV: NOPASSWD: ") == 1
-        assert result.count("kai ALL=(bob) SETENV: NOPASSWD: ") == 1
+        # Each target gets three rules: claude SETENV (#456), codex
+        # SETENV (per-user codex OAuth isolation), and kill. The
+        # claude rule's binary path uniquely identifies one rule per
+        # target, so counting on the full prefix verifies dedup
+        # without the kill-rule or codex-rule noise inflating the
+        # count.
+        claude_bin = "/home/kai/.local/bin/claude"
+        assert result.count(f"kai ALL=(sellison) SETENV: NOPASSWD: {claude_bin}") == 1
+        assert result.count(f"kai ALL=(bob) SETENV: NOPASSWD: {claude_bin}") == 1
 
     def test_os_user_matching_service_user_skipped(self, monkeypatch):
         """Acceptance (d): os_user == service_user → no rule (self-sudo path)."""
@@ -440,12 +443,42 @@ class TestGenerateSudoers:
         """Legacy CLAUDE_USER and yaml os_users coexist; deduped."""
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
         # claude_user and os_users overlap on "alice"; should produce
-        # one ruleset (claude + kill rules, #456) for each distinct
-        # target. Count claude rules specifically to skip kill-rule
-        # noise on the same target name.
+        # one ruleset (claude + codex + kill rules) for each distinct
+        # target. Counting on the full claude-rule prefix verifies
+        # dedup at the target level without the codex-rule or
+        # kill-rule occurrences inflating the count.
         result = _generate_sudoers("kai", claude_user="alice", os_users=["alice", "bob"])
-        assert result.count("kai ALL=(alice) SETENV: NOPASSWD: ") == 1
-        assert result.count("kai ALL=(bob) SETENV: NOPASSWD: ") == 1
+        claude_bin = "/home/kai/.local/bin/claude"
+        assert result.count(f"kai ALL=(alice) SETENV: NOPASSWD: {claude_bin}") == 1
+        assert result.count(f"kai ALL=(bob) SETENV: NOPASSWD: {claude_bin}") == 1
+
+    # -- Codex per-target rule (per-user OAuth isolation) ----------------
+
+    def test_codex_rule_emitted_per_target(self, monkeypatch):
+        """
+        Each per-target ruleset includes a NOPASSWD rule for the codex
+        binary alongside the claude rule. The bot spawns
+        `sudo -H -u <target> -- codex app-server` so codex reads
+        ~<target>/.codex/auth.json instead of the service user's home;
+        without this sudoers rule, the spawn fails with "a password is
+        required" and the codex backend cannot start for any user
+        whose os_user differs from the service user.
+        """
+        monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
+        # shutil.which("codex") may not find codex in the test env; the
+        # function falls back to /opt/homebrew/bin/codex in that case.
+        # Either path is a valid codex location.
+        result = _generate_sudoers("kai", os_users=["alice", "bob"])
+        # Each target gets exactly one codex SETENV rule. The binary
+        # path is not pinned in the assertion (shutil.which is
+        # environment-dependent); match on the rule prefix instead.
+        assert "kai ALL=(alice) SETENV: NOPASSWD: " in result
+        assert "kai ALL=(bob) SETENV: NOPASSWD: " in result
+        # Specifically: a line referencing "codex" appears under each target.
+        alice_lines = [line for line in result.splitlines() if "(alice)" in line and "codex" in line]
+        bob_lines = [line for line in result.splitlines() if "(bob)" in line and "codex" in line]
+        assert len(alice_lines) == 1, alice_lines
+        assert len(bob_lines) == 1, bob_lines
 
     # -- Issue #456: per-target kill rule for cross-user signal escalation ----
 

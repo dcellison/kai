@@ -727,16 +727,48 @@ class TestRunTriageCodex:
         assert cmd[i + 1] == "gpt-5.4"
 
     @pytest.mark.asyncio
-    async def test_codex_no_sudo_even_with_claude_user(self):
+    async def test_codex_no_sudo_when_user_unset(self):
         """
-        claude_user is a claude-specific sudo argument. The codex
-        branch ignores it; argv must NOT contain "sudo".
+        With no claude_user passed, codex runs as the bot process user
+        directly: argv begins with "codex", no "sudo" wrap.
         """
         mock_proc = _mock_subprocess(stdout=self._codex_ndjson("{}"))
         with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_triage("prompt", agent_backend="codex", claude_user="some-user")
+            await run_triage("prompt", agent_backend="codex")
         cmd = mock_exec.call_args[0]
+        assert cmd[0] == "codex"
         assert "sudo" not in cmd
+
+    @pytest.mark.asyncio
+    async def test_codex_wraps_sudo_when_user_set(self):
+        """
+        With claude_user set to a non-self user, codex argv is wrapped
+        in `sudo -H -u <user> --preserve-env=KAI_WEBHOOK_SECRET --`.
+        The per-user os_user lever is what makes a multi-user install
+        spawn codex as each user, reading their per-user ~/.codex/auth.json.
+
+        The current process user is determined at runtime; this test
+        passes a username that cannot match the test runner's user
+        ("ci-fake-user") so resolve_claude_user does NOT short-circuit
+        to no-sudo. If the test runner happens to actually be named
+        "ci-fake-user", the test would self-sudo-skip; that name is
+        chosen to be implausible enough to avoid the collision.
+        """
+        mock_proc = _mock_subprocess(stdout=self._codex_ndjson("{}"))
+        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_triage("prompt", agent_backend="codex", claude_user="ci-fake-user")
+        cmd = mock_exec.call_args[0]
+        # Sudo wrap is present and points at the target user.
+        assert cmd[0] == "sudo"
+        assert "-H" in cmd
+        i = cmd.index("-u")
+        assert cmd[i + 1] == "ci-fake-user"
+        # KAI_WEBHOOK_SECRET preserved through sudo's env_reset.
+        assert any(arg.startswith("--preserve-env=") and "KAI_WEBHOOK_SECRET" in arg for arg in cmd)
+        # Codex binary still gets invoked after the sudo wrap.
+        assert "codex" in cmd
+        codex_i = cmd.index("codex")
+        assert cmd[codex_i + 1] == "exec"
 
     @pytest.mark.asyncio
     async def test_codex_no_max_budget_flag(self):

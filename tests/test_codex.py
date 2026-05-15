@@ -1020,3 +1020,78 @@ class TestSubprocessConstruction:
 
         call_kwargs = mock_exec.call_args[1]
         assert call_kwargs["env"]["KAI_WEBHOOK_SECRET"] == "s3cr3t"
+
+
+# ── Per-user OAuth isolation (codex_user / sudo wrap) ─────────────
+
+
+class TestCodexUserSudoWrap:
+    """
+    Verify the per-user OAuth isolation lever.
+
+    When codex_user is set to a non-self user, the subprocess argv is
+    wrapped in `sudo -H -u <user> --preserve-env=KAI_WEBHOOK_SECRET,TMPDIR --`
+    so codex runs as <codex_user> and reads
+    ~<codex_user>/.codex/auth.json. This is what makes a multi-user
+    install (e.g., users.yaml has os_user=daniel for one chat and
+    os_user=scott for another) actually use each user's own codex
+    login, instead of falling back to the service user's auth.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_sudo_when_codex_user_unset(self):
+        """Default (codex_user=None): argv starts with "codex", no sudo."""
+        c = _make_codex()
+        proc = _make_mock_proc(_handshake_lines())
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await c._ensure_started()
+        argv = mock_exec.call_args[0]
+        assert argv[0] == "codex"
+        assert "sudo" not in argv
+
+    @pytest.mark.asyncio
+    async def test_sudo_wraps_argv_when_codex_user_set(self):
+        """
+        codex_user="ci-fake-user" produces sudo-wrapped argv with the
+        right flags. The implausible username avoids the self-sudo
+        short-circuit in resolve_claude_user (which would skip the
+        wrap if the value matched the test runner's actual user).
+        """
+        c = _make_codex(codex_user="ci-fake-user")
+        proc = _make_mock_proc(_handshake_lines())
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await c._ensure_started()
+        argv = mock_exec.call_args[0]
+        assert argv[0] == "sudo"
+        assert "-H" in argv
+        i = argv.index("-u")
+        assert argv[i + 1] == "ci-fake-user"
+        # KAI_WEBHOOK_SECRET and TMPDIR preserved through sudo's env_reset.
+        assert any(
+            arg.startswith("--preserve-env=") and "KAI_WEBHOOK_SECRET" in arg and "TMPDIR" in arg for arg in argv
+        )
+        # Codex binary follows the sudo prologue.
+        codex_i = argv.index("codex")
+        assert argv[codex_i + 1] == "app-server"
+
+    @pytest.mark.asyncio
+    async def test_start_new_session_when_codex_user_set(self):
+        """
+        Cross-user mode uses start_new_session=True so killing sudo
+        also kills the codex grandchild (otherwise the codex process
+        orphans when sudo dies).
+        """
+        c = _make_codex(codex_user="ci-fake-user")
+        proc = _make_mock_proc(_handshake_lines())
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await c._ensure_started()
+        assert mock_exec.call_args[1]["start_new_session"] is True
+
+    @pytest.mark.asyncio
+    async def test_start_new_session_false_when_codex_user_unset(self):
+        """Single-user mode does not need a new session group."""
+        c = _make_codex()
+        proc = _make_mock_proc(_handshake_lines())
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await c._ensure_started()
+        assert mock_exec.call_args[1]["start_new_session"] is False

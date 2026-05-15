@@ -199,6 +199,14 @@ class SubprocessPool:
                 memory_enabled=self._config.memory_enabled,
             )
 
+        # os_user for sudo -u isolation. None = run as bot user.
+        # Resolved here (rather than inside each branch) because both
+        # ClaudeCodeBackend and CodexBackend consume it for per-user
+        # subprocess isolation. Goose is the only backend that does
+        # not: goose runs as the service user and bills against a
+        # single GOOSE_PROVIDER auth set in /etc/kai/env.
+        os_user = user.os_user if user else self._config.claude_user
+
         if backend == "codex":
             # Import locally so codex.py is only imported on a
             # codex-active install. Mirrors the goose pattern above
@@ -218,12 +226,9 @@ class SubprocessPool:
                 workspace_config=ws_config,
                 max_context_window=context_window,
                 provider="openai",
+                codex_user=os_user,
                 memory_enabled=self._config.memory_enabled,
             )
-
-        # os_user for sudo -u isolation. None = run as bot user.
-        # Only relevant for ClaudeCodeBackend (Goose / Codex don't use sudo).
-        os_user = user.os_user if user else self._config.claude_user
 
         return ClaudeCodeBackend(
             model=model,

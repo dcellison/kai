@@ -419,9 +419,12 @@ async def run_triage(
         # The final agent message text is recovered by walking the
         # events and accumulating any text content; see
         # _extract_codex_text() below for the schema-defensive parser.
-        # No sudo: codex on subscription auth uses the service user's
-        # own ~/.codex/auth.json; per-user OAuth isolation is the
-        # os_user lever in users.yaml (post-#353), not a sudo wrap.
+        # Per-user OAuth isolation: when claude_user is set (the
+        # webhook handler passes the same os_user value to both
+        # backends through this parameter), wrap the codex argv in
+        # `sudo -H -u <user>` so codex reads ~<user>/.codex/auth.json
+        # instead of the service user's home. The parameter name is
+        # claude-historical; rename is out of scope for this fix.
         # No --max-budget-usd: codex on subscription auth has no
         # per-call billing; runaway protection comes from
         # _TRIAGE_TIMEOUT at the asyncio.wait_for below.
@@ -430,7 +433,7 @@ async def run_triage(
             agent_backend,
             override=os.environ.get("ISSUE_TRIAGE_MODEL_CODEX", ""),
         )
-        cmd = [
+        codex_cmd = [
             "codex",
             "exec",
             "--json",
@@ -438,11 +441,33 @@ async def run_triage(
             triage_model,
         ]
 
+        # Resolve self-sudo: skip the sudo wrap when claude_user matches
+        # the bot process user. Mirrors the claude branch's pattern.
+        effective_user = resolve_claude_user(claude_user)
+        if effective_user:
+            # -H sets HOME to <effective_user>'s pw entry so codex
+            # reads auth from the right home. --preserve-env passes
+            # KAI_WEBHOOK_SECRET through sudo's env_reset (the SETENV:
+            # sudoers rule allows this). Same shape claude uses.
+            cmd = [
+                "sudo",
+                "-H",
+                "-u",
+                effective_user,
+                "--preserve-env=KAI_WEBHOOK_SECRET",
+                "--",
+            ] + codex_cmd
+        else:
+            cmd = codex_cmd
+
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # New session group in cross-user mode so killing sudo
+            # also kills the codex grandchild (mirrors claude branch).
+            start_new_session=bool(effective_user),
         )
 
         try:
@@ -451,7 +476,17 @@ async def run_triage(
                 timeout=_TRIAGE_TIMEOUT,
             )
         except TimeoutError:
-            proc.kill()
+            # Kill the subprocess tree if it exceeds the timeout. In
+            # cross-user mode (effective_user set) the process is in
+            # a new group (PGID == PID); kill the group so both sudo
+            # and the codex grandchild die, preventing orphans.
+            if effective_user:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # Already dead
+            else:
+                proc.kill()
             await proc.wait()
             raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from None
 
