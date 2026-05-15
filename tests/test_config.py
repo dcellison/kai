@@ -2001,3 +2001,222 @@ class TestModelRegistry:
         from kai.eval.behavioral import _DEFAULT_GEN_MODEL
 
         assert get_model_for(ModelRole.BEHAVIORAL_GEN, "claude") == _DEFAULT_GEN_MODEL
+
+
+# ── Codex wizard hardening: backend-aware model validation ───────────
+
+
+class TestCodexModelsSurface:
+    """Lock the codex-vs-goose separation at the data layer.
+
+    PROVIDER_MODELS["openai"] is goose's openai-API surface;
+    CODEX_MODELS is codex CLI's separate surface. They are independent
+    constants with no overlap requirement and no fallback path.
+    """
+
+    def test_codex_models_includes_gpt55_and_codex_variants(self):
+        from kai.config import CODEX_MODELS
+
+        assert "gpt-5.5" in CODEX_MODELS
+        assert "gpt-5.3-codex" in CODEX_MODELS
+        assert "gpt-5.3-codex-spark" in CODEX_MODELS
+        assert "gpt-5.2" in CODEX_MODELS
+
+    def test_codex_models_excludes_nano(self):
+        from kai.config import CODEX_MODELS
+
+        assert "gpt-5.4-nano" not in CODEX_MODELS
+
+    def test_provider_models_openai_keeps_nano_for_goose(self):
+        from kai.config import PROVIDER_MODELS
+
+        assert "gpt-5.4-nano" in PROVIDER_MODELS["openai"]
+
+    def test_codex_default_model_is_gpt55(self):
+        from kai.config import CODEX_DEFAULT_MODEL
+
+        assert CODEX_DEFAULT_MODEL == "gpt-5.5"
+
+    def test_provider_defaults_openai_unchanged(self):
+        from kai.config import PROVIDER_DEFAULTS
+
+        assert PROVIDER_DEFAULTS["openai"] == "gpt-5.4"
+
+
+class TestValidateModelForBackend:
+    """Backend-aware validator."""
+
+    def test_codex_accepts_codex_models(self):
+        from kai.config import validate_model_for_backend
+
+        assert validate_model_for_backend("gpt-5.5", "codex", "openai") is True
+        assert validate_model_for_backend("gpt-5.4-mini", "codex", "openai") is True
+
+    def test_codex_rejects_nano_even_though_in_openai_provider_list(self):
+        from kai.config import PROVIDER_MODELS, validate_model_for_backend
+
+        assert "gpt-5.4-nano" in PROVIDER_MODELS["openai"]
+        assert validate_model_for_backend("gpt-5.4-nano", "codex", "openai") is False
+
+    def test_codex_rejects_claude_models(self):
+        from kai.config import validate_model_for_backend
+
+        assert validate_model_for_backend("opus", "codex", "openai") is False
+
+    def test_goose_openai_accepts_nano(self):
+        from kai.config import validate_model_for_backend
+
+        assert validate_model_for_backend("gpt-5.4-nano", "goose", "openai") is True
+
+    def test_claude_accepts_anthropic_models(self):
+        from kai.config import validate_model_for_backend
+
+        assert validate_model_for_backend("opus", "claude", "anthropic") is True
+
+
+class TestModelsForBackend:
+    """Wizard/runtime model-keyboard list helper."""
+
+    def test_codex_returns_codex_models(self):
+        from kai.config import CODEX_MODELS, models_for_backend
+
+        assert models_for_backend("codex", "openai") is CODEX_MODELS
+
+    def test_goose_openai_returns_openai_provider_models(self):
+        from kai.config import PROVIDER_MODELS, models_for_backend
+
+        assert models_for_backend("goose", "openai") is PROVIDER_MODELS["openai"]
+
+    def test_claude_returns_anthropic_provider_models(self):
+        from kai.config import PROVIDER_MODELS, models_for_backend
+
+        assert models_for_backend("claude", "anthropic") is PROVIDER_MODELS["anthropic"]
+
+    def test_open_ended_provider_returns_none(self):
+        from kai.config import models_for_backend
+
+        assert models_for_backend("goose", "openrouter") is None
+
+
+class TestGetUserBackendAndProvider:
+    """Per-user cascade resolver."""
+
+    def _config(self, agent_backend="claude", llm_provider=""):
+        cfg = MagicMock()
+        cfg.agent_backend = agent_backend
+        cfg.llm_provider = llm_provider
+        return cfg
+
+    def _user_config(self, agent_backend=None, llm_provider=None):
+        uc = MagicMock()
+        uc.agent_backend = agent_backend
+        uc.llm_provider = llm_provider
+        return uc
+
+    def test_no_user_config_returns_global(self):
+        from kai.config import get_user_backend_and_provider
+
+        cfg = self._config(agent_backend="claude")
+        backend, provider = get_user_backend_and_provider(None, cfg)
+        assert backend == "claude"
+        assert provider == "anthropic"
+
+    def test_user_backend_overrides_global(self):
+        from kai.config import get_user_backend_and_provider
+
+        cfg = self._config(agent_backend="claude")
+        uc = self._user_config(agent_backend="codex")
+        backend, provider = get_user_backend_and_provider(uc, cfg)
+        assert backend == "codex"
+        assert provider == "openai"
+
+    def test_global_codex_user_goose_returns_goose(self):
+        from kai.config import get_user_backend_and_provider
+
+        cfg = self._config(agent_backend="codex")
+        uc = self._user_config(agent_backend="goose", llm_provider="openai")
+        backend, provider = get_user_backend_and_provider(uc, cfg)
+        assert backend == "goose"
+        assert provider == "openai"
+
+    def test_codex_provider_is_openai_regardless_of_llm_provider(self):
+        from kai.config import get_user_backend_and_provider
+
+        cfg = self._config(agent_backend="codex")
+        uc = self._user_config(agent_backend="codex", llm_provider="anthropic")
+        backend, provider = get_user_backend_and_provider(uc, cfg)
+        assert backend == "codex"
+        assert provider == "openai"
+
+
+class TestAgentTimeoutSecondsRename:
+    """CLAUDE_TIMEOUT_SECONDS -> AGENT_TIMEOUT_SECONDS rename with legacy alias."""
+
+    def _required_env(self, monkeypatch, **overrides):
+        for var in _CONFIG_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        base = {
+            "TELEGRAM_BOT_TOKEN": "test-token",
+            "ALLOWED_USER_IDS": "12345",
+            "DEFAULT_MODEL": "sonnet",
+            "BUDGET_CEILING": "10.0",
+            "WEBHOOK_PORT": "8080",
+            "WEBHOOK_SECRET": "test-secret",
+        }
+        base.update(overrides)
+        for k, v in base.items():
+            monkeypatch.setenv(k, v)
+
+    def test_agent_timeout_seconds_preferred(self, monkeypatch):
+        self._required_env(
+            monkeypatch,
+            AGENT_TIMEOUT_SECONDS="180",
+            CLAUDE_TIMEOUT_SECONDS="60",
+        )
+        cfg = load_config()
+        assert cfg.claude_timeout_seconds == 180
+
+    def test_legacy_only_falls_back_with_warning(self, monkeypatch, caplog):
+        self._required_env(monkeypatch, CLAUDE_TIMEOUT_SECONDS="240")
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            cfg = load_config()
+        assert cfg.claude_timeout_seconds == 240
+        assert any("CLAUDE_TIMEOUT_SECONDS is deprecated" in r.message for r in caplog.records)
+
+    def test_neither_set_defaults_to_120(self, monkeypatch):
+        self._required_env(monkeypatch)
+        cfg = load_config()
+        assert cfg.claude_timeout_seconds == 120
+
+
+class TestLoadConfigBackendAwareModelValidation:
+    """load_config DEFAULT_MODEL validation is backend-aware."""
+
+    def _env(self, monkeypatch, **overrides):
+        for var in _CONFIG_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        base = {
+            "TELEGRAM_BOT_TOKEN": "test-token",
+            "ALLOWED_USER_IDS": "12345",
+            "BUDGET_CEILING": "10.0",
+            "WEBHOOK_PORT": "8080",
+            "WEBHOOK_SECRET": "test-secret",
+        }
+        base.update(overrides)
+        for k, v in base.items():
+            monkeypatch.setenv(k, v)
+
+    def test_codex_rejects_goose_only_model(self, monkeypatch):
+        self._env(monkeypatch, AGENT_BACKEND="codex", DEFAULT_MODEL="gpt-5.4-nano")
+        with pytest.raises(SystemExit, match="not valid for codex"):
+            load_config()
+
+    def test_codex_rejects_claude_model(self, monkeypatch):
+        self._env(monkeypatch, AGENT_BACKEND="codex", DEFAULT_MODEL="opus")
+        with pytest.raises(SystemExit, match="not valid for codex"):
+            load_config()
+
+    def test_codex_accepts_gpt55(self, monkeypatch):
+        self._env(monkeypatch, AGENT_BACKEND="codex", DEFAULT_MODEL="gpt-5.5")
+        cfg = load_config()
+        assert cfg.default_model == "gpt-5.5"

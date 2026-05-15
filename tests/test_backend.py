@@ -1389,3 +1389,58 @@ class TestPerUserMemoryIsolation:
         assert "USER_B_SECRET" not in result_a
         assert "USER_B_SECRET" in result_b
         assert "USER_A_SECRET" not in result_b
+
+
+# ── workspace_config.model apply-time validation ─────────────────────
+
+
+class TestApplyWorkspaceModel:
+    """Cross-backend workspace-override validation helper.
+
+    workspaces.yaml is shared across users on different backends, so the
+    file's `model:` field is intentionally loose at load time. Each
+    backend validates the override at APPLY time and silently skips a
+    mismatch (with WARNING log) so codex never gets a goose-only model
+    and vice versa.
+    """
+
+    def test_no_workspace_config_keeps_current_model(self):
+        from kai.backend import apply_workspace_model
+
+        assert apply_workspace_model(None, "codex", "openai", "gpt-5.5") == "gpt-5.5"
+
+    def test_workspace_without_model_keeps_current(self):
+        from kai.backend import apply_workspace_model
+
+        wc = WorkspaceConfig(path=Path("/tmp/ws"), model=None, timeout=None)
+        assert apply_workspace_model(wc, "codex", "openai", "gpt-5.5") == "gpt-5.5"
+
+    def test_codex_accepts_codex_compatible_override(self):
+        from kai.backend import apply_workspace_model
+
+        wc = WorkspaceConfig(path=Path("/tmp/ws"), model="gpt-5.5", timeout=None)
+        assert apply_workspace_model(wc, "codex", "openai", "gpt-5.4") == "gpt-5.5"
+
+    def test_codex_rejects_goose_only_override(self, caplog):
+        from kai.backend import apply_workspace_model
+
+        wc = WorkspaceConfig(path=Path("/tmp/ws"), model="gpt-5.4-nano", timeout=None)
+        with caplog.at_level(logging.WARNING, logger="kai.backend"):
+            result = apply_workspace_model(wc, "codex", "openai", "gpt-5.5")
+        assert result == "gpt-5.5"
+        assert any("Ignoring workspace model override" in r.message for r in caplog.records)
+
+    def test_goose_openai_accepts_nano_override(self):
+        from kai.backend import apply_workspace_model
+
+        wc = WorkspaceConfig(path=Path("/tmp/ws"), model="gpt-5.4-nano", timeout=None)
+        assert apply_workspace_model(wc, "goose", "openai", "gpt-5.4") == "gpt-5.4-nano"
+
+    def test_claude_rejects_codex_override(self, caplog):
+        from kai.backend import apply_workspace_model
+
+        wc = WorkspaceConfig(path=Path("/tmp/ws"), model="gpt-5.5", timeout=None)
+        with caplog.at_level(logging.WARNING, logger="kai.backend"):
+            result = apply_workspace_model(wc, "claude", "anthropic", "sonnet")
+        assert result == "sonnet"
+        assert any("Ignoring workspace model override" in r.message for r in caplog.records)

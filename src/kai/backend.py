@@ -22,10 +22,47 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kai.config import DATA_DIR, PROJECT_ROOT, Config, WorkspaceConfig
+from kai.config import DATA_DIR, PROJECT_ROOT, Config, WorkspaceConfig, validate_model_for_backend
 from kai.history import get_recent_history
 
 log = logging.getLogger(__name__)
+
+
+def apply_workspace_model(
+    workspace_config: WorkspaceConfig | None,
+    backend: str,
+    provider: str,
+    current_model: str,
+) -> str:
+    """Decide which model to use when applying a workspace_config.
+
+    Workspaces are shared across users on different backends, so
+    `workspaces.yaml` accepts any model that's valid for any curated
+    surface at load time (_load_workspace_configs validates against
+    _ALL_CURATED_MODELS). At APPLY time - in a backend's __init__ or
+    change_workspace - we know which backend is actually receiving the
+    override and can reject a model that's invalid for it (e.g. a
+    workspaces.yaml entry with `model: gpt-5.4-nano` applied to a
+    CodexBackend instance, where codex CLI rejects nano).
+
+    Returns workspace_config.model when valid for the active backend;
+    otherwise returns current_model unchanged and logs a WARNING so
+    the operator sees the override was skipped. Shared helper so the
+    rejection contract stays uniform across CodexBackend,
+    ClaudeCodeBackend, and GooseBackend.
+    """
+    if workspace_config is None or not workspace_config.model:
+        return current_model
+    if validate_model_for_backend(workspace_config.model, backend, provider):
+        return workspace_config.model
+    log.warning(
+        "Ignoring workspace model override '%s' for %s/%s (invalid for the active backend); keeping model='%s'",
+        workspace_config.model,
+        backend,
+        provider,
+        current_model,
+    )
+    return current_model
 
 
 # ── Protocol types ──────────────────────────────────────────────────

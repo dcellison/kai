@@ -40,16 +40,18 @@ from pathlib import Path
 import yaml
 
 from kai.config import (
+    CODEX_DEFAULT_MODEL,
+    CODEX_MODELS,
     EFFORT_LEVELS,
     MAX_CONTEXT_CEILING,
-    OPEN_ENDED_PROVIDERS,
     PROJECT_ROOT,
     PROVIDER_DEFAULTS,
     PROVIDER_KEY_VARS,
     PROVIDER_MODELS,
     VALID_BACKENDS,
     VALID_PROVIDERS,
-    validate_model_for_provider,
+    models_for_backend,
+    validate_model_for_backend,
 )
 
 # Config file written by `config`, read by `apply`.
@@ -163,11 +165,15 @@ def _prompt_bool(label: str, default: bool = False) -> bool:
     return value == "true"
 
 
-def _prompt_default_model(eff_provider: str, default_val: str) -> str:
+def _prompt_default_model(agent_backend: str, eff_provider: str, default_val: str) -> str:
     """
-    Prompt for DEFAULT_MODEL, dispatching on the effective provider.
+    Prompt for DEFAULT_MODEL, dispatching on the active backend.
 
-    Two shapes of provider need different prompts:
+    Three shapes of model surface need different prompts:
+    - Codex backend ships its own curated CLI model list (CODEX_MODELS)
+      which is fully separate from goose's openai-API surface. Wizard
+      offers the codex-only set; never falls through to the OpenAI
+      provider list.
     - Curated providers (those with an entry in PROVIDER_MODELS, currently
       anthropic, openai, google) ship a fixed model list; the operator
       picks from the list via _prompt_choice.
@@ -180,24 +186,28 @@ def _prompt_default_model(eff_provider: str, default_val: str) -> str:
     commit to a concrete model string. load_config falls back to "sonnet"
     when DEFAULT_MODEL is empty or missing, and "sonnet" is anthropic-only;
     letting the operator leave the field blank on an open-ended provider
-    would set them up for a startup-time validation failure that load_config
-    surfaces with a less helpful error message than this wizard can.
+    would set them up for a startup-time validation failure.
 
     Args:
-        eff_provider: The effective provider (anthropic for the claude
-            backend; the configured llm_provider otherwise).
+        agent_backend: The active backend ("claude", "codex", "goose").
+            Codex routes to CODEX_MODELS; everything else delegates to
+            the provider-based selection below.
+        eff_provider: The effective provider for non-codex backends
+            (anthropic for claude; the configured llm_provider for
+            goose; ignored when agent_backend == "codex").
         default_val: Prefill for the prompt. Callers should pass a value
-            that is valid for eff_provider (e.g. PROVIDER_DEFAULTS[eff_provider]
-            when re-prompting after rejecting an invalid existing value).
+            that is valid for the backend's surface (CODEX_DEFAULT_MODEL
+            for codex, PROVIDER_DEFAULTS[eff_provider] for others) when
+            re-prompting after rejecting an invalid existing value.
 
     Returns:
         The chosen model identifier. Always non-empty.
     """
-    provider_models = PROVIDER_MODELS.get(eff_provider)
-    if provider_models and eff_provider not in OPEN_ENDED_PROVIDERS:
+    surface = models_for_backend(agent_backend, eff_provider)
+    if surface:
         return _prompt_choice(
             "Default model",
-            sorted(provider_models.keys()),
+            sorted(surface.keys()),
             default_val,
         )
     return _prompt(
@@ -288,6 +298,20 @@ def _validate_chat_id(value: str) -> bool:
         return int(value) != 0
     except ValueError:
         return False
+
+
+def _validate_codex_bin(value: str) -> bool:
+    """Return True when the path exists and is executable.
+
+    Required by the codex wizard prompt; the path is baked into both
+    the runtime CODEX_BIN env var and the sudoers rule that allows
+    cross-os_user codex spawns, so a non-existent path here would
+    surface as a confusing 'a password is required' at first message.
+    """
+    if not value:
+        return False
+    p = Path(value)
+    return p.is_file() and os.access(p, os.X_OK)
 
 
 # ── Config subcommand ────────────────────────────────────────────────
@@ -505,20 +529,40 @@ def _cmd_config() -> None:
     # follows today.
     codex_auth_mode = ""
     codex_api_key = ""
+    codex_bin = ""
     if agent_backend == "codex":
         codex_auth_mode = _prompt_choice(
             "Codex auth mode",
             ["subscription", "api_key"],
             existing_env.get("CODEX_AUTH_MODE", "subscription"),
         )
-        if codex_auth_mode == "subscription":
-            print("  After install, run 'codex login' as the service user.")
-        else:
+        if codex_auth_mode == "api_key":
             codex_api_key = _prompt(
                 "OPENAI_API_KEY",
                 existing_env.get("OPENAI_API_KEY", ""),
                 required=True,
             )
+        # Codex binary path: wizard-prompted and persisted in install.conf
+        # so `make install` writes both /etc/kai/env's CODEX_BIN and the
+        # sudoers SETENV rule from the same source of truth, eliminating
+        # the env-var-stripping workaround that needed `sudo CODEX_BIN=...
+        # .venv/bin/python -m kai install apply` to bypass make's inner
+        # sudo. Default suggestion uses `which codex` from the operator's
+        # PATH; falls back to Homebrew only when which finds nothing.
+        while True:
+            which_codex = shutil.which("codex") or "/opt/homebrew/bin/codex"
+            codex_bin = _prompt(
+                "Codex binary path",
+                existing_env.get("CODEX_BIN", which_codex),
+                required=True,
+            )
+            if _validate_codex_bin(codex_bin):
+                break
+            print(f"  Path '{codex_bin}' does not exist or is not executable.")
+        if codex_auth_mode == "subscription":
+            print("  After install, log in as each os_user that should answer messages:")
+            print("    e.g.   <os_user> ~$ codex login")
+            print("  Run as the os_user themselves, not via sudo from another account.")
 
     # Non-Claude backends: provider and API key. The provider choice
     # determines which env var to prompt for (or none for ollama).
@@ -554,6 +598,17 @@ def _cmd_config() -> None:
     # backend always uses Anthropic; Goose uses the selected provider.
     eff_provider = "anthropic" if agent_backend == "claude" else llm_provider
 
+    def _default_model_prefill() -> str:
+        """Backend-aware prefill for the re-prompt-after-reject path.
+
+        Codex installs use CODEX_DEFAULT_MODEL (independent from
+        PROVIDER_DEFAULTS["openai"] which goose-on-openai still
+        consults). Other backends use PROVIDER_DEFAULTS[eff_provider].
+        """
+        if agent_backend == "codex":
+            return CODEX_DEFAULT_MODEL
+        return PROVIDER_DEFAULTS.get(eff_provider, "")
+
     if users_yaml_exists:
         print("-- Claude --")
         print("  Model, timeout, budget, and context window are now per-user.")
@@ -561,43 +616,51 @@ def _cmd_config() -> None:
         # Read DEFAULT_MODEL, falling back to CLAUDE_MODEL for backward compat
         existing_model = existing_env.get("DEFAULT_MODEL", existing_env.get("CLAUDE_MODEL", ""))
         # Re-validate the existing value against the (possibly newly chosen)
-        # effective provider. Empty existing_model fails validation for any
-        # curated provider, including anthropic ("" is not in PROVIDER_MODELS).
-        # Open-ended providers always validate True, so empty + open-ended
-        # would silently pass; the _prompt(required=True) branch in
-        # _prompt_default_model handles that case by forcing the operator
-        # to commit to a model string.
-        if existing_model and validate_model_for_provider(existing_model, eff_provider):
+        # backend - backend-aware, not provider-only, so codex rejects
+        # gpt-5.4-nano even though it's valid for goose-on-openai.
+        # Empty existing_model fails validation for any curated backend;
+        # the _prompt(required=True) branch in _prompt_default_model
+        # handles the open-ended case.
+        if existing_model and validate_model_for_backend(existing_model, agent_backend, eff_provider):
             model = existing_model
         else:
             if existing_model:
-                print(
-                    f"  DEFAULT_MODEL '{existing_model}' is not valid for provider "
-                    f"'{eff_provider}'. Please choose a new default."
-                )
-            # Prefill always uses PROVIDER_DEFAULTS for the effective provider
-            # rather than existing_env["DEFAULT_MODEL"]. We entered this branch
-            # because the existing value is missing or invalid for the effective
-            # provider; offering it as the prefill would let the operator
-            # accept the just-rejected value with Enter, since _prompt_choice
-            # returns its default parameter without validating it against
-            # the choices list.
-            model = _prompt_default_model(eff_provider, PROVIDER_DEFAULTS.get(eff_provider, ""))
-        timeout = existing_env.get("CLAUDE_TIMEOUT_SECONDS", "")
+                surface = "codex" if agent_backend == "codex" else f"provider '{eff_provider}'"
+                print(f"  DEFAULT_MODEL '{existing_model}' is not valid for {surface}. Please choose a new default.")
+            # Prefill always uses the backend-aware default rather than
+            # existing_env["DEFAULT_MODEL"]. We entered this branch because
+            # the existing value is missing or invalid; offering it as the
+            # prefill would let the operator accept the just-rejected value
+            # with Enter, since _prompt_choice returns its default parameter
+            # without validating it against the choices list.
+            model = _prompt_default_model(agent_backend, eff_provider, _default_model_prefill())
+        # AGENT_TIMEOUT_SECONDS is the canonical key; fall back to the
+        # legacy CLAUDE_TIMEOUT_SECONDS for installs that haven't re-run
+        # the wizard since the rename.
+        timeout = existing_env.get("AGENT_TIMEOUT_SECONDS", existing_env.get("CLAUDE_TIMEOUT_SECONDS", ""))
         budget = existing_env.get("BUDGET_CEILING", existing_env.get("CLAUDE_MAX_BUDGET_USD", ""))
         max_context_window = existing_env.get("CLAUDE_MAX_CONTEXT_WINDOW", "")
     else:
         print("-- Claude --")
-        default_model_val = existing_env.get(
-            "DEFAULT_MODEL",
-            existing_env.get("CLAUDE_MODEL", PROVIDER_DEFAULTS.get(eff_provider, "")),
-        )
-        model = _prompt_default_model(eff_provider, default_model_val)
+        # Re-validate any existing DEFAULT_MODEL against the chosen
+        # backend so a switch from claude to codex doesn't silently
+        # keep an anthropic model.
+        raw_existing = existing_env.get("DEFAULT_MODEL", existing_env.get("CLAUDE_MODEL", ""))
+        if raw_existing and validate_model_for_backend(raw_existing, agent_backend, eff_provider):
+            default_model_val = raw_existing
+        else:
+            default_model_val = _default_model_prefill()
+        model = _prompt_default_model(agent_backend, eff_provider, default_model_val)
 
         while True:
+            # AGENT_TIMEOUT_SECONDS is canonical; legacy
+            # CLAUDE_TIMEOUT_SECONDS is the fallback for upgrades.
+            timeout_default = existing_env.get(
+                "AGENT_TIMEOUT_SECONDS", existing_env.get("CLAUDE_TIMEOUT_SECONDS", "120")
+            )
             timeout = _prompt(
-                "Claude timeout (seconds)",
-                existing_env.get("CLAUDE_TIMEOUT_SECONDS", "120"),
+                "Agent timeout (seconds)",
+                timeout_default,
             )
             if _validate_positive_int(timeout):
                 break
@@ -1152,25 +1215,24 @@ def _cmd_config() -> None:
             env["CODEX_AUTH_MODE"] = codex_auth_mode
         if codex_api_key:
             env["OPENAI_API_KEY"] = codex_api_key
-        # Persist the resolved codex binary path so the running bot
-        # invokes the same absolute path as the sudoers rule. Sudo
-        # uses the service user's PATH to resolve bare command names,
-        # and on multi-user installs codex usually lives in a per-
-        # os_user home that isn't on the service PATH - the spawn
-        # then fails with "a password is required" because sudo
-        # can't find a binary to match the rule against. Only
-        # emitted when explicitly set via CODEX_BIN at install time,
-        # otherwise the runtime falls back to bare "codex" (correct
-        # for single-user installs where it's on PATH).
-        codex_bin = os.environ.get("CODEX_BIN")
+        # Persist the wizard-collected codex binary path. The same
+        # value drives /etc/kai/env's CODEX_BIN and the sudoers SETENV
+        # rule so they can never drift. _cmd_apply's env-var override
+        # block keeps working for ad-hoc deploys (sudo CODEX_BIN=...
+        # kai install apply) but the wizard path is now the canonical
+        # source of truth.
         if codex_bin:
             env["CODEX_BIN"] = codex_bin
 
     # Remove stale renamed keys if present - leaving both the old and
     # new key causes silent confusion (the deprecation warning is
-    # suppressed when the new key exists).
+    # suppressed when the new key exists). CLAUDE_TIMEOUT_SECONDS is
+    # renamed to AGENT_TIMEOUT_SECONDS; pop the legacy key on every
+    # regenerate so the next /etc/kai/env carries only the canonical
+    # form.
     env.pop("CLAUDE_MODEL", None)
     env.pop("CLAUDE_MAX_BUDGET_USD", None)
+    env.pop("CLAUDE_TIMEOUT_SECONDS", None)
 
     # BUDGET_CEILING is global (not per-user). Skipped entirely on the
     # claude backend (--max-budget-usd is omitted from claude --print
@@ -1195,11 +1257,12 @@ def _cmd_config() -> None:
     # to own the validation responsibility.
     env["DEFAULT_MODEL"] = model
 
-    # CLAUDE_TIMEOUT_SECONDS remains gated on the legacy single-user
+    # AGENT_TIMEOUT_SECONDS remains gated on the legacy single-user
     # path; per-user timeouts live in users.yaml and override the
-    # global default at runtime.
+    # global default at runtime. (Renamed from CLAUDE_TIMEOUT_SECONDS;
+    # the legacy key is migrated to the new name at apply time.)
     if not users_yaml_exists:
-        env["CLAUDE_TIMEOUT_SECONDS"] = timeout
+        env["AGENT_TIMEOUT_SECONDS"] = timeout
 
     # Context window tuning - only include if non-default.
     # Compare as int to handle inputs like "000" that pass validation.
@@ -1793,6 +1856,7 @@ def _generate_sudoers(
     service_user: str,
     claude_user: str | None = None,
     os_users: Iterable[str] = (),
+    codex_bin: str | None = None,
 ) -> str:
     """
     Generate sudoers rules for the service user to read protected config files.
@@ -1876,24 +1940,16 @@ def _generate_sudoers(
         # rule and breaking the bot's sudo dispatch.
         svc_home = _user_home(service_user)
         claude_bin = f"{svc_home}/.local/bin/claude"
-        # Codex binary path: anchored deterministically to the same
-        # location codex installs to under the operator's account
-        # (npm's global prefix on macOS is /opt/homebrew, on Linux
-        # is usually /usr/local). We pick the Homebrew prefix as the
-        # default because the smoke-test target is an Apple-Silicon
-        # Mac mini; Linux operators get an override via the
-        # CODEX_BIN env var read at install time. We deliberately
-        # do NOT call shutil.which("codex"): _generate_sudoers runs
-        # under `sudo make install` (root context), and shutil.which
-        # would resolve against root's install-time PATH, exactly
-        # the failure mode PR #455 removed for claude_bin (any
-        # user's ~/.local/bin/codex on root's PATH would bake the
-        # wrong path into the rule). The runtime invocation in
-        # codex.py / triage.py runs bare `codex`; sudo resolves it
-        # against the service user's secure_path, which must
-        # therefore include the directory naming this rule's
-        # binary. The smoke test reveals path mismatches.
-        codex_bin = os.environ.get("CODEX_BIN") or "/opt/homebrew/bin/codex"
+        # Codex binary path is now threaded as an argument. The wizard
+        # prompts for and persists the value in install.conf; _cmd_apply
+        # passes it to _apply_sudoers which passes it here. We
+        # deliberately do NOT call shutil.which or os.environ inside
+        # this function: resolving against root's install-time PATH
+        # would silently pick the wrong binary on multi-user installs
+        # (the same failure mode PR #455 removed for claude_bin). The
+        # Homebrew fallback only fires on a first-time install where
+        # the wizard has not run yet.
+        codex_bin_resolved = codex_bin or "/opt/homebrew/bin/codex"
         # kill(1) for the cross-user kill escalation (#456). The bot
         # runs `sudo -n -u <target> /bin/kill -<sig> <pid>` against
         # the inner claude grandchild because POSIX signal permissions
@@ -1941,7 +1997,7 @@ def _generate_sudoers(
         """)
         for target in target_users:
             rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {claude_bin}\n"
-            rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {codex_bin}\n"
+            rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {codex_bin_resolved}\n"
             rules += f"{service_user} ALL=({target}) NOPASSWD: {kill_bin}\n"
 
     return rules
@@ -2914,19 +2970,29 @@ def _cmd_apply() -> None:
     llm_provider_raw = env.get("LLM_PROVIDER", "").strip().lower()
     eff_provider_for_check = "anthropic" if agent_backend_raw == "claude" else llm_provider_raw
     resolved_model = default_model_raw or "sonnet"
-    if not validate_model_for_provider(resolved_model, eff_provider_for_check):
-        valid_models = sorted(PROVIDER_MODELS.get(eff_provider_for_check, {}).keys())
+    # Backend-aware validation: codex installs validate against
+    # CODEX_MODELS only - no fallback to PROVIDER_MODELS["openai"].
+    # That closes the regression where install.conf with
+    # AGENT_BACKEND=codex and DEFAULT_MODEL=opus survived apply
+    # because validate_model_for_provider accepted unknown effective-
+    # provider "" unchecked, or where DEFAULT_MODEL=gpt-5.4-nano
+    # (goose-valid) survived because the wizard mapped codex onto
+    # openai's surface.
+    if not validate_model_for_backend(resolved_model, agent_backend_raw, eff_provider_for_check):
+        if agent_backend_raw == "codex":
+            valid_models = sorted(CODEX_MODELS.keys())
+            surface_label = "codex"
+        else:
+            valid_models = sorted(PROVIDER_MODELS.get(eff_provider_for_check, {}).keys())
+            surface_label = f"provider '{eff_provider_for_check}'"
         if default_model_raw:
-            msg = (
-                f"install.conf has DEFAULT_MODEL='{default_model_raw}' which is not "
-                f"valid for provider '{eff_provider_for_check}'."
-            )
+            msg = f"install.conf has DEFAULT_MODEL='{default_model_raw}' which is not valid for {surface_label}."
         else:
             msg = (
                 f"install.conf has no DEFAULT_MODEL; the load_config fallback "
-                f"'sonnet' is not valid for provider '{eff_provider_for_check}'."
+                f"'sonnet' is not valid for {surface_label}."
             )
-        valid_list = ", ".join(valid_models) or "(provider has no curated list)"
+        valid_list = ", ".join(valid_models) or "(no curated list)"
         raise SystemExit(
             f"{msg} Re-run 'python -m kai install config' to pick a compatible model. Valid models: {valid_list}"
         )
@@ -2989,14 +3055,22 @@ def _cmd_apply() -> None:
         # Inject CODEX_BIN from the apply-time env so a multi-user
         # codex install can pin an absolute codex path without
         # round-tripping through the wizard. Apply-time env wins over
-        # any stale value already in install.conf so the operator's
-        # explicit `sudo CODEX_BIN=... kai install apply` is honored.
-        # Only codex installs care; on other backends the var is
-        # ignored at runtime so writing it is harmless but noisy -
-        # skip the write to keep /etc/kai/env clean.
+        # any value already in install.conf so the operator's explicit
+        # `sudo CODEX_BIN=... kai install apply` is honored. Only codex
+        # installs care; on other backends the var is ignored at
+        # runtime so writing it is harmless but noisy - skip the write
+        # to keep /etc/kai/env clean.
         env_codex_bin = os.environ.get("CODEX_BIN")
         if env_codex_bin and env.get("AGENT_BACKEND") == "codex":
             env["CODEX_BIN"] = env_codex_bin
+        # AGENT_TIMEOUT_SECONDS migration. Operators upgrading without
+        # re-running the wizard carry the legacy CLAUDE_TIMEOUT_SECONDS
+        # key in install.conf; rewrite to the canonical name at apply
+        # time so /etc/kai/env ends up clean and load_config does not
+        # need the legacy fallback after the next start.
+        if "AGENT_TIMEOUT_SECONDS" not in env and "CLAUDE_TIMEOUT_SECONDS" in env:
+            env["AGENT_TIMEOUT_SECONDS"] = env["CLAUDE_TIMEOUT_SECONDS"]
+        env.pop("CLAUDE_TIMEOUT_SECONDS", None)
         _apply_secrets(env, dry_run)
 
         # -- Step 6: Deploy Goose config (if backend=goose) --
@@ -3005,7 +3079,7 @@ def _cmd_apply() -> None:
 
         # -- Step 7: Configure sudoers --
         claude_user = env.get("CLAUDE_USER") or None
-        _apply_sudoers(service_user, dry_run, claude_user)
+        _apply_sudoers(service_user, dry_run, claude_user, codex_bin=env.get("CODEX_BIN"))
 
         # -- Step 8: Migrate runtime data --
         _apply_migrate(data_path, install_path, svc_uid, svc_gid, dry_run)
@@ -3055,15 +3129,26 @@ def _cmd_apply() -> None:
                 "\nTo reconfigure later, re-run: python -m kai install config"
             )
 
-        # Codex subscription auth requires an interactive `codex login`
-        # run AS the service user (so the token lands in the service
-        # user's ~/.codex/auth.json, not the operator's). Surface this
-        # explicitly so the operator does not start the service and
-        # then chase silent auth failures on the first message.
+        # Codex subscription auth requires `codex login` run AS each
+        # os_user that should answer messages. The per-user wrap reads
+        # ~<os_user>/.codex/auth.json, NOT the service user's home, so
+        # a `sudo -u kai codex login` (the old hint) lands the token
+        # in the wrong place. Enumerate the distinct os_user set from
+        # /etc/kai/users.yaml; fall back to the service user only
+        # when no os_users are configured.
         if env.get("AGENT_BACKEND") == "codex" and env.get("CODEX_AUTH_MODE", "subscription") == "subscription":
+            try:
+                login_users = sorted(set(_collect_os_users_from_yaml("/etc/kai/users.yaml")))
+            except (OSError, ValueError):
+                login_users = []
+            if not login_users:
+                login_users = [service_user]
             print("\nCodex subscription auth required:")
-            print(f"  sudo -u {service_user} codex login")
-            print("Run this before the service starts handling messages.")
+            print("  Log in once for each os_user that should answer Telegram messages:")
+            for user in login_users:
+                print(f"    {user} ~$ codex login")
+            print("  Run as the os_user themselves, not via sudo from another account.")
+            print("  These must complete before the service answers its first message.")
 
 
 def _apply_directories(
@@ -4014,6 +4099,7 @@ def _apply_sudoers(
     dry_run: bool,
     claude_user: str | None = None,
     users_yaml_path: str | Path = "/etc/kai/users.yaml",
+    codex_bin: str | None = None,
 ) -> None:
     """
     Write sudoers rules for the service user to read protected config.
@@ -4022,6 +4108,12 @@ def _apply_sudoers(
     distinct `os_user` the runtime may target via `sudo -u`, so each gets a
     matching SETENV: NOPASSWD: rule. Without this, hand-added per-user rules
     were silently wiped on every `sudo make install`. See issue #341.
+
+    `codex_bin` is threaded from `_cmd_apply`'s env dict (which sources
+    it from install.conf, after the apply-time env-var override block)
+    so the SETENV rule pins the same absolute path the running bot
+    will invoke. Falls back to /opt/homebrew/bin/codex only on first-
+    time installs where the wizard has not run.
     """
     sudoers_path = Path("/etc/sudoers.d/kai")
     # Load and validate users.yaml *before* the dry_run gate. Intentional:
@@ -4029,7 +4121,7 @@ def _apply_sudoers(
     # dry run, since the operator's next step is `sudo make install` which
     # would hit the same error with worse blast radius (partial install).
     os_users = _collect_os_users_from_yaml(users_yaml_path)
-    sudoers_content = _generate_sudoers(service_user, claude_user, os_users)
+    sudoers_content = _generate_sudoers(service_user, claude_user, os_users, codex_bin=codex_bin)
 
     # Backstop check: the per-user rules pin the claude binary to
     # {service_user_home}/.local/bin/claude (the native-installer

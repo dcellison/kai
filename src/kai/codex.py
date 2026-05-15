@@ -53,6 +53,7 @@ from kai.backend import (
     AgentResponse,
     ApiContext,
     StreamEvent,
+    apply_workspace_model,
     build_foreign_workspace_reminder,
     build_session_context,
     ensure_user_memory,
@@ -152,11 +153,13 @@ class CodexBackend(AgentBackend):
         self._default_model = model
         self._default_timeout = timeout_seconds
 
-        # Apply per-workspace overrides (if configured). These become
-        # the "effective" values for this workspace.
+        # Apply per-workspace overrides (if configured). Model is
+        # validated against codex's CLI surface so a workspaces.yaml
+        # entry with `model: gpt-5.4-nano` (valid for goose-on-openai)
+        # is silently rejected here. Timeout has no cross-backend
+        # equivalent.
         if workspace_config:
-            if workspace_config.model:
-                self.model = workspace_config.model
+            self.model = apply_workspace_model(workspace_config, "codex", self.provider, self.model)
             if workspace_config.timeout is not None:
                 self.timeout_seconds = workspace_config.timeout
 
@@ -1120,12 +1123,12 @@ class CodexBackend(AgentBackend):
 
         # Revert to global defaults, then apply overrides. Prevents
         # stale values when switching from a fully-configured workspace
-        # to a partially-configured one.
+        # to a partially-configured one. Model override validated
+        # against codex's CLI surface.
         self.model = self._default_model
         self.timeout_seconds = self._default_timeout
         if workspace_config:
-            if workspace_config.model:
-                self.model = workspace_config.model
+            self.model = apply_workspace_model(workspace_config, "codex", self.provider, self.model)
             if workspace_config.timeout is not None:
                 self.timeout_seconds = workspace_config.timeout
         # _fresh_session is set True by _ensure_started() on next send()

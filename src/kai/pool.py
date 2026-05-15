@@ -28,7 +28,7 @@ from kai.config import (
     Config,
     WorkspaceConfig,
     get_effective_provider,
-    validate_model_for_provider,
+    validate_model_for_backend,
 )
 from kai.goose import GooseBackend
 from kai.workspace_utils import is_workspace_allowed
@@ -320,19 +320,34 @@ class SubprocessPool:
             needs_restart = False
 
             # Model: only apply if workspace config didn't set one.
-            # Validate against the instance's provider - a provider change
-            # (in users.yaml) can invalidate a stored model.
+            # Validate against the instance's effective backend - a
+            # backend change (per-user override in users.yaml) can
+            # invalidate a stored model. Codex installs use CODEX_MODELS
+            # only, so a stored "gpt-5.4-nano" from a prior goose era
+            # is correctly rejected.
             ws_model = instance.workspace_config.model if instance.workspace_config else None
             if not ws_model and "model" in db_settings and db_settings["model"] != instance.model:
                 stored_model = db_settings["model"]
-                if validate_model_for_provider(stored_model, instance.provider):
+                # Class-name inspection rather than an explicit
+                # instance attribute keeps the ABC free of
+                # backend-name leakage; mirrors the same shape
+                # bot.py uses for runtime backend resolution.
+                instance_cls = type(instance).__name__
+                if instance_cls == "CodexBackend":
+                    instance_backend = "codex"
+                elif instance_cls == "GooseBackend":
+                    instance_backend = "goose"
+                else:
+                    instance_backend = "claude"
+                if validate_model_for_backend(stored_model, instance_backend, instance.provider):
                     instance.model = stored_model
                     needs_restart = True
                 else:
                     log.warning(
-                        "Ignoring stored model '%s' for user %d (invalid for provider '%s')",
+                        "Ignoring stored model '%s' for user %d (invalid for backend '%s'/provider '%s')",
                         stored_model,
                         chat_id,
+                        instance_backend,
                         instance.provider,
                     )
 

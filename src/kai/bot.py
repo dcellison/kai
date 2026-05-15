@@ -61,11 +61,12 @@ from kai.config import (
     MAX_CONTEXT_CEILING,
     OPEN_ENDED_PROVIDERS,
     PROVIDER_DEFAULTS,
-    PROVIDER_MODELS,
     Config,
     WorkspaceConfig,
     get_effective_provider,
-    validate_model_for_provider,
+    get_user_backend_and_provider,
+    models_for_backend,
+    validate_model_for_backend,
 )
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
@@ -433,33 +434,57 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ── Model selection ──────────────────────────────────────────────────
 
 
-def _get_user_provider(pool: SubprocessPool, chat_id: int, config: Config) -> str:
-    """Derive the effective provider for a user without creating an instance.
+def _backend_name_for_instance(instance: object) -> str:
+    """Map a backend instance to its config-key backend name.
 
-    Checks the running instance first; falls back to the config cascade
-    (user -> global) so read-only commands avoid spawning a subprocess.
+    Class-name inspection keeps the ABC free of backend-name leakage.
+    """
+    cls = type(instance).__name__
+    if cls == "CodexBackend":
+        return "codex"
+    if cls == "GooseBackend":
+        return "goose"
+    return "claude"
+
+
+def _get_user_backend_provider(pool: SubprocessPool, chat_id: int, config: Config) -> tuple[str, str]:
+    """Derive the effective (backend, provider) for a user without creating an instance.
+
+    Checks the running instance first; falls back to the canonical
+    get_user_backend_and_provider helper so read-only commands avoid
+    spawning a subprocess. The pair drives both the model-keyboard
+    listing and model validation, so they cannot drift.
     """
     instance = pool.get_if_exists(chat_id)
     if instance:
-        return instance.provider
-    # No running instance - derive from config cascade (same as _create_instance)
+        return _backend_name_for_instance(instance), instance.provider
     user_config = config.get_user_config(chat_id)
-    uc_backend = user_config.agent_backend if user_config and user_config.agent_backend else config.agent_backend
-    uc_provider = user_config.llm_provider if user_config and user_config.llm_provider else config.llm_provider
-    return get_effective_provider(uc_backend, uc_provider)
+    return get_user_backend_and_provider(user_config, config)
+
+
+def _get_user_provider(pool: SubprocessPool, chat_id: int, config: Config) -> str:
+    """Derive the effective provider for a user without creating an instance.
+
+    Thin wrapper around _get_user_backend_provider, kept for the
+    handful of callers that only need the provider value (display in
+    /stats, log messages). Backend-aware callers should use
+    _get_user_backend_provider directly.
+    """
+    _, provider = _get_user_backend_provider(pool, chat_id, config)
+    return provider
 
 
 def _get_user_models(pool: SubprocessPool, chat_id: int, config: Config) -> dict[str, str] | None:
-    """Get the curated model dict for a user's provider, or None if open-ended.
+    """Get the curated model dict for a user's backend/provider, or None if open-ended.
 
-    Returns the PROVIDER_MODELS entry for the user's effective provider.
-    None means the provider accepts arbitrary model IDs (no keyboard).
+    Codex installs see CODEX_MODELS; other backends see PROVIDER_MODELS
+    for their effective provider. None means open-ended (no keyboard).
+    The codex-side surface is fully separate from PROVIDER_MODELS["openai"]
+    so a codex install never offers a goose-only model.
     """
-    provider = _get_user_provider(pool, chat_id, config)
-    if provider in OPEN_ENDED_PROVIDERS:
-        return None
-    models = PROVIDER_MODELS.get(provider)
-    if models is None:
+    backend, provider = _get_user_backend_provider(pool, chat_id, config)
+    models = models_for_backend(backend, provider)
+    if models is None and backend != "codex" and provider not in OPEN_ENDED_PROVIDERS:
         # Provider is not open-ended but has no curated list. This means
         # PROVIDER_MODELS is missing an entry for a valid provider -
         # programming oversight, not user error.
@@ -548,8 +573,10 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
     pool = _get_pool(context)
     chat_id = _chat_id(update)
 
-    # Validate against the user's provider model list
-    if not validate_model_for_provider(model, pool.get(chat_id).provider):
+    # Validate against the user's effective backend - codex installs
+    # check CODEX_MODELS only, no fallback to PROVIDER_MODELS["openai"].
+    backend, provider = _get_user_backend_provider(pool, chat_id, config)
+    if not validate_model_for_backend(model, backend, provider):
         await query.answer("Invalid model.")
         return
 
@@ -588,10 +615,13 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     model = context.args[0].lower()
-    instance = pool.get(chat_id)
 
-    if not validate_model_for_provider(model, instance.provider):
-        valid = sorted(PROVIDER_MODELS.get(instance.provider, {}).keys())
+    # Backend-aware validation: codex installs use CODEX_MODELS only;
+    # goose / claude delegate to the provider surface.
+    backend, provider = _get_user_backend_provider(pool, chat_id, config)
+    if not validate_model_for_backend(model, backend, provider):
+        valid_models = models_for_backend(backend, provider) or {}
+        valid = sorted(valid_models.keys())
         await update.message.reply_text(f"Choose: {', '.join(valid)}")
         return
 
@@ -649,9 +679,11 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         model_key = value.lower()
-        instance = pool.get(chat_id)
-        if not validate_model_for_provider(model_key, instance.provider):
-            valid = sorted(PROVIDER_MODELS.get(instance.provider, {}).keys())
+        # Backend-aware validation
+        backend, provider = _get_user_backend_provider(pool, chat_id, config)
+        if not validate_model_for_backend(model_key, backend, provider):
+            valid_models = models_for_backend(backend, provider) or {}
+            valid = sorted(valid_models.keys())
             await update.message.reply_text(f"Unknown model. Choose from: {', '.join(valid)}")
             return
 
@@ -1485,10 +1517,11 @@ async def _handle_workspace_config(
             else:
                 await update.message.reply_text("Usage: /workspace config model <model_id>")
             return
-        # Value provided - need instance for provider validation
-        instance = pool.get(chat_id)
-        if not validate_model_for_provider(value.lower(), instance.provider):
-            valid = sorted(PROVIDER_MODELS.get(instance.provider, {}).keys())
+        # Backend-aware validation
+        backend, provider = _get_user_backend_provider(pool, chat_id, config)
+        if not validate_model_for_backend(value.lower(), backend, provider):
+            valid_models = models_for_backend(backend, provider) or {}
+            valid = sorted(valid_models.keys())
             await update.message.reply_text(f"Unknown model. Choose from: {', '.join(valid)}")
             return
         await sessions.set_workspace_config_setting(chat_id, workspace_str, "model", value.lower())

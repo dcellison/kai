@@ -32,6 +32,7 @@ from kai.backend import (
     AgentResponse,
     ApiContext,
     StreamEvent,
+    apply_workspace_model,
     build_foreign_workspace_reminder,
     build_session_context,
     ensure_user_memory,
@@ -117,11 +118,10 @@ class GooseBackend(AgentBackend):
         self._default_model = model
         self._default_timeout = timeout_seconds
 
-        # Apply per-workspace overrides (if configured). These become
-        # the "effective" values for this workspace.
+        # Apply per-workspace overrides (if configured). Model
+        # validated against the goose provider surface.
         if workspace_config:
-            if workspace_config.model:
-                self.model = workspace_config.model
+            self.model = apply_workspace_model(workspace_config, "goose", self.provider, self.model)
             if workspace_config.timeout is not None:
                 self.timeout_seconds = workspace_config.timeout
 
@@ -645,12 +645,12 @@ class GooseBackend(AgentBackend):
 
         # Revert to global defaults, then apply overrides. Prevents
         # stale values when switching from a fully-configured workspace
-        # to a partially-configured one.
+        # to a partially-configured one. Model validated against the
+        # goose provider surface.
         self.model = self._default_model
         self.timeout_seconds = self._default_timeout
         if workspace_config:
-            if workspace_config.model:
-                self.model = workspace_config.model
+            self.model = apply_workspace_model(workspace_config, "goose", self.provider, self.model)
             if workspace_config.timeout is not None:
                 self.timeout_seconds = workspace_config.timeout
         # _fresh_session is set True by _ensure_started() on next send()

@@ -32,6 +32,7 @@ from kai.backend import (
     AgentResponse,
     ApiContext,
     StreamEvent,
+    apply_workspace_model,
     build_foreign_workspace_reminder,
     build_session_context,
     ensure_user_memory,
@@ -158,10 +159,11 @@ class ClaudeCodeBackend(AgentBackend):
 
         # Apply per-workspace overrides (if configured). These become
         # the "effective" values for this workspace. The /model command
-        # can still override model within a session.
+        # can still override model within a session. Model validated
+        # against claude's anthropic surface so a workspaces.yaml entry
+        # with a codex-only model is silently rejected here.
         if workspace_config:
-            if workspace_config.model:
-                self.model = workspace_config.model
+            self.model = apply_workspace_model(workspace_config, "claude", "anthropic", self.model)
             if workspace_config.budget is not None:
                 self.max_budget_usd = workspace_config.budget
             if workspace_config.timeout is not None:
@@ -1209,8 +1211,7 @@ class ClaudeCodeBackend(AgentBackend):
         self.timeout_seconds = self._default_timeout
 
         if workspace_config:
-            if workspace_config.model:
-                self.model = workspace_config.model
+            self.model = apply_workspace_model(workspace_config, "claude", "anthropic", self.model)
             if workspace_config.budget is not None:
                 self.max_budget_usd = workspace_config.budget
             if workspace_config.timeout is not None:

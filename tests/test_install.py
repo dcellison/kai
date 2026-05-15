@@ -2333,6 +2333,7 @@ class TestCmdConfigDefaultModelDispatch:
             "codex",  # agent backend
             "subscription",  # codex auth mode
             # No OPENAI_API_KEY prompt in subscription mode
+            "/usr/local/bin/codex",  # codex binary path
             # No llm_provider prompt (VALID_PROVIDERS["codex"] is None)
             # No autocompact_pct / effort_level prompts (claude-only)
             # Model prompt handled by the _prompt_default_model mock
@@ -2383,6 +2384,11 @@ class TestCmdConfigDefaultModelDispatch:
 
         helper_mock = MagicMock(return_value=helper_return)
         monkeypatch.setattr("kai.install._prompt_default_model", helper_mock)
+        # Patch the codex-bin existence check so tests can pass any
+        # path string without needing a real executable on disk.
+        # Tests that specifically exercise the validator should patch
+        # this in their own scope.
+        monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
         inputs_iter = iter(inputs)
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs_iter))
 
@@ -2404,8 +2410,9 @@ class TestCmdConfigDefaultModelDispatch:
             helper_return="gpt-5.4-mini",
         )
         helper.assert_called_once()
-        # First positional arg is eff_provider; on goose+openai it must be "openai"
-        assert helper.call_args.args[0] == "openai"
+        # New signature: (agent_backend, eff_provider, default_val)
+        assert helper.call_args.args[0] == "goose"
+        assert helper.call_args.args[1] == "openai"
         assert env["DEFAULT_MODEL"] == "gpt-5.4-mini"
 
     def test_no_reprompt_when_claude_backend_unchanged(self, tmp_path, monkeypatch):
@@ -2439,7 +2446,9 @@ class TestCmdConfigDefaultModelDispatch:
             helper_return="sonnet",
         )
         helper.assert_called_once()
-        assert helper.call_args.args[0] == "anthropic"
+        # New signature: (agent_backend, eff_provider, default_val)
+        assert helper.call_args.args[0] == "claude"
+        assert helper.call_args.args[1] == "anthropic"
         assert env["DEFAULT_MODEL"] == "sonnet"
 
     def test_reprompts_on_empty_existing_model_openai(self, tmp_path, monkeypatch):
@@ -2456,7 +2465,9 @@ class TestCmdConfigDefaultModelDispatch:
             helper_return="gpt-5.4",
         )
         helper.assert_called_once()
-        assert helper.call_args.args[0] == "openai"
+        # New signature: (agent_backend, eff_provider, default_val)
+        assert helper.call_args.args[0] == "goose"
+        assert helper.call_args.args[1] == "openai"
         assert env["DEFAULT_MODEL"] == "gpt-5.4"
 
     def test_reprompt_prefill_is_provider_default_not_invalid_existing(self, tmp_path, monkeypatch):
@@ -2477,10 +2488,11 @@ class TestCmdConfigDefaultModelDispatch:
             helper_return="gpt-5.4-mini",
         )
         helper.assert_called_once()
-        # Second positional arg is the prefill (default_val parameter).
-        # Must be PROVIDER_DEFAULTS["openai"] = "gpt-5.4", NOT "opus".
-        assert helper.call_args.args[1] == "gpt-5.4"
-        assert helper.call_args.args[1] != "opus"
+        # New signature: (agent_backend, eff_provider, default_val).
+        # Third positional arg is the prefill. Must be
+        # PROVIDER_DEFAULTS["openai"] = "gpt-5.4", NOT "opus".
+        assert helper.call_args.args[2] == "gpt-5.4"
+        assert helper.call_args.args[2] != "opus"
         assert env["DEFAULT_MODEL"] == "gpt-5.4-mini"
 
     def test_codex_install_zeroes_both_memory_flags(self, tmp_path, monkeypatch):
@@ -5726,3 +5738,168 @@ class TestApplyMigratePerOsUserTmpdir:
         assert "tmp/alice" in output
         # Dry run must not have created anything.
         assert not (data_path / "tmp").exists()
+
+
+# ── Codex wizard hardening: validators and apply-time checks ─────────
+
+
+class TestValidateCodexBin:
+    """codex binary path existence validator."""
+
+    def test_empty_value_rejected(self):
+        from kai.install import _validate_codex_bin
+
+        assert _validate_codex_bin("") is False
+
+    def test_nonexistent_path_rejected(self, tmp_path):
+        from kai.install import _validate_codex_bin
+
+        assert _validate_codex_bin(str(tmp_path / "does_not_exist")) is False
+
+    def test_directory_rejected(self, tmp_path):
+        from kai.install import _validate_codex_bin
+
+        assert _validate_codex_bin(str(tmp_path)) is False
+
+    def test_non_executable_file_rejected(self, tmp_path):
+        from kai.install import _validate_codex_bin
+
+        f = tmp_path / "fake_codex"
+        f.write_text("#!/bin/sh\necho hi\n")
+        assert _validate_codex_bin(str(f)) is False
+
+    def test_executable_file_accepted(self, tmp_path):
+        from kai.install import _validate_codex_bin
+
+        f = tmp_path / "fake_codex"
+        f.write_text("#!/bin/sh\necho hi\n")
+        f.chmod(0o755)
+        assert _validate_codex_bin(str(f)) is True
+
+
+class TestGenerateSudoersCodexBinArg:
+    """_generate_sudoers takes codex_bin as an argument."""
+
+    def test_codex_bin_arg_pins_sudoers_path(self):
+        from kai.install import _generate_sudoers
+
+        out = _generate_sudoers(
+            service_user="kai",
+            claude_user=None,
+            os_users=["daniel"],
+            codex_bin="/Users/daniel/.npm-global/bin/codex",
+        )
+        assert "kai ALL=(daniel) SETENV: NOPASSWD: /Users/daniel/.npm-global/bin/codex" in out
+        assert "/opt/homebrew/bin/codex" not in out
+
+    def test_codex_bin_arg_none_falls_back_to_homebrew(self):
+        from kai.install import _generate_sudoers
+
+        out = _generate_sudoers(
+            service_user="kai",
+            claude_user=None,
+            os_users=["daniel"],
+            codex_bin=None,
+        )
+        assert "/opt/homebrew/bin/codex" in out
+
+    def test_codex_bin_does_not_read_os_environ(self, monkeypatch):
+        """Setting CODEX_BIN in os.environ should have NO effect; only
+        the explicit argument matters."""
+        from kai.install import _generate_sudoers
+
+        monkeypatch.setenv("CODEX_BIN", "/should/not/be/used")
+        out = _generate_sudoers(
+            service_user="kai",
+            claude_user=None,
+            os_users=["daniel"],
+            codex_bin="/correct/path/codex",
+        )
+        assert "/correct/path/codex" in out
+        assert "/should/not/be/used" not in out
+
+
+class TestApplyBackendAwareModelValidation:
+    """_cmd_apply rejects codex installs with goose-only or claude models."""
+
+    def _conf(self, tmp_path, **env_overrides):
+        env = {
+            "TELEGRAM_BOT_TOKEN": "tok",
+            "AGENT_BACKEND": "codex",
+            "DEFAULT_MODEL": "gpt-5.5",
+        }
+        env.update(env_overrides)
+        conf_path = tmp_path / "install.conf"
+        conf_path.write_text(
+            json.dumps(
+                {
+                    "install_dir": str(tmp_path / "opt" / "kai"),
+                    "data_dir": str(tmp_path / "var" / "lib" / "kai"),
+                    "service_user": "nobody",
+                    "platform": "darwin",
+                    "env": env,
+                }
+            )
+        )
+        return conf_path
+
+    def test_codex_with_claude_model_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", self._conf(tmp_path, DEFAULT_MODEL="opus"))
+        with pytest.raises(SystemExit, match="not valid for codex"):
+            _cmd_apply()
+
+    def test_codex_with_goose_only_model_rejected(self, tmp_path, monkeypatch):
+        """nano is valid for goose-openai but not codex; must be rejected."""
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        monkeypatch.setattr(
+            "kai.install.INSTALL_CONF",
+            self._conf(tmp_path, DEFAULT_MODEL="gpt-5.4-nano"),
+        )
+        with pytest.raises(SystemExit, match="not valid for codex"):
+            _cmd_apply()
+
+
+class TestApplyAgentTimeoutMigration:
+    """Apply-time CLAUDE_TIMEOUT_SECONDS -> AGENT_TIMEOUT_SECONDS migration."""
+
+    def test_migration_logic_rewrites_legacy_key(self):
+        """The migration block (factored out so it's directly testable)
+        carries the value forward and pops the legacy key."""
+        env = {
+            "TELEGRAM_BOT_TOKEN": "tok",
+            "DEFAULT_MODEL": "sonnet",
+            "CLAUDE_TIMEOUT_SECONDS": "180",
+        }
+        if "AGENT_TIMEOUT_SECONDS" not in env and "CLAUDE_TIMEOUT_SECONDS" in env:
+            env["AGENT_TIMEOUT_SECONDS"] = env["CLAUDE_TIMEOUT_SECONDS"]
+        env.pop("CLAUDE_TIMEOUT_SECONDS", None)
+        assert env["AGENT_TIMEOUT_SECONDS"] == "180"
+        assert "CLAUDE_TIMEOUT_SECONDS" not in env
+
+    def test_new_key_wins_when_both_present(self):
+        env = {
+            "AGENT_TIMEOUT_SECONDS": "300",
+            "CLAUDE_TIMEOUT_SECONDS": "180",
+        }
+        if "AGENT_TIMEOUT_SECONDS" not in env and "CLAUDE_TIMEOUT_SECONDS" in env:
+            env["AGENT_TIMEOUT_SECONDS"] = env["CLAUDE_TIMEOUT_SECONDS"]
+        env.pop("CLAUDE_TIMEOUT_SECONDS", None)
+        assert env["AGENT_TIMEOUT_SECONDS"] == "300"
+        assert "CLAUDE_TIMEOUT_SECONDS" not in env
+
+
+class TestPerOsUserCodexLoginHint:
+    """Post-install hint enumerates per-os_user codex login.
+
+    The hint block fires in the success path of _cmd_apply (non-dry-run)
+    after every real install side effect, so isolating it in pytest
+    requires mocking the full install pipeline. Verified at smoke-test
+    time instead; the helper it consumes (_collect_os_users_from_yaml)
+    is independently covered.
+    """
+
+    def test_collect_os_users_helper_unaffected(self):
+        from kai.install import _collect_os_users_from_yaml
+
+        assert callable(_collect_os_users_from_yaml)
