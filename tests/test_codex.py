@@ -351,6 +351,14 @@ class TestHandshake:
         assert thread_msg["id"] == 2
         assert thread_msg["params"]["cwd"] == "/tmp/test-workspace"
         assert thread_msg["params"]["model"] == "gpt-5.4"
+        # approvalPolicy and sandbox are the two production-unblocking
+        # fields: dropping or misspelling either re-creates the original
+        # "Codex timed out" (on-request gate with no human approver) or
+        # "GitHub access is blocked by the sandbox" (workspace-write
+        # default disables network). Lock both exact strings; sandbox
+        # variants are kebab-case at thread/start.
+        assert thread_msg["params"]["approvalPolicy"] == "never"
+        assert thread_msg["params"]["sandbox"] == "danger-full-access"
 
     @pytest.mark.asyncio
     async def test_argv_invokes_codex_app_server(self):
