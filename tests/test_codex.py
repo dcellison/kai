@@ -507,6 +507,27 @@ class TestHandshake:
         call_kwargs = mock_exec.call_args[1]
         assert "CODEX_PROVIDER" not in call_kwargs["env"]
 
+    @pytest.mark.asyncio
+    async def test_subprocess_limit_is_at_least_16mb(self):
+        """
+        The asyncio.StreamReader limit on stdout must be large enough
+        for any single codex event payload. The default 64KB and our
+        previous 1MB both produced
+        "Separator is not found, and chunk exceed the limit"
+        from readline on real PR-review turns where codex inlines a
+        tool result (e.g. a `gh pr diff` body or a long item/completed
+        agentMessage text). Lock the lower bound so a future shrinkback
+        gets caught here, not on a live operator turn.
+        """
+        c = _make_codex()
+        proc = _make_mock_proc(_handshake_lines())
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await c._ensure_started()
+
+        call_kwargs = mock_exec.call_args[1]
+        assert call_kwargs["limit"] >= 16 * 1024 * 1024
+
 
 # ── Stream parsing ─────────────────────────────────────────────────
 

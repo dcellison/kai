@@ -292,7 +292,20 @@ class CodexBackend(AgentBackend):
             # cannot signal a process whose UIDs are all the
             # target user). See _send_signal for the full chain.
             start_new_session=bool(effective_codex_user),
-            limit=1024 * 1024,  # 1MB per-line buffer
+            # A single codex event can carry the full text of a tool
+            # call's output inline (e.g. a `gh pr diff` result on a
+            # reasoning item, or an item/completed for a long
+            # agentMessage). The asyncio.StreamReader default limit
+            # is 64KB; we previously bumped it to 1MB which was still
+            # too tight for PR-review-sized chunks - real codex review
+            # turns surfaced "Separator is not found, and chunk exceed
+            # the limit" from readline. 16MB is well above any
+            # plausible single-event payload while still bounding
+            # memory if codex ever produces a runaway line. A
+            # proper streaming reader (chunked + reassemble on \n)
+            # would remove the ceiling entirely; deferred until the
+            # 16MB ceiling is itself observed in practice.
+            limit=16 * 1024 * 1024,
         )
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
