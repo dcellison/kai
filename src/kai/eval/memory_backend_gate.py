@@ -1465,6 +1465,27 @@ def compare_thresholds(claude: BackendMetrics, codex: BackendMetrics) -> Thresho
         )
     )
 
+    # Conditional episode recall floor. With small positive-probe
+    # counts the recall metric is noisy, so the spec only enforces
+    # this when there are at least 3 episode-positive probes. The
+    # FN band above catches one-or-two-miss regressions; the recall
+    # floor catches the case where the codex arm misses every
+    # positive while the baseline already missed enough that the
+    # FN band stays satisfied (e.g. claude misses 2/3 -> FN=2,
+    # codex misses 3/3 -> FN=3, FN band passes but recall=0).
+    positive_probe_count = codex.episode_true_positive_count + codex.episode_false_negative_count
+    if positive_probe_count >= 3:
+        recall_floor = max(0.67, claude.episode_recall - 0.25)
+        checks.append(
+            ThresholdCheck(
+                name="T6.episode_recall",
+                passed=codex.episode_recall >= recall_floor,
+                claude_value=claude.episode_recall,
+                codex_value=codex.episode_recall,
+                threshold=f"codex episode_recall >= {recall_floor:.4f}",
+            )
+        )
+
     checks.append(
         ThresholdCheck(
             name="T7.hallucinated_id",

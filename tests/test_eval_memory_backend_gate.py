@@ -430,6 +430,52 @@ class TestCompareThresholds:
         assert len(report.checks) == 1
         assert report.checks[0].name == "T1.claude_baseline"
 
+    def test_fails_codex_on_episode_recall_floor_with_three_positives(self):
+        """The conditional T6 recall floor fires when at least 3
+        episode-positive probes exist. A weak claude baseline can
+        let the FN-count band pass while codex misses every positive;
+        the recall floor exists to catch exactly that hole.
+
+        Setup: 3 episode-positive probes. Claude misses 2 (TP=1,
+        FN=2, recall=0.33). Codex misses 3 (TP=0, FN=3, recall=0.0).
+        FN band: codex_FN (3) <= claude_FN (2) + 1 = 3, passes.
+        Recall floor: max(0.67, 0.33 - 0.25) = 0.67, codex (0.0)
+        fails. The check is what flips the verdict."""
+        claude = _clean_metrics(
+            episode_true_positive_count=1,
+            episode_false_negative_count=2,
+            episode_recall=1 / 3,
+        )
+        codex = _clean_metrics(
+            episode_true_positive_count=0,
+            episode_false_negative_count=3,
+            episode_recall=0.0,
+        )
+        report = g.compare_thresholds(claude, codex)
+        failed = [c.name for c in report.checks if not c.passed]
+        assert "T6.episode_recall" in failed
+        # The FN-count band still passes; this is the key point of the
+        # finding - the recall floor is not redundant with the FN band.
+        assert "T6.episode_false_negative" not in failed
+
+    def test_recall_floor_not_evaluated_below_three_positives(self):
+        """With only 2 episode-positive probes the recall floor does
+        NOT fire; small-sample noise would make a hard threshold
+        meaningless. The FN-count band still runs."""
+        claude = _clean_metrics(
+            episode_true_positive_count=1,
+            episode_false_negative_count=1,
+            episode_recall=0.5,
+        )
+        codex = _clean_metrics(
+            episode_true_positive_count=0,
+            episode_false_negative_count=2,
+            episode_recall=0.0,
+        )
+        report = g.compare_thresholds(claude, codex)
+        check_names = [c.name for c in report.checks]
+        assert "T6.episode_recall" not in check_names
+
 
 # ── Output ──────────────────────────────────────────────────────────
 
