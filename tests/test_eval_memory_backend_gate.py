@@ -650,3 +650,273 @@ class TestComputeMetricsFromLog:
         assert metrics.hallucinated_id_count == 1
         # consolidation_skip_rate = skipped / (stored + skipped) = 1/3.
         assert metrics.consolidation_skip_rate == pytest.approx(1 / 3)
+
+
+# ── Consolidation assertion scoring ─────────────────────────────────
+
+
+def _write_consolidate_line(path: Path, payload: dict, *, append: bool = True) -> int:
+    """Append one synthetic `memory.consolidate.intent` line, return new file size.
+
+    Matches the FileHandler `LEVEL:logger:message` format the harness
+    produces. The returned size is what `_run_probe` would see as
+    `pre_log_offset` for the NEXT probe.
+    """
+    line = "INFO:kai.memory_extraction:memory.consolidate.intent " + json.dumps(payload, separators=(",", ":")) + "\n"
+    mode = "a" if append else "w"
+    with path.open(mode, encoding="utf-8") as fh:
+        fh.write(line)
+    return path.stat().st_size
+
+
+class TestReadConsolidationEvents:
+    """`_read_consolidation_events` reads only lines after the supplied
+    offset and decodes JSON payloads from `memory.consolidate.intent`
+    log lines; other prefixes and malformed lines are silently
+    skipped so per-probe attribution survives a future log change."""
+
+    def test_returns_only_lines_after_offset(self, tmp_path):
+        path = tmp_path / "claude.log"
+        path.write_text("", encoding="utf-8")
+        _write_consolidate_line(path, {"intent": "new", "outcome": "stored"})
+        offset_after_first = path.stat().st_size
+        _write_consolidate_line(path, {"intent": "skip_redundant", "outcome": "skipped"})
+
+        events = g._read_consolidation_events(path, offset_after_first)
+
+        assert len(events) == 1
+        assert events[0]["intent"] == "skip_redundant"
+
+    def test_skips_unrelated_prefixes(self, tmp_path):
+        path = tmp_path / "claude.log"
+        path.write_text(
+            'INFO:kai.memory:memory.recall {"hits":[]}\n'
+            'INFO:kai.memory_extraction:memory.consolidate.intent {"intent":"new","outcome":"stored"}\n',
+            encoding="utf-8",
+        )
+        events = g._read_consolidation_events(path, 0)
+        assert len(events) == 1
+        assert events[0]["intent"] == "new"
+
+
+class TestScoreConsolidationAssertion:
+    """A probe's `expected.consolidation` declares one or both of
+    `expected_intent` / `expected_outcome`. The scorer flips the
+    matching `consolidation_*_satisfied` bool to True iff at least
+    one captured event satisfies that axis."""
+
+    def test_intent_match_only(self):
+        outcome = g.ProbeOutcome(
+            probe_id="p",
+            category="consolidation",
+            consolidation_events=[{"intent": "skip_redundant", "outcome": "skipped"}],
+        )
+        g._score_consolidation_assertion(outcome, g.ExpectedConsolidation(expected_intent="skip_redundant"))
+        assert outcome.consolidation_intent_satisfied is True
+        assert outcome.consolidation_outcome_satisfied is None
+
+    def test_both_axes_must_be_satisfied(self):
+        """The two axes can be satisfied by different events; that
+        flexibility is intentional so a probe declaring both does
+        not have to depend on a single payload carrying both."""
+        outcome = g.ProbeOutcome(
+            probe_id="p",
+            category="consolidation",
+            consolidation_events=[
+                {"intent": "update_of", "outcome": "stored"},
+                {"intent": "skip_redundant", "outcome": "skipped"},
+            ],
+        )
+        g._score_consolidation_assertion(
+            outcome,
+            g.ExpectedConsolidation(expected_intent="update_of", expected_outcome="skipped"),
+        )
+        assert outcome.consolidation_intent_satisfied is True
+        assert outcome.consolidation_outcome_satisfied is True
+
+    def test_failure_when_intent_does_not_match(self):
+        outcome = g.ProbeOutcome(
+            probe_id="p",
+            category="consolidation",
+            consolidation_events=[{"intent": "new", "outcome": "stored"}],
+        )
+        g._score_consolidation_assertion(outcome, g.ExpectedConsolidation(expected_intent="skip_redundant"))
+        assert outcome.consolidation_intent_satisfied is False
+
+
+# ── Episode validity includes speaker check ─────────────────────────
+
+
+class TestEpisodeValiditySpeakerCheck:
+    """An episode row missing or carrying the wrong speaker must
+    NOT count toward `episode_required_field_validity`, even when
+    every content field is present. The speaker field lives outside
+    the schema's required list (the stage-2 generator sets it) so
+    the gate has to enforce it explicitly."""
+
+    def _make_episode(self, *, speaker: str | None) -> memory.MemoryResult:
+        metadata = {
+            "goal": "Diagnose the slowness",
+            "context": "Production extractions are slow",
+            "approach": "Ran a diagnostic and isolated the cost driver",
+            "outcome": "Reduced the payload cap",
+            "outcome_quality": "success",
+            "tags": ["memory"],
+            "actors": ["user"],
+        }
+        if speaker is not None:
+            metadata["speaker"] = speaker
+        return memory.MemoryResult(
+            id="ep-1",
+            text="episode summary",
+            score=0.0,
+            memory_type="episode",
+            metadata=metadata,
+            created_at="",
+            updated_at="",
+        )
+
+    def _make_run(self, episode: memory.MemoryResult) -> g.BackendRun:
+        return g.BackendRun(
+            backend="claude",
+            sandbox_user_id="sandbox-498-claude",
+            model_fact="m",
+            model_episode="m",
+            log_path=Path("/dev/null"),
+            probes=[
+                g.ProbeOutcome(
+                    probe_id="p1",
+                    category="episode-positive",
+                    new_episode_ids=[episode.id],
+                )
+            ],
+            final_episodes=[episode],
+        )
+
+    def _probes(self) -> list[g.GateProbe]:
+        return [
+            g.GateProbe(
+                probe_id="p1",
+                category="episode-positive",
+                prior=(),
+                current_user="u",
+                current_assistant="a",
+            )
+        ]
+
+    def test_speaker_episode_summary_counts_as_valid(self):
+        run = self._make_run(self._make_episode(speaker="episode_summary"))
+        tp, _fp, _fn, _tn, validity = g.score_episodes(self._probes(), run)
+        assert tp == 1
+        assert validity == 1.0
+
+    def test_missing_speaker_drops_validity_to_zero(self):
+        run = self._make_run(self._make_episode(speaker=None))
+        tp, _fp, _fn, _tn, validity = g.score_episodes(self._probes(), run)
+        # Still a true positive (the row appeared), but invalid.
+        assert tp == 1
+        assert validity == 0.0
+
+    def test_wrong_speaker_drops_validity_to_zero(self):
+        run = self._make_run(self._make_episode(speaker="user"))
+        tp, _fp, _fn, _tn, validity = g.score_episodes(self._probes(), run)
+        assert tp == 1
+        assert validity == 0.0
+
+
+# ── CLI initializes memory before run_backend ───────────────────────
+
+
+class TestCLIInitializesMemory:
+    """The CLI must call `memory.init_memory` before any backend arm
+    runs. Without it, `kai.memory._memory` stays None and every
+    storage call short-circuits, so the harness would produce a
+    silent zero-state result. This was caught in PR #502 round 1."""
+
+    def test_init_memory_called_before_backend_runs(self, tmp_path, monkeypatch):
+        """Patch `init_memory` and `run_backend` to record call order;
+        the gate must call init_memory at least once and must do so
+        before the first run_backend invocation."""
+        from unittest.mock import patch
+
+        # Build a minimum-valid probe fixture so the preflight passes.
+        path = tmp_path / "probes.jsonl"
+        rows = []
+        for i in range(10):
+            rows.append(
+                _probe_row(
+                    probe_id=f"d{i}",
+                    category="durable-fact",
+                    expected={
+                        "must_store": [{"anchor_id": f"a{i}", "content_any": [f"c{i}"]}],
+                        "retrieval": [
+                            {"query": f"q{i}", "anchor_id": f"a{i}"},
+                            {"query": f"q2{i}", "anchor_id": f"a{i}"},
+                        ],
+                    },
+                )
+            )
+        for i in range(6):
+            rows.append(
+                _probe_row(
+                    probe_id=f"w{i}",
+                    category="workflow-noise",
+                    expected={"must_not_store": [{"content_any": [f"n{i}"]}]},
+                )
+            )
+        for i in range(4):
+            rows.append(
+                _probe_row(
+                    probe_id=f"c{i}",
+                    category="consolidation",
+                    expected={"consolidation": {"expected_intent": "skip_redundant"}},
+                )
+            )
+        for i in range(2):
+            rows.append(_probe_row(probe_id=f"ep{i}", category="episode-positive", expected={}))
+            rows.append(_probe_row(probe_id=f"en{i}", category="episode-negative", expected={}))
+        _write_jsonl(path, rows)
+
+        call_order: list[str] = []
+
+        def _fake_init(_config):
+            call_order.append("init_memory")
+
+        async def _fake_run_backend(**kwargs):
+            call_order.append("run_backend")
+            return g.BackendRun(
+                backend=kwargs["backend"],
+                sandbox_user_id=kwargs["sandbox_user_id"],
+                model_fact="m",
+                model_episode="m",
+                log_path=kwargs["log_path"],
+            )
+
+        args = type(
+            "Args",
+            (),
+            {
+                "probes": path,
+                "output_dir": tmp_path / "out",
+                "user_prefix": "sandbox-test",
+                "backends": ["claude", "codex"],
+                "reset": True,
+                "keep_sandboxes": False,
+                "qualitative_sample_size": 10,
+                "fail_on_threshold": False,
+                "validate_only": False,
+            },
+        )()
+
+        with (
+            patch("kai.eval.memory_backend_gate.memory.init_memory", _fake_init),
+            patch("kai.eval.memory_backend_gate.load_config", return_value=_BASE_CONFIG),
+            patch("kai.eval.memory_backend_gate.run_backend", _fake_run_backend),
+        ):
+            import asyncio
+
+            rc = asyncio.run(g._run_cli(args))
+
+        assert rc == 0
+        assert "init_memory" in call_order
+        assert call_order.index("init_memory") < call_order.index("run_backend")

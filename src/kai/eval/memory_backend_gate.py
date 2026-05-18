@@ -228,6 +228,14 @@ class ProbeOutcome:
     new_fact_ids: list[str] = field(default_factory=list)
     new_episode_ids: list[str] = field(default_factory=list)
     consolidation_events: list[dict] = field(default_factory=list)
+    # Per-probe consolidation assertion results. None means the probe
+    # did not declare an assertion on that axis; True/False means it
+    # did and the gate scored it. Kept separate from the global
+    # `memory.consolidate.intent` counters so a single probe can fail
+    # a `consolidation` assertion without contaminating aggregate
+    # metrics that summarize the whole arm.
+    consolidation_intent_satisfied: bool | None = None
+    consolidation_outcome_satisfied: bool | None = None
     reasoner_events: list[dict] = field(default_factory=list)
 
 
@@ -715,6 +723,7 @@ async def run_backend(
                 sandbox_user_id=sandbox_user_id,
                 prior_fact_ids=prior_fact_ids,
                 prior_episode_ids=prior_episode_ids,
+                log_path=log_path,
             )
             run.probes.append(outcome)
             for fid in outcome.new_fact_ids:
@@ -738,6 +747,7 @@ async def _run_probe(
     sandbox_user_id: str,
     prior_fact_ids: set[str],
     prior_episode_ids: set[str],
+    log_path: Path,
 ) -> ProbeOutcome:
     """Run extract_and_store for one probe and snapshot the delta.
 
@@ -745,6 +755,13 @@ async def _run_probe(
     for stage-2 tasks scheduled by this probe to finish before
     snapshotting episodes; without the wait, episode positives can
     score as false negatives because the snapshot races the task.
+
+    Captures the log file offset before `extract_and_store` so the
+    new `memory.consolidate.intent` payloads emitted during the
+    probe can be attributed back to this probe specifically. The
+    file-offset approach is the same pattern `_score_one_query`
+    uses for retrieval log lines; both rely on the per-backend
+    FileHandler producing append-only output.
     """
     user_text, assistant_text, prior_pairs = _window_to_extractor_args(
         {
@@ -753,6 +770,7 @@ async def _run_probe(
         }
     )
 
+    pre_log_offset = log_path.stat().st_size if log_path.exists() else 0
     pre_episode_tasks = set(memory_extraction._pending_episode_tasks)
     await memory_extraction.extract_and_store(
         user_text,
@@ -773,11 +791,14 @@ async def _run_probe(
     new_facts = [r for r in facts_after if r.id not in prior_fact_ids]
     new_episodes = [r for r in episodes_after if r.id not in prior_episode_ids]
 
+    consolidation_events = _read_consolidation_events(log_path, pre_log_offset)
+
     outcome = ProbeOutcome(
         probe_id=probe.probe_id,
         category=probe.category,
         new_fact_ids=[r.id for r in new_facts],
         new_episode_ids=[r.id for r in new_episodes],
+        consolidation_events=consolidation_events,
     )
 
     for anchor in probe.must_store:
@@ -800,7 +821,59 @@ async def _run_probe(
                     outcome.forbidden_violations.append(needle)
                     break
 
+    if probe.consolidation is not None:
+        _score_consolidation_assertion(outcome, probe.consolidation)
+
     return outcome
+
+
+def _read_consolidation_events(log_path: Path, start_offset: int) -> list[dict]:
+    """Decode `memory.consolidate.intent` JSON payloads written after `start_offset`.
+
+    Returns one dict per matching log line in append order. Lines that
+    do not match the prefix or fail to JSON-decode are silently skipped
+    so a future log-format change cannot fail the gate on parse alone.
+    Designed so per-probe attribution works even when other modules
+    interleave INFO lines in the same file (a root-logger FileHandler
+    captures every named logger's output, not just the consolidation
+    emit site).
+    """
+    if not log_path.exists():
+        return []
+    with log_path.open("r", encoding="utf-8") as fh:
+        fh.seek(start_offset)
+        tail = fh.read()
+    events: list[dict] = []
+    for line in tail.splitlines():
+        stripped = line.rstrip("\n")
+        if not stripped:
+            continue
+        parts = stripped.split(":", 2)
+        message = parts[2] if len(parts) == 3 else stripped
+        payload = parse_json_suffix_line(message, "memory.consolidate.intent")
+        if payload is not None:
+            events.append(payload)
+    return events
+
+
+def _score_consolidation_assertion(outcome: ProbeOutcome, expected: ExpectedConsolidation) -> None:
+    """Apply the per-probe consolidation assertion semantics.
+
+    For each declared assertion axis (`expected_intent`,
+    `expected_outcome`), the probe is satisfied if at least one
+    captured `memory.consolidate.intent` payload's field matches.
+    The two axes are independent: a probe declaring both must satisfy
+    both, but the matches can come from different payloads (a future
+    `same_event: true` flag would tighten this).
+    """
+    if expected.expected_intent is not None:
+        outcome.consolidation_intent_satisfied = any(
+            event.get("intent") == expected.expected_intent for event in outcome.consolidation_events
+        )
+    if expected.expected_outcome is not None:
+        outcome.consolidation_outcome_satisfied = any(
+            event.get("outcome") == expected.expected_outcome for event in outcome.consolidation_events
+        )
 
 
 def _match_anchor(anchor: ExpectedAnchor, candidates: list[memory.MemoryResult]) -> memory.MemoryResult | None:
@@ -1125,7 +1198,17 @@ def score_episodes(probes: list[GateProbe], run: BackendRun) -> tuple[int, int, 
                 continue
             field_total += 1
             metadata = row.metadata or {}
-            if all(metadata.get(name) for name in required):
+            # All required content fields must be present AND the row
+            # must carry the canonical `speaker=episode_summary` tag.
+            # The speaker field lives outside the schema's required
+            # list (it is set by the stage-2 generator, not by the
+            # model) but is part of the spec's episode validity
+            # contract: a malformed episode with the wrong speaker
+            # would otherwise score as valid under T6 and let a
+            # broken metadata path through the gate.
+            fields_present = all(metadata.get(name) for name in required)
+            speaker_ok = metadata.get("speaker") == "episode_summary"
+            if fields_present and speaker_ok:
                 field_valid += 1
     validity = field_valid / max(1, field_total) if field_total else 1.0
     return tp, fp, fn, tn, validity
@@ -1478,6 +1561,9 @@ def build_gate_result(
                 "tag_correct": outcome.tag_correct,
                 "new_fact_ids": outcome.new_fact_ids,
                 "new_episode_ids": outcome.new_episode_ids,
+                "consolidation_events": outcome.consolidation_events,
+                "consolidation_intent_satisfied": outcome.consolidation_intent_satisfied,
+                "consolidation_outcome_satisfied": outcome.consolidation_outcome_satisfied,
             }
         retrieval_entries = []
         for backend_name, run in runs.items():
@@ -1821,6 +1907,23 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     base_config = load_config()
+    # Initialize the module-level Mem0 instance before any backend
+    # arm runs. Without this `kai.memory._memory` stays None and
+    # every storage call (delete_all, get_all, add_structured,
+    # format_context) short-circuits to a silent no-op, so
+    # extracted facts surface as outcome=dropped_backend and
+    # retrieval returns nothing - the gate would run but score
+    # whatever zero-state Codex happens to also produce. The
+    # replay harness handles this the same way; use a
+    # memory-enabled config copy because `load_config()` may
+    # return memory_enabled=False if the operator's env file does
+    # not opt in.
+    memory_init_config = dataclasses.replace(
+        base_config,
+        memory_enabled=True,
+        memory_extraction_enabled=True,
+    )
+    memory.init_memory(memory_init_config)
     runs: dict[str, BackendRun] = {}
     metrics_by_backend: dict[str, BackendMetrics] = {}
     for backend in args.backends:
