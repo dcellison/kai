@@ -25,7 +25,7 @@ import asyncio
 import json
 import logging
 from dataclasses import replace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1092,3 +1092,75 @@ def test_module_exposes_extraction_result():
     from kai.memory_extraction import ExtractionResult as ER
 
     assert ER is ExtractionResult
+
+
+class TestRunEpisodeExtractorViaReasoner:
+    """`_run_episode_extractor` now routes through the OneShotReasoner
+    boundary. These tests monkeypatch the reasoner helper so the
+    caller-side mapping from typed reasoner exceptions to the stage-2
+    `(episode, cost_usd, reason)` triple is exercised directly."""
+
+    @pytest.mark.asyncio
+    async def test_valid_envelope_returns_episode_triple(self):
+        """A reasoner returning a well-formed Claude envelope produces
+        the same `(episode, cost_usd, None)` triple the subprocess
+        path produces today."""
+        from kai.oneshot import OneShotResult
+
+        envelope_text = _stage2_envelope(_valid_episode(), cost_usd=0.04).decode("utf-8")
+
+        class _FakeReasoner:
+            async def run(self, **kwargs):
+                return OneShotResult(
+                    text=envelope_text,
+                    backend="claude",
+                    model="claude-haiku-4-5-20251001",
+                    raw_metadata={"returncode": 0, "stderr": b""},
+                    duration_ms=42,
+                )
+
+        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_FakeReasoner()):
+            episode, cost_usd, reason = await _run_episode_extractor("payload", _cfg())
+
+        assert episode == _valid_episode()
+        assert cost_usd == pytest.approx(0.04)
+        assert reason is None
+
+    @pytest.mark.asyncio
+    async def test_timeout_maps_to_literal_timeout_reason(self):
+        """OneShotTimeout maps to the literal `"timeout"` reason string
+        with `cost_usd=0.0` (no envelope ever returned). Downstream
+        telemetry pins this exact string."""
+        from kai.oneshot import OneShotTimeout
+
+        class _TimingOutReasoner:
+            async def run(self, **kwargs):
+                raise OneShotTimeout()
+
+        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_TimingOutReasoner()):
+            episode, cost_usd, reason = await _run_episode_extractor("payload", _cfg())
+
+        assert episode is None
+        assert cost_usd == 0.0
+        assert reason == "timeout"
+
+    @pytest.mark.asyncio
+    async def test_subprocess_error_preserves_exit_reason_format(self):
+        """OneShotSubprocessError must carry returncode and stderr; the
+        stage-2 mapping recomposes them into the `exit_<code>: <stderr>`
+        reason format that telemetry has used since the original
+        subprocess path."""
+        from kai.oneshot import OneShotSubprocessError
+
+        class _FailingReasoner:
+            async def run(self, **kwargs):
+                raise OneShotSubprocessError(returncode=2, stderr=b"oauth refused: please login")
+
+        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_FailingReasoner()):
+            episode, cost_usd, reason = await _run_episode_extractor("payload", _cfg())
+
+        assert episode is None
+        assert cost_usd == 0.0
+        assert reason is not None
+        assert reason.startswith("exit_2: ")
+        assert "oauth refused" in reason

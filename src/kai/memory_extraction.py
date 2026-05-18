@@ -22,15 +22,24 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
 from kai import memory
-from kai.config import DATA_DIR, Config
+from kai.config import Config
 from kai.memory import MemoryResult
+from kai.oneshot import _EXTRACTOR_CWD as _EXTRACTOR_CWD
+from kai.oneshot import _SUBPROCESS_ENV_ALLOWLIST as _SUBPROCESS_ENV_ALLOWLIST
+from kai.oneshot import (
+    ClaudeOneShotReasoner,
+    OneShotError,
+    OneShotReasoner,
+    OneShotSubprocessError,
+    OneShotTimeout,
+)
+from kai.oneshot import _ensure_extractor_cwd as _ensure_extractor_cwd
 
 log = logging.getLogger(__name__)
 
@@ -193,10 +202,13 @@ _pending_episode_tasks: set[asyncio.Task[None]] = set()
 # Neutral cwd for the subprocess. Fixed (not per-call tmp) so
 # ~/.claude/projects/ does not accumulate a new session directory per
 # extraction. Creation is deferred to first use via
-# `_ensure_extractor_cwd()` - matches Kai's lazy-init convention (no
-# filesystem I/O at import time) and lets a permission/path failure
-# surface as a logged extractor miss rather than an import-time crash.
-_EXTRACTOR_CWD = DATA_DIR / "memory" / "extractor_cwd"
+# `_EXTRACTOR_CWD` and `_ensure_extractor_cwd` live in `kai.oneshot`
+# now (the canonical home for provider subprocess mechanics). Re-
+# exported here as one-line aliases so existing test imports of
+# `kai.memory_extraction._EXTRACTOR_CWD` continue to resolve to the
+# same Path object. The `eval/behavioral` harness imports from
+# `kai.oneshot` directly to avoid cross-module coupling on what is
+# now a non-memory-specific helper.
 
 # Role labels used in `_build_extraction_payload` to separate USER and
 # ASSISTANT segments for Haiku. Users can embed these literal markers in
@@ -214,22 +226,11 @@ _EXTRACTOR_CWD = DATA_DIR / "memory" / "extractor_cwd"
 # short" is not an injection and should survive unchanged).
 _ROLE_LABEL_RE = re.compile(r"\n\s*(USER|ASSISTANT)\s*:", re.IGNORECASE)
 
-# Env vars forwarded to the extractor subprocess. Deliberately tight: the
-# parent's full environment is NOT inherited so secrets (DATABASE_URL,
-# GitHub tokens, webhook secrets, etc.) cannot reach the model if the
-# `--tools ""` boundary ever regresses. The vars below are the minimum
-# needed for the claude CLI to find its binary, read its config, and
-# authenticate on the pay-per-token fallback path. Vars absent from the
-# parent environment (ANTHROPIC_API_KEY when the operator is on Max-plan
-# OAuth, for example) are simply not forwarded - the subprocess behaves
-# as if the var is unset, matching the prior parent-inherit semantics.
-_SUBPROCESS_ENV_ALLOWLIST = (
-    "PATH",
-    "HOME",
-    "CLAUDE_CONFIG_DIR",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_BASE_URL",
-)
+# `_SUBPROCESS_ENV_ALLOWLIST` is canonical in `kai.oneshot` (the
+# reasoner uses it to scope the spawned subprocess env). Re-exported
+# here so that test imports of `kai.memory_extraction._SUBPROCESS_ENV_ALLOWLIST`
+# and any operator-facing logs that mention the constant by this path
+# continue to resolve.
 
 
 # ── JSON schema ──────────────────────────────────────────────────────
@@ -737,19 +738,6 @@ GUIDELINES:
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
-
-
-def _ensure_extractor_cwd() -> None:
-    """
-    Create the neutral subprocess cwd on first use.
-
-    Idempotent: mkdir(exist_ok=True) is cheap on the hot path. Called
-    from _run_extractor() before spawning the subprocess. Deferred from
-    import time on purpose - a permission or path failure should
-    surface as a logged extractor miss, not an import-time crash that
-    takes the whole bot down.
-    """
-    _EXTRACTOR_CWD.mkdir(parents=True, exist_ok=True)
 
 
 def _get_semaphore(user_id: str) -> asyncio.Semaphore:
@@ -1675,6 +1663,26 @@ def _paraphrase_neighbor(content: str, user_id: str, threshold: float) -> Memory
     return None
 
 
+# ── Reasoner wiring ─────────────────────────────────────────────────
+
+
+def _get_memory_reasoner() -> OneShotReasoner:
+    """
+    Resolve the one-shot reasoner used by both memory stages.
+
+    Phase 1 hardcodes Claude. The indirection exists for tests, which
+    monkeypatch this helper to inject fake reasoners that raise or
+    return specific envelopes without spawning real subprocesses, and
+    for the future #497 work that will let an operator select Codex
+    here. Returning a fresh instance per call (rather than a module-
+    level singleton) keeps Phase 1 stateless and mirrors the prior
+    per-call subprocess construction; if a future provider benefits
+    from a long-lived client (connection pool, HTTP session), update
+    this helper rather than each call site.
+    """
+    return ClaudeOneShotReasoner()
+
+
 # ── Subprocess wiring ───────────────────────────────────────────────
 
 
@@ -1754,67 +1762,53 @@ async def _run_extractor(
     API-key-only auth path - only `--bare` does, and its absence is
     asserted by a regression test (§13.3).
     """
-    _ensure_extractor_cwd()
-
-    cmd = [
-        "claude",
-        "--print",
-        "--model",
-        config.memory_extraction_model,
-        "--output-format",
-        "json",
-        "--json-schema",
-        json.dumps(_FACT_SCHEMA),
-        "--system-prompt",
-        system_prompt,
-        "--permission-mode",
-        "bypassPermissions",
-        "--tools",
-        "",
-        "--no-session-persistence",
-        # --exclude-dynamic-system-prompt-sections was considered and
-        # rejected: per `claude --help` it is "ignored with
-        # --system-prompt", which we always set. Leaving it in would
-        # be a silent no-op that looks load-bearing to future readers.
-    ]
-    # Build the allow-listed env (_SUBPROCESS_ENV_ALLOWLIST defined at
-    # module level). Absent keys are simply not forwarded.
-    subprocess_env: dict[str, str] = {key: os.environ[key] for key in _SUBPROCESS_ENV_ALLOWLIST if key in os.environ}
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(_EXTRACTOR_CWD),
-        env=subprocess_env,
-    )
+    # Provider subprocess mechanics (argv, env allow-list, neutral
+    # cwd, timeout, kill+await on miss) live in `kai.oneshot`'s
+    # ClaudeOneShotReasoner. The reasoner raises typed exceptions on
+    # timeout / non-zero exit; we catch them here and map to the
+    # zero-state ExtractionResult that this function has always
+    # returned on failure. JSON envelope parsing stays in this
+    # function so memory-domain concerns (is_error, structured_output,
+    # facts, has_episode) do not leak into the reasoner.
+    reasoner = _get_memory_reasoner()
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=payload_text.encode("utf-8")),
+        result = await reasoner.run(
+            prompt=payload_text,
+            system_prompt=system_prompt,
+            model=config.memory_extraction_model,
             timeout=config.memory_extraction_timeout_s,
+            purpose="fact_extraction",
+            json_schema=_FACT_SCHEMA,
         )
-    except TimeoutError:
-        proc.kill()
-        await proc.wait()
+    except OneShotTimeout:
         log.warning(
             "Memory extraction timed out after %ds",
             config.memory_extraction_timeout_s,
         )
         return ExtractionResult(facts=[], has_episode=False)
-    if proc.returncode != 0:
+    except OneShotSubprocessError as e:
         log.warning(
             "Memory extraction subprocess exited %d: %s",
-            proc.returncode,
-            stderr[:500].decode("utf-8", errors="replace"),
+            e.returncode,
+            e.stderr[:500].decode("utf-8", errors="replace"),
         )
         return ExtractionResult(facts=[], has_episode=False)
+    except OneShotError:
+        # OneShotOutputError or any future OneShotError subclass the
+        # reasoner adds. Collapse to empty extraction rather than
+        # propagate; the broad outer handler in extract_and_store
+        # already provides the "never raises" contract for unexpected
+        # exceptions, but typed reasoner failures are expected and
+        # should produce the same zero-state result as the older
+        # subprocess-error path.
+        log.warning("Memory extraction reasoner error", exc_info=True)
+        return ExtractionResult(facts=[], has_episode=False)
     try:
-        parsed = json.loads(stdout)
+        parsed = json.loads(result.text)
     except json.JSONDecodeError:
         log.warning(
             "Memory extraction produced invalid JSON: %r",
-            stdout[:500].decode("utf-8", errors="replace"),
+            result.text[:500],
         )
         return ExtractionResult(facts=[], has_episode=False)
     if not isinstance(parsed, dict):
@@ -1961,54 +1955,40 @@ async def _run_episode_extractor(
     on `_run_extractor`; runaway protection comes from
     `memory_episode_timeout_s` at the `asyncio.wait_for` call below.
     """
-    _ensure_extractor_cwd()
-
-    cmd = [
-        "claude",
-        "--print",
-        "--model",
-        config.memory_episode_model,
-        "--output-format",
-        "json",
-        "--json-schema",
-        json.dumps(_EPISODE_SCHEMA),
-        "--system-prompt",
-        _EPISODE_SYSTEM_PROMPT,
-        "--permission-mode",
-        "bypassPermissions",
-        "--tools",
-        "",
-        "--no-session-persistence",
-    ]
-    subprocess_env: dict[str, str] = {key: os.environ[key] for key in _SUBPROCESS_ENV_ALLOWLIST if key in os.environ}
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(_EXTRACTOR_CWD),
-        env=subprocess_env,
-    )
+    # Stage 2 routes through the same reasoner as stage 1; the
+    # caller-side mapping recovers the exact failure-reason strings
+    # downstream telemetry depends on (`"timeout"` and
+    # `"exit_<code>: <stderr>"`). OneShotSubprocessError carries the
+    # returncode and stderr bytes precisely so this mapping works.
+    reasoner = _get_memory_reasoner()
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=payload_text.encode("utf-8")),
+        result = await reasoner.run(
+            prompt=payload_text,
+            system_prompt=_EPISODE_SYSTEM_PROMPT,
+            model=config.memory_episode_model,
             timeout=config.memory_episode_timeout_s,
+            purpose="episode_generation",
+            json_schema=_EPISODE_SCHEMA,
         )
-    except TimeoutError:
-        proc.kill()
-        await proc.wait()
+    except OneShotTimeout:
         return None, 0.0, "timeout"
-    if proc.returncode != 0:
+    except OneShotSubprocessError as e:
         return (
             None,
             0.0,
-            f"exit_{proc.returncode}: {stderr[:200].decode('utf-8', errors='replace')}",
+            f"exit_{e.returncode}: {e.stderr[:200].decode('utf-8', errors='replace')}",
         )
+    except OneShotError:
+        # Future-proof: any other reasoner-level failure collapses to
+        # a parse-shaped reason rather than propagating. The outer
+        # _generate_episode's broad except handles the truly
+        # unexpected case; this branch keeps known reasoner failures
+        # in the stage-2 vocabulary.
+        return None, 0.0, "reasoner_error"
     try:
-        parsed = json.loads(stdout)
+        parsed = json.loads(result.text)
     except json.JSONDecodeError:
-        return None, 0.0, f"invalid_json: {stdout[:200].decode('utf-8', errors='replace')}"
+        return None, 0.0, f"invalid_json: {result.text[:200]}"
     if not isinstance(parsed, dict):
         return None, 0.0, "non_object_envelope"
     # Cost lives in the CLI envelope. Coerce defensively: a future CLI

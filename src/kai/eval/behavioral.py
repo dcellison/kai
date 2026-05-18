@@ -664,7 +664,7 @@ def _subprocess_env() -> dict[str, str]:
     env. Vars absent from the parent (e.g. ANTHROPIC_API_KEY when the
     operator runs on Max-plan OAuth) are simply not forwarded.
     """
-    from kai.memory_extraction import _SUBPROCESS_ENV_ALLOWLIST
+    from kai.oneshot import _SUBPROCESS_ENV_ALLOWLIST
 
     return {key: os.environ[key] for key in _SUBPROCESS_ENV_ALLOWLIST if key in os.environ}
 
@@ -1484,7 +1484,7 @@ async def _run_all_probes(
     cwd is set up once at run start (idempotent mkdir) so the per-
     probe subprocess calls do not re-stat the directory each time.
     """
-    from kai.memory_extraction import _EXTRACTOR_CWD, _ensure_extractor_cwd
+    from kai.oneshot import _EXTRACTOR_CWD, _ensure_extractor_cwd
 
     # Idempotent; matches the extractor's lazy-init convention so a
     # permission failure surfaces as a logged subprocess miss rather

@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -3359,3 +3359,86 @@ class TestSpeakerAttribution:
         # third value that flows through a separate write path and
         # is intentionally not in the extractor enum.
         assert set(speaker_prop["enum"]) == {"user", "assistant"}
+
+
+class TestRunExtractorViaReasoner:
+    """`_run_extractor` now routes through the OneShotReasoner boundary.
+    These tests monkeypatch the reasoner helper rather than the
+    subprocess so they exercise the caller-side mapping from typed
+    reasoner exceptions to the existing zero-state ExtractionResult."""
+
+    @pytest.mark.asyncio
+    async def test_valid_envelope_returns_extraction_result(self):
+        """A reasoner returning a well-formed Claude envelope produces the
+        same ExtractionResult that the subprocess path produces today."""
+        from kai.oneshot import OneShotResult
+
+        envelope_text = '{"is_error": false, "structured_output": {"facts": [], "has_episode": false}}'
+
+        class _FakeReasoner:
+            async def run(self, **kwargs):
+                return OneShotResult(
+                    text=envelope_text,
+                    backend="claude",
+                    model="claude-haiku-4-5-20251001",
+                    raw_metadata={"returncode": 0, "stderr": b""},
+                    duration_ms=12,
+                )
+
+        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_FakeReasoner()):
+            result = await memory_extraction._run_extractor(
+                payload_text="payload",
+                config=_cfg(),
+                candidate_ids=set(),
+                candidate_metadata={},
+                user_id="u1",
+            )
+
+        assert result.facts == []
+        assert result.has_episode is False
+
+    @pytest.mark.asyncio
+    async def test_timeout_collapses_to_empty_extraction_result(self):
+        """OneShotTimeout from the reasoner maps to the canonical empty
+        ExtractionResult, preserving the never-raises contract that the
+        outer extract_and_store relies on."""
+        from kai.oneshot import OneShotTimeout
+
+        class _TimingOutReasoner:
+            async def run(self, **kwargs):
+                raise OneShotTimeout()
+
+        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_TimingOutReasoner()):
+            result = await memory_extraction._run_extractor(
+                payload_text="payload",
+                config=_cfg(),
+                candidate_ids=set(),
+                candidate_metadata={},
+                user_id="u1",
+            )
+
+        assert result.facts == []
+        assert result.has_episode is False
+
+    @pytest.mark.asyncio
+    async def test_subprocess_error_collapses_to_empty_extraction_result(self):
+        """OneShotSubprocessError carries returncode and stderr; stage 1
+        does not surface them (stage 2 does), so the caller-side mapping
+        is "log a warning and return empty"."""
+        from kai.oneshot import OneShotSubprocessError
+
+        class _FailingReasoner:
+            async def run(self, **kwargs):
+                raise OneShotSubprocessError(returncode=2, stderr=b"oauth refused")
+
+        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_FailingReasoner()):
+            result = await memory_extraction._run_extractor(
+                payload_text="payload",
+                config=_cfg(),
+                candidate_ids=set(),
+                candidate_metadata={},
+                user_id="u1",
+            )
+
+        assert result.facts == []
+        assert result.has_episode is False
