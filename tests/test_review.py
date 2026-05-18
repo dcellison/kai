@@ -893,9 +893,10 @@ class TestRunReviewCodex:
         review path must surface ALL of them joined with a blank-line
         separator; the prior parser dropped earlier completions and
         only returned the last item's text, silently truncating
-        reviews. Regression guard for the bug TG Codex caught in the
-        PR #490 review (the same class of failure as the persistent
-        backend bug fixed by PR #491).
+        reviews. Regression guard for the multi-item truncation bug:
+        the prior parser returned only the last completed item, which
+        is the same class of failure as the persistent backend bug
+        fixed by PR #491.
         """
         # Build a two-item NDJSON stream by hand because the single-
         # item _codex_ndjson helper above can't express it.
