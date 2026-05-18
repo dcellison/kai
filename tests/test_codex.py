@@ -351,6 +351,14 @@ class TestHandshake:
         assert thread_msg["id"] == 2
         assert thread_msg["params"]["cwd"] == "/tmp/test-workspace"
         assert thread_msg["params"]["model"] == "gpt-5.4"
+        # approvalPolicy and sandbox are the two production-unblocking
+        # fields: dropping or misspelling either re-creates the original
+        # "Codex timed out" (on-request gate with no human approver) or
+        # "GitHub access is blocked by the sandbox" (workspace-write
+        # default disables network). Lock both exact strings; sandbox
+        # variants are kebab-case at thread/start.
+        assert thread_msg["params"]["approvalPolicy"] == "never"
+        assert thread_msg["params"]["sandbox"] == "danger-full-access"
 
     @pytest.mark.asyncio
     async def test_argv_invokes_codex_app_server(self):
@@ -507,6 +515,27 @@ class TestHandshake:
         call_kwargs = mock_exec.call_args[1]
         assert "CODEX_PROVIDER" not in call_kwargs["env"]
 
+    @pytest.mark.asyncio
+    async def test_subprocess_limit_is_at_least_16mb(self):
+        """
+        The asyncio.StreamReader limit on stdout must be large enough
+        for any single codex event payload. The default 64KB and our
+        previous 1MB both produced
+        "Separator is not found, and chunk exceed the limit"
+        from readline on real PR-review turns where codex inlines a
+        tool result (e.g. a `gh pr diff` body or a long item/completed
+        agentMessage text). Lock the lower bound so a future shrinkback
+        gets caught here, not on a live operator turn.
+        """
+        c = _make_codex()
+        proc = _make_mock_proc(_handshake_lines())
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await c._ensure_started()
+
+        call_kwargs = mock_exec.call_args[1]
+        assert call_kwargs["limit"] >= 16 * 1024 * 1024
+
 
 # ── Stream parsing ─────────────────────────────────────────────────
 
@@ -540,6 +569,77 @@ class TestStreamParsing:
         assert events[2].response.success is True
         assert events[2].response.text == "Hello world"
         assert events[2].response.cost_usd == 0.0
+
+    @pytest.mark.asyncio
+    async def test_multi_agent_message_items_join_with_blank_line(self):
+        """
+        A single turn can emit multiple agentMessage items (e.g. preamble
+        before a tool call, post-tool summary after). The visible text must
+        commit each item's content with a blank-line separator; item N's
+        completion must NEVER override prior items' accumulated text
+        (the bug that produced "summary here.The..." truncations during
+        the live smoke test).
+        """
+        c = _make_codex()
+        c._proc = _make_mock_proc(
+            [
+                _item_started_agent(item_id="item-1"),
+                _agent_message_delta("Hello", item_id="item-1"),
+                _agent_message_delta(" world.", item_id="item-1"),
+                _item_completed_agent("Hello world.", item_id="item-1"),
+                _item_started_agent(item_id="item-2"),
+                _agent_message_delta("Next, ", item_id="item-2"),
+                _agent_message_delta("more text.", item_id="item-2"),
+                _item_completed_agent("Next, more text.", item_id="item-2"),
+                _turn_completed("completed"),
+            ]
+        )
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        events = await _collect_events(c)
+
+        final = events[-1]
+        assert final.done is True
+        assert final.response is not None
+        assert final.response.success is True
+        # Items joined with a blank-line separator; item 2's text is
+        # appended, NOT substituted for item 1's. This is the regression
+        # guard for the smoke-test overwrite bug.
+        assert final.response.text == "Hello world.\n\nNext, more text."
+
+    @pytest.mark.asyncio
+    async def test_item_completed_overrides_only_current_item(self):
+        """
+        item/completed's `text` field is authoritative for THAT item only.
+        A drift between accumulated deltas and the completed text for
+        item 2 must not erase item 1's previously committed content.
+        """
+        c = _make_codex()
+        c._proc = _make_mock_proc(
+            [
+                _item_started_agent(item_id="item-1"),
+                _agent_message_delta("first item content.", item_id="item-1"),
+                _item_completed_agent("first item content.", item_id="item-1"),
+                _item_started_agent(item_id="item-2"),
+                # Deltas accumulate "partial..." but completion says
+                # the canonical text is "Second item." - the override
+                # must apply to current item only.
+                _agent_message_delta("partial accumulated text", item_id="item-2"),
+                _item_completed_agent("Second item.", item_id="item-2"),
+                _turn_completed("completed"),
+            ]
+        )
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        events = await _collect_events(c)
+
+        final = events[-1]
+        assert final.response is not None
+        assert final.response.text == "first item content.\n\nSecond item."
 
     @pytest.mark.asyncio
     async def test_unknown_event_type_skipped(self):

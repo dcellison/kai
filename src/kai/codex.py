@@ -292,7 +292,20 @@ class CodexBackend(AgentBackend):
             # cannot signal a process whose UIDs are all the
             # target user). See _send_signal for the full chain.
             start_new_session=bool(effective_codex_user),
-            limit=1024 * 1024,  # 1MB per-line buffer
+            # A single codex event can carry the full text of a tool
+            # call's output inline (e.g. a `gh pr diff` result on a
+            # reasoning item, or an item/completed for a long
+            # agentMessage). The asyncio.StreamReader default limit
+            # is 64KB; we previously bumped it to 1MB which was still
+            # too tight for PR-review-sized chunks - real codex review
+            # turns surfaced "Separator is not found, and chunk exceed
+            # the limit" from readline. 16MB is well above any
+            # plausible single-event payload while still bounding
+            # memory if codex ever produces a runaway line. A
+            # proper streaming reader (chunked + reassemble on \n)
+            # would remove the ceiling entirely; deferred until the
+            # 16MB ceiling is itself observed in practice.
+            limit=16 * 1024 * 1024,
         )
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
@@ -351,7 +364,33 @@ class CodexBackend(AgentBackend):
 
         await self._write_notification("initialized")
 
-        thread_params: dict = {"cwd": str(self.workspace)}
+        # `approvalPolicy: "never"` is load-bearing for an unattended
+        # Telegram bot. Codex's default is "on-request", which makes
+        # the server emit approval-request notifications and wait for
+        # a client response before any tool call. Kai has no human
+        # in the loop to approve from Telegram, so on-request gates
+        # silently: codex waits forever, the bot's stdout-readline
+        # ceiling fires, the operator sees "Codex timed out".
+        #
+        # `sandbox: "danger-full-access"` matches the claude backend's
+        # posture: claude --print runs unsandboxed with whatever
+        # permissions the bot's os_user has. The `workspace-write`
+        # alternative would disable network access (codex's default
+        # for workspace-write profiles), breaking `gh`, `curl`, `pip`,
+        # and anything else the bot needs to reach outside the local
+        # filesystem. The bot already runs under a per-user sudo wrap
+        # with that user's full file authority; constraining codex
+        # tighter than the surrounding process makes no security
+        # sense.
+        #
+        # Sandbox variants are kebab-case (`read-only`, `workspace-write`,
+        # `danger-full-access`); the codex server rejects camelCase
+        # spellings at thread/start with "unknown variant".
+        thread_params: dict = {
+            "cwd": str(self.workspace),
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+        }
         if self.model:
             thread_params["model"] = self.model
         await self._write_rpc("thread/start", thread_params)
@@ -597,11 +636,31 @@ class CodexBackend(AgentBackend):
 
         # Stream response: read stdout lines, accumulate text chunks,
         # and yield StreamEvents. Unknown event types are logged at
-        # DEBUG and skipped (schema-drift defense). The smoke test
-        # against a real codex binary will reveal which event names
-        # the pinned version actually emits; this loop tolerates
-        # variation by only acting on events it recognizes.
-        accumulated = ""
+        # DEBUG and skipped (schema-drift defense).
+        #
+        # Multi-agentMessage tracking: a single turn can emit MORE
+        # than one agentMessage item (e.g. preamble, tool call,
+        # post-tool summary). Per the codex protocol README, deltas
+        # are scoped to a single itemId; concatenating them across
+        # items without separators tacks the second item's first
+        # word onto the first item's terminator ("summary here.The"
+        # -> the operator's smoke-test observation). We track each
+        # item's text separately, commit completed items into a
+        # joined-with-blank-line prefix, and only let item/completed
+        # override the CURRENT item's text - never the prior
+        # committed content. The visible text streamed to telegram
+        # is `committed + ("\n\n" + current if current)`.
+        committed_text = ""
+        current_item_id: str | None = None
+        current_item_text = ""
+
+        def _visible_text() -> str:
+            if not current_item_id:
+                return committed_text
+            if not committed_text:
+                return current_item_text
+            return committed_text + "\n\n" + current_item_text
+
         last_activity = time.monotonic()
         max_idle_seconds = self.timeout_seconds * 5
 
@@ -616,12 +675,13 @@ class CodexBackend(AgentBackend):
                         max_idle_seconds,
                     )
                     await self._kill()
+                    visible = _visible_text()
                     yield StreamEvent(
-                        text_so_far=accumulated,
+                        text_so_far=visible,
                         done=True,
                         response=AgentResponse(
                             success=False,
-                            text=accumulated,
+                            text=visible,
                             error="Codex interaction timed out (no output)",
                         ),
                     )
@@ -635,12 +695,13 @@ class CodexBackend(AgentBackend):
                 except TimeoutError:
                     log.error("Codex response timed out")
                     await self._kill()
+                    visible = _visible_text()
                     yield StreamEvent(
-                        text_so_far=accumulated,
+                        text_so_far=visible,
                         done=True,
                         response=AgentResponse(
                             success=False,
-                            text=accumulated,
+                            text=visible,
                             error="Codex timed out",
                         ),
                     )
@@ -653,13 +714,14 @@ class CodexBackend(AgentBackend):
                     # EOF - process died
                     log.error("Codex process EOF")
                     await self._kill()
+                    visible = _visible_text()
                     yield StreamEvent(
-                        text_so_far=accumulated,
+                        text_so_far=visible,
                         done=True,
                         response=AgentResponse(
-                            success=bool(accumulated),
-                            text=accumulated,
-                            error=None if accumulated else "Codex process ended unexpectedly",
+                            success=bool(visible),
+                            text=visible,
+                            error=None if visible else "Codex process ended unexpectedly",
                         ),
                     )
                     return
@@ -701,37 +763,83 @@ class CodexBackend(AgentBackend):
                 method = msg.get("method")
                 if method == "item/started":
                     item = msg.get("params", {}).get("item", {})
-                    log.debug("Codex: item/started type=%s id=%s", item.get("type"), item.get("id"))
+                    if item.get("type") == "agentMessage":
+                        # Begin a new in-flight agentMessage. Anything
+                        # currently in current_item_text was uncommitted
+                        # (no item/completed arrived); commit it now
+                        # so the new item's deltas start fresh and we
+                        # don't lose mid-stream text on the boundary.
+                        if current_item_id and current_item_text:
+                            committed_text = (
+                                committed_text + "\n\n" + current_item_text if committed_text else current_item_text
+                            )
+                        current_item_id = item.get("id")
+                        current_item_text = ""
+                    else:
+                        log.debug("Codex: item/started type=%s id=%s", item.get("type"), item.get("id"))
 
                 elif method == "item/agentMessage/delta":
-                    delta_text = msg.get("params", {}).get("delta", "")
+                    params = msg.get("params", {})
+                    delta_text = params.get("delta", "")
+                    delta_item_id = params.get("itemId")
                     if delta_text:
-                        accumulated += delta_text
-                        yield StreamEvent(text_so_far=accumulated)
+                        # Defensive: if a delta arrives without a
+                        # prior item/started (out-of-order or schema
+                        # drift), treat it as opening a new item.
+                        if delta_item_id and delta_item_id != current_item_id:
+                            if current_item_id and current_item_text:
+                                committed_text = (
+                                    committed_text + "\n\n" + current_item_text if committed_text else current_item_text
+                                )
+                            current_item_id = delta_item_id
+                            current_item_text = ""
+                        current_item_text += delta_text
+                        yield StreamEvent(text_so_far=_visible_text())
 
                 elif method == "item/completed":
                     item = msg.get("params", {}).get("item", {})
                     if item.get("type") == "agentMessage":
-                        # Authoritative full text; trust it over our
-                        # delta-accumulation in case any delta was
-                        # missed or arrived out of order.
+                        # Authoritative final text for THIS item only.
+                        # Override current_item_text if codex's final
+                        # value differs from our delta sum (the docs
+                        # call item/completed the source of truth).
                         final_text = item.get("text", "")
-                        if final_text and final_text != accumulated:
-                            accumulated = final_text
-                            yield StreamEvent(text_so_far=accumulated)
+                        if final_text:
+                            current_item_text = final_text
+                        # Commit the in-flight item to the prefix and
+                        # reset. Subsequent items append after a blank
+                        # line; subsequent deltas can never overwrite
+                        # this text.
+                        if current_item_text:
+                            committed_text = (
+                                committed_text + "\n\n" + current_item_text if committed_text else current_item_text
+                            )
+                        current_item_id = None
+                        current_item_text = ""
+                        yield StreamEvent(text_so_far=_visible_text())
                     else:
                         log.debug("Codex: item/completed type=%s", item.get("type"))
 
                 elif method == "turn/completed":
                     turn = msg.get("params", {}).get("turn", {})
                     status = turn.get("status")
+                    # Flush any uncommitted current_item_text so the
+                    # final response carries it (schema-drift defense:
+                    # a missing item/completed should not lose text).
+                    if current_item_id and current_item_text:
+                        committed_text = (
+                            committed_text + "\n\n" + current_item_text if committed_text else current_item_text
+                        )
+                        current_item_id = None
+                        current_item_text = ""
+                    final_visible = committed_text
                     if status == "completed":
                         yield StreamEvent(
-                            text_so_far=accumulated,
+                            text_so_far=final_visible,
                             done=True,
                             response=AgentResponse(
                                 success=True,
-                                text=accumulated,
+                                text=final_visible,
                                 session_id=self._session_id,
                                 cost_usd=0.0,
                                 duration_ms=0,
@@ -743,11 +851,11 @@ class CodexBackend(AgentBackend):
                     err_obj = turn.get("error") or {}
                     err_msg = err_obj.get("message") or f"Codex turn ended with status={status}"
                     yield StreamEvent(
-                        text_so_far=accumulated,
+                        text_so_far=final_visible,
                         done=True,
                         response=AgentResponse(
                             success=False,
-                            text=accumulated,
+                            text=final_visible,
                             error=err_msg,
                         ),
                     )
@@ -759,12 +867,13 @@ class CodexBackend(AgentBackend):
                     # would be redundant.
                     err_obj = msg.get("params", {}).get("error", {})
                     err_msg = err_obj.get("message") or "Codex error"
+                    visible = _visible_text()
                     yield StreamEvent(
-                        text_so_far=accumulated,
+                        text_so_far=visible,
                         done=True,
                         response=AgentResponse(
                             success=False,
-                            text=accumulated,
+                            text=visible,
                             error=err_msg,
                         ),
                     )
@@ -780,12 +889,13 @@ class CodexBackend(AgentBackend):
                 # never made it to streaming, so finish here.
                 elif msg.get("id") == prompt_id and "error" in msg:
                     err = msg["error"].get("message", "unknown codex error")
+                    visible = _visible_text()
                     yield StreamEvent(
-                        text_so_far=accumulated,
+                        text_so_far=visible,
                         done=True,
                         response=AgentResponse(
                             success=False,
-                            text=accumulated,
+                            text=visible,
                             error=err,
                         ),
                     )
@@ -805,12 +915,13 @@ class CodexBackend(AgentBackend):
         except Exception as e:
             log.exception("Unexpected error reading Codex stream")
             await self._kill()
+            visible = _visible_text()
             yield StreamEvent(
-                text_so_far=accumulated,
+                text_so_far=visible,
                 done=True,
                 response=AgentResponse(
                     success=False,
-                    text=accumulated,
+                    text=visible,
                     error=str(e),
                 ),
             )
