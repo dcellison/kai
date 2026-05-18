@@ -94,6 +94,7 @@ from typing import Any
 # Import from the Layer 1 sibling module so the two layers stay aligned
 # on probe schema, drift detection, and probe-set-hash semantics. If
 # Layer 1's drift bucketing changes, Layer 2 follows automatically.
+from kai.codex_exec import extract_codex_text
 from kai.config import ModelRole, get_model_for
 from kai.eval.retrieval import (
     Probe,
@@ -101,6 +102,7 @@ from kai.eval.retrieval import (
     load_probes,
     probe_set_hash,
 )
+from kai.prompt_utils import make_boundary
 
 log = logging.getLogger(__name__)
 
@@ -307,6 +309,14 @@ class BehavioralConfig:
     # test fixtures that build a config without invoking the CLI still
     # get a sensible path.
     data_dir: Path = Path(".")
+    # Active agent backend for this run ("claude" or "codex"). Resolved
+    # once at _run_cli from AGENT_BACKEND and threaded through every
+    # subprocess builder + stdout parser + version capture so the
+    # codex and claude verticals can stay byte-isolated. Default
+    # "claude" matches the pre-codex behavior so test fixtures that
+    # build a config without setting this field still produce the
+    # historical command shape.
+    backend: str = "claude"
 
 
 @dataclass
@@ -477,6 +487,158 @@ def _build_gen_cmd(config: BehavioralConfig) -> list[str]:
         "",
         "--no-session-persistence",
     ]
+
+
+def _build_judge_cmd_codex(config: BehavioralConfig) -> list[str]:
+    """Construct the argv vector for one codex judge subprocess invocation.
+
+    Codex equivalent of `_build_judge_cmd` (claude). Codex `exec --json`
+    has no `--json-schema`, `--system-prompt`, `--permission-mode`, or
+    `--tools` flag set; the harness handles schema validation post-hoc
+    (see `_validate_judge_envelope`) and injects the system prompt as
+    a boundary-delimited prefix to stdin (see `_render_codex_stdin`).
+
+    The `--max-budget-usd` knob is also absent because codex on
+    subscription auth has no per-call billing surface. The CLI flag
+    is silently ignored on codex; the corresponding harness output
+    field records `cost_usd = None`.
+
+    `CODEX_BIN` env override is honored same as triage/review and the
+    persistent backend: installs where codex lives in a per-os_user
+    home and not on the service user's PATH still resolve the absolute
+    binary. Falls back to bare "codex" when unset.
+    """
+    codex_bin = os.environ.get("CODEX_BIN") or "codex"
+    return [
+        codex_bin,
+        "exec",
+        "--json",
+        "--model",
+        config.judge_model,
+    ]
+
+
+def _build_gen_cmd_codex(config: BehavioralConfig) -> list[str]:
+    """Construct the argv vector for one codex generator subprocess invocation.
+
+    Same shape as `_build_judge_cmd_codex`. The generator's claude-side
+    `--system-prompt ""` (literally empty) corresponds to omitting the
+    boundary block entirely in `_render_codex_stdin`; the generator
+    receives the user payload unchanged. Output is free-form text
+    wrapped in NDJSON `agent_message` events; `_parse_codex_gen_stdout`
+    joins all completed items with a blank-line separator so multi-item
+    turns are not truncated (the PR #490 / PR #491 lesson).
+    """
+    codex_bin = os.environ.get("CODEX_BIN") or "codex"
+    return [
+        codex_bin,
+        "exec",
+        "--json",
+        "--model",
+        config.gen_model,
+    ]
+
+
+def _render_codex_stdin(system_prompt: str, user_payload: str) -> str:
+    """Build the boundary-delimited stdin payload for a codex one-shot call.
+
+    Codex `exec` mode has no `--system-prompt` flag. The harness
+    achieves the same effect by prepending the system text to stdin
+    with a labeled boundary, then the user payload. Boundary tokens
+    use the same `make_boundary` helper Kai's other prompts use, so
+    injection-resistance is consistent across the codebase.
+
+    An empty system_prompt produces no boundary block at all - the
+    generator's `--system-prompt ""` translates to "send the user
+    payload unchanged" rather than "send a SYSTEM section that says
+    nothing." The latter would be a free-floating boundary marker
+    visible to the model with no content inside it.
+    """
+    if not system_prompt:
+        return user_payload
+    begin, end = make_boundary("SYSTEM")
+    return f"{begin}\n{system_prompt}\n{end}\n\n{user_payload}"
+
+
+def _validate_judge_envelope(parsed: object) -> bool:
+    """Validate a judge envelope against `_JUDGE_SCHEMA`.
+
+    Claude does CLI-side validation via `--json-schema`; codex does
+    not, so the harness must reproduce the equivalent shape check
+    post-hoc. Returns True on a valid envelope, False on any miss.
+
+    Enforces every property `_JUDGE_SCHEMA` declares:
+    - Top-level must be a dict (the schema's `"type": "object"`)
+    - `choice` present, a string, member of the four-value enum
+    - `reasoning` present and a string (any value)
+    - No properties other than `choice` and `reasoning` (mirrors
+      `"additionalProperties": False`)
+
+    Kept as a tiny pure function so the judge parser and the test
+    list can both exercise it directly.
+    """
+    if not isinstance(parsed, dict):
+        return False
+    allowed_keys = {"choice", "reasoning"}
+    if set(parsed.keys()) != allowed_keys:
+        return False
+    choice = parsed.get("choice")
+    if not isinstance(choice, str):
+        return False
+    if choice not in {"A_wins", "B_wins", "tie", "both_wrong"}:
+        return False
+    reasoning = parsed.get("reasoning")
+    return isinstance(reasoning, str)
+
+
+def _parse_codex_judge_stdout(stdout: bytes) -> tuple[str, str] | None:
+    """Decode codex NDJSON, extract the agent_message text, parse as JSON, validate.
+
+    Codex equivalent of `_parse_judge_stdout` (claude). The contract
+    mirrors the claude version exactly: return `(choice, reasoning)`
+    on success or `None` on any failure (decode, JSON parse, schema
+    miss). The upstream `_run_one_judge` is backend-agnostic against
+    this contract.
+
+    `join_items=False` is correct here: the judge's downstream
+    contract is exactly one structured JSON object. A preamble
+    agent_message before the JSON body would corrupt the parse, so
+    last-wins semantics match what claude's `--json-schema` enforces
+    CLI-side. (Contrast with the generator path, which uses the
+    join-all default.)
+    """
+    try:
+        decoded = stdout.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    text = extract_codex_text(decoded, join_items=False)
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not _validate_judge_envelope(parsed):
+        return None
+    return parsed["choice"], parsed["reasoning"]
+
+
+def _parse_codex_gen_stdout(stdout: bytes) -> str:
+    """Decode codex NDJSON, return the joined agent_message text.
+
+    Codex generator output is free-form text, same class as PR review
+    output. `extract_codex_text` with the default `join_items=True`
+    joins all completed `agent_message` items with a blank-line
+    separator so multi-item turns are not silently truncated (the
+    failure mode PR #490 fixed in the review path). The generator
+    arm contract is "return all the text the model emitted"; the
+    upstream `_run_one_arm` bucket-decides on the result string.
+    """
+    try:
+        decoded = stdout.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+    return extract_codex_text(decoded)
 
 
 def _subprocess_env() -> dict[str, str]:
@@ -1035,20 +1197,35 @@ async def _run_one_arm(
     that carries cost is not produced when --output-format=text), so
     the field is included for schema symmetry with the judge call but
     not populated. Documented limitation per spec §3.3.
+
+    Backend dispatch: claude builds `claude --print` argv and reads
+    the raw stdout text; codex builds `codex exec --json` argv,
+    prepends no system prompt (the claude path passes
+    `--system-prompt ""` literally), and unwraps NDJSON via
+    `_parse_codex_gen_stdout` which joins multi-item turns with a
+    blank-line separator.
     """
-    cmd = _build_gen_cmd(config)
+    if config.backend == "codex":
+        cmd = _build_gen_cmd_codex(config)
+        stdin_payload = _render_codex_stdin("", arm_prompt)
+    else:
+        cmd = _build_gen_cmd(config)
+        stdin_payload = arm_prompt
     rc, stdout, _stderr, elapsed_ms = await _run_subprocess(
         cmd=cmd,
-        stdin_payload=arm_prompt,
+        stdin_payload=stdin_payload,
         timeout_s=config.gen_timeout_s,
         cwd=cwd,
         env=env,
     )
     if rc != 0:
         return None, elapsed_ms, None
-    text = stdout.decode("utf-8", errors="replace").strip()
+    if config.backend == "codex":
+        text = _parse_codex_gen_stdout(stdout).strip()
+    else:
+        text = stdout.decode("utf-8", errors="replace").strip()
     if not text:
-        # Successful exit with no output is still a broken response —
+        # Successful exit with no output is still a broken response -
         # the judge cannot score nothing against the gold fact. Bucket
         # as generation_error rather than feeding empty string into
         # the comparison.
@@ -1072,22 +1249,38 @@ async def _run_one_judge(
     exit, malformed JSON, missing structured_output, invalid choice).
     Caller buckets None as `judge_error`.
     """
-    cmd = _build_judge_cmd(config)
     payload = _render_judge_user_payload(
         question=question,
         ground_truth_text=ground_truth_text,
         response_a=response_a,
         response_b=response_b,
     )
+    if config.backend == "codex":
+        cmd = _build_judge_cmd_codex(config)
+        # System prompt is prepended to stdin because codex `exec`
+        # has no --system-prompt flag. Empty system_prompt would emit
+        # no boundary block, but the judge always uses a non-empty
+        # system prompt, so the SYSTEM section is present.
+        stdin_payload = _render_codex_stdin(_JUDGE_SYSTEM_PROMPT, payload)
+    else:
+        cmd = _build_judge_cmd(config)
+        stdin_payload = payload
     rc, stdout, _stderr, elapsed_ms = await _run_subprocess(
         cmd=cmd,
-        stdin_payload=payload,
+        stdin_payload=stdin_payload,
         timeout_s=config.judge_timeout_s,
         cwd=cwd,
         env=env,
     )
     if rc != 0:
         return None, elapsed_ms, None
+    if config.backend == "codex":
+        # Codex has no --json-schema CLI-side; the harness parses NDJSON,
+        # extracts the agent_message text, parses as JSON, and validates
+        # against _JUDGE_SCHEMA via _validate_judge_envelope. Cost is
+        # always None on codex (subscription auth has no per-call billing).
+        parsed = _parse_codex_judge_stdout(stdout)
+        return parsed, elapsed_ms, None
     # Decode the envelope once and feed it to BOTH the choice extractor
     # and the cost extractor; previously each function called
     # json.loads(stdout) independently, doubling the parse work per
@@ -1561,34 +1754,54 @@ def _pick_qualitative_examples(outcomes: list[ProbeOutcome]) -> dict[str, dict[s
 # ── Output JSON envelope ───────────────────────────────────────────
 
 
-def _capture_claude_cli_version() -> str:
-    """Capture `claude --version` output for the run record.
+def _capture_agent_cli_version(backend: str) -> tuple[str, str]:
+    """Capture the active agent CLI's version string for the run record.
+
+    Returns `(field_name, value)` where `field_name` is the output
+    JSON key the caller should write under: `"claude_cli_version"` on
+    a claude run, `"codex_cli_version"` on a codex run. The harness
+    writes exactly one of those keys and leaves the other absent.
+    Unknown backends fall back to the claude tuple so non-registry
+    paths (e.g. goose) preserve the pre-codex behavior.
 
     Used to detect cross-run drift in the residual default context the
-    CLI injects even with `--system-prompt ""`. A CLI upgrade between
-    runs that changes that default is the most likely cause of a swing
-    in win-rate that does not correspond to any code change in Kai or
-    in the probe set. Recording the version makes that diagnosable
-    without bisecting the CLI's release notes.
+    CLI injects. A CLI upgrade between runs that changes that default
+    is the most likely cause of a swing in win-rate that does not
+    correspond to any code change in Kai or in the probe set.
+
+    The codex branch honors `CODEX_BIN`. Recording the version of
+    `codex` from PATH when the eval subprocess actually spawned
+    `$CODEX_BIN` would be a debugging trap: an operator chasing a
+    schema-drift bug would see the wrong version string. The
+    `--version` flag goes to the same binary the eval will spawn.
 
     Best-effort: if the CLI is missing, mis-aliased, or `--version`
-    fails for any reason, return the literal "unknown". The harness
-    can still run (the CLI subprocess invocations that follow will
-    surface the real failure with a clearer error) and the output JSON
-    just records that the version could not be determined.
+    fails for any reason, the value is the literal "unknown". The
+    harness can still run (the CLI subprocess invocations that follow
+    will surface the real failure with a clearer error) and the
+    output JSON records that the version could not be determined.
     """
+    if backend == "codex":
+        field_name = "codex_cli_version"
+        codex_bin = os.environ.get("CODEX_BIN") or "codex"
+        argv = [codex_bin, "--version"]
+    else:
+        # claude (and any unknown backend, by design) - preserve the
+        # historical lookup.
+        field_name = "claude_cli_version"
+        argv = ["claude", "--version"]
     try:
         result = subprocess.run(
-            ["claude", "--version"],
+            argv,
             capture_output=True,
             text=True,
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
-        return "unknown"
+        return field_name, "unknown"
     if result.returncode != 0:
-        return "unknown"
-    return result.stdout.strip() or "unknown"
+        return field_name, "unknown"
+    return field_name, result.stdout.strip() or "unknown"
 
 
 def _outcome_to_per_probe_dict(outcome: ProbeOutcome, *, probe_id: int) -> dict[str, Any]:
@@ -1626,7 +1839,8 @@ def build_output_json(
     outcomes: list[ProbeOutcome],
     drift_count: int,
     config: BehavioralConfig,
-    claude_cli_version: str,
+    cli_version_field: str,
+    cli_version_value: str,
 ) -> dict[str, Any]:
     """Assemble the full output JSON envelope.
 
@@ -1634,6 +1848,15 @@ def build_output_json(
     and assert the envelope shape without running the subprocess
     machinery. Schema versioned via _OUTPUT_SCHEMA_VERSION; bump it
     when downstream parsers would need to be re-tested.
+
+    `cli_version_field` is the JSON key under which to write the CLI
+    version - "claude_cli_version" on a claude run, "codex_cli_version"
+    on a codex run. The envelope writes EXACTLY ONE of those keys;
+    the call site computes the pair via _capture_agent_cli_version so
+    it is structurally impossible to populate both. This shape was
+    chosen over taking two optional Optional[str] arguments because
+    "exactly one of the two" is hard to express in a type checker but
+    trivial to keep correct when the caller passes a single tuple.
     """
     counts = _aggregate_outcomes(outcomes)
     rates = _compute_rates(counts)
@@ -1659,7 +1882,7 @@ def build_output_json(
         # rather than treat this as a verdict count.
         "attempted_count": sum(counts.values()),
         "drift_count": drift_count,
-        "claude_cli_version": claude_cli_version,
+        cli_version_field: cli_version_value,
         "judge_model": config.judge_model,
         "gen_model": config.gen_model,
         "seed": config.seed,
@@ -1693,9 +1916,22 @@ def _render_summary(output: dict[str, Any]) -> str:
     Layer 1's `_render_single_metrics` style.
     """
     counts = output["outcomes"]
+    # CLI version line dispatches on whichever key is present.
+    # The harness writes exactly one of `claude_cli_version` /
+    # `codex_cli_version` per run; reading the literal claude key
+    # (the pre-codex shape) would KeyError on a codex run before the
+    # JSON file could be written. Fall back to "unknown" if neither
+    # key is present so this never raises - a missing version line
+    # is a softer failure than a CLI crash mid-render.
+    if "codex_cli_version" in output:
+        cli_line = f"Codex CLI: {output['codex_cli_version']}"
+    elif "claude_cli_version" in output:
+        cli_line = f"Claude CLI: {output['claude_cli_version']}"
+    else:
+        cli_line = "Agent CLI: unknown"
     lines = [
         f"Probes: {output['probe_count']} total, {output['attempted_count']} attempted, {output['drift_count']} drifted",
-        f"Claude CLI: {output['claude_cli_version']}",
+        cli_line,
         f"Models: gen={output['gen_model']}, judge={output['judge_model']}",
         f"Seed: {output['seed']} (max_concurrency={output['max_concurrency']})",
     ]
@@ -2070,9 +2306,28 @@ async def _run_cli(args: argparse.Namespace) -> int:
         max_concurrency=args.max_concurrency,
         pollution_lines=args.pollution_lines,
         data_dir=data_dir,
+        backend=eval_backend,
     )
 
-    claude_cli_version = _capture_claude_cli_version()
+    # Capture CLI version for the run record. The helper returns a
+    # tuple so the output builder can write exactly one of
+    # claude_cli_version / codex_cli_version under the right key
+    # without the caller juggling two Optional[str] arguments.
+    cli_version_field, cli_version_value = _capture_agent_cli_version(eval_backend)
+
+    # Codex on subscription auth has no per-call billing surface, so
+    # the budget flags are not enforced at the subprocess level. The
+    # output JSON records cost_usd=None per call. Log once at startup
+    # so an operator who set --judge-budget-usd / --gen-budget-usd
+    # explicitly sees that the flags were not enforced; otherwise the
+    # eval would silently consume subscription quota.
+    if eval_backend == "codex":
+        print(
+            "eval: codex on subscription auth has no per-call cost surface; "
+            "--judge-budget-usd / --gen-budget-usd are not enforced and "
+            "cost_usd in the output JSON will be None.",
+            file=sys.stderr,
+        )
 
     print(
         f"Running {len(scored_probes)} probes "
@@ -2102,7 +2357,8 @@ async def _run_cli(args: argparse.Namespace) -> int:
         outcomes=all_outcomes,
         drift_count=len(drifted_probes),
         config=config,
-        claude_cli_version=claude_cli_version,
+        cli_version_field=cli_version_field,
+        cli_version_value=cli_version_value,
     )
 
     # Sum check: surface a loud failure here rather than at downstream

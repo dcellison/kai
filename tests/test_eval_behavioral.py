@@ -61,20 +61,29 @@ from kai.eval.behavioral import (
     _aggregate_outcomes,
     _arm_letter_for_memory,
     _build_gen_cmd,
+    _build_gen_cmd_codex,
     _build_judge_cmd,
+    _build_judge_cmd_codex,
+    _capture_agent_cli_version,
     _compute_rates,
     _inject_synthetic_pollution,
     _load_user_history_messages,
     _make_drift_outcome,
     _non_negative_int,
+    _parse_codex_gen_stdout,
+    _parse_codex_judge_stdout,
     _parse_judge_stdout,
     _positive_int,
+    _render_codex_stdin,
     _render_judge_user_payload,
+    _render_summary,
     _resolve_seed,
     _rollup_outcome,
     _run_subprocess,
     _sample_pollution_for_probe,
+    _validate_judge_envelope,
     build_arm_prompt,
+    build_output_json,
 )
 from kai.eval.retrieval import Probe
 
@@ -881,7 +890,7 @@ class TestOutputWriteFailure:
             ),
             patch.object(behavioral, "_run_all_probes", new=fake_run_all_probes),
             patch.object(behavioral, "_resolve_ground_truth", return_value={"f1": "gold"}),
-            patch.object(behavioral, "_capture_claude_cli_version", return_value="2.1.118"),
+            patch.object(behavioral, "_capture_agent_cli_version", return_value=("claude_cli_version", "2.1.118")),
         ):
             exit_code = asyncio.run(behavioral._run_cli(args))
 
@@ -953,7 +962,7 @@ class TestBackendAwareModelResolution:
             ),
             patch.object(behavioral, "_run_all_probes", new=fake_run_all_probes),
             patch.object(behavioral, "_resolve_ground_truth", return_value={"f1": "gold"}),
-            patch.object(behavioral, "_capture_claude_cli_version", return_value="2.1.118"),
+            patch.object(behavioral, "_capture_agent_cli_version", return_value=("claude_cli_version", "2.1.118")),
         ):
             asyncio.run(behavioral._run_cli(args))
         return captured["config"]
@@ -1041,7 +1050,8 @@ class TestProbeIdMatchesSourcePosition:
             outcomes=outcomes,
             drift_count=1,
             config=config,
-            claude_cli_version="2.1.118",
+            cli_version_field="claude_cli_version",
+            cli_version_value="2.1.118",
         )
 
         # The per_probe rows preserve outcomes-list ORDER (scored then
@@ -1444,3 +1454,356 @@ class TestInitializeMemoryDataDirContract:
         ):
             result = behavioral._initialize_memory()
         assert result is None
+
+
+# ── Codex vertical (Phase 5 of codex epic #480) ─────────────────────
+
+
+class TestBuildJudgeCmdCodex:
+    """Codex judge argv is `codex exec --json --model <model>` with no
+    claude-side flags, and `CODEX_BIN` overrides the binary path."""
+
+    def test_argv_shape(self, monkeypatch):
+        monkeypatch.delenv("CODEX_BIN", raising=False)
+        config = _make_config(judge_model="gpt-5.4-mini", backend="codex")
+        cmd = _build_judge_cmd_codex(config)
+        assert cmd[0] == "codex"
+        assert cmd[1] == "exec"
+        assert "--json" in cmd
+        i = cmd.index("--model")
+        assert cmd[i + 1] == "gpt-5.4-mini"
+        # No claude flags.
+        assert "--print" not in cmd
+        assert "--json-schema" not in cmd
+        assert "--system-prompt" not in cmd
+        assert "--permission-mode" not in cmd
+        assert "--tools" not in cmd
+        assert "--max-budget-usd" not in cmd
+
+    def test_codex_bin_env_override(self, monkeypatch):
+        monkeypatch.setenv("CODEX_BIN", "/tmp/fake-codex")
+        config = _make_config(judge_model="gpt-5.4-mini", backend="codex")
+        cmd = _build_judge_cmd_codex(config)
+        assert cmd[0] == "/tmp/fake-codex"
+
+
+class TestBuildGenCmdCodex:
+    """Codex generator argv mirrors the judge shape; same flags absent."""
+
+    def test_argv_shape(self, monkeypatch):
+        monkeypatch.delenv("CODEX_BIN", raising=False)
+        config = _make_config(gen_model="gpt-5.4-mini", backend="codex")
+        cmd = _build_gen_cmd_codex(config)
+        assert cmd[0] == "codex"
+        assert cmd[1] == "exec"
+        assert "--json" in cmd
+        i = cmd.index("--model")
+        assert cmd[i + 1] == "gpt-5.4-mini"
+        assert "--system-prompt" not in cmd
+        assert "--tools" not in cmd
+        assert "--max-budget-usd" not in cmd
+
+    def test_codex_bin_env_override(self, monkeypatch):
+        monkeypatch.setenv("CODEX_BIN", "/tmp/fake-codex")
+        config = _make_config(gen_model="gpt-5.4-mini", backend="codex")
+        cmd = _build_gen_cmd_codex(config)
+        assert cmd[0] == "/tmp/fake-codex"
+
+
+class TestRenderCodexStdin:
+    """The stdin renderer prepends a boundary-delimited SYSTEM block when
+    a system prompt is set, and emits the user payload unchanged when
+    the system prompt is empty (generator's --system-prompt "" analog)."""
+
+    def test_empty_system_prompt_returns_user_payload_unchanged(self):
+        result = _render_codex_stdin("", "hello world")
+        assert result == "hello world"
+
+    def test_system_prompt_wraps_with_boundary_block(self):
+        result = _render_codex_stdin("be impartial", "rate the responses")
+        # SYSTEM block at the head, then a blank line, then the user payload.
+        assert result.startswith("--- BEGIN SYSTEM")
+        assert "be impartial" in result
+        assert "--- END SYSTEM" in result
+        assert result.endswith("rate the responses")
+        # The SYSTEM block comes BEFORE the user payload.
+        sys_end = result.index("--- END SYSTEM")
+        user_start = result.index("rate the responses")
+        assert sys_end < user_start
+
+
+class TestValidateJudgeEnvelope:
+    """Post-hoc validator that mirrors the claude `--json-schema` contract."""
+
+    def test_valid_envelope_returns_true(self):
+        assert _validate_judge_envelope({"choice": "A_wins", "reasoning": "because"})
+
+    def test_top_level_not_dict_returns_false(self):
+        assert not _validate_judge_envelope([])
+        assert not _validate_judge_envelope("string")
+        assert not _validate_judge_envelope(None)
+
+    def test_missing_choice_returns_false(self):
+        assert not _validate_judge_envelope({"reasoning": "r"})
+
+    def test_missing_reasoning_returns_false(self):
+        assert not _validate_judge_envelope({"choice": "A_wins"})
+
+    def test_choice_not_in_enum_returns_false(self):
+        assert not _validate_judge_envelope({"choice": "X_wins", "reasoning": "r"})
+
+    def test_choice_non_string_returns_false(self):
+        assert not _validate_judge_envelope({"choice": 1, "reasoning": "r"})
+
+    def test_reasoning_non_string_returns_false(self):
+        assert not _validate_judge_envelope({"choice": "A_wins", "reasoning": 42})
+
+    def test_extra_property_returns_false(self):
+        assert not _validate_judge_envelope({"choice": "A_wins", "reasoning": "r", "extra": "x"})
+
+
+def _codex_ndjson_envelope(text: str, item_id: str = "i1") -> bytes:
+    """Build a minimal codex `exec --json` NDJSON stream wrapping a single
+    agent_message with `text` as its consolidated content."""
+    events = [
+        {"type": "thread.started", "thread_id": "thr_t"},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {"id": item_id, "type": "agent_message", "text": text}},
+        {"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}},
+    ]
+    return ("\n".join(json.dumps(e) for e in events) + "\n").encode()
+
+
+class TestParseCodexJudgeStdout:
+    """Judge parser: codex NDJSON -> agent_message JSON -> schema validate
+    -> (choice, reasoning). join_items=False because the judge contract
+    is exactly one final JSON object."""
+
+    def test_happy_path(self):
+        envelope_json = '{"choice": "A_wins", "reasoning": "the gold fact is present in A"}'
+        stdout = _codex_ndjson_envelope(envelope_json)
+        result = _parse_codex_judge_stdout(stdout)
+        assert result == ("A_wins", "the gold fact is present in A")
+
+    def test_malformed_json_returns_none(self):
+        stdout = _codex_ndjson_envelope("not-json-at-all")
+        assert _parse_codex_judge_stdout(stdout) is None
+
+    def test_missing_choice_returns_none(self):
+        stdout = _codex_ndjson_envelope('{"reasoning": "no choice key"}')
+        assert _parse_codex_judge_stdout(stdout) is None
+
+    def test_invalid_choice_enum_returns_none(self):
+        stdout = _codex_ndjson_envelope('{"choice": "X_wins", "reasoning": "r"}')
+        assert _parse_codex_judge_stdout(stdout) is None
+
+    def test_extra_property_returns_none(self):
+        stdout = _codex_ndjson_envelope('{"choice": "A_wins", "reasoning": "r", "extra": "x"}')
+        assert _parse_codex_judge_stdout(stdout) is None
+
+    def test_empty_stdout_returns_none(self):
+        assert _parse_codex_judge_stdout(b"") is None
+
+    def test_join_items_false_keeps_last_for_preamble_plus_json_safety(self):
+        """If codex emits a preamble agent_message before the JSON body,
+        last-wins selects the JSON. Joining would corrupt the parse."""
+        envelope_json = '{"choice": "tie", "reasoning": "r"}'
+        events = [
+            {"type": "thread.started", "thread_id": "thr_t"},
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": "Let me think..."}},
+            {"type": "item.completed", "item": {"id": "i2", "type": "agent_message", "text": envelope_json}},
+            {"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}},
+        ]
+        stdout = ("\n".join(json.dumps(e) for e in events) + "\n").encode()
+        result = _parse_codex_judge_stdout(stdout)
+        assert result == ("tie", "r")
+
+
+class TestParseCodexGenStdout:
+    """Generator parser: codex NDJSON -> joined agent_message text. Multi-
+    item turns are preserved with a blank-line separator (B-1 regression)."""
+
+    def test_single_item(self):
+        stdout = _codex_ndjson_envelope("a single response")
+        assert _parse_codex_gen_stdout(stdout) == "a single response"
+
+    def test_multi_item_joined_with_blank_line(self):
+        events = [
+            {"type": "thread.started", "thread_id": "thr_t"},
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": "first part"}},
+            {"type": "item.completed", "item": {"id": "i2", "type": "agent_message", "text": "second part"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}},
+        ]
+        stdout = ("\n".join(json.dumps(e) for e in events) + "\n").encode()
+        # B-1 regression guard: BOTH items present, separated by \n\n. The
+        # prior implementation (join_items=False on generator) would have
+        # returned only "second part" and silently dropped the first.
+        assert _parse_codex_gen_stdout(stdout) == "first part\n\nsecond part"
+
+    def test_empty_stream_returns_empty_string(self):
+        assert _parse_codex_gen_stdout(b"") == ""
+
+
+class TestCaptureAgentCliVersionCodex:
+    """Backend dispatch for the version-capture helper, plus the
+    `CODEX_BIN` override for the codex branch."""
+
+    def test_claude_branch_uses_claude_version(self, monkeypatch):
+        monkeypatch.delenv("CODEX_BIN", raising=False)
+        fake_result = MagicMock()
+        fake_result.returncode = 0
+        fake_result.stdout = "claude 2.1.118\n"
+        with patch("kai.eval.behavioral.subprocess.run", return_value=fake_result) as mock_run:
+            field, value = _capture_agent_cli_version("claude")
+        assert field == "claude_cli_version"
+        assert value == "claude 2.1.118"
+        assert mock_run.call_args[0][0] == ["claude", "--version"]
+
+    def test_codex_branch_uses_codex_version(self, monkeypatch):
+        monkeypatch.delenv("CODEX_BIN", raising=False)
+        fake_result = MagicMock()
+        fake_result.returncode = 0
+        fake_result.stdout = "codex 0.130.0\n"
+        with patch("kai.eval.behavioral.subprocess.run", return_value=fake_result) as mock_run:
+            field, value = _capture_agent_cli_version("codex")
+        assert field == "codex_cli_version"
+        assert value == "codex 0.130.0"
+        assert mock_run.call_args[0][0] == ["codex", "--version"]
+
+    def test_codex_branch_honors_codex_bin(self, monkeypatch):
+        monkeypatch.setenv("CODEX_BIN", "/tmp/fake-codex")
+        fake_result = MagicMock()
+        fake_result.returncode = 0
+        fake_result.stdout = "codex 0.130.0\n"
+        with patch("kai.eval.behavioral.subprocess.run", return_value=fake_result) as mock_run:
+            field, _value = _capture_agent_cli_version("codex")
+        assert field == "codex_cli_version"
+        assert mock_run.call_args[0][0] == ["/tmp/fake-codex", "--version"]
+
+    def test_unknown_backend_falls_back_to_claude(self, monkeypatch):
+        monkeypatch.delenv("CODEX_BIN", raising=False)
+        fake_result = MagicMock()
+        fake_result.returncode = 0
+        fake_result.stdout = "claude 2.1.118\n"
+        with patch("kai.eval.behavioral.subprocess.run", return_value=fake_result) as mock_run:
+            field, _value = _capture_agent_cli_version("goose")
+        assert field == "claude_cli_version"
+        assert mock_run.call_args[0][0] == ["claude", "--version"]
+
+    def test_subprocess_failure_returns_unknown(self):
+        fake_result = MagicMock()
+        fake_result.returncode = 1
+        fake_result.stdout = ""
+        with patch("kai.eval.behavioral.subprocess.run", return_value=fake_result):
+            _field, value = _capture_agent_cli_version("codex")
+        assert value == "unknown"
+
+
+class TestOutputJsonMutuallyExclusiveVersionFields:
+    """`claude_cli_version` and `codex_cli_version` never co-occur, and no
+    `backend` field is added to the output JSON."""
+
+    def _outcomes_and_probes(self):
+        probe = Probe(question="q", expected_fact_id="f1")
+        outcome = _make_outcome(probe=probe, memory_outcome="memory_wins")
+        return [probe], [outcome]
+
+    def test_codex_run_writes_codex_field_only(self):
+        probes, outcomes = self._outcomes_and_probes()
+        output = build_output_json(
+            probes=probes,
+            outcomes=outcomes,
+            drift_count=0,
+            config=_make_config(backend="codex"),
+            cli_version_field="codex_cli_version",
+            cli_version_value="codex 0.130.0",
+        )
+        assert output["codex_cli_version"] == "codex 0.130.0"
+        assert "claude_cli_version" not in output
+        assert "backend" not in output
+
+    def test_claude_run_writes_claude_field_only(self):
+        probes, outcomes = self._outcomes_and_probes()
+        output = build_output_json(
+            probes=probes,
+            outcomes=outcomes,
+            drift_count=0,
+            config=_make_config(backend="claude"),
+            cli_version_field="claude_cli_version",
+            cli_version_value="claude 2.1.118",
+        )
+        assert output["claude_cli_version"] == "claude 2.1.118"
+        assert "codex_cli_version" not in output
+        assert "backend" not in output
+
+
+class TestRenderSummaryVersionDispatch:
+    """The summary line picks the right label based on which version key is
+    present in the output dict. Reading the literal claude key (the pre-
+    codex shape) would KeyError on a codex run."""
+
+    def _outcomes_and_probes(self):
+        probe = Probe(question="q", expected_fact_id="f1")
+        outcome = _make_outcome(probe=probe, memory_outcome="memory_wins")
+        return [probe], [outcome]
+
+    def test_claude_run_renders_claude_label(self):
+        probes, outcomes = self._outcomes_and_probes()
+        output = build_output_json(
+            probes=probes,
+            outcomes=outcomes,
+            drift_count=0,
+            config=_make_config(backend="claude"),
+            cli_version_field="claude_cli_version",
+            cli_version_value="claude 2.1.118",
+        )
+        summary = _render_summary(output)
+        assert "Claude CLI: claude 2.1.118" in summary
+        assert "Codex CLI:" not in summary
+
+    def test_codex_run_renders_codex_label_without_keyerror(self):
+        probes, outcomes = self._outcomes_and_probes()
+        output = build_output_json(
+            probes=probes,
+            outcomes=outcomes,
+            drift_count=0,
+            config=_make_config(backend="codex"),
+            cli_version_field="codex_cli_version",
+            cli_version_value="codex 0.130.0",
+        )
+        # Pre-fix this would have KeyError'd on output['claude_cli_version'].
+        summary = _render_summary(output)
+        assert "Codex CLI: codex 0.130.0" in summary
+        assert "Claude CLI:" not in summary
+
+    def test_shared_summary_lines_match_between_backends(self):
+        probes, outcomes = self._outcomes_and_probes()
+        config = _make_config(backend="claude")
+        claude_output = build_output_json(
+            probes=probes,
+            outcomes=outcomes,
+            drift_count=0,
+            config=config,
+            cli_version_field="claude_cli_version",
+            cli_version_value="v",
+        )
+        codex_output = build_output_json(
+            probes=probes,
+            outcomes=outcomes,
+            drift_count=0,
+            config=_make_config(backend="codex"),
+            cli_version_field="codex_cli_version",
+            cli_version_value="v",
+        )
+        claude_summary = _render_summary(claude_output)
+        codex_summary = _render_summary(codex_output)
+        # Probe counts, models, seed lines render identically between
+        # the two runs; only the CLI label differs.
+        for snippet in (
+            f"Models: gen={config.gen_model}, judge={config.judge_model}",
+            f"Seed: {config.seed}",
+        ):
+            assert snippet in claude_summary
+            assert snippet in codex_summary
