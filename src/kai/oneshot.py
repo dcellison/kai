@@ -696,15 +696,28 @@ class CodexOneShotReasoner:
 
             # Codex's `--output-schema` enforcement is best-effort:
             # the CLI does not hard-reject a final message that
-            # parses as JSON but does not match the schema. A bare
-            # string ("not an object"), a list, or a wrong-keyed
-            # object would otherwise wrap into a syntactically
-            # valid `is_error: false` envelope, and memory
-            # extraction's nested-vs-root resolution would silently
-            # treat it as a successful empty extraction. Reject
-            # anything other than a JSON object here so a schema
-            # failure surfaces as `OneShotOutputError` and the
-            # caller's typed-error path takes over instead.
+            # parses as JSON but does not match the schema. Three
+            # distinct shape failures must surface as typed errors,
+            # not as a successful is_error=false envelope that the
+            # caller would treat as "the model found nothing":
+            #
+            #   1. Scalar / list / null payloads (`json.loads` returns
+            #      something that is not a dict).
+            #   2. Object payloads missing required top-level fields
+            #      named by the supplied schema (e.g. an `{"episode":
+            #      ...}` response under the fact schema, which
+            #      requires `facts` and `has_episode`).
+            #
+            # The required-field check intentionally stays minimal:
+            # the reasoner does not import a JSON Schema validator
+            # because the runtime dependency is not worth the cost
+            # for two callers, and a deeper structural check belongs
+            # to the caller's own `_validate_facts` / episode
+            # validators. Only the top-level required list is read
+            # off `json_schema`; anything beyond that (additional
+            # properties, nested required, type enforcement) is left
+            # to the caller's existing validators, same posture as
+            # the Claude path.
             if not isinstance(payload, dict):
                 log.info(
                     "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=%d outcome=output_error error_category=non_object_json returncode=0",
@@ -713,6 +726,18 @@ class CodexOneShotReasoner:
                     duration_ms,
                 )
                 raise OneShotOutputError("codex final JSON was not an object")
+
+            required_fields = json_schema.get("required")
+            if isinstance(required_fields, list):
+                missing = [field for field in required_fields if field not in payload]
+                if missing:
+                    log.info(
+                        "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=%d outcome=output_error error_category=missing_required_fields returncode=0",
+                        purpose,
+                        model,
+                        duration_ms,
+                    )
+                    raise OneShotOutputError(f"codex final JSON missing required fields: {missing}")
 
             # Wrap codex's schema-shaped payload in the same envelope
             # claude emits natively. memory_extraction.py already

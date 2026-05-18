@@ -3502,3 +3502,31 @@ class TestRunExtractorWithCodexEnvelope:
 
         assert result.facts == []
         assert result.has_episode is False
+
+    @pytest.mark.asyncio
+    async def test_codex_reasoner_output_error_collapses_to_empty_result(self):
+        """When the Codex reasoner raises OneShotOutputError (e.g.
+        because Codex returned a wrong-shape object that the
+        reasoner rejected at the schema boundary), `_run_extractor`
+        must collapse to the zero-state ExtractionResult rather than
+        propagate. This is the typed-error path that prevents a
+        wrong-shape Codex payload from reaching the fact validator
+        or being silently stored as `the model found nothing`."""
+        from kai.oneshot import OneShotOutputError
+
+        class _OutputErrorReasoner:
+            async def run(self, **kwargs):
+                raise OneShotOutputError("codex final JSON missing required fields: ['facts', 'has_episode']")
+
+        config = _cfg(memory_reasoner_backend="codex", memory_extraction_model="gpt-5.4-mini")
+        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_OutputErrorReasoner()):
+            result = await memory_extraction._run_extractor(
+                payload_text="payload",
+                config=config,
+                candidate_ids=set(),
+                candidate_metadata={},
+                user_id="u1",
+            )
+
+        assert result.facts == []
+        assert result.has_episode is False

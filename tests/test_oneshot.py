@@ -856,6 +856,102 @@ class TestCodexOneShotReasonerOutputError:
             )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "wrong_key_object",
+        [
+            {"unexpected": True},
+            {"episode": {"goal": "x"}},
+            {"facts": []},  # missing has_episode
+            {"has_episode": False},  # missing facts
+            {},
+        ],
+    )
+    async def test_object_missing_required_fields_raises_output_error(self, tmp_path, wrong_key_object):
+        """A parseable JSON object that does not satisfy the supplied
+        schema's top-level `required` list must raise
+        OneShotOutputError. Codex's --output-schema enforcement does
+        not hard-reject these payloads, so the reasoner is the last
+        boundary between a model that ignored the schema and the
+        memory extractor treating wrong-shape output as `the model
+        found nothing`. The check reads `required` off the supplied
+        schema rather than embedding fact/episode field names so
+        the reasoner stays domain-neutral."""
+        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        # Fact-extraction schema requires facts AND has_episode at root.
+        fact_schema = {
+            "type": "object",
+            "required": ["facts", "has_episode"],
+            "properties": {
+                "facts": {"type": "array"},
+                "has_episode": {"type": "boolean"},
+            },
+        }
+        stdout = _codex_envelope_ndjson(wrong_key_object)
+        proc = _make_proc(stdout=stdout, returncode=0)
+
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(OneShotOutputError),
+        ):
+            await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema=fact_schema,
+            )
+
+    @pytest.mark.asyncio
+    async def test_missing_required_fields_logs_dedicated_category(self, tmp_path, caplog):
+        """Operator dashboards must be able to separate `wrong-shape
+        object` from `bad JSON` and from `non-object scalar`; each
+        gets its own error_category so log queries can partition the
+        failure modes without re-parsing the message body."""
+        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        stdout = _codex_envelope_ndjson({"unexpected": True})
+        proc = _make_proc(stdout=stdout, returncode=0)
+        schema = {"type": "object", "required": ["facts", "has_episode"]}
+
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            caplog.at_level(logging.INFO, logger="kai.oneshot"),
+            pytest.raises(OneShotOutputError),
+        ):
+            await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema=schema,
+            )
+
+        records = [r for r in caplog.records if r.message.startswith("oneshot_reasoner")]
+        assert len(records) == 1
+        msg = records[0].getMessage()
+        assert "outcome=output_error" in msg
+        assert "error_category=missing_required_fields" in msg
+
+    @pytest.mark.asyncio
+    async def test_schema_without_required_field_does_not_block_success(self, tmp_path):
+        """A schema that omits the top-level `required` list must not
+        force a rejection; the reasoner falls back to its baseline
+        contract (object payload) and accepts the payload. This keeps
+        the guard from over-rejecting schemas that use other JSON
+        Schema constructs (oneOf, allOf, etc.) to express constraints
+        instead of a flat `required` list."""
+        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        stdout = _codex_envelope_ndjson({"any": "object", "shape": True})
+        proc = _make_proc(stdout=stdout, returncode=0)
+        schema_without_required = {"type": "object", "properties": {"any": {"type": "string"}}}
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema=schema_without_required,
+            )
+
+        envelope = json.loads(result.text)
+        assert envelope["is_error"] is False
+        assert envelope["structured_output"] == {"any": "object", "shape": True}
+
+    @pytest.mark.asyncio
     async def test_non_object_json_logs_non_object_category(self, tmp_path, caplog):
         """The non-object-JSON path must emit its own log category so
         operator-side dashboards can separate "model returned wrong
