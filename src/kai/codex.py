@@ -177,11 +177,22 @@ class CodexBackend(AgentBackend):
         # only the wrapper orphans the codex grandchild because POSIX
         # signal permission rules forbid a service-user-owned killpg
         # from reaching a target-user grandchild. The escalation path
-        # uses `sudo -n -u <target> /bin/kill ...` against the cached
-        # inner-codex PID. See _send_signal for the full rationale and
-        # claude.py for the original implementation this mirrors.
+        # uses `sudo -n -u <target> /bin/kill ...` against each cached
+        # codex descendant PID. See _send_signal for the full rationale
+        # and claude.py for the original implementation this mirrors.
+        #
+        # The cache is a LIST, ordered innermost-first, because codex's
+        # npm-global packaging interposes a node wrapper between sudo
+        # and the Rust binary. Killing only the wrapper leaves the Rust
+        # binary orphaned to init; signalling the leaf without the
+        # wrapper leaves node as a thin shell that normally exits via
+        # SIGCHLD but is worth killing explicitly. Both PIDs are owned
+        # by the target user; the sudoers rule covers either. A future
+        # codex release that drops the node wrapper collapses naturally
+        # to a single-PID list with no test-side changes needed beyond
+        # the pgrep mocks.
         self._pgid: int | None = None
-        self._inner_codex_pid: int | None = None
+        self._inner_codex_pids: list[int] = []
         self._effective_codex_user: str | None = None
 
     @property
@@ -320,11 +331,11 @@ class CodexBackend(AgentBackend):
             self._pgid = None
 
         # Remember the resolved sudo target for the #456-equivalent
-        # cross-user signal escalation. _inner_codex_pid is reset to
-        # None here so a recycled instance does not carry a stale
-        # PID from a previous spawn into the fresh tree.
+        # cross-user signal escalation. _inner_codex_pids is reset to
+        # an empty list here so a recycled instance does not carry
+        # stale PIDs from a previous spawn into the fresh tree.
         self._effective_codex_user = effective_codex_user
-        self._inner_codex_pid = None
+        self._inner_codex_pids = []
 
         # Handshake per the codex app-server protocol:
         #   1. Client `initialize` request (clientInfo + optional
@@ -928,25 +939,61 @@ class CodexBackend(AgentBackend):
 
     # ── Kill / restart / shutdown ──────────────────────────────────
 
-    def _lookup_inner_codex_pid(self) -> int | None:
+    def _lookup_inner_codex_pids(self) -> list[int]:
         """
-        Find the inner codex subprocess PID in cross-user mode.
+        Find the codex descendant PIDs in cross-user mode.
 
         In cross-user mode the bot spawns `sudo -u <target> -- codex
-        app-server` and self._proc tracks the sudo wrapper. sudo
-        fork+exec's codex as its sole child, so pgrep -P <sudo_pid>
-        returns the codex PID. Returns None when no sudo wrapper is
-        alive, sudo has not yet forked, or pgrep fails. The result
-        is cached on self._inner_codex_pid; callers that need to
-        signal after sudo has been killed must rely on the cache.
+        app-server` and self._proc tracks the sudo wrapper. Codex's
+        npm-global packaging interposes a node wrapper between sudo
+        and the actual Rust binary, so the process tree is:
+
+            sudo (service user)
+              └── node /path/to/codex app-server  (target user)
+                    └── /path/.../codex/codex app-server  (target user)
+
+        `pgrep -P <sudo_pid>` returns the node PID. We then `pgrep -P`
+        against that to find the Rust binary. Returns the descendant
+        PIDs in inner-to-outer order: `[rust_pid, node_pid]`. When
+        a future codex release drops the node wrapper (single-binary
+        install), the second pgrep returns nothing and the result
+        collapses to `[node_pid]` (which IS the Rust binary in that
+        case). Returns an empty list when no sudo wrapper is alive,
+        sudo has not yet forked, or pgrep fails outright.
+
+        Innermost-first ordering matters: _send_signal iterates the
+        list in order so the Rust binary dies before the node wrapper
+        gets killpg'd (the wrapper would otherwise exit via SIGCHLD
+        regardless, but signalling the Rust binary first is the
+        defensive shape that catches the original #487 orphan).
+
         Synchronous variant used by the sync force_kill path.
-        Mirrors claude.py's _lookup_inner_claude_pid (#456/#459).
+        Mirrors claude.py's _lookup_inner_claude_pid (#456/#459), with
+        the extra level for codex's npm packaging that #487 surfaced.
         """
         if self._proc is None:
-            return None
+            return []
+        first_pid = self._pgrep_first_child(self._proc.pid)
+        if first_pid is None:
+            return []
+        # Second level: pgrep the first child to find its child (the
+        # Rust binary under the node wrapper). If pgrep returns
+        # nothing the install has no wrapper layer; the first PID is
+        # itself the leaf.
+        second_pid = self._pgrep_first_child(first_pid)
+        if second_pid is None:
+            return [first_pid]
+        return [second_pid, first_pid]
+
+    @staticmethod
+    def _pgrep_first_child(parent_pid: int) -> int | None:
+        """Run pgrep -P <parent_pid> and return the first child PID,
+        or None if pgrep fails / returns no children. Extracted so
+        the two-level walk in _lookup_inner_codex_pids reads as one
+        idea per line."""
         try:
             result = subprocess.run(
-                ["pgrep", "-P", str(self._proc.pid)],
+                ["pgrep", "-P", str(parent_pid)],
                 capture_output=True,
                 text=True,
                 timeout=2,
@@ -964,23 +1011,37 @@ class CodexBackend(AgentBackend):
         except ValueError:
             return None
 
-    async def _async_lookup_inner_codex_pid(self) -> int | None:
+    async def _async_lookup_inner_codex_pids(self) -> list[int]:
         """
-        Async pgrep equivalent of `_lookup_inner_codex_pid`.
+        Async pgrep equivalent of `_lookup_inner_codex_pids`.
 
-        Same semantics, but uses asyncio.create_subprocess_exec so
-        the event loop is not blocked while pgrep runs. Called from
-        the async _kill / shutdown paths; the sync variant remains
-        for force_kill. 2s ceiling matches the sync version. Mirrors
-        claude.py's _async_lookup_inner_claude_pid (#459).
+        Same semantics and two-level walk, but uses
+        asyncio.create_subprocess_exec so the event loop is not
+        blocked while pgrep runs. Called from the async _kill /
+        shutdown paths; the sync variant remains for force_kill.
+        2s ceiling matches the sync version. Mirrors claude.py's
+        _async_lookup_inner_claude_pid (#459), extended to walk
+        the extra level for codex's npm packaging (#487).
         """
         if self._proc is None:
-            return None
+            return []
+        first_pid = await self._async_pgrep_first_child(self._proc.pid)
+        if first_pid is None:
+            return []
+        second_pid = await self._async_pgrep_first_child(first_pid)
+        if second_pid is None:
+            return [first_pid]
+        return [second_pid, first_pid]
+
+    @staticmethod
+    async def _async_pgrep_first_child(parent_pid: int) -> int | None:
+        """Async pgrep -P <parent_pid>, returning the first child PID
+        or None. Companion to _pgrep_first_child; same contract."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 "pgrep",
                 "-P",
-                str(self._proc.pid),
+                str(parent_pid),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -1086,9 +1147,17 @@ class CodexBackend(AgentBackend):
         """
         if self._pgid is not None:
             if self._effective_codex_user is not None:
-                if self._inner_codex_pid is None:
-                    self._inner_codex_pid = self._lookup_inner_codex_pid()
-                if self._inner_codex_pid is not None:
+                if not self._inner_codex_pids:
+                    self._inner_codex_pids = self._lookup_inner_codex_pids()
+                # Innermost-first: kill the Rust binary before the
+                # node wrapper so the wrapper does not get a chance
+                # to spawn a fresh leaf, and so the failure-to-orphan
+                # diagnostic in the warning identifies the load-bearing
+                # PID. A future codex release that drops the wrapper
+                # collapses to a single-element list and the loop
+                # body runs exactly once. _inner_codex_pids is set up
+                # in inner-to-outer order by _lookup_inner_codex_pids.
+                for pid in self._inner_codex_pids:
                     try:
                         # Absolute /bin/kill path so sudo's secure_path
                         # resolution cannot silently pick a different
@@ -1105,7 +1174,7 @@ class CodexBackend(AgentBackend):
                                 self._effective_codex_user,
                                 "/bin/kill",
                                 f"-{int(sig)}",
-                                str(self._inner_codex_pid),
+                                str(pid),
                             ],
                             capture_output=True,
                             timeout=5,
@@ -1113,16 +1182,17 @@ class CodexBackend(AgentBackend):
                         )
                         if result.returncode != 0:
                             log.warning(
-                                "sudo kill escalation failed (rc=%d, stderr=%r); inner codex may orphan",
+                                "sudo kill escalation failed (rc=%d, stderr=%r); codex pid=%d may orphan",
                                 result.returncode,
                                 result.stderr[:200].decode(errors="replace") if result.stderr else "",
+                                pid,
                             )
                     except (subprocess.TimeoutExpired, OSError):
                         # Inner codex already dead, sudoers rule
                         # missing on an old install, or kill timed
-                        # out. Fall through to killpg; the wrapper
-                        # still needs reaping.
-                        pass
+                        # out. Continue to the next PID and then to
+                        # killpg; the wrapper still needs reaping.
+                        continue
             try:
                 os.killpg(self._pgid, sig)
             except OSError:
@@ -1146,12 +1216,15 @@ class CodexBackend(AgentBackend):
         """
         if self._pgid is not None:
             if self._effective_codex_user is not None:
-                if self._inner_codex_pid is None:
-                    self._inner_codex_pid = await self._async_lookup_inner_codex_pid()
-                if self._inner_codex_pid is not None:
+                if not self._inner_codex_pids:
+                    self._inner_codex_pids = await self._async_lookup_inner_codex_pids()
+                # Innermost-first; see _send_signal for the full
+                # rationale on ordering and the npm-wrapper failure
+                # mode this guards against.
+                for pid in self._inner_codex_pids:
                     await self._async_sudo_kill(
                         self._effective_codex_user,
-                        self._inner_codex_pid,
+                        pid,
                         int(sig),
                     )
             try:
@@ -1203,7 +1276,7 @@ class CodexBackend(AgentBackend):
             self._proc = None
             self._session_id = None
             self._pgid = None
-            self._inner_codex_pid = None
+            self._inner_codex_pids = []
             self._effective_codex_user = None
 
     async def restart(self) -> None:

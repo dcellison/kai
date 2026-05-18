@@ -1261,8 +1261,8 @@ class TestCodexUserSudoWrap:
             await c._ensure_started()
         assert c._pgid == 12345
         assert c._effective_codex_user == "ci-fake-user"
-        # Fresh spawn must reset any stale cached grandchild PID.
-        assert c._inner_codex_pid is None
+        # Fresh spawn must reset any stale cached descendant PIDs.
+        assert c._inner_codex_pids == []
 
     @pytest.mark.asyncio
     async def test_pgid_unset_when_codex_user_unset(self):
@@ -1290,51 +1290,67 @@ class TestCodexCrossUserTeardown:
     """
 
     def test_force_kill_cross_user_escalates_then_killpg(self):
-        """force_kill in cross-user mode looks up the inner codex PID, sudo-kills it, then killpgs the wrapper."""
+        """
+        force_kill in cross-user mode walks two pgrep levels under the
+        sudo wrapper, sudo-kills each descendant innermost-first, then
+        killpgs the wrapper. This single-leaf scenario (no node
+        wrapper) collapses the second pgrep to empty so the cache
+        ends up as [67890].
+        """
         c = _make_codex(codex_user="ci-fake-user")
         proc = MagicMock()
         proc.pid = 12345
         c._proc = proc
         c._pgid = 12345
         c._effective_codex_user = "ci-fake-user"
-        c._inner_codex_pid = None  # Force a lookup
+        c._inner_codex_pids = []  # Force a lookup
         c._stderr_task = MagicMock()
 
-        # Mock pgrep returning the inner codex PID 67890.
-        pgrep_result = MagicMock()
-        pgrep_result.returncode = 0
-        pgrep_result.stdout = "67890\n"
+        # First pgrep -P 12345 -> 67890 (the only child).
+        pgrep_first = MagicMock()
+        pgrep_first.returncode = 0
+        pgrep_first.stdout = "67890\n"
+        # Second pgrep -P 67890 -> empty (no grandchild). Lookup
+        # collapses to [67890] (single-binary install).
+        pgrep_second = MagicMock()
+        pgrep_second.returncode = 1
+        pgrep_second.stdout = ""
         # Mock the sudo /bin/kill returning success.
         sudo_kill_result = MagicMock()
         sudo_kill_result.returncode = 0
         sudo_kill_result.stderr = b""
 
         with (
-            patch("kai.codex.subprocess.run", side_effect=[pgrep_result, sudo_kill_result]) as mock_run,
+            patch(
+                "kai.codex.subprocess.run",
+                side_effect=[pgrep_first, pgrep_second, sudo_kill_result],
+            ) as mock_run,
             patch("kai.codex.os.killpg") as mock_killpg,
         ):
             c.force_kill()
 
-        # First call: pgrep -P 12345 to find the grandchild.
+        # First call: pgrep -P 12345 (level 1, sudo's child).
         assert mock_run.call_args_list[0][0][0] == ["pgrep", "-P", "12345"]
-        # Second call: sudo -n -u ci-fake-user /bin/kill -9 67890.
-        sudo_argv = mock_run.call_args_list[1][0][0]
+        # Second call: pgrep -P 67890 (level 2 walk).
+        assert mock_run.call_args_list[1][0][0] == ["pgrep", "-P", "67890"]
+        # Third call: sudo -n -u ci-fake-user /bin/kill -9 67890.
+        sudo_argv = mock_run.call_args_list[2][0][0]
         assert sudo_argv[:5] == ["sudo", "-n", "-u", "ci-fake-user", "/bin/kill"]
         assert sudo_argv[5] == f"-{int(signal.SIGKILL)}"
         assert sudo_argv[6] == "67890"
         # Then killpg reaps the wrapper.
         mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
         # Cache primed for any subsequent _send_signal call.
-        assert c._inner_codex_pid == 67890
+        assert c._inner_codex_pids == [67890]
 
-    def test_force_kill_uses_cached_inner_pid(self):
-        """If _inner_codex_pid is already cached, force_kill skips the pgrep lookup."""
+    def test_force_kill_uses_cached_inner_pids(self):
+        """If _inner_codex_pids is already populated, force_kill skips the pgrep lookup."""
         c = _make_codex(codex_user="ci-fake-user")
         c._proc = MagicMock()
         c._proc.pid = 12345
         c._pgid = 12345
         c._effective_codex_user = "ci-fake-user"
-        c._inner_codex_pid = 67890  # Pre-cached
+        c._inner_codex_pids = [67890]  # Pre-cached
         c._stderr_task = MagicMock()
 
         sudo_kill_result = MagicMock()
@@ -1379,7 +1395,7 @@ class TestCodexCrossUserTeardown:
         c._proc.pid = 12345
         c._pgid = 12345
         c._effective_codex_user = "ci-fake-user"
-        c._inner_codex_pid = 67890
+        c._inner_codex_pids = [67890]
         c._stderr_task = MagicMock()
 
         sudo_kill_result = MagicMock()
@@ -1405,7 +1421,7 @@ class TestCodexCrossUserTeardown:
         c._proc = proc
         c._pgid = 12345
         c._effective_codex_user = "ci-fake-user"
-        c._inner_codex_pid = 67890  # Pre-cached -> skip pgrep
+        c._inner_codex_pids = [67890]  # Pre-cached -> skip pgrep
         c._stderr_task = MagicMock()
 
         sudo_proc = MagicMock()
@@ -1427,7 +1443,7 @@ class TestCodexCrossUserTeardown:
         # State cleared after _kill.
         assert c._proc is None
         assert c._pgid is None
-        assert c._inner_codex_pid is None
+        assert c._inner_codex_pids == []
         assert c._effective_codex_user is None
 
     @pytest.mark.asyncio
@@ -1441,7 +1457,7 @@ class TestCodexCrossUserTeardown:
         c._proc = proc
         c._pgid = 12345
         c._effective_codex_user = "ci-fake-user"
-        c._inner_codex_pid = 67890
+        c._inner_codex_pids = [67890]
         c._stderr_task = MagicMock()
 
         sudo_proc = MagicMock()
@@ -1459,3 +1475,155 @@ class TestCodexCrossUserTeardown:
         sigkill_call = mock_exec.call_args_list[1][0]
         assert sigterm_call[5] == f"-{int(signal.SIGTERM)}"
         assert sigkill_call[5] == f"-{int(signal.SIGKILL)}"
+
+
+class TestCodexGrandchildEscalation:
+    """
+    Codex's npm-global packaging interposes a `node` wrapper between
+    the sudo wrapper and the Rust binary that actually holds the
+    session:
+
+        sudo (service user)
+          -> node /Users/.../bin/codex app-server  (target user)
+              -> /Users/.../codex/codex app-server  (target user)
+
+    A one-level pgrep returns the node PID; killing only that PID
+    leaves the Rust binary reparented to init and accumulating sessions
+    across recycles. _lookup_inner_codex_pids walks two levels and
+    returns [rust_pid, node_pid] (innermost-first); _send_signal
+    iterates and sudo-kills each in order before killpg reaps the
+    sudo wrapper.
+    """
+
+    def test_lookup_walks_two_pgrep_levels(self):
+        """Two-level walk: pgrep -P sudo_pid -> node, pgrep -P node -> rust."""
+        c = _make_codex(codex_user="ci-fake-user")
+        c._proc = MagicMock()
+        c._proc.pid = 12345
+
+        pgrep_level1 = MagicMock()
+        pgrep_level1.returncode = 0
+        pgrep_level1.stdout = "22222\n"  # node wrapper PID
+        pgrep_level2 = MagicMock()
+        pgrep_level2.returncode = 0
+        pgrep_level2.stdout = "33333\n"  # Rust binary PID
+
+        with patch("kai.codex.subprocess.run", side_effect=[pgrep_level1, pgrep_level2]) as mock_run:
+            pids = c._lookup_inner_codex_pids()
+
+        assert mock_run.call_args_list[0][0][0] == ["pgrep", "-P", "12345"]
+        assert mock_run.call_args_list[1][0][0] == ["pgrep", "-P", "22222"]
+        # Innermost-first: Rust first, then node.
+        assert pids == [33333, 22222]
+
+    def test_lookup_collapses_to_single_pid_when_no_grandchild(self):
+        """Single-binary install (no node wrapper): level-2 pgrep returns
+        empty, lookup falls back to the level-1 PID alone."""
+        c = _make_codex(codex_user="ci-fake-user")
+        c._proc = MagicMock()
+        c._proc.pid = 12345
+
+        pgrep_level1 = MagicMock()
+        pgrep_level1.returncode = 0
+        pgrep_level1.stdout = "22222\n"
+        pgrep_level2 = MagicMock()
+        pgrep_level2.returncode = 1
+        pgrep_level2.stdout = ""
+
+        with patch("kai.codex.subprocess.run", side_effect=[pgrep_level1, pgrep_level2]):
+            pids = c._lookup_inner_codex_pids()
+
+        assert pids == [22222]
+
+    def test_lookup_returns_empty_when_pgrep_fails(self):
+        """pgrep failure at level 1 returns an empty list, not a partial
+        chain. The escalation path treats empty as "no escalation possible"
+        and falls through to killpg alone."""
+        c = _make_codex(codex_user="ci-fake-user")
+        c._proc = MagicMock()
+        c._proc.pid = 12345
+
+        pgrep_fail = MagicMock()
+        pgrep_fail.returncode = 1
+        pgrep_fail.stdout = ""
+
+        with patch("kai.codex.subprocess.run", return_value=pgrep_fail):
+            pids = c._lookup_inner_codex_pids()
+
+        assert pids == []
+
+    def test_force_kill_signals_both_descendants_innermost_first(self):
+        """
+        With the npm-wrapper tree (sudo -> node -> rust), force_kill
+        sudo-kills the Rust binary FIRST, then the node wrapper, then
+        killpgs the sudo wrapper. The order matters: signalling the
+        leaf first prevents node from spawning a fresh leaf in the
+        race window before killpg arrives.
+        """
+        c = _make_codex(codex_user="ci-fake-user")
+        proc = MagicMock()
+        proc.pid = 12345
+        c._proc = proc
+        c._pgid = 12345
+        c._effective_codex_user = "ci-fake-user"
+        c._inner_codex_pids = []  # Force lookup
+        c._stderr_task = MagicMock()
+
+        pgrep_level1 = MagicMock()
+        pgrep_level1.returncode = 0
+        pgrep_level1.stdout = "22222\n"
+        pgrep_level2 = MagicMock()
+        pgrep_level2.returncode = 0
+        pgrep_level2.stdout = "33333\n"
+        sudo_kill_ok = MagicMock()
+        sudo_kill_ok.returncode = 0
+        sudo_kill_ok.stderr = b""
+
+        with (
+            patch(
+                "kai.codex.subprocess.run",
+                side_effect=[pgrep_level1, pgrep_level2, sudo_kill_ok, sudo_kill_ok],
+            ) as mock_run,
+            patch("kai.codex.os.killpg") as mock_killpg,
+        ):
+            c.force_kill()
+
+        # call 0: pgrep level 1; call 1: pgrep level 2;
+        # call 2: sudo kill 33333 (Rust, innermost); call 3: sudo kill 22222 (node)
+        rust_kill_argv = mock_run.call_args_list[2][0][0]
+        node_kill_argv = mock_run.call_args_list[3][0][0]
+        assert rust_kill_argv[6] == "33333"
+        assert node_kill_argv[6] == "22222"
+        # Cache reflects the chain in inner-to-outer order.
+        assert c._inner_codex_pids == [33333, 22222]
+        mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
+
+    @pytest.mark.asyncio
+    async def test_async_kill_signals_both_descendants_innermost_first(self):
+        """Async path mirror of the sync force_kill chain test."""
+        c = _make_codex(codex_user="ci-fake-user")
+        proc = MagicMock()
+        proc.pid = 12345
+        proc.wait = AsyncMock(return_value=0)
+        c._proc = proc
+        c._pgid = 12345
+        c._effective_codex_user = "ci-fake-user"
+        c._inner_codex_pids = [33333, 22222]  # Pre-cached - skip pgrep
+        c._stderr_task = MagicMock()
+
+        sudo_proc = MagicMock()
+        sudo_proc.returncode = 0
+        sudo_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        with (
+            patch("kai.codex.asyncio.create_subprocess_exec", AsyncMock(return_value=sudo_proc)) as mock_exec,
+            patch("kai.codex.os.killpg") as mock_killpg,
+        ):
+            await c._kill()
+
+        # Two sudo kill calls in innermost-first order.
+        first_kill_argv = mock_exec.call_args_list[0][0]
+        second_kill_argv = mock_exec.call_args_list[1][0]
+        assert first_kill_argv[6] == "33333"
+        assert second_kill_argv[6] == "22222"
+        mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
