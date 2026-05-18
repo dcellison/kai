@@ -28,15 +28,19 @@ continues to resolve to the same objects.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from kai.codex_exec import extract_codex_text
 from kai.config import DATA_DIR
+from kai.prompt_utils import make_boundary
 
 log = logging.getLogger(__name__)
 
@@ -372,3 +376,357 @@ class ClaudeOneShotReasoner:
             },
             duration_ms=duration_ms,
         )
+
+
+# ── Codex implementation ────────────────────────────────────────────
+
+
+# Env vars forwarded to the codex one-shot subprocess. Deliberately
+# separate from `_SUBPROCESS_ENV_ALLOWLIST`: that list carries
+# Anthropic-specific variables (CLAUDE_CONFIG_DIR, ANTHROPIC_API_KEY,
+# ANTHROPIC_BASE_URL) that mean nothing to codex and would only widen
+# blast radius if forwarded. Codex authentication comes from one of
+# two sources, both covered by this list:
+#   - subscription (ChatGPT Pro) OAuth state under ~/.codex, reached
+#     via HOME or the optional CODEX_HOME override.
+#   - pay-per-token via OPENAI_API_KEY, with OPENAI_BASE_URL for
+#     compatible proxies (Azure OpenAI, vLLM, etc.).
+# PATH is required so the codex binary can resolve its own libexec
+# helpers and any subprocesses it spawns. KAI_WEBHOOK_SECRET, GitHub
+# tokens, Telegram tokens, DATABASE_URL, and the rest of the bot
+# parent env are NOT forwarded; a regression that started reaching
+# for them would surface as a logged miss rather than a silent
+# secret-leak to the model.
+_CODEX_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "CODEX_HOME",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+)
+
+
+def _render_codex_stdin(system_prompt: str | None, prompt: str) -> str:
+    """
+    Build a boundary-delimited stdin payload for a codex one-shot call.
+
+    Codex `exec` mode has no `--system-prompt` flag. The closest
+    equivalent is prepending the system text inside a randomized
+    boundary block (same scheme `triage.py`, `review.py`, and the
+    behavioral harness use to wrap untrusted prompt sections) and
+    sending the user payload below it. The model treats the boundary
+    block as authoritative context but cannot forge the closing token
+    from inside the user payload because `make_boundary` re-rolls the
+    token per call.
+
+    A None or empty `system_prompt` produces no boundary block at all
+    rather than an empty SYSTEM section. An empty SYSTEM section
+    would emit a free-floating boundary marker that the model could
+    see with no content inside it, which is both confusing and a
+    pointless attack surface; sending the payload unchanged matches
+    the no-system-prompt semantics callers already get from claude's
+    `--system-prompt` flag being omitted.
+
+    The helper lives in oneshot.py (not behavioral.py) deliberately:
+    importing eval-harness code from a provider implementation would
+    couple memory extraction's runtime to the eval module's import
+    graph. The two helpers are intentional duplicates of a small
+    function rather than a shared import, mirroring how `triage.py`
+    and `review.py` each format their own boundary blocks.
+    """
+    if not system_prompt:
+        return prompt
+    begin, end = make_boundary("SYSTEM")
+    return f"{begin}\n{system_prompt}\n{end}\n\n{prompt}"
+
+
+class CodexOneShotReasoner:
+    """
+    Spawns `codex exec --json` once per call and returns either the
+    raw final agent_message text or, when a JSON schema is supplied, a
+    normalized `{"is_error": false, "structured_output": ...}` envelope
+    string that matches the shape memory_extraction.py already parses.
+
+    Codex differs from Claude in three load-bearing ways:
+
+    - No `--system-prompt` flag: the system text is prepended to stdin
+      via `_render_codex_stdin` with a randomized boundary block.
+    - No inline `--json-schema`: codex takes `--output-schema <FILE>`,
+      so this reasoner writes the schema to a per-call temp file and
+      removes it on every exit path (success, timeout, non-zero exit,
+      or output-parse failure).
+    - NDJSON event output instead of a single envelope: stdout is a
+      sequence of `thread.*`, `turn.*`, and `item.*` events. The final
+      `agent_message` text is recovered via `extract_codex_text` with
+      `join_items=False`, which matches triage's "last completed
+      message only" contract for structured-output callers. A
+      preamble agent_message followed by a JSON body would otherwise
+      corrupt the parse.
+
+    The schema-backed call always returns a wrapped envelope so the
+    caller's nested-vs-root resolution path (the one already in
+    `memory_extraction._run_extractor` and `_run_episode_extractor`)
+    sees the same `structured_output` shape it sees from Claude. The
+    reasoner does not inspect fact / episode / tag / confidence
+    fields; that contract stays with the caller. When no schema is
+    supplied (`json_schema is None`), the final agent_message text is
+    returned directly without wrapping; memory extraction always
+    supplies a schema, so the wrap path is the production memory
+    path and the non-schema branch exists only for future free-form
+    callers.
+
+    Flag rationale:
+
+    - `--json` is required for NDJSON event output; without it the
+      CLI emits free-form text that the parser cannot walk.
+    - `--skip-git-repo-check` is required because the neutral
+      extractor cwd is not a Git repository. Codex's trusted-dir
+      gate refuses to spawn otherwise; the lesson from the broader
+      codex one-shot lineage is to pass this on every exec invocation.
+    - `--ephemeral` mirrors Claude's `--no-session-persistence`: no
+      session files written under ~/.codex per call.
+    - `--ignore-rules` keeps user or project execpolicy `.rules`
+      files from influencing memory extraction. The neutral cwd
+      already avoids project rules, but the explicit flag protects
+      the one-shot path from user-level rule drift on the service
+      user's `~/.codex/`.
+    - `--cd <cwd>` tells codex its working root explicitly; the
+      subprocess `cwd` argument keeps the process environment aligned
+      with that root so a future codex release that reads cwd from
+      either source sees the same value.
+    - `--output-schema <file>` is included only when a schema is
+      supplied. Codex's schema enforcement is best-effort (unlike
+      claude's CLI-side `--json-schema` validation); the reasoner
+      parses the final text as JSON and raises `OneShotOutputError`
+      on malformed output so memory storage never sees a half-shaped
+      payload.
+
+    Deliberately NOT passed:
+
+    - `--dangerously-bypass-approvals-and-sandbox`: memory extraction
+      asks for structured output only and does not need tools, shell
+      commands, or filesystem writes. Granting the bypass would widen
+      blast radius if a future codex release tried to invoke tools.
+    - `--sandbox danger-full-access`: same reasoning. If codex
+      attempts tool calls during exec, the call should fail or
+      produce no valid final JSON; the reasoner then raises
+      `OneShotOutputError` and the caller stores nothing.
+
+    The schema temp file lives under `DATA_DIR/memory/extractor_cwd/`
+    on production and the test-supplied cwd otherwise. Storing it
+    next to the run cwd keeps the path predictable in logs and means
+    a crash that leaks the file leaves it inside the memory subtree
+    rather than under /tmp where unrelated tooling might trip on it.
+    Cleanup is wrapped in `contextlib.suppress(FileNotFoundError)` so
+    a process death between write and remove does not leave a stale
+    exception masking the original failure.
+    """
+
+    def __init__(self, *, cwd: Path | None = None) -> None:
+        """
+        Args:
+            cwd: Override for the subprocess working directory and the
+                schema temp file's parent. Tests pass a temp path so
+                the run does not touch the real DATA_DIR. Production
+                callers leave this unset; the reasoner uses
+                `_EXTRACTOR_CWD` and ensures it exists on first call.
+        """
+        self._cwd = cwd if cwd is not None else _EXTRACTOR_CWD
+
+    async def run(
+        self,
+        *,
+        prompt: str,
+        system_prompt: str | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+        purpose: str,
+        json_schema: dict[str, Any] | None = None,
+    ) -> OneShotResult:
+        # Same lazy-mkdir contract as Claude: deferred from import
+        # time so a permission failure surfaces as a logged miss
+        # rather than crashing the bot at startup.
+        self._cwd.mkdir(parents=True, exist_ok=True)
+
+        codex_bin = os.environ.get("CODEX_BIN") or "codex"
+        cmd: list[str] = [
+            codex_bin,
+            "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--ignore-rules",
+            "--cd",
+            str(self._cwd),
+        ]
+        if model is not None:
+            cmd.extend(["--model", model])
+
+        # Schema temp file lifecycle. Written before subprocess spawn
+        # so the CLI sees a populated file; removed in `finally` so
+        # success, timeout, non-zero exit, and output-parse failures
+        # all clean up. `delete=False` is required because the
+        # subprocess opens the file by path, not by inherited fd;
+        # NamedTemporaryFile's auto-delete on close would yank the
+        # file out from under the running codex process.
+        schema_path: Path | None = None
+        if json_schema is not None:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".json",
+                prefix="codex-schema-",
+                dir=str(self._cwd),
+                delete=False,
+                encoding="utf-8",
+            ) as fh:
+                json.dump(json_schema, fh)
+                schema_path = Path(fh.name)
+            cmd.extend(["--output-schema", str(schema_path)])
+
+        # Allow-listed env: only forward keys present in the parent
+        # env. Absent keys are simply not forwarded; the subprocess
+        # behaves as if they were unset. Defense-in-depth against a
+        # future regression that tries to reuse Claude's env list:
+        # the codex list deliberately excludes the Anthropic-specific
+        # variables and keeps the secret surface narrow.
+        subprocess_env: dict[str, str] = {key: os.environ[key] for key in _CODEX_ENV_ALLOWLIST if key in os.environ}
+
+        stdin_payload = _render_codex_stdin(system_prompt, prompt)
+
+        start = time.monotonic()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(self._cwd),
+                env=subprocess_env,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(input=stdin_payload.encode("utf-8")),
+                    timeout=timeout,
+                )
+            except TimeoutError:
+                # Same kill+await pattern as Claude: without the await
+                # a subsequent kill on the reaped pid could race on
+                # ProcessLookupError. The duration is measured around
+                # the wait_for so the log line shows wall-clock
+                # cost-to-timeout, not wall-clock-to-reap.
+                proc.kill()
+                await proc.wait()
+                duration_ms = int((time.monotonic() - start) * 1000)
+                log.info(
+                    "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=%d outcome=timeout error_category=timeout",
+                    purpose,
+                    model,
+                    duration_ms,
+                )
+                raise OneShotTimeout() from None
+
+            duration_ms = int((time.monotonic() - start) * 1000)
+            returncode = proc.returncode if proc.returncode is not None else -1
+            if returncode != 0:
+                log.info(
+                    "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=%d outcome=subprocess_error error_category=non_zero_exit returncode=%d",
+                    purpose,
+                    model,
+                    duration_ms,
+                    returncode,
+                )
+                raise OneShotSubprocessError(returncode=returncode, stderr=stderr)
+
+            stdout_text = stdout.decode("utf-8", errors="replace")
+            # Triage's lesson carried over: structured-output callers
+            # want only the LAST completed agent_message so a preamble
+            # message does not get glued ahead of the JSON body. Memory
+            # extraction is the canonical structured caller here; the
+            # `join_items=True` (review/chat) path has no caller in
+            # #497 but the protocol leaves room for one.
+            final_text = extract_codex_text(stdout_text, join_items=False)
+
+            if json_schema is None:
+                # Free-form path: hand the final agent_message text
+                # back unchanged. Memory extraction never takes this
+                # branch in production; it stays here so a future
+                # free-form caller does not need to special-case
+                # codex.
+                log.info(
+                    "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=%d outcome=success returncode=0",
+                    purpose,
+                    model,
+                    duration_ms,
+                )
+                return OneShotResult(
+                    text=final_text,
+                    backend="codex",
+                    model=model,
+                    raw_metadata={
+                        "returncode": returncode,
+                        "stderr": stderr,
+                        "cwd": str(self._cwd),
+                    },
+                    duration_ms=duration_ms,
+                )
+
+            # Schema-backed path. The final agent_message must parse
+            # as a JSON object; anything else is OneShotOutputError so
+            # memory_extraction's caller-side mapping collapses it to
+            # the zero-state extraction result instead of letting a
+            # malformed payload reach the fact validator.
+            if not final_text:
+                log.info(
+                    "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=%d outcome=output_error error_category=empty_agent_message returncode=0",
+                    purpose,
+                    model,
+                    duration_ms,
+                )
+                raise OneShotOutputError("codex produced no final agent_message")
+            try:
+                payload = json.loads(final_text)
+            except json.JSONDecodeError as exc:
+                log.info(
+                    "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=%d outcome=output_error error_category=invalid_json returncode=0",
+                    purpose,
+                    model,
+                    duration_ms,
+                )
+                raise OneShotOutputError(f"codex final text was not valid JSON: {exc}") from None
+
+            # Wrap codex's schema-shaped payload in the same envelope
+            # claude emits natively. memory_extraction.py already
+            # walks the `structured_output` field on a parsed dict;
+            # rewrapping here keeps the parser path provider-neutral.
+            # `is_error: false` is hardcoded because reaching this
+            # branch means rc=0 AND a parseable final JSON; the
+            # caller's is_error guard still fires on a future codex
+            # variant that emits an error envelope as its agent_message.
+            envelope = json.dumps({"is_error": False, "structured_output": payload})
+            log.info(
+                "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=%d outcome=success returncode=0",
+                purpose,
+                model,
+                duration_ms,
+            )
+            return OneShotResult(
+                text=envelope,
+                backend="codex",
+                model=model,
+                raw_metadata={
+                    "returncode": returncode,
+                    "stderr": stderr,
+                    "cwd": str(self._cwd),
+                },
+                duration_ms=duration_ms,
+            )
+        finally:
+            # Cleanup runs on every exit path: success, timeout,
+            # subprocess error, output error, and any unexpected
+            # exception propagating from the spawn itself. Suppress
+            # FileNotFoundError so a cleanup race (e.g. the OS
+            # already removed the file under a temp sweep) does not
+            # mask the original failure with a secondary one.
+            if schema_path is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    schema_path.unlink()

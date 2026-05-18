@@ -3442,3 +3442,63 @@ class TestRunExtractorViaReasoner:
 
         assert result.facts == []
         assert result.has_episode is False
+
+
+class TestMemoryReasonerSelection:
+    """`_get_memory_reasoner(config)` dispatches on
+    `config.memory_reasoner_backend`. The Claude case is the default
+    and proves the helper still returns a Claude reasoner when no env
+    var is set; the Codex case proves the selector wires up the new
+    CodexOneShotReasoner without requiring memory_extraction.py to
+    branch on backend at the call site."""
+
+    def test_default_returns_claude_reasoner(self):
+        from kai.oneshot import ClaudeOneShotReasoner
+
+        reasoner = memory_extraction._get_memory_reasoner(_cfg())
+        assert isinstance(reasoner, ClaudeOneShotReasoner)
+
+    def test_codex_backend_returns_codex_reasoner(self):
+        from kai.oneshot import CodexOneShotReasoner
+
+        config = _cfg(memory_reasoner_backend="codex")
+        reasoner = memory_extraction._get_memory_reasoner(config)
+        assert isinstance(reasoner, CodexOneShotReasoner)
+
+
+class TestRunExtractorWithCodexEnvelope:
+    """A fake Codex reasoner returning a normalized envelope
+    (the same `{"is_error": false, "structured_output": ...}` shape
+    `CodexOneShotReasoner` produces) must flow through `_run_extractor`
+    without any backend-specific parsing. This locks in the
+    provider-neutrality contract: the parser path is identical
+    regardless of which backend produced the envelope."""
+
+    @pytest.mark.asyncio
+    async def test_codex_envelope_flows_through_unchanged(self):
+        from kai.oneshot import OneShotResult
+
+        envelope_text = '{"is_error": false, "structured_output": {"facts": [], "has_episode": false}}'
+
+        class _FakeCodexReasoner:
+            async def run(self, **kwargs):
+                return OneShotResult(
+                    text=envelope_text,
+                    backend="codex",
+                    model="gpt-5.4-mini",
+                    raw_metadata={"returncode": 0, "stderr": b""},
+                    duration_ms=42,
+                )
+
+        config = _cfg(memory_reasoner_backend="codex", memory_extraction_model="gpt-5.4-mini")
+        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_FakeCodexReasoner()):
+            result = await memory_extraction._run_extractor(
+                payload_text="payload",
+                config=config,
+                candidate_ids=set(),
+                candidate_metadata={},
+                user_id="u1",
+            )
+
+        assert result.facts == []
+        assert result.has_episode is False

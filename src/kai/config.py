@@ -169,6 +169,16 @@ class ModelRole(StrEnum):
     ISSUE_TRIAGE = "issue_triage"
     BEHAVIORAL_JUDGE = "behavioral_judge"
     BEHAVIORAL_GEN = "behavioral_gen"
+    # Memory extraction roles. Routed through the per-backend registry
+    # so MEMORY_REASONER_BACKEND=codex can resolve a codex-native
+    # model (gpt-5.4-mini) instead of inheriting the Claude-shaped
+    # `claude-haiku-4-5-20251001` literal that the codex CLI would
+    # reject. MEMORY_EPISODE is a distinct row from MEMORY_EXTRACTION
+    # so an operator can downgrade one stage without the other;
+    # load_config still applies the "episode inherits extraction"
+    # default at env-resolution time when MEMORY_EPISODE_MODEL is unset.
+    MEMORY_EXTRACTION = "memory_extraction"
+    MEMORY_EPISODE = "memory_episode"
 
 
 # Values are exactly what each backend's CLI accepts as --model.
@@ -199,6 +209,19 @@ MODEL_REGISTRY: dict[tuple[str, ModelRole], str] = {
     # against CODEX_MODELS so future drift gets caught at startup.
     ("codex", ModelRole.BEHAVIORAL_JUDGE): "gpt-5.4-mini",
     ("codex", ModelRole.BEHAVIORAL_GEN): "gpt-5.4-mini",
+    # Memory extraction rows. Claude entries equal the existing
+    # `memory_extraction_model` / `memory_episode_model` dataclass
+    # default so an install that has not set MEMORY_REASONER_BACKEND
+    # sees byte-identical model resolution. Codex entries pick the
+    # smallest currently-exposed codex model (gpt-5.4-mini) on the
+    # same editorial tier as Claude's haiku selection; the structural
+    # validator below asserts both rows land on models the codex CLI
+    # accepts, so a future operator who renames a codex SKU surfaces
+    # the bad row at startup rather than at first extraction.
+    ("claude", ModelRole.MEMORY_EXTRACTION): "claude-haiku-4-5-20251001",
+    ("claude", ModelRole.MEMORY_EPISODE): "claude-haiku-4-5-20251001",
+    ("codex", ModelRole.MEMORY_EXTRACTION): "gpt-5.4-mini",
+    ("codex", ModelRole.MEMORY_EPISODE): "gpt-5.4-mini",
 }
 
 
@@ -730,12 +753,30 @@ class Config:
     memory_token_budget: int = 2000
     memory_embedding_model: str = "all-MiniLM-L6-v2"
 
+    # Memory reasoner backend selection. Independent of `agent_backend`
+    # because memory extraction has not yet passed the cross-backend
+    # eval gate; an install running `AGENT_BACKEND=codex` must NOT
+    # silently flip memory extraction onto an unevaluated provider.
+    # Default stays "claude" until a follow-up production-enables the
+    # codex path. Values are validated at config-load time against
+    # `{"claude", "codex"}`; an unknown value is a SystemExit, matching
+    # the AGENT_BACKEND validation pattern. When `memory_enabled=False`
+    # or `memory_extraction_enabled=False`, the value still parses but
+    # no reasoner is invoked.
+    memory_reasoner_backend: str = "claude"
+
     # Track 2 (Haiku extraction) config. Requires memory_enabled=True and
     # a Claude backend. Default is False at Phase 2 ship so the self-
     # reinforcing extraction loop has real-world observation time before
     # the default flips. The kill switch is the same flag.
     memory_extraction_enabled: bool = False
-    # Claude model name for extraction. Default is Haiku 4.5.
+    # Default model name for extraction. The literal here is the
+    # Claude registry row; load_config() re-resolves this through
+    # `get_model_for(ModelRole.MEMORY_EXTRACTION, memory_reasoner_backend)`
+    # so an install with MEMORY_REASONER_BACKEND=codex gets a codex
+    # model instead of the Claude default. The dataclass literal
+    # stays because test fixtures construct Config directly and
+    # depend on a usable Claude default without going through env.
     memory_extraction_model: str = "claude-haiku-4-5-20251001"
     # Per-call budget ceiling. Omitted from claude --print argv on the
     # claude backend (Max-plan OAuth makes the CLI's computed-cost
@@ -1890,9 +1931,42 @@ def load_config() -> Config:
     # here so the dependency is explicit and the budget-burn hole is
     # closed regardless of operator env-var ordering.
     memory_extraction_enabled = memory_extraction_enabled and memory_enabled
-    memory_extraction_model = (
-        os.environ.get("MEMORY_EXTRACTION_MODEL", "claude-haiku-4-5-20251001").strip() or "claude-haiku-4-5-20251001"
-    )
+
+    # Memory reasoner backend. Must validate BEFORE the role-resolved
+    # model defaults below so a typo like MEMORY_REASONER_BACKEND=gpt5
+    # is surfaced at config-load time, not at the first extraction
+    # call inside _get_memory_reasoner(). The valid set is {"claude",
+    # "codex"} for #497; OpenCode would extend this set, but adding
+    # it here without a registry row would defeat the registry
+    # completeness check.
+    memory_reasoner_backend = os.environ.get("MEMORY_REASONER_BACKEND", "claude").strip().lower()
+    _valid_memory_backends = ("claude", "codex")
+    if memory_reasoner_backend not in _valid_memory_backends:
+        raise SystemExit(
+            f"MEMORY_REASONER_BACKEND '{memory_reasoner_backend}' is not valid "
+            f"(must be one of: {', '.join(_valid_memory_backends)})"
+        )
+
+    # Memory model resolution. Env override wins; otherwise the role
+    # registry resolves to a backend-appropriate default (claude-haiku
+    # for backend=claude, gpt-5.4-mini for backend=codex). Sentinel
+    # empty-string from the dataclass would also fall through to the
+    # registry, but explicit None-check on the env var matches the
+    # other memory_* fields' style and keeps the read order
+    # predictable.
+    memory_extraction_model = os.environ.get("MEMORY_EXTRACTION_MODEL", "").strip()
+    if not memory_extraction_model:
+        memory_extraction_model = get_model_for(ModelRole.MEMORY_EXTRACTION, memory_reasoner_backend)
+    # Codex memory model overrides must name a model the codex CLI
+    # exposes. Claude memory model overrides stay free-form (matches
+    # the previous behavior; a stricter list would need its own
+    # validation pass and is out of scope here).
+    if memory_reasoner_backend == "codex" and memory_extraction_model not in CODEX_MODELS:
+        valid = sorted(CODEX_MODELS.keys())
+        raise SystemExit(
+            f"MEMORY_EXTRACTION_MODEL '{memory_extraction_model}' is not valid "
+            f"for memory_reasoner_backend='codex' (must be one of: {', '.join(valid)})"
+        )
     try:
         memory_extraction_budget_usd = float(os.environ.get("MEMORY_EXTRACTION_BUDGET_USD", "0.01"))
         if memory_extraction_budget_usd < 0:
@@ -1940,6 +2014,17 @@ def load_config() -> Config:
     # intentional kill switch is MEMORY_ENABLED). Timeout floor is 10s
     # to prevent accidentally tightening it below Haiku's warm-up time.
     memory_episode_model = os.environ.get("MEMORY_EPISODE_MODEL", "").strip() or memory_extraction_model
+    # Apply the same codex-CLI validation to the episode model. The
+    # episode default inherits memory_extraction_model (already
+    # validated), so this gate only fires on an explicit
+    # MEMORY_EPISODE_MODEL override that names a non-codex SKU under
+    # the codex memory backend.
+    if memory_reasoner_backend == "codex" and memory_episode_model not in CODEX_MODELS:
+        valid = sorted(CODEX_MODELS.keys())
+        raise SystemExit(
+            f"MEMORY_EPISODE_MODEL '{memory_episode_model}' is not valid "
+            f"for memory_reasoner_backend='codex' (must be one of: {', '.join(valid)})"
+        )
     try:
         memory_episode_budget_usd = float(os.environ.get("MEMORY_EPISODE_BUDGET_USD", "0.15"))
         if memory_episode_budget_usd <= 0:
@@ -2147,6 +2232,7 @@ def load_config() -> Config:
         memory_search_limit=memory_search_limit,
         memory_token_budget=memory_token_budget,
         memory_embedding_model=memory_embedding_model,
+        memory_reasoner_backend=memory_reasoner_backend,
         memory_extraction_enabled=memory_extraction_enabled,
         memory_extraction_model=memory_extraction_model,
         memory_extraction_budget_usd=memory_extraction_budget_usd,

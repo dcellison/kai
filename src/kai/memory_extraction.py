@@ -34,6 +34,7 @@ from kai.oneshot import _EXTRACTOR_CWD as _EXTRACTOR_CWD
 from kai.oneshot import _SUBPROCESS_ENV_ALLOWLIST as _SUBPROCESS_ENV_ALLOWLIST
 from kai.oneshot import (
     ClaudeOneShotReasoner,
+    CodexOneShotReasoner,
     OneShotError,
     OneShotReasoner,
     OneShotSubprocessError,
@@ -1666,21 +1667,34 @@ def _paraphrase_neighbor(content: str, user_id: str, threshold: float) -> Memory
 # ── Reasoner wiring ─────────────────────────────────────────────────
 
 
-def _get_memory_reasoner() -> OneShotReasoner:
+def _get_memory_reasoner(config: Config) -> OneShotReasoner:
     """
     Resolve the one-shot reasoner used by both memory stages.
 
-    Phase 1 hardcodes Claude. The indirection exists for tests, which
-    monkeypatch this helper to inject fake reasoners that raise or
-    return specific envelopes without spawning real subprocesses, and
-    for the future #497 work that will let an operator select Codex
-    here. Returning a fresh instance per call (rather than a module-
-    level singleton) keeps Phase 1 stateless and mirrors the prior
-    per-call subprocess construction; if a future provider benefits
-    from a long-lived client (connection pool, HTTP session), update
-    this helper rather than each call site.
+    Dispatches on `config.memory_reasoner_backend`. The valid set is
+    validated at config-load time so this helper can rely on the
+    string being either "claude" or "codex"; a third value would have
+    failed `load_config` already and never reached here. The
+    RuntimeError branch exists as a safety net for a future enum
+    extension where the dataclass field gains a new value before this
+    function is updated; surfacing it as a runtime error rather than
+    silently selecting Claude keeps the failure visible.
+
+    Returning a fresh instance per call (rather than a module-level
+    singleton) keeps the memory path stateless and mirrors the
+    pre-refactor per-call subprocess construction. If a future
+    provider benefits from a long-lived client (connection pool,
+    HTTP session), update this helper rather than each call site.
+
+    Tests monkeypatch this helper to inject fake reasoners; the
+    `config` parameter is accepted but not inspected on the test
+    side because patches use `return_value=`.
     """
-    return ClaudeOneShotReasoner()
+    if config.memory_reasoner_backend == "claude":
+        return ClaudeOneShotReasoner()
+    if config.memory_reasoner_backend == "codex":
+        return CodexOneShotReasoner()
+    raise RuntimeError(f"Unknown memory_reasoner_backend: {config.memory_reasoner_backend!r}")
 
 
 # ── Subprocess wiring ───────────────────────────────────────────────
@@ -1770,7 +1784,7 @@ async def _run_extractor(
     # returned on failure. JSON envelope parsing stays in this
     # function so memory-domain concerns (is_error, structured_output,
     # facts, has_episode) do not leak into the reasoner.
-    reasoner = _get_memory_reasoner()
+    reasoner = _get_memory_reasoner(config)
     try:
         result = await reasoner.run(
             prompt=payload_text,
@@ -1960,7 +1974,7 @@ async def _run_episode_extractor(
     # downstream telemetry depends on (`"timeout"` and
     # `"exit_<code>: <stderr>"`). OneShotSubprocessError carries the
     # returncode and stderr bytes precisely so this mapping works.
-    reasoner = _get_memory_reasoner()
+    reasoner = _get_memory_reasoner(config)
     try:
         result = await reasoner.run(
             prompt=payload_text,

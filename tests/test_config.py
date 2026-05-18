@@ -63,6 +63,7 @@ _CONFIG_ENV_VARS = [
     "MEMORY_SEARCH_LIMIT",
     "MEMORY_TOKEN_BUDGET",
     "MEMORY_EMBEDDING_MODEL",
+    "MEMORY_REASONER_BACKEND",
     "MEMORY_EXTRACTION_ENABLED",
     "MEMORY_EXTRACTION_MODEL",
     "MEMORY_EXTRACTION_BUDGET_USD",
@@ -1481,6 +1482,132 @@ class TestEpisodeClassifierContextTurns:
         monkeypatch.setenv("EPISODE_CLASSIFIER_CONTEXT_TURNS", "abc")
         with pytest.raises(SystemExit, match="must be an integer"):
             load_config()
+
+
+# ── Memory reasoner backend selection ───────────────────────────────
+
+
+class TestMemoryReasonerBackend:
+    """MEMORY_REASONER_BACKEND selects the OneShotReasoner used by both
+    memory stages. Default is `claude` even when AGENT_BACKEND=codex,
+    because codex memory extraction has not yet cleared the
+    cross-backend quality eval; the value must be explicitly opted in.
+    Invalid values are SystemExit at config-load time, matching the
+    AGENT_BACKEND validation pattern (no first-extraction surprise)."""
+
+    def test_default_is_claude(self, monkeypatch):
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.memory_reasoner_backend == "claude"
+
+    def test_default_stays_claude_under_agent_backend_codex(self, monkeypatch):
+        """The conservative posture: AGENT_BACKEND=codex does NOT flip
+        memory extraction onto codex. The selection is explicit so an
+        unevaluated provider cannot silently start writing memory."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("LLM_PROVIDER", "openai")
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.5")
+        config = load_config()
+        assert config.agent_backend == "codex"
+        assert config.memory_reasoner_backend == "claude"
+
+    def test_codex_value_accepted(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        config = load_config()
+        assert config.memory_reasoner_backend == "codex"
+
+    def test_invalid_value_raises_systemexit(self, monkeypatch):
+        """Typos like `gpt5` must fail at config-load time, not at
+        the first `_get_memory_reasoner` call. The error message
+        names the offending var so an operator does not have to grep
+        for it."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "gpt5")
+        with pytest.raises(SystemExit, match="MEMORY_REASONER_BACKEND"):
+            load_config()
+
+    def test_case_insensitive(self, monkeypatch):
+        """Operators sometimes set env vars in uppercase out of habit;
+        the parser is case-insensitive to avoid a confusing
+        SystemExit on Codex/CLAUDE typo variants."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "CODEX")
+        config = load_config()
+        assert config.memory_reasoner_backend == "codex"
+
+
+class TestMemoryReasonerModelResolution:
+    """Memory model defaults resolve through the per-backend role
+    registry. Claude rows match the existing literal so installs that
+    have not set MEMORY_REASONER_BACKEND see byte-identical model
+    selection. Codex rows pick a codex-CLI-valid SKU."""
+
+    def test_claude_default_model_unchanged(self, monkeypatch):
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.memory_reasoner_backend == "claude"
+        assert config.memory_extraction_model == "claude-haiku-4-5-20251001"
+        assert config.memory_episode_model == "claude-haiku-4-5-20251001"
+
+    def test_codex_default_resolves_to_codex_model(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        config = load_config()
+        assert config.memory_extraction_model == "gpt-5.4-mini"
+        assert config.memory_episode_model == "gpt-5.4-mini"
+
+    def test_explicit_override_wins_for_codex(self, monkeypatch):
+        """An explicit MEMORY_EXTRACTION_MODEL takes precedence over
+        the registry default; the episode model inherits the override
+        when MEMORY_EPISODE_MODEL is unset."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        monkeypatch.setenv("MEMORY_EXTRACTION_MODEL", "gpt-5.5")
+        config = load_config()
+        assert config.memory_extraction_model == "gpt-5.5"
+        # Episode inherits extraction when its own var is unset.
+        assert config.memory_episode_model == "gpt-5.5"
+
+    def test_explicit_episode_override_wins(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        monkeypatch.setenv("MEMORY_EPISODE_MODEL", "gpt-5.4")
+        config = load_config()
+        # Extraction got the registry default; episode is the override.
+        assert config.memory_extraction_model == "gpt-5.4-mini"
+        assert config.memory_episode_model == "gpt-5.4"
+
+    def test_codex_extraction_model_rejects_non_codex_value(self, monkeypatch):
+        """A model name the codex CLI does not expose must fail at
+        startup. Without this guard, an operator who sets
+        MEMORY_REASONER_BACKEND=codex but forgets to update
+        MEMORY_EXTRACTION_MODEL (still pointing at a Claude SKU) would
+        see a SubprocessError on every extraction."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        monkeypatch.setenv("MEMORY_EXTRACTION_MODEL", "claude-haiku-4-5-20251001")
+        with pytest.raises(SystemExit, match="MEMORY_EXTRACTION_MODEL"):
+            load_config()
+
+    def test_codex_episode_model_rejects_non_codex_value(self, monkeypatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        monkeypatch.setenv("MEMORY_EPISODE_MODEL", "claude-haiku-4-5-20251001")
+        with pytest.raises(SystemExit, match="MEMORY_EPISODE_MODEL"):
+            load_config()
+
+    def test_claude_model_override_stays_free_form(self, monkeypatch):
+        """Claude memory-model overrides are intentionally NOT validated
+        against a fixed list; the existing permissive behavior is
+        preserved so an operator running a pinned Claude SKU
+        (`claude-haiku-4-5-20251001-pinned`) does not have a config
+        change rejected by a newly added allowlist."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EXTRACTION_MODEL", "claude-haiku-4-5-20251001-pinned")
+        config = load_config()
+        assert config.memory_extraction_model == "claude-haiku-4-5-20251001-pinned"
 
 
 # ── Stage-2 episode generation (issue #385) ───────────────────────────

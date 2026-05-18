@@ -1164,3 +1164,43 @@ class TestRunEpisodeExtractorViaReasoner:
         assert reason is not None
         assert reason.startswith("exit_2: ")
         assert "oauth refused" in reason
+
+
+class TestRunEpisodeExtractorWithCodexEnvelope:
+    """A fake Codex reasoner returning a normalized episode envelope
+    must flow through `_run_episode_extractor` unchanged. Stage 2's
+    parser path was already provider-neutral on the `structured_output`
+    field; this test pins that fact so a future refactor cannot
+    re-introduce a backend branch in the episode extractor."""
+
+    @pytest.mark.asyncio
+    async def test_codex_envelope_produces_episode_triple(self):
+        from kai.oneshot import OneShotResult
+
+        episode = _valid_episode()
+        # CodexOneShotReasoner emits exactly this envelope shape (no
+        # total_cost_usd field; codex subscription auth has no
+        # per-call billing surface). The stage-2 cost coercion to 0.0
+        # is the documented behavior for non-claude backends.
+        envelope_text = '{"is_error": false, "structured_output": {"episode": ' + json.dumps(episode) + "}}"
+
+        class _FakeCodexReasoner:
+            async def run(self, **kwargs):
+                return OneShotResult(
+                    text=envelope_text,
+                    backend="codex",
+                    model="gpt-5.4-mini",
+                    raw_metadata={"returncode": 0, "stderr": b""},
+                    duration_ms=33,
+                )
+
+        config = _cfg(memory_reasoner_backend="codex", memory_episode_model="gpt-5.4-mini")
+        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_FakeCodexReasoner()):
+            ep, cost_usd, reason = await _run_episode_extractor("payload", config)
+
+        assert ep == episode
+        # No total_cost_usd in the envelope -> 0.0 (matches the codex
+        # subscription-auth posture; pay-per-token codex deployments
+        # will populate this differently if they ever land).
+        assert cost_usd == 0.0
+        assert reason is None
