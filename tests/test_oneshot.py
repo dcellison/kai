@@ -820,6 +820,68 @@ class TestCodexOneShotReasonerOutputError:
                 json_schema={"type": "object"},
             )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "non_object_payload",
+        [
+            '"a plain string"',
+            "[]",
+            "[1, 2, 3]",
+            "42",
+            "true",
+            "null",
+        ],
+    )
+    async def test_non_object_json_under_schema_raises_output_error(self, tmp_path, non_object_payload):
+        """A final agent_message that parses as JSON but is not an
+        object must still raise OneShotOutputError. Codex's
+        `--output-schema` enforcement is best-effort; without this
+        guard, a string / list / scalar would wrap into a
+        syntactically valid `is_error: false` envelope and the
+        caller would silently store zero facts as if the model had
+        legitimately found nothing. The schema-failure case must be
+        distinguishable from the empty-extraction case."""
+        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        stdout = _codex_event("agent_message", non_object_payload).encode("utf-8") + b"\n"
+        proc = _make_proc(stdout=stdout, returncode=0)
+
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(OneShotOutputError),
+        ):
+            await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema={"type": "object"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_non_object_json_logs_non_object_category(self, tmp_path, caplog):
+        """The non-object-JSON path must emit its own log category so
+        operator-side dashboards can separate "model returned wrong
+        shape" from "model returned malformed JSON" without re-parsing
+        the message body."""
+        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        stdout = _codex_event("agent_message", '"a plain string"').encode("utf-8") + b"\n"
+        proc = _make_proc(stdout=stdout, returncode=0)
+
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            caplog.at_level(logging.INFO, logger="kai.oneshot"),
+            pytest.raises(OneShotOutputError),
+        ):
+            await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema={"type": "object"},
+            )
+
+        records = [r for r in caplog.records if r.message.startswith("oneshot_reasoner")]
+        assert len(records) == 1
+        msg = records[0].getMessage()
+        assert "outcome=output_error" in msg
+        assert "error_category=non_object_json" in msg
+
 
 class TestCodexOneShotReasonerSuccess:
     """Valid schema-backed output: the reasoner returns the normalized

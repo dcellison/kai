@@ -694,6 +694,26 @@ class CodexOneShotReasoner:
                 )
                 raise OneShotOutputError(f"codex final text was not valid JSON: {exc}") from None
 
+            # Codex's `--output-schema` enforcement is best-effort:
+            # the CLI does not hard-reject a final message that
+            # parses as JSON but does not match the schema. A bare
+            # string ("not an object"), a list, or a wrong-keyed
+            # object would otherwise wrap into a syntactically
+            # valid `is_error: false` envelope, and memory
+            # extraction's nested-vs-root resolution would silently
+            # treat it as a successful empty extraction. Reject
+            # anything other than a JSON object here so a schema
+            # failure surfaces as `OneShotOutputError` and the
+            # caller's typed-error path takes over instead.
+            if not isinstance(payload, dict):
+                log.info(
+                    "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=%d outcome=output_error error_category=non_object_json returncode=0",
+                    purpose,
+                    model,
+                    duration_ms,
+                )
+                raise OneShotOutputError("codex final JSON was not an object")
+
             # Wrap codex's schema-shaped payload in the same envelope
             # claude emits natively. memory_extraction.py already
             # walks the `structured_output` field on a parsed dict;
