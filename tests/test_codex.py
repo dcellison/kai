@@ -1475,6 +1475,11 @@ class TestCodexCrossUserTeardown:
         sigkill_call = mock_exec.call_args_list[1][0]
         assert sigterm_call[5] == f"-{int(signal.SIGTERM)}"
         assert sigkill_call[5] == f"-{int(signal.SIGKILL)}"
+        # Post-shutdown state cleared. Mirrors the _kill cleanup
+        # assertion; without the matching clear in shutdown(), the
+        # legacy singular field would be created dynamically and the
+        # plural cache would silently retain stale PIDs.
+        assert c._inner_codex_pids == []
 
 
 class TestCodexGrandchildEscalation:

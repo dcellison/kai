@@ -1343,5 +1343,5 @@ class CodexBackend(AgentBackend):
         self._proc = None
         self._session_id = None
         self._pgid = None
-        self._inner_codex_pid = None
+        self._inner_codex_pids = []
         self._effective_codex_user = None
