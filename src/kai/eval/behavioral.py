@@ -513,6 +513,15 @@ def _build_judge_cmd_codex(config: BehavioralConfig) -> list[str]:
         codex_bin,
         "exec",
         "--json",
+        # `codex exec` refuses to spawn unless the cwd is on the user's
+        # trusted-directories list OR this flag is passed. The eval
+        # cwd is wherever the operator invoked the harness from, which
+        # is not necessarily a trusted dir. Passing the flag mirrors
+        # what an interactive `codex exec` user would do for any
+        # non-workspace invocation; the safety check is meant for the
+        # interactive code-modifying path, not a one-shot
+        # structured-output classification call.
+        "--skip-git-repo-check",
         "--model",
         config.judge_model,
     ]
@@ -534,6 +543,9 @@ def _build_gen_cmd_codex(config: BehavioralConfig) -> list[str]:
         codex_bin,
         "exec",
         "--json",
+        # Same `codex exec` trusted-dir gate as the judge builder; see
+        # _build_judge_cmd_codex for the full rationale.
+        "--skip-git-repo-check",
         "--model",
         config.gen_model,
     ]

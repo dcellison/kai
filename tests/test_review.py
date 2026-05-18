@@ -767,6 +767,11 @@ class TestRunReviewCodex:
         assert cmd[0] == "codex"
         assert cmd[1] == "exec"
         assert "--json" in cmd
+        # `--skip-git-repo-check` is load-bearing: codex exec refuses
+        # to spawn unless the cwd is on the user's trusted-directories
+        # list or this flag is passed. Production-only initial success
+        # was due to the bot's cwd happening to be trusted.
+        assert "--skip-git-repo-check" in cmd
         assert "--print" not in cmd  # No claude flag
 
     @pytest.mark.asyncio

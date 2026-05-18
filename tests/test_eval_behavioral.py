@@ -1470,6 +1470,11 @@ class TestBuildJudgeCmdCodex:
         assert cmd[0] == "codex"
         assert cmd[1] == "exec"
         assert "--json" in cmd
+        # `--skip-git-repo-check` is load-bearing: codex exec refuses
+        # to spawn unless the cwd is on the user's trusted-directories
+        # list or this flag is passed. Without it the eval bucketed
+        # every probe as generation_error.
+        assert "--skip-git-repo-check" in cmd
         i = cmd.index("--model")
         assert cmd[i + 1] == "gpt-5.4-mini"
         # No claude flags.
@@ -1497,6 +1502,9 @@ class TestBuildGenCmdCodex:
         assert cmd[0] == "codex"
         assert cmd[1] == "exec"
         assert "--json" in cmd
+        # Same `--skip-git-repo-check` invariant as the judge builder;
+        # see TestBuildJudgeCmdCodex.test_argv_shape for the rationale.
+        assert "--skip-git-repo-check" in cmd
         i = cmd.index("--model")
         assert cmd[i + 1] == "gpt-5.4-mini"
         assert "--system-prompt" not in cmd

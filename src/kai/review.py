@@ -741,6 +741,14 @@ async def run_review(
             codex_bin,
             "exec",
             "--json",
+            # `codex exec` refuses to spawn unless the cwd is on the
+            # user's trusted-directories list OR this flag is passed.
+            # Production review has worked only because the bot's cwd
+            # happened to be trusted; one-shot callers from any other
+            # cwd hit "Not inside a trusted directory" and rc=1. The
+            # safety check is meant for the interactive code-modifying
+            # path, not a non-interactive triage / review / eval call.
+            "--skip-git-repo-check",
             "--model",
             review_model,
         ]
