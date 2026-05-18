@@ -25,7 +25,7 @@ different lifecycles - hence the separate file.
 import json
 
 
-def extract_codex_text(stdout: str) -> str:
+def extract_codex_text(stdout: str, *, join_items: bool = True) -> str:
     """
     Walk codex's NDJSON event stream and return the agent message text.
 
@@ -36,9 +36,18 @@ def extract_codex_text(stdout: str) -> str:
     the DOT separator; the app-server protocol uses slashes
     instead. Same data model, different wire encoding.)
 
-    Callers only care about the agent's final natural-language
-    response. The `item.completed` event for an agent_message item
-    carries the full consolidated text:
+    A single turn can emit MULTIPLE `agent_message` items (preamble,
+    tool call, post-tool summary). The persistent codex backend in
+    codex.py handles this with a per-item state machine that joins
+    completed items with a blank-line separator; this helper offers
+    the same behavior under `join_items=True` (the default, correct
+    for free-form review/chat callers) and a last-wins fallback under
+    `join_items=False` (for callers like triage whose JSON-extract
+    contract assumes exactly one final agent_message and would fail
+    if a preamble agent_message were prepended to the JSON body).
+
+    The `item.completed` event for an agent_message item carries the
+    full consolidated text for THAT item:
 
         {"type": "item.completed",
          "item": {"id": "...", "type": "agent_message", "text": "..."}}
@@ -49,7 +58,7 @@ def extract_codex_text(stdout: str) -> str:
     `"agent_message"` (snake_case), and `text` is a flat field on
     the item object (the inner enum is `#[serde(flatten)]`).
 
-    A streaming run may emit `item.updated` events for the same
+    A streaming run may emit `item.updated` events for an
     agent_message id before its `item.completed`. We trust the
     completed event as authoritative; if no completed event arrived
     (e.g. truncated stream) we fall back to the latest updated text
@@ -63,13 +72,23 @@ def extract_codex_text(stdout: str) -> str:
 
     Args:
         stdout: The full stdout from `codex exec --json`.
+        join_items: When True (default), every `item.completed`
+            agent_message in the stream is appended to the result,
+            joined with a blank-line separator. When False, only the
+            LAST completed agent_message is returned. Set False for
+            callers whose output contract is "exactly one final
+            response" (e.g. triage parsing structured JSON, where a
+            joined preamble + JSON body would corrupt the parse);
+            leave at True for free-form callers (review, chat).
 
     Returns:
-        The agent_message text from the last `item.completed`
-        event, or the latest `item.updated` text as a fallback.
-        Empty string if no agent_message was emitted.
+        The agent_message text. With `join_items=True`, completed
+        items are joined by `\\n\\n`; with `join_items=False`, only
+        the last `item.completed` is returned. If no completed
+        events arrived, falls back to the latest `item.updated`
+        text. Empty string if no agent_message was emitted.
     """
-    completed_text: str | None = None
+    completed_texts: list[str] = []
     latest_updated_text: str | None = None
     for line in stdout.splitlines():
         line = line.strip()
@@ -90,11 +109,13 @@ def extract_codex_text(stdout: str) -> str:
             if text is None:
                 continue
             if event_type == "item.completed":
-                completed_text = text
+                completed_texts.append(text)
             else:
                 latest_updated_text = text
-    if completed_text is not None:
-        return completed_text.strip()
+    if completed_texts:
+        if join_items:
+            return "\n\n".join(t.strip() for t in completed_texts)
+        return completed_texts[-1].strip()
     if latest_updated_text is not None:
         return latest_updated_text.strip()
     return ""

@@ -507,7 +507,16 @@ async def run_triage(
         # _parse_triage_json). extract_codex_text lives in codex_exec
         # so review.py can share the same parser without importing
         # from triage.py.
-        return extract_codex_text(stdout.decode())
+        #
+        # join_items=False: triage's downstream contract is "exactly
+        # one JSON object." If codex emits a preamble agent_message
+        # followed by the JSON body as a separate agent_message,
+        # joining them would yield "preamble\n\n{json}" which
+        # _parse_triage_json's fence-stripping cannot recover from.
+        # Last-wins preserves the prior helper behavior and keeps the
+        # JSON contract intact; review.py (free-form markdown) uses
+        # the joining default instead.
+        return extract_codex_text(stdout.decode(), join_items=False)
 
     if agent_backend == "goose":
         if not provider:

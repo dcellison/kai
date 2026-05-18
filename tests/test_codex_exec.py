@@ -70,14 +70,37 @@ class TestExtractCodexText:
         stream = "\n".join(json.dumps(e) for e in events) + "\n"
         assert extract_codex_text(stream) == "FINAL"
 
-    def test_last_completed_wins(self):
-        """Multiple item.completed events (rare): last one wins."""
+    def test_default_joins_multiple_completed_items_with_blank_line(self):
+        """
+        A single codex turn can emit multiple agent_message items
+        (e.g. preamble before a tool call, summary after). The default
+        behavior must surface ALL of them joined with a blank-line
+        separator so review-style callers do not silently drop earlier
+        findings. Mirrors the persistent backend's per-item state
+        machine from PR #491.
+        """
+        events = [
+            {"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": "first finding"}},
+            {"type": "item.completed", "item": {"id": "i2", "type": "agent_message", "text": "second finding"}},
+        ]
+        stream = "\n".join(json.dumps(e) for e in events) + "\n"
+        assert extract_codex_text(stream) == "first finding\n\nsecond finding"
+
+    def test_join_items_false_returns_last_completed(self):
+        """
+        Opt-out path for callers whose downstream contract is "exactly
+        one final agent_message" (triage parsing structured JSON). With
+        join_items=False, a multi-item turn collapses to the last
+        completed item only - the prior helper behavior, preserved for
+        callers that would have their parse corrupted by a joined
+        preamble + body.
+        """
         events = [
             {"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": "first"}},
             {"type": "item.completed", "item": {"id": "i2", "type": "agent_message", "text": "second"}},
         ]
         stream = "\n".join(json.dumps(e) for e in events) + "\n"
-        assert extract_codex_text(stream) == "second"
+        assert extract_codex_text(stream, join_items=False) == "second"
 
     def test_updated_fallback_when_no_completed(self):
         """If only item.updated events arrive (truncated stream), use the latest one."""

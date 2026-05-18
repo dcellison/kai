@@ -886,6 +886,45 @@ class TestRunReviewCodex:
         assert result == body
 
     @pytest.mark.asyncio
+    async def test_codex_multi_item_review_preserves_all_findings(self):
+        """
+        A codex review turn can emit multiple agent_message items
+        (preamble before a tool call, post-tool summary after). The
+        review path must surface ALL of them joined with a blank-line
+        separator; the prior parser dropped earlier completions and
+        only returned the last item's text, silently truncating
+        reviews. Regression guard for the bug TG Codex caught in the
+        PR #490 review (the same class of failure as the persistent
+        backend bug fixed by PR #491).
+        """
+        # Build a two-item NDJSON stream by hand because the single-
+        # item _codex_ndjson helper above can't express it.
+        events = [
+            {"type": "thread.started", "thread_id": "thr_test"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {"id": "item_1", "type": "agent_message", "text": "First finding: foo.py has a bug."},
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_2",
+                    "type": "agent_message",
+                    "text": "Second finding: bar.py needs a docstring.",
+                },
+            },
+            {"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}},
+        ]
+        stream = ("\n".join(json.dumps(e) for e in events) + "\n").encode()
+        mock_proc = _mock_process(stdout=stream)
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await run_review("prompt", agent_backend="codex")
+        # Both findings present, blank-line separated. The prior
+        # "last wins" behavior would have returned only the second.
+        assert result == "First finding: foo.py has a bug.\n\nSecond finding: bar.py needs a docstring."
+
+    @pytest.mark.asyncio
     async def test_codex_subprocess_failure_raises(self):
         """Non-zero exit from codex raises RuntimeError with stderr."""
         mock_proc = _mock_process(returncode=1, stderr=b"auth failed")
