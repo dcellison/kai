@@ -1000,6 +1000,32 @@ class CodexOneShotReasoner:
         if model is not None:
             cmd.extend(["--model", model])
 
+        # Per-user OS routing. The construction-level None case was
+        # refused at the top of run(). resolve_claude_user returns
+        # None when the target user matches the current process user
+        # (the historical self-sudo-skip path). For claude, the
+        # self-sudo-skip is legitimate (Max-plan OAuth state lives
+        # under the bot user's home). For codex, it is a security
+        # boundary violation: codex MUST NOT run as the bot user, or
+        # it gains access to /etc/kai/env and other bot-user-only
+        # state. Refuse the same-user case here with the same typed
+        # error as the construction-level None case so the caller's
+        # collapse-to-zero-state path applies uniformly. The refusal
+        # fires BEFORE the schema temp file is written so there is
+        # nothing to clean up on this branch.
+        effective_user = resolve_claude_user(self._os_user)
+        if effective_user is None:
+            log.info(
+                "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=0 outcome=routing_error error_category=same_user_refused os_user=self",
+                purpose,
+                model,
+            )
+            raise OneShotRoutingError(
+                "codex memory routing refuses same-user spawn; "
+                f"os_user={self._os_user!r} resolves to the bot user. "
+                "Set users.yaml os_user to a different OS account."
+            )
+
         # Schema temp file lifecycle. Written before subprocess spawn
         # so the CLI sees a populated file; removed in `finally` so
         # success, timeout, non-zero exit, and output-parse failures
@@ -1042,15 +1068,10 @@ class CodexOneShotReasoner:
             schema_path.chmod(0o644)
             cmd.extend(["--output-schema", str(schema_path)])
 
-        # Per-user OS routing. The construction-level None case is
-        # already refused above; this branch covers the self-sudo-
-        # skip (target == bot user, where resolve_claude_user returns
-        # None) and the cross-user case (target != bot user, where it
-        # returns the target). Self-sudo-skip spawns directly with no
-        # wrap; cross-user wraps in sudo with the auth preserve list.
-        effective_user = resolve_claude_user(self._os_user)
-        if effective_user is not None:
-            cmd = _wrap_cmd_for_user(cmd, effective_user, "codex")
+        # Wrap codex in `sudo -H -u <target>` with the auth preserve
+        # list. Same-user routing is already refused above; this
+        # branch always wraps.
+        cmd = _wrap_cmd_for_user(cmd, effective_user, "codex")
 
         # Allow-listed env: only forward keys present in the parent
         # env. Defense-in-depth against a future regression that

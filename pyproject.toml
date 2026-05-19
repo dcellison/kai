@@ -69,3 +69,7 @@ known-first-party = ["kai"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: marks tests requiring optional dependencies (deselect with -m 'not integration')",
+    "routing_test: codex routing-policy tests that opt out of the test-level same-user bypass",
+]

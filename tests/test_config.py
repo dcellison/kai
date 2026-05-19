@@ -1724,6 +1724,31 @@ class TestCodexMemoryRequiresOsUser:
         config = load_config()
         assert config.memory_reasoner_backend == "claude"
 
+    def test_users_yaml_os_user_matches_bot_user_raises_systemexit(self, tmp_path, monkeypatch):
+        """Codex must NOT run as the bot user. The runtime refuses
+        same-user spawn; config-load surfaces the same boundary so
+        a misconfigured users.yaml does not silently no-op every
+        extraction. The check names the bot user and the offending
+        chat_ids so the operator can locate the misconfiguration."""
+        import pwd
+
+        bot_user = pwd.getpwuid(os.getuid()).pw_name
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            f"users:\n  - telegram_id: 12345\n    name: misconfigured\n    role: admin\n    os_user: {bot_user}\n"
+        )
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        with pytest.raises(SystemExit) as exc:
+            load_config()
+        msg = str(exc.value)
+        assert "bot user" in msg
+        assert "12345" in msg
+        assert bot_user in msg
+
     def test_goose_user_without_os_user_does_not_block_codex_memory(self, tmp_path, monkeypatch):
         """Mixed-backend deployment: a global codex install where one
         user has `agent_backend: goose` should not be required to

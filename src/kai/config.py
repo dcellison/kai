@@ -2172,11 +2172,10 @@ def load_config() -> Config:
         # `agent_backend` wins; otherwise the global default applies.
         # Only users whose effective backend is one bot.py would
         # actually run extraction for need an os_user.
-        missing = [
-            uc.telegram_id
-            for uc in user_configs.values()
-            if (uc.agent_backend or agent_backend) in ("claude", "codex") and not uc.os_user
+        extraction_users = [
+            uc for uc in user_configs.values() if (uc.agent_backend or agent_backend) in ("claude", "codex")
         ]
+        missing = [uc.telegram_id for uc in extraction_users if not uc.os_user]
         if missing:
             raise SystemExit(
                 "MEMORY_REASONER_BACKEND='codex' with MEMORY_EXTRACTION_ENABLED=true "
@@ -2186,6 +2185,32 @@ def load_config() -> Config:
                 "the codex subprocess will run as), or set MEMORY_EXTRACTION_ENABLED=false "
                 "to run with retrieval-only memory."
             )
+
+        # Codex must NOT run as the bot user. The codex reasoner
+        # refuses same-user spawn at runtime; surface the same
+        # boundary at config-load so a misconfigured users.yaml does
+        # not silently no-op every extraction. Detect by matching
+        # the configured os_user against the current process user;
+        # mirror the runtime's resolve_claude_user check so the two
+        # gates name the same condition.
+        try:
+            current_user = pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            # No passwd entry for the running UID (e.g., container
+            # with --user <uid>). The runtime resolve_claude_user
+            # falls through to honor the configured os_user in this
+            # case, so config-load does too.
+            current_user = None
+        if current_user is not None:
+            same_user = [uc.telegram_id for uc in extraction_users if uc.os_user == current_user]
+            if same_user:
+                raise SystemExit(
+                    "MEMORY_REASONER_BACKEND='codex' refuses to run codex as the bot user "
+                    f"({current_user!r}). The following users.yaml chat_ids have 'os_user' "
+                    f"set to the bot user: {sorted(same_user)}. Set 'os_user' to a "
+                    "different OS account, or set MEMORY_EXTRACTION_ENABLED=false to "
+                    "run with retrieval-only memory."
+                )
 
     # Deprecation warnings for env vars superseded by users.yaml.
     # The vars still work as global fallbacks, but users.yaml is the
