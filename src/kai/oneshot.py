@@ -633,6 +633,150 @@ _CODEX_ENV_ALLOWLIST = (
 )
 
 
+# JSON Schema keywords OpenAI's strict structured-outputs rejects.
+# Codex `exec --output-schema <FILE>` forwards the schema verbatim to
+# the Chat Completions endpoint in strict mode, so any of these in the
+# schema produce a 400 `invalid_json_schema` and the codex subprocess
+# exits non-zero. The list is what OpenAI's strict-mode docs disallow
+# as of the codex CLI version verified during the #498 eval-gate work
+# on 2026-05-19; future loosening on the OpenAI side would only mean
+# this strip becomes redundant, never that it does the wrong thing.
+_STRICT_MODE_DISALLOWED_KEYS: frozenset[str] = frozenset(
+    {
+        "minLength",
+        "maxLength",
+        "pattern",
+        "format",
+        "minimum",
+        "maximum",
+        "multipleOf",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "default",
+    }
+)
+
+
+def _sanitize_for_codex(schema: dict[str, Any]) -> dict[str, Any]:
+    """
+    Transform a JSON Schema into OpenAI strict structured-outputs form.
+
+    OpenAI strict mode is a tighter subset of JSON Schema than what
+    Claude's `--json-schema` accepts. Three rules apply, derived from
+    the API's error responses against the production memory schemas:
+
+    1. `additionalProperties: false` on every object node. The kai
+       schemas already set this; the sanitizer is defensive in case a
+       future schema author forgets.
+    2. `required` must include every key in `properties`. Truly
+       optional properties (e.g., `confirmation_quote` on confirmed-
+       action facts, `existing_id` on consolidation intents, `lessons`
+       on episodes) violate this. The sanitizer adds every property
+       to `required` and widens the `type` of the previously-optional
+       properties to include `"null"`, so the model can emit `null`
+       when the field does not apply.
+    3. Many validators are disallowed: `minLength`, `maxLength`,
+       `pattern`, `format`, `minimum`, `maximum`, `multipleOf`,
+       `minItems`, `maxItems`, `uniqueItems`, `default`. The
+       sanitizer strips these recursively from every node.
+
+    Allowed keywords are preserved: `type`, `properties`, `required`,
+    `items`, `enum`, `additionalProperties`, `description`, `oneOf`,
+    `anyOf`, `not`.
+
+    Why sanitize rather than maintain a parallel codex-only schema:
+    the bound constraints (string lengths, value ranges, array sizes)
+    are already enforced post-extraction by the Python validators in
+    `kai.memory_extraction` (`_validate_facts`, `_validate_episode`).
+    Dropping them from the schema does not widen the production
+    contract; it only relaxes what the model is INSTRUCTED to produce.
+    The caller's bound checks continue to gate storage.
+
+    Pure function. The input schema is not mutated; the output is a
+    fresh dict tree the caller can write to disk and discard.
+    """
+    return _strict_node(schema)
+
+
+def _strict_node(node: Any) -> Any:
+    """Recursive worker for `_sanitize_for_codex`.
+
+    Returns a sanitized copy of `node`. Lists and dicts are walked
+    structurally; scalars round-trip unchanged. Object nodes (those
+    with `type == "object"`, or with a `properties` field at the
+    top level when `type` is absent) get the strict-mode treatment;
+    other dicts (e.g., the `properties` mapping itself, which has
+    property-name keys rather than schema keywords) are walked
+    transparently.
+    """
+    if isinstance(node, dict):
+        out: dict[str, Any] = {}
+        for key, value in node.items():
+            if key in _STRICT_MODE_DISALLOWED_KEYS:
+                continue
+            out[key] = _strict_node(value)
+        node_type = out.get("type")
+        # An object node carries `type: "object"` AND a `properties`
+        # mapping. The schema's top-level `properties` value is itself
+        # a dict whose keys are property names; we recurse into each
+        # property value (which IS a schema) but do not treat the
+        # outer `properties` mapping as an object node.
+        if node_type == "object" and isinstance(out.get("properties"), dict):
+            properties: dict[str, Any] = out["properties"]
+            if "additionalProperties" not in out:
+                out["additionalProperties"] = False
+            existing_required = list(out.get("required") or [])
+            required_set = set(existing_required)
+            for prop_name in properties:
+                if prop_name in required_set:
+                    continue
+                # Previously-optional property: widen its type to
+                # include `null` so the model can emit `null` for
+                # absent values, then add it to required.
+                properties[prop_name] = _widen_nullable(properties[prop_name])
+                existing_required.append(prop_name)
+                required_set.add(prop_name)
+            out["required"] = existing_required
+        return out
+    if isinstance(node, list):
+        return [_strict_node(item) for item in node]
+    return node
+
+
+def _widen_nullable(prop_schema: Any) -> Any:
+    """Add `null` to the property's `type` so the model can emit null.
+
+    Three cases the production schemas exercise:
+
+    - `type: "string"` -> `type: ["string", "null"]`.
+    - `type: ["string", "integer"]` (already a list) -> append "null"
+      if not already present.
+    - No `type` at all (e.g., a property whose schema is just an
+      `enum` or an `oneOf`): leave unchanged. OpenAI strict mode may
+      or may not accept this shape in the optional-via-required-and-
+      null form; in practice the production schemas do not use it,
+      and forcing `type: "null"` onto an enum-only property would be
+      a guess about intent. If a future schema hits this, the API
+      will return a 400 and the operator-side log review will surface
+      the property name.
+    """
+    if not isinstance(prop_schema, dict):
+        return prop_schema
+    out = dict(prop_schema)
+    existing_type = out.get("type")
+    if existing_type is None:
+        return out
+    if isinstance(existing_type, list):
+        if "null" not in existing_type:
+            out["type"] = [*existing_type, "null"]
+        return out
+    if existing_type == "null":
+        return out
+    out["type"] = [existing_type, "null"]
+    return out
+
+
 def _render_codex_stdin(system_prompt: str | None, prompt: str) -> str:
     """
     Build a boundary-delimited stdin payload for a codex one-shot call.
@@ -833,6 +977,17 @@ class CodexOneShotReasoner:
         # form (not secret).
         schema_path: Path | None = None
         if json_schema is not None:
+            # Sanitize before writing. Codex forwards the schema to
+            # OpenAI's Chat Completions endpoint in strict structured-
+            # outputs mode, which has tighter requirements than the
+            # JSON Schema subset claude's `--json-schema` accepts.
+            # See `_sanitize_for_codex` for the transformation rules.
+            # The original `json_schema` reference is preserved for
+            # the downstream required-fields check on the model's
+            # response, which uses the caller's TRULY required list
+            # (not the widened all-properties list the sanitizer
+            # produces).
+            sanitized_schema = _sanitize_for_codex(json_schema)
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 suffix=".json",
@@ -841,7 +996,7 @@ class CodexOneShotReasoner:
                 delete=False,
                 encoding="utf-8",
             ) as fh:
-                json.dump(json_schema, fh)
+                json.dump(sanitized_schema, fh)
                 schema_path = Path(fh.name)
             schema_path.chmod(0o644)
             cmd.extend(["--output-schema", str(schema_path)])

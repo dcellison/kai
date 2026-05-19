@@ -586,8 +586,13 @@ class TestCodexOneShotReasonerSchemaFile:
 
     @pytest.mark.asyncio
     async def test_schema_file_written_with_supplied_schema(self, tmp_path):
-        """The path passed via --output-schema must point at a file
-        whose contents are the JSON-serialized schema dict."""
+        """The path passed via --output-schema points at a file
+        whose contents are the SANITIZED form of the schema dict
+        (per the OpenAI strict-mode boundary transform). The
+        sanitizer adds `additionalProperties: false` and lists the
+        property in `required`; the on-disk JSON reflects that."""
+        from kai.oneshot import _sanitize_for_codex
+
         reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         captured: dict = {}
 
@@ -605,7 +610,7 @@ class TestCodexOneShotReasonerSchemaFile:
                 json_schema=schema,
             )
 
-        assert json.loads(captured["body"]) == schema
+        assert json.loads(captured["body"]) == _sanitize_for_codex(schema)
         # Cleanup ran in the finally block.
         assert not captured["path"].exists()
 
@@ -1457,3 +1462,350 @@ class TestRoutingLogField:
             await reasoner.run(prompt="p", purpose="fact_extraction")
         msg = next(r.getMessage() for r in caplog.records if r.message.startswith("oneshot_reasoner"))
         assert "os_user=self" in msg
+
+
+# ── _sanitize_for_codex (issue #505) ────────────────────────────────
+
+
+class TestSanitizeForCodexDisallowedKeys:
+    """OpenAI strict structured-outputs rejects many JSON Schema
+    keywords claude accepts (`minLength`, `maxLength`, `pattern`,
+    `format`, `minimum`, `maximum`, `multipleOf`, `minItems`,
+    `maxItems`, `uniqueItems`, `default`). The sanitizer strips
+    them recursively before the schema reaches codex's
+    `--output-schema` flag."""
+
+    def test_strips_string_length_bounds(self):
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {"type": "string", "minLength": 1, "maxLength": 500}
+        out = _sanitize_for_codex(schema)
+        assert out == {"type": "string"}
+
+    def test_strips_number_bounds(self):
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {"type": "number", "minimum": 0.5, "maximum": 1.0}
+        out = _sanitize_for_codex(schema)
+        assert out == {"type": "number"}
+
+    def test_strips_array_bounds(self):
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 5,
+            "uniqueItems": True,
+        }
+        out = _sanitize_for_codex(schema)
+        assert out == {"type": "array", "items": {"type": "string"}}
+
+    def test_strips_pattern_and_format(self):
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {"type": "string", "pattern": "^x+$", "format": "email"}
+        out = _sanitize_for_codex(schema)
+        assert out == {"type": "string"}
+
+    def test_strips_default(self):
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {"type": "string", "default": "foo"}
+        out = _sanitize_for_codex(schema)
+        assert out == {"type": "string"}
+
+    def test_preserves_enum(self):
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {"type": "string", "enum": ["a", "b", "c"]}
+        out = _sanitize_for_codex(schema)
+        assert out == {"type": "string", "enum": ["a", "b", "c"]}
+
+    def test_preserves_description(self):
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {"type": "string", "description": "a label"}
+        out = _sanitize_for_codex(schema)
+        assert out == {"type": "string", "description": "a label"}
+
+
+class TestSanitizeForCodexRequiredExpansion:
+    """Strict mode requires `required` to list every key in
+    `properties`. Truly optional properties get added to required
+    AND have their `type` widened to include `"null"` so the model
+    can emit null for absent values."""
+
+    def test_optional_property_added_to_required(self):
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "nickname": {"type": "string"},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        }
+        out = _sanitize_for_codex(schema)
+        assert set(out["required"]) == {"name", "nickname"}
+
+    def test_optional_type_widened_to_nullable(self):
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "nickname": {"type": "string"},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        }
+        out = _sanitize_for_codex(schema)
+        assert out["properties"]["nickname"]["type"] == ["string", "null"]
+        assert out["properties"]["name"]["type"] == "string"
+
+    def test_optional_list_type_appends_null(self):
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "field": {"type": ["string", "integer"]},
+            },
+            "required": [],
+            "additionalProperties": False,
+        }
+        out = _sanitize_for_codex(schema)
+        assert out["properties"]["field"]["type"] == ["string", "integer", "null"]
+
+    def test_already_nullable_type_not_double_appended(self):
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {
+            "type": "object",
+            "properties": {"field": {"type": ["string", "null"]}},
+            "required": [],
+            "additionalProperties": False,
+        }
+        out = _sanitize_for_codex(schema)
+        # Property is added to required AND keeps its type list as-is.
+        assert out["required"] == ["field"]
+        assert out["properties"]["field"]["type"] == ["string", "null"]
+
+    def test_property_without_type_left_alone(self):
+        """A property whose schema is just an enum (no explicit
+        `type`) is added to required but cannot be safely widened.
+        Leaving the type absent is the documented posture; if a
+        future schema hits this and codex 400s on it, the
+        operator-side log review will surface the property name."""
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {
+            "type": "object",
+            "properties": {"mode": {"enum": ["a", "b"]}},
+            "required": [],
+            "additionalProperties": False,
+        }
+        out = _sanitize_for_codex(schema)
+        assert out["required"] == ["mode"]
+        assert "type" not in out["properties"]["mode"]
+
+
+class TestSanitizeForCodexAdditionalProperties:
+    """Every object node must have `additionalProperties: false`."""
+
+    def test_adds_when_missing(self):
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "required": ["x"],
+        }
+        out = _sanitize_for_codex(schema)
+        assert out["additionalProperties"] is False
+
+    def test_preserves_when_already_set(self):
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "required": ["x"],
+            "additionalProperties": False,
+        }
+        out = _sanitize_for_codex(schema)
+        assert out["additionalProperties"] is False
+
+    def test_non_object_node_does_not_gain_additional_properties(self):
+        """Arrays and scalar types must NOT get an
+        `additionalProperties` injected; that would be a schema
+        error of its own."""
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {"type": "array", "items": {"type": "string"}}
+        out = _sanitize_for_codex(schema)
+        assert "additionalProperties" not in out
+
+
+class TestSanitizeForCodexRecursion:
+    """The sanitizer recurses into nested objects and array items."""
+
+    def test_recurses_into_array_items(self):
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "minLength": 1},
+                    "tag": {"type": "string"},
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+        }
+        out = _sanitize_for_codex(schema)
+        item = out["items"]
+        assert "minLength" not in item["properties"]["name"]
+        assert set(item["required"]) == {"name", "tag"}
+
+    def test_recurses_into_nested_objects(self):
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "inner": {
+                    "type": "object",
+                    "properties": {
+                        "deep": {"type": "string", "maxLength": 10},
+                    },
+                    "required": ["deep"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["inner"],
+            "additionalProperties": False,
+        }
+        out = _sanitize_for_codex(schema)
+        assert "maxLength" not in out["properties"]["inner"]["properties"]["deep"]
+
+
+class TestSanitizeForCodexProductionSchemas:
+    """The real `_FACT_SCHEMA` and `_EPISODE_SCHEMA` must come out
+    strict-mode-valid after sanitization. Regression test for the
+    specific failure mode caught running the eval gate on
+    2026-05-19: the API rejected the production schemas for
+    `required` not covering `confirmation_quote` (FACT) and
+    `lessons` (EPISODE)."""
+
+    def _assert_strict_mode_valid(self, node):
+        if isinstance(node, dict):
+            if node.get("type") == "object":
+                assert node.get("additionalProperties") is False, "object missing additionalProperties: false"
+                properties = set((node.get("properties") or {}).keys())
+                required = set(node.get("required") or [])
+                assert properties == required or properties.issubset(required), (
+                    f"required {required} does not cover properties {properties}"
+                )
+            for k, v in node.items():
+                assert k not in (
+                    "minLength",
+                    "maxLength",
+                    "pattern",
+                    "format",
+                    "minimum",
+                    "maximum",
+                    "multipleOf",
+                    "minItems",
+                    "maxItems",
+                    "uniqueItems",
+                    "default",
+                ), f"disallowed key survived: {k}"
+                self._assert_strict_mode_valid(v)
+        elif isinstance(node, list):
+            for item in node:
+                self._assert_strict_mode_valid(item)
+
+    def test_fact_schema_round_trips_strict_mode_valid(self):
+        from kai.memory_extraction import _FACT_SCHEMA
+        from kai.oneshot import _sanitize_for_codex
+
+        sanitized = _sanitize_for_codex(_FACT_SCHEMA)
+        self._assert_strict_mode_valid(sanitized)
+        # The two known-optional fact item properties are now in
+        # required AND widened to nullable.
+        item = sanitized["properties"]["facts"]["items"]
+        for optional in ("confirmation_quote", "existing_id"):
+            assert optional in item["required"]
+            assert item["properties"][optional]["type"] == ["string", "null"]
+
+    def test_episode_schema_round_trips_strict_mode_valid(self):
+        from kai.memory_extraction import _EPISODE_SCHEMA
+        from kai.oneshot import _sanitize_for_codex
+
+        sanitized = _sanitize_for_codex(_EPISODE_SCHEMA)
+        self._assert_strict_mode_valid(sanitized)
+        # `lessons` was the previously-optional field; should now be
+        # required + nullable.
+        episode = sanitized["properties"]["episode"]
+        assert "lessons" in episode["required"]
+        assert episode["properties"]["lessons"]["type"] == ["string", "null"]
+
+    def test_input_schema_not_mutated(self):
+        """The sanitizer must not mutate the caller's schema. Both
+        production memory stages read from module-level constants;
+        an in-place mutation would corrupt subsequent calls."""
+        from kai.memory_extraction import _FACT_SCHEMA
+        from kai.oneshot import _sanitize_for_codex
+
+        before = json.dumps(_FACT_SCHEMA, sort_keys=True)
+        _sanitize_for_codex(_FACT_SCHEMA)
+        after = json.dumps(_FACT_SCHEMA, sort_keys=True)
+        assert before == after
+
+
+class TestCodexReasonerWritesSanitizedSchema:
+    """`CodexOneShotReasoner.run()` calls the sanitizer before
+    writing the temp file, so the disk contents codex actually reads
+    have no strict-mode-disallowed keywords."""
+
+    @pytest.mark.asyncio
+    async def test_disk_schema_is_sanitized(self, tmp_path):
+        from kai.memory_extraction import _FACT_SCHEMA
+
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        captured: dict = {}
+
+        def _capture(*args, **kwargs):
+            i = args.index("--output-schema")
+            captured["path"] = Path(args[i + 1])
+            captured["body"] = json.loads(captured["path"].read_text(encoding="utf-8"))
+            return _make_proc(stdout=b"")
+
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(side_effect=_capture)),
+            pytest.raises(OneShotOutputError),
+        ):
+            await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema=_FACT_SCHEMA,
+            )
+
+        # The on-disk schema reflects the sanitizer's transform, not
+        # the input. Spot-check the known previously-optional fields
+        # are now required with nullable types.
+        disk = captured["body"]
+        item = disk["properties"]["facts"]["items"]
+        assert "confirmation_quote" in item["required"]
+        assert item["properties"]["confirmation_quote"]["type"] == ["string", "null"]
+        # And the disallowed keys are absent.
+        assert "minLength" not in item["properties"]["content"]
+        assert "maxItems" not in disk["properties"]["facts"]
