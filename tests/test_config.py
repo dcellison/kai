@@ -90,6 +90,23 @@ def _clean_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _mock_binary_resolver(monkeypatch):
+    """Pin the binary resolver so config-load cross-binary validation
+    passes on any host. Tests in this file exercise the config parser
+    in isolation and do not care whether the local machine actually
+    has claude/codex installed; cross-binary validation tests
+    explicitly override this fixture with their own setUp.
+
+    Without this, tests that set MEMORY_ENABLED=true +
+    MEMORY_EXTRACTION_ENABLED=true would fail on hosts where the
+    configured reasoner's binary is not on PATH."""
+    monkeypatch.setattr(
+        "kai.oneshot_binary.resolve_oneshot_binary",
+        lambda backend: f"/fake/{backend}",
+    )
+
+
 def _set_required(monkeypatch, token="fake-token", user_ids="123"):
     """Set only the truly required env vars (token + user IDs).
 
@@ -1536,6 +1553,96 @@ class TestMemoryReasonerBackend:
         monkeypatch.setenv("MEMORY_REASONER_BACKEND", "CODEX")
         config = load_config()
         assert config.memory_reasoner_backend == "codex"
+
+
+class TestMemoryReasonerBinaryValidation:
+    """Cross-binary validation: when memory extraction is enabled, the
+    configured reasoner backend's binary must be reachable at startup.
+    The check fires only on the composed `memory_extraction_enabled`
+    value (both MEMORY_ENABLED and MEMORY_EXTRACTION_ENABLED true);
+    retrieval-only memory does NOT require a reachable agent binary."""
+
+    def test_claude_binary_missing_raises_systemexit(self, monkeypatch):
+        """MEMORY_REASONER_BACKEND=claude with extraction enabled and
+        no claude on PATH must fail at config-load with a clear
+        message. The composed `memory_extraction_enabled` is what
+        triggers the check; both env vars must be true."""
+        from kai.oneshot_binary import BinaryResolutionError
+
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+
+        def boom(_backend: str) -> str:
+            raise BinaryResolutionError("could not resolve claude binary: `claude` not on PATH")
+
+        monkeypatch.setattr("kai.oneshot_binary.resolve_oneshot_binary", boom)
+        with pytest.raises(SystemExit) as exc:
+            load_config()
+        assert "MEMORY_REASONER_BACKEND='claude'" in str(exc.value)
+        assert "claude binary" in str(exc.value)
+
+    def test_codex_binary_missing_raises_systemexit(self, monkeypatch):
+        """Same shape for codex; the error mentions the codex backend."""
+        from kai.oneshot_binary import BinaryResolutionError
+
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+
+        def boom(_backend: str) -> str:
+            raise BinaryResolutionError("could not resolve codex binary: CODEX_BIN unset, `codex` not on PATH")
+
+        monkeypatch.setattr("kai.oneshot_binary.resolve_oneshot_binary", boom)
+        with pytest.raises(SystemExit) as exc:
+            load_config()
+        assert "MEMORY_REASONER_BACKEND='codex'" in str(exc.value)
+        assert "codex binary" in str(exc.value)
+
+    def test_retrieval_only_skips_binary_check(self, monkeypatch):
+        """MEMORY_ENABLED=true with MEMORY_EXTRACTION_ENABLED=false
+        (retrieval-only) must NOT require a reachable agent binary.
+        The check is gated on the composed extraction-enabled value,
+        not on memory_enabled alone."""
+        from kai.oneshot_binary import BinaryResolutionError
+
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        # Extraction explicitly disabled; binary should NEVER be looked up.
+        called = []
+
+        def boom(backend: str) -> str:
+            called.append(backend)
+            raise BinaryResolutionError("should not be called")
+
+        monkeypatch.setattr("kai.oneshot_binary.resolve_oneshot_binary", boom)
+        # No SystemExit expected; the load completes successfully.
+        config = load_config()
+        assert config.memory_enabled is True
+        assert config.memory_extraction_enabled is False
+        assert called == [], f"resolver must not run on retrieval-only; got {called}"
+
+    def test_extraction_disabled_without_memory_enabled_skips_check(self, monkeypatch):
+        """The compositional gate also covers `MEMORY_EXTRACTION_ENABLED=true`
+        with `MEMORY_ENABLED=false`. Composed extraction_enabled is
+        False, so the binary check does not fire."""
+        from kai.oneshot_binary import BinaryResolutionError
+
+        _set_required(monkeypatch)
+        # MEMORY_ENABLED unset / false, but EXTRACTION_ENABLED true.
+        # The composed value at config.py:1933 is False; binary check skipped.
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+        called = []
+
+        def boom(backend: str) -> str:
+            called.append(backend)
+            raise BinaryResolutionError("should not be called")
+
+        monkeypatch.setattr("kai.oneshot_binary.resolve_oneshot_binary", boom)
+        config = load_config()
+        assert config.memory_extraction_enabled is False
+        assert called == []
 
 
 class TestMemoryReasonerModelResolution:

@@ -1709,6 +1709,7 @@ class TestCmdConfig:
         memory_block = [
             "true",  # memory enabled
             "true",  # extraction enabled (claude backend)
+            "claude",  # MEMORY_REASONER_BACKEND (matches install vendor; suppressed at emission as default)
             "60",  # extraction timeout seconds (#345)
             "5",  # consolidation candidates (non-default, exercises emission branch)
             "5",  # episode classifier context turns (#392, non-default exercises emission)
@@ -1731,6 +1732,10 @@ class TestCmdConfig:
         env = conf["env"]
         assert env["MEMORY_ENABLED"] == "true"
         assert env["MEMORY_EXTRACTION_ENABLED"] == "true"
+        # MEMORY_REASONER_BACKEND="claude" is the dataclass default;
+        # the wizard's emission gate suppresses default values, so the
+        # key must NOT appear in the generated env.
+        assert "MEMORY_REASONER_BACKEND" not in env
         # Budget keys absent on claude backend: prompt is skipped, value
         # stays at dataclass default, double-gated emission suppresses.
         assert "MEMORY_EXTRACTION_BUDGET_USD" not in env
@@ -1778,6 +1783,7 @@ class TestCmdConfig:
         memory_block = [
             "true",  # memory enabled
             "true",  # extraction enabled
+            "claude",  # MEMORY_REASONER_BACKEND (default-accept; suppressed at emission)
             "10",  # extraction timeout (dataclass default; suppressed)
             "8",  # consolidation candidates (dataclass default; suppressed)
             "3",  # episode classifier context turns (#392, dataclass default; suppressed)
@@ -1823,6 +1829,7 @@ class TestCmdConfig:
         memory_block = [
             "true",
             "true",
+            "claude",  # MEMORY_REASONER_BACKEND (default-accept; suppressed)
             "45",
             "4",
             "7",  # episode classifier context turns (#392, non-default)
@@ -2076,6 +2083,7 @@ class TestCmdConfig:
         memory_block = [
             "true",  # memory enabled
             "true",  # extraction enabled
+            "claude",  # MEMORY_REASONER_BACKEND (default-accept; suppressed)
             "10",  # extraction timeout (default; suppressed)
             "8",  # consolidation candidates (default; suppressed)
             "5",  # episode classifier context turns (#392, non-default)
@@ -2106,6 +2114,7 @@ class TestCmdConfig:
         memory_block = [
             "true",  # memory enabled
             "true",  # extraction enabled
+            "claude",  # MEMORY_REASONER_BACKEND (default-accept; suppressed)
             "10",  # extraction timeout (default)
             "8",  # consolidation candidates (default)
             "3",  # episode classifier context turns (#392, dataclass default)
@@ -2151,6 +2160,105 @@ class TestCmdConfig:
         # that leaves a stale value in /etc/kai/env after a
         # claude→goose flip surfaces here.
         assert "EPISODE_CLASSIFIER_CONTEXT_TURNS" not in env
+
+    def test_goose_retrieval_only_does_not_persist_invalid_reasoner_backend(self, tmp_path, monkeypatch):
+        """v5 regression: a goose install accepting memory_enabled=true
+        with extraction disabled must NOT write MEMORY_REASONER_BACKEND
+        to the generated env. The wizard gates the prompt on
+        memory_extraction_enabled (the composed value), so on a
+        goose-backed install the prompt never fires and the key never
+        lands. Prevents the prior failure mode where the prompt fired
+        and `agent_backend=goose` as the default would have produced
+        MEMORY_REASONER_BACKEND=goose, failing load_config validation."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+
+        # Goose install: extraction is gated out, so no reasoner prompt.
+        # Inputs match the existing goose-skip test shape (memory_enabled,
+        # token_budget, search_limit).
+        memory_block = ["true", "2000", "10"]
+        inputs = iter(self._base_inputs(memory_block, agent_backend="goose"))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        env = json.loads((tmp_path / "install.conf").read_text())["env"]
+        # The critical assertion: no invalid reasoner-backend value
+        # in the env. The cleanup block also drops it on non-supported
+        # backends as defense-in-depth.
+        assert "MEMORY_REASONER_BACKEND" not in env
+        # Extraction config is also absent on goose retrieval-only.
+        assert "MEMORY_EXTRACTION_ENABLED" not in env
+
+    def test_codex_install_accept_all_defaults_yields_load_config_compatible_env(self, monkeypatch):
+        """v6 catch-all regression: a codex install that accepts every
+        wizard default for memory must produce an env block that
+        load_config accepts without raising. Pins the entire 'wizard
+        default invalid under selected reasoner' bug class so a
+        future default flip lands as a single-test failure rather
+        than a runtime config-load SystemExit.
+
+        Test shape: rather than re-driving the full wizard (covered
+        by surrounding tests), this test pins the integration
+        contract directly: assemble the env block the wizard emits
+        on codex accept-all-defaults and feed it into load_config.
+        The wizard's emission rules are simple enough that the env
+        contents are mechanical: MEMORY_ENABLED=true,
+        MEMORY_EXTRACTION_ENABLED=true, MEMORY_REASONER_BACKEND=codex,
+        and no other memory keys (every other knob accepted the
+        dataclass default and the wizard's delta-from-default
+        emission suppresses them)."""
+        from kai.config import load_config
+
+        # Pin the resolver so this test does not depend on having
+        # codex actually installed on the host.
+        monkeypatch.setattr(
+            "kai.oneshot_binary.resolve_oneshot_binary",
+            lambda backend: f"/fake/{backend}",
+        )
+        # Pin protected-env / dotenv to be inert. Without this,
+        # load_config reads /etc/kai/env (when present on the dev
+        # box) and `os.environ.setdefault` populates the process env
+        # with values that leak into subsequent tests. The /etc/kai/env
+        # on a dev install typically carries `CODEX_BIN=/Users/...`,
+        # which would make later test_review codex tests assert the
+        # absolute path instead of the literal "codex". The autouse
+        # fixture in test_config.py applies the same neutering for
+        # its scope; this test is in test_install.py and has to do
+        # it explicitly.
+        monkeypatch.setattr("kai.config.load_dotenv", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.config._read_protected_file", lambda path: None)
+        # Seed only the env keys the wizard would emit. Everything
+        # else falls back to dataclass defaults via load_config.
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+        monkeypatch.setenv("ALLOWED_USER_IDS", "1")
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        # DEFAULT_MODEL validates against the agent backend's model
+        # set; codex requires a CODEX_MODELS entry. The wizard would
+        # have prompted for this; here we set it explicitly to focus
+        # the test on the memory wiring contract.
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4")
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        # MEMORY_EPISODE_MODEL is intentionally NOT set; the codex
+        # branch defaults the wizard prompt to blank, which means
+        # load_config inherits from MEMORY_EXTRACTION_MODEL, which
+        # itself defaults to the codex registry SKU. The contract
+        # under test is "blank episode_model under codex resolves to
+        # a CODEX_MODELS-valid SKU."
+        config = load_config()
+        assert config.memory_enabled is True
+        assert config.memory_extraction_enabled is True
+        assert config.memory_reasoner_backend == "codex"
+        # Both models must validate as codex SKUs (load_config
+        # checks against CODEX_MODELS and SystemExits on miss).
+        from kai.config import CODEX_MODELS
+
+        assert config.memory_extraction_model in CODEX_MODELS
+        assert config.memory_episode_model in CODEX_MODELS
 
 
 # ── Apply subcommand ─────────────────────────────────────────────────
@@ -2495,49 +2603,64 @@ class TestCmdConfigDefaultModelDispatch:
         assert helper.call_args.args[2] != "opus"
         assert env["DEFAULT_MODEL"] == "gpt-5.4-mini"
 
-    def test_codex_install_zeroes_both_memory_flags(self, tmp_path, monkeypatch):
+    def test_codex_install_enables_memory_with_codex_reasoner(self, tmp_path, monkeypatch):
         """
-        Codex installs must force MEMORY_ENABLED=false AND
-        MEMORY_EXTRACTION_ENABLED=false. The Haiku extraction pipeline
-        bypasses the agent backend abstraction and shells out to
-        claude directly; running it on a codex-backed install would
-        either inject a [Memory subsystem: enabled] marker into the
-        inner codex agent's session context against a subsystem that
-        cannot service its requests, or attempt to spawn a claude
-        binary that may not be installed.
+        Codex installs CAN enable semantic memory. The reasoner
+        backend defaults to codex (matching the agent backend), the
+        extraction-enabled flag persists, MEMORY_REASONER_BACKEND
+        lands as a non-default value, and the stale-key cleanup at
+        wizard end no longer strips the codex extraction config.
 
-        The operator says yes to "Enable semantic memory" at the
-        prompt; the guard catches it. Neither flag should appear in
-        the resulting install.conf env (codex emits memory keys only
-        when they are non-default, and both default to false).
+        Regression for the prior wizard behavior that forced both
+        memory flags off on codex installs and printed a "currently
+        requires the claude backend" message; that guard came out
+        when the OneShotReasoner abstraction made codex memory
+        reachable end-to-end.
         """
-        # Seed install.conf with existing_env that has BOTH memory flags
-        # set to true. The guard's pre-check reads MEMORY_EXTRACTION_ENABLED
-        # before it can be zeroed by the unconditional reset later in the
-        # function, so the guard message fires.
         self._setup(
             monkeypatch,
             tmp_path,
-            existing_env={
-                "DEFAULT_MODEL": "gpt-5.4",
-                "MEMORY_ENABLED": "true",
-                "MEMORY_EXTRACTION_ENABLED": "true",
-            },
+            existing_env={"DEFAULT_MODEL": "gpt-5.4"},
         )
-        _, env = self._run(
-            monkeypatch,
-            tmp_path,
-            # Operator answers "true" at the memory_enabled prompt; the
-            # guard overrides it. Without the guard, MEMORY_ENABLED=true
-            # would land in the resulting install.conf.
-            self._inputs_for_codex_subscription(memory_enabled="true"),
-            helper_return="gpt-5.4",
-        )
-        # Both memory keys must be absent from the emitted env (the
-        # emission code only writes them when true; the guard forced
-        # both flags false).
-        assert "MEMORY_ENABLED" not in env
-        assert "MEMORY_EXTRACTION_ENABLED" not in env
+        # Feed the wizard codex defaults for every memory prompt. The
+        # reasoner_backend default mirrors agent_backend=codex, so
+        # accepting it via empty string locks in MEMORY_REASONER_BACKEND
+        # =codex. The episode model default is empty (inherit
+        # extraction model) on the codex reasoner branch; accepting
+        # blank exercises that path.
+        memory_inputs = [
+            "true",  # MEMORY_ENABLED
+            "true",  # MEMORY_EXTRACTION_ENABLED
+            "",  # MEMORY_REASONER_BACKEND (accept default = codex)
+            "10",  # extraction timeout (dataclass default)
+            "8",  # consolidation candidates (dataclass default)
+            "3",  # episode classifier context turns (dataclass default)
+            "",  # episode model (blank inherits extraction model on codex)
+            "120",  # episode timeout (dataclass default)
+            "0.9",  # paraphrase-dedup threshold (dataclass default)
+            "2000",  # token budget (dataclass default)
+            "10",  # search limit (dataclass default)
+        ]
+        # Codex-subscription inputs sequence inserts memory_enabled
+        # as the second-to-last entry (before the perplexity key).
+        # Replace memory_enabled with "true" and append the rest of
+        # the memory block in order; the helper currently emits
+        # memory_enabled as the final memory-flag entry, so we splice
+        # the new prompt sequence into the rest of the chain.
+        base_inputs = self._inputs_for_codex_subscription(memory_enabled="true")
+        # Find the memory_enabled slot ("true") and insert the rest
+        # of the memory block immediately after it; the trailing
+        # perplexity key entry stays at the end.
+        idx = len(base_inputs) - 2  # memory_enabled position
+        inputs = base_inputs[: idx + 1] + memory_inputs[1:] + base_inputs[idx + 1 :]
+        _, env = self._run(monkeypatch, tmp_path, inputs, helper_return="gpt-5.4")
+        # Codex install now persists memory extraction config. The
+        # reasoner backend is codex (non-default; emitted), and the
+        # extraction flag survives the cleanup block that previously
+        # stripped it on non-claude installs.
+        assert env.get("MEMORY_ENABLED") == "true"
+        assert env.get("MEMORY_EXTRACTION_ENABLED") == "true"
+        assert env.get("MEMORY_REASONER_BACKEND") == "codex"
 
 
 class TestCmdApplyDefaultModelGate:

@@ -40,6 +40,7 @@ from typing import Any, Protocol
 
 from kai.codex_exec import extract_codex_text
 from kai.config import DATA_DIR, resolve_claude_user
+from kai.oneshot_binary import BinaryResolutionError, resolve_oneshot_binary
 from kai.prompt_utils import make_boundary
 
 log = logging.getLogger(__name__)
@@ -477,7 +478,20 @@ class ClaudeOneShotReasoner:
         self._cwd.mkdir(parents=True, exist_ok=True)
         self._cwd.chmod(0o755)
 
-        cmd: list[str] = ["claude", "--print"]
+        # Resolve the claude binary through the shared resolver so
+        # config validation, this argv, and the smoke output all see
+        # the same resolution result. BinaryResolutionError from the
+        # resolver becomes OneShotRoutingError here so the existing
+        # memory_extraction `except OneShotError` catch surface still
+        # collapses the failure to the zero-state extraction result;
+        # the rewrap preserves the leaf-resolver / reasoner-error
+        # split documented on oneshot_binary.
+        try:
+            resolved_binary = resolve_oneshot_binary("claude")
+        except BinaryResolutionError as e:
+            raise OneShotRoutingError(str(e)) from e
+
+        cmd: list[str] = [resolved_binary, "--print"]
         if model is not None:
             cmd.extend(["--model", model])
         cmd.extend(["--output-format", "json"])
@@ -600,6 +614,14 @@ class ClaudeOneShotReasoner:
                 "returncode": returncode,
                 "stderr": stderr,
                 "cwd": str(self._cwd),
+                # cmd is the post-wrap argv (includes sudo prefix on
+                # cross-user routing); resolved_binary is the pre-wrap
+                # agent path. Smoke prints resolved_binary directly so
+                # the operator-visible "which binary ran" answer does
+                # not regress under the sudo wrap, where cmd[0] is
+                # "sudo" rather than the agent.
+                "cmd": list(cmd),
+                "resolved_binary": resolved_binary,
             },
             duration_ms=duration_ms,
         )
@@ -952,9 +974,21 @@ class CodexOneShotReasoner:
         self._cwd.mkdir(parents=True, exist_ok=True)
         self._cwd.chmod(0o755)
 
-        codex_bin = os.environ.get("CODEX_BIN") or "codex"
+        # Resolve the codex binary through the shared resolver so
+        # config validation, this argv, and the smoke output all see
+        # the same resolution result. Tighter than the previous inline
+        # `os.environ.get("CODEX_BIN") or "codex"` because the resolver
+        # validates an explicit CODEX_BIN override as is-file plus
+        # executable (no PATH fallback for a bad override), matching
+        # config-load validation. BinaryResolutionError becomes
+        # OneShotRoutingError here so the existing memory_extraction
+        # `except OneShotError` catch surface is unchanged.
+        try:
+            resolved_binary = resolve_oneshot_binary("codex")
+        except BinaryResolutionError as e:
+            raise OneShotRoutingError(str(e)) from e
         cmd: list[str] = [
-            codex_bin,
+            resolved_binary,
             "exec",
             "--json",
             "--skip-git-repo-check",
@@ -1115,6 +1149,15 @@ class CodexOneShotReasoner:
                         "returncode": returncode,
                         "stderr": stderr,
                         "cwd": str(self._cwd),
+                        # cmd is post-wrap (includes sudo prefix on
+                        # cross-user routing); resolved_binary is the
+                        # pre-wrap agent path. Smoke prints
+                        # resolved_binary so the operator-visible
+                        # "which binary ran" answer survives the sudo
+                        # wrap, where cmd[0] is "sudo" rather than
+                        # the agent.
+                        "cmd": list(cmd),
+                        "resolved_binary": resolved_binary,
                     },
                     duration_ms=duration_ms,
                 )
@@ -1216,6 +1259,13 @@ class CodexOneShotReasoner:
                     "returncode": returncode,
                     "stderr": stderr,
                     "cwd": str(self._cwd),
+                    # cmd / resolved_binary as documented on the
+                    # free-form return above; same fields populate
+                    # on every codex success branch so the smoke
+                    # output reads the same shape regardless of
+                    # whether json_schema was set.
+                    "cmd": list(cmd),
+                    "resolved_binary": resolved_binary,
                 },
                 duration_ms=duration_ms,
             )

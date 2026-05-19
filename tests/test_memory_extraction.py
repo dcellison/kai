@@ -51,6 +51,27 @@ from kai.memory_extraction import (
 # ── Fixtures ─────────────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _mock_binary_resolver():
+    """Pin the binary resolver to literal backend names so existing
+    argv assertions (`args[0] == "claude"`) stay valid across host
+    machines. Tests in this file mock subprocess execution end-to-end
+    and do not care which absolute path the resolver would have
+    returned; pinning is the minimal-friction way to keep extraction-
+    pipeline assertions stable while the resolver lives at the
+    reasoner argv boundary."""
+
+    def fake_resolve(backend: str) -> str:
+        if backend == "claude":
+            return "claude"
+        if backend == "codex":
+            return "codex"
+        raise ValueError(f"unknown backend: {backend!r}")
+
+    with patch("kai.oneshot.resolve_oneshot_binary", side_effect=fake_resolve):
+        yield
+
+
 _BASE_CONFIG = Config(
     telegram_bot_token="test-token",
     allowed_user_ids={12345},

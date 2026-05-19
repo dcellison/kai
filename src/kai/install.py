@@ -937,35 +937,12 @@ def _cmd_config() -> None:
         "Enable semantic memory (Mem0 + Qdrant)",
         existing_env.get("MEMORY_ENABLED", "false").lower() in ("1", "true", "yes"),
     )
-    # Codex backend cannot use semantic memory in v1 - the Haiku
-    # extraction pipeline shells out to `claude --print` and lives in
-    # the claude vertical. bot.py's effective_backend == "claude" gate
-    # already prevents extraction from running on a codex install, but
-    # the wizard zeroes both flags here as defense in depth: a
-    # MEMORY_ENABLED=true env var on a codex install would still
-    # inject the [Memory subsystem: enabled] marker into the inner
-    # codex agent's session context (build_session_context reads
-    # memory_enabled, not effective_backend) and trigger inner-agent
-    # behavior that has nowhere to land. Force both flags off so the
-    # codex agent never advertises a memory subsystem that cannot
-    # service its requests.
-    memory_extraction_enabled_pre_guard = existing_env.get("MEMORY_EXTRACTION_ENABLED", "false").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    if agent_backend == "codex" and (memory_enabled or memory_extraction_enabled_pre_guard):
-        print("  Semantic memory currently requires the claude backend.")
-        print("  Disabling semantic memory for this codex install.")
-        memory_enabled = False
-        # Zero memory_extraction_enabled explicitly here too. The
-        # unconditional `memory_extraction_enabled = False` a few lines
-        # down also covers this case, but a future refactor that moves
-        # or reorders the extraction prompt could silently reintroduce
-        # the exact bug the spec hardened against over multiple review
-        # rounds. The explicit assignment makes the guard refactor-safe
-        # and matches the comment's "force both flags off" claim.
-        memory_extraction_enabled = False
+    # Codex memory is supported. Both claude and codex agent backends
+    # can run semantic memory with a backend-matched reasoner; the
+    # reasoner_backend prompt below resolves which subprocess runs
+    # the extraction. The historical "codex disables memory" guard
+    # was removed once OneShotReasoner abstracted away the claude-
+    # only assumption in memory_extraction.
     # Defaults match the dataclass values in config.py. Only non-defaults
     # (or memory_enabled=true itself) are written to the env dict below.
     memory_extraction_enabled = False
@@ -1002,17 +979,48 @@ def _cmd_config() -> None:
     # default at runtime via load_config, so the env entry stays
     # suppressed by the delta-from-default check below.
     memory_duplicate_threshold = "0.9"
+    # Default to claude when the agent backend has no memory reasoner
+    # (goose retrieval-only) so the prompt-and-persist path never lands
+    # an invalid MEMORY_REASONER_BACKEND value. The prompt itself is
+    # gated on extraction being enabled below; for retrieval-only
+    # installs the variable is neither prompted nor persisted, so
+    # load_config falls back to the dataclass default at runtime.
+    memory_reasoner_backend = "claude"
     if memory_enabled:
-        # Haiku extraction only fires when the active backend is Claude
-        # (bot.py:3609 silently skips it otherwise - no startup error,
-        # no log line). Skip the prompt for non-claude backends rather
-        # than offer an option whose effect is invisible at runtime.
-        if agent_backend == "claude":
+        # Memory extraction is supported on agent backends that have a
+        # OneShotReasoner implementation. Today that is claude and
+        # codex; goose retrieval-only installs accept memory_enabled
+        # but skip the extraction prompt because no reasoner exists
+        # for goose. Add to the tuple when a new reasoner ships.
+        if agent_backend in ("claude", "codex"):
             memory_extraction_enabled = _prompt_bool(
-                "Enable Haiku extraction (proactive memory writes)",
+                "Enable memory extraction (proactive memory writes)",
                 existing_env.get("MEMORY_EXTRACTION_ENABLED", "false").lower() in ("1", "true", "yes"),
             )
             if memory_extraction_enabled:
+                # MEMORY_REASONER_BACKEND selects which one-shot
+                # reasoner runs the extraction subprocess. Default
+                # mirrors the install's agent_backend (same vendor
+                # for both surfaces) when the agent has a reasoner;
+                # falls back to "claude" otherwise so the persisted
+                # value is always one config validation accepts.
+                # The prompt sits inside the extraction-enabled
+                # branch because the variable has no runtime effect
+                # when extraction is disabled.
+                reasoner_default = agent_backend if agent_backend in ("claude", "codex") else "claude"
+                while True:
+                    candidate = (
+                        _prompt(
+                            "Memory reasoner backend (claude or codex)",
+                            existing_env.get("MEMORY_REASONER_BACKEND", reasoner_default),
+                        )
+                        .strip()
+                        .lower()
+                    )
+                    if candidate in ("claude", "codex"):
+                        memory_reasoner_backend = candidate
+                        break
+                    print("  Must be 'claude' or 'codex'.")
                 # No MEMORY_EXTRACTION_BUDGET_USD prompt on this branch:
                 # --max-budget-usd is omitted from the stage-1 claude
                 # --print argv (memory_extraction.py:_run_extractor),
@@ -1101,10 +1109,42 @@ def _cmd_config() -> None:
                 # the inheritance fallback continues to work for tests
                 # and for operators who explicitly want to track
                 # whatever extraction model is set.
-                memory_episode_model = _prompt(
-                    "Episode generator model (Sonnet recommended for narrative quality)",
-                    existing_env.get("MEMORY_EPISODE_MODEL", "claude-sonnet-4-6"),
-                )
+                # Episode model default is reasoner-aware. On the codex
+                # reasoner load_config validates this value against
+                # CODEX_MODELS and exits on a non-codex SKU; a
+                # claude-sonnet default would fail config-load. Default
+                # to "" on codex so the inheritance fallback in
+                # load_config picks up the (already validated) codex
+                # extraction model. On claude the historical
+                # claude-sonnet-4-6 recommendation stands.
+                if memory_reasoner_backend == "codex":
+                    episode_default = ""
+                    episode_prompt = "Episode generator model (blank inherits extraction model)"
+                else:
+                    episode_default = "claude-sonnet-4-6"
+                    episode_prompt = "Episode generator model (Sonnet recommended for narrative quality)"
+                while True:
+                    candidate = _prompt(
+                        episode_prompt,
+                        existing_env.get("MEMORY_EPISODE_MODEL", episode_default),
+                    ).strip()
+                    # Validate non-empty entries against CODEX_MODELS on
+                    # the codex branch, matching load_config's fail-fast
+                    # rule. Blank stays blank (inheritance). Claude
+                    # branch accepts any non-empty string (free-form,
+                    # matches the prior behavior).
+                    if memory_reasoner_backend == "codex" and candidate:
+                        from kai.config import CODEX_MODELS
+
+                        if candidate not in CODEX_MODELS:
+                            valid = sorted(CODEX_MODELS.keys())
+                            print(
+                                f"  '{candidate}' is not a valid codex model. "
+                                f"Must be one of: {', '.join(valid)} or blank."
+                            )
+                            continue
+                    memory_episode_model = candidate
+                    break
                 # No MEMORY_EPISODE_BUDGET_USD prompt on this branch:
                 # --max-budget-usd is omitted from the stage-2 claude
                 # --print argv (memory_extraction.py:_run_episode_extractor)
@@ -1332,6 +1372,15 @@ def _cmd_config() -> None:
         env["MEMORY_ENABLED"] = "true"
         if memory_extraction_enabled:
             env["MEMORY_EXTRACTION_ENABLED"] = "true"
+            # Persist MEMORY_REASONER_BACKEND only when non-default.
+            # The dataclass and load_config default is "claude"; an
+            # explicit "claude" selection is suppressed here so the
+            # generated env stays minimal. The prompt itself only
+            # fires when extraction is enabled (above), so a
+            # retrieval-only install never reaches this site and the
+            # key is never written for it.
+            if memory_reasoner_backend != "claude":
+                env["MEMORY_REASONER_BACKEND"] = memory_reasoner_backend
             # Double-gate (agent_backend AND non-default value) is
             # intentionally redundant: the wizard now skips the
             # extraction-budget prompt on claude, so the value is
@@ -1394,25 +1443,26 @@ def _cmd_config() -> None:
         if int(memory_search_limit) != 10:
             env["MEMORY_SEARCH_LIMIT"] = memory_search_limit
 
-    # Drop stale extraction keys when the backend isn't Claude. Mirrors
-    # the CLAUDE_MODEL/CLAUDE_MAX_BUDGET_USD cleanup above: bot.py:3609
-    # silently ignores these on non-claude backends, so leaving them in
-    # /etc/kai/env is misleading without effect. A user who flips backend
-    # from claude to goose should not see lingering extraction config.
-    if agent_backend != "claude":
+    # Drop stale extraction keys when the agent backend has no memory
+    # reasoner. Today that is goose; claude and codex both support
+    # extraction. A user who flips backend from claude/codex to goose
+    # should not see lingering extraction config that would be
+    # silently ignored at runtime.
+    if agent_backend not in ("claude", "codex"):
         env.pop("MEMORY_EXTRACTION_ENABLED", None)
+        env.pop("MEMORY_REASONER_BACKEND", None)
         env.pop("MEMORY_EXTRACTION_BUDGET_USD", None)
         env.pop("MEMORY_EXTRACTION_TIMEOUT_S", None)
         env.pop("MEMORY_CONSOLIDATION_CANDIDATES_N", None)
         # Episode-classifier window key (issue #392). Same lifecycle
         # as the other stage-1 extraction tunables: only consulted on
-        # the claude backend, so leaving a stale value here after a
-        # claude→goose flip would be misleading without effect.
+        # backends with a reasoner, so leaving a stale value here
+        # after a supported→goose flip would be misleading.
         env.pop("EPISODE_CLASSIFIER_CONTEXT_TURNS", None)
         # Episode keys follow the same lifecycle: stage 2 only fires
-        # when stage 1 fires, and stage 1 silently skips on non-claude
-        # backends. Leaving these in the env file would mislead an
-        # operator who flips backend from claude to goose.
+        # when stage 1 fires, and stage 1 silently skips on backends
+        # without a reasoner. Leaving these in the env file would
+        # mislead an operator who flips backend.
         env.pop("MEMORY_EPISODE_MODEL", None)
         env.pop("MEMORY_EPISODE_BUDGET_USD", None)
         env.pop("MEMORY_EPISODE_TIMEOUT_S", None)

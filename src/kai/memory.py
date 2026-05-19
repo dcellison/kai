@@ -613,8 +613,70 @@ def init_memory(config: Config) -> None:
     """
     global _memory, _config
 
+    # Structured startup log describing the configured memory state.
+    # Emitted exactly once per init regardless of whether memory is
+    # enabled, so an operator scanning the log after a restart can
+    # confirm the configured state without firing an extraction.
+    # The `extraction_binary` field is populated ONLY when
+    # `memory_extraction_enabled` is true (config-load validation
+    # already proved the binary was reachable at startup); for
+    # retrieval-only installs (MEMORY_ENABLED=true with extraction
+    # disabled) the field is null and the resolver is NOT called,
+    # so a retrieval-only install with no claude/codex binary on
+    # PATH still initializes successfully here.
+    #
+    # The resolver call IS wrapped in try/except as defense against
+    # between-load-and-init drift (PATH change, binary unlinked,
+    # etc.). A miss logs a WARNING and emits `extraction_binary: null`
+    # so memory init still completes; the next actual extraction
+    # would surface the real failure with a typed error.
+    extraction_binary: str | None = None
+    if config.memory_enabled and config.memory_extraction_enabled:
+        from kai.oneshot_binary import BinaryResolutionError, resolve_oneshot_binary
+
+        try:
+            extraction_binary = resolve_oneshot_binary(config.memory_reasoner_backend)
+        except BinaryResolutionError as e:
+            # Defensive: config-load validation already passed, so
+            # this should not happen on a healthy install. If it
+            # does, log loudly and continue with null so init does
+            # not fail on an observability field.
+            log.warning(
+                "memory.config: %s reasoner binary resolution failed at init time (%s); "
+                "extraction_binary will log as null",
+                config.memory_reasoner_backend,
+                e,
+            )
+
     if not config.memory_enabled:
+        log.info(
+            "memory.config %s",
+            json.dumps(
+                {
+                    "enabled": False,
+                    "extraction_enabled": False,
+                    "reasoner_backend": None,
+                    "extraction_model": None,
+                    "episode_model": None,
+                    "extraction_binary": None,
+                }
+            ),
+        )
         return
+
+    log.info(
+        "memory.config %s",
+        json.dumps(
+            {
+                "enabled": True,
+                "extraction_enabled": config.memory_extraction_enabled,
+                "reasoner_backend": config.memory_reasoner_backend,
+                "extraction_model": config.memory_extraction_model or None,
+                "episode_model": config.memory_episode_model or None,
+                "extraction_binary": extraction_binary,
+            }
+        ),
+    )
 
     _config = config
 

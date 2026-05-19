@@ -141,6 +141,105 @@ class TestInitMemory:
         init_memory(config)
         assert not is_enabled()
 
+    def test_init_disabled_emits_config_log_with_null_fields(self, caplog):
+        """Even when memory is disabled, init_memory emits exactly
+        one structured `memory.config` log so an operator scanning
+        the log post-restart can confirm the configured state. All
+        non-`enabled` fields elide to null."""
+        import json as json_module
+
+        from kai.memory import init_memory
+
+        config = _make_config(enabled=False)
+        with caplog.at_level(logging.INFO, logger="kai.memory"):
+            init_memory(config)
+        records = [r for r in caplog.records if "memory.config" in r.getMessage()]
+        assert len(records) == 1
+        payload = json_module.loads(records[0].getMessage().split("memory.config ", 1)[1])
+        assert payload == {
+            "enabled": False,
+            "extraction_enabled": False,
+            "reasoner_backend": None,
+            "extraction_model": None,
+            "episode_model": None,
+            "extraction_binary": None,
+        }
+
+    def test_init_retrieval_only_emits_null_extraction_binary(self, caplog, tmp_path, monkeypatch):
+        """Retrieval-only memory (MEMORY_ENABLED=true with extraction
+        disabled) MUST NOT call the resolver: the resolver call is
+        gated on `memory_extraction_enabled`, so an install without a
+        claude or codex binary on PATH still initializes
+        successfully. The resolver mock fires loudly if called."""
+        import json as json_module
+
+        from kai.memory import init_memory
+
+        called = []
+
+        def fake_resolve(backend: str) -> str:
+            called.append(backend)
+            raise RuntimeError("resolver should not run on retrieval-only init")
+
+        monkeypatch.setattr("kai.oneshot_binary.resolve_oneshot_binary", fake_resolve)
+        # Memory enabled but extraction disabled = retrieval-only.
+        config = _make_config(
+            memory_extraction_enabled=False,
+            memory_reasoner_backend="claude",
+            memory_extraction_model="claude-haiku-4-5",
+            memory_episode_model="",
+        )
+        with (
+            caplog.at_level(logging.INFO, logger="kai.memory"),
+            patch("kai.memory.DATA_DIR", tmp_path),
+            patch("mem0.Memory") as mock_mem,
+        ):
+            # Set the embedding model dim to the expected 384 so init
+            # proceeds past the dim-check guard.
+            mock_mem.from_config.return_value.embedding_model.model.get_embedding_dimension.return_value = 384
+            init_memory(config)
+        records = [r for r in caplog.records if "memory.config" in r.getMessage()]
+        assert len(records) == 1
+        payload = json_module.loads(records[0].getMessage().split("memory.config ", 1)[1])
+        assert payload["enabled"] is True
+        assert payload["extraction_enabled"] is False
+        assert payload["extraction_binary"] is None
+        # Critical contract: resolver MUST NOT have been called.
+        assert called == [], f"resolver was invoked on retrieval-only init: {called}"
+
+    def test_init_extraction_enabled_resolves_binary_in_log(self, caplog, tmp_path, monkeypatch):
+        """When extraction is enabled, init_memory calls the resolver
+        and writes the resolved path into the `extraction_binary`
+        field of the structured log."""
+        import json as json_module
+
+        from kai.memory import init_memory
+
+        monkeypatch.setattr(
+            "kai.oneshot_binary.resolve_oneshot_binary",
+            lambda backend: f"/fake/{backend}-binary",
+        )
+        config = _make_config(
+            memory_extraction_enabled=True,
+            memory_reasoner_backend="codex",
+            memory_extraction_model="gpt-5.4-mini",
+            memory_episode_model="",
+        )
+        with (
+            caplog.at_level(logging.INFO, logger="kai.memory"),
+            patch("kai.memory.DATA_DIR", tmp_path),
+            patch("mem0.Memory") as mock_mem,
+        ):
+            mock_mem.from_config.return_value.embedding_model.model.get_embedding_dimension.return_value = 384
+            init_memory(config)
+        records = [r for r in caplog.records if "memory.config" in r.getMessage()]
+        assert len(records) == 1
+        payload = json_module.loads(records[0].getMessage().split("memory.config ", 1)[1])
+        assert payload["enabled"] is True
+        assert payload["extraction_enabled"] is True
+        assert payload["reasoner_backend"] == "codex"
+        assert payload["extraction_binary"] == "/fake/codex-binary"
+
     @integration
     def test_mem0_telemetry_path_is_isolated(self):
         """Mem0's hardcoded telemetry Qdrant path must live under the

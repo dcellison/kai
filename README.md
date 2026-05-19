@@ -80,6 +80,14 @@ Three layers of persistent context give the agent continuity across sessions:
 
 Workspaces can also define a system prompt via `workspaces.yaml` for workspace-specific instructions. See [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture).
 
+#### Memory backend selection
+
+Semantic memory extraction (the subprocess that proactively writes facts and episode summaries) is independent of the agent backend. The reasoner used for extraction is selected by `MEMORY_REASONER_BACKEND` (`claude` or `codex`); each value names the subprocess that runs the extraction call. All four combinations of agent backend and reasoner backend are supported (claude+claude, claude+codex, codex+claude, codex+codex). The wizard defaults to the same-vendor case when extraction is enabled, but the operator can pick either.
+
+The named binary must be reachable at startup when extraction is enabled; the bot exits at config-load otherwise with a message naming the resolution sequence. Retrieval-only memory (`MEMORY_ENABLED=true` with extraction disabled) does not require either binary.
+
+To verify a memory configuration end-to-end without writing to the store, run `python -m kai.smoke.memory` from the install directory. Pass `--os-user <name>` when the configured reasoner is codex; the codex reasoner refuses to spawn without one. The smoke prints the resolved binary, the argv that ran, and any extracted facts.
+
 ### Scheduled jobs
 
 Reminders and recurring agent jobs with one-shot, daily, and interval schedules. Ask naturally ("remind me at 3pm") or use the HTTP API (`POST /api/schedule`). Agent jobs run as full agent sessions - Kai can check conditions, search the web, run commands, and report back on a schedule. Auto-remove jobs support monitoring use cases where the agent watches for a condition and deactivates itself when it's met. See [Scheduling and Conditional Jobs](https://github.com/dcellison/kai/wiki/Scheduling-and-Conditional-Jobs).

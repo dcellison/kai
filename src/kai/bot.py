@@ -3736,7 +3736,7 @@ async def _handle_response(
                 effective_backend = (
                     user_config.agent_backend if user_config and user_config.agent_backend else config.agent_backend
                 )
-                if config.memory_extraction_enabled and effective_backend == "claude":
+                if config.memory_extraction_enabled and effective_backend in ("claude", "codex"):
                     # Windowed PRIOR CONTEXT for the episode classifier
                     # (issue #392). Fetch one extra pair beyond the
                     # configured window and drop the most recent: the

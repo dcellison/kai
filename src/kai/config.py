@@ -1947,6 +1947,33 @@ def load_config() -> Config:
             f"(must be one of: {', '.join(_valid_memory_backends)})"
         )
 
+    # Cross-binary validation. When the operator has BOTH MEMORY_ENABLED=true
+    # AND MEMORY_EXTRACTION_ENABLED=true (the composed `memory_extraction_enabled`
+    # value above), the configured reasoner backend's binary must be reachable
+    # at startup; otherwise the first extraction would surface as a runtime
+    # OneShotRoutingError at first user message rather than a clear config-load
+    # failure. Retrieval-only memory (MEMORY_ENABLED=true with extraction
+    # disabled) intentionally does NOT trigger this check because no reasoner
+    # subprocess runs in that mode; gaining a binary prerequisite there would
+    # break the supported retrieval-only configuration.
+    #
+    # Local import avoids any future risk of an import cycle with kai.oneshot
+    # (which itself imports from kai.config). We catch `BinaryResolutionError`,
+    # the leaf module's stdlib-only exception type, NOT `OneShotRoutingError`
+    # (which lives in kai.oneshot and would defeat the cycle-free design).
+    if memory_extraction_enabled:
+        from kai.oneshot_binary import BinaryResolutionError, resolve_oneshot_binary
+
+        try:
+            resolve_oneshot_binary(memory_reasoner_backend)
+        except BinaryResolutionError as e:
+            raise SystemExit(
+                f"MEMORY_REASONER_BACKEND='{memory_reasoner_backend}' requires the binary "
+                f"to be reachable at startup, but {e}. Set CODEX_BIN (for codex) or fix "
+                f"PATH (for either backend); rerun the wizard if you no longer want memory "
+                f"extraction enabled."
+            ) from None
+
     # Memory model resolution. Env override wins; otherwise the role
     # registry resolves to a backend-appropriate default (claude-haiku
     # for backend=claude, gpt-5.4-mini for backend=codex). Sentinel
