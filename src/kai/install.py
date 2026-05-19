@@ -410,6 +410,15 @@ def _cmd_config() -> None:
     # CLAUDE_USER prompt later (section 8). Needs to be in scope
     # regardless of which branch we take.
     admin_os_user: str | None = None
+    # Admin identity is captured in scope so the codex-memory branch
+    # below can re-prompt for a valid os_user and rewrite the wizard-
+    # owned users.yaml without re-collecting the static fields. Both
+    # stay empty on the existing-users.yaml branch; the codex-memory
+    # validation block is gated on `not users_yaml_exists` so it only
+    # consults these when the wizard actually owns the file.
+    admin_telegram_id: str = ""
+    admin_name: str = ""
+    admin_home_workspace: str | None = None
 
     if users_yaml_exists:
         # Summarize the existing config without modifying it.
@@ -455,14 +464,17 @@ def _cmd_config() -> None:
 
         # Advanced options: os_user and home_workspace.
         advanced = _prompt_bool("Configure advanced user options", False)
-        admin_home_workspace: str | None = None
 
         if advanced:
             # Default os_user to CLAUDE_USER if previously set, else $USER.
-            # Note: on machines where the service user and the current user
-            # are the same (e.g., "kai" on the Mac mini), accepting the
-            # default means os_user matches the bot process user. This is
-            # fine - PR #192 handles the self-sudo skip for this case.
+            # Note: on the claude backend, an os_user that matches the bot
+            # process user is fine; the runtime detects self-sudo via
+            # `resolve_claude_user` and spawns claude in-process (the
+            # Max-plan OAuth path under the bot user's home). The codex
+            # memory branch enforces a separate non-bot-user precondition
+            # further down in the wizard (after the operator picks codex
+            # extraction) so the security boundary that block exists for
+            # is not silently bypassed by accepting the default here.
             default_os_user = existing_env.get("CLAUDE_USER", "") or os.environ.get("USER", "")
             while True:
                 admin_os_user = _prompt("OS user for subprocess isolation", default_os_user).strip() or None
@@ -1021,6 +1033,62 @@ def _cmd_config() -> None:
                         memory_reasoner_backend = candidate
                         break
                     print("  Must be 'claude' or 'codex'.")
+                # Codex extraction requires every extraction-eligible
+                # users.yaml entry to set a non-bot-user `os_user`.
+                # CodexOneShotReasoner.run() refuses the None and the
+                # same-user cases at runtime; load_config() refuses the
+                # same shapes at startup. Without this wizard-time
+                # check, a fresh install that accepted the default
+                # "Configure advanced user options = false" earlier in
+                # the prompt sequence produces a users.yaml with no
+                # `os_user`, and load_config() then SystemExits on the
+                # next daemon start. Re-prompt and rewrite the wizard-
+                # owned users.yaml in-place so the generated config
+                # passes load_config. The check fires only when the
+                # wizard owns the file (`not users_yaml_exists`); when
+                # the operator owns users.yaml, the load_config
+                # SystemExit at next start surfaces the same shape of
+                # error with the same diagnostic.
+                if memory_reasoner_backend == "codex" and not users_yaml_exists:
+                    needs_reprompt = (
+                        not admin_os_user
+                        or admin_os_user == service_user
+                        or not _validate_os_user(admin_os_user)
+                    )
+                    if needs_reprompt:
+                        print()
+                        print("  Codex memory extraction requires the admin user to spawn")
+                        print(f"  under a non-service OS account (service runs as '{service_user}';")
+                        print("  codex must run as a different account so the subprocess")
+                        print("  cannot read bot-user-only files such as /etc/kai/env).")
+                        while True:
+                            admin_os_user = _prompt(
+                                "OS account for codex memory extraction",
+                                "",
+                                required=True,
+                            ).strip()
+                            if not _validate_os_user(admin_os_user):
+                                print(
+                                    "  Username may only contain letters, numbers, "
+                                    "dots, hyphens, and underscores."
+                                )
+                                continue
+                            if admin_os_user == service_user:
+                                print(
+                                    f"  Must not match the service user '{service_user}' "
+                                    "(codex would run as the bot user)."
+                                )
+                                continue
+                            break
+                        users_yaml_content = _generate_users_yaml(
+                            admin_telegram_id,
+                            admin_name,
+                            os_user=admin_os_user,
+                            home_workspace=admin_home_workspace,
+                        )
+                        users_yaml_path.write_text(users_yaml_content)
+                        os.chmod(users_yaml_path, 0o600)
+                        print(f"  Updated {users_yaml_path} with os_user={admin_os_user}")
                 # No MEMORY_EXTRACTION_BUDGET_USD prompt on this branch:
                 # --max-budget-usd is omitted from the stage-1 claude
                 # --print argv (memory_extraction.py:_run_extractor),

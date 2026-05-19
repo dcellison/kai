@@ -935,10 +935,17 @@ class CodexOneShotReasoner:
                 policy says any agent subprocess that inherits the
                 bot's sudoers permissions can be coerced into reading
                 kai-only protected files. `run()` raises
-                `OneShotRoutingError` when `os_user is None`. A
-                supplied `os_user` matching the current process is
-                the legitimate self-sudo-skip case (single-user
-                install), detected by `resolve_claude_user`.
+                `OneShotRoutingError` when `os_user is None`, AND
+                when a supplied `os_user` resolves to the current
+                process user via `resolve_claude_user` (the same-
+                user case). Unlike claude, the self-sudo-skip is
+                NOT a legitimate path here: claude can safely run
+                in-process because Max-plan OAuth state lives under
+                the bot user's home, but codex would gain unintended
+                access to bot-user-only protected files (/etc/kai/
+                env, etc.). load_config() mirrors the refusal at
+                startup so a misconfigured users.yaml fails fast
+                rather than silently no-opping every extraction.
         """
         self._cwd = cwd if cwd is not None else _EXTRACTOR_CWD
         self._os_user = os_user

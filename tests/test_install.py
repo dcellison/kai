@@ -2268,6 +2268,132 @@ class TestCmdConfig:
         assert config.memory_extraction_model in CODEX_MODELS
         assert config.memory_episode_model in CODEX_MODELS
 
+    def test_codex_fresh_install_with_memory_extraction_yields_valid_users_yaml(
+        self, tmp_path, monkeypatch
+    ):
+        """Fresh-install regression for the codex memory wizard gate.
+
+        When the wizard drives the path 'no users.yaml -> codex backend
+        -> enable memory -> enable extraction -> codex reasoner' AND the
+        operator accepts the default 'Configure advanced user options =
+        false' earlier in the prompt sequence, the wizard re-prompts for
+        a non-service os_user at the memory-reasoner-backend gate and
+        rewrites users.yaml in place before the env is persisted. The
+        produced env + generated users.yaml together must pass
+        load_config(); without the gate the wizard emits a users.yaml
+        with no os_user and load_config() SystemExits at next daemon
+        start ('chat_ids are missing os_user' on the codex precondition).
+
+        This test pins the full fresh-install integration contract, in
+        contrast to test_codex_install_accept_all_defaults_yields_load_
+        config_compatible_env which hand-seeds users.yaml and only
+        checks the env emission.
+        """
+        from unittest.mock import MagicMock
+
+        from kai.config import load_config
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+        # Pin the model + codex-binary helpers so the test does not
+        # depend on the host having codex installed or a curated
+        # model registry on disk. The mock value below is a real
+        # CODEX_MODELS entry so load_config's model-vs-backend
+        # validation passes.
+        monkeypatch.setattr(
+            "kai.install._prompt_default_model",
+            MagicMock(return_value="gpt-5.4"),
+        )
+        monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
+
+        inputs = iter(
+            [
+                "/opt/kai",  # install dir
+                "/var/lib/kai",  # data dir
+                "kai",  # service user
+                "darwin",  # platform
+                "fake-token",  # bot token
+                "12345",  # admin telegram ID
+                "admin",  # admin display name
+                "false",  # advanced user options - the failure-mode entry
+                "polling",  # transport
+                "codex",  # agent backend
+                "subscription",  # codex auth mode
+                "/usr/local/bin/codex",  # codex binary path
+                # model: handled by _prompt_default_model mock
+                "120",  # agent timeout
+                "10.0",  # budget (codex != claude branch)
+                "200000",  # max context window
+                # autocompact + effort skipped on non-claude backend
+                "8080",  # webhook port
+                "test-secret",  # webhook secret
+                "",  # workspace base
+                "",  # allowed workspaces
+                "false",  # pr review enabled
+                "900",  # pr review timeout
+                "1.0",  # pr review budget (non-claude branch)
+                "false",  # issue triage enabled
+                "",  # github notify chat id
+                "false",  # voice
+                "false",  # tts
+                # claude_user skipped on agent_backend != claude
+                "true",  # memory enabled
+                "true",  # memory extraction enabled
+                "codex",  # memory reasoner backend
+                "codex_runner",  # NEW: re-prompted os_user after codex gate
+                "10",  # extraction timeout
+                "8",  # consolidation candidates
+                "3",  # episode classifier context turns
+                "",  # episode model (blank inherits extraction model)
+                "120",  # episode timeout
+                "0.9",  # paraphrase-dedup threshold
+                "2000",  # token budget
+                "10",  # search limit
+                "",  # perplexity key
+            ]
+        )
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        # users.yaml must carry the re-prompted os_user. The wizard
+        # rewrote it in place after the codex memory gate fired; the
+        # pre-fix path left os_user absent here.
+        users_yaml_path = tmp_path / "users.yaml"
+        assert users_yaml_path.exists()
+        data = yaml.safe_load(users_yaml_path.read_text())
+        entry = data["users"][0]
+        assert entry["telegram_id"] == 12345
+        assert entry["os_user"] == "codex_runner"
+
+        # Integration pin: feed the produced env + users.yaml into
+        # load_config and assert it accepts the shape. Neuter the
+        # /etc/kai/ readers and PROJECT_ROOT so load_config consumes
+        # the wizard-generated artifacts under tmp_path. The
+        # oneshot-binary resolver is mocked because the test host
+        # has no codex binary; load_config validates the resolved
+        # path on the codex extraction-eligible branch.
+        env_block = json.loads((tmp_path / "install.conf").read_text())["env"]
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr("kai.config.load_dotenv", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.config._read_protected_file", lambda path: None)
+        monkeypatch.setattr(
+            "kai.oneshot_binary.resolve_oneshot_binary",
+            lambda backend: f"/fake/{backend}",
+        )
+        for key, value in env_block.items():
+            monkeypatch.setenv(key, value)
+
+        config = load_config()
+        assert config.memory_enabled is True
+        assert config.memory_extraction_enabled is True
+        assert config.memory_reasoner_backend == "codex"
+        assert config.user_configs is not None
+        assert 12345 in config.user_configs
+        assert config.user_configs[12345].os_user == "codex_runner"
+
 
 # ── Apply subcommand ─────────────────────────────────────────────────
 
