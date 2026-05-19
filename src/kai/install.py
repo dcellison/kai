@@ -1051,9 +1051,7 @@ def _cmd_config() -> None:
                 # error with the same diagnostic.
                 if memory_reasoner_backend == "codex" and not users_yaml_exists:
                     needs_reprompt = (
-                        not admin_os_user
-                        or admin_os_user == service_user
-                        or not _validate_os_user(admin_os_user)
+                        not admin_os_user or admin_os_user == service_user or not _validate_os_user(admin_os_user)
                     )
                     if needs_reprompt:
                         print()
@@ -1068,10 +1066,7 @@ def _cmd_config() -> None:
                                 required=True,
                             ).strip()
                             if not _validate_os_user(admin_os_user):
-                                print(
-                                    "  Username may only contain letters, numbers, "
-                                    "dots, hyphens, and underscores."
-                                )
+                                print("  Username may only contain letters, numbers, dots, hyphens, and underscores.")
                                 continue
                             if admin_os_user == service_user:
                                 print(

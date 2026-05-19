@@ -2268,9 +2268,7 @@ class TestCmdConfig:
         assert config.memory_extraction_model in CODEX_MODELS
         assert config.memory_episode_model in CODEX_MODELS
 
-    def test_codex_fresh_install_with_memory_extraction_yields_valid_users_yaml(
-        self, tmp_path, monkeypatch
-    ):
+    def test_codex_fresh_install_with_memory_extraction_yields_valid_users_yaml(self, tmp_path, monkeypatch):
         """Fresh-install regression for the codex memory wizard gate.
 
         When the wizard drives the path 'no users.yaml -> codex backend
@@ -2796,9 +2794,7 @@ class TestCmdConfigDefaultModelDispatch:
         assert env.get("MEMORY_EXTRACTION_ENABLED") == "true"
         assert env.get("MEMORY_REASONER_BACKEND") == "codex"
 
-    def test_claude_install_codex_reasoner_emits_codex_bin_and_matches_sudoers(
-        self, tmp_path, monkeypatch
-    ):
+    def test_claude_install_codex_reasoner_emits_codex_bin_and_matches_sudoers(self, tmp_path, monkeypatch):
         """claude+codex memory regression: when AGENT_BACKEND=claude but
         MEMORY_REASONER_BACKEND=codex, the wizard must still collect
         CODEX_BIN (the earlier agent-block prompt is skipped because the
@@ -2862,11 +2858,7 @@ class TestCmdConfigDefaultModelDispatch:
             os_users=["alice"],
             codex_bin=env["CODEX_BIN"],
         )
-        codex_lines = [
-            line
-            for line in sudoers.splitlines()
-            if "(alice)" in line and "/usr/local/bin/codex" in line
-        ]
+        codex_lines = [line for line in sudoers.splitlines() if "(alice)" in line and "/usr/local/bin/codex" in line]
         assert len(codex_lines) == 1, codex_lines
 
 
