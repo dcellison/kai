@@ -1516,6 +1516,18 @@ class TestSanitizeForCodexDisallowedKeys:
         out = _sanitize_for_codex(schema)
         assert out == {"type": "string"}
 
+    def test_strips_not_composition(self):
+        """`not` is currently rejected by OpenAI strict structured
+        outputs even though plain JSON Schema accepts it. Stripping
+        is forward-protection against a future schema author who
+        adds a `not` branch without knowing the codex CLI would 400
+        on it."""
+        from kai.oneshot import _sanitize_for_codex
+
+        schema = {"type": "string", "not": {"enum": ["forbidden"]}}
+        out = _sanitize_for_codex(schema)
+        assert out == {"type": "string"}
+
     def test_preserves_enum(self):
         from kai.oneshot import _sanitize_for_codex
 
@@ -1727,6 +1739,7 @@ class TestSanitizeForCodexProductionSchemas:
                     "maxItems",
                     "uniqueItems",
                     "default",
+                    "not",
                 ), f"disallowed key survived: {k}"
                 self._assert_strict_mode_valid(v)
         elif isinstance(node, list):

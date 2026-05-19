@@ -654,6 +654,12 @@ _STRICT_MODE_DISALLOWED_KEYS: frozenset[str] = frozenset(
         "maxItems",
         "uniqueItems",
         "default",
+        # `not` composition is currently unsupported by OpenAI strict
+        # structured outputs even though plain JSON Schema allows it.
+        # The production memory schemas never use `not`; stripping it
+        # is forward-protection against a future schema author adding
+        # it without knowing the codex CLI would 400 on it.
+        "not",
     }
 )
 
@@ -683,7 +689,8 @@ def _sanitize_for_codex(schema: dict[str, Any]) -> dict[str, Any]:
 
     Allowed keywords are preserved: `type`, `properties`, `required`,
     `items`, `enum`, `additionalProperties`, `description`, `oneOf`,
-    `anyOf`, `not`.
+    `anyOf`. `not` is NOT preserved; OpenAI strict structured outputs
+    currently rejects it even though plain JSON Schema accepts it.
 
     Why sanitize rather than maintain a parallel codex-only schema:
     the bound constraints (string lengths, value ranges, array sizes)
