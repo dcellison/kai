@@ -2796,6 +2796,79 @@ class TestCmdConfigDefaultModelDispatch:
         assert env.get("MEMORY_EXTRACTION_ENABLED") == "true"
         assert env.get("MEMORY_REASONER_BACKEND") == "codex"
 
+    def test_claude_install_codex_reasoner_emits_codex_bin_and_matches_sudoers(
+        self, tmp_path, monkeypatch
+    ):
+        """claude+codex memory regression: when AGENT_BACKEND=claude but
+        MEMORY_REASONER_BACKEND=codex, the wizard must still collect
+        CODEX_BIN (the earlier agent-block prompt is skipped because the
+        agent backend is not codex). install.conf must emit CODEX_BIN,
+        and the sudoers rules _generate_sudoers produces from that env
+        must reference the same path. Without this contract the codex
+        memory reasoner spawns the binary resolved from PATH while the
+        sudoers SETENV rule allows only the wizard's fallback
+        /opt/homebrew/bin/codex; if the two diverge, every cross-user
+        codex call fails with "a password is required" and extraction
+        silently no-ops.
+        """
+        from kai.install import _generate_sudoers
+
+        self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_MODEL": "sonnet"})
+        # The new claude-with-codex-reasoner memory block. The
+        # CODEX_BIN re-prompt is the load-bearing entry: it only
+        # fires when memory_reasoner_backend == codex AND the earlier
+        # codex agent-block did not collect a path (agent_backend !=
+        # codex). Episode model is left blank to inherit the codex
+        # extraction default in load_config.
+        memory_inputs = [
+            "true",  # MEMORY_ENABLED
+            "true",  # MEMORY_EXTRACTION_ENABLED
+            "codex",  # MEMORY_REASONER_BACKEND (override default = claude)
+            "/usr/local/bin/codex",  # NEW: codex_bin re-prompt at memory gate
+            "10",  # extraction timeout (dataclass default)
+            "8",  # consolidation candidates (dataclass default)
+            "3",  # episode classifier context turns (dataclass default)
+            "",  # episode model (blank inherits extraction model on codex)
+            "120",  # episode timeout (dataclass default)
+            "0.9",  # paraphrase-dedup threshold (dataclass default)
+            "2000",  # token budget (dataclass default)
+            "10",  # search limit (dataclass default)
+        ]
+        # _inputs_for_claude_backend places memory_enabled as the
+        # second-to-last entry. Replace it with "true" and splice the
+        # rest of the memory block immediately after; the trailing
+        # perplexity-key entry stays at the end.
+        base_inputs = self._inputs_for_claude_backend()
+        idx = len(base_inputs) - 2  # memory_enabled position
+        base_inputs = base_inputs[:idx] + ["true"] + base_inputs[idx + 1 :]
+        inputs = base_inputs[: idx + 1] + memory_inputs[1:] + base_inputs[idx + 1 :]
+        _, env = self._run(monkeypatch, tmp_path, inputs, helper_return="sonnet")
+        assert env.get("MEMORY_REASONER_BACKEND") == "codex"
+        # The wizard must emit CODEX_BIN even though AGENT_BACKEND=
+        # claude. Pre-fix this assertion failed because the env-
+        # emission block was gated on agent_backend == codex.
+        assert env.get("CODEX_BIN") == "/usr/local/bin/codex"
+
+        # Sudoers rules generated from env["CODEX_BIN"] must use the
+        # same path. This pins the install-time wiring so the codex
+        # memory reasoner argv (which resolves codex via the same
+        # binary path through resolve_oneshot_binary) and the
+        # sudoers SETENV rule cannot drift apart. _user_home is
+        # patched because the sudoers generator inspects per-target
+        # home directories that do not exist on the test host.
+        monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
+        sudoers = _generate_sudoers(
+            "kai",
+            os_users=["alice"],
+            codex_bin=env["CODEX_BIN"],
+        )
+        codex_lines = [
+            line
+            for line in sudoers.splitlines()
+            if "(alice)" in line and "/usr/local/bin/codex" in line
+        ]
+        assert len(codex_lines) == 1, codex_lines
+
 
 class TestCmdApplyDefaultModelGate:
     """

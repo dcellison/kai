@@ -1089,6 +1089,31 @@ def _cmd_config() -> None:
                         users_yaml_path.write_text(users_yaml_content)
                         os.chmod(users_yaml_path, 0o600)
                         print(f"  Updated {users_yaml_path} with os_user={admin_os_user}")
+                # CODEX_BIN must be collected whenever the codex
+                # reasoner is selected, not only when the agent
+                # backend is codex. The earlier codex agent-backend
+                # block prompts for the binary path only on
+                # `agent_backend == "codex"`, so a claude+codex (or
+                # goose+codex) memory install would otherwise emit no
+                # CODEX_BIN entry. _apply_sudoers then falls back to
+                # /opt/homebrew/bin/codex via _generate_sudoers, while
+                # the runtime CodexOneShotReasoner resolves codex via
+                # PATH; if the two diverge the sudoers SETENV rule no
+                # longer matches the argv the reasoner spawns. Re-
+                # prompt here when the agent block did not already
+                # collect a value so install.conf, /etc/kai/env, and
+                # /etc/kai/sudoers.d cannot drift apart.
+                if memory_reasoner_backend == "codex" and not codex_bin:
+                    while True:
+                        which_codex = shutil.which("codex") or "/opt/homebrew/bin/codex"
+                        codex_bin = _prompt(
+                            "Codex binary path (required by codex memory reasoner)",
+                            existing_env.get("CODEX_BIN", which_codex),
+                            required=True,
+                        )
+                        if _validate_codex_bin(codex_bin):
+                            break
+                        print(f"  Path '{codex_bin}' does not exist or is not executable.")
                 # No MEMORY_EXTRACTION_BUDGET_USD prompt on this branch:
                 # --max-budget-usd is omitted from the stage-1 claude
                 # --print argv (memory_extraction.py:_run_extractor),
@@ -1323,14 +1348,21 @@ def _cmd_config() -> None:
             env["CODEX_AUTH_MODE"] = codex_auth_mode
         if codex_api_key:
             env["OPENAI_API_KEY"] = codex_api_key
-        # Persist the wizard-collected codex binary path. The same
-        # value drives /etc/kai/env's CODEX_BIN and the sudoers SETENV
-        # rule so they can never drift. _cmd_apply's env-var override
-        # block keeps working for ad-hoc deploys (sudo CODEX_BIN=...
-        # kai install apply) but the wizard path is now the canonical
-        # source of truth.
-        if codex_bin:
-            env["CODEX_BIN"] = codex_bin
+
+    # Persist the wizard-collected codex binary path whenever any
+    # codex surface (agent backend or memory reasoner) is in play.
+    # Gating on `codex_bin` rather than `agent_backend == "codex"`
+    # covers the supported claude+codex / goose+codex memory cases
+    # where the codex binary is required solely because the memory
+    # reasoner is codex; the second collection block at the memory
+    # gate above guarantees `codex_bin` is set on those paths. The
+    # same value drives /etc/kai/env's CODEX_BIN and the sudoers
+    # SETENV rule so the two can never drift. _cmd_apply's env-var
+    # override block keeps working for ad-hoc deploys (sudo
+    # CODEX_BIN=... kai install apply) but the wizard path remains
+    # the canonical source of truth.
+    if codex_bin:
+        env["CODEX_BIN"] = codex_bin
 
     # Remove stale renamed keys if present - leaving both the old and
     # new key causes silent confusion (the deprecation warning is
@@ -3174,12 +3206,16 @@ def _cmd_apply() -> None:
         # codex install can pin an absolute codex path without
         # round-tripping through the wizard. Apply-time env wins over
         # any value already in install.conf so the operator's explicit
-        # `sudo CODEX_BIN=... kai install apply` is honored. Only codex
-        # installs care; on other backends the var is ignored at
-        # runtime so writing it is harmless but noisy - skip the write
-        # to keep /etc/kai/env clean.
+        # `sudo CODEX_BIN=... kai install apply` is honored. The gate
+        # accepts either AGENT_BACKEND=codex (the codex agent path) or
+        # MEMORY_REASONER_BACKEND=codex (the claude+codex / goose+codex
+        # memory path); in both cases codex actually runs and the
+        # sudoers SETENV rule needs the same path the runtime resolver
+        # spawns. Skipping the write on truly codex-free installs
+        # keeps /etc/kai/env clean.
         env_codex_bin = os.environ.get("CODEX_BIN")
-        if env_codex_bin and env.get("AGENT_BACKEND") == "codex":
+        codex_needed = env.get("AGENT_BACKEND") == "codex" or env.get("MEMORY_REASONER_BACKEND") == "codex"
+        if env_codex_bin and codex_needed:
             env["CODEX_BIN"] = env_codex_bin
         # AGENT_TIMEOUT_SECONDS migration. Operators upgrading without
         # re-running the wizard carry the legacy CLAUDE_TIMEOUT_SECONDS
