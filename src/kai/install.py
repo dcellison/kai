@@ -1869,6 +1869,52 @@ def _collect_os_users_from_yaml(users_yaml_path: str | Path) -> list[str]:
     return result
 
 
+def _build_codex_login_reminder(
+    env: dict[str, str],
+    service_user: str,
+    users_yaml_path: str | Path = "/etc/kai/users.yaml",
+) -> str | None:
+    """Compose the post-install codex subscription-auth reminder.
+
+    Codex CLI auth state lives under the spawning user's home directory
+    (~<os_user>/.codex/auth.json). CodexOneShotReasoner spawns codex
+    per-user via `sudo -u <os_user>`, so subscription auth must be
+    completed AS each target user before the first call; a service-
+    user-only login lands the token in the wrong home and every
+    cross-user spawn fails. Returns the reminder text (without a
+    leading blank line) when codex actually runs on this install AND
+    uses subscription auth, else None. The "codex runs anywhere"
+    predicate matches AGENT_BACKEND=codex OR MEMORY_REASONER_BACKEND=
+    codex so claude+codex (or goose+codex) memory installs still get
+    the reminder. Factored out of _cmd_apply so the gate and the
+    per-user enumeration are independently testable.
+    """
+    codex_needed = env.get("AGENT_BACKEND") == "codex" or env.get("MEMORY_REASONER_BACKEND") == "codex"
+    if not codex_needed:
+        return None
+    if env.get("CODEX_AUTH_MODE", "subscription") != "subscription":
+        return None
+    # _collect_os_users_from_yaml raises ValueError on a crafted/
+    # malformed entry (sudoers-injection guard); the apply path
+    # already wrote sudoers from the same file, so a raise here would
+    # be too late. Treat both raise paths as "fall back to service
+    # user" so the operator still sees an actionable hint.
+    try:
+        login_users = sorted(set(_collect_os_users_from_yaml(users_yaml_path)))
+    except (OSError, ValueError):
+        login_users = []
+    if not login_users:
+        login_users = [service_user]
+    user_lines = "\n".join(f"    {u} ~$ codex login" for u in login_users)
+    return (
+        "Codex subscription auth required:\n"
+        "  Log in once for each os_user that should answer Telegram messages:\n"
+        f"{user_lines}\n"
+        "  Run as the os_user themselves, not via sudo from another account.\n"
+        "  These must complete before the service answers its first message."
+    )
+
+
 def _collect_user_memory_owners(users_yaml_path: str | Path) -> list[tuple[int, str | None]]:
     """
     Read users.yaml and return (telegram_id, os_user) tuples.
@@ -3283,26 +3329,14 @@ def _cmd_apply() -> None:
                 "\nTo reconfigure later, re-run: python -m kai install config"
             )
 
-        # Codex subscription auth requires `codex login` run AS each
-        # os_user that should answer messages. The per-user wrap reads
-        # ~<os_user>/.codex/auth.json, NOT the service user's home, so
-        # a `sudo -u kai codex login` (the old hint) lands the token
-        # in the wrong place. Enumerate the distinct os_user set from
-        # /etc/kai/users.yaml; fall back to the service user only
-        # when no os_users are configured.
-        if env.get("AGENT_BACKEND") == "codex" and env.get("CODEX_AUTH_MODE", "subscription") == "subscription":
-            try:
-                login_users = sorted(set(_collect_os_users_from_yaml("/etc/kai/users.yaml")))
-            except (OSError, ValueError):
-                login_users = []
-            if not login_users:
-                login_users = [service_user]
-            print("\nCodex subscription auth required:")
-            print("  Log in once for each os_user that should answer Telegram messages:")
-            for user in login_users:
-                print(f"    {user} ~$ codex login")
-            print("  Run as the os_user themselves, not via sudo from another account.")
-            print("  These must complete before the service answers its first message.")
+        # Codex subscription auth reminder. Factored out so the gate
+        # ("codex runs anywhere": agent backend OR memory reasoner is
+        # codex) and the per-user enumeration can be unit-tested
+        # without mocking the entire apply pipeline. Returns None when
+        # no reminder applies.
+        reminder = _build_codex_login_reminder(env, service_user)
+        if reminder:
+            print("\n" + reminder)
 
 
 def _apply_directories(

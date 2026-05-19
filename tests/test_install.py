@@ -6222,14 +6222,129 @@ class TestApplyAgentTimeoutMigration:
 class TestPerOsUserCodexLoginHint:
     """Post-install hint enumerates per-os_user codex login.
 
-    The hint block fires in the success path of _cmd_apply (non-dry-run)
-    after every real install side effect, so isolating it in pytest
-    requires mocking the full install pipeline. Verified at smoke-test
-    time instead; the helper it consumes (_collect_os_users_from_yaml)
-    is independently covered.
+    The reminder fires when codex actually runs on this install: agent
+    backend = codex OR memory reasoner = codex. Subscription auth lives
+    under each spawning user's home, so the reminder must enumerate
+    every distinct os_user in users.yaml (falling back to the service
+    user only when none are configured). The gate and enumeration are
+    factored into `_build_codex_login_reminder` so this test exercises
+    them directly without driving the full _cmd_apply pipeline.
     """
 
-    def test_collect_os_users_helper_unaffected(self):
-        from kai.install import _collect_os_users_from_yaml
+    @staticmethod
+    def _write_users_yaml(tmp_path, entries: list[dict]) -> Path:
+        path = tmp_path / "users.yaml"
+        path.write_text(yaml.safe_dump({"users": entries}))
+        return path
 
-        assert callable(_collect_os_users_from_yaml)
+    def test_claude_agent_with_codex_memory_reasoner_emits_reminder(self, tmp_path):
+        """The reviewer-flagged regression. With AGENT_BACKEND=claude and
+        MEMORY_REASONER_BACKEND=codex, codex still runs per-user for
+        memory extraction; the operator must run `codex login` as the
+        target os_user or the first extraction fails with no auth.
+        Pre-fix the reminder was suppressed because the gate keyed on
+        AGENT_BACKEND alone.
+        """
+        from kai.install import _build_codex_login_reminder
+
+        users_yaml = self._write_users_yaml(
+            tmp_path,
+            [{"telegram_id": 12345, "name": "alice", "role": "admin", "os_user": "alice"}],
+        )
+        env = {
+            "AGENT_BACKEND": "claude",
+            "MEMORY_REASONER_BACKEND": "codex",
+        }
+        text = _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml)
+        assert text is not None
+        assert "Codex subscription auth required:" in text
+        assert "alice ~$ codex login" in text
+        # service-user fallback must NOT fire when users.yaml has entries.
+        assert "kai ~$ codex login" not in text
+
+    def test_codex_agent_backend_still_emits_reminder(self, tmp_path):
+        """Defense-in-depth for the original gate: AGENT_BACKEND=codex
+        alone (no memory) still produces the reminder.
+        """
+        from kai.install import _build_codex_login_reminder
+
+        users_yaml = self._write_users_yaml(
+            tmp_path,
+            [{"telegram_id": 1, "name": "alice", "role": "admin", "os_user": "alice"}],
+        )
+        env = {"AGENT_BACKEND": "codex"}
+        text = _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml)
+        assert text is not None
+        assert "alice ~$ codex login" in text
+
+    def test_pure_claude_no_codex_anywhere_returns_none(self, tmp_path):
+        """No codex surface, no reminder. Claude memory extraction does
+        not spawn codex; emitting the hint here would be wizard noise.
+        """
+        from kai.install import _build_codex_login_reminder
+
+        users_yaml = self._write_users_yaml(
+            tmp_path,
+            [{"telegram_id": 1, "name": "alice", "role": "admin", "os_user": "alice"}],
+        )
+        env = {"AGENT_BACKEND": "claude"}
+        assert _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml) is None
+
+    def test_codex_api_key_mode_returns_none(self, tmp_path):
+        """API-key auth needs no per-user login; the env var ships the
+        token. The reminder must skip both codex-anywhere cases when
+        CODEX_AUTH_MODE=api_key.
+        """
+        from kai.install import _build_codex_login_reminder
+
+        users_yaml = self._write_users_yaml(
+            tmp_path,
+            [{"telegram_id": 1, "name": "alice", "role": "admin", "os_user": "alice"}],
+        )
+        for env in (
+            {"AGENT_BACKEND": "codex", "CODEX_AUTH_MODE": "api_key"},
+            {
+                "AGENT_BACKEND": "claude",
+                "MEMORY_REASONER_BACKEND": "codex",
+                "CODEX_AUTH_MODE": "api_key",
+            },
+        ):
+            assert _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml) is None, env
+
+    def test_no_os_users_falls_back_to_service_user(self, tmp_path):
+        """When users.yaml has no os_user entries (legacy single-user
+        mode or empty file), the fallback hint names the service user.
+        """
+        from kai.install import _build_codex_login_reminder
+
+        users_yaml = self._write_users_yaml(
+            tmp_path,
+            [{"telegram_id": 1, "name": "alice", "role": "admin"}],
+        )
+        env = {"AGENT_BACKEND": "codex"}
+        text = _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml)
+        assert text is not None
+        assert "kai ~$ codex login" in text
+
+    def test_multiple_os_users_enumerated_and_deduplicated(self, tmp_path):
+        """Each distinct os_user gets one line. Duplicates in users.yaml
+        collapse so the operator does not see redundant hints; order is
+        deterministic (sorted) so the post-install output is stable
+        across runs.
+        """
+        from kai.install import _build_codex_login_reminder
+
+        users_yaml = self._write_users_yaml(
+            tmp_path,
+            [
+                {"telegram_id": 1, "name": "alice", "role": "admin", "os_user": "alice"},
+                {"telegram_id": 2, "name": "bob", "role": "user", "os_user": "bob"},
+                {"telegram_id": 3, "name": "carol", "role": "user", "os_user": "alice"},
+            ],
+        )
+        env = {"AGENT_BACKEND": "codex"}
+        text = _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml)
+        assert text is not None
+        # alice once (dedup), bob once; sorted ordering puts alice first.
+        login_lines = [line for line in text.splitlines() if "~$ codex login" in line]
+        assert login_lines == ["    alice ~$ codex login", "    bob ~$ codex login"]
