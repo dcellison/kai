@@ -1667,7 +1667,44 @@ def _paraphrase_neighbor(content: str, user_id: str, threshold: float) -> Memory
 # ── Reasoner wiring ─────────────────────────────────────────────────
 
 
-def _get_memory_reasoner(config: Config) -> OneShotReasoner:
+def _resolve_os_user(user_id: str, config: Config) -> str | None:
+    """
+    Resolve a Telegram user_id to its `os_user` from `users.yaml`.
+
+    Returns None for any path that does not produce a per-user OS
+    routing target:
+
+    - `config.user_configs is None` (legacy ALLOWED_USER_IDS install
+      that never built a users.yaml).
+    - `user_id` does not parse as an int (eval-gate sandbox IDs like
+      `sandbox-498-claude`).
+    - The parsed telegram_id is not present in `user_configs`.
+    - The user's entry has no `os_user` field set.
+
+    Callers map None into their own routing policy: the codex memory
+    reasoner refuses; the claude memory reasoner falls through to
+    direct spawn (preserves the historical Max-plan OAuth install
+    that never set per-user os_user).
+
+    Resolution is intentionally a single lookup at the top of
+    `extract_and_store`; both memory stages receive the resolved
+    value from there. Re-resolving inside stage 2 would require
+    threading `Config.user_configs` into deeper call sites for no
+    extra correctness benefit.
+    """
+    if config.user_configs is None:
+        return None
+    try:
+        tid = int(user_id)
+    except ValueError:
+        return None
+    user_cfg = config.user_configs.get(tid)
+    if user_cfg is None:
+        return None
+    return user_cfg.os_user
+
+
+def _get_memory_reasoner(config: Config, os_user: str | None = None) -> OneShotReasoner:
     """
     Resolve the one-shot reasoner used by both memory stages.
 
@@ -1680,20 +1717,22 @@ def _get_memory_reasoner(config: Config) -> OneShotReasoner:
     function is updated; surfacing it as a runtime error rather than
     silently selecting Claude keeps the failure visible.
 
+    `os_user` is resolved once at the top of `extract_and_store` and
+    threaded into this helper. The codex reasoner raises
+    `OneShotRoutingError` from `run()` when os_user is None; the
+    claude reasoner spawns directly. Tests monkeypatch this helper
+    to inject fake reasoners; the `os_user` parameter is accepted
+    but not inspected on the test side because patches use
+    `return_value=`.
+
     Returning a fresh instance per call (rather than a module-level
     singleton) keeps the memory path stateless and mirrors the
-    pre-refactor per-call subprocess construction. If a future
-    provider benefits from a long-lived client (connection pool,
-    HTTP session), update this helper rather than each call site.
-
-    Tests monkeypatch this helper to inject fake reasoners; the
-    `config` parameter is accepted but not inspected on the test
-    side because patches use `return_value=`.
+    pre-refactor per-call subprocess construction.
     """
     if config.memory_reasoner_backend == "claude":
-        return ClaudeOneShotReasoner()
+        return ClaudeOneShotReasoner(os_user=os_user)
     if config.memory_reasoner_backend == "codex":
-        return CodexOneShotReasoner()
+        return CodexOneShotReasoner(os_user=os_user)
     raise RuntimeError(f"Unknown memory_reasoner_backend: {config.memory_reasoner_backend!r}")
 
 
@@ -1707,6 +1746,7 @@ async def _run_extractor(
     candidate_ids: set[str],
     candidate_metadata: dict[str, dict],
     user_id: str,
+    os_user: str | None = None,
     system_prompt: str = _EXTRACTION_SYSTEM_PROMPT,
     user_window_text: str = "",
     assistant_window_text: str = "",
@@ -1784,7 +1824,7 @@ async def _run_extractor(
     # returned on failure. JSON envelope parsing stays in this
     # function so memory-domain concerns (is_error, structured_output,
     # facts, has_episode) do not leak into the reasoner.
-    reasoner = _get_memory_reasoner(config)
+    reasoner = _get_memory_reasoner(config, os_user=os_user)
     try:
         result = await reasoner.run(
             prompt=payload_text,
@@ -1946,6 +1986,8 @@ def _build_episode_payload(user_text: str, assistant_text: str) -> str:
 async def _run_episode_extractor(
     payload_text: str,
     config: Config,
+    *,
+    os_user: str | None = None,
 ) -> tuple[dict | None, float, str | None]:
     """
     Spawn `claude --print` with the episode-generator prompt and parse.
@@ -1974,7 +2016,10 @@ async def _run_episode_extractor(
     # downstream telemetry depends on (`"timeout"` and
     # `"exit_<code>: <stderr>"`). OneShotSubprocessError carries the
     # returncode and stderr bytes precisely so this mapping works.
-    reasoner = _get_memory_reasoner(config)
+    # `os_user` is the routing target resolved once at the top of
+    # `extract_and_store` (per-user OS routing); stage 2 inherits the
+    # same target so the policy boundary is enforced consistently.
+    reasoner = _get_memory_reasoner(config, os_user=os_user)
     try:
         result = await reasoner.run(
             prompt=payload_text,
@@ -2035,6 +2080,7 @@ async def _generate_episode(
     user_id: str,
     session_id: str | None,
     config: Config,
+    os_user: str | None = None,
 ) -> None:
     """
     Stage-2 task body: generate one episode record and store it.
@@ -2074,7 +2120,7 @@ async def _generate_episode(
             # quick succession and the second waits on the first.
             start = time.monotonic()
             payload = _build_episode_payload(user_text, assistant_text)
-            episode, cost_usd, run_reason = await _run_episode_extractor(payload, config)
+            episode, cost_usd, run_reason = await _run_episode_extractor(payload, config, os_user=os_user)
             if episode is None:
                 # Map the run-helper's failure tags onto the documented
                 # outcome enum: timeout, subprocess_error, parse_error,
@@ -2439,6 +2485,7 @@ async def extract_and_store(
     session_id: str | None = None,
     config: Config | None = None,
     prior_pairs: list[tuple[str, str]] | None = None,
+    os_user_override: str | None = None,
 ) -> int:
     """
     Run Haiku extraction on an exchange and store the resulting facts.
@@ -2474,6 +2521,16 @@ async def extract_and_store(
         except Exception:
             log.warning("extract_and_store: could not load config", exc_info=True)
             return 0
+
+    # Per-user OS routing target. Resolved ONCE here and threaded
+    # into both stages; stage 2 does not re-resolve because it has
+    # no `user_id` to resolve from (it runs as a fire-and-forget
+    # task whose only handle on the user is what extract_and_store
+    # passes in). `os_user_override` short-circuits the resolution
+    # for callers that have already chosen the target (the eval
+    # gate's `--os-user` flag); production traffic resolves through
+    # `users.yaml[telegram_id].os_user`.
+    os_user = os_user_override if os_user_override is not None else _resolve_os_user(user_id, config)
 
     sem = _get_semaphore(user_id)
     # Pre-initialize the storage counters so the post-try summary log
@@ -2580,6 +2637,7 @@ async def extract_and_store(
                 candidate_ids=candidate_id_set,
                 candidate_metadata=candidate_metadata,
                 user_id=user_id,
+                os_user=os_user,
                 user_window_text=user_window_text,
                 assistant_window_text=assistant_window_text,
             )
@@ -2639,6 +2697,7 @@ async def extract_and_store(
                         user_id=user_id,
                         session_id=session_id,
                         config=config,
+                        os_user=os_user,
                     ),
                     name=f"episode-{user_id}",
                 )

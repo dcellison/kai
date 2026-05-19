@@ -3044,7 +3044,7 @@ class TestValidateEpisodeIntegration:
             "actors": ["user"],
         }
 
-        async def _fake_runner(payload, config):
+        async def _fake_runner(payload, config, **kwargs):
             return episode_payload, 0.001, None
 
         captured: dict = {}
@@ -3098,7 +3098,7 @@ class TestValidateEpisodeIntegration:
             "actors": ["user"],
         }
 
-        async def _fake_runner(payload, config):
+        async def _fake_runner(payload, config, **kwargs):
             return episode_payload, 0.001, None
 
         captured: dict = {}
@@ -3155,7 +3155,7 @@ class TestValidateEpisodeIntegration:
             "actors": ["user"],
         }
 
-        async def _fake_runner(payload, config):
+        async def _fake_runner(payload, config, **kwargs):
             return episode_payload, 0.001, None
 
         captured_metadata: dict = {}
@@ -3530,3 +3530,157 @@ class TestRunExtractorWithCodexEnvelope:
 
         assert result.facts == []
         assert result.has_episode is False
+
+
+# ── Per-user OS routing (issue #503) ────────────────────────────────
+
+
+class TestResolveOsUser:
+    """`_resolve_os_user` maps a Telegram chat_id (string) to an
+    `os_user` from `users.yaml`. Sandbox IDs and legacy installs
+    return None; the codex memory reasoner then refuses and the
+    claude reasoner falls through to direct spawn."""
+
+    def test_resolves_known_telegram_id(self):
+        from kai.config import UserConfig
+
+        config = replace(
+            _BASE_CONFIG,
+            user_configs={
+                42: UserConfig(telegram_id=42, name="op", os_user="opuser"),
+            },
+        )
+        assert memory_extraction._resolve_os_user("42", config) == "opuser"
+
+    def test_returns_none_when_user_configs_absent(self):
+        """Legacy ALLOWED_USER_IDS install: no users.yaml means no
+        os_user mapping exists."""
+        config = replace(_BASE_CONFIG, user_configs=None)
+        assert memory_extraction._resolve_os_user("42", config) is None
+
+    def test_returns_none_for_non_numeric_user_id(self):
+        """Eval-gate sandbox user IDs are non-numeric; the resolver
+        must not crash and must return None so the gate's
+        os_user_override kicks in."""
+        from kai.config import UserConfig
+
+        config = replace(
+            _BASE_CONFIG,
+            user_configs={42: UserConfig(telegram_id=42, name="op", os_user="opuser")},
+        )
+        assert memory_extraction._resolve_os_user("sandbox-498-codex", config) is None
+
+    def test_returns_none_when_telegram_id_absent(self):
+        from kai.config import UserConfig
+
+        config = replace(
+            _BASE_CONFIG,
+            user_configs={42: UserConfig(telegram_id=42, name="op", os_user="opuser")},
+        )
+        assert memory_extraction._resolve_os_user("999", config) is None
+
+    def test_returns_none_when_os_user_not_set_on_entry(self):
+        from kai.config import UserConfig
+
+        config = replace(
+            _BASE_CONFIG,
+            user_configs={42: UserConfig(telegram_id=42, name="op", os_user=None)},
+        )
+        assert memory_extraction._resolve_os_user("42", config) is None
+
+
+class TestGetMemoryReasonerWithOsUser:
+    """`_get_memory_reasoner` threads `os_user` into the reasoner
+    constructor so both stages route to the same target."""
+
+    def test_claude_reasoner_receives_os_user(self):
+        config = _cfg()
+        reasoner = memory_extraction._get_memory_reasoner(config, os_user="target")
+        assert reasoner._os_user == "target"
+
+    def test_codex_reasoner_receives_os_user(self):
+        config = _cfg(memory_reasoner_backend="codex", memory_extraction_model="gpt-5.4-mini")
+        reasoner = memory_extraction._get_memory_reasoner(config, os_user="target")
+        assert reasoner._os_user == "target"
+
+
+class TestExtractAndStoreThreadsOsUser:
+    """`extract_and_store` resolves `os_user` once at the top
+    (preferring `os_user_override`) and threads it into BOTH
+    stages. Stage 2 inherits the same target so the policy
+    boundary is enforced consistently across the per-exchange
+    lifecycle."""
+
+    @pytest.mark.asyncio
+    async def test_override_flows_to_both_stages(self, monkeypatch):
+        """The gate's `--os-user` override reaches `_run_extractor`
+        AND any stage-2 task scheduled by the same call. Without
+        the threading, sandbox episode-positive probes would
+        refuse on the codex arm."""
+        from kai import memory as memory_module
+
+        captured_run_extractor: dict = {}
+        captured_generate_episode: dict = {}
+
+        # Stub stage 1 to return an episode-positive ExtractionResult
+        # so the stage-2 task gets scheduled.
+        async def _fake_run_extractor(payload, config, **kwargs):
+            captured_run_extractor.update(kwargs)
+            return memory_extraction.ExtractionResult(facts=[], has_episode=True)
+
+        async def _fake_generate_episode(**kwargs):
+            captured_generate_episode.update(kwargs)
+
+        monkeypatch.setattr(memory_extraction, "_run_extractor", _fake_run_extractor)
+        monkeypatch.setattr(memory_extraction, "_generate_episode", _fake_generate_episode)
+        # init_memory is a no-op for this test; we never call into
+        # the storage layer because stage 1 returned no facts.
+        monkeypatch.setattr(memory_module, "_memory", object())
+
+        await memory_extraction.extract_and_store(
+            user_text="u",
+            assistant_text="a",
+            user_id="sandbox-498-codex",
+            config=_cfg(),
+            os_user_override="target",
+        )
+
+        # Drain the scheduled episode task so _fake_generate_episode
+        # captures its kwargs.
+        await asyncio.sleep(0)
+        for task in list(memory_extraction._pending_episode_tasks):
+            await task
+
+        assert captured_run_extractor.get("os_user") == "target"
+        assert captured_generate_episode.get("os_user") == "target"
+
+    @pytest.mark.asyncio
+    async def test_resolved_os_user_flows_when_no_override(self, monkeypatch):
+        """Production callers do not supply `os_user_override`;
+        the resolver pulls the target from `users.yaml` and the
+        same target reaches both stages."""
+        from kai import memory as memory_module
+        from kai.config import UserConfig
+
+        captured: dict = {}
+
+        async def _fake_run_extractor(payload, config, **kwargs):
+            captured.update(kwargs)
+            return memory_extraction.ExtractionResult(facts=[], has_episode=False)
+
+        monkeypatch.setattr(memory_extraction, "_run_extractor", _fake_run_extractor)
+        monkeypatch.setattr(memory_module, "_memory", object())
+
+        config = replace(
+            _cfg(),
+            user_configs={
+                42: UserConfig(telegram_id=42, name="op", os_user="opuser"),
+            },
+        )
+        await memory_extraction.extract_and_store(
+            user_text="u",
+            assistant_text="a",
+            user_id="42",
+            config=config,
+        )
+        assert captured.get("os_user") == "opuser"

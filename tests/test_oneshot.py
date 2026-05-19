@@ -9,6 +9,8 @@ storage) live in `tests/test_memory_extraction.py` and stay there.
 
 import json
 import logging
+import os
+import pwd
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,9 +23,23 @@ from kai.oneshot import (
     CodexOneShotReasoner,
     OneShotOutputError,
     OneShotResult,
+    OneShotRoutingError,
     OneShotSubprocessError,
     OneShotTimeout,
 )
+
+
+def _current_user() -> str:
+    """OS username of the test runner.
+
+    Tests that exercise the codex reasoner's direct-spawn path use
+    this as `os_user` so `resolve_claude_user` self-sudo-skips back
+    to None (target matches current process); the reasoner then
+    spawns codex directly with no sudo wrap. Without setting
+    `os_user`, the codex reasoner would raise `OneShotRoutingError`
+    by design.
+    """
+    return pwd.getpwuid(os.getuid()).pw_name
 
 
 def _make_proc(
@@ -383,7 +399,7 @@ class TestCodexOneShotReasonerArgv:
     @pytest.mark.asyncio
     async def test_argv_includes_required_flags(self, tmp_path, monkeypatch):
         monkeypatch.delenv("CODEX_BIN", raising=False)
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         proc = _make_proc(stdout=_codex_envelope_ndjson({"ok": True}))
 
         with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
@@ -421,7 +437,7 @@ class TestCodexOneShotReasonerArgv:
         """CODEX_BIN must override the bare `codex` resolution so
         per-os_user homebrew installs work without PATH munging."""
         monkeypatch.setenv("CODEX_BIN", "/custom/path/to/codex")
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         proc = _make_proc(stdout=_codex_envelope_ndjson({"ok": True}))
 
         with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
@@ -439,7 +455,7 @@ class TestCodexOneShotReasonerArgv:
         """When the caller passes no schema, --output-schema must be
         absent entirely. The non-schema branch returns raw final text
         and never writes a temp file."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         proc = _make_proc(stdout=_codex_event("agent_message", "free-form text").encode("utf-8") + b"\n")
 
         with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
@@ -452,7 +468,7 @@ class TestCodexOneShotReasonerArgv:
     async def test_argv_omits_model_when_none(self, tmp_path):
         """A None model means the codex CLI's default; the reasoner
         must not emit a stray `--model` with an empty string."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         proc = _make_proc(stdout=_codex_envelope_ndjson({"ok": True}))
 
         with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
@@ -470,7 +486,7 @@ class TestCodexOneShotReasonerArgv:
         """User content goes through stdin only. Argv is visible via
         `ps -ef`; the rendered stdin block carries both the system
         prompt boundary and the user payload."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         proc = _make_proc(stdout=_codex_envelope_ndjson({"ok": True}))
 
         with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
@@ -500,7 +516,7 @@ class TestCodexOneShotReasonerStdin:
 
     @pytest.mark.asyncio
     async def test_stdin_wraps_system_prompt_in_boundary_when_provided(self, tmp_path):
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         proc = _make_proc(stdout=_codex_envelope_ndjson({"ok": True}))
 
         with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -524,7 +540,7 @@ class TestCodexOneShotReasonerStdin:
         """No system prompt means no SYSTEM block at all; the user
         payload reaches codex unchanged, matching how Claude's
         omitted --system-prompt flag behaves."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         proc = _make_proc(stdout=_codex_envelope_ndjson({"ok": True}))
 
         with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -545,7 +561,7 @@ class TestCodexOneShotReasonerStdin:
         """Empty-string system prompt collapses to the same no-boundary
         behavior; a free-floating SYSTEM section with empty content
         would be visible to the model with nothing inside it."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         proc = _make_proc(stdout=_codex_envelope_ndjson({"ok": True}))
 
         with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -572,7 +588,7 @@ class TestCodexOneShotReasonerSchemaFile:
     async def test_schema_file_written_with_supplied_schema(self, tmp_path):
         """The path passed via --output-schema must point at a file
         whose contents are the JSON-serialized schema dict."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         captured: dict = {}
 
         def _capture(*args, **kwargs):
@@ -595,7 +611,7 @@ class TestCodexOneShotReasonerSchemaFile:
 
     @pytest.mark.asyncio
     async def test_schema_file_removed_on_timeout(self, tmp_path):
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         captured: dict = {}
 
         def _capture(*args, **kwargs):
@@ -618,7 +634,7 @@ class TestCodexOneShotReasonerSchemaFile:
 
     @pytest.mark.asyncio
     async def test_schema_file_removed_on_subprocess_error(self, tmp_path):
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         captured: dict = {}
 
         def _capture(*args, **kwargs):
@@ -643,7 +659,7 @@ class TestCodexOneShotReasonerSchemaFile:
         """Empty final agent_message under a schema-backed call must
         raise OneShotOutputError AND remove the temp file. Without
         the cleanup, repeat failures would leak one file per call."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         captured: dict = {}
 
         def _capture(*args, **kwargs):
@@ -675,7 +691,7 @@ class TestCodexOneShotReasonerEnv:
 
     @pytest.mark.asyncio
     async def test_env_contains_only_codex_allowlisted_keys(self, tmp_path, monkeypatch):
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         proc = _make_proc(stdout=_codex_envelope_ndjson({"ok": True}))
 
         # Allow-listed keys present in parent env.
@@ -716,7 +732,7 @@ class TestCodexOneShotReasonerTimeout:
 
     @pytest.mark.asyncio
     async def test_timeout_kills_and_awaits_then_raises(self, tmp_path):
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         proc = _make_proc(raise_timeout=True)
 
         with (
@@ -741,7 +757,7 @@ class TestCodexOneShotReasonerSubprocessError:
 
     @pytest.mark.asyncio
     async def test_non_zero_exit_raises_with_returncode_and_stderr(self, tmp_path):
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         proc = _make_proc(stdout=b"", stderr=b"codex auth failed", returncode=2)
 
         with (
@@ -766,7 +782,7 @@ class TestCodexOneShotReasonerOutputError:
 
     @pytest.mark.asyncio
     async def test_empty_final_message_under_schema_raises_output_error(self, tmp_path):
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         proc = _make_proc(stdout=b"", returncode=0)
 
         with (
@@ -784,7 +800,7 @@ class TestCodexOneShotReasonerOutputError:
         """A `turn.failed` event short-circuits extract_codex_text to
         empty string; the reasoner must then raise OneShotOutputError
         rather than wrap empty content in the envelope."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         stdout = json.dumps({"type": "turn.failed", "error": "x"}).encode("utf-8") + b"\n"
         proc = _make_proc(stdout=stdout, returncode=0)
 
@@ -804,7 +820,7 @@ class TestCodexOneShotReasonerOutputError:
         be wrapped in `{"is_error": false, "structured_output": ...}`;
         OneShotOutputError fires so the caller sees a typed failure
         instead of a downstream parse error on the envelope."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         # agent_message text is "not json at all" - extract_codex_text
         # returns that string, then the JSON parse raises.
         stdout = _codex_event("agent_message", "not json at all").encode("utf-8") + b"\n"
@@ -841,7 +857,7 @@ class TestCodexOneShotReasonerOutputError:
         caller would silently store zero facts as if the model had
         legitimately found nothing. The schema-failure case must be
         distinguishable from the empty-extraction case."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         stdout = _codex_event("agent_message", non_object_payload).encode("utf-8") + b"\n"
         proc = _make_proc(stdout=stdout, returncode=0)
 
@@ -876,7 +892,7 @@ class TestCodexOneShotReasonerOutputError:
         found nothing`. The check reads `required` off the supplied
         schema rather than embedding fact/episode field names so
         the reasoner stays domain-neutral."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         # Fact-extraction schema requires facts AND has_episode at root.
         fact_schema = {
             "type": "object",
@@ -905,7 +921,7 @@ class TestCodexOneShotReasonerOutputError:
         object` from `bad JSON` and from `non-object scalar`; each
         gets its own error_category so log queries can partition the
         failure modes without re-parsing the message body."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         stdout = _codex_envelope_ndjson({"unexpected": True})
         proc = _make_proc(stdout=stdout, returncode=0)
         schema = {"type": "object", "required": ["facts", "has_episode"]}
@@ -935,7 +951,7 @@ class TestCodexOneShotReasonerOutputError:
         the guard from over-rejecting schemas that use other JSON
         Schema constructs (oneOf, allOf, etc.) to express constraints
         instead of a flat `required` list."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         stdout = _codex_envelope_ndjson({"any": "object", "shape": True})
         proc = _make_proc(stdout=stdout, returncode=0)
         schema_without_required = {"type": "object", "properties": {"any": {"type": "string"}}}
@@ -957,7 +973,7 @@ class TestCodexOneShotReasonerOutputError:
         operator-side dashboards can separate "model returned wrong
         shape" from "model returned malformed JSON" without re-parsing
         the message body."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         stdout = _codex_event("agent_message", '"a plain string"').encode("utf-8") + b"\n"
         proc = _make_proc(stdout=stdout, returncode=0)
 
@@ -986,7 +1002,7 @@ class TestCodexOneShotReasonerSuccess:
 
     @pytest.mark.asyncio
     async def test_schema_backed_success_returns_normalized_envelope(self, tmp_path):
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         payload = {"facts": [{"content": "x"}], "has_episode": False}
         stdout = _codex_envelope_ndjson(payload)
         proc = _make_proc(stdout=stdout, stderr=b"", returncode=0)
@@ -1013,7 +1029,7 @@ class TestCodexOneShotReasonerSuccess:
         LAST `item.completed` agent_message. Joining a preamble with
         the JSON body (the `join_items=True` path) would produce a
         non-JSON string and trip the OneShotOutputError branch."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         preamble = _codex_event("agent_message", "preamble text, not JSON")
         payload = {"facts": []}
         final = _codex_event("agent_message", json.dumps(payload))
@@ -1036,7 +1052,7 @@ class TestCodexOneShotReasonerSuccess:
         agent_message text back unchanged; no envelope wrapping
         happens. Memory extraction never takes this branch, but the
         protocol permits it for future callers."""
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         stdout = _codex_event("agent_message", "free-form reply").encode("utf-8") + b"\n"
         proc = _make_proc(stdout=stdout, returncode=0)
 
@@ -1059,7 +1075,7 @@ class TestCodexOneShotReasonerLogging:
 
     @pytest.mark.asyncio
     async def test_log_line_includes_backend_codex_on_success(self, tmp_path, caplog):
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         proc = _make_proc(stdout=_codex_envelope_ndjson({"ok": True}), returncode=0)
 
         with (
@@ -1081,7 +1097,7 @@ class TestCodexOneShotReasonerLogging:
 
     @pytest.mark.asyncio
     async def test_log_line_carries_returncode_on_subprocess_error(self, tmp_path, caplog):
-        reasoner = CodexOneShotReasoner(cwd=tmp_path)
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         proc = _make_proc(stderr=b"refused", returncode=3)
 
         with (
@@ -1101,3 +1117,310 @@ class TestCodexOneShotReasonerLogging:
         assert "backend=codex" in msg
         assert "outcome=subprocess_error" in msg
         assert "returncode=3" in msg
+
+
+# ── Per-user OS routing (issue #503) ────────────────────────────────
+
+
+class TestRoutingArgvAndPreserveEnv:
+    """`os_user` constructor argument controls the sudo wrap.
+
+    Direct spawn (self-sudo-skip case): when `os_user` matches the
+    current process user, `resolve_claude_user` normalizes to None
+    and the reasoner spawns without a wrap. Cross-user spawn: the
+    target differs from the current user, so the wrap fires with
+    `--preserve-env=<auth-csv>` carrying the per-backend auth vars.
+    """
+
+    @pytest.mark.asyncio
+    async def test_claude_direct_spawn_when_os_user_is_current(self, tmp_path):
+        reasoner = ClaudeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_proc(stdout=b"{}")
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await reasoner.run(prompt="p", purpose="fact_extraction")
+        cmd = mock_exec.call_args[0]
+        assert "sudo" not in cmd
+        assert cmd[0] == "claude"
+        assert mock_exec.call_args.kwargs["start_new_session"] is False
+
+    @pytest.mark.asyncio
+    async def test_claude_wraps_when_os_user_differs(self, tmp_path):
+        """A target other than the current user produces the wrap.
+
+        `resolve_claude_user` is patched directly so the assertion
+        does not depend on which OS user the test runner happens
+        to be.
+        """
+        reasoner = ClaudeOneShotReasoner(cwd=tmp_path, os_user="other-user")
+        proc = _make_proc(stdout=b"{}")
+        with (
+            patch("kai.oneshot.resolve_claude_user", return_value="other-user"),
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec,
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction")
+        cmd = mock_exec.call_args[0]
+        assert cmd[0] == "sudo"
+        assert cmd[1] == "-H"
+        assert cmd[2] == "-u"
+        assert cmd[3] == "other-user"
+        # Preserve-env CSV exact contract: Claude auth vars only;
+        # no HOME (covered by -H), no PATH (covered by allow-list).
+        assert cmd[4] == "--preserve-env=CLAUDE_CONFIG_DIR,ANTHROPIC_API_KEY,ANTHROPIC_BASE_URL"
+        assert cmd[5] == "--"
+        assert cmd[6] == "claude"
+        assert mock_exec.call_args.kwargs["start_new_session"] is True
+
+    @pytest.mark.asyncio
+    async def test_codex_direct_spawn_when_os_user_is_current(self, tmp_path):
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_proc(stdout=b"")
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec,
+            pytest.raises(OneShotOutputError),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
+        cmd = mock_exec.call_args[0]
+        assert "sudo" not in cmd
+        assert mock_exec.call_args.kwargs["start_new_session"] is False
+
+    @pytest.mark.asyncio
+    async def test_codex_wraps_with_preserve_env(self, tmp_path):
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user="other-user")
+        proc = _make_proc(stdout=b"")
+        with (
+            patch("kai.oneshot.resolve_claude_user", return_value="other-user"),
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec,
+            pytest.raises(OneShotOutputError),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
+        cmd = mock_exec.call_args[0]
+        assert cmd[:4] == ("sudo", "-H", "-u", "other-user") or list(cmd[:4]) == ["sudo", "-H", "-u", "other-user"]
+        assert cmd[4] == "--preserve-env=CODEX_HOME,OPENAI_API_KEY,OPENAI_BASE_URL"
+        assert cmd[5] == "--"
+        # PATH and bare HOME deliberately not in the preserve list
+        # (CODEX_HOME is intentional; the substring check splits on
+        # the CSV so a future regression that adds bare HOME still
+        # fails this assertion).
+        preserved = cmd[4].split("=", 1)[1].split(",")
+        assert "PATH" not in preserved
+        assert "HOME" not in preserved
+        assert mock_exec.call_args.kwargs["start_new_session"] is True
+
+
+class TestRoutingRefusal:
+    """Codex with `os_user=None` refuses to run; Claude does not.
+
+    The asymmetry is deliberate: existing Max-plan Claude installs
+    have always run claude as the bot user, and breaking those
+    installs without an explicit operator opt-in would be hostile.
+    Codex memory is brand new in #497 / PR #501; the refusal is
+    its safe default.
+    """
+
+    @pytest.mark.asyncio
+    async def test_codex_with_no_os_user_raises_routing_error(self, tmp_path, caplog):
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=None)
+        with (
+            caplog.at_level(logging.INFO, logger="kai.oneshot"),
+            pytest.raises(OneShotRoutingError),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
+        records = [r for r in caplog.records if r.message.startswith("oneshot_reasoner")]
+        assert len(records) == 1
+        msg = records[0].getMessage()
+        assert "outcome=routing_error" in msg
+        assert "error_category=missing_os_user" in msg
+        assert "os_user=self" in msg
+
+    @pytest.mark.asyncio
+    async def test_claude_with_no_os_user_still_spawns(self, tmp_path):
+        """Claude memory must not regress for existing single-user
+        installs that have never set per-user os_user."""
+        reasoner = ClaudeOneShotReasoner(cwd=tmp_path, os_user=None)
+        proc = _make_proc(stdout=b"{}")
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await reasoner.run(prompt="p", purpose="fact_extraction")
+        cmd = mock_exec.call_args[0]
+        assert "sudo" not in cmd
+
+
+class TestRoutingTimeoutCleanup:
+    """On timeout from a wrapped spawn, the cross-user kill goes
+    out BEFORE the wrapper reap. Negative-PGID covers the whole
+    target-user descendant tree, including the npm-wrapped codex
+    chain (`sudo -> node -> codex`)."""
+
+    @pytest.mark.asyncio
+    async def test_cross_user_kill_fires_before_wrapper_reap(self, tmp_path):
+        reasoner = ClaudeOneShotReasoner(cwd=tmp_path, os_user="other-user")
+        proc = _make_proc(raise_timeout=True)
+        proc.pid = 12345
+        kill_calls: list[tuple] = []
+
+        kill_proc = _make_proc(stdout=b"", returncode=0)
+
+        async def _fake_exec(*args, **kwargs):
+            # First call: the wrapped agent spawn. Subsequent calls
+            # (the kill subprocess) are recorded so we can assert
+            # the cross-user kill argv and ordering.
+            if args[0] == "sudo" and len(args) > 4 and args[4] == "/bin/kill":
+                kill_calls.append(args)
+                return kill_proc
+            return proc
+
+        with (
+            patch("kai.oneshot.resolve_claude_user", return_value="other-user"),
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(side_effect=_fake_exec)),
+            pytest.raises(OneShotTimeout),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", timeout=0.1)
+
+        # The cross-user kill ran exactly once with the negative-PGID
+        # argv shape; the wrapper reap happened after.
+        assert len(kill_calls) == 1
+        kill_argv = list(kill_calls[0])
+        assert kill_argv == ["sudo", "-n", "-u", "other-user", "/bin/kill", "-KILL", "-12345"]
+        proc.kill.assert_called_once()
+        proc.wait.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cross_user_kill_failure_logs_and_reaps(self, tmp_path, caplog):
+        """A kill subprocess returning rc != 0 (e.g., the agent
+        already exited between TimeoutError and the kill spawn)
+        logs a warning, still reaps the wrapper, and still raises
+        OneShotTimeout."""
+        reasoner = ClaudeOneShotReasoner(cwd=tmp_path, os_user="other-user")
+        proc = _make_proc(raise_timeout=True)
+        proc.pid = 999
+        kill_proc = _make_proc(stdout=b"", stderr=b"No such process", returncode=1)
+
+        async def _fake_exec(*args, **kwargs):
+            if args[0] == "sudo" and len(args) > 4 and args[4] == "/bin/kill":
+                return kill_proc
+            return proc
+
+        with (
+            patch("kai.oneshot.resolve_claude_user", return_value="other-user"),
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(side_effect=_fake_exec)),
+            caplog.at_level(logging.WARNING, logger="kai.oneshot"),
+            pytest.raises(OneShotTimeout),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", timeout=0.1)
+
+        proc.kill.assert_called_once()
+        warnings = [r for r in caplog.records if "cross-user kill returned rc=1" in r.getMessage()]
+        assert warnings, "expected a warning about the failing kill subprocess"
+
+    @pytest.mark.asyncio
+    async def test_direct_spawn_does_not_run_cross_user_kill(self, tmp_path):
+        """The self-sudo-skip path keeps the original kill+await
+        and does NOT invoke the cross-user kill subprocess."""
+        reasoner = ClaudeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_proc(raise_timeout=True)
+        exec_calls: list[tuple] = []
+
+        async def _fake_exec(*args, **kwargs):
+            exec_calls.append(args)
+            return proc
+
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(side_effect=_fake_exec)),
+            pytest.raises(OneShotTimeout),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", timeout=0.1)
+        # One spawn only: the wrapped agent (or in this case the
+        # direct claude binary). No second spawn for the cross-user
+        # kill, because there is no cross-user wrap.
+        assert len(exec_calls) == 1
+        # And the spawn was not wrapped in sudo.
+        assert exec_calls[0][0] != "sudo"
+
+
+class TestCwdAndSchemaModes:
+    """The neutral extractor cwd is world-traversable, and the
+    codex schema temp file is world-readable, so a target `os_user`
+    can enter the cwd and open the schema input."""
+
+    @pytest.mark.asyncio
+    async def test_ensure_extractor_cwd_chmods_existing_dir(self, tmp_path, monkeypatch):
+        """An existing cwd at mode 0o700 self-heals to 0o755 on the
+        next call. The unconditional chmod is the load-bearing line
+        for cross-user routing because `mkdir(exist_ok=True)` is a
+        no-op when the directory already exists."""
+        cwd = tmp_path / "memory" / "extractor_cwd"
+        cwd.mkdir(parents=True)
+        cwd.chmod(0o700)
+        monkeypatch.setattr("kai.oneshot._EXTRACTOR_CWD", cwd)
+
+        from kai.oneshot import _ensure_extractor_cwd
+
+        _ensure_extractor_cwd()
+
+        # 0o7XXX mask isolates the permission bits from any sticky/
+        # setuid bits Posix might add.
+        assert cwd.stat().st_mode & 0o777 == 0o755
+
+    @pytest.mark.asyncio
+    async def test_ensure_extractor_cwd_creates_at_correct_mode(self, tmp_path, monkeypatch):
+        """A non-existent cwd is created at 0o755 on first call."""
+        cwd = tmp_path / "memory" / "extractor_cwd"
+        assert not cwd.exists()
+        monkeypatch.setattr("kai.oneshot._EXTRACTOR_CWD", cwd)
+
+        from kai.oneshot import _ensure_extractor_cwd
+
+        _ensure_extractor_cwd()
+
+        assert cwd.is_dir()
+        assert cwd.stat().st_mode & 0o777 == 0o755
+
+    @pytest.mark.asyncio
+    async def test_codex_schema_temp_file_is_world_readable(self, tmp_path):
+        """`tempfile.NamedTemporaryFile` defaults to 0o600; the
+        reasoner explicitly chmods to 0o644 so the target user can
+        open the schema file via --output-schema."""
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        captured: dict = {}
+
+        def _capture_spawn(*args, **kwargs):
+            i = args.index("--output-schema")
+            captured["path"] = Path(args[i + 1])
+            captured["mode"] = captured["path"].stat().st_mode & 0o777
+            return _make_proc(stdout=b"")
+
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(side_effect=_capture_spawn)),
+            pytest.raises(OneShotOutputError),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
+
+        assert captured["mode"] == 0o644
+
+
+class TestRoutingLogField:
+    """Every outcome line carries `os_user=<target>` or `os_user=self`."""
+
+    @pytest.mark.asyncio
+    async def test_claude_success_log_has_os_user_target(self, tmp_path, caplog):
+        reasoner = ClaudeOneShotReasoner(cwd=tmp_path, os_user="other-user")
+        proc = _make_proc(stdout=b"{}")
+        with (
+            patch("kai.oneshot.resolve_claude_user", return_value="other-user"),
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            caplog.at_level(logging.INFO, logger="kai.oneshot"),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction")
+        msg = next(r.getMessage() for r in caplog.records if r.message.startswith("oneshot_reasoner"))
+        assert "os_user=other-user" in msg
+
+    @pytest.mark.asyncio
+    async def test_claude_success_log_has_os_user_self_on_direct_spawn(self, tmp_path, caplog):
+        reasoner = ClaudeOneShotReasoner(cwd=tmp_path, os_user=None)
+        proc = _make_proc(stdout=b"{}")
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            caplog.at_level(logging.INFO, logger="kai.oneshot"),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction")
+        msg = next(r.getMessage() for r in caplog.records if r.message.startswith("oneshot_reasoner"))
+        assert "os_user=self" in msg

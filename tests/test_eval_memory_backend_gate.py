@@ -946,6 +946,7 @@ class TestCLIInitializesMemory:
                 "output_dir": tmp_path / "out",
                 "user_prefix": "sandbox-test",
                 "backends": ["claude", "codex"],
+                "os_user": "test-target",
                 "reset": True,
                 "keep_sandboxes": False,
                 "qualitative_sample_size": 10,
@@ -966,3 +967,155 @@ class TestCLIInitializesMemory:
         assert rc == 0
         assert "init_memory" in call_order
         assert call_order.index("init_memory") < call_order.index("run_backend")
+
+
+# ── --os-user preflight (issue #503) ────────────────────────────────
+
+
+class TestOsUserPreflight:
+    """The eval gate's `--os-user` is required when the codex arm is
+    in scope, because sandbox user IDs do not resolve to users.yaml
+    entries and the codex memory reasoner refuses to run with
+    `os_user=None`. The preflight rejects the missing-flag case
+    before any model call so the operator gets exit 2 instead of a
+    per-probe routing_error cascade."""
+
+    def _valid_fixture(self, tmp_path: Path) -> Path:
+        rows = []
+        for i in range(10):
+            rows.append(
+                _probe_row(
+                    probe_id=f"d{i}",
+                    category="durable-fact",
+                    expected={
+                        "must_store": [{"anchor_id": f"a{i}", "content_any": [f"c{i}"]}],
+                        "retrieval": [
+                            {"query": f"q{i}", "anchor_id": f"a{i}"},
+                            {"query": f"q2{i}", "anchor_id": f"a{i}"},
+                        ],
+                    },
+                )
+            )
+        for i in range(6):
+            rows.append(
+                _probe_row(
+                    probe_id=f"w{i}",
+                    category="workflow-noise",
+                    expected={"must_not_store": [{"content_any": [f"n{i}"]}]},
+                )
+            )
+        for i in range(4):
+            rows.append(
+                _probe_row(
+                    probe_id=f"c{i}",
+                    category="consolidation",
+                    expected={"consolidation": {"expected_intent": "skip_redundant"}},
+                )
+            )
+        for i in range(2):
+            rows.append(_probe_row(probe_id=f"ep{i}", category="episode-positive", expected={}))
+            rows.append(_probe_row(probe_id=f"en{i}", category="episode-negative", expected={}))
+        path = tmp_path / "probes.jsonl"
+        _write_jsonl(path, rows)
+        return path
+
+    def _args(self, *, probes_path: Path, output_dir: Path, backends: list[str], os_user: str | None) -> object:
+        """Synthetic argparse.Namespace stand-in."""
+        return type(
+            "Args",
+            (),
+            {
+                "probes": probes_path,
+                "output_dir": output_dir,
+                "user_prefix": "sandbox-test",
+                "backends": backends,
+                "os_user": os_user,
+                "reset": True,
+                "keep_sandboxes": False,
+                "qualitative_sample_size": 10,
+                "fail_on_threshold": False,
+                "validate_only": False,
+            },
+        )()
+
+    def test_codex_without_os_user_exits_2(self, tmp_path, capsys):
+        import asyncio
+
+        path = self._valid_fixture(tmp_path)
+        args = self._args(
+            probes_path=path,
+            output_dir=tmp_path / "out",
+            backends=["claude", "codex"],
+            os_user=None,
+        )
+        rc = asyncio.run(g._run_cli(args))
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "--os-user is required" in err
+
+    def test_claude_only_does_not_require_os_user(self, tmp_path, monkeypatch):
+        """If the operator runs only the claude arm, `--os-user` is
+        not required (the claude reasoner falls through to direct
+        spawn for the historical Max-plan installs)."""
+        import asyncio
+        from unittest.mock import patch
+
+        path = self._valid_fixture(tmp_path)
+        args = self._args(
+            probes_path=path,
+            output_dir=tmp_path / "out",
+            backends=["claude"],
+            os_user=None,
+        )
+
+        async def _fake_run_backend(**kwargs):
+            return g.BackendRun(
+                backend=kwargs["backend"],
+                sandbox_user_id=kwargs["sandbox_user_id"],
+                model_fact="m",
+                model_episode="m",
+                log_path=kwargs["log_path"],
+            )
+
+        with (
+            patch("kai.eval.memory_backend_gate.memory.init_memory", lambda _c: None),
+            patch("kai.eval.memory_backend_gate.load_config", return_value=_BASE_CONFIG),
+            patch("kai.eval.memory_backend_gate.run_backend", _fake_run_backend),
+        ):
+            rc = asyncio.run(g._run_cli(args))
+        assert rc == 0
+
+    def test_os_user_flows_into_run_backend(self, tmp_path, monkeypatch):
+        """When `--os-user` is supplied, the value is threaded into
+        `run_backend(..., os_user_override=...)` for both arms."""
+        import asyncio
+        from unittest.mock import patch
+
+        path = self._valid_fixture(tmp_path)
+        args = self._args(
+            probes_path=path,
+            output_dir=tmp_path / "out",
+            backends=["claude", "codex"],
+            os_user="target",
+        )
+
+        captured: list[str | None] = []
+
+        async def _fake_run_backend(**kwargs):
+            captured.append(kwargs.get("os_user_override"))
+            return g.BackendRun(
+                backend=kwargs["backend"],
+                sandbox_user_id=kwargs["sandbox_user_id"],
+                model_fact="m",
+                model_episode="m",
+                log_path=kwargs["log_path"],
+            )
+
+        with (
+            patch("kai.eval.memory_backend_gate.memory.init_memory", lambda _c: None),
+            patch("kai.eval.memory_backend_gate.load_config", return_value=_BASE_CONFIG),
+            patch("kai.eval.memory_backend_gate.run_backend", _fake_run_backend),
+        ):
+            rc = asyncio.run(g._run_cli(args))
+        assert rc == 0
+        assert captured == ["target", "target"]

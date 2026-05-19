@@ -681,6 +681,7 @@ async def run_backend(
     sandbox_user_id: str,
     log_path: Path,
     reset: bool,
+    os_user_override: str | None = None,
 ) -> BackendRun:
     """Drive one backend arm end-to-end.
 
@@ -724,6 +725,7 @@ async def run_backend(
                 prior_fact_ids=prior_fact_ids,
                 prior_episode_ids=prior_episode_ids,
                 log_path=log_path,
+                os_user_override=os_user_override,
             )
             run.probes.append(outcome)
             for fid in outcome.new_fact_ids:
@@ -748,6 +750,7 @@ async def _run_probe(
     prior_fact_ids: set[str],
     prior_episode_ids: set[str],
     log_path: Path,
+    os_user_override: str | None = None,
 ) -> ProbeOutcome:
     """Run extract_and_store for one probe and snapshot the delta.
 
@@ -778,6 +781,7 @@ async def _run_probe(
         user_id=sandbox_user_id,
         config=config,
         prior_pairs=prior_pairs,
+        os_user_override=os_user_override,
     )
     new_tasks = memory_extraction._pending_episode_tasks - pre_episode_tasks
     if new_tasks:
@@ -1877,6 +1881,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Backends to run; default is both.",
     )
     parser.add_argument(
+        "--os-user",
+        default=None,
+        help=(
+            "OS user to run the memory reasoner as via sudo -H -u. "
+            "REQUIRED when 'codex' is in --backends because the codex "
+            "memory reasoner refuses to spawn as the bot process user. "
+            "The eval gate writes to sandbox user IDs that have no "
+            "users.yaml entry, so the resolution path used in "
+            "production (telegram_id -> users.yaml.os_user) yields "
+            "None and the codex reasoner would refuse. Supply this "
+            "flag to override the resolution and route both arms "
+            "through the same OS target."
+        ),
+    )
+    parser.add_argument(
         "--reset",
         action="store_true",
         help="Delete sandbox rows before the run; without it a non-empty sandbox aborts.",
@@ -1922,6 +1941,20 @@ async def _run_cli(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    # Routing preflight: the codex memory reasoner refuses to run
+    # when its os_user is None. Sandbox user IDs do not resolve to
+    # users.yaml entries, so the gate must supply an --os-user
+    # override whenever the codex arm is in scope. Reject the
+    # missing-flag case before any model call so the operator gets
+    # an immediate exit-2 instead of a per-probe routing_error
+    # cascade in the artifacts.
+    if "codex" in args.backends and not args.os_user:
+        print(
+            "error: --os-user is required when 'codex' is in --backends; "
+            "the codex memory reasoner refuses to run as the bot process user",
+            file=sys.stderr,
+        )
+        return 2
     if args.validate_only:
         print(f"fixture ok: {len(probes)} probes, {sum(len(p.retrieval) for p in probes)} retrieval queries")
         return 0
@@ -1958,6 +1991,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 sandbox_user_id=sandbox_user_id,
                 log_path=log_path,
                 reset=args.reset,
+                os_user_override=args.os_user,
             )
         except SystemExit as exc:
             print(f"error: {exc}", file=sys.stderr)
