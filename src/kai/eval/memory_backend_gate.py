@@ -1479,12 +1479,17 @@ def compare_thresholds(claude: BackendMetrics, codex: BackendMetrics) -> Thresho
     # codex misses 3/3 -> FN=3, FN band passes but recall=0).
     #
     # The 0.65 lower bound is deliberately set below the 2/3 = 0.667
-    # achievable value so a backend that hits 2 of 3 positives clears
-    # the floor cleanly. The previous 0.67 bound sat in the literal
-    # impossible region between 2/3 and 3/3, which made the check
-    # decide a backend's fate on floating-point rounding rather than
-    # behavior. The semantic intent (catch a backend that misses every
-    # positive) is preserved: 0/3, 1/3 still fail; 2/3, 3/3 pass.
+    # achievable value so the absolute floor does not sit in the
+    # literal impossible region between 2/3 and 3/3 (where the
+    # previous 0.67 bound lived). When the relative regression term
+    # `claude_recall - 0.25` does not raise the effective floor
+    # above 0.65, a backend that hits 2 of 3 positives clears the
+    # check on the floating-point math instead of failing by 0.0033.
+    # When claude scores high enough that the relative term wins
+    # (e.g. claude=1.0 -> floor=0.75), the codex arm is still held
+    # to no more than a 0.25 absolute drop, so 2/3 against a perfect
+    # baseline correctly fails as a regression rather than a
+    # discrete-bucket pass.
     positive_probe_count = codex.episode_true_positive_count + codex.episode_false_negative_count
     if positive_probe_count >= 3:
         recall_floor = max(0.65, claude.episode_recall - 0.25)
