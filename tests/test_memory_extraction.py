@@ -2048,9 +2048,7 @@ class TestStoreFactsSpeakerPersistence:
                 "speaker": "user",
             }
         ]
-        stored, replaced, _ = _store_facts(
-            facts, user_id="u1", session_id="s1", config=_cfg()
-        )
+        stored, replaced, _ = _store_facts(facts, user_id="u1", session_id="s1", config=_cfg())
         assert (stored, replaced) == (1, 1)
         assert captured["metadata"]["speaker"] == "user"
 
