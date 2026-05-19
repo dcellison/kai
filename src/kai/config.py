@@ -2139,11 +2139,20 @@ def load_config() -> Config:
     # so the operator does not discover this through silently empty
     # memory state.
     #
-    # Two failure modes covered:
+    # The precondition only applies to users whose EFFECTIVE agent
+    # backend is one the runtime would actually invoke extraction
+    # for. `bot.py:3739` gates extraction on
+    # `effective_backend in ("claude", "codex")`; goose users skip
+    # extraction entirely under that gate, so they do not need
+    # `os_user` for codex memory routing. The effective-backend
+    # cascade here mirrors the runtime: the user's per-entry
+    # `agent_backend` wins; otherwise the global default applies.
+    #
+    # Failure modes covered (scoped to extraction-eligible users):
     #   1. users.yaml missing entirely: codex memory cannot be wired
     #      because there is no per-user os_user surface.
-    #   2. users.yaml present but at least one entry lacks os_user:
-    #      that user's extraction never runs.
+    #   2. users.yaml present but at least one extraction-eligible
+    #      entry lacks os_user: that user's extraction never runs.
     #
     # Claude memory does not need this check: ClaudeOneShotReasoner
     # supports a None os_user (the historical Max-plan self-sudo-skip
@@ -2159,14 +2168,22 @@ def load_config() -> Config:
                 "generate users.yaml, or set MEMORY_EXTRACTION_ENABLED=false to "
                 "run with retrieval-only memory."
             )
-        missing = [uc.telegram_id for uc in user_configs.values() if not uc.os_user]
+        # Mirror the runtime's effective-backend cascade: per-user
+        # `agent_backend` wins; otherwise the global default applies.
+        # Only users whose effective backend is one bot.py would
+        # actually run extraction for need an os_user.
+        missing = [
+            uc.telegram_id
+            for uc in user_configs.values()
+            if (uc.agent_backend or agent_backend) in ("claude", "codex") and not uc.os_user
+        ]
         if missing:
             raise SystemExit(
                 "MEMORY_REASONER_BACKEND='codex' with MEMORY_EXTRACTION_ENABLED=true "
-                "requires every users.yaml entry to set 'os_user'. The following "
-                f"chat_ids are missing 'os_user': {sorted(missing)}. Edit users.yaml "
-                "to add an 'os_user' field for each entry (the OS user the codex "
-                "subprocess will run as), or set MEMORY_EXTRACTION_ENABLED=false "
+                "requires every claude/codex users.yaml entry to set 'os_user'. The "
+                f"following chat_ids are missing 'os_user': {sorted(missing)}. Edit "
+                "users.yaml to add an 'os_user' field for each entry (the OS user "
+                "the codex subprocess will run as), or set MEMORY_EXTRACTION_ENABLED=false "
                 "to run with retrieval-only memory."
             )
 

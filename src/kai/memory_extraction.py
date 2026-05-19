@@ -1789,9 +1789,10 @@ async def _run_extractor(
       `asyncio.wait_for` below), which is sufficient: a stuck or
       recursive extractor cannot hold the executor longer than the
       timeout, regardless of how many tokens it has notionally generated.
-      The `memory_extraction_budget_usd` Config field stays defined so
-      non-claude backends - which run on pay-per-token billing and need
-      a real ceiling - can read it through their own dispatch.
+      The `memory_extraction_budget_usd` Config field stays defined as
+      inert compatibility config: both supported reasoners (claude and
+      codex) are subscription-backed in the operator deployment model
+      and no code path forwards the value to subprocess argv.
     - --permission-mode bypassPermissions is acceptable because
       --tools "" leaves nothing to permit or deny.
 

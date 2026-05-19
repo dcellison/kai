@@ -1724,6 +1724,40 @@ class TestCodexMemoryRequiresOsUser:
         config = load_config()
         assert config.memory_reasoner_backend == "claude"
 
+    def test_goose_user_without_os_user_does_not_block_codex_memory(self, tmp_path, monkeypatch):
+        """Mixed-backend deployment: a global codex install where one
+        user has `agent_backend: goose` should not be required to
+        give that goose user an `os_user`. The runtime gate at
+        `bot.py:3739` skips extraction for goose users (effective
+        backend not in claude/codex), so the precondition must
+        mirror the same effective-backend cascade rather than
+        enforce os_user on every entry blindly."""
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            "users:\n"
+            "  - telegram_id: 1\n"
+            "    name: codex_user\n"
+            "    role: admin\n"
+            "    os_user: codex_os\n"
+            "  - telegram_id: 2\n"
+            "    name: goose_user\n"
+            "    role: user\n"
+            "    agent_backend: goose\n"
+            "    llm_provider: openai\n"
+        )
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        # No SystemExit: the goose user is not extraction-eligible.
+        config = load_config()
+        assert config.memory_reasoner_backend == "codex"
+        # Both users load; the precondition skipped chat 2
+        # because its effective backend is goose, not codex.
+        assert 1 in config.user_configs
+        assert 2 in config.user_configs
+
     def test_codex_memory_retrieval_only_skips_precondition(self, monkeypatch):
         """Retrieval-only memory (extraction disabled) does NOT
         require os_user even on codex; the precondition fires only

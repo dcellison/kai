@@ -1213,8 +1213,8 @@ class TestRunEpisodeExtractorWithCodexEnvelope:
             ep, cost_usd, reason = await _run_episode_extractor("payload", config)
 
         assert ep == episode
-        # No total_cost_usd in the envelope -> 0.0 (matches the codex
-        # subscription-auth posture; pay-per-token codex deployments
-        # will populate this differently if they ever land).
+        # No total_cost_usd in the envelope -> 0.0. Codex runs
+        # subscription-backed in the supported deployment model, so
+        # the cost field is informational and reads as zero.
         assert cost_usd == 0.0
         assert reason is None
