@@ -1040,10 +1040,11 @@ class CodexOneShotReasoner:
             # variant that emits an error envelope as its agent_message.
             envelope = json.dumps({"is_error": False, "structured_output": payload})
             log.info(
-                "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=%d outcome=success returncode=0",
+                "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=%d outcome=success returncode=0 os_user=%s",
                 purpose,
                 model,
                 duration_ms,
+                os_user_field,
             )
             return OneShotResult(
                 text=envelope,

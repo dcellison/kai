@@ -1094,6 +1094,39 @@ class TestCodexOneShotReasonerLogging:
         assert "purpose=fact_extraction" in msg
         assert "backend=codex" in msg
         assert "outcome=success" in msg
+        # Schema-backed success is the production memory path; the
+        # routing log field must be present so operator-side log
+        # review can confirm the subprocess ran under the intended
+        # OS user. `os_user=self` here because the direct-spawn
+        # self-sudo-skip case is what `_current_user()` triggers.
+        assert "os_user=self" in msg
+
+    @pytest.mark.asyncio
+    async def test_log_line_carries_target_os_user_on_wrapped_success(self, tmp_path, caplog):
+        """The cross-user wrap path's schema-backed success log
+        emits `os_user=<target>` (not `self`), so a production
+        codex memory run can be greppable for the routing target
+        per the operator smoke check. Regression test for the
+        log-field gap caught in PR #504 review round 1."""
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user="other-user")
+        proc = _make_proc(stdout=_codex_envelope_ndjson({"ok": True}), returncode=0)
+
+        with (
+            patch("kai.oneshot.resolve_claude_user", return_value="other-user"),
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            caplog.at_level(logging.INFO, logger="kai.oneshot"),
+        ):
+            await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema={"type": "object"},
+            )
+
+        records = [r for r in caplog.records if r.message.startswith("oneshot_reasoner")]
+        assert len(records) == 1
+        msg = records[0].getMessage()
+        assert "outcome=success" in msg
+        assert "os_user=other-user" in msg
 
     @pytest.mark.asyncio
     async def test_log_line_carries_returncode_on_subprocess_error(self, tmp_path, caplog):
