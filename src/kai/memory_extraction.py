@@ -2319,8 +2319,25 @@ def _store_facts(
 
         # Build the metadata bundle once; the same shape applies to
         # both the `new` and `update_of` branches that call add_structured.
+        #
+        # `speaker` is required by the fact schema; the structured-output
+        # validator guarantees it is present on any fact that reaches
+        # this function in production, and `_validate_facts` runs a
+        # confirmation_quote-based override that may force it to
+        # "assistant". Persisting it here is what lets downstream
+        # readers distinguish user-asserted from assistant-asserted
+        # facts. Without this copy, the row lands with no
+        # `metadata.speaker` and `_read_time_speaker` silently falls
+        # through to the legacy "assistant" default for every extracted
+        # fact regardless of the model's attribution. That was the
+        # state production was in before this line existed. The `or`
+        # fallback matches that legacy default so a fact dict that
+        # bypassed validation (e.g. in a unit-test shim) lands in the
+        # same state it would have before the fix, rather than
+        # KeyError-ing the storage path.
         extra: dict = {
             "source": "extracted",
+            "speaker": fact.get("speaker") or "assistant",
             "confidence": fact.get("confidence"),
             "session_id": session_id or "",
             "prompt_version": _EXTRACTION_PROMPT_VERSION,

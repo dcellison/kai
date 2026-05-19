@@ -1964,6 +1964,97 @@ class TestStoreFactsIntent:
         assert payload["outcome"] == "skipped"
 
 
+# ── _store_facts: speaker persistence ───────────────────────────────
+
+
+class TestStoreFactsSpeakerPersistence:
+    """Regression: `_store_facts` must copy `fact["speaker"]` into the
+    metadata bundle passed to `add_structured`. Before the fix, the
+    extractor's per-fact speaker attribution was dropped on the floor
+    at storage time; every extracted row landed with no
+    `metadata.speaker`, and the read-time helper masked the bug by
+    falling through to the legacy "assistant" default. The gate's
+    direct `metadata.get("speaker")` read surfaced the gap as a
+    uniformly-zero speaker_accuracy across both backends in #498's
+    first clean run."""
+
+    def test_new_branch_persists_user_speaker(self, monkeypatch):
+        """User-asserted fact lands with metadata.speaker == "user". The
+        new branch passes through _paraphrase_neighbor when memory is
+        enabled, so wire that to "no neighbor found" and capture the
+        metadata kwarg add_structured receives."""
+        monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
+        monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [])
+        captured: dict = {}
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda content, **kw: captured.update(kw) or "new-id",
+        )
+        facts = [
+            {
+                "content": "User prefers black coffee.",
+                "tags": ["preference"],
+                "confidence": 0.9,
+                "intent": "new",
+                "speaker": "user",
+            }
+        ]
+        stored, _, _ = _store_facts(facts, user_id="u1", session_id="s1", config=_cfg())
+        assert stored == 1
+        assert captured["metadata"]["speaker"] == "user"
+
+    def test_new_branch_persists_assistant_speaker(self, monkeypatch):
+        """Assistant-attributed fact lands with metadata.speaker ==
+        "assistant" - the value the confirmation_quote override in
+        _validate_facts may force. Same shape as the user case."""
+        monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
+        monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [])
+        captured: dict = {}
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda content, **kw: captured.update(kw) or "new-id",
+        )
+        facts = [
+            {
+                "content": "Reminder set for Monday.",
+                "tags": ["confirmed_action"],
+                "confidence": 0.9,
+                "intent": "new",
+                "speaker": "assistant",
+            }
+        ]
+        stored, _, _ = _store_facts(facts, user_id="u1", session_id="s1", config=_cfg())
+        assert stored == 1
+        assert captured["metadata"]["speaker"] == "assistant"
+
+    def test_update_of_branch_persists_speaker(self, monkeypatch):
+        """The update_of branch builds the metadata bundle from the same
+        code as the new branch; cover it explicitly so a future
+        refactor that diverges the two branches cannot silently
+        regress speaker persistence on consolidation writes."""
+        monkeypatch.setattr("kai.memory_extraction.memory.delete_by_id", lambda **kw: True)
+        captured: dict = {}
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda content, **kw: captured.update(kw) or "new-id",
+        )
+        facts = [
+            {
+                "content": "User now in Pacific time.",
+                "tags": ["preference", "timezone"],
+                "confidence": 0.9,
+                "intent": "update_of",
+                "existing_id": "old-id",
+                "speaker": "user",
+            }
+        ]
+        stored, replaced, _ = _store_facts(
+            facts, user_id="u1", session_id="s1", config=_cfg()
+        )
+        assert (stored, replaced) == (1, 1)
+        assert captured["metadata"]["speaker"] == "user"
+
+
 # ── extract_and_store: end-to-end consolidation ─────────────────────
 
 
