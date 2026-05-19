@@ -144,6 +144,53 @@ class TestSmokeMemorySuccess:
         assert "verdict: pass" not in out
 
 
+class TestSmokeMemoryProductionMode:
+    """The smoke claims to verify the memory extraction pipeline
+    end-to-end. Running the reasoner against a fixed payload when
+    production has memory disabled or extraction disabled produces a
+    false-positive 'pass' for a path that never fires on real
+    traffic. The smoke refuses to run in those configurations."""
+
+    @pytest.mark.asyncio
+    async def test_memory_disabled_exits_nonzero(self, monkeypatch, capsys):
+        """MEMORY_ENABLED=false: smoke must refuse, name the var, and
+        not invoke the reasoner."""
+        from kai.smoke import memory as smoke_module
+
+        monkeypatch.setattr(smoke_module, "load_config", lambda: _config(memory_enabled=False))
+
+        def fail_factory(*args, **kwargs):
+            pytest.fail("reasoner must not run when memory is disabled")
+
+        monkeypatch.setattr(smoke_module, "_get_memory_reasoner", fail_factory)
+        rc = await smoke_module._run(os_user=None)
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "MEMORY_ENABLED" in captured.err
+
+    @pytest.mark.asyncio
+    async def test_extraction_disabled_exits_nonzero(self, monkeypatch, capsys):
+        """Retrieval-only mode (MEMORY_ENABLED=true with extraction
+        disabled): smoke must refuse rather than print verdict:pass
+        against a path that will never fire on real traffic."""
+        from kai.smoke import memory as smoke_module
+
+        monkeypatch.setattr(
+            smoke_module,
+            "load_config",
+            lambda: _config(memory_extraction_enabled=False),
+        )
+
+        def fail_factory(*args, **kwargs):
+            pytest.fail("reasoner must not run when extraction is disabled")
+
+        monkeypatch.setattr(smoke_module, "_get_memory_reasoner", fail_factory)
+        rc = await smoke_module._run(os_user=None)
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "MEMORY_EXTRACTION_ENABLED" in captured.err
+
+
 class TestSmokeMemoryRoutingPrecondition:
     @pytest.mark.asyncio
     async def test_codex_without_os_user_exits_with_message(self, monkeypatch, capsys):

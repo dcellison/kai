@@ -1645,6 +1645,99 @@ class TestMemoryReasonerBinaryValidation:
         assert called == []
 
 
+class TestCodexMemoryRequiresOsUser:
+    """The codex reasoner refuses to spawn without an `os_user` (the
+    security boundary that keeps codex from running as the bot user).
+    Config-load enforces the precondition: a wizard-generated config
+    that enables codex memory without per-user os_user entries fails
+    fast instead of silently no-opping every extraction at runtime."""
+
+    def test_no_users_yaml_raises_systemexit(self, monkeypatch):
+        """ALLOWED_USER_IDS without users.yaml does not expose an
+        os_user surface at all. Codex memory cannot be wired in this
+        configuration; SystemExit at config-load."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        with pytest.raises(SystemExit) as exc:
+            load_config()
+        msg = str(exc.value)
+        assert "users.yaml" in msg
+        assert "os_user" in msg
+        assert "codex" in msg
+
+    def test_users_yaml_with_os_user_passes(self, tmp_path, monkeypatch):
+        """The happy path: users.yaml with a per-user os_user entry
+        for every authorized chat_id. Config-load completes; codex
+        memory is wired."""
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: alice_os\n"
+        )
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        config = load_config()
+        assert config.memory_reasoner_backend == "codex"
+        assert config.user_configs is not None
+        assert config.user_configs[12345].os_user == "alice_os"
+
+    def test_users_yaml_with_missing_os_user_raises_systemexit(self, tmp_path, monkeypatch):
+        """At least one users.yaml entry without os_user must fail
+        config-load. The error names the offending chat_id so the
+        operator can find the entry to fix."""
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            "users:\n"
+            "  - telegram_id: 12345\n"
+            "    name: alice\n"
+            "    role: admin\n"
+            "    os_user: alice_os\n"
+            "  - telegram_id: 67890\n"
+            "    name: bob\n"
+            "    role: user\n"
+        )
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        with pytest.raises(SystemExit) as exc:
+            load_config()
+        msg = str(exc.value)
+        assert "67890" in msg
+        assert "12345" not in msg  # alice has os_user; should not appear
+        assert "os_user" in msg
+
+    def test_claude_memory_does_not_require_os_user(self, monkeypatch):
+        """ClaudeOneShotReasoner accepts os_user=None (Max-plan
+        self-sudo-skip path), so claude memory does NOT require
+        users.yaml. The precondition applies only to codex."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "claude")
+        # No users.yaml; ALLOWED_USER_IDS-only. Claude is fine here.
+        config = load_config()
+        assert config.memory_reasoner_backend == "claude"
+
+    def test_codex_memory_retrieval_only_skips_precondition(self, monkeypatch):
+        """Retrieval-only memory (extraction disabled) does NOT
+        require os_user even on codex; the precondition fires only
+        when extraction is actually enabled."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        # MEMORY_EXTRACTION_ENABLED unset = retrieval-only.
+        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        # No users.yaml; precondition should not fire.
+        config = load_config()
+        assert config.memory_enabled is True
+        assert config.memory_extraction_enabled is False
+
+
 class TestMemoryReasonerModelResolution:
     """Memory model defaults resolve through the per-backend role
     registry. Claude rows match the existing literal so installs that

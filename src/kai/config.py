@@ -778,14 +778,14 @@ class Config:
     # stays because test fixtures construct Config directly and
     # depend on a usable Claude default without going through env.
     memory_extraction_model: str = "claude-haiku-4-5-20251001"
-    # Per-call budget ceiling. Omitted from claude --print argv on the
-    # claude backend (Max-plan OAuth makes the CLI's computed-cost
-    # ceiling a phantom signal; runaway protection comes from
-    # memory_extraction_timeout_s instead). Field stays defined for
-    # non-claude backends, which run on pay-per-token billing where
-    # the ceiling is a real cost gate, and so operators upgrading a
-    # deployment with MEMORY_EXTRACTION_BUDGET_USD already set in
-    # /etc/kai/env do not see a startup error after upgrade.
+    # Per-call budget ceiling. Retained as inert compatibility config.
+    # Both supported memory reasoners (claude and codex) are
+    # subscription-backed in the operator deployment model and no code
+    # path forwards this value to subprocess argv. Runaway protection
+    # comes from memory_extraction_timeout_s instead. The field stays
+    # in the dataclass so operators upgrading from a deployment with
+    # MEMORY_EXTRACTION_BUDGET_USD already set in /etc/kai/env do not
+    # see a startup error after upgrade.
     memory_extraction_budget_usd: float = 0.01
     # Timeout (seconds) for a single extraction subprocess. Haiku
     # typically finishes in 2-4s; 10s gives headroom without stranding
@@ -841,19 +841,14 @@ class Config:
     # is never the effective value. Test fixtures that construct Config
     # directly should set this explicitly to a real model name.
     memory_episode_model: str = ""
-    # Per-call budget ceiling (USD). Omitted from claude --print argv
-    # on the claude backend (Max-plan OAuth makes the CLI's
-    # computed-cost ceiling a phantom signal; runaway protection comes
-    # from memory_episode_timeout_s instead). Field stays defined for
-    # non-claude backends, which run on pay-per-token billing where
-    # the ceiling is a real cost gate, and so operators upgrading a
-    # deployment with MEMORY_EPISODE_BUDGET_USD already set in
-    # /etc/kai/env do not see a startup error after upgrade. Default
-    # 0.15 is sized for a Sonnet-class model on the FULL uncapped
-    # (user, assistant) pair; stage 2 deliberately bypasses stage-1's
-    # 500-char assistant cap. Operators downgrading memory_episode_model
-    # to Haiku can drop this to 0.05 or lower; the wizard recommends
-    # 0.15 as the default for non-claude backends.
+    # Per-call budget ceiling (USD). Retained as inert compatibility
+    # config. Same rationale as memory_extraction_budget_usd above:
+    # both supported reasoners are subscription-backed and no code
+    # path forwards this value to subprocess argv. Runaway protection
+    # comes from memory_episode_timeout_s instead. The field stays in
+    # the dataclass so operators upgrading from a deployment with
+    # MEMORY_EPISODE_BUDGET_USD already set in /etc/kai/env do not see
+    # a startup error after upgrade.
     memory_episode_budget_usd: float = 0.15
     # Subprocess timeout (seconds). Default 120 - twice the production-
     # tuned stage-1 value (60s) and 12x the stage-1 dataclass default
@@ -2134,6 +2129,46 @@ def load_config() -> Config:
         # ALLOWED_USER_IDS is valid and no users.yaml exists. This works
         # but is the legacy path - nudge toward users.yaml.
         log.info("Using ALLOWED_USER_IDS from env (legacy). Run 'make config' to migrate to users.yaml.")
+
+    # Codex memory routing precondition. The codex reasoner refuses to
+    # spawn without an `os_user` (the security boundary that keeps
+    # codex from running as the bot user). The runtime resolver reads
+    # `os_user` from users.yaml per chat_id; if the entry is missing
+    # or unset, extraction silently collapses to a zero-state miss
+    # every turn. Fail at config-load with a clear remediation hint
+    # so the operator does not discover this through silently empty
+    # memory state.
+    #
+    # Two failure modes covered:
+    #   1. users.yaml missing entirely: codex memory cannot be wired
+    #      because there is no per-user os_user surface.
+    #   2. users.yaml present but at least one entry lacks os_user:
+    #      that user's extraction never runs.
+    #
+    # Claude memory does not need this check: ClaudeOneShotReasoner
+    # supports a None os_user (the historical Max-plan self-sudo-skip
+    # path that spawns claude as the bot user), so claude extraction
+    # still works without per-user OS routing.
+    if memory_extraction_enabled and memory_reasoner_backend == "codex":
+        if user_configs is None:
+            raise SystemExit(
+                "MEMORY_REASONER_BACKEND='codex' with MEMORY_EXTRACTION_ENABLED=true "
+                "requires users.yaml with a per-user 'os_user' entry for every "
+                "authorized chat_id. ALLOWED_USER_IDS alone does not provide the "
+                "OS-user routing the codex reasoner needs. Run 'make config' to "
+                "generate users.yaml, or set MEMORY_EXTRACTION_ENABLED=false to "
+                "run with retrieval-only memory."
+            )
+        missing = [uc.telegram_id for uc in user_configs.values() if not uc.os_user]
+        if missing:
+            raise SystemExit(
+                "MEMORY_REASONER_BACKEND='codex' with MEMORY_EXTRACTION_ENABLED=true "
+                "requires every users.yaml entry to set 'os_user'. The following "
+                f"chat_ids are missing 'os_user': {sorted(missing)}. Edit users.yaml "
+                "to add an 'os_user' field for each entry (the OS user the codex "
+                "subprocess will run as), or set MEMORY_EXTRACTION_ENABLED=false "
+                "to run with retrieval-only memory."
+            )
 
     # Deprecation warnings for env vars superseded by users.yaml.
     # The vars still work as global fallbacks, but users.yaml is the

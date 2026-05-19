@@ -69,6 +69,31 @@ async def _run(os_user: str | None) -> int:
     messages are logged at WARNING; the operator sees them in the
     terminal output."""
     config = load_config()
+
+    # Production-mode precondition. The smoke claims to verify the
+    # memory extraction pipeline end-to-end; running the reasoner
+    # against a fixed payload when production has memory disabled or
+    # extraction disabled produces a false-positive "pass" for a path
+    # that will never fire on real traffic. Refuse to run in those
+    # configurations rather than print a misleading verdict.
+    if not config.memory_enabled:
+        sys.stderr.write(
+            "smoke: MEMORY_ENABLED is false; memory extraction is not configured to run "
+            "in production. The smoke would exercise the reasoner against a fixed payload "
+            "but that result does not reflect production behavior. Enable memory in the "
+            "wizard before running the smoke.\n"
+        )
+        return 1
+    if not config.memory_extraction_enabled:
+        sys.stderr.write(
+            "smoke: MEMORY_EXTRACTION_ENABLED is false (retrieval-only mode); memory "
+            "extraction is not configured to run in production. The smoke verifies the "
+            "extraction pipeline; for retrieval-only installs, exercise retrieval via "
+            "the /memory commands instead. Enable extraction in the wizard to run the "
+            "smoke.\n"
+        )
+        return 1
+
     if config.memory_reasoner_backend == "codex" and not os_user:
         sys.stderr.write(
             "smoke: --os-user is required when memory_reasoner_backend=codex; "

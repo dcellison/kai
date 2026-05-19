@@ -2192,7 +2192,7 @@ class TestCmdConfig:
         # Extraction config is also absent on goose retrieval-only.
         assert "MEMORY_EXTRACTION_ENABLED" not in env
 
-    def test_codex_install_accept_all_defaults_yields_load_config_compatible_env(self, monkeypatch):
+    def test_codex_install_accept_all_defaults_yields_load_config_compatible_env(self, tmp_path, monkeypatch):
         """v6 catch-all regression: a codex install that accepts every
         wizard default for memory must produce an env block that
         load_config accepts without raising. Pins the entire 'wizard
@@ -2218,6 +2218,14 @@ class TestCmdConfig:
             "kai.oneshot_binary.resolve_oneshot_binary",
             lambda backend: f"/fake/{backend}",
         )
+        # users.yaml is required for codex memory (config-load
+        # validates the per-user os_user precondition). The wizard
+        # builds this alongside the env block; here we set up a
+        # minimal users.yaml inline so the test focuses on the
+        # memory env contract.
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 1\n    name: tester\n    role: admin\n    os_user: tester_os\n")
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
         # Pin protected-env / dotenv to be inert. Without this,
         # load_config reads /etc/kai/env (when present on the dev
         # box) and `os.environ.setdefault` populates the process env
