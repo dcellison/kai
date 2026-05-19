@@ -439,7 +439,7 @@ class TestCompareThresholds:
         Setup: 3 episode-positive probes. Claude misses 2 (TP=1,
         FN=2, recall=0.33). Codex misses 3 (TP=0, FN=3, recall=0.0).
         FN band: codex_FN (3) <= claude_FN (2) + 1 = 3, passes.
-        Recall floor: max(0.67, 0.33 - 0.25) = 0.67, codex (0.0)
+        Recall floor: max(0.65, 0.33 - 0.25) = 0.65, codex (0.0)
         fails. The check is what flips the verdict."""
         claude = _clean_metrics(
             episode_true_positive_count=1,
@@ -457,6 +457,26 @@ class TestCompareThresholds:
         # The FN-count band still passes; this is the key point of the
         # finding - the recall floor is not redundant with the FN band.
         assert "T6.episode_false_negative" not in failed
+
+    def test_recall_floor_passes_two_thirds_with_three_positives(self):
+        """Regression for the floor's lower bound. With 3 episode-
+        positive probes and both arms at 2/3 = 0.667, T6.episode_recall
+        must pass. A previous floor of 0.67 sat in the impossible
+        region between 2/3 and 3/3 and decided a backend on floating-
+        point rounding rather than behavior."""
+        claude = _clean_metrics(
+            episode_true_positive_count=2,
+            episode_false_negative_count=1,
+            episode_recall=2 / 3,
+        )
+        codex = _clean_metrics(
+            episode_true_positive_count=2,
+            episode_false_negative_count=1,
+            episode_recall=2 / 3,
+        )
+        report = g.compare_thresholds(claude, codex)
+        failed = [c.name for c in report.checks if not c.passed]
+        assert "T6.episode_recall" not in failed
 
     def test_recall_floor_not_evaluated_below_three_positives(self):
         """With only 2 episode-positive probes the recall floor does

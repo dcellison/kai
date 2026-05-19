@@ -1477,9 +1477,17 @@ def compare_thresholds(claude: BackendMetrics, codex: BackendMetrics) -> Thresho
     # positive while the baseline already missed enough that the
     # FN band stays satisfied (e.g. claude misses 2/3 -> FN=2,
     # codex misses 3/3 -> FN=3, FN band passes but recall=0).
+    #
+    # The 0.65 lower bound is deliberately set below the 2/3 = 0.667
+    # achievable value so a backend that hits 2 of 3 positives clears
+    # the floor cleanly. The previous 0.67 bound sat in the literal
+    # impossible region between 2/3 and 3/3, which made the check
+    # decide a backend's fate on floating-point rounding rather than
+    # behavior. The semantic intent (catch a backend that misses every
+    # positive) is preserved: 0/3, 1/3 still fail; 2/3, 3/3 pass.
     positive_probe_count = codex.episode_true_positive_count + codex.episode_false_negative_count
     if positive_probe_count >= 3:
-        recall_floor = max(0.67, claude.episode_recall - 0.25)
+        recall_floor = max(0.65, claude.episode_recall - 0.25)
         checks.append(
             ThresholdCheck(
                 name="T6.episode_recall",
