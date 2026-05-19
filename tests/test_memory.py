@@ -165,6 +165,7 @@ class TestInitMemory:
             "extraction_binary": None,
         }
 
+    @integration
     def test_init_retrieval_only_emits_null_extraction_binary(self, caplog, tmp_path, monkeypatch):
         """Retrieval-only memory (MEMORY_ENABLED=true with extraction
         disabled) MUST NOT call the resolver: the resolver call is
@@ -207,6 +208,7 @@ class TestInitMemory:
         # Critical contract: resolver MUST NOT have been called.
         assert called == [], f"resolver was invoked on retrieval-only init: {called}"
 
+    @integration
     def test_init_extraction_enabled_resolves_binary_in_log(self, caplog, tmp_path, monkeypatch):
         """When extraction is enabled, init_memory calls the resolver
         and writes the resolved path into the `extraction_binary`
