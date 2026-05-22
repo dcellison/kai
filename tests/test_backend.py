@@ -1444,3 +1444,288 @@ class TestApplyWorkspaceModel:
             result = apply_workspace_model(wc, "claude", "anthropic", "sonnet")
         assert result == "sonnet"
         assert any("Ignoring workspace model override" in r.message for r in caplog.records)
+
+
+# ── Backend-neutral per-turn context assembly (#516) ────────────────
+
+
+class TestExtractTextQuery:
+    """Tests for the raw user-text extraction used as the memory search query.
+
+    The query must come from the original prompt BEFORE any context is
+    prepended; if the helper saw the post-injection prompt, the embedding
+    would be dominated by CLAUDE.md/MEMORY.md/history/API docs and
+    fresh-session retrieval would be essentially random.
+    """
+
+    def test_string_prompt_returns_full_text(self):
+        from kai.backend import extract_text_query
+
+        assert extract_text_query("Hello there") == "Hello there"
+
+    def test_empty_string_returns_empty(self):
+        from kai.backend import extract_text_query
+
+        assert extract_text_query("") == ""
+
+    def test_list_prompt_returns_first_text_block(self):
+        from kai.backend import extract_text_query
+
+        prompt = [
+            {"type": "image", "path": "/tmp/example.png"},
+            {"type": "text", "text": "Describe this."},
+        ]
+        assert extract_text_query(prompt) == "Describe this."
+
+    def test_list_prompt_no_text_block_returns_empty(self):
+        from kai.backend import extract_text_query
+
+        prompt = [{"type": "image", "path": "/tmp/example.png"}]
+        assert extract_text_query(prompt) == ""
+
+    def test_list_prompt_skips_malformed_entries(self):
+        """A block whose `text` field is not a string (or that is missing
+        the `type` key entirely) must not crash the helper. Pre-fix the
+        loose `next(...)` form would have raised KeyError or returned a
+        non-string; the defensive `isinstance` checks skip the bad entry
+        and fall through to the next candidate.
+        """
+        from kai.backend import extract_text_query
+
+        prompt = [
+            {"type": "text"},  # missing 'text' key
+            {"type": "text", "text": None},  # wrong type
+            {"type": "text", "text": "real text"},
+        ]
+        assert extract_text_query(prompt) == "real text"
+
+
+class TestAssembleTurnContext:
+    """Tests for the composed per-turn prompt assembly contract.
+
+    The ordering invariant is the contract: marker closest to user text,
+    then session_context, then memory, then workspace_reminder, with the
+    inverse of that order applied via repeated prepends. Backends that
+    re-implement this locally are exactly the failure mode the helper
+    exists to prevent; these tests pin the invariant at the helper level
+    so a future backend wire-up has a one-line integration target.
+    """
+
+    async def test_string_prompt_full_ordering(self, monkeypatch):
+        """All four context layers present, string prompt. Final reading
+        order must be reminder, memory, session, marker, user text, with
+        only whitespace separating the marker and the user message.
+        """
+        from kai.backend import USER_MESSAGE_MARKER, assemble_turn_context
+
+        async def fake_format_context(query, *, user_id, **kwargs):
+            return "[Relevant memories]\n- fact one"
+
+        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        result = await assemble_turn_context(
+            "ACTUAL_USER_TEXT",
+            chat_id=42,
+            session_context="[SESSION]",
+            workspace_reminder="[REMINDER]",
+        )
+        assert isinstance(result, str)
+        assert result.count(USER_MESSAGE_MARKER) == 1
+        # Inverse-prepend ordering: each subsequent layer lands above
+        # the previous one, so the final reading order from top to
+        # bottom is reminder, memory, session, marker, user text.
+        positions = [
+            result.index("[REMINDER]"),
+            result.index("[Relevant memories]"),
+            result.index("[SESSION]"),
+            result.index(USER_MESSAGE_MARKER),
+            result.index("ACTUAL_USER_TEXT"),
+        ]
+        assert positions == sorted(positions), positions
+        # Only whitespace between the marker and the user message.
+        marker_end = result.index(USER_MESSAGE_MARKER) + len(USER_MESSAGE_MARKER)
+        user_start = result.index("ACTUAL_USER_TEXT")
+        assert result[marker_end:user_start].strip() == "", repr(result[marker_end:user_start])
+
+    async def test_format_context_receives_raw_query(self, monkeypatch):
+        """The search query handed to format_context is the original user
+        text, not the post-prepend prompt. Pre-fix-shape regression: if
+        the helper extracted the query after session_context was applied,
+        the embedding would be dominated by CLAUDE.md/history/API docs.
+        """
+        from kai.backend import assemble_turn_context
+
+        captured: dict = {}
+
+        async def fake_format_context(query, *, user_id, **kwargs):
+            captured["query"] = query
+            captured["user_id"] = user_id
+            return ""
+
+        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        await assemble_turn_context(
+            "ACTUAL_USER_TEXT",
+            chat_id=42,
+            session_context="[10KB of CLAUDE.md and history]",
+            workspace_reminder="",
+        )
+        assert captured["query"] == "ACTUAL_USER_TEXT"
+        assert captured["user_id"] == "42"
+
+    async def test_no_memory_block_still_preserves_marker(self, monkeypatch):
+        """When format_context returns the empty string (memory disabled
+        or no relevant hits), the marker must still appear and remain
+        the closest prefix to the user text.
+        """
+        from kai.backend import USER_MESSAGE_MARKER, assemble_turn_context
+
+        async def fake_format_context(query, *, user_id, **kwargs):
+            return ""
+
+        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        result = await assemble_turn_context(
+            "user message",
+            chat_id=42,
+            session_context="",
+            workspace_reminder="",
+        )
+        assert isinstance(result, str)
+        assert result.count(USER_MESSAGE_MARKER) == 1
+        marker_end = result.index(USER_MESSAGE_MARKER) + len(USER_MESSAGE_MARKER)
+        user_start = result.index("user message")
+        assert result[marker_end:user_start].strip() == ""
+
+    async def test_chat_id_none_skips_recall(self, monkeypatch):
+        """chat_id=None must NOT call format_context. An empty or fake
+        user_id would search across all users, which is a data isolation
+        risk if a future memory implementation changes filtering
+        semantics. The marker still applies.
+        """
+        from kai.backend import USER_MESSAGE_MARKER, assemble_turn_context
+
+        called = False
+
+        async def fake_format_context(query, *, user_id, **kwargs):
+            nonlocal called
+            called = True
+            return "[Relevant memories]"
+
+        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        result = await assemble_turn_context(
+            "user message",
+            chat_id=None,
+            session_context="",
+            workspace_reminder="",
+        )
+        assert not called
+        assert USER_MESSAGE_MARKER in result
+
+    async def test_whitespace_query_skips_recall(self, monkeypatch):
+        """An empty or whitespace-only query produces arbitrary
+        embedding hits; the gate must skip the call entirely rather
+        than rely on format_context's own empty-query guard. The
+        marker still applies.
+        """
+        from kai.backend import USER_MESSAGE_MARKER, assemble_turn_context
+
+        called = False
+
+        async def fake_format_context(query, *, user_id, **kwargs):
+            nonlocal called
+            called = True
+            return "[Relevant memories]"
+
+        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        result = await assemble_turn_context(
+            "   ",
+            chat_id=42,
+            session_context="",
+            workspace_reminder="",
+        )
+        assert not called
+        assert USER_MESSAGE_MARKER in result
+
+    async def test_list_prompt_preserves_original_block_order(self, monkeypatch):
+        """List prompts get text prefixes inserted at the front; original
+        content blocks (e.g. an image followed by a text block) must
+        keep their relative order, and the memory query extraction must
+        find the original text block, not an injected one.
+        """
+        from kai.backend import USER_MESSAGE_MARKER, assemble_turn_context
+
+        captured: dict = {}
+
+        async def fake_format_context(query, *, user_id, **kwargs):
+            captured["query"] = query
+            return ""
+
+        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        original = [
+            {"type": "image", "path": "/tmp/example.png"},
+            {"type": "text", "text": "Describe this."},
+        ]
+        result = await assemble_turn_context(
+            original,
+            chat_id=42,
+            session_context="",
+            workspace_reminder="",
+        )
+        assert isinstance(result, list)
+        assert captured["query"] == "Describe this."
+        # Injected text-prefix blocks (the marker) come at the front;
+        # original image + text remain in order at the tail.
+        marker_block = next(
+            i for i, b in enumerate(result) if b.get("type") == "text" and b.get("text") == USER_MESSAGE_MARKER
+        )
+        image_block = next(i for i, b in enumerate(result) if b.get("type") == "image")
+        original_text_block = next(
+            i for i, b in enumerate(result) if b.get("type") == "text" and b.get("text") == "Describe this."
+        )
+        assert marker_block < image_block < original_text_block
+
+    async def test_list_prompt_no_text_skips_recall(self, monkeypatch):
+        """An image-only list prompt has no text query, so recall must
+        be skipped. The marker still applies as a text-prefix block.
+        """
+        from kai.backend import USER_MESSAGE_MARKER, assemble_turn_context
+
+        called = False
+
+        async def fake_format_context(query, *, user_id, **kwargs):
+            nonlocal called
+            called = True
+            return ""
+
+        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        original = [{"type": "image", "path": "/tmp/example.png"}]
+        result = await assemble_turn_context(
+            original,
+            chat_id=42,
+            session_context="",
+            workspace_reminder="",
+        )
+        assert not called
+        # Marker present as a text-prefix block at the front.
+        assert any(b.get("type") == "text" and b.get("text") == USER_MESSAGE_MARKER for b in result)
+
+    async def test_format_context_called_once_per_eligible_turn(self, monkeypatch):
+        """format_context must be called exactly once per eligible turn;
+        the helper does not retry or fan out. The single-call contract
+        keeps the `memory.recall` log line count predictable.
+        """
+        from kai.backend import assemble_turn_context
+
+        call_count = 0
+
+        async def fake_format_context(query, *, user_id, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return "[Relevant memories]"
+
+        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        await assemble_turn_context(
+            "user message",
+            chat_id=42,
+            session_context="",
+            workspace_reminder="",
+        )
+        assert call_count == 1

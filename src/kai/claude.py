@@ -33,35 +33,15 @@ from kai.backend import (
     ApiContext,
     StreamEvent,
     apply_workspace_model,
+    assemble_turn_context,
     build_foreign_workspace_reminder,
     build_session_context,
     ensure_user_memory,
     ensure_user_preferences,
-    prepend_to_prompt,
 )
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
 
 log = logging.getLogger(__name__)
-
-
-# Persistent structural delimiter for the current user message. Spec
-# 360 §1.2 / §3.3: when retrieval blocks contain quote-shaped lines
-# that mimic real user input (legacy `User said:` rows or sufficiently
-# user-voiced extracted facts), the inner agent can fail to recognize
-# the trailing user text as the actual message. This marker is the
-# one structural signal that says "the message below this line is
-# the real one — respond to it." Module-level so tests can import
-# and assert against it without string duplication.
-#
-# Bracket-label format chosen to match the visual shape of the other
-# context blocks (`[Recent conversations ...]`, `[Your persistent
-# memory ...]`, `[Relevant memories ...]`) without colliding with any
-# of them — a retrieval row could in principle contain any of those
-# header strings verbatim, but cannot accidentally produce this exact
-# label. NOT gated by a feature flag: spec §5.1 requires the marker
-# to be a permanent fixture so prompt shape is consistent
-# session-to-session.
-USER_MESSAGE_MARKER = "[User's current message - respond to this:]"
 
 
 # ── Claude Code backend ─────────────────────────────────────────────
@@ -770,65 +750,36 @@ class ClaudeCodeBackend(AgentBackend):
             )
             return
 
-        # Capture the user's original message text for memory search
-        # BEFORE session context is prepended. On fresh sessions,
-        # prepend_to_prompt adds CLAUDE.md + MEMORY.md + history + API
-        # docs (~10-20KB) which would dominate the embedding vector and
-        # make the first message's memory retrieval essentially random.
-        if isinstance(prompt, str):
-            search_query = prompt
-        else:
-            search_query = next(
-                (block["text"] for block in prompt if block.get("type") == "text"),
-                "",
-            )
-
-        # Persistent structural delimiter for the current user message.
-        # Prepended FIRST in the chain so subsequent prepends (session,
-        # memory, reminder) stack ABOVE it in the assembled prompt,
-        # leaving the marker as the closest prefix to the user's
-        # actual text.
+        # Per-turn prompt context. Build the fresh-session bootstrap
+        # (MEMORY.md / PREFERENCES.md seed + session_context block)
+        # and the foreign-workspace reminder LOCALLY, then hand both
+        # to `assemble_turn_context` so the shared helper owns the
+        # ordering invariant (marker closest to user text, session/
+        # memory/reminder stacked above in that order).
         #
-        # This ordering is load-bearing and the most common way to
-        # break the spec 360 fix: `prepend_to_prompt` is a pure
-        # prefix-prepend, so calling it for the marker LAST in the
-        # chain would put the marker at the TOP of the assembled
-        # prompt — the exact opposite of the invariant. The order of
-        # the prepends below is the inverse of the final reading
-        # order. See spec 360 §3.3 and `tests/test_claude.py::
-        # test_delimiter_is_closest_prefix_to_user_text` for the
-        # regression test that catches the inverted form.
-        prompt = prepend_to_prompt(prompt, USER_MESSAGE_MARKER)
-
-        # Inject identity, memory, history, and API context on the
-        # first message of a new session. Context injection logic lives
-        # in backend.py as shared functions usable by any backend.
+        # Fresh-session lifecycle stays in the backend because the
+        # `_fresh_session` flag, the MEMORY.md/PREFERENCES.md seeding
+        # (and its swallowed-OSError contract), and the
+        # `build_session_context` inputs (workspace, home_workspace,
+        # API context, workspace_config) are all backend-owned state.
+        # The shared helper handles only string composition; pulling
+        # the lifecycle into it would couple the helper to per-
+        # backend internals it has no other reason to know about.
+        #
+        # The single-call MEMORY.md/PREFERENCES.md bootstrap retry
+        # caveat from before extraction still applies: the seed runs
+        # exactly once per session because `_fresh_session` flips to
+        # False unconditionally; a transient OSError inside
+        # `ensure_user_memory` / `ensure_user_preferences` is logged
+        # as a warning but not retried on subsequent messages of the
+        # same session. Failure modes here are persistent
+        # (permissions, missing parent dir), not transient, so the
+        # one-shot behavior is acceptable; documenting it so future
+        # readers do not assume self-healing.
+        session_ctx = ""
         if self._fresh_session:
             self._fresh_session = False
-            # Ensure this user's MEMORY.md exists before the session
-            # context is built. In production, install.py pre-creates
-            # the per-user directory; this call is a no-op then. For
-            # users added after install (or local dev with no install
-            # at all), it seeds the directory + file so the subprocess
-            # has a writable target and build_session_context reads a
-            # real file rather than falling back to the "not yet
-            # created" placeholder. See backend.ensure_user_memory().
-            #
-            # Retry limitation: this call is gated on _fresh_session,
-            # which the line above flips to False unconditionally. A
-            # transient OSError inside ensure_user_memory (logged as a
-            # warning, not raised) is therefore not retried on
-            # subsequent messages of the same session - the session
-            # would have to be rebuilt for another attempt. In
-            # practice the failure modes are persistent (permissions,
-            # missing parent dir), not transient, so this is
-            # acceptable; documenting it so future readers do not
-            # assume self-healing.
             ensure_user_memory(chat_id, DATA_DIR)
-            # Sibling bootstrap for the per-user PREFERENCES.md surface.
-            # Same scope, same OSError-swallow semantics; see
-            # backend.ensure_user_preferences() for the multi-user
-            # ownership caveats.
             ensure_user_preferences(chat_id, DATA_DIR)
             session_ctx = build_session_context(
                 workspace=self.workspace,
@@ -839,32 +790,22 @@ class ClaudeCodeBackend(AgentBackend):
                 data_dir=DATA_DIR,
                 memory_enabled=self.memory_enabled,
             )
-            prompt = prepend_to_prompt(prompt, session_ctx)
 
-        # Inject semantically relevant memories for this message.
-        # Runs on every message (~50-100ms). Returns empty string
-        # when memory is disabled or no relevant memories found.
-        # Skip entirely when chat_id is None - an empty-string user_id
-        # would search across all users, which is a data isolation risk.
-        if chat_id is not None and search_query:
-            from kai.memory import format_context as memory_format_context
+        # Foreign-workspace reminder is built fresh per turn (its
+        # value depends on the current workspace, which the operator
+        # can change between messages via `/workspace`). `build_
+        # foreign_workspace_reminder` returns None when the workspace
+        # equals home_workspace; `assemble_turn_context` no-ops on an
+        # empty string, so coerce the None to "" rather than threading
+        # the optional through the helper signature.
+        reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace) or ""
 
-            # token_budget is omitted - format_context uses the value
-            # from the Config stored at init_memory() time. Awaited
-            # because the search runs in an executor to avoid blocking.
-            memory_ctx = await memory_format_context(
-                search_query,
-                user_id=str(chat_id),
-            )
-            if memory_ctx:
-                prompt = prepend_to_prompt(prompt, memory_ctx)
-
-        # When in a foreign workspace, remind on every message to only
-        # respond to what the user asks - workspace context (CLAUDE.md,
-        # git branch, auto-memory) can otherwise trigger autonomous action.
-        reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace)
-        if reminder:
-            prompt = prepend_to_prompt(prompt, reminder)
+        prompt = await assemble_turn_context(
+            prompt,
+            chat_id=chat_id,
+            session_context=session_ctx,
+            workspace_reminder=reminder,
+        )
 
         content = prompt if isinstance(prompt, list) else [{"type": "text", "text": prompt}]
         msg = (

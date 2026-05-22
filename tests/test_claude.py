@@ -1710,7 +1710,7 @@ class TestContextInjection:
         marker, and the user's actual text must appear after it. Imported
         from the module rather than hard-coded so a future rename of the
         constant fails this test loudly rather than silently drifting."""
-        from kai.claude import USER_MESSAGE_MARKER
+        from kai.backend import USER_MESSAGE_MARKER
 
         proc = _make_mock_proc([_system_event(), _result_event(), b""])
         claude = _make_claude(workspace=home_workspace, home_workspace=home_workspace)
@@ -1747,7 +1747,7 @@ class TestContextInjection:
         to return a non-empty string so the memory_ctx prepend also
         fires. With all three context blocks populated we can assert
         their relative position to the marker."""
-        from kai.claude import USER_MESSAGE_MARKER
+        from kai.backend import USER_MESSAGE_MARKER
 
         proc = _make_mock_proc([_system_event(), _result_event(), b""])
         # Foreign workspace so build_foreign_workspace_reminder returns
@@ -1808,6 +1808,48 @@ class TestContextInjection:
         user_idx = prompt.index("ACTUAL_USER_TEXT")
         between = prompt[marker_idx + len(USER_MESSAGE_MARKER) : user_idx]
         assert between.strip() == "", f"non-whitespace between marker and user text: {between!r}"
+
+    @pytest.mark.asyncio
+    async def test_memory_query_captured_before_session_context_pollution(self, home_workspace, foreign_workspace):
+        """Pin the read-path invariant for the integration: when Claude
+        is on a fresh session (so build_session_context fires and the
+        prompt grows to include CLAUDE.md, recent history, API docs,
+        etc.), format_context must still receive the RAW user text as
+        the embedding query, not the post-prepend prompt. Pre-fix
+        shape was protected inside claude._send_locked by capturing
+        search_query before any prepend; post-extraction the same
+        guarantee comes from `assemble_turn_context` calling
+        `extract_text_query` as its first operation. This test exists
+        at the integration boundary so a future regression where
+        Claude bypasses the helper would be caught here, not only in
+        the helper-level unit tests.
+        """
+        proc = _make_mock_proc([_system_event(), _result_event(), b""])
+        claude = _make_claude(
+            workspace=foreign_workspace,
+            home_workspace=home_workspace,
+            webhook_secret="secret",
+        )
+        claude._proc = proc
+        claude._fresh_session = True
+
+        captured: dict = {}
+
+        async def fake_format_context(query, *, user_id, **kwargs):
+            captured["query"] = query
+            captured["user_id"] = user_id
+            return ""
+
+        with (
+            patch("kai.backend.get_recent_history", return_value="prior turn"),
+            patch("kai.memory.format_context", new=fake_format_context),
+        ):
+            events = []
+            async for event in claude._send_locked("What do I prefer?", chat_id=42):
+                events.append(event)
+
+        assert captured["query"] == "What do I prefer?"
+        assert captured["user_id"] == "42"
 
 
 # ── _send_locked: multi-modal prompt ─────────────────────────────────

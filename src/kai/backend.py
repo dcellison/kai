@@ -810,6 +810,160 @@ def prepend_to_prompt(prompt: str | list, prefix: str) -> str | list:
     return [{"type": "text", "text": prefix}] + prompt
 
 
+# Persistent structural delimiter for the current user message. When
+# retrieval blocks contain quote-shaped lines that mimic real user
+# input (legacy `User said:` rows or sufficiently user-voiced extracted
+# facts), the inner agent can fail to recognize the trailing user text
+# as the actual message. This marker is the one structural signal that
+# says "the message below this line is the real one; respond to it."
+# Module-level so tests can import and assert against it without
+# string duplication.
+#
+# Bracket-label format chosen to match the visual shape of the other
+# context blocks (`[Recent conversations ...]`, `[Your persistent
+# memory ...]`, `[Relevant memories ...]`) without colliding with any
+# of them; a retrieval row could in principle contain any of those
+# header strings verbatim, but cannot accidentally produce this exact
+# label. NOT gated by a feature flag: the marker must be a permanent
+# fixture so prompt shape is consistent session-to-session.
+#
+# Lives in backend.py rather than claude.py because the per-turn
+# context-assembly contract (capture query before pollution, prepend
+# marker, prepend session/memory/reminder above it) is backend-neutral
+# and is consumed by `assemble_turn_context` below. Importing
+# backends should reference `kai.backend.USER_MESSAGE_MARKER`.
+USER_MESSAGE_MARKER = "[User's current message - respond to this:]"
+
+
+def extract_text_query(prompt: str | list) -> str:
+    """
+    Extract the user's original text from a prompt, before any context injection.
+
+    The memory retrieval query MUST come from the raw user message, not
+    from the prompt after session context, memory recall, or reminder
+    blocks have been prepended. On a fresh session the prepended
+    CLAUDE.md, MEMORY.md, history, and API docs reach ~10-20KB; if any
+    of that ends up in the embedding query, the first message's memory
+    retrieval is essentially random and the user-visible behavior is
+    "Kai never remembers anything on the first turn of a new session."
+
+    For string prompts the raw text is the prompt itself. For list
+    prompts (mixed-modal content blocks), return the first text block's
+    body. Defensive shape checks (`isinstance(block, dict)`,
+    `isinstance(block.get("text"), str)`) guard against malformed list
+    entries from older callers or future backends that may grow new
+    block shapes; an unexpected entry is skipped rather than crashing
+    the assembly path. Returns "" when no text block exists, which the
+    caller (`assemble_turn_context`) treats as "skip recall."
+    """
+    if isinstance(prompt, str):
+        return prompt
+    for block in prompt:
+        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+            return block["text"]
+    return ""
+
+
+async def assemble_turn_context(
+    prompt: str | list,
+    *,
+    chat_id: int | None,
+    session_context: str = "",
+    workspace_reminder: str = "",
+) -> str | list:
+    """
+    Assemble the per-turn prompt context for an interactive backend.
+
+    Backend-neutral assembly of the per-turn prompt around a single
+    user message. Captures the original user text as the memory
+    search query BEFORE any context is prepended (so the embedding
+    vector is not polluted by injected CLAUDE.md / history / API docs
+    on fresh sessions), then layers prefixes in an order whose
+    inverse is the final reading order:
+
+        workspace_reminder    (topmost)
+        semantic memory block
+        session_context
+        USER_MESSAGE_MARKER
+        user prompt           (bottom; the real message)
+
+    `prepend_to_prompt` stacks each prefix ABOVE the existing prompt,
+    so the implementation order below is the REVERSE of the reading
+    order: marker first (so it lands closest to the user text),
+    session_context second, memory third, reminder last (topmost).
+    This is load-bearing and the single most common way to break the
+    invariant; the regression test
+    `tests/test_claude.py::test_delimiter_is_closest_prefix_to_user_text`
+    catches an inverted call order, but a backend that re-implements
+    this logic locally can drift silently.
+
+    Semantic recall is gated on both `chat_id is not None` (an empty
+    or fake user id risks cross-user behavior in any future memory
+    implementation that changes filtering semantics) AND a non-
+    whitespace search query (empty embeddings produce arbitrary
+    false-positive hits). `format_context` has its own empty-query
+    guard but skipping the call entirely keeps the "at most one
+    `memory.recall` log line per eligible turn" contract clear.
+
+    The `kai.memory` import is function-local because `kai.backend`
+    is imported from low-level entry points (config, install) that
+    must not pull the memory subsystem at module-load time, and
+    function-local import preserves the existing lazy-import shape
+    in claude.py so tests can patch `kai.memory.format_context`
+    without import-order surprises.
+
+    The helper does NOT call `build_session_context` or
+    `build_foreign_workspace_reminder`; those have backend-specific
+    inputs (fresh-session detection, workspace state, API context)
+    and stay backend-owned. The backend builds those strings and
+    passes them in. The helper owns only the ordering invariant.
+
+    Returns the assembled prompt in the same type family as the
+    input (`str | list`). Backends do their own protocol-specific
+    coercion afterwards (Claude stream-json content blocks, Codex
+    JSON-RPC text blocks, ACP content shape).
+    """
+    # Capture the raw user text before any prepend. Empty result is
+    # treated as "skip retrieval" by the guard below.
+    search_query = extract_text_query(prompt)
+
+    # Marker first so subsequent prepends stack ABOVE it. Always
+    # applied, even when memory is disabled or no recall fires:
+    # the marker protects the current user message from injected
+    # context, not just from recalled memories, so it must be a
+    # permanent prompt-shape fixture for interactive backends.
+    prompt = prepend_to_prompt(prompt, USER_MESSAGE_MARKER)
+
+    # First-session context (CLAUDE.md + PREFERENCES.md + recent
+    # history + API context) is built by the caller because the
+    # fresh-session lifecycle is backend-owned. Empty string is the
+    # normal non-fresh-session value.
+    if session_context:
+        prompt = prepend_to_prompt(prompt, session_context)
+
+    # Semantic recall on every eligible turn (~50-100ms via the
+    # executor inside format_context). Skip entirely when chat_id
+    # is None (cross-user leakage risk) or the query is whitespace-
+    # only (random embedding hits). The function-local import
+    # mirrors the claude.py shape pre-extraction so test patching
+    # of kai.memory.format_context stays valid.
+    if chat_id is not None and search_query.strip():
+        from kai.memory import format_context as memory_format_context
+
+        memory_ctx = await memory_format_context(search_query, user_id=str(chat_id))
+        if memory_ctx:
+            prompt = prepend_to_prompt(prompt, memory_ctx)
+
+    # Foreign-workspace reminder is built fresh by the caller on
+    # every turn (it depends on the workspace state at call time).
+    # Prepended last so it lands topmost in the final reading order,
+    # matching the pre-extraction Claude behavior.
+    if workspace_reminder:
+        prompt = prepend_to_prompt(prompt, workspace_reminder)
+
+    return prompt
+
+
 def get_workspace_system_prompt(
     workspace_config: WorkspaceConfig | None,
 ) -> str | None:
