@@ -1800,12 +1800,12 @@ def _codex_users_from_yaml(users_yaml_path: str | Path, global_agent_backend: st
     `global_agent_backend`. Only entries whose effective backend is
     "codex" appear in the returned list.
 
-    Includes entries with a missing `os_user`. A codex-effective entry
-    without an `os_user` is a configuration error (codex spawning
-    requires a non-bot-user account), but the wizard predicate using
-    this helper must still see the user as "codex" so install plumbing
-    (CODEX_BIN, sudoers, login reminder) fires. The missing os_user
-    surfaces as a `load_config` SystemExit elsewhere.
+    Includes entries with a missing `os_user`. After #522, missing
+    `os_user` is a valid configuration that resolves to same-user
+    in-process spawn at runtime (the self-sudo-skip path). The helper
+    still includes those entries because codex itself runs for them,
+    so install plumbing (CODEX_BIN, sudoers, login reminder) must
+    fire regardless of whether `os_user` is set.
 
     Behavior parallels `_collect_os_users_from_yaml`: missing file or
     empty/non-dict/no-users-key returns []; malformed YAML raises;
