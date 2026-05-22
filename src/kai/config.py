@@ -146,12 +146,7 @@ _ALL_CURATED_MODELS: frozenset[str] = frozenset(
 # deliberately: conversational model selection is owned by pool.py +
 # DEFAULT_MODEL + PROVIDER_DEFAULTS, and routing it through the
 # registry would collide with the per-user override layer that
-# users.yaml / /settings already provide. FACT_EXTRACTION /
-# EPISODE_EXTRACTION are also excluded; they are owned by
-# config.memory_extraction_model / memory_episode_model with the
-# load_config inheritance sentinel below, and the future
-# backend-agnostic memory epic will introduce them to this enum
-# alongside their codex consumer.
+# users.yaml / /settings already provide.
 
 
 class ModelRole(StrEnum):
@@ -169,14 +164,13 @@ class ModelRole(StrEnum):
     ISSUE_TRIAGE = "issue_triage"
     BEHAVIORAL_JUDGE = "behavioral_judge"
     BEHAVIORAL_GEN = "behavioral_gen"
-    # Memory extraction roles. Routed through the per-backend registry
-    # so MEMORY_REASONER_BACKEND=codex can resolve a codex-native
-    # model (gpt-5.4-mini) instead of inheriting the Claude-shaped
-    # `claude-haiku-4-5-20251001` literal that the codex CLI would
-    # reject. MEMORY_EPISODE is a distinct row from MEMORY_EXTRACTION
-    # so an operator can downgrade one stage without the other;
-    # load_config still applies the "episode inherits extraction"
-    # default at env-resolution time when MEMORY_EPISODE_MODEL is unset.
+    # Memory extraction roles. Resolved per-user at extraction time:
+    # `get_model_for(MEMORY_EXTRACTION, effective_backend)` picks the
+    # registry row matching the user's effective agent_backend. Codex
+    # users get the codex registry value (gpt-5.4-mini); claude users
+    # get the claude registry value. MEMORY_EPISODE is a distinct row
+    # so operators can adjust one stage without touching the other; both
+    # are runtime-only (no env-var override surface, no Config field).
     MEMORY_EXTRACTION = "memory_extraction"
     MEMORY_EPISODE = "memory_episode"
 
@@ -209,15 +203,15 @@ MODEL_REGISTRY: dict[tuple[str, ModelRole], str] = {
     # against CODEX_MODELS so future drift gets caught at startup.
     ("codex", ModelRole.BEHAVIORAL_JUDGE): "gpt-5.4-mini",
     ("codex", ModelRole.BEHAVIORAL_GEN): "gpt-5.4-mini",
-    # Memory extraction rows. Claude entries equal the existing
-    # `memory_extraction_model` / `memory_episode_model` dataclass
-    # default so an install that has not set MEMORY_REASONER_BACKEND
-    # sees byte-identical model resolution. Codex entries pick the
-    # smallest currently-exposed codex model (gpt-5.4-mini) on the
-    # same editorial tier as Claude's haiku selection; the structural
-    # validator below asserts both rows land on models the codex CLI
-    # accepts, so a future operator who renames a codex SKU surfaces
-    # the bad row at startup rather than at first extraction.
+    # Memory extraction rows. Claude entries match the historical
+    # extraction default (claude-haiku-4-5-20251001), so any install
+    # that ran under the old MEMORY_EXTRACTION_MODEL=<empty> path
+    # sees identical model resolution post-migration. Codex entries
+    # pick the smallest currently-exposed codex model (gpt-5.4-mini)
+    # on the same editorial tier as Claude's haiku selection;
+    # _check_model_registry_complete validates codex rows against
+    # CODEX_MODELS at startup so a future SKU rename surfaces the
+    # bad row before runtime.
     ("claude", ModelRole.MEMORY_EXTRACTION): "claude-haiku-4-5-20251001",
     ("claude", ModelRole.MEMORY_EPISODE): "claude-haiku-4-5-20251001",
     ("codex", ModelRole.MEMORY_EXTRACTION): "gpt-5.4-mini",
@@ -753,31 +747,18 @@ class Config:
     memory_token_budget: int = 2000
     memory_embedding_model: str = "all-MiniLM-L6-v2"
 
-    # Memory reasoner backend selection. Independent of `agent_backend`
-    # because memory extraction has not yet passed the cross-backend
-    # eval gate; an install running `AGENT_BACKEND=codex` must NOT
-    # silently flip memory extraction onto an unevaluated provider.
-    # Default stays "claude" until a follow-up production-enables the
-    # codex path. Values are validated at config-load time against
-    # `{"claude", "codex"}`; an unknown value is a SystemExit, matching
-    # the AGENT_BACKEND validation pattern. When `memory_enabled=False`
-    # or `memory_extraction_enabled=False`, the value still parses but
-    # no reasoner is invoked.
-    memory_reasoner_backend: str = "claude"
-
-    # Track 2 (Haiku extraction) config. Requires memory_enabled=True and
-    # a Claude backend. Default is False at Phase 2 ship so the self-
-    # reinforcing extraction loop has real-world observation time before
-    # the default flips. The kill switch is the same flag.
+    # Memory extraction toggle. Sub-toggle of memory_enabled (extraction
+    # only runs when memory is on); the kill switch is the same flag.
+    # The reasoner and model for extraction are derived per-user from
+    # the user's effective `agent_backend` at extraction time
+    # (memory_extraction._build_memory_reasoner +
+    # get_model_for(role, effective_backend)). There is no global
+    # MEMORY_REASONER_BACKEND / MEMORY_EXTRACTION_MODEL / MEMORY_EPISODE_MODEL
+    # config surface; the registry is the single source of truth for
+    # the (role, backend) -> model mapping. An operator who wants a
+    # different model for a (role, backend) pair edits MODEL_REGISTRY
+    # in code.
     memory_extraction_enabled: bool = False
-    # Default model name for extraction. The literal here is the
-    # Claude registry row; load_config() re-resolves this through
-    # `get_model_for(ModelRole.MEMORY_EXTRACTION, memory_reasoner_backend)`
-    # so an install with MEMORY_REASONER_BACKEND=codex gets a codex
-    # model instead of the Claude default. The dataclass literal
-    # stays because test fixtures construct Config directly and
-    # depend on a usable Claude default without going through env.
-    memory_extraction_model: str = "claude-haiku-4-5-20251001"
     # Per-call budget ceiling. Retained as inert compatibility config.
     # Both supported memory reasoners (claude and codex) are
     # subscription-backed in the operator deployment model and no code
@@ -830,17 +811,10 @@ class Config:
     # Stage-2 episode generation (issue #385). Conditional second extractor
     # that runs out-of-band on stage-1 positives (has_episode=true) to
     # produce one Sophia-shaped episode record per episode-worthy turn.
-    # Honors memory_enabled; no dedicated kill switch.
-    #
-    # memory_episode_model: empty string is the sentinel for "inherit
-    # memory_extraction_model" - load_config() applies the inheritance
-    # at startup, so an operator who only sets MEMORY_EXTRACTION_MODEL
-    # gets both stages on the new model. The literal stays empty here
-    # rather than a model name so a reader who greps for "what is the
-    # default model" is not misled: in production the dataclass literal
-    # is never the effective value. Test fixtures that construct Config
-    # directly should set this explicitly to a real model name.
-    memory_episode_model: str = ""
+    # Honors memory_enabled; no dedicated kill switch. The model is
+    # resolved per-user from the registry at episode-extraction time
+    # via get_model_for(ModelRole.MEMORY_EPISODE, effective_backend);
+    # there is no global override field.
     # Per-call budget ceiling (USD). Retained as inert compatibility
     # config. Same rationale as memory_extraction_budget_usd above:
     # both supported reasoners are subscription-backed and no code
@@ -1197,6 +1171,40 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
 
 # Valid user roles for users.yaml
 _VALID_ROLES = {"admin", "user"}
+
+
+def _compute_extraction_eligible_backends(
+    agent_backend: str,
+    user_configs: "dict[int, UserConfig] | None",
+    memory_extraction_enabled: bool,
+) -> set[str]:
+    """
+    Return the set of distinct effective backends across extraction-eligible users.
+
+    Mirrors `_ingest_memory`'s extraction gate (effective backend in
+    {"claude", "codex"}; goose users are filtered out because they
+    have no `OneShotReasoner` implementation). With users.yaml: each
+    user contributes its effective backend (per-user override or
+    global default). Without users.yaml (legacy ALLOWED_USER_IDS auth):
+    every authorized user inherits the global, so the set is
+    `{agent_backend}` when that is extraction-eligible, else empty.
+
+    Returns an empty set when `memory_extraction_enabled` is False;
+    callers that gate codex plumbing or registry validation off the
+    set should not fire on retrieval-only or memory-disabled installs.
+    """
+    if not memory_extraction_enabled:
+        return set()
+    eligible: set[str] = set()
+    if user_configs is None:
+        if agent_backend in ("claude", "codex"):
+            eligible.add(agent_backend)
+        return eligible
+    for uc in user_configs.values():
+        effective = uc.agent_backend or agent_backend
+        if effective in ("claude", "codex"):
+            eligible.add(effective)
+    return eligible
 
 
 def _load_user_configs(
@@ -1927,68 +1935,30 @@ def load_config() -> Config:
     # closed regardless of operator env-var ordering.
     memory_extraction_enabled = memory_extraction_enabled and memory_enabled
 
-    # Memory reasoner backend. Must validate BEFORE the role-resolved
-    # model defaults below so a typo like MEMORY_REASONER_BACKEND=gpt5
-    # is surfaced at config-load time, not at the first extraction
-    # call inside _get_memory_reasoner(). The valid set is {"claude",
-    # "codex"} for #497; OpenCode would extend this set, but adding
-    # it here without a registry row would defeat the registry
-    # completeness check.
-    memory_reasoner_backend = os.environ.get("MEMORY_REASONER_BACKEND", "claude").strip().lower()
-    _valid_memory_backends = ("claude", "codex")
-    if memory_reasoner_backend not in _valid_memory_backends:
-        raise SystemExit(
-            f"MEMORY_REASONER_BACKEND '{memory_reasoner_backend}' is not valid "
-            f"(must be one of: {', '.join(_valid_memory_backends)})"
-        )
+    # Deprecation warnings for the three retired memory env vars. The
+    # reasoner and model used for memory extraction now derive entirely
+    # from each user's effective `agent_backend` (per-user dispatch via
+    # memory_extraction._build_memory_reasoner +
+    # get_model_for(role, effective_backend)). A legacy /etc/kai/env
+    # may still carry any of these keys; honor them as one-shot
+    # deprecation hints (one log.warning per key seen), then ignore
+    # the values. The next `sudo make install` rewrites /etc/kai/env
+    # from install.conf with the wizard's emission blocks removed, so
+    # the keys do not survive the next reinstall.
+    _deprecated_memory_env = (
+        ("MEMORY_REASONER_BACKEND", "memory reasoner is now derived per-user from agent_backend"),
+        ("MEMORY_EXTRACTION_MODEL", "memory extraction model is now resolved per-user from the MODEL_REGISTRY"),
+        ("MEMORY_EPISODE_MODEL", "memory episode model is now resolved per-user from the MODEL_REGISTRY"),
+    )
+    for _legacy_key, _reason in _deprecated_memory_env:
+        if os.environ.get(_legacy_key):
+            log.warning(
+                "%s is deprecated and ignored; %s. Remove it from /etc/kai/env "
+                "(the next 'sudo make install' will drop it automatically).",
+                _legacy_key,
+                _reason,
+            )
 
-    # Cross-binary validation. When the operator has BOTH MEMORY_ENABLED=true
-    # AND MEMORY_EXTRACTION_ENABLED=true (the composed `memory_extraction_enabled`
-    # value above), the configured reasoner backend's binary must be reachable
-    # at startup; otherwise the first extraction would surface as a runtime
-    # OneShotRoutingError at first user message rather than a clear config-load
-    # failure. Retrieval-only memory (MEMORY_ENABLED=true with extraction
-    # disabled) intentionally does NOT trigger this check because no reasoner
-    # subprocess runs in that mode; gaining a binary prerequisite there would
-    # break the supported retrieval-only configuration.
-    #
-    # Local import avoids any future risk of an import cycle with kai.oneshot
-    # (which itself imports from kai.config). We catch `BinaryResolutionError`,
-    # the leaf module's stdlib-only exception type, NOT `OneShotRoutingError`
-    # (which lives in kai.oneshot and would defeat the cycle-free design).
-    if memory_extraction_enabled:
-        from kai.oneshot_binary import BinaryResolutionError, resolve_oneshot_binary
-
-        try:
-            resolve_oneshot_binary(memory_reasoner_backend)
-        except BinaryResolutionError as e:
-            raise SystemExit(
-                f"MEMORY_REASONER_BACKEND='{memory_reasoner_backend}' requires the binary "
-                f"to be reachable at startup, but {e}. Set CODEX_BIN (for codex) or fix "
-                f"PATH (for either backend); rerun the wizard if you no longer want memory "
-                f"extraction enabled."
-            ) from None
-
-    # Memory model resolution. Env override wins; otherwise the role
-    # registry resolves to a backend-appropriate default (claude-haiku
-    # for backend=claude, gpt-5.4-mini for backend=codex). Sentinel
-    # empty-string from the dataclass would also fall through to the
-    # registry, but explicit None-check on the env var matches the
-    # other memory_* fields' style and keeps the read order
-    # predictable.
-    memory_extraction_model = os.environ.get("MEMORY_EXTRACTION_MODEL", "").strip()
-    if not memory_extraction_model:
-        memory_extraction_model = get_model_for(ModelRole.MEMORY_EXTRACTION, memory_reasoner_backend)
-    # Codex memory model overrides must name a model the codex CLI
-    # exposes. Claude memory model overrides stay free-form (matches
-    # the previous behavior; a stricter list would need its own
-    # validation pass and is out of scope here).
-    if memory_reasoner_backend == "codex" and memory_extraction_model not in CODEX_MODELS:
-        valid = sorted(CODEX_MODELS.keys())
-        raise SystemExit(
-            f"MEMORY_EXTRACTION_MODEL '{memory_extraction_model}' is not valid "
-            f"for memory_reasoner_backend='codex' (must be one of: {', '.join(valid)})"
-        )
     try:
         memory_extraction_budget_usd = float(os.environ.get("MEMORY_EXTRACTION_BUDGET_USD", "0.01"))
         if memory_extraction_budget_usd < 0:
@@ -2028,25 +1998,14 @@ def load_config() -> Config:
         raise SystemExit("MEMORY_CONSOLIDATION_CANDIDATES_N must be an integer") from None
 
     # Stage-2 episode generation (issue #385). Same try/except pattern as
-    # the other memory_* numeric vars. Model defaults to whatever was
-    # loaded for memory_extraction_model so an operator who changed only
-    # MEMORY_EXTRACTION_MODEL also moves stage 2 onto the new model;
-    # explicit MEMORY_EPISODE_MODEL takes precedence. Budget is strictly
-    # positive (zero would silently disable a real subprocess; the
-    # intentional kill switch is MEMORY_ENABLED). Timeout floor is 10s
-    # to prevent accidentally tightening it below Haiku's warm-up time.
-    memory_episode_model = os.environ.get("MEMORY_EPISODE_MODEL", "").strip() or memory_extraction_model
-    # Apply the same codex-CLI validation to the episode model. The
-    # episode default inherits memory_extraction_model (already
-    # validated), so this gate only fires on an explicit
-    # MEMORY_EPISODE_MODEL override that names a non-codex SKU under
-    # the codex memory backend.
-    if memory_reasoner_backend == "codex" and memory_episode_model not in CODEX_MODELS:
-        valid = sorted(CODEX_MODELS.keys())
-        raise SystemExit(
-            f"MEMORY_EPISODE_MODEL '{memory_episode_model}' is not valid "
-            f"for memory_reasoner_backend='codex' (must be one of: {', '.join(valid)})"
-        )
+    # the other memory_* numeric vars. Model resolution is per-user at
+    # extraction time (memory_extraction._resolve_episode_model uses
+    # get_model_for(ModelRole.MEMORY_EPISODE, effective_backend)); the
+    # global MEMORY_EPISODE_MODEL env var is deprecated and warned
+    # about above. Budget is strictly positive (zero would silently
+    # disable a real subprocess; the intentional kill switch is
+    # MEMORY_ENABLED). Timeout floor is 10s to prevent accidentally
+    # tightening it below Haiku's warm-up time.
     try:
         memory_episode_budget_usd = float(os.environ.get("MEMORY_EPISODE_BUDGET_USD", "0.15"))
         if memory_episode_budget_usd <= 0:
@@ -2130,87 +2089,97 @@ def load_config() -> Config:
         # but is the legacy path - nudge toward users.yaml.
         log.info("Using ALLOWED_USER_IDS from env (legacy). Run 'make config' to migrate to users.yaml.")
 
-    # Codex memory routing precondition. The codex reasoner refuses to
-    # spawn without an `os_user` (the security boundary that keeps
-    # codex from running as the bot user). The runtime resolver reads
-    # `os_user` from users.yaml per chat_id; if the entry is missing
-    # or unset, extraction silently collapses to a zero-state miss
-    # every turn. Fail at config-load with a clear remediation hint
-    # so the operator does not discover this through silently empty
-    # memory state.
-    #
-    # The precondition only applies to users whose EFFECTIVE agent
-    # backend is one the runtime would actually invoke extraction
-    # for. `bot.py:3739` gates extraction on
-    # `effective_backend in ("claude", "codex")`; goose users skip
-    # extraction entirely under that gate, so they do not need
-    # `os_user` for codex memory routing. The effective-backend
-    # cascade here mirrors the runtime: the user's per-entry
-    # `agent_backend` wins; otherwise the global default applies.
-    #
-    # Failure modes covered (scoped to extraction-eligible users):
-    #   1. users.yaml missing entirely: codex memory cannot be wired
-    #      because there is no per-user os_user surface.
-    #   2. users.yaml present but at least one extraction-eligible
-    #      entry lacks os_user: that user's extraction never runs.
-    #
-    # Claude memory does not need this check: ClaudeOneShotReasoner
-    # supports a None os_user (the historical Max-plan self-sudo-skip
-    # path that spawns claude as the bot user), so claude extraction
-    # still works without per-user OS routing.
-    if memory_extraction_enabled and memory_reasoner_backend == "codex":
-        if user_configs is None:
-            raise SystemExit(
-                "MEMORY_REASONER_BACKEND='codex' with MEMORY_EXTRACTION_ENABLED=true "
-                "requires users.yaml with a per-user 'os_user' entry for every "
-                "authorized chat_id. ALLOWED_USER_IDS alone does not provide the "
-                "OS-user routing the codex reasoner needs. Run 'make config' to "
-                "generate users.yaml, or set MEMORY_EXTRACTION_ENABLED=false to "
-                "run with retrieval-only memory."
-            )
-        # Mirror the runtime's effective-backend cascade: per-user
-        # `agent_backend` wins; otherwise the global default applies.
-        # Only users whose effective backend is one bot.py would
-        # actually run extraction for need an os_user.
-        extraction_users = [
-            uc for uc in user_configs.values() if (uc.agent_backend or agent_backend) in ("claude", "codex")
-        ]
-        missing = [uc.telegram_id for uc in extraction_users if not uc.os_user]
+    # Memory extraction preconditions, validated per the
+    # extraction-eligible backend set. Reasoner and model both derive
+    # per-user from each user's effective `agent_backend` at extraction
+    # time, so the "is this install in a valid state for memory
+    # extraction" question must read the full eligible set rather than
+    # a single global backend value. The helper mirrors
+    # `_ingest_memory`'s extraction gate in bot.py (goose users are
+    # filtered out because they have no `OneShotReasoner` implementation).
+    extraction_eligible_backends = _compute_extraction_eligible_backends(
+        agent_backend, user_configs, memory_extraction_enabled
+    )
+
+    # Codex extraction requires users.yaml. The codex reasoner
+    # spawns codex under each user's `os_user`; ALLOWED_USER_IDS-only
+    # authorization exposes no per-user os_user surface, so codex
+    # extraction would collapse to a zero-state miss every turn. Fail
+    # fast at config-load with a clear remediation hint.
+    if memory_extraction_enabled and "codex" in extraction_eligible_backends and user_configs is None:
+        raise SystemExit(
+            "Codex memory extraction requires users.yaml with a per-user 'os_user' entry "
+            "for every codex-effective chat_id. ALLOWED_USER_IDS alone does not provide "
+            "the OS-user routing the codex reasoner needs. Run 'make config' to generate "
+            "users.yaml, or set MEMORY_EXTRACTION_ENABLED=false to run with retrieval-only "
+            "memory."
+        )
+
+    # Every codex-effective user must have a non-bot-user os_user.
+    # Claude-effective users are NOT gated on os_user because
+    # ClaudeOneShotReasoner accepts os_user=None (the historical
+    # Max-plan self-sudo-skip path that spawns claude as the bot user).
+    # Codex has no equivalent safe path: spawning codex as the bot
+    # user would give it access to /etc/kai/env and other bot-user-only
+    # state, so the runtime CodexOneShotReasoner refuses; surface the
+    # same boundary at config-load.
+    if memory_extraction_enabled and user_configs is not None and "codex" in extraction_eligible_backends:
+        codex_users = [uc for uc in user_configs.values() if (uc.agent_backend or agent_backend) == "codex"]
+        missing = [uc.telegram_id for uc in codex_users if not uc.os_user]
         if missing:
             raise SystemExit(
-                "MEMORY_REASONER_BACKEND='codex' with MEMORY_EXTRACTION_ENABLED=true "
-                "requires every claude/codex users.yaml entry to set 'os_user'. The "
-                f"following chat_ids are missing 'os_user': {sorted(missing)}. Edit "
-                "users.yaml to add an 'os_user' field for each entry (the OS user "
-                "the codex subprocess will run as), or set MEMORY_EXTRACTION_ENABLED=false "
-                "to run with retrieval-only memory."
+                "Codex memory extraction requires every codex-effective users.yaml entry "
+                "to set 'os_user'. The following chat_ids are missing 'os_user': "
+                f"{sorted(missing)}. Edit users.yaml to add an 'os_user' field for each "
+                "entry (the OS user the codex subprocess will run as), or set "
+                "MEMORY_EXTRACTION_ENABLED=false to run with retrieval-only memory."
             )
-
-        # Codex must NOT run as the bot user. The codex reasoner
-        # refuses same-user spawn at runtime; surface the same
-        # boundary at config-load so a misconfigured users.yaml does
-        # not silently no-op every extraction. Detect by matching
-        # the configured os_user against the current process user;
-        # mirror the runtime's resolve_claude_user check so the two
-        # gates name the same condition.
         try:
             current_user = pwd.getpwuid(os.getuid()).pw_name
         except KeyError:
             # No passwd entry for the running UID (e.g., container
-            # with --user <uid>). The runtime resolve_claude_user
-            # falls through to honor the configured os_user in this
-            # case, so config-load does too.
+            # with --user <uid>); the runtime falls through to honor
+            # the configured os_user, so config-load does too.
             current_user = None
         if current_user is not None:
-            same_user = [uc.telegram_id for uc in extraction_users if uc.os_user == current_user]
+            same_user = [uc.telegram_id for uc in codex_users if uc.os_user == current_user]
             if same_user:
                 raise SystemExit(
-                    "MEMORY_REASONER_BACKEND='codex' refuses to run codex as the bot user "
+                    "Codex memory extraction refuses to run codex as the bot user "
                     f"({current_user!r}). The following users.yaml chat_ids have 'os_user' "
                     f"set to the bot user: {sorted(same_user)}. Set 'os_user' to a "
                     "different OS account, or set MEMORY_EXTRACTION_ENABLED=false to "
                     "run with retrieval-only memory."
                 )
+
+    # Registry completeness and binary resolution per
+    # eligible backend. With model env vars retired, get_model_for()
+    # is the only check that a (role, backend) registry row exists;
+    # the existing early _check_model_registry_complete(agent_backend)
+    # call covers conversational + triage + review + behavioral-eval
+    # rows for the global backend, but a per-user override to a
+    # different backend would reach runtime without its memory-role
+    # rows being validated. Loop over the eligible set after
+    # _load_user_configs runs so per-user overrides are visible.
+    # `_check_model_registry_complete` is idempotent so re-running
+    # it for the global backend if it appears in the set is harmless.
+    # `resolve_oneshot_binary` is gated on the same set so a missing
+    # CODEX_BIN on a deployment where any user routes to codex fails
+    # fast at startup instead of at the first extraction.
+    if memory_extraction_enabled and extraction_eligible_backends:
+        from kai.oneshot_binary import BinaryResolutionError, resolve_oneshot_binary
+
+        for _backend in sorted(extraction_eligible_backends):
+            _check_model_registry_complete(_backend)
+            try:
+                resolve_oneshot_binary(_backend)
+            except BinaryResolutionError as e:
+                raise SystemExit(
+                    f"Memory extraction requires the {_backend!r} binary to be reachable "
+                    f"at startup (at least one extraction-eligible user routes to it), but "
+                    f"{e}. Set CODEX_BIN (for codex) or fix PATH (for either backend); "
+                    f"rerun the wizard if you no longer want memory extraction enabled."
+                ) from None
 
     # Deprecation warnings for env vars superseded by users.yaml.
     # The vars still work as global fallbacks, but users.yaml is the
@@ -2336,14 +2305,11 @@ def load_config() -> Config:
         memory_search_limit=memory_search_limit,
         memory_token_budget=memory_token_budget,
         memory_embedding_model=memory_embedding_model,
-        memory_reasoner_backend=memory_reasoner_backend,
         memory_extraction_enabled=memory_extraction_enabled,
-        memory_extraction_model=memory_extraction_model,
         memory_extraction_budget_usd=memory_extraction_budget_usd,
         memory_extraction_timeout_s=memory_extraction_timeout_s,
         episode_classifier_context_turns=episode_classifier_context_turns,
         memory_consolidation_candidates_n=memory_consolidation_candidates_n,
-        memory_episode_model=memory_episode_model,
         memory_episode_budget_usd=memory_episode_budget_usd,
         memory_episode_timeout_s=memory_episode_timeout_s,
         memory_search_floor=memory_search_floor,

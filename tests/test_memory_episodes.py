@@ -62,11 +62,9 @@ def _cfg(**overrides) -> Config:
     defaults = {
         "memory_enabled": True,
         "memory_extraction_enabled": True,
-        "memory_extraction_model": "claude-haiku-4-5-20251001",
         "memory_extraction_budget_usd": 0.05,
         "memory_extraction_timeout_s": 60,
         "memory_consolidation_candidates_n": 0,
-        "memory_episode_model": "claude-haiku-4-5-20251001",
         "memory_episode_budget_usd": 0.15,
         "memory_episode_timeout_s": 120,
     }
@@ -201,7 +199,14 @@ class TestExtractionResultClassifier:
             return _make_proc(stdout=_stage1_envelope(facts=[], has_episode=True))
 
         monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
-        result = await _run_extractor("payload", _cfg(), candidate_ids=set(), candidate_metadata={}, user_id="u1")
+        result = await _run_extractor(
+            "payload",
+            _cfg(),
+            candidate_ids=set(),
+            candidate_metadata={},
+            user_id="u1",
+            effective_backend="claude",
+        )
         assert isinstance(result, ExtractionResult)
         assert result.has_episode is True
         assert result.facts == []
@@ -216,7 +221,14 @@ class TestExtractionResultClassifier:
             return _make_proc(stdout=_stage1_envelope(facts=[], has_episode=False))
 
         monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
-        result = await _run_extractor("payload", _cfg(), candidate_ids=set(), candidate_metadata={}, user_id="u1")
+        result = await _run_extractor(
+            "payload",
+            _cfg(),
+            candidate_ids=set(),
+            candidate_metadata={},
+            user_id="u1",
+            effective_backend="claude",
+        )
         assert result.has_episode is False
 
     @pytest.mark.asyncio
@@ -242,7 +254,14 @@ class TestExtractionResultClassifier:
             return build_proc()
 
         monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
-        result = await _run_extractor("payload", _cfg(), candidate_ids=set(), candidate_metadata={}, user_id="u1")
+        result = await _run_extractor(
+            "payload",
+            _cfg(),
+            candidate_ids=set(),
+            candidate_metadata={},
+            user_id="u1",
+            effective_backend="claude",
+        )
         assert result.has_episode is False
         assert result.facts == []
 
@@ -496,6 +515,7 @@ class TestStage2Isolation:
                 user_id="u1",
                 session_id=None,
                 config=_cfg(memory_episode_timeout_s=10),
+                effective_backend="claude",
             )
 
         episode_records = [r for r in caplog.records if r.message.startswith("memory.episode ")]
@@ -545,6 +565,7 @@ class TestStage2Isolation:
                 user_id="u1",
                 session_id=None,
                 config=_cfg(),
+                effective_backend="claude",
             )
         await release_task
 
@@ -592,6 +613,7 @@ class TestStage2Isolation:
                 user_id="u1",
                 session_id=None,
                 config=_cfg(),
+                effective_backend="claude",
             )
 
         records = [r for r in caplog.records if r.message.startswith("memory.episode ")]
@@ -628,6 +650,7 @@ class TestStage2Isolation:
                 user_id="u1",
                 session_id=None,
                 config=_cfg(),
+                effective_backend="claude",
             )
 
         episode_records = [r for r in caplog.records if r.message.startswith("memory.episode ")]
@@ -674,6 +697,7 @@ class TestStage2Storage:
             user_id="u1",
             session_id="sess-42",
             config=_cfg(),
+            effective_backend="claude",
         )
 
         assert captured["memory_type"] == "episode"
@@ -713,6 +737,7 @@ class TestStage2Storage:
             user_id="u1",
             session_id=None,
             config=_cfg(),
+            effective_backend="claude",
         )
 
         assert "lessons" not in captured["metadata"]
@@ -744,6 +769,7 @@ class TestStage2Storage:
             user_id="u1",
             session_id=None,
             config=_cfg(),
+            effective_backend="claude",
         )
 
         assert captured["metadata"]["lessons"] == episode_with_lessons["lessons"]
@@ -773,6 +799,7 @@ class TestStage2Storage:
             user_id="u1",
             session_id=None,
             config=_cfg(),
+            effective_backend="claude",
         )
 
         assert captured["content"] == f"{ep['goal']}\n\n{ep['context']}"
@@ -798,6 +825,7 @@ class TestStage2Storage:
                 user_id="u1",
                 session_id=None,
                 config=_cfg(),
+                effective_backend="claude",
             )
 
         records = [r for r in caplog.records if r.message.startswith("memory.episode ")]
@@ -834,6 +862,7 @@ class TestStage2Storage:
                 user_id="u1",
                 session_id=None,
                 config=_cfg(),
+                effective_backend="claude",
             )
 
         records = [r for r in caplog.records if r.message.startswith("memory.episode ")]
@@ -860,11 +889,12 @@ class TestStage2SubprocessAssembly:
 
     @pytest.mark.asyncio
     async def test_stage2_command_uses_episode_config(self, monkeypatch):
-        """Model, budget, timeout, system prompt, and JSON schema all
-        come from the episode-specific config fields, not the stage-1
-        ones. A regression where stage 2 reads memory_extraction_model
-        would silently double the stage-1 cost on every episode-worthy
-        turn."""
+        """Budget, timeout, system prompt, and JSON schema all come
+        from the episode-specific config fields, not the stage-1 ones.
+        The model now resolves through `get_model_for(MEMORY_EPISODE,
+        effective_backend)` (issue #515 retired the per-stage env vars),
+        so the assertion pins the registry-resolved value rather than a
+        config-field override."""
         captured: dict = {}
 
         async def _fake_exec(*args, **kwargs):
@@ -875,14 +905,14 @@ class TestStage2SubprocessAssembly:
         monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
         await _run_episode_extractor(
             "payload",
-            _cfg(
-                memory_episode_model="claude-sonnet-4-6",
-                memory_episode_budget_usd=0.15,
-            ),
+            _cfg(memory_episode_budget_usd=0.15),
+            effective_backend="claude",
         )
 
         args = captured["args"]
-        assert args[args.index("--model") + 1] == "claude-sonnet-4-6"
+        # Registry MEMORY_EPISODE row for claude is the Haiku SKU; same
+        # value the retired `memory_episode_model` default pointed at.
+        assert args[args.index("--model") + 1] == "claude-haiku-4-5-20251001"
         # --max-budget-usd is NOT emitted on the claude backend (issue
         # #390): Max-plan OAuth makes the CLI's computed-cost ceiling a
         # phantom signal. Runaway protection comes from
@@ -906,7 +936,7 @@ class TestStage2SubprocessAssembly:
             return _make_proc(stdout=_stage2_envelope(_valid_episode()))
 
         monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
-        await _run_episode_extractor("payload", _cfg())
+        await _run_episode_extractor("payload", _cfg(), effective_backend="claude")
 
         args = captured["args"]
         assert args[args.index("--tools") + 1] == ""
@@ -1133,8 +1163,8 @@ class TestRunEpisodeExtractorViaReasoner:
                     duration_ms=42,
                 )
 
-        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_FakeReasoner()):
-            episode, cost_usd, reason = await _run_episode_extractor("payload", _cfg())
+        with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FakeReasoner()):
+            episode, cost_usd, reason = await _run_episode_extractor("payload", _cfg(), effective_backend="claude")
 
         assert episode == _valid_episode()
         assert cost_usd == pytest.approx(0.04)
@@ -1151,8 +1181,8 @@ class TestRunEpisodeExtractorViaReasoner:
             async def run(self, **kwargs):
                 raise OneShotTimeout()
 
-        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_TimingOutReasoner()):
-            episode, cost_usd, reason = await _run_episode_extractor("payload", _cfg())
+        with patch("kai.memory_extraction._build_memory_reasoner", return_value=_TimingOutReasoner()):
+            episode, cost_usd, reason = await _run_episode_extractor("payload", _cfg(), effective_backend="claude")
 
         assert episode is None
         assert cost_usd == 0.0
@@ -1170,8 +1200,8 @@ class TestRunEpisodeExtractorViaReasoner:
             async def run(self, **kwargs):
                 raise OneShotSubprocessError(returncode=2, stderr=b"oauth refused: please login")
 
-        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_FailingReasoner()):
-            episode, cost_usd, reason = await _run_episode_extractor("payload", _cfg())
+        with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FailingReasoner()):
+            episode, cost_usd, reason = await _run_episode_extractor("payload", _cfg(), effective_backend="claude")
 
         assert episode is None
         assert cost_usd == 0.0
@@ -1208,9 +1238,9 @@ class TestRunEpisodeExtractorWithCodexEnvelope:
                     duration_ms=33,
                 )
 
-        config = _cfg(memory_reasoner_backend="codex", memory_episode_model="gpt-5.4-mini")
-        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_FakeCodexReasoner()):
-            ep, cost_usd, reason = await _run_episode_extractor("payload", config)
+        config = _cfg()
+        with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FakeCodexReasoner()):
+            ep, cost_usd, reason = await _run_episode_extractor("payload", config, effective_backend="codex")
 
         assert ep == episode
         # No total_cost_usd in the envelope -> 0.0. Codex runs

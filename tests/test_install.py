@@ -1705,19 +1705,15 @@ class TestCmdConfig:
         # Budget prompts (extraction, episode) are skipped on the claude
         # backend per issue #390 - --max-budget-usd is no longer emitted
         # to claude --print argv at either stage, so the wizard does not
-        # ask for a value that would never be enforced.
+        # ask for a value that would never be enforced. The memory
+        # reasoner backend and episode model prompts were retired in
+        # issue #515 (per-user dispatch via agent_backend).
         memory_block = [
             "true",  # memory enabled
             "true",  # extraction enabled (claude backend)
-            "claude",  # MEMORY_REASONER_BACKEND (matches install vendor; suppressed at emission as default)
             "60",  # extraction timeout seconds (#345)
             "5",  # consolidation candidates (non-default, exercises emission branch)
             "5",  # episode classifier context turns (#392, non-default exercises emission)
-            # Episode model: empty input now resolves to the wizard's
-            # default of "claude-sonnet-4-6" rather than the empty
-            # string. To exercise the explicit-override emission
-            # branch, type a different model literal here.
-            "claude-haiku-4-5-20251001",  # episode model (explicit override)
             "60",  # episode timeout seconds (non-default)
             "0.85",  # paraphrase-dedup threshold (non-default, exercises emission)
             "3000",  # token budget
@@ -1732,10 +1728,11 @@ class TestCmdConfig:
         env = conf["env"]
         assert env["MEMORY_ENABLED"] == "true"
         assert env["MEMORY_EXTRACTION_ENABLED"] == "true"
-        # MEMORY_REASONER_BACKEND="claude" is the dataclass default;
-        # the wizard's emission gate suppresses default values, so the
-        # key must NOT appear in the generated env.
+        # The retired memory-reasoner + model env vars are no longer
+        # collected by the wizard; the wizard never writes them.
         assert "MEMORY_REASONER_BACKEND" not in env
+        assert "MEMORY_EXTRACTION_MODEL" not in env
+        assert "MEMORY_EPISODE_MODEL" not in env
         # Budget keys absent on claude backend: prompt is skipped, value
         # stays at dataclass default, double-gated emission suppresses.
         assert "MEMORY_EXTRACTION_BUDGET_USD" not in env
@@ -1745,11 +1742,6 @@ class TestCmdConfig:
         # non-default 5, so the emission gate fires and the env entry
         # is written.
         assert env["EPISODE_CLASSIFIER_CONTEXT_TURNS"] == "5"
-        # Episode model: the wizard's non-blank default means an
-        # operator who hits Enter at the prompt now gets Sonnet
-        # written to the env. This test asserts the explicit-override
-        # path: a model literal typed in the prompt survives to env.
-        assert env["MEMORY_EPISODE_MODEL"] == "claude-haiku-4-5-20251001"
         assert "MEMORY_EPISODE_BUDGET_USD" not in env
         assert env["MEMORY_EPISODE_TIMEOUT_S"] == "60"
         # Paraphrase-dedup threshold: operator picked 0.85 (non-default),
@@ -1758,36 +1750,25 @@ class TestCmdConfig:
         assert env["MEMORY_TOKEN_BUDGET"] == "3000"
         assert env["MEMORY_SEARCH_LIMIT"] == "20"
 
-    def test_memory_episode_wizard_default_writes_sonnet(self, tmp_path, monkeypatch):
-        """Regression for the v1 default-flip: an operator who accepts
-        every wizard default in the episode block should end up with
-        MEMORY_EPISODE_MODEL=claude-sonnet-4-6 written to env, not the
-        empty-inheritance fallback. Pins the recommendation contract so
-        a future "default back to inheritance" change surfaces here.
-
-        Budget default is 0.15 (matches the dataclass default), so the
-        emission gate suppresses the key - asserted absent. Timeout
-        default is 120, also suppressed."""
+    def test_memory_episode_defaults_suppress_emission(self, tmp_path, monkeypatch):
+        """Operator who accepts every wizard default in the episode
+        block produces no episode-specific env entries (the emission
+        gates suppress equal-to-dataclass-default values). The memory
+        reasoner backend and episode model prompts were retired in
+        issue #515; per-user dispatch resolves both at runtime."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
 
-        # Every input below matches the corresponding dataclass
-        # default so the emission gates suppress non-episode keys.
-        # Asserted on the negative side below for the episode keys;
-        # the positive assertion is on the Sonnet model entry.
-        # Budget prompts (extraction, episode) are skipped on the
-        # claude backend per issue #390, so they are absent from
-        # the input list rather than supplying the dataclass default.
+        # Every input matches the corresponding dataclass default so
+        # the emission gates suppress every key in the memory block.
         memory_block = [
             "true",  # memory enabled
             "true",  # extraction enabled
-            "claude",  # MEMORY_REASONER_BACKEND (default-accept; suppressed at emission)
             "10",  # extraction timeout (dataclass default; suppressed)
             "8",  # consolidation candidates (dataclass default; suppressed)
             "3",  # episode classifier context turns (#392, dataclass default; suppressed)
-            "",  # episode model: accept wizard default = claude-sonnet-4-6
             "120",  # episode timeout (dataclass default; suppressed)
             "0.9",  # paraphrase-dedup threshold (dataclass default; suppressed)
             "2000",  # token budget (dataclass default; suppressed)
@@ -1799,21 +1780,19 @@ class TestCmdConfig:
         _cmd_config()
 
         env = json.loads((tmp_path / "install.conf").read_text())["env"]
-        # Sonnet is the recommended default, so empty input → Sonnet.
-        assert env["MEMORY_EPISODE_MODEL"] == "claude-sonnet-4-6"
+        # Retired vars never appear, regardless of input.
+        assert "MEMORY_REASONER_BACKEND" not in env
+        assert "MEMORY_EXTRACTION_MODEL" not in env
+        assert "MEMORY_EPISODE_MODEL" not in env
         # Budget and timeout match dataclass defaults → no emission.
         assert "MEMORY_EPISODE_BUDGET_USD" not in env
         assert "MEMORY_EPISODE_TIMEOUT_S" not in env
         # Stage-1 keys also suppressed because their inputs match
-        # the dataclass defaults too. Assert the suppression so a
-        # future change to the gate semantics surfaces here.
+        # the dataclass defaults too.
         assert "MEMORY_EXTRACTION_BUDGET_USD" not in env
         assert "MEMORY_EXTRACTION_TIMEOUT_S" not in env
         assert "MEMORY_CONSOLIDATION_CANDIDATES_N" not in env
-        # Episode-classifier context window (#392) at default 3 is
-        # also suppressed by the emission gate.
         assert "EPISODE_CLASSIFIER_CONTEXT_TURNS" not in env
-        # Paraphrase-dedup threshold at default 0.9 is also suppressed.
         assert "MEMORY_DUPLICATE_THRESHOLD" not in env
 
     def test_memory_round_trip_through_env_file(self, tmp_path, monkeypatch):
@@ -1823,17 +1802,16 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
 
-        # Inputs in wizard order: enabled, ext enabled, timeout, consolidation, classifier-window, episode model/timeout, token budget, search limit.
+        # Inputs in wizard order: enabled, ext enabled, timeout, consolidation, classifier-window, episode timeout, dedup threshold, token budget, search limit.
         # Budget prompts (extraction, episode) are skipped on the claude
-        # backend per issue #390, so they are absent from this input list.
+        # backend per issue #390. The memory reasoner backend and
+        # episode model prompts were retired in issue #515.
         memory_block = [
             "true",
             "true",
-            "claude",  # MEMORY_REASONER_BACKEND (default-accept; suppressed)
             "45",
             "4",
             "7",  # episode classifier context turns (#392, non-default)
-            "claude-haiku-4-5-future",
             "90",
             "0.8",  # paraphrase-dedup threshold (non-default)
             "2500",
@@ -1856,10 +1834,15 @@ class TestCmdConfig:
         assert 'MEMORY_CONSOLIDATION_CANDIDATES_N="4"' in rendered
         # Episode-classifier context window (#392) round-trip parity.
         assert 'EPISODE_CLASSIFIER_CONTEXT_TURNS="7"' in rendered
-        # Episode tunables: explicit model entry survives, non-default
-        # timeout survives. Round-trip parity with the extraction tunables
-        # above. Budget is suppressed on claude for the same reason.
-        assert 'MEMORY_EPISODE_MODEL="claude-haiku-4-5-future"' in rendered
+        # Retired keys (per issue #515 per-user dispatch) must NOT
+        # round-trip; the wizard no longer collects them, so they
+        # cannot appear in the env file.
+        assert "MEMORY_REASONER_BACKEND" not in rendered
+        assert "MEMORY_EXTRACTION_MODEL" not in rendered
+        assert "MEMORY_EPISODE_MODEL" not in rendered
+        # Episode tunables: non-default timeout survives. Round-trip
+        # parity with the extraction tunables above. Budget is
+        # suppressed on claude for the same reason.
         assert "MEMORY_EPISODE_BUDGET_USD" not in rendered
         assert 'MEMORY_EPISODE_TIMEOUT_S="90"' in rendered
         assert 'MEMORY_TOKEN_BUDGET="2500"' in rendered
@@ -2083,11 +2066,9 @@ class TestCmdConfig:
         memory_block = [
             "true",  # memory enabled
             "true",  # extraction enabled
-            "claude",  # MEMORY_REASONER_BACKEND (default-accept; suppressed)
             "10",  # extraction timeout (default; suppressed)
             "8",  # consolidation candidates (default; suppressed)
             "5",  # episode classifier context turns (#392, non-default)
-            "",  # episode model (accept Sonnet wizard default)
             "120",  # episode timeout (default; suppressed)
             "0.9",  # paraphrase-dedup threshold (default; suppressed)
             "2000",  # token budget (default; suppressed)
@@ -2114,11 +2095,9 @@ class TestCmdConfig:
         memory_block = [
             "true",  # memory enabled
             "true",  # extraction enabled
-            "claude",  # MEMORY_REASONER_BACKEND (default-accept; suppressed)
             "10",  # extraction timeout (default)
             "8",  # consolidation candidates (default)
             "3",  # episode classifier context turns (#392, dataclass default)
-            "",  # episode model (Sonnet default)
             "120",  # episode timeout (default)
             "0.9",  # paraphrase-dedup threshold (default)
             "2000",  # token budget (default)
@@ -2250,7 +2229,9 @@ class TestCmdConfig:
         monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4")
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        # MEMORY_REASONER_BACKEND retired (issue #515); memory reasoner
+        # derives from AGENT_BACKEND per-user. The wizard no longer
+        # emits the key.
         # MEMORY_EPISODE_MODEL is intentionally NOT set; the codex
         # branch defaults the wizard prompt to blank, which means
         # load_config inherits from MEMORY_EXTRACTION_MODEL, which
@@ -2260,13 +2241,14 @@ class TestCmdConfig:
         config = load_config()
         assert config.memory_enabled is True
         assert config.memory_extraction_enabled is True
-        assert config.memory_reasoner_backend == "codex"
-        # Both models must validate as codex SKUs (load_config
-        # checks against CODEX_MODELS and SystemExits on miss).
-        from kai.config import CODEX_MODELS
+        assert config.agent_backend == "codex"
+        # Per-user dispatch (issue #515) resolves the memory model
+        # from the registry at extraction time; verify both stage roles
+        # have a codex-valid row.
+        from kai.config import CODEX_MODELS, ModelRole, get_model_for
 
-        assert config.memory_extraction_model in CODEX_MODELS
-        assert config.memory_episode_model in CODEX_MODELS
+        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex") in CODEX_MODELS
+        assert get_model_for(ModelRole.MEMORY_EPISODE, "codex") in CODEX_MODELS
 
     def test_codex_fresh_install_with_memory_extraction_yields_valid_users_yaml(self, tmp_path, monkeypatch):
         """Fresh-install regression for the codex memory wizard gate.
@@ -2339,12 +2321,10 @@ class TestCmdConfig:
                 # claude_user skipped on agent_backend != claude
                 "true",  # memory enabled
                 "true",  # memory extraction enabled
-                "codex",  # memory reasoner backend
-                "codex_runner",  # NEW: re-prompted os_user after codex gate
+                "codex_runner",  # re-prompted os_user after codex gate
                 "10",  # extraction timeout
                 "8",  # consolidation candidates
                 "3",  # episode classifier context turns
-                "",  # episode model (blank inherits extraction model)
                 "120",  # episode timeout
                 "0.9",  # paraphrase-dedup threshold
                 "2000",  # token budget
@@ -2387,7 +2367,7 @@ class TestCmdConfig:
         config = load_config()
         assert config.memory_enabled is True
         assert config.memory_extraction_enabled is True
-        assert config.memory_reasoner_backend == "codex"
+        assert config.agent_backend == "codex"
         assert config.user_configs is not None
         assert 12345 in config.user_configs
         assert config.user_configs[12345].os_user == "codex_runner"
@@ -2737,37 +2717,28 @@ class TestCmdConfigDefaultModelDispatch:
 
     def test_codex_install_enables_memory_with_codex_reasoner(self, tmp_path, monkeypatch):
         """
-        Codex installs CAN enable semantic memory. The reasoner
-        backend defaults to codex (matching the agent backend), the
-        extraction-enabled flag persists, MEMORY_REASONER_BACKEND
-        lands as a non-default value, and the stale-key cleanup at
-        wizard end no longer strips the codex extraction config.
+        Codex installs CAN enable semantic memory. The wizard no
+        longer prompts for MEMORY_REASONER_BACKEND or the episode
+        model (issue #515 retired both); the memory reasoner derives
+        from each user's effective `agent_backend` at extraction time.
+        The extraction-enabled flag persists and the stale-key cleanup
+        at wizard end no longer strips the codex extraction config.
 
         Regression for the prior wizard behavior that forced both
         memory flags off on codex installs and printed a "currently
-        requires the claude backend" message; that guard came out
-        when the OneShotReasoner abstraction made codex memory
-        reachable end-to-end.
+        requires the claude backend" message.
         """
         self._setup(
             monkeypatch,
             tmp_path,
             existing_env={"DEFAULT_MODEL": "gpt-5.4"},
         )
-        # Feed the wizard codex defaults for every memory prompt. The
-        # reasoner_backend default mirrors agent_backend=codex, so
-        # accepting it via empty string locks in MEMORY_REASONER_BACKEND
-        # =codex. The episode model default is empty (inherit
-        # extraction model) on the codex reasoner branch; accepting
-        # blank exercises that path.
         memory_inputs = [
             "true",  # MEMORY_ENABLED
             "true",  # MEMORY_EXTRACTION_ENABLED
-            "",  # MEMORY_REASONER_BACKEND (accept default = codex)
             "10",  # extraction timeout (dataclass default)
             "8",  # consolidation candidates (dataclass default)
             "3",  # episode classifier context turns (dataclass default)
-            "",  # episode model (blank inherits extraction model on codex)
             "120",  # episode timeout (dataclass default)
             "0.9",  # paraphrase-dedup threshold (dataclass default)
             "2000",  # token budget (dataclass default)
@@ -2786,80 +2757,23 @@ class TestCmdConfigDefaultModelDispatch:
         idx = len(base_inputs) - 2  # memory_enabled position
         inputs = base_inputs[: idx + 1] + memory_inputs[1:] + base_inputs[idx + 1 :]
         _, env = self._run(monkeypatch, tmp_path, inputs, helper_return="gpt-5.4")
-        # Codex install now persists memory extraction config. The
-        # reasoner backend is codex (non-default; emitted), and the
-        # extraction flag survives the cleanup block that previously
-        # stripped it on non-claude installs.
+        # Codex install persists memory extraction config; the global
+        # AGENT_BACKEND=codex is what makes codex extraction-eligible.
         assert env.get("MEMORY_ENABLED") == "true"
         assert env.get("MEMORY_EXTRACTION_ENABLED") == "true"
-        assert env.get("MEMORY_REASONER_BACKEND") == "codex"
+        assert env.get("AGENT_BACKEND") == "codex"
+        # MEMORY_REASONER_BACKEND retired; the wizard must not emit it.
+        assert "MEMORY_REASONER_BACKEND" not in env
 
-    def test_claude_install_codex_reasoner_emits_codex_bin_and_matches_sudoers(self, tmp_path, monkeypatch):
-        """claude+codex memory regression: when AGENT_BACKEND=claude but
-        MEMORY_REASONER_BACKEND=codex, the wizard must still collect
-        CODEX_BIN (the earlier agent-block prompt is skipped because the
-        agent backend is not codex). install.conf must emit CODEX_BIN,
-        and the sudoers rules _generate_sudoers produces from that env
-        must reference the same path. Without this contract the codex
-        memory reasoner spawns the binary resolved from PATH while the
-        sudoers SETENV rule allows only the wizard's fallback
-        /opt/homebrew/bin/codex; if the two diverge, every cross-user
-        codex call fails with "a password is required" and extraction
-        silently no-ops.
-        """
-        from kai.install import _generate_sudoers
-
-        self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_MODEL": "sonnet"})
-        # The new claude-with-codex-reasoner memory block. The
-        # CODEX_BIN re-prompt is the load-bearing entry: it only
-        # fires when memory_reasoner_backend == codex AND the earlier
-        # codex agent-block did not collect a path (agent_backend !=
-        # codex). Episode model is left blank to inherit the codex
-        # extraction default in load_config.
-        memory_inputs = [
-            "true",  # MEMORY_ENABLED
-            "true",  # MEMORY_EXTRACTION_ENABLED
-            "codex",  # MEMORY_REASONER_BACKEND (override default = claude)
-            "/usr/local/bin/codex",  # NEW: codex_bin re-prompt at memory gate
-            "10",  # extraction timeout (dataclass default)
-            "8",  # consolidation candidates (dataclass default)
-            "3",  # episode classifier context turns (dataclass default)
-            "",  # episode model (blank inherits extraction model on codex)
-            "120",  # episode timeout (dataclass default)
-            "0.9",  # paraphrase-dedup threshold (dataclass default)
-            "2000",  # token budget (dataclass default)
-            "10",  # search limit (dataclass default)
-        ]
-        # _inputs_for_claude_backend places memory_enabled as the
-        # second-to-last entry. Replace it with "true" and splice the
-        # rest of the memory block immediately after; the trailing
-        # perplexity-key entry stays at the end.
-        base_inputs = self._inputs_for_claude_backend()
-        idx = len(base_inputs) - 2  # memory_enabled position
-        base_inputs = base_inputs[:idx] + ["true"] + base_inputs[idx + 1 :]
-        inputs = base_inputs[: idx + 1] + memory_inputs[1:] + base_inputs[idx + 1 :]
-        _, env = self._run(monkeypatch, tmp_path, inputs, helper_return="sonnet")
-        assert env.get("MEMORY_REASONER_BACKEND") == "codex"
-        # The wizard must emit CODEX_BIN even though AGENT_BACKEND=
-        # claude. Pre-fix this assertion failed because the env-
-        # emission block was gated on agent_backend == codex.
-        assert env.get("CODEX_BIN") == "/usr/local/bin/codex"
-
-        # Sudoers rules generated from env["CODEX_BIN"] must use the
-        # same path. This pins the install-time wiring so the codex
-        # memory reasoner argv (which resolves codex via the same
-        # binary path through resolve_oneshot_binary) and the
-        # sudoers SETENV rule cannot drift apart. _user_home is
-        # patched because the sudoers generator inspects per-target
-        # home directories that do not exist on the test host.
-        monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
-        sudoers = _generate_sudoers(
-            "kai",
-            os_users=["alice"],
-            codex_bin=env["CODEX_BIN"],
-        )
-        codex_lines = [line for line in sudoers.splitlines() if "(alice)" in line and "/usr/local/bin/codex" in line]
-        assert len(codex_lines) == 1, codex_lines
+    # The old test_claude_install_codex_reasoner_emits_codex_bin_and_matches_sudoers
+    # tested a wizard prompt path that issue #515 retired (global
+    # MEMORY_REASONER_BACKEND=codex with AGENT_BACKEND=claude). The
+    # mixed-backend scenario it covered now requires a users.yaml entry
+    # with per-user `agent_backend: codex`, which the wizard does not
+    # prompt for - operators edit users.yaml directly. The CODEX_BIN
+    # sudoers wiring is covered by other tests in the suite; a
+    # dedicated regression for the codex_runs_anywhere predicate
+    # belongs in the new-tests pass for issue #515.
 
 
 class TestCmdApplyDefaultModelGate:
@@ -6229,24 +6143,30 @@ class TestPerOsUserCodexLoginHint:
         path.write_text(yaml.safe_dump({"users": entries}))
         return path
 
-    def test_claude_agent_with_codex_memory_reasoner_emits_reminder(self, tmp_path):
-        """The reviewer-flagged regression. With AGENT_BACKEND=claude and
-        MEMORY_REASONER_BACKEND=codex, codex still runs per-user for
-        memory extraction; the operator must run `codex login` as the
-        target os_user or the first extraction fails with no auth.
-        Pre-fix the reminder was suppressed because the gate keyed on
-        AGENT_BACKEND alone.
+    def test_claude_agent_with_per_user_codex_emits_reminder(self, tmp_path):
+        """Mixed-backend regression. With AGENT_BACKEND=claude but a
+        users.yaml entry pinned to `agent_backend: codex`, codex still
+        runs per-user; the operator must run `codex login` as the
+        target os_user or the first turn fails with no auth.
+        Pre-#515 fix the reminder was suppressed because the gate
+        keyed on AGENT_BACKEND alone; now the gate honors per-user
+        agent_backend overrides via `_codex_users_from_yaml`.
         """
         from kai.install import _build_codex_login_reminder
 
         users_yaml = self._write_users_yaml(
             tmp_path,
-            [{"telegram_id": 12345, "name": "alice", "role": "admin", "os_user": "alice"}],
+            [
+                {
+                    "telegram_id": 12345,
+                    "name": "alice",
+                    "role": "admin",
+                    "agent_backend": "codex",
+                    "os_user": "alice",
+                }
+            ],
         )
-        env = {
-            "AGENT_BACKEND": "claude",
-            "MEMORY_REASONER_BACKEND": "codex",
-        }
+        env = {"AGENT_BACKEND": "claude"}
         text = _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml)
         assert text is not None
         assert "Codex subscription auth required:" in text
@@ -6293,15 +6213,28 @@ class TestPerOsUserCodexLoginHint:
             tmp_path,
             [{"telegram_id": 1, "name": "alice", "role": "admin", "os_user": "alice"}],
         )
-        for env in (
-            {"AGENT_BACKEND": "codex", "CODEX_AUTH_MODE": "api_key"},
-            {
-                "AGENT_BACKEND": "claude",
-                "MEMORY_REASONER_BACKEND": "codex",
-                "CODEX_AUTH_MODE": "api_key",
-            },
-        ):
-            assert _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml) is None, env
+        # First env: global codex with api_key auth, users.yaml has
+        # alice as a generic claude-effective user (no agent_backend
+        # override). Second env: claude global with per-user codex
+        # override via users.yaml + api_key auth. Both must return None
+        # because api_key auth needs no per-user codex login.
+        env_codex_global = {"AGENT_BACKEND": "codex", "CODEX_AUTH_MODE": "api_key"}
+        assert _build_codex_login_reminder(env_codex_global, "kai", users_yaml_path=users_yaml) is None
+
+        users_yaml_mixed = self._write_users_yaml(
+            tmp_path,
+            [
+                {
+                    "telegram_id": 2,
+                    "name": "alice",
+                    "role": "admin",
+                    "agent_backend": "codex",
+                    "os_user": "alice",
+                }
+            ],
+        )
+        env_mixed = {"AGENT_BACKEND": "claude", "CODEX_AUTH_MODE": "api_key"}
+        assert _build_codex_login_reminder(env_mixed, "kai", users_yaml_path=users_yaml_mixed) is None
 
     def test_no_os_users_falls_back_to_service_user(self, tmp_path):
         """When users.yaml has no os_user entries (legacy single-user

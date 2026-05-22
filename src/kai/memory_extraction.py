@@ -28,7 +28,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 from kai import memory
-from kai.config import Config
+from kai.config import Config, ModelRole, get_model_for
 from kai.memory import MemoryResult
 from kai.oneshot import _EXTRACTOR_CWD as _EXTRACTOR_CWD
 from kai.oneshot import _SUBPROCESS_ENV_ALLOWLIST as _SUBPROCESS_ENV_ALLOWLIST
@@ -1704,36 +1704,68 @@ def _resolve_os_user(user_id: str, config: Config) -> str | None:
     return user_cfg.os_user
 
 
-def _get_memory_reasoner(config: Config, os_user: str | None = None) -> OneShotReasoner:
+def _resolve_effective_backend(user_id: str, config: Config) -> str:
     """
-    Resolve the one-shot reasoner used by both memory stages.
+    Resolve the user being extracted to its effective `agent_backend`.
 
-    Dispatches on `config.memory_reasoner_backend`. The valid set is
-    validated at config-load time so this helper can rely on the
-    string being either "claude" or "codex"; a third value would have
-    failed `load_config` already and never reached here. The
-    RuntimeError branch exists as a safety net for a future enum
-    extension where the dataclass field gains a new value before this
-    function is updated; surfacing it as a runtime error rather than
-    silently selecting Claude keeps the failure visible.
+    Cascade: per-user `agent_backend` from users.yaml wins; otherwise
+    the global `config.agent_backend` applies. The same shape
+    `_ingest_memory` in bot.py uses to gate extraction eligibility,
+    kept in lockstep so the per-user dispatch site here cannot drift
+    from the eligibility check there.
+
+    `user_id` is the Telegram chat_id string the caller threads through
+    `extract_and_store`. Non-integer values (eval-gate sandbox IDs like
+    `sandbox-498-claude`) fall back to the global default because
+    they cannot index `user_configs`. Same for IDs not present in
+    `user_configs`. Both cases produce the same value the global path
+    would have produced before per-user dispatch existed.
+
+    Goose users never reach this function because `bot.py`'s
+    extraction gate filters them out upstream; the defensive raise in
+    `_build_memory_reasoner` below catches a future regression where
+    the gate moves or changes.
+    """
+    if config.user_configs is None:
+        return config.agent_backend
+    try:
+        tid = int(user_id)
+    except ValueError:
+        return config.agent_backend
+    user_cfg = config.user_configs.get(tid)
+    if user_cfg is None:
+        return config.agent_backend
+    return user_cfg.agent_backend or config.agent_backend
+
+
+def _build_memory_reasoner(effective_backend: str, os_user: str | None = None) -> OneShotReasoner:
+    """
+    Build the one-shot reasoner matching the user's effective backend.
+
+    Dispatches on the per-user `effective_backend` resolved by
+    `_resolve_effective_backend`. The valid set is "claude" / "codex";
+    goose users do not reach this site (gated upstream in `bot.py`).
+    The RuntimeError branch is a defensive safety net for a future
+    regression where the upstream gate widens or changes - surfacing
+    as a runtime error rather than silently selecting Claude keeps the
+    failure visible.
 
     `os_user` is resolved once at the top of `extract_and_store` and
-    threaded into this helper. The codex reasoner raises
-    `OneShotRoutingError` from `run()` when os_user is None; the
-    claude reasoner spawns directly. Tests monkeypatch this helper
-    to inject fake reasoners; the `os_user` parameter is accepted
-    but not inspected on the test side because patches use
-    `return_value=`.
+    threaded in. The codex reasoner raises `OneShotRoutingError` from
+    `run()` when `os_user is None`; the claude reasoner spawns
+    directly. Tests monkeypatch this helper to inject fake reasoners;
+    the parameters are accepted but not inspected on the test side
+    because patches use `return_value=`.
 
     Returning a fresh instance per call (rather than a module-level
     singleton) keeps the memory path stateless and mirrors the
     pre-refactor per-call subprocess construction.
     """
-    if config.memory_reasoner_backend == "claude":
+    if effective_backend == "claude":
         return ClaudeOneShotReasoner(os_user=os_user)
-    if config.memory_reasoner_backend == "codex":
+    if effective_backend == "codex":
         return CodexOneShotReasoner(os_user=os_user)
-    raise RuntimeError(f"Unknown memory_reasoner_backend: {config.memory_reasoner_backend!r}")
+    raise RuntimeError(f"extraction reached _build_memory_reasoner for non-extraction backend: {effective_backend!r}")
 
 
 # ── Subprocess wiring ───────────────────────────────────────────────
@@ -1746,6 +1778,7 @@ async def _run_extractor(
     candidate_ids: set[str],
     candidate_metadata: dict[str, dict],
     user_id: str,
+    effective_backend: str,
     os_user: str | None = None,
     system_prompt: str = _EXTRACTION_SYSTEM_PROMPT,
     user_window_text: str = "",
@@ -1825,12 +1858,12 @@ async def _run_extractor(
     # returned on failure. JSON envelope parsing stays in this
     # function so memory-domain concerns (is_error, structured_output,
     # facts, has_episode) do not leak into the reasoner.
-    reasoner = _get_memory_reasoner(config, os_user=os_user)
+    reasoner = _build_memory_reasoner(effective_backend, os_user=os_user)
     try:
         result = await reasoner.run(
             prompt=payload_text,
             system_prompt=system_prompt,
-            model=config.memory_extraction_model,
+            model=get_model_for(ModelRole.MEMORY_EXTRACTION, effective_backend),
             timeout=config.memory_extraction_timeout_s,
             purpose="fact_extraction",
             json_schema=_FACT_SCHEMA,
@@ -1988,6 +2021,7 @@ async def _run_episode_extractor(
     payload_text: str,
     config: Config,
     *,
+    effective_backend: str,
     os_user: str | None = None,
 ) -> tuple[dict | None, float, str | None]:
     """
@@ -2020,12 +2054,12 @@ async def _run_episode_extractor(
     # `os_user` is the routing target resolved once at the top of
     # `extract_and_store` (per-user OS routing); stage 2 inherits the
     # same target so the policy boundary is enforced consistently.
-    reasoner = _get_memory_reasoner(config, os_user=os_user)
+    reasoner = _build_memory_reasoner(effective_backend, os_user=os_user)
     try:
         result = await reasoner.run(
             prompt=payload_text,
             system_prompt=_EPISODE_SYSTEM_PROMPT,
-            model=config.memory_episode_model,
+            model=get_model_for(ModelRole.MEMORY_EPISODE, effective_backend),
             timeout=config.memory_episode_timeout_s,
             purpose="episode_generation",
             json_schema=_EPISODE_SCHEMA,
@@ -2081,6 +2115,7 @@ async def _generate_episode(
     user_id: str,
     session_id: str | None,
     config: Config,
+    effective_backend: str,
     os_user: str | None = None,
 ) -> None:
     """
@@ -2121,7 +2156,9 @@ async def _generate_episode(
             # quick succession and the second waits on the first.
             start = time.monotonic()
             payload = _build_episode_payload(user_text, assistant_text)
-            episode, cost_usd, run_reason = await _run_episode_extractor(payload, config, os_user=os_user)
+            episode, cost_usd, run_reason = await _run_episode_extractor(
+                payload, config, effective_backend=effective_backend, os_user=os_user
+            )
             if episode is None:
                 # Map the run-helper's failure tags onto the documented
                 # outcome enum: timeout, subprocess_error, parse_error,
@@ -2550,6 +2587,17 @@ async def extract_and_store(
     # `users.yaml[telegram_id].os_user`.
     os_user = os_user_override if os_user_override is not None else _resolve_os_user(user_id, config)
 
+    # Per-user reasoner backend (issue #515). Resolved ONCE alongside
+    # `os_user` and threaded into both stages so the (effective_backend,
+    # os_user) pair stays consistent across stage 1 and stage 2 for a
+    # single exchange. The model for each stage is looked up inline
+    # via `get_model_for(role, effective_backend)` at the call site
+    # (no global model field; the registry is the single source of
+    # truth). Goose users do not reach this site because `bot.py`'s
+    # extraction gate filters them out upstream; the cascade here
+    # mirrors `_resolve_effective_backend`.
+    effective_backend = _resolve_effective_backend(user_id, config)
+
     sem = _get_semaphore(user_id)
     # Pre-initialize the storage counters so the post-try summary log
     # cannot reference an unbound name regardless of which branch (or
@@ -2655,6 +2703,7 @@ async def extract_and_store(
                 candidate_ids=candidate_id_set,
                 candidate_metadata=candidate_metadata,
                 user_id=user_id,
+                effective_backend=effective_backend,
                 os_user=os_user,
                 user_window_text=user_window_text,
                 assistant_window_text=assistant_window_text,
@@ -2715,6 +2764,7 @@ async def extract_and_store(
                         user_id=user_id,
                         session_id=session_id,
                         config=config,
+                        effective_backend=effective_backend,
                         os_user=os_user,
                     ),
                     name=f"episode-{user_id}",

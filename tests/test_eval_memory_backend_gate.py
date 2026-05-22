@@ -247,18 +247,29 @@ class TestValidateUserPrefix:
 
 class TestMakeBackendConfig:
     def test_claude_resolves_claude_models(self):
+        """Issue #515 retired the memory reasoner + model env vars;
+        `make_backend_config` now stamps `agent_backend` and the eval
+        harness reads models inline via `get_model_for(role, backend)`
+        at each call site. Pin both the agent_backend selection and
+        the registry-resolved model strings so a future registry
+        change surfaces here."""
+        from kai.config import ModelRole, get_model_for
+
         config = g.make_backend_config(_BASE_CONFIG, "claude")
-        assert config.memory_reasoner_backend == "claude"
-        assert config.memory_extraction_model == "claude-haiku-4-5-20251001"
-        assert config.memory_episode_model == "claude-haiku-4-5-20251001"
+        assert config.agent_backend == "claude"
         assert config.memory_enabled is True
         assert config.memory_extraction_enabled is True
+        # Registry resolution still produces the expected literals.
+        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "claude") == "claude-haiku-4-5-20251001"
+        assert get_model_for(ModelRole.MEMORY_EPISODE, "claude") == "claude-haiku-4-5-20251001"
 
     def test_codex_resolves_codex_models(self):
+        from kai.config import ModelRole, get_model_for
+
         config = g.make_backend_config(_BASE_CONFIG, "codex")
-        assert config.memory_reasoner_backend == "codex"
-        assert config.memory_extraction_model == "gpt-5.4-mini"
-        assert config.memory_episode_model == "gpt-5.4-mini"
+        assert config.agent_backend == "codex"
+        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex") == "gpt-5.4-mini"
+        assert get_model_for(ModelRole.MEMORY_EPISODE, "codex") == "gpt-5.4-mini"
 
 
 # ── Anchor matching ─────────────────────────────────────────────────

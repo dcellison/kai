@@ -1319,7 +1319,6 @@ class TestMemoryExtractionConfig:
         _set_required(monkeypatch)
         config = load_config()
         assert config.memory_extraction_enabled is False
-        assert config.memory_extraction_model == "claude-haiku-4-5-20251001"
         assert config.memory_extraction_budget_usd == 0.01
         assert config.memory_extraction_timeout_s == 10
 
@@ -1350,11 +1349,20 @@ class TestMemoryExtractionConfig:
         assert config.memory_extraction_enabled is False
         assert config.memory_enabled is False
 
-    def test_model_override(self, monkeypatch):
+    def test_model_override_logs_deprecation(self, monkeypatch, caplog):
+        """The legacy MEMORY_EXTRACTION_MODEL env var is no longer
+        load-bearing (issue #515): memory models resolve per-user
+        from the registry via get_model_for(role, effective_backend).
+        Setting the env var still parses without error, but emits a
+        single deprecation warning at load_config time."""
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_EXTRACTION_MODEL", "claude-haiku-4-5-20251001-custom")
-        config = load_config()
-        assert config.memory_extraction_model == "claude-haiku-4-5-20251001-custom"
+        with caplog.at_level("WARNING", logger="kai.config"):
+            config = load_config()
+        # Field is gone; verify no AttributeError on access shape.
+        assert not hasattr(config, "memory_extraction_model")
+        deprecation_msgs = [r.message for r in caplog.records if "MEMORY_EXTRACTION_MODEL is deprecated" in r.message]
+        assert len(deprecation_msgs) == 1, deprecation_msgs
 
     def test_budget_override(self, monkeypatch):
         _set_required(monkeypatch)
@@ -1504,69 +1512,50 @@ class TestEpisodeClassifierContextTurns:
 # ── Memory reasoner backend selection ───────────────────────────────
 
 
-class TestMemoryReasonerBackend:
-    """MEMORY_REASONER_BACKEND selects the OneShotReasoner used by both
-    memory stages. Default is `claude` even when AGENT_BACKEND=codex,
-    because codex memory extraction has not yet cleared the
-    cross-backend quality eval; the value must be explicitly opted in.
-    Invalid values are SystemExit at config-load time, matching the
-    AGENT_BACKEND validation pattern (no first-extraction surprise)."""
+class TestMemoryReasonerBackendDeprecation:
+    """The MEMORY_REASONER_BACKEND env var was retired in issue #515.
+    Memory reasoner selection is now per-user, derived from each
+    user's effective `agent_backend`. Legacy installs that still
+    carry the env var get a deprecation warning but load_config
+    completes normally."""
 
-    def test_default_is_claude(self, monkeypatch):
-        _set_required(monkeypatch)
-        config = load_config()
-        assert config.memory_reasoner_backend == "claude"
-
-    def test_default_stays_claude_under_agent_backend_codex(self, monkeypatch):
-        """The conservative posture: AGENT_BACKEND=codex does NOT flip
-        memory extraction onto codex. The selection is explicit so an
-        unevaluated provider cannot silently start writing memory."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("AGENT_BACKEND", "codex")
-        monkeypatch.setenv("LLM_PROVIDER", "openai")
-        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.5")
-        config = load_config()
-        assert config.agent_backend == "codex"
-        assert config.memory_reasoner_backend == "claude"
-
-    def test_codex_value_accepted(self, monkeypatch):
+    def test_env_var_logs_deprecation_warning(self, monkeypatch, caplog):
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
-        config = load_config()
-        assert config.memory_reasoner_backend == "codex"
+        with caplog.at_level("WARNING", logger="kai.config"):
+            config = load_config()
+        # No SystemExit; load_config returns normally.
+        deprecation_msgs = [r.message for r in caplog.records if "MEMORY_REASONER_BACKEND is deprecated" in r.message]
+        assert len(deprecation_msgs) == 1, deprecation_msgs
+        # The field is gone.
+        assert not hasattr(config, "memory_reasoner_backend")
 
-    def test_invalid_value_raises_systemexit(self, monkeypatch):
-        """Typos like `gpt5` must fail at config-load time, not at
-        the first `_get_memory_reasoner` call. The error message
-        names the offending var so an operator does not have to grep
-        for it."""
+    def test_unknown_value_still_only_warns(self, monkeypatch, caplog):
+        """Even a typo like `gpt5` does NOT SystemExit any more; the
+        value is ignored after the deprecation warning. Operators
+        who used to see config-load failures will now see one warning
+        and a working install."""
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_REASONER_BACKEND", "gpt5")
-        with pytest.raises(SystemExit, match="MEMORY_REASONER_BACKEND"):
+        with caplog.at_level("WARNING", logger="kai.config"):
             load_config()
-
-    def test_case_insensitive(self, monkeypatch):
-        """Operators sometimes set env vars in uppercase out of habit;
-        the parser is case-insensitive to avoid a confusing
-        SystemExit on Codex/CLAUDE typo variants."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "CODEX")
-        config = load_config()
-        assert config.memory_reasoner_backend == "codex"
+        deprecation_msgs = [r.message for r in caplog.records if "MEMORY_REASONER_BACKEND is deprecated" in r.message]
+        assert len(deprecation_msgs) == 1
 
 
 class TestMemoryReasonerBinaryValidation:
-    """Cross-binary validation: when memory extraction is enabled, the
-    configured reasoner backend's binary must be reachable at startup.
-    The check fires only on the composed `memory_extraction_enabled`
-    value (both MEMORY_ENABLED and MEMORY_EXTRACTION_ENABLED true);
-    retrieval-only memory does NOT require a reachable agent binary."""
+    """Cross-binary validation: when memory extraction is enabled, each
+    extraction-eligible backend's binary must be reachable at startup.
+    Per-user dispatch (issue #515) means the eligible set is computed
+    from each user's effective `agent_backend`, so the check iterates
+    that set rather than reading a single global reasoner toggle.
+    Retrieval-only memory does NOT require a reachable agent binary."""
 
     def test_claude_binary_missing_raises_systemexit(self, monkeypatch):
-        """MEMORY_REASONER_BACKEND=claude with extraction enabled and
-        no claude on PATH must fail at config-load with a clear
-        message. The composed `memory_extraction_enabled` is what
-        triggers the check; both env vars must be true."""
+        """Default-claude install with extraction enabled and no claude
+        on PATH must fail at config-load. The composed
+        `memory_extraction_enabled` plus the eligible-set membership
+        triggers the check."""
         from kai.oneshot_binary import BinaryResolutionError
 
         _set_required(monkeypatch)
@@ -1579,32 +1568,45 @@ class TestMemoryReasonerBinaryValidation:
         monkeypatch.setattr("kai.oneshot_binary.resolve_oneshot_binary", boom)
         with pytest.raises(SystemExit) as exc:
             load_config()
-        assert "MEMORY_REASONER_BACKEND='claude'" in str(exc.value)
-        assert "claude binary" in str(exc.value)
+        # New error wording: names the offending backend and the
+        # extraction-eligible-user link, no longer cites a global env
+        # var since per-user dispatch made it irrelevant.
+        assert "'claude'" in str(exc.value)
+        assert "binary" in str(exc.value)
 
-    def test_codex_binary_missing_raises_systemexit(self, monkeypatch):
-        """Same shape for codex; the error mentions the codex backend."""
+    def test_codex_binary_missing_raises_systemexit(self, tmp_path, monkeypatch):
+        """Codex via per-user routing: a users.yaml entry pinned to
+        codex makes codex extraction-eligible. Missing codex binary
+        must fail at config-load with the same per-backend error
+        shape as claude."""
         from kai.oneshot_binary import BinaryResolutionError
 
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    agent_backend: codex\n    os_user: alice_os\n"
+        )
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
 
         def boom(_backend: str) -> str:
-            raise BinaryResolutionError("could not resolve codex binary: CODEX_BIN unset, `codex` not on PATH")
+            if _backend == "codex":
+                raise BinaryResolutionError("could not resolve codex binary: CODEX_BIN unset, `codex` not on PATH")
+            return f"/fake/{_backend}"
 
         monkeypatch.setattr("kai.oneshot_binary.resolve_oneshot_binary", boom)
         with pytest.raises(SystemExit) as exc:
             load_config()
-        assert "MEMORY_REASONER_BACKEND='codex'" in str(exc.value)
-        assert "codex binary" in str(exc.value)
+        assert "'codex'" in str(exc.value)
+        assert "binary" in str(exc.value)
 
     def test_retrieval_only_skips_binary_check(self, monkeypatch):
         """MEMORY_ENABLED=true with MEMORY_EXTRACTION_ENABLED=false
         (retrieval-only) must NOT require a reachable agent binary.
         The check is gated on the composed extraction-enabled value,
-        not on memory_enabled alone."""
+        not on memory_enabled alone, and the eligible set is empty
+        when extraction is disabled."""
         from kai.oneshot_binary import BinaryResolutionError
 
         _set_required(monkeypatch)
@@ -1626,12 +1628,13 @@ class TestMemoryReasonerBinaryValidation:
     def test_extraction_disabled_without_memory_enabled_skips_check(self, monkeypatch):
         """The compositional gate also covers `MEMORY_EXTRACTION_ENABLED=true`
         with `MEMORY_ENABLED=false`. Composed extraction_enabled is
-        False, so the binary check does not fire."""
+        False, eligible set is empty, and the binary check does not
+        fire."""
         from kai.oneshot_binary import BinaryResolutionError
 
         _set_required(monkeypatch)
         # MEMORY_ENABLED unset / false, but EXTRACTION_ENABLED true.
-        # The composed value at config.py:1933 is False; binary check skipped.
+        # The composed value is False; binary check skipped.
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
         called = []
 
@@ -1648,29 +1651,33 @@ class TestMemoryReasonerBinaryValidation:
 class TestCodexMemoryRequiresOsUser:
     """The codex reasoner refuses to spawn without an `os_user` (the
     security boundary that keeps codex from running as the bot user).
-    Config-load enforces the precondition: a wizard-generated config
-    that enables codex memory without per-user os_user entries fails
-    fast instead of silently no-opping every extraction at runtime."""
+    Per-user dispatch (issue #515) means codex eligibility is computed
+    from each user's effective `agent_backend`; the precondition is
+    expressed against that effective cascade rather than a single
+    `MEMORY_REASONER_BACKEND` global. Config-load enforces it so a
+    wizard-generated config that enables codex memory without per-user
+    os_user entries fails fast instead of silently no-opping every
+    extraction at runtime."""
 
     def test_no_users_yaml_raises_systemexit(self, monkeypatch):
-        """ALLOWED_USER_IDS without users.yaml does not expose an
-        os_user surface at all. Codex memory cannot be wired in this
-        configuration; SystemExit at config-load."""
+        """AGENT_BACKEND=codex without users.yaml. ALLOWED_USER_IDS
+        exposes no per-user os_user surface, so codex extraction
+        cannot be wired; SystemExit at config-load."""
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
         with pytest.raises(SystemExit) as exc:
             load_config()
         msg = str(exc.value)
         assert "users.yaml" in msg
         assert "os_user" in msg
-        assert "codex" in msg
+        assert "odex" in msg  # 'codex' or 'Codex'
 
     def test_users_yaml_with_os_user_passes(self, tmp_path, monkeypatch):
         """The happy path: users.yaml with a per-user os_user entry
-        for every authorized chat_id. Config-load completes; codex
-        memory is wired."""
+        for every codex-effective chat_id. Config-load completes;
+        codex memory is wired per user."""
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text(
             "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: alice_os\n"
@@ -1679,16 +1686,19 @@ class TestCodexMemoryRequiresOsUser:
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        # DEFAULT_MODEL must be a codex-valid SKU when AGENT_BACKEND=codex.
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
         config = load_config()
-        assert config.memory_reasoner_backend == "codex"
+        assert config.agent_backend == "codex"
         assert config.user_configs is not None
         assert config.user_configs[12345].os_user == "alice_os"
 
     def test_users_yaml_with_missing_os_user_raises_systemexit(self, tmp_path, monkeypatch):
-        """At least one users.yaml entry without os_user must fail
-        config-load. The error names the offending chat_id so the
-        operator can find the entry to fix."""
+        """At least one codex-effective users.yaml entry without
+        os_user must fail config-load. The error names the
+        offending chat_id so the operator can find the entry to
+        fix."""
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text(
             "users:\n"
@@ -1704,7 +1714,7 @@ class TestCodexMemoryRequiresOsUser:
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
         with pytest.raises(SystemExit) as exc:
             load_config()
         msg = str(exc.value)
@@ -1714,15 +1724,15 @@ class TestCodexMemoryRequiresOsUser:
 
     def test_claude_memory_does_not_require_os_user(self, monkeypatch):
         """ClaudeOneShotReasoner accepts os_user=None (Max-plan
-        self-sudo-skip path), so claude memory does NOT require
-        users.yaml. The precondition applies only to codex."""
+        self-sudo-skip path), so claude-only installs do NOT require
+        users.yaml. The precondition fires only when codex is in the
+        extraction-eligible set."""
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "claude")
-        # No users.yaml; ALLOWED_USER_IDS-only. Claude is fine here.
+        # AGENT_BACKEND defaults to claude. No users.yaml.
         config = load_config()
-        assert config.memory_reasoner_backend == "claude"
+        assert config.agent_backend == "claude"
 
     def test_users_yaml_os_user_matches_bot_user_raises_systemexit(self, tmp_path, monkeypatch):
         """Codex must NOT run as the bot user. The runtime refuses
@@ -1730,8 +1740,6 @@ class TestCodexMemoryRequiresOsUser:
         a misconfigured users.yaml does not silently no-op every
         extraction. The check names the bot user and the offending
         chat_ids so the operator can locate the misconfiguration."""
-        import pwd
-
         bot_user = pwd.getpwuid(os.getuid()).pw_name
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text(
@@ -1741,7 +1749,7 @@ class TestCodexMemoryRequiresOsUser:
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
         with pytest.raises(SystemExit) as exc:
             load_config()
         msg = str(exc.value)
@@ -1774,10 +1782,11 @@ class TestCodexMemoryRequiresOsUser:
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
         # No SystemExit: the goose user is not extraction-eligible.
         config = load_config()
-        assert config.memory_reasoner_backend == "codex"
+        assert config.agent_backend == "codex"
         # Both users load; the precondition skipped chat 2
         # because its effective backend is goose, not codex.
         assert 1 in config.user_configs
@@ -1786,11 +1795,13 @@ class TestCodexMemoryRequiresOsUser:
     def test_codex_memory_retrieval_only_skips_precondition(self, monkeypatch):
         """Retrieval-only memory (extraction disabled) does NOT
         require os_user even on codex; the precondition fires only
-        when extraction is actually enabled."""
+        when extraction is actually enabled (the eligible set is
+        empty when extraction is off)."""
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         # MEMORY_EXTRACTION_ENABLED unset = retrieval-only.
-        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
         # No users.yaml; precondition should not fire.
         config = load_config()
         assert config.memory_enabled is True
@@ -1799,74 +1810,181 @@ class TestCodexMemoryRequiresOsUser:
 
 class TestMemoryReasonerModelResolution:
     """Memory model defaults resolve through the per-backend role
-    registry. Claude rows match the existing literal so installs that
-    have not set MEMORY_REASONER_BACKEND see byte-identical model
+    registry via `get_model_for(role, effective_backend)`. There is no
+    longer an env-var override surface for memory models (issue #515
+    retired MEMORY_EXTRACTION_MODEL and MEMORY_EPISODE_MODEL); the
+    registry is the only source. Claude rows must match the prior
+    literal so installs without users.yaml see byte-identical model
     selection. Codex rows pick a codex-CLI-valid SKU."""
 
     def test_claude_default_model_unchanged(self, monkeypatch):
+        """Default (claude) install: registry resolves to the same
+        Haiku SKU that the retired MEMORY_EXTRACTION_MODEL default
+        produced, so production behavior is byte-identical."""
         _set_required(monkeypatch)
-        config = load_config()
-        assert config.memory_reasoner_backend == "claude"
-        assert config.memory_extraction_model == "claude-haiku-4-5-20251001"
-        assert config.memory_episode_model == "claude-haiku-4-5-20251001"
+        # load_config completes; the model selection happens at the
+        # call site (memory_extraction.py), so the test reads the
+        # registry directly to pin the per-backend default.
+        load_config()
+        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "claude") == "claude-haiku-4-5-20251001"
+        assert get_model_for(ModelRole.MEMORY_EPISODE, "claude") == "claude-haiku-4-5-20251001"
 
-    def test_codex_default_resolves_to_codex_model(self, monkeypatch):
+    def test_codex_default_resolves_to_codex_model(self, tmp_path, monkeypatch):
+        """Codex install: registry resolves to a codex-CLI-valid SKU.
+        Test path is the per-user dispatch surface that production
+        will follow: AGENT_BACKEND=codex + users.yaml with os_user."""
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: alice_os\n"
+        )
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
         _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
-        config = load_config()
-        assert config.memory_extraction_model == "gpt-5.4-mini"
-        assert config.memory_episode_model == "gpt-5.4-mini"
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
+        load_config()
+        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex") == "gpt-5.4-mini"
+        assert get_model_for(ModelRole.MEMORY_EPISODE, "codex") == "gpt-5.4-mini"
 
-    def test_explicit_override_wins_for_codex(self, monkeypatch):
-        """An explicit MEMORY_EXTRACTION_MODEL takes precedence over
-        the registry default; the episode model inherits the override
-        when MEMORY_EPISODE_MODEL is unset."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
-        monkeypatch.setenv("MEMORY_EXTRACTION_MODEL", "gpt-5.5")
-        config = load_config()
-        assert config.memory_extraction_model == "gpt-5.5"
-        # Episode inherits extraction when its own var is unset.
-        assert config.memory_episode_model == "gpt-5.5"
-
-    def test_explicit_episode_override_wins(self, monkeypatch):
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
-        monkeypatch.setenv("MEMORY_EPISODE_MODEL", "gpt-5.4")
-        config = load_config()
-        # Extraction got the registry default; episode is the override.
-        assert config.memory_extraction_model == "gpt-5.4-mini"
-        assert config.memory_episode_model == "gpt-5.4"
-
-    def test_codex_extraction_model_rejects_non_codex_value(self, monkeypatch):
-        """A model name the codex CLI does not expose must fail at
-        startup. Without this guard, an operator who sets
-        MEMORY_REASONER_BACKEND=codex but forgets to update
-        MEMORY_EXTRACTION_MODEL (still pointing at a Claude SKU) would
-        see a SubprocessError on every extraction."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
-        monkeypatch.setenv("MEMORY_EXTRACTION_MODEL", "claude-haiku-4-5-20251001")
-        with pytest.raises(SystemExit, match="MEMORY_EXTRACTION_MODEL"):
-            load_config()
-
-    def test_codex_episode_model_rejects_non_codex_value(self, monkeypatch):
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_REASONER_BACKEND", "codex")
-        monkeypatch.setenv("MEMORY_EPISODE_MODEL", "claude-haiku-4-5-20251001")
-        with pytest.raises(SystemExit, match="MEMORY_EPISODE_MODEL"):
-            load_config()
-
-    def test_claude_model_override_stays_free_form(self, monkeypatch):
-        """Claude memory-model overrides are intentionally NOT validated
-        against a fixed list; the existing permissive behavior is
-        preserved so an operator running a pinned Claude SKU
-        (`claude-haiku-4-5-20251001-pinned`) does not have a config
-        change rejected by a newly added allowlist."""
+    def test_legacy_extraction_model_env_var_is_ignored(self, monkeypatch, caplog):
+        """The retired MEMORY_EXTRACTION_MODEL env var no longer has
+        a load-bearing effect. Setting it logs a deprecation warning
+        and does not change the registry-resolved model; nor does it
+        raise on a Claude SKU sent to a codex install (since the value
+        is dropped before any validation)."""
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_EXTRACTION_MODEL", "claude-haiku-4-5-20251001-pinned")
-        config = load_config()
-        assert config.memory_extraction_model == "claude-haiku-4-5-20251001-pinned"
+        with caplog.at_level("WARNING", logger="kai.config"):
+            config = load_config()
+        # Field is gone; the value is dropped after the warning.
+        assert not hasattr(config, "memory_extraction_model")
+        # Registry resolution is untouched.
+        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "claude") == "claude-haiku-4-5-20251001"
+        assert any("MEMORY_EXTRACTION_MODEL is deprecated" in r.message for r in caplog.records)
+
+    def test_legacy_episode_model_env_var_is_ignored(self, monkeypatch, caplog):
+        """Same shape for the retired MEMORY_EPISODE_MODEL env var."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_EPISODE_MODEL", "claude-sonnet-4-6")
+        with caplog.at_level("WARNING", logger="kai.config"):
+            config = load_config()
+        assert not hasattr(config, "memory_episode_model")
+        assert get_model_for(ModelRole.MEMORY_EPISODE, "claude") == "claude-haiku-4-5-20251001"
+        assert any("MEMORY_EPISODE_MODEL is deprecated" in r.message for r in caplog.records)
+
+
+class TestExtractionEligibleBackendsHelper:
+    """`_compute_extraction_eligible_backends` is the per-user
+    dispatch cascade in one helper. It feeds the codex
+    precondition checks at config-load and the per-backend binary
+    resolution loop in memory.init_memory."""
+
+    def test_returns_empty_when_memory_extraction_disabled(self):
+        """Retrieval-only and memory-disabled installs do not run any
+        reasoner, so the eligible set is empty regardless of
+        agent_backend and users.yaml."""
+        from kai.config import _compute_extraction_eligible_backends
+
+        assert _compute_extraction_eligible_backends("claude", None, False) == set()
+        assert _compute_extraction_eligible_backends("codex", None, False) == set()
+
+    def test_no_users_yaml_uses_global_backend(self):
+        """ALLOWED_USER_IDS-only authorization (no users.yaml): every
+        authorized user inherits the global agent backend, so the
+        eligible set is `{agent_backend}` when extraction-eligible."""
+        from kai.config import _compute_extraction_eligible_backends
+
+        assert _compute_extraction_eligible_backends("claude", None, True) == {"claude"}
+        assert _compute_extraction_eligible_backends("codex", None, True) == {"codex"}
+
+    def test_goose_global_with_no_users_yaml_returns_empty(self):
+        """Goose is not extraction-eligible (no OneShotReasoner
+        implementation). ALLOWED_USER_IDS install with
+        AGENT_BACKEND=goose produces an empty set; no reasoner
+        plumbing fires."""
+        from kai.config import _compute_extraction_eligible_backends
+
+        assert _compute_extraction_eligible_backends("goose", None, True) == set()
+
+    def test_mixed_users_yaml_contributes_each_effective_backend(self):
+        """users.yaml with both claude and codex users: the eligible
+        set is the union of effective backends, in the same shape
+        bot.py's extraction gate uses."""
+        from kai.config import UserConfig, _compute_extraction_eligible_backends
+
+        configs = {
+            1: UserConfig(telegram_id=1, name="alice", os_user="a"),
+            2: UserConfig(telegram_id=2, name="bob", os_user="b", agent_backend="codex"),
+        }
+        eligible = _compute_extraction_eligible_backends("claude", configs, True)
+        assert eligible == {"claude", "codex"}
+
+    def test_goose_users_filtered_out(self):
+        """A users.yaml entry with `agent_backend: goose` does NOT
+        contribute to the eligible set, mirroring the runtime gate
+        at bot.py that skips extraction for goose users. The
+        precondition/binary checks must not fire on a goose-only
+        user even when extraction is enabled globally."""
+        from kai.config import UserConfig, _compute_extraction_eligible_backends
+
+        configs = {
+            1: UserConfig(telegram_id=1, name="alice", os_user="a"),
+            2: UserConfig(telegram_id=2, name="bob", os_user="b", agent_backend="goose", llm_provider="openai"),
+        }
+        eligible = _compute_extraction_eligible_backends("claude", configs, True)
+        assert eligible == {"claude"}
+
+
+class TestConfigNoMemoryModelFields:
+    """Regression guard for issue #515 field removal. A future
+    change that adds back any of these fields (e.g., as part of a
+    bigger refactor that misses the spec rationale) must surface
+    here rather than at runtime."""
+
+    def test_config_has_no_memory_extraction_model_field(self):
+        # `Config()` cannot be called without required fields, so
+        # inspect the dataclass fields directly.
+        from dataclasses import fields
+
+        from kai.config import Config
+
+        field_names = {f.name for f in fields(Config)}
+        assert "memory_extraction_model" not in field_names
+        assert "memory_episode_model" not in field_names
+        assert "memory_reasoner_backend" not in field_names
+
+
+class TestRegistryValidationPerEligibleBackend:
+    """Per-eligible-backend `_check_model_registry_complete`
+    catches missing memory-role rows at config-load. A per-user
+    codex override on a global-claude install must not reach
+    runtime without its codex memory-role rows being validated."""
+
+    def test_missing_codex_memory_extraction_row_systemexits(self, monkeypatch, tmp_path):
+        """Mixed install: AGENT_BACKEND=claude with one users.yaml
+        entry pinned to `agent_backend: codex`. Patch the registry
+        so the codex MEMORY_EXTRACTION row is missing; load_config
+        SystemExits at startup."""
+        import kai.config as config_mod
+        from kai.config import ModelRole
+
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            "users:\n"
+            "  - telegram_id: 1\n    name: alice\n    role: admin\n"
+            "    agent_backend: codex\n    os_user: alice_os\n"
+        )
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+        # Patch the registry to drop the codex MEMORY_EXTRACTION row.
+        patched_registry = dict(config_mod.MODEL_REGISTRY)
+        patched_registry.pop(("codex", ModelRole.MEMORY_EXTRACTION), None)
+        monkeypatch.setattr("kai.config.MODEL_REGISTRY", patched_registry)
+        with pytest.raises(SystemExit):
+            load_config()
 
 
 # ── Stage-2 episode generation (issue #385) ───────────────────────────
@@ -1874,44 +1992,19 @@ class TestMemoryReasonerModelResolution:
 
 class TestMemoryEpisode:
     """The MEMORY_EPISODE_* env vars: stage-2 episode generation, which
-    runs out-of-band on stage-1 positives. Bounds differ from stage 1:
-    budget is strictly positive (no zero kill-switch; the master switch
-    is MEMORY_ENABLED) and timeout has a 10s floor (Haiku warm-up time).
-    The model defaults to whatever memory_extraction_model is set to,
-    so an operator who only changed MEMORY_EXTRACTION_MODEL also moves
-    stage 2 onto the new model without a second var."""
+    runs out-of-band on stage-1 positives. Bounds: budget is strictly
+    positive (no zero kill-switch; the master switch is MEMORY_ENABLED)
+    and timeout has a 10s floor (Haiku warm-up time). The model is no
+    longer configurable here (issue #515 retired MEMORY_EPISODE_MODEL);
+    `get_model_for(ModelRole.MEMORY_EPISODE, effective_backend)` is the
+    only source."""
 
     def test_defaults(self, monkeypatch):
-        """Defaults must stay stable so unset = production behavior.
-        Model inheritance from memory_extraction_model is the contract
-        when no env var is set: a fresh install with neither var set
-        ends up with both stages on Haiku (the wizard separately
-        recommends Sonnet for stage 2; the inheritance fallback is
-        the safety floor for tests and operators who skipped wizard).
-        Budget default is 0.15, sized for Sonnet."""
+        """Defaults must stay stable so unset = production behavior."""
         _set_required(monkeypatch)
         config = load_config()
-        assert config.memory_episode_model == "claude-haiku-4-5-20251001"
         assert config.memory_episode_budget_usd == 0.15
         assert config.memory_episode_timeout_s == 120
-
-    def test_model_inherits_extraction_model_when_unset(self, monkeypatch):
-        """Operator changes MEMORY_EXTRACTION_MODEL only - episode
-        follows. Documented in the templates/.env comment."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_EXTRACTION_MODEL", "claude-haiku-4-5-future")
-        config = load_config()
-        assert config.memory_episode_model == "claude-haiku-4-5-future"
-
-    def test_model_override_takes_precedence(self, monkeypatch):
-        """Explicit MEMORY_EPISODE_MODEL beats extraction inheritance.
-        Use case: operator runs Haiku for stage 1 and Sonnet for stage 2
-        narrative quality."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_EXTRACTION_MODEL", "claude-haiku-4-5-20251001")
-        monkeypatch.setenv("MEMORY_EPISODE_MODEL", "claude-sonnet-4-6")
-        config = load_config()
-        assert config.memory_episode_model == "claude-sonnet-4-6"
 
     def test_budget_override(self, monkeypatch):
         """Override path: arbitrary positive value beats the dataclass

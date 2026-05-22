@@ -82,11 +82,11 @@ Workspaces can also define a system prompt via `workspaces.yaml` for workspace-s
 
 #### Memory backend selection
 
-Semantic memory extraction (the subprocess that proactively writes facts and episode summaries) is independent of the agent backend. The reasoner used for extraction is selected by `MEMORY_REASONER_BACKEND` (`claude` or `codex`); each value names the subprocess that runs the extraction call. All four combinations of agent backend and reasoner backend are supported (claude+claude, claude+codex, codex+claude, codex+codex). The wizard defaults to the same-vendor case when extraction is enabled, but the operator can pick either.
+Semantic memory extraction (the subprocess that proactively writes facts and episode summaries) routes per-user: each user's effective `agent_backend` selects the reasoner, and the model comes from the project's `MODEL_REGISTRY` for that `(role, backend)` pair. Claude-effective users get the claude reasoner with the claude-registry model; codex-effective users get the codex reasoner with the codex-registry model. There is no per-deployment override for the memory reasoner or model; an operator who wants a different model edits the registry in `config.py`.
 
-The named binary must be reachable at startup when extraction is enabled; the bot exits at config-load otherwise with a message naming the resolution sequence. Retrieval-only memory (`MEMORY_ENABLED=true` with extraction disabled) does not require either binary.
+Each backend that runs extraction on this install must have its binary reachable at startup; the bot exits at config-load otherwise with a message naming the offending backend and resolution sequence. Retrieval-only memory (`MEMORY_ENABLED=true` with extraction disabled) requires no extraction binary.
 
-To verify a memory configuration end-to-end without writing to the store, run `python -m kai.smoke.memory` from the install directory. Pass `--os-user <name>` when the configured reasoner is codex; the codex reasoner refuses to spawn without one. The smoke prints the resolved binary, the argv that ran, and any extracted facts.
+To verify a memory configuration end-to-end without writing to the store, run `python -m kai.smoke.memory` from the install directory. Pass `--user-id <chat_id>` to drive the smoke under that user's effective backend (otherwise the global `AGENT_BACKEND` is used). Pass `--os-user <name>` when the effective backend resolves to codex; the codex reasoner refuses to spawn without one. The smoke prints the resolved binary, the argv that ran, and any extracted facts.
 
 ### Scheduled jobs
 

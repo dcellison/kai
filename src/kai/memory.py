@@ -617,36 +617,44 @@ def init_memory(config: Config) -> None:
     # Emitted exactly once per init regardless of whether memory is
     # enabled, so an operator scanning the log after a restart can
     # confirm the configured state without firing an extraction.
-    # The `extraction_binary` field is populated ONLY when
-    # `memory_extraction_enabled` is true (config-load validation
-    # already proved the binary was reachable at startup); for
-    # retrieval-only installs (MEMORY_ENABLED=true with extraction
-    # disabled) the field is null and the resolver is NOT called,
-    # so a retrieval-only install with no claude/codex binary on
-    # PATH still initializes successfully here.
+    # Resolve the per-eligible-backend binary set for the startup log.
+    # With per-user dispatch (issue #515), a single install can have
+    # one user on claude and another on codex; the log must surface
+    # the effective backend set rather than a single global value.
+    # `_compute_extraction_eligible_backends` mirrors the eligibility
+    # cascade load_config used to validate the set before this point,
+    # so the log reports what extraction will actually invoke.
     #
-    # The resolver call IS wrapped in try/except as defense against
+    # The resolver call is wrapped in try/except as defense against
     # between-load-and-init drift (PATH change, binary unlinked,
-    # etc.). A miss logs a WARNING and emits `extraction_binary: null`
-    # so memory init still completes; the next actual extraction
-    # would surface the real failure with a typed error.
-    extraction_binary: str | None = None
-    if config.memory_enabled and config.memory_extraction_enabled:
+    # etc.). A miss logs a WARNING and emits `extraction_binaries`
+    # with a null entry for the affected backend so memory init still
+    # completes; the next actual extraction would surface the real
+    # failure with a typed error. Retrieval-only installs
+    # (MEMORY_ENABLED=true with extraction disabled) produce an empty
+    # eligible set, so the resolver loop is a no-op and the map is
+    # empty.
+    from kai.config import ModelRole, _compute_extraction_eligible_backends, get_model_for
+
+    eligible_backends: set[str] = _compute_extraction_eligible_backends(
+        config.agent_backend, config.user_configs, config.memory_extraction_enabled
+    )
+    extraction_binaries: dict[str, str | None] = {}
+    if eligible_backends:
         from kai.oneshot_binary import BinaryResolutionError, resolve_oneshot_binary
 
-        try:
-            extraction_binary = resolve_oneshot_binary(config.memory_reasoner_backend)
-        except BinaryResolutionError as e:
-            # Defensive: config-load validation already passed, so
-            # this should not happen on a healthy install. If it
-            # does, log loudly and continue with null so init does
-            # not fail on an observability field.
-            log.warning(
-                "memory.config: %s reasoner binary resolution failed at init time (%s); "
-                "extraction_binary will log as null",
-                config.memory_reasoner_backend,
-                e,
-            )
+        for backend in sorted(eligible_backends):
+            try:
+                extraction_binaries[backend] = resolve_oneshot_binary(backend)
+            except BinaryResolutionError as e:
+                log.warning(
+                    "memory.config: %s reasoner binary resolution failed at init time (%s); "
+                    "extraction_binaries[%r] will log as null",
+                    backend,
+                    e,
+                    backend,
+                )
+                extraction_binaries[backend] = None
 
     if not config.memory_enabled:
         log.info(
@@ -655,14 +663,50 @@ def init_memory(config: Config) -> None:
                 {
                     "enabled": False,
                     "extraction_enabled": False,
+                    "reasoner_mode": None,
                     "reasoner_backend": None,
+                    "reasoner_backends": [],
                     "extraction_model": None,
-                    "episode_model": None,
-                    "extraction_binary": None,
+                    "extraction_models": {},
+                    "episode_models": {},
+                    "extraction_binaries": {},
                 }
             ),
         )
         return
+
+    # Resolved per-backend models for the startup log. Operators see
+    # the actual model each backend will run, not an env var. Empty
+    # eligible set (retrieval-only memory) leaves both maps empty
+    # and the uniform/per-user mode keys unset.
+    extraction_models: dict[str, str] = {
+        backend: get_model_for(ModelRole.MEMORY_EXTRACTION, backend) for backend in sorted(eligible_backends)
+    }
+    episode_models: dict[str, str] = {
+        backend: get_model_for(ModelRole.MEMORY_EPISODE, backend) for backend in sorted(eligible_backends)
+    }
+
+    # Uniform vs per-user log shape. Single-eligible-backend installs
+    # keep the legacy `reasoner_backend` + `extraction_model` flat keys
+    # so existing log consumers see no shape change on the common path.
+    # Mixed installs emit `reasoner_backends` + `extraction_models` as
+    # a per-backend map; flat keys are null in that mode so consumers
+    # do not silently read the wrong value.
+    if len(eligible_backends) == 1:
+        only = next(iter(eligible_backends))
+        reasoner_mode = "uniform"
+        flat_backend: str | None = only
+        flat_model: str | None = extraction_models[only]
+    elif len(eligible_backends) > 1:
+        reasoner_mode = "per-user"
+        flat_backend = None
+        flat_model = None
+    else:
+        # Retrieval-only or memory-disabled-extraction install. No
+        # reasoner runs, so neither mode applies.
+        reasoner_mode = None
+        flat_backend = None
+        flat_model = None
 
     log.info(
         "memory.config %s",
@@ -670,10 +714,13 @@ def init_memory(config: Config) -> None:
             {
                 "enabled": True,
                 "extraction_enabled": config.memory_extraction_enabled,
-                "reasoner_backend": config.memory_reasoner_backend,
-                "extraction_model": config.memory_extraction_model or None,
-                "episode_model": config.memory_episode_model or None,
-                "extraction_binary": extraction_binary,
+                "reasoner_mode": reasoner_mode,
+                "reasoner_backend": flat_backend,
+                "reasoner_backends": sorted(eligible_backends),
+                "extraction_model": flat_model,
+                "extraction_models": extraction_models,
+                "episode_models": episode_models,
+                "extraction_binaries": extraction_binaries,
             }
         ),
     )

@@ -35,6 +35,7 @@ import tempfile
 import textwrap
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -533,16 +534,45 @@ def _cmd_config() -> None:
         existing_env.get("AGENT_BACKEND", "claude"),
     )
 
+    # Compute the two codex predicates the wizard branches on. Both
+    # use the authoritative-source rule: when users.yaml exists, the
+    # configured users alone determine whether codex runs; without
+    # users.yaml, the global AGENT_BACKEND is the only signal (every
+    # authorized user inherits it). `codex_runs_anywhere` gates
+    # everything codex needs to run AT ALL (CODEX_BIN, sudoers,
+    # login reminder) regardless of memory state. `codex_extraction_
+    # needed` narrows to memory-specific gates (codex memory os_user
+    # precondition surfaces at load_config; the fresh-install os_user
+    # re-prompt fires here).
+    #
+    # Re-read users.yaml here in case the wizard wrote a fresh
+    # admin entry above (lines ~485-493 for the not-users_yaml_exists
+    # branch); that file is now the authoritative source for the
+    # codex_users helper too. _codex_users_from_yaml falls back to []
+    # if the file is missing, so the fallback to global agent_backend
+    # in _compute_codex_runs_anywhere handles both fresh and
+    # existing-yaml paths.
+    try:
+        _codex_users_now = _codex_users_from_yaml(users_yaml_path, agent_backend)
+    except (OSError, ValueError):
+        _codex_users_now = []
+    codex_runs_anywhere = _compute_codex_runs_anywhere(agent_backend, users_yaml_exists, _codex_users_now)
+
     # Codex auth handling runs BEFORE the legacy provider/key block so
     # subscription mode is not gated on an OPENAI_API_KEY the operator
     # does not need. VALID_PROVIDERS["codex"] is intentionally unset
     # (codex is openai-only and has its own auth model), so the
     # legacy block below skips codex entirely - same path claude
-    # follows today.
+    # follows today. Gate is `codex_runs_anywhere` rather than
+    # `agent_backend == "codex"` so an install with global claude but
+    # a users.yaml that includes codex-effective users still collects
+    # CODEX_BIN, auth, and the login hint. Conversely, an install
+    # with global codex but a users.yaml where every entry overrides
+    # to non-codex skips codex setup entirely.
     codex_auth_mode = ""
     codex_api_key = ""
     codex_bin = ""
-    if agent_backend == "codex":
+    if codex_runs_anywhere:
         codex_auth_mode = _prompt_choice(
             "Codex auth mode",
             ["subscription", "api_key"],
@@ -969,17 +999,12 @@ def _cmd_config() -> None:
     # when the operator is on the claude backend AND extraction is
     # enabled - same gating pattern as the other extraction tunables.
     episode_classifier_context_turns = "3"
-    # Stage-2 episode generation defaults (issue #385). Each pre-init
+    # Stage-2 episode budget + timeout pre-inits (issue #385). Each
     # value matches the corresponding wizard prompt default and the
     # emission-gate sentinel so the data flow reads consistently
-    # whether the operator runs the episode block or skips it.
-    # Model is the exception by design: empty string here means
-    # "inherit memory_extraction_model" via load_config, while the
-    # wizard separately recommends Sonnet to operators who reach the
-    # prompt - they're different defaults for different audiences
-    # (test fixtures and skipped-wizard installs vs operators
-    # actively configuring).
-    memory_episode_model = ""
+    # whether the operator runs the episode block or skips it. The
+    # episode model itself is resolved per-user from the registry
+    # at extraction time; no wizard prompt or env var carries it.
     memory_episode_budget_usd = "0.15"
     memory_episode_timeout_s = "120"
     memory_token_budget = "2000"
@@ -991,13 +1016,6 @@ def _cmd_config() -> None:
     # default at runtime via load_config, so the env entry stays
     # suppressed by the delta-from-default check below.
     memory_duplicate_threshold = "0.9"
-    # Default to claude when the agent backend has no memory reasoner
-    # (goose retrieval-only) so the prompt-and-persist path never lands
-    # an invalid MEMORY_REASONER_BACKEND value. The prompt itself is
-    # gated on extraction being enabled below; for retrieval-only
-    # installs the variable is neither prompted nor persisted, so
-    # load_config falls back to the dataclass default at runtime.
-    memory_reasoner_backend = "claude"
     if memory_enabled:
         # Memory extraction is supported on agent backends that have a
         # OneShotReasoner implementation. Today that is claude and
@@ -1010,46 +1028,30 @@ def _cmd_config() -> None:
                 existing_env.get("MEMORY_EXTRACTION_ENABLED", "false").lower() in ("1", "true", "yes"),
             )
             if memory_extraction_enabled:
-                # MEMORY_REASONER_BACKEND selects which one-shot
-                # reasoner runs the extraction subprocess. Default
-                # mirrors the install's agent_backend (same vendor
-                # for both surfaces) when the agent has a reasoner;
-                # falls back to "claude" otherwise so the persisted
-                # value is always one config validation accepts.
-                # The prompt sits inside the extraction-enabled
-                # branch because the variable has no runtime effect
-                # when extraction is disabled.
-                reasoner_default = agent_backend if agent_backend in ("claude", "codex") else "claude"
-                while True:
-                    candidate = (
-                        _prompt(
-                            "Memory reasoner backend (claude or codex)",
-                            existing_env.get("MEMORY_REASONER_BACKEND", reasoner_default),
-                        )
-                        .strip()
-                        .lower()
-                    )
-                    if candidate in ("claude", "codex"):
-                        memory_reasoner_backend = candidate
-                        break
-                    print("  Must be 'claude' or 'codex'.")
-                # Codex extraction requires every extraction-eligible
+                # Per-user dispatch (issue #515). Memory reasoner and
+                # model derive from each user's effective agent_backend
+                # at extraction time via memory_extraction._build_
+                # memory_reasoner + get_model_for(role, effective_
+                # backend). There is no global reasoner or model
+                # config; the wizard prompts that used to ask for both
+                # were retired with the env vars they emitted.
+                codex_extraction_needed = codex_runs_anywhere
+                # Codex extraction requires every codex-effective
                 # users.yaml entry to set a non-bot-user `os_user`.
-                # CodexOneShotReasoner.run() refuses the None and the
-                # same-user cases at runtime; load_config() refuses the
-                # same shapes at startup. Without this wizard-time
-                # check, a fresh install that accepted the default
-                # "Configure advanced user options = false" earlier in
-                # the prompt sequence produces a users.yaml with no
-                # `os_user`, and load_config() then SystemExits on the
-                # next daemon start. Re-prompt and rewrite the wizard-
-                # owned users.yaml in-place so the generated config
-                # passes load_config. The check fires only when the
-                # wizard owns the file (`not users_yaml_exists`); when
-                # the operator owns users.yaml, the load_config
-                # SystemExit at next start surfaces the same shape of
-                # error with the same diagnostic.
-                if memory_reasoner_backend == "codex" and not users_yaml_exists:
+                # The runtime CodexOneShotReasoner.run() refuses
+                # missing-os_user and same-user spawning; load_config
+                # refuses the same shapes at startup. Without this
+                # wizard-time check, a fresh install that accepted
+                # the default "Configure advanced user options = false"
+                # earlier in the prompt sequence produces a users.yaml
+                # with no `os_user`, and load_config then SystemExits
+                # on the next daemon start. Re-prompt and rewrite the
+                # wizard-owned users.yaml in-place so the generated
+                # config passes load_config. The check fires only
+                # when the wizard owns the file (`not users_yaml_
+                # exists`); when the operator owns users.yaml, the
+                # load_config SystemExit surfaces the same diagnostic.
+                if codex_extraction_needed and not users_yaml_exists:
                     needs_reprompt = (
                         not admin_os_user or admin_os_user == service_user or not _validate_os_user(admin_os_user)
                     )
@@ -1084,21 +1086,28 @@ def _cmd_config() -> None:
                         users_yaml_path.write_text(users_yaml_content)
                         os.chmod(users_yaml_path, 0o600)
                         print(f"  Updated {users_yaml_path} with os_user={admin_os_user}")
-                # CODEX_BIN must be collected whenever the codex
-                # reasoner is selected, not only when the agent
-                # backend is codex. The earlier codex agent-backend
-                # block prompts for the binary path only on
-                # `agent_backend == "codex"`, so a claude+codex (or
-                # goose+codex) memory install would otherwise emit no
-                # CODEX_BIN entry. _apply_sudoers then falls back to
-                # /opt/homebrew/bin/codex via _generate_sudoers, while
-                # the runtime CodexOneShotReasoner resolves codex via
-                # PATH; if the two diverge the sudoers SETENV rule no
-                # longer matches the argv the reasoner spawns. Re-
-                # prompt here when the agent block did not already
-                # collect a value so install.conf, /etc/kai/env, and
-                # /etc/kai/sudoers.d cannot drift apart.
-                if memory_reasoner_backend == "codex" and not codex_bin:
+                        # users.yaml just gained a codex user; refresh
+                        # the codex_users set so codex_runs_anywhere
+                        # reflects the new state for any downstream
+                        # check that consults it (the env-emission
+                        # block reads codex_runs_anywhere via the
+                        # codex_bin emission gate).
+                        try:
+                            _codex_users_now = _codex_users_from_yaml(users_yaml_path, agent_backend)
+                        except (OSError, ValueError):
+                            _codex_users_now = []
+                        codex_runs_anywhere = _compute_codex_runs_anywhere(agent_backend, True, _codex_users_now)
+                        codex_extraction_needed = codex_runs_anywhere
+                # CODEX_BIN must be collected whenever codex runs
+                # anywhere on the install. The earlier codex agent
+                # block already prompts for the binary path when
+                # codex_runs_anywhere; this second prompt fires only
+                # in the rare case where the earlier block did not
+                # collect a value AND a codex user surfaces via the
+                # os_user re-prompt above. Defense in depth: even
+                # if the earlier prompt's gate was wrong, the binary
+                # path is collected before the env block writes.
+                if codex_runs_anywhere and not codex_bin:
                     while True:
                         which_codex = shutil.which("codex") or "/opt/homebrew/bin/codex"
                         codex_bin = _prompt(
@@ -1175,64 +1184,15 @@ def _cmd_config() -> None:
                     except ValueError:
                         pass
                     print("  Must be 0-10.")
-                # Stage-2 episode generation tunables (issue #385). All
-                # three sit inside the extraction-enabled guard because
-                # episodes only fire when stage 1 fires (the has_episode
-                # classifier comes from stage 1's output). Operators
-                # who disable extraction also disable episodes; those
-                # tunables would otherwise be wizard noise.
-                #
-                # Wizard recommends Sonnet for stage 2 even though the
-                # config dataclass default falls back to the extraction
-                # model (Haiku). Reasoning: stage 2 runs out-of-band so
-                # latency does not reach the user, and on a Max-plan
-                # OAuth subscription headless `claude --print` calls do
-                # not bill per-token, so the only reason to keep Haiku
-                # for stage 2 was historical (cost-asymmetry framing
-                # that does not apply to Kai's deployment shape).
-                # Narrative quality across the 7-8 Sophia episode
-                # fields is exactly the regime where Sonnet pulls ahead
-                # of Haiku, so the default the operator sees should
-                # reflect that. The dataclass default stays at "" so
-                # the inheritance fallback continues to work for tests
-                # and for operators who explicitly want to track
-                # whatever extraction model is set.
-                # Episode model default is reasoner-aware. On the codex
-                # reasoner load_config validates this value against
-                # CODEX_MODELS and exits on a non-codex SKU; a
-                # claude-sonnet default would fail config-load. Default
-                # to "" on codex so the inheritance fallback in
-                # load_config picks up the (already validated) codex
-                # extraction model. On claude the historical
-                # claude-sonnet-4-6 recommendation stands.
-                if memory_reasoner_backend == "codex":
-                    episode_default = ""
-                    episode_prompt = "Episode generator model (blank inherits extraction model)"
-                else:
-                    episode_default = "claude-sonnet-4-6"
-                    episode_prompt = "Episode generator model (Sonnet recommended for narrative quality)"
-                while True:
-                    candidate = _prompt(
-                        episode_prompt,
-                        existing_env.get("MEMORY_EPISODE_MODEL", episode_default),
-                    ).strip()
-                    # Validate non-empty entries against CODEX_MODELS on
-                    # the codex branch, matching load_config's fail-fast
-                    # rule. Blank stays blank (inheritance). Claude
-                    # branch accepts any non-empty string (free-form,
-                    # matches the prior behavior).
-                    if memory_reasoner_backend == "codex" and candidate:
-                        from kai.config import CODEX_MODELS
-
-                        if candidate not in CODEX_MODELS:
-                            valid = sorted(CODEX_MODELS.keys())
-                            print(
-                                f"  '{candidate}' is not a valid codex model. "
-                                f"Must be one of: {', '.join(valid)} or blank."
-                            )
-                            continue
-                    memory_episode_model = candidate
-                    break
+                # Stage-2 episode tunables (issue #385). Budget and
+                # timeout sit inside the extraction-enabled guard
+                # because episodes only fire when stage 1 fires (the
+                # has_episode classifier comes from stage 1's output).
+                # The episode model is resolved per-user from the
+                # registry at extraction time via get_model_for(
+                # ModelRole.MEMORY_EPISODE, effective_backend); the
+                # wizard prompt for the model was retired with the
+                # MEMORY_EPISODE_MODEL env var.
                 # No MEMORY_EPISODE_BUDGET_USD prompt on this branch:
                 # --max-budget-usd is omitted from the stage-2 claude
                 # --print argv (memory_extraction.py:_run_episode_extractor)
@@ -1467,15 +1427,14 @@ def _cmd_config() -> None:
         env["MEMORY_ENABLED"] = "true"
         if memory_extraction_enabled:
             env["MEMORY_EXTRACTION_ENABLED"] = "true"
-            # Persist MEMORY_REASONER_BACKEND only when non-default.
-            # The dataclass and load_config default is "claude"; an
-            # explicit "claude" selection is suppressed here so the
-            # generated env stays minimal. The prompt itself only
-            # fires when extraction is enabled (above), so a
-            # retrieval-only install never reaches this site and the
-            # key is never written for it.
-            if memory_reasoner_backend != "claude":
-                env["MEMORY_REASONER_BACKEND"] = memory_reasoner_backend
+            # MEMORY_REASONER_BACKEND, MEMORY_EXTRACTION_MODEL, and
+            # MEMORY_EPISODE_MODEL are deprecated (issue #515). Memory
+            # reasoner and model both derive per-user from each user's
+            # effective agent_backend via the model registry; there is
+            # no env-var surface to emit. Legacy values still parse
+            # as deprecation warnings at load_config time so existing
+            # installs survive one reboot before this wizard regenerates
+            # /etc/kai/env without those keys.
             # Double-gate (agent_backend AND non-default value) is
             # intentionally redundant: the wizard now skips the
             # extraction-budget prompt on claude, so the value is
@@ -1511,13 +1470,10 @@ def _cmd_config() -> None:
             if int(episode_classifier_context_turns) != 3:
                 env["EPISODE_CLASSIFIER_CONTEXT_TURNS"] = episode_classifier_context_turns
             # Stage-2 episode tunables (issue #385). Same delta-from-default
-            # discipline as the stage-1 keys above. Episode model is
-            # written ONLY when the operator entered a non-blank value -
-            # blank means "inherit memory_extraction_model" and load_config
-            # implements the inheritance, so we deliberately leave the
-            # key out so the inheritance path stays intact across reinstall.
-            if memory_episode_model.strip():
-                env["MEMORY_EPISODE_MODEL"] = memory_episode_model.strip()
+            # discipline as the stage-1 keys above. MEMORY_EPISODE_MODEL
+            # is no longer emitted: the episode model resolves per-user
+            # from the registry at extraction time via get_model_for
+            # (issue #515).
             # Double-gate matches the stage-1 budget treatment above.
             if agent_backend != "claude" and float(memory_episode_budget_usd) != 0.15:
                 env["MEMORY_EPISODE_BUDGET_USD"] = memory_episode_budget_usd
@@ -1538,6 +1494,17 @@ def _cmd_config() -> None:
         if int(memory_search_limit) != 10:
             env["MEMORY_SEARCH_LIMIT"] = memory_search_limit
 
+    # Drop the three deprecated memory env vars on every wizard run
+    # (issue #515). Reasoner and model both derive per-user from each
+    # user's effective agent_backend via the registry; the env vars
+    # are no longer parsed beyond a one-shot deprecation warning at
+    # load_config time. Popping unconditionally keeps install.conf
+    # from carrying the keys forward across reinstall regardless of
+    # which agent backend the operator selected.
+    env.pop("MEMORY_REASONER_BACKEND", None)
+    env.pop("MEMORY_EXTRACTION_MODEL", None)
+    env.pop("MEMORY_EPISODE_MODEL", None)
+
     # Drop stale extraction keys when the agent backend has no memory
     # reasoner. Today that is goose; claude and codex both support
     # extraction. A user who flips backend from claude/codex to goose
@@ -1545,7 +1512,6 @@ def _cmd_config() -> None:
     # silently ignored at runtime.
     if agent_backend not in ("claude", "codex"):
         env.pop("MEMORY_EXTRACTION_ENABLED", None)
-        env.pop("MEMORY_REASONER_BACKEND", None)
         env.pop("MEMORY_EXTRACTION_BUDGET_USD", None)
         env.pop("MEMORY_EXTRACTION_TIMEOUT_S", None)
         env.pop("MEMORY_CONSOLIDATION_CANDIDATES_N", None)
@@ -1558,7 +1524,6 @@ def _cmd_config() -> None:
         # when stage 1 fires, and stage 1 silently skips on backends
         # without a reasoner. Leaving these in the env file would
         # mislead an operator who flips backend.
-        env.pop("MEMORY_EPISODE_MODEL", None)
         env.pop("MEMORY_EPISODE_BUDGET_USD", None)
         env.pop("MEMORY_EPISODE_TIMEOUT_S", None)
         # Paraphrase-dedup threshold is consulted by `_store_facts`,
@@ -1864,6 +1829,120 @@ def _collect_os_users_from_yaml(users_yaml_path: str | Path) -> list[str]:
     return result
 
 
+@dataclass(frozen=True)
+class CodexUserRef:
+    """Reference to a codex-effective user found in users.yaml.
+
+    Carries telegram_id and the optional os_user separately so a
+    misconfigured entry (codex backend with missing os_user) still
+    counts as "codex exists" for the predicate that gates install
+    plumbing, while only entries with a non-empty os_user appear in
+    the post-install login reminder.
+    """
+
+    telegram_id: int
+    os_user: str | None
+
+
+def _codex_users_from_yaml(users_yaml_path: str | Path, global_agent_backend: str) -> list[CodexUserRef]:
+    """Read users.yaml and return one CodexUserRef per codex-effective entry.
+
+    Effective backend cascade mirrors `_ingest_memory` in bot.py and
+    `config._compute_extraction_eligible_backends`: per-user
+    `agent_backend` overrides the
+    global default; an entry with no `agent_backend` field inherits
+    `global_agent_backend`. Only entries whose effective backend is
+    "codex" appear in the returned list.
+
+    Includes entries with a missing `os_user`. A codex-effective entry
+    without an `os_user` is a configuration error (codex spawning
+    requires a non-bot-user account), but the wizard predicate using
+    this helper must still see the user as "codex" so install plumbing
+    (CODEX_BIN, sudoers, login reminder) fires. The missing os_user
+    surfaces as a `load_config` SystemExit elsewhere.
+
+    Behavior parallels `_collect_os_users_from_yaml`: missing file or
+    empty/non-dict/no-users-key returns []; malformed YAML raises;
+    non-dict entries are skipped. Telegram IDs that do not parse as
+    int are skipped (the entry is invalid and the same logic exists
+    in `_load_user_configs`).
+    """
+    path = Path(users_yaml_path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+
+    if not text.strip():
+        return []
+
+    data = yaml.safe_load(text)
+    if not isinstance(data, dict):
+        return []
+
+    users = data.get("users")
+    if not isinstance(users, list):
+        return []
+
+    result: list[CodexUserRef] = []
+    for entry in users:
+        if not isinstance(entry, dict):
+            continue
+        # Effective backend cascade. Per-user `agent_backend` is
+        # admin-controlled in users.yaml; missing field means inherit
+        # the global default. Only the "codex" effective backend
+        # matters here; "claude" / "goose" / anything else produces
+        # no ref.
+        per_user_backend = entry.get("agent_backend")
+        if not isinstance(per_user_backend, str) or not per_user_backend.strip():
+            effective = global_agent_backend
+        else:
+            effective = per_user_backend.strip().lower()
+        if effective != "codex":
+            continue
+        raw_tid = entry.get("telegram_id")
+        try:
+            tid = int(raw_tid)
+        except (TypeError, ValueError):
+            continue
+        os_user_raw = entry.get("os_user")
+        if isinstance(os_user_raw, str):
+            normalized = os_user_raw.strip()
+            os_user_val: str | None = normalized if normalized else None
+        else:
+            os_user_val = None
+        result.append(CodexUserRef(telegram_id=tid, os_user=os_user_val))
+    return result
+
+
+def _compute_codex_runs_anywhere(
+    global_agent_backend: str,
+    users_yaml_exists: bool,
+    codex_users: list[CodexUserRef],
+) -> bool:
+    """Return True when any user on this install routes to codex.
+
+    Authoritative-source rule (issue #515 v4): when `users_yaml_exists`
+    is True, the users.yaml is the user set; the global `AGENT_BACKEND`
+    is only the default users inherit when they have no per-user
+    override, NOT an additional virtual user. So `codex_users` alone
+    drives the answer.
+
+    Without users.yaml (legacy ALLOWED_USER_IDS auth or pre-wizard
+    fresh install where the file has not been written yet), every
+    authorized user inherits the global, so `global_agent_backend ==
+    "codex"` determines the answer.
+
+    The wizard uses this predicate for everything codex needs to run
+    AT ALL (CODEX_BIN collection, sudoers, login reminder); the
+    `codex_extraction_needed` companion narrows to memory-specific
+    sites by AND-ing with `memory_extraction_enabled`.
+    """
+    if users_yaml_exists:
+        return bool(codex_users)
+    return global_agent_backend == "codex"
+
+
 def _build_codex_login_reminder(
     env: dict[str, str],
     service_user: str,
@@ -1872,32 +1951,43 @@ def _build_codex_login_reminder(
     """Compose the post-install codex subscription-auth reminder.
 
     Codex CLI auth state lives under the spawning user's home directory
-    (~<os_user>/.codex/auth.json). CodexOneShotReasoner spawns codex
+    (~<os_user>/.codex/auth.json). The codex reasoner spawns codex
     per-user via `sudo -u <os_user>`, so subscription auth must be
     completed AS each target user before the first call; a service-
     user-only login lands the token in the wrong home and every
     cross-user spawn fails. Returns the reminder text (without a
     leading blank line) when codex actually runs on this install AND
-    uses subscription auth, else None. The "codex runs anywhere"
-    predicate matches AGENT_BACKEND=codex OR MEMORY_REASONER_BACKEND=
-    codex so claude+codex (or goose+codex) memory installs still get
-    the reminder. Factored out of _cmd_apply so the gate and the
-    per-user enumeration are independently testable.
+    uses subscription auth, else None.
+
+    Gate uses the authoritative-source `codex_runs_anywhere` rule:
+    when /etc/kai/users.yaml exists, only users.yaml entries with
+    effective codex backend count; without users.yaml, falls back to
+    `AGENT_BACKEND=codex`. Enumeration filters to codex-effective
+    users with a non-empty os_user (claude-effective users have no
+    codex login to perform; missing-os_user codex users surface as
+    config-load errors elsewhere).
     """
-    codex_needed = env.get("AGENT_BACKEND") == "codex" or env.get("MEMORY_REASONER_BACKEND") == "codex"
-    if not codex_needed:
+    global_agent_backend = env.get("AGENT_BACKEND", "claude")
+    try:
+        codex_users = _codex_users_from_yaml(users_yaml_path, global_agent_backend)
+    except (OSError, ValueError):
+        # Malformed or sudoers-injection-flagged users.yaml. Apply
+        # path has already written sudoers from the same file, so
+        # raising here would be too late; treat as "no codex users
+        # readable" and fall back to the service-user hint below.
+        codex_users = []
+    users_yaml_exists = Path(users_yaml_path).exists()
+    if not _compute_codex_runs_anywhere(global_agent_backend, users_yaml_exists, codex_users):
         return None
     if env.get("CODEX_AUTH_MODE", "subscription") != "subscription":
         return None
-    # _collect_os_users_from_yaml raises ValueError on a crafted/
-    # malformed entry (sudoers-injection guard); the apply path
-    # already wrote sudoers from the same file, so a raise here would
-    # be too late. Treat both raise paths as "fall back to service
-    # user" so the operator still sees an actionable hint.
-    try:
-        login_users = sorted(set(_collect_os_users_from_yaml(users_yaml_path)))
-    except (OSError, ValueError):
-        login_users = []
+    # Enumerate codex-effective os_users with a usable account. A
+    # codex user without os_user does not get a line (login as which
+    # user?), so the missing-os_user case is handled by the
+    # config-load SystemExit elsewhere. Fall back to service_user
+    # only when no codex users contribute an os_user (legacy
+    # ALLOWED_USER_IDS install with global AGENT_BACKEND=codex).
+    login_users = sorted({ref.os_user for ref in codex_users if ref.os_user})
     if not login_users:
         login_users = [service_user]
     user_lines = "\n".join(f"    {u} ~$ codex login" for u in login_users)
@@ -3247,16 +3337,24 @@ def _cmd_apply() -> None:
         # codex install can pin an absolute codex path without
         # round-tripping through the wizard. Apply-time env wins over
         # any value already in install.conf so the operator's explicit
-        # `sudo CODEX_BIN=... kai install apply` is honored. The gate
-        # accepts either AGENT_BACKEND=codex (the codex agent path) or
-        # MEMORY_REASONER_BACKEND=codex (the claude+codex / goose+codex
-        # memory path); in both cases codex actually runs and the
-        # sudoers SETENV rule needs the same path the runtime resolver
-        # spawns. Skipping the write on truly codex-free installs
-        # keeps /etc/kai/env clean.
+        # `sudo CODEX_BIN=... kai install apply` is honored. Gate uses
+        # the authoritative-source `codex_runs_anywhere` rule: when
+        # /etc/kai/users.yaml exists, only users.yaml entries with
+        # effective codex backend count; without users.yaml, falls back
+        # to the env's AGENT_BACKEND. Skipping the write on truly
+        # codex-free installs keeps /etc/kai/env clean.
         env_codex_bin = os.environ.get("CODEX_BIN")
-        codex_needed = env.get("AGENT_BACKEND") == "codex" or env.get("MEMORY_REASONER_BACKEND") == "codex"
-        if env_codex_bin and codex_needed:
+        _apply_global_backend = env.get("AGENT_BACKEND", "claude")
+        try:
+            _apply_codex_users = _codex_users_from_yaml("/etc/kai/users.yaml", _apply_global_backend)
+        except (OSError, ValueError):
+            _apply_codex_users = []
+        _apply_codex_runs_anywhere = _compute_codex_runs_anywhere(
+            _apply_global_backend,
+            Path("/etc/kai/users.yaml").exists(),
+            _apply_codex_users,
+        )
+        if env_codex_bin and _apply_codex_runs_anywhere:
             env["CODEX_BIN"] = env_codex_bin
         # AGENT_TIMEOUT_SECONDS migration. Operators upgrading without
         # re-running the wizard carry the legacy CLAUDE_TIMEOUT_SECONDS

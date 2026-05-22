@@ -37,9 +37,7 @@ def _config(**overrides) -> Config:
     defaults = {
         "memory_enabled": True,
         "memory_extraction_enabled": True,
-        "memory_reasoner_backend": "claude",
-        "memory_extraction_model": "claude-haiku-4-5",
-        "memory_episode_model": "",
+        "agent_backend": "claude",
         "memory_extraction_timeout_s": 30,
     }
     defaults.update(overrides)
@@ -95,8 +93,8 @@ class TestSmokeMemorySuccess:
                 duration_ms=42,
             )
         )
-        with patch.object(smoke_module, "_get_memory_reasoner", return_value=type("R", (), {"run": fake_run})()):
-            rc = await smoke_module._run(os_user=None)
+        with patch.object(smoke_module, "_build_memory_reasoner", return_value=type("R", (), {"run": fake_run})()):
+            rc = await smoke_module._run(user_id=None, os_user=None)
         out = capsys.readouterr().out
         assert rc == 0
         assert "resolved_binary: /fake/path/claude" in out
@@ -137,8 +135,8 @@ class TestSmokeMemorySuccess:
                 duration_ms=10,
             )
         )
-        with patch.object(smoke_module, "_get_memory_reasoner", return_value=type("R", (), {"run": fake_run})()):
-            rc = await smoke_module._run(os_user=None)
+        with patch.object(smoke_module, "_build_memory_reasoner", return_value=type("R", (), {"run": fake_run})()):
+            rc = await smoke_module._run(user_id=None, os_user=None)
         out = capsys.readouterr().out
         assert rc == 1
         assert "verdict: pass" not in out
@@ -162,8 +160,8 @@ class TestSmokeMemoryProductionMode:
         def fail_factory(*args, **kwargs):
             pytest.fail("reasoner must not run when memory is disabled")
 
-        monkeypatch.setattr(smoke_module, "_get_memory_reasoner", fail_factory)
-        rc = await smoke_module._run(os_user=None)
+        monkeypatch.setattr(smoke_module, "_build_memory_reasoner", fail_factory)
+        rc = await smoke_module._run(user_id=None, os_user=None)
         captured = capsys.readouterr()
         assert rc == 1
         assert "MEMORY_ENABLED" in captured.err
@@ -184,8 +182,8 @@ class TestSmokeMemoryProductionMode:
         def fail_factory(*args, **kwargs):
             pytest.fail("reasoner must not run when extraction is disabled")
 
-        monkeypatch.setattr(smoke_module, "_get_memory_reasoner", fail_factory)
-        rc = await smoke_module._run(os_user=None)
+        monkeypatch.setattr(smoke_module, "_build_memory_reasoner", fail_factory)
+        rc = await smoke_module._run(user_id=None, os_user=None)
         captured = capsys.readouterr()
         assert rc == 1
         assert "MEMORY_EXTRACTION_ENABLED" in captured.err
@@ -200,16 +198,16 @@ class TestSmokeMemoryRoutingPrecondition:
         any subprocess fires."""
         from kai.smoke import memory as smoke_module
 
-        monkeypatch.setattr(smoke_module, "load_config", lambda: _config(memory_reasoner_backend="codex"))
+        monkeypatch.setattr(smoke_module, "load_config", lambda: _config(agent_backend="codex"))
 
         # Reasoner should NEVER be constructed on the os_user-missing
-        # path; the precondition fires before _get_memory_reasoner.
+        # path; the precondition fires before _build_memory_reasoner.
         def fail_factory(*args, **kwargs):
-            pytest.fail("_get_memory_reasoner must not run when --os-user is missing")
+            pytest.fail("_build_memory_reasoner must not run when --os-user is missing")
 
-        monkeypatch.setattr(smoke_module, "_get_memory_reasoner", fail_factory)
+        monkeypatch.setattr(smoke_module, "_build_memory_reasoner", fail_factory)
 
-        rc = await smoke_module._run(os_user=None)
+        rc = await smoke_module._run(user_id=None, os_user=None)
         captured = capsys.readouterr()
         assert rc == 1
         assert "--os-user" in captured.err
@@ -238,6 +236,144 @@ class TestSmokeMemoryRoutingPrecondition:
                 duration_ms=10,
             )
         )
-        with patch.object(smoke_module, "_get_memory_reasoner", return_value=type("R", (), {"run": fake_run})()):
-            rc = await smoke_module._run(os_user=None)
+        with patch.object(smoke_module, "_build_memory_reasoner", return_value=type("R", (), {"run": fake_run})()):
+            rc = await smoke_module._run(user_id=None, os_user=None)
         assert rc == 0
+
+
+class TestSmokeMemoryUserIdDispatch:
+    """The `--user-id` flag drives the smoke's effective backend
+    resolution (issue #515). With per-user dispatch, the smoke must
+    reach the same reasoner production would for that user; without
+    `--user-id`, it falls back to the global `agent_backend`."""
+
+    @pytest.mark.asyncio
+    async def test_user_id_resolves_codex_user(self, monkeypatch, capsys):
+        """A `--user-id` matching a codex-effective users.yaml entry
+        resolves to codex, prints `backend: codex`, and resolves the
+        codex registry model. Pins per-user dispatch end-to-end at
+        the smoke surface."""
+        from kai.config import UserConfig
+        from kai.smoke import memory as smoke_module
+
+        config = _config(
+            user_configs={
+                1: UserConfig(
+                    telegram_id=1,
+                    name="codex_user",
+                    os_user="codex_os",
+                    agent_backend="codex",
+                )
+            }
+        )
+        monkeypatch.setattr(smoke_module, "load_config", lambda: config)
+        captured_backend: list[str] = []
+
+        def _build(effective_backend, os_user=None):
+            captured_backend.append(effective_backend)
+            run_fn = AsyncMock(
+                return_value=OneShotResult(
+                    text=_success_envelope(),
+                    backend=effective_backend,
+                    model="gpt-5.4-mini",
+                    raw_metadata={
+                        "cmd": ["codex"],
+                        "resolved_binary": "/fake/codex",
+                        "returncode": 0,
+                        "stderr": b"",
+                        "cwd": "/tmp",
+                    },
+                    duration_ms=10,
+                )
+            )
+            return type("R", (), {"run": run_fn})()
+
+        monkeypatch.setattr(smoke_module, "_build_memory_reasoner", _build)
+        rc = await smoke_module._run(user_id="1", os_user="codex_os")
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert captured_backend == ["codex"]
+        assert "backend: codex" in out
+
+    @pytest.mark.asyncio
+    async def test_user_id_resolves_claude_user(self, monkeypatch, capsys):
+        """A `--user-id` matching a claude-effective users.yaml entry
+        resolves to claude even when global AGENT_BACKEND=codex."""
+        from kai.config import UserConfig
+        from kai.smoke import memory as smoke_module
+
+        config = _config(
+            agent_backend="codex",
+            user_configs={
+                1: UserConfig(
+                    telegram_id=1,
+                    name="claude_user",
+                    os_user="claude_os",
+                    agent_backend="claude",
+                )
+            },
+        )
+        monkeypatch.setattr(smoke_module, "load_config", lambda: config)
+        captured_backend: list[str] = []
+
+        def _build(effective_backend, os_user=None):
+            captured_backend.append(effective_backend)
+            run_fn = AsyncMock(
+                return_value=OneShotResult(
+                    text=_success_envelope(),
+                    backend=effective_backend,
+                    model="claude-haiku-4-5",
+                    raw_metadata={
+                        "cmd": ["claude"],
+                        "resolved_binary": "/fake/claude",
+                        "returncode": 0,
+                        "stderr": b"",
+                        "cwd": "/tmp",
+                    },
+                    duration_ms=10,
+                )
+            )
+            return type("R", (), {"run": run_fn})()
+
+        monkeypatch.setattr(smoke_module, "_build_memory_reasoner", _build)
+        rc = await smoke_module._run(user_id="1", os_user=None)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert captured_backend == ["claude"]
+        assert "backend: claude" in out
+
+    @pytest.mark.asyncio
+    async def test_no_user_id_uses_global_agent_backend(self, monkeypatch, capsys):
+        """Smoke without `--user-id` falls back to the global
+        `agent_backend`. Pins the legacy single-backend smoke path
+        so the per-user dispatch change does not silently break
+        operator habits ('run smoke without flags' still works)."""
+        from kai.smoke import memory as smoke_module
+
+        config = _config(agent_backend="claude")
+        monkeypatch.setattr(smoke_module, "load_config", lambda: config)
+        captured_backend: list[str] = []
+
+        def _build(effective_backend, os_user=None):
+            captured_backend.append(effective_backend)
+            run_fn = AsyncMock(
+                return_value=OneShotResult(
+                    text=_success_envelope(),
+                    backend=effective_backend,
+                    model="claude-haiku-4-5",
+                    raw_metadata={
+                        "cmd": ["claude"],
+                        "resolved_binary": "/fake/claude",
+                        "returncode": 0,
+                        "stderr": b"",
+                        "cwd": "/tmp",
+                    },
+                    duration_ms=10,
+                )
+            )
+            return type("R", (), {"run": run_fn})()
+
+        monkeypatch.setattr(smoke_module, "_build_memory_reasoner", _build)
+        rc = await smoke_module._run(user_id=None, os_user=None)
+        assert rc == 0
+        assert captured_backend == ["claude"]

@@ -90,7 +90,6 @@ def _cfg(**overrides) -> Config:
     defaults = {
         "memory_enabled": True,
         "memory_extraction_enabled": True,
-        "memory_extraction_model": "claude-haiku-4-5-20251001",
         "memory_extraction_budget_usd": 0.01,
         "memory_extraction_timeout_s": 10,
         "memory_consolidation_candidates_n": 0,
@@ -2856,6 +2855,7 @@ class TestRunExtractorSystemPromptDefault:
                 candidate_ids=set(),
                 candidate_metadata={},
                 user_id="test-user-default-kwarg",
+                effective_backend="claude",
             )
 
         asyncio.run(_run())
@@ -3181,6 +3181,7 @@ class TestValidateEpisodeIntegration:
             user_id="u-int",
             session_id="s-1",
             config=_cfg(),
+            effective_backend="claude",
         )
 
         assert captured["outcome"] == "validate_rejected"
@@ -3231,6 +3232,7 @@ class TestValidateEpisodeIntegration:
             user_id="u-int",
             session_id="s-1",
             config=_cfg(),
+            effective_backend="claude",
         )
 
         assert captured["outcome"] == "stored"
@@ -3293,6 +3295,7 @@ class TestValidateEpisodeIntegration:
             user_id="u-int",
             session_id="s-1",
             config=_cfg(),
+            effective_backend="claude",
         )
 
         assert captured_metadata.get("speaker") == "episode_summary"
@@ -3495,13 +3498,14 @@ class TestRunExtractorViaReasoner:
                     duration_ms=12,
                 )
 
-        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_FakeReasoner()):
+        with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FakeReasoner()):
             result = await memory_extraction._run_extractor(
                 payload_text="payload",
                 config=_cfg(),
                 candidate_ids=set(),
                 candidate_metadata={},
                 user_id="u1",
+                effective_backend="claude",
             )
 
         assert result.facts == []
@@ -3518,13 +3522,14 @@ class TestRunExtractorViaReasoner:
             async def run(self, **kwargs):
                 raise OneShotTimeout()
 
-        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_TimingOutReasoner()):
+        with patch("kai.memory_extraction._build_memory_reasoner", return_value=_TimingOutReasoner()):
             result = await memory_extraction._run_extractor(
                 payload_text="payload",
                 config=_cfg(),
                 candidate_ids=set(),
                 candidate_metadata={},
                 user_id="u1",
+                effective_backend="claude",
             )
 
         assert result.facts == []
@@ -3541,13 +3546,14 @@ class TestRunExtractorViaReasoner:
             async def run(self, **kwargs):
                 raise OneShotSubprocessError(returncode=2, stderr=b"oauth refused")
 
-        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_FailingReasoner()):
+        with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FailingReasoner()):
             result = await memory_extraction._run_extractor(
                 payload_text="payload",
                 config=_cfg(),
                 candidate_ids=set(),
                 candidate_metadata={},
                 user_id="u1",
+                effective_backend="claude",
             )
 
         assert result.facts == []
@@ -3555,24 +3561,23 @@ class TestRunExtractorViaReasoner:
 
 
 class TestMemoryReasonerSelection:
-    """`_get_memory_reasoner(config)` dispatches on
-    `config.memory_reasoner_backend`. The Claude case is the default
-    and proves the helper still returns a Claude reasoner when no env
-    var is set; the Codex case proves the selector wires up the new
-    CodexOneShotReasoner without requiring memory_extraction.py to
-    branch on backend at the call site."""
+    """`_build_memory_reasoner(effective_backend)` dispatches on the
+    per-user effective backend resolved by `_resolve_effective_backend`.
+    The Claude case proves the helper returns a Claude reasoner; the
+    Codex case proves the dispatch wires up CodexOneShotReasoner.
+    Backend selection used to live on `config.memory_reasoner_backend`;
+    with issue #515 it derives from the user being extracted."""
 
-    def test_default_returns_claude_reasoner(self):
+    def test_claude_backend_returns_claude_reasoner(self):
         from kai.oneshot import ClaudeOneShotReasoner
 
-        reasoner = memory_extraction._get_memory_reasoner(_cfg())
+        reasoner = memory_extraction._build_memory_reasoner("claude")
         assert isinstance(reasoner, ClaudeOneShotReasoner)
 
     def test_codex_backend_returns_codex_reasoner(self):
         from kai.oneshot import CodexOneShotReasoner
 
-        config = _cfg(memory_reasoner_backend="codex")
-        reasoner = memory_extraction._get_memory_reasoner(config)
+        reasoner = memory_extraction._build_memory_reasoner("codex")
         assert isinstance(reasoner, CodexOneShotReasoner)
 
 
@@ -3600,14 +3605,15 @@ class TestRunExtractorWithCodexEnvelope:
                     duration_ms=42,
                 )
 
-        config = _cfg(memory_reasoner_backend="codex", memory_extraction_model="gpt-5.4-mini")
-        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_FakeCodexReasoner()):
+        config = _cfg(agent_backend="codex")
+        with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FakeCodexReasoner()):
             result = await memory_extraction._run_extractor(
                 payload_text="payload",
                 config=config,
                 candidate_ids=set(),
                 candidate_metadata={},
                 user_id="u1",
+                effective_backend="codex",
             )
 
         assert result.facts == []
@@ -3628,14 +3634,15 @@ class TestRunExtractorWithCodexEnvelope:
             async def run(self, **kwargs):
                 raise OneShotOutputError("codex final JSON missing required fields: ['facts', 'has_episode']")
 
-        config = _cfg(memory_reasoner_backend="codex", memory_extraction_model="gpt-5.4-mini")
-        with patch("kai.memory_extraction._get_memory_reasoner", return_value=_OutputErrorReasoner()):
+        config = _cfg(agent_backend="codex")
+        with patch("kai.memory_extraction._build_memory_reasoner", return_value=_OutputErrorReasoner()):
             result = await memory_extraction._run_extractor(
                 payload_text="payload",
                 config=config,
                 candidate_ids=set(),
                 candidate_metadata={},
                 user_id="u1",
+                effective_backend="codex",
             )
 
         assert result.facts == []
@@ -3699,18 +3706,16 @@ class TestResolveOsUser:
         assert memory_extraction._resolve_os_user("42", config) is None
 
 
-class TestGetMemoryReasonerWithOsUser:
-    """`_get_memory_reasoner` threads `os_user` into the reasoner
+class TestBuildMemoryReasonerWithOsUser:
+    """`_build_memory_reasoner` threads `os_user` into the reasoner
     constructor so both stages route to the same target."""
 
     def test_claude_reasoner_receives_os_user(self):
-        config = _cfg()
-        reasoner = memory_extraction._get_memory_reasoner(config, os_user="target")
+        reasoner = memory_extraction._build_memory_reasoner("claude", os_user="target")
         assert reasoner._os_user == "target"
 
     def test_codex_reasoner_receives_os_user(self):
-        config = _cfg(memory_reasoner_backend="codex", memory_extraction_model="gpt-5.4-mini")
-        reasoner = memory_extraction._get_memory_reasoner(config, os_user="target")
+        reasoner = memory_extraction._build_memory_reasoner("codex", os_user="target")
         assert reasoner._os_user == "target"
 
 
@@ -3794,3 +3799,252 @@ class TestExtractAndStoreThreadsOsUser:
             config=config,
         )
         assert captured.get("os_user") == "opuser"
+
+
+class TestExtractAndStorePerUserDispatch:
+    """Per-user reasoner dispatch (issue #515): `extract_and_store`
+    resolves the effective backend from the user being extracted and
+    threads that backend into both stages. Mixed-backend deployments
+    (one claude user + one codex user under the same install) must
+    extract via the matching vendor without cross-talk."""
+
+    @pytest.mark.asyncio
+    async def test_dispatches_per_user_to_matching_reasoner(self, monkeypatch):
+        """Two users in users.yaml, one claude-effective (no override,
+        global default) and one codex-effective (per-user override).
+        `extract_and_store` for each user resolves a different
+        effective backend; captured `_build_memory_reasoner` argv
+        proves the dispatch."""
+        from kai import memory as memory_module
+        from kai.config import UserConfig
+
+        captured_backends: list[str] = []
+
+        class _StubReasoner:
+            def __init__(self):
+                self._os_user = None
+
+            async def run(self, **kwargs):
+                from kai.oneshot import OneShotResult
+
+                return OneShotResult(
+                    text='{"is_error": false, "structured_output": {"facts": [], "has_episode": false}}',
+                    backend="stub",
+                    model="stub",
+                    raw_metadata={"returncode": 0, "stderr": b""},
+                    duration_ms=1,
+                )
+
+        def _spy_build(effective_backend, os_user=None):
+            captured_backends.append(effective_backend)
+            return _StubReasoner()
+
+        monkeypatch.setattr(memory_extraction, "_build_memory_reasoner", _spy_build)
+        monkeypatch.setattr(memory_module, "_memory", object())
+
+        config = replace(
+            _cfg(),
+            agent_backend="claude",
+            user_configs={
+                1: UserConfig(telegram_id=1, name="alice", os_user="alice_os"),
+                2: UserConfig(
+                    telegram_id=2,
+                    name="bob",
+                    os_user="bob_os",
+                    agent_backend="codex",
+                ),
+            },
+        )
+        await memory_extraction.extract_and_store(user_text="u", assistant_text="a", user_id="1", config=config)
+        await memory_extraction.extract_and_store(user_text="u", assistant_text="a", user_id="2", config=config)
+
+        assert captured_backends == ["claude", "codex"]
+
+    @pytest.mark.asyncio
+    async def test_passes_per_user_matching_model(self, monkeypatch):
+        """The reasoner's `run` kwargs include the per-backend
+        registry model. Pinning the model assignment per call site
+        guards against a regression where one stage's `get_model_for`
+        call drifts off the effective backend."""
+        from kai import memory as memory_module
+        from kai.config import UserConfig
+
+        captured_models: list[str] = []
+
+        class _ModelCapturingReasoner:
+            def __init__(self):
+                self._os_user = None
+
+            async def run(self, **kwargs):
+                from kai.oneshot import OneShotResult
+
+                captured_models.append(kwargs.get("model"))
+                return OneShotResult(
+                    text='{"is_error": false, "structured_output": {"facts": [], "has_episode": false}}',
+                    backend="stub",
+                    model="stub",
+                    raw_metadata={"returncode": 0, "stderr": b""},
+                    duration_ms=1,
+                )
+
+        def _build(effective_backend, os_user=None):
+            return _ModelCapturingReasoner()
+
+        monkeypatch.setattr(memory_extraction, "_build_memory_reasoner", _build)
+        monkeypatch.setattr(memory_module, "_memory", object())
+
+        config = replace(
+            _cfg(),
+            agent_backend="claude",
+            user_configs={
+                1: UserConfig(telegram_id=1, name="alice", os_user="alice_os"),
+                2: UserConfig(
+                    telegram_id=2,
+                    name="bob",
+                    os_user="bob_os",
+                    agent_backend="codex",
+                ),
+            },
+        )
+        await memory_extraction.extract_and_store(user_text="u", assistant_text="a", user_id="1", config=config)
+        await memory_extraction.extract_and_store(user_text="u", assistant_text="a", user_id="2", config=config)
+
+        # Claude user receives the claude-registry stage-1 model;
+        # codex user receives the codex-registry stage-1 model. The
+        # exact literals come from MODEL_REGISTRY[MEMORY_EXTRACTION].
+        assert captured_models == ["claude-haiku-4-5-20251001", "gpt-5.4-mini"]
+
+    @pytest.mark.asyncio
+    async def test_per_user_override_wins_over_global(self, monkeypatch):
+        """Global `AGENT_BACKEND=claude` with a per-user
+        `agent_backend: codex` override resolves to codex for the
+        override user. Pin the cascade direction (per-user beats
+        global) at the dispatch site."""
+        from kai import memory as memory_module
+        from kai.config import UserConfig
+
+        captured: list[str] = []
+
+        def _build(effective_backend, os_user=None):
+            captured.append(effective_backend)
+
+            class _R:
+                _os_user = None
+
+                async def run(self, **kwargs):
+                    from kai.oneshot import OneShotResult
+
+                    return OneShotResult(
+                        text='{"is_error": false, "structured_output": {"facts": [], "has_episode": false}}',
+                        backend="stub",
+                        model="stub",
+                        raw_metadata={"returncode": 0, "stderr": b""},
+                        duration_ms=1,
+                    )
+
+            return _R()
+
+        monkeypatch.setattr(memory_extraction, "_build_memory_reasoner", _build)
+        monkeypatch.setattr(memory_module, "_memory", object())
+
+        config = replace(
+            _cfg(),
+            agent_backend="claude",
+            user_configs={
+                1: UserConfig(
+                    telegram_id=1,
+                    name="alice",
+                    os_user="alice_os",
+                    agent_backend="codex",
+                )
+            },
+        )
+        await memory_extraction.extract_and_store(user_text="u", assistant_text="a", user_id="1", config=config)
+        assert captured == ["codex"]
+
+    @pytest.mark.asyncio
+    async def test_inherits_global_when_no_per_user_override(self, monkeypatch):
+        """Global `AGENT_BACKEND=codex` with a users.yaml entry that
+        does not pin `agent_backend` resolves to codex for that
+        user. Pins the cascade fallback when no override exists."""
+        from kai import memory as memory_module
+        from kai.config import UserConfig
+
+        captured: list[str] = []
+
+        def _build(effective_backend, os_user=None):
+            captured.append(effective_backend)
+
+            class _R:
+                _os_user = None
+
+                async def run(self, **kwargs):
+                    from kai.oneshot import OneShotResult
+
+                    return OneShotResult(
+                        text='{"is_error": false, "structured_output": {"facts": [], "has_episode": false}}',
+                        backend="stub",
+                        model="stub",
+                        raw_metadata={"returncode": 0, "stderr": b""},
+                        duration_ms=1,
+                    )
+
+            return _R()
+
+        monkeypatch.setattr(memory_extraction, "_build_memory_reasoner", _build)
+        monkeypatch.setattr(memory_module, "_memory", object())
+
+        config = replace(
+            _cfg(),
+            agent_backend="codex",
+            user_configs={
+                1: UserConfig(telegram_id=1, name="alice", os_user="alice_os"),
+            },
+        )
+        await memory_extraction.extract_and_store(user_text="u", assistant_text="a", user_id="1", config=config)
+        assert captured == ["codex"]
+
+    @pytest.mark.asyncio
+    async def test_stage2_inherits_stage1_dispatch(self, monkeypatch):
+        """Stage-2 episode generation must use the same effective
+        backend stage 1 resolved (per-exchange consistency). The
+        episode model is looked up independently via
+        `get_model_for(MEMORY_EPISODE, effective_backend)` but the
+        backend itself does not get re-resolved."""
+        from kai import memory as memory_module
+        from kai.config import UserConfig
+
+        # Stub stage 1 to return episode-positive so stage 2 fires.
+        async def _fake_run_extractor(payload, config, **kwargs):
+            return memory_extraction.ExtractionResult(facts=[], has_episode=True)
+
+        captured_episode_kwargs: dict = {}
+
+        async def _fake_generate_episode(**kwargs):
+            captured_episode_kwargs.update(kwargs)
+
+        monkeypatch.setattr(memory_extraction, "_run_extractor", _fake_run_extractor)
+        monkeypatch.setattr(memory_extraction, "_generate_episode", _fake_generate_episode)
+        monkeypatch.setattr(memory_module, "_memory", object())
+
+        config = replace(
+            _cfg(),
+            agent_backend="claude",
+            user_configs={
+                1: UserConfig(
+                    telegram_id=1,
+                    name="alice",
+                    os_user="alice_os",
+                    agent_backend="codex",
+                )
+            },
+        )
+        await memory_extraction.extract_and_store(user_text="u", assistant_text="a", user_id="1", config=config)
+        # Drain scheduled stage-2 task.
+        await asyncio.sleep(0)
+        for task in list(memory_extraction._pending_episode_tasks):
+            await task
+
+        # Stage 2 inherits the codex backend stage 1 resolved.
+        assert captured_episode_kwargs.get("effective_backend") == "codex"
+        assert captured_episode_kwargs.get("os_user") == "alice_os"

@@ -145,7 +145,10 @@ class TestInitMemory:
         """Even when memory is disabled, init_memory emits exactly
         one structured `memory.config` log so an operator scanning
         the log post-restart can confirm the configured state. All
-        non-`enabled` fields elide to null."""
+        non-`enabled` fields elide to null/empty. Per-user dispatch
+        (issue #515) added `reasoner_mode`/`reasoner_backends`/
+        `extraction_models`/`episode_models`/`extraction_binaries`
+        beside the legacy flat keys."""
         import json as json_module
 
         from kai.memory import init_memory
@@ -159,10 +162,13 @@ class TestInitMemory:
         assert payload == {
             "enabled": False,
             "extraction_enabled": False,
+            "reasoner_mode": None,
             "reasoner_backend": None,
+            "reasoner_backends": [],
             "extraction_model": None,
-            "episode_model": None,
-            "extraction_binary": None,
+            "extraction_models": {},
+            "episode_models": {},
+            "extraction_binaries": {},
         }
 
     @integration
@@ -184,12 +190,10 @@ class TestInitMemory:
 
         monkeypatch.setattr("kai.oneshot_binary.resolve_oneshot_binary", fake_resolve)
         # Memory enabled but extraction disabled = retrieval-only.
-        config = _make_config(
-            memory_extraction_enabled=False,
-            memory_reasoner_backend="claude",
-            memory_extraction_model="claude-haiku-4-5",
-            memory_episode_model="",
-        )
+        # No reasoner/model fields needed at config level any more
+        # (issue #515 retired them); per-user dispatch resolves at
+        # runtime, and the retrieval-only eligible set is empty.
+        config = _make_config(memory_extraction_enabled=False)
         with (
             caplog.at_level(logging.INFO, logger="kai.memory"),
             patch("kai.memory.DATA_DIR", tmp_path),
@@ -204,7 +208,12 @@ class TestInitMemory:
         payload = json_module.loads(records[0].getMessage().split("memory.config ", 1)[1])
         assert payload["enabled"] is True
         assert payload["extraction_enabled"] is False
-        assert payload["extraction_binary"] is None
+        # Retrieval-only: eligible set is empty so the per-backend
+        # binary map is empty, the flat field is null, and the mode
+        # key is null because no reasoner runs.
+        assert payload["extraction_binaries"] == {}
+        assert payload["reasoner_backend"] is None
+        assert payload["reasoner_mode"] is None
         # Critical contract: resolver MUST NOT have been called.
         assert called == [], f"resolver was invoked on retrieval-only init: {called}"
 
@@ -221,11 +230,14 @@ class TestInitMemory:
             "kai.oneshot_binary.resolve_oneshot_binary",
             lambda backend: f"/fake/{backend}-binary",
         )
+        # Per-user dispatch: the eligible set is computed from
+        # `agent_backend` (legacy ALLOWED_USER_IDS auth has no
+        # users.yaml, so every user inherits the global). A
+        # single-backend install logs the uniform-mode flat keys plus
+        # the per-backend maps.
         config = _make_config(
             memory_extraction_enabled=True,
-            memory_reasoner_backend="codex",
-            memory_extraction_model="gpt-5.4-mini",
-            memory_episode_model="",
+            agent_backend="codex",
         )
         with (
             caplog.at_level(logging.INFO, logger="kai.memory"),
@@ -239,8 +251,67 @@ class TestInitMemory:
         payload = json_module.loads(records[0].getMessage().split("memory.config ", 1)[1])
         assert payload["enabled"] is True
         assert payload["extraction_enabled"] is True
+        assert payload["reasoner_mode"] == "uniform"
         assert payload["reasoner_backend"] == "codex"
-        assert payload["extraction_binary"] == "/fake/codex-binary"
+        assert payload["reasoner_backends"] == ["codex"]
+        assert payload["extraction_binaries"] == {"codex": "/fake/codex-binary"}
+
+    @integration
+    def test_init_per_user_mode_startup_log_shape(self, caplog, tmp_path, monkeypatch):
+        """Mixed-backend install (per-user dispatch active): the
+        startup log emits `reasoner_mode=per-user`, the sorted
+        `reasoner_backends` list, and the per-backend
+        `extraction_models`/`episode_models`/`extraction_binaries`
+        maps. The flat `reasoner_backend`/`extraction_model` keys
+        are null to prevent consumers from silently reading the
+        wrong value on mixed installs."""
+        import json as json_module
+
+        from kai.config import UserConfig
+        from kai.memory import init_memory
+
+        monkeypatch.setattr(
+            "kai.oneshot_binary.resolve_oneshot_binary",
+            lambda backend: f"/fake/{backend}-binary",
+        )
+        config = _make_config(
+            memory_extraction_enabled=True,
+            agent_backend="claude",
+            user_configs={
+                1: UserConfig(telegram_id=1, name="alice", os_user="a"),
+                2: UserConfig(telegram_id=2, name="bob", os_user="b", agent_backend="codex"),
+            },
+        )
+        with (
+            caplog.at_level(logging.INFO, logger="kai.memory"),
+            patch("kai.memory.DATA_DIR", tmp_path),
+            patch("mem0.Memory") as mock_mem,
+        ):
+            mock_mem.from_config.return_value.embedding_model.model.get_embedding_dimension.return_value = 384
+            init_memory(config)
+        records = [r for r in caplog.records if "memory.config" in r.getMessage()]
+        assert len(records) == 1
+        payload = json_module.loads(records[0].getMessage().split("memory.config ", 1)[1])
+        assert payload["reasoner_mode"] == "per-user"
+        # Sorted ordering so consumers see a deterministic list.
+        assert payload["reasoner_backends"] == ["claude", "codex"]
+        # Flat keys null on per-user mode; the per-backend maps
+        # carry the resolved models so consumers must read them
+        # explicitly rather than silently picking one vendor.
+        assert payload["reasoner_backend"] is None
+        assert payload["extraction_model"] is None
+        assert payload["extraction_models"] == {
+            "claude": "claude-haiku-4-5-20251001",
+            "codex": "gpt-5.4-mini",
+        }
+        assert payload["episode_models"] == {
+            "claude": "claude-haiku-4-5-20251001",
+            "codex": "gpt-5.4-mini",
+        }
+        assert payload["extraction_binaries"] == {
+            "claude": "/fake/claude-binary",
+            "codex": "/fake/codex-binary",
+        }
 
     @integration
     def test_mem0_telemetry_path_is_isolated(self):

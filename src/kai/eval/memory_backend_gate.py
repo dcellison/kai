@@ -592,17 +592,21 @@ def make_backend_config(base_config: Config, backend: str) -> Config:
 
     Forces memory_enabled=True and memory_extraction_enabled=True so
     the harness can run against an install whose env file disables
-    memory in production; resolves the memory models through the
-    role registry so a future SKU rename is picked up automatically.
-    Uses `dataclasses.replace` because `Config` is frozen.
+    memory in production. Drives the per-user dispatch (issue #515)
+    by setting `agent_backend` to the backend under test; with no
+    `user_configs` override, `_resolve_effective_backend` in
+    `memory_extraction.py` returns the global value for every
+    extraction call, so the harness deterministically exercises one
+    backend per run. Memory models come from the registry per-call
+    via `get_model_for(role, effective_backend)`; no Config fields
+    carry per-backend models any more. Uses `dataclasses.replace`
+    because `Config` is frozen.
     """
     return dataclasses.replace(
         base_config,
         memory_enabled=True,
         memory_extraction_enabled=True,
-        memory_reasoner_backend=backend,
-        memory_extraction_model=get_model_for(ModelRole.MEMORY_EXTRACTION, backend),
-        memory_episode_model=get_model_for(ModelRole.MEMORY_EPISODE, backend),
+        agent_backend=backend,
     )
 
 
@@ -698,11 +702,16 @@ async def run_backend(
     elif memory.get_all(user_id=sandbox_user_id, limit=1):
         raise SystemExit(f"sandbox user {sandbox_user_id!r} has existing rows; pass --reset to clear them")
 
+    # Memory models for this run come from the per-backend registry,
+    # matching what `_resolve_effective_backend` -> `get_model_for`
+    # produces in production per-extraction. Pinned here so the
+    # BackendRun summary reports the same SKUs the reasoner actually
+    # spawned.
     run = BackendRun(
         backend=backend,
         sandbox_user_id=sandbox_user_id,
-        model_fact=config.memory_extraction_model,
-        model_episode=config.memory_episode_model,
+        model_fact=get_model_for(ModelRole.MEMORY_EXTRACTION, backend),
+        model_episode=get_model_for(ModelRole.MEMORY_EPISODE, backend),
         log_path=log_path,
     )
 
