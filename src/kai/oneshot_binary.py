@@ -18,14 +18,13 @@ import. Keeping the resolver leaf-only sidesteps that entirely and
 keeps the dependency direction one-way.
 
 `BinaryResolutionError` is deliberately distinct from
-`kai.oneshot.OneShotRoutingError`. Routing failures (e.g., codex
-refusing to run as the bot user) and binary-resolution failures
-(e.g., codex binary not on PATH) are adjacent but not identical
-conditions with different remediation paths. The reasoner argv
-builders catch `BinaryResolutionError` and convert to
-`OneShotRoutingError` so the existing `memory_extraction.py`
-`except OneShotError` catch surface is unchanged; the new error
-type is what `kai.config` and `kai.smoke.memory` see.
+`kai.oneshot.OneShotRoutingError` so config-load and smoke can
+distinguish "binary not found" from runtime routing errors when
+deciding what to print. The reasoner argv builders catch
+`BinaryResolutionError` and convert to `OneShotRoutingError` so
+the existing `memory_extraction.py` `except OneShotError` catch
+surface is unchanged; the new error type is what `kai.config`
+and `kai.smoke.memory` see directly.
 """
 
 import os

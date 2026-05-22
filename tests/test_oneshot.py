@@ -35,9 +35,10 @@ def _current_user() -> str:
     Tests that exercise the codex reasoner's direct-spawn path use
     this as `os_user` so `resolve_claude_user` self-sudo-skips back
     to None (target matches current process); the reasoner then
-    spawns codex directly with no sudo wrap. Without setting
-    `os_user`, the codex reasoner would raise `OneShotRoutingError`
-    by design.
+    spawns codex directly with no sudo wrap. Both reasoners now
+    accept `os_user=None` and follow the same in-process path,
+    so this helper is a parity convenience rather than a routing
+    requirement.
     """
     return pwd.getpwuid(os.getuid()).pw_name
 

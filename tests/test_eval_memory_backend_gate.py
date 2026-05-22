@@ -1000,16 +1000,15 @@ class TestCLIInitializesMemory:
         assert call_order.index("init_memory") < call_order.index("run_backend")
 
 
-# ── --os-user preflight (issue #503) ────────────────────────────────
+# ── --os-user override threading ────────────────────────────────────
 
 
-class TestOsUserPreflight:
-    """The eval gate's `--os-user` is required when the codex arm is
-    in scope, because sandbox user IDs do not resolve to users.yaml
-    entries and the codex memory reasoner refuses to run with
-    `os_user=None`. The preflight rejects the missing-flag case
-    before any model call so the operator gets exit 2 instead of a
-    per-probe routing_error cascade."""
+class TestOsUserOverride:
+    """The eval gate's `--os-user` is an optional override (issue
+    #522). When supplied, it threads into `run_backend(...,
+    os_user_override=...)` for both arms; when omitted, both arms
+    proceed with `os_user_override=None` and the reasoners follow
+    their self-sudo-skip path (in-process spawn as the bot user)."""
 
     def _valid_fixture(self, tmp_path: Path) -> Path:
         rows = []
@@ -1069,8 +1068,13 @@ class TestOsUserPreflight:
             },
         )()
 
-    def test_codex_without_os_user_exits_2(self, tmp_path, capsys):
+    def test_codex_without_os_user_proceeds(self, tmp_path, monkeypatch):
+        """Issue #522: codex same-user spawn is supported. Running
+        the gate with `--backends codex` and no `--os-user` reaches
+        `run_backend` with `os_user_override=None`; no preflight
+        rejection."""
         import asyncio
+        from unittest.mock import patch
 
         path = self._valid_fixture(tmp_path)
         args = self._args(
@@ -1079,15 +1083,31 @@ class TestOsUserPreflight:
             backends=["claude", "codex"],
             os_user=None,
         )
-        rc = asyncio.run(g._run_cli(args))
-        assert rc == 2
-        err = capsys.readouterr().err
-        assert "--os-user is required" in err
+
+        captured: list[str | None] = []
+
+        async def _fake_run_backend(**kwargs):
+            captured.append(kwargs.get("os_user_override"))
+            return g.BackendRun(
+                backend=kwargs["backend"],
+                sandbox_user_id=kwargs["sandbox_user_id"],
+                model_fact="m",
+                model_episode="m",
+                log_path=kwargs["log_path"],
+            )
+
+        with (
+            patch("kai.eval.memory_backend_gate.memory.init_memory", lambda _c: None),
+            patch("kai.eval.memory_backend_gate.load_config", return_value=_BASE_CONFIG),
+            patch("kai.eval.memory_backend_gate.run_backend", _fake_run_backend),
+        ):
+            rc = asyncio.run(g._run_cli(args))
+        assert rc == 0
+        assert captured == [None, None]
 
     def test_claude_only_does_not_require_os_user(self, tmp_path, monkeypatch):
-        """If the operator runs only the claude arm, `--os-user` is
-        not required (the claude reasoner falls through to direct
-        spawn for the historical Max-plan installs)."""
+        """Single-arm claude run with no `--os-user` proceeds the
+        same way it always has."""
         import asyncio
         from unittest.mock import patch
 

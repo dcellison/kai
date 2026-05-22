@@ -229,14 +229,14 @@ class OneShotOutputError(OneShotError):
 
 class OneShotRoutingError(OneShotError):
     """
-    Reasoner refused to run because per-user OS routing was required
-    but no `os_user` was resolved. Raised by the codex reasoner when
-    its `os_user` is None; the claude reasoner deliberately does NOT
-    raise this to preserve the historical Max-plan OAuth path that
-    spawns claude as the bot user. Surfaces as a typed error so the
-    caller (memory_extraction) collapses to the zero-state extraction
-    result rather than letting the codex memory path silently run
-    inside the boundary the policy is meant to enforce.
+    Reasoner refused to run for a routing reason that cannot be
+    satisfied at the call site. The only current source is binary
+    resolution failure: `resolve_oneshot_binary` raised
+    `BinaryResolutionError` and the reasoner re-raises as this
+    typed error so the caller's existing `OneShotError` catch
+    surface collapses to the zero-state extraction result. Both
+    backends now accept `os_user=None` (the self-sudo-skip path),
+    so missing-os_user is no longer a refusal source.
     """
 
 

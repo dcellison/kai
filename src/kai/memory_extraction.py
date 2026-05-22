@@ -1751,11 +1751,11 @@ def _build_memory_reasoner(effective_backend: str, os_user: str | None = None) -
     failure visible.
 
     `os_user` is resolved once at the top of `extract_and_store` and
-    threaded in. The codex reasoner raises `OneShotRoutingError` from
-    `run()` when `os_user is None`; the claude reasoner spawns
-    directly. Tests monkeypatch this helper to inject fake reasoners;
-    the parameters are accepted but not inspected on the test side
-    because patches use `return_value=`.
+    threaded in. Both reasoners accept `os_user=None` and spawn
+    in-process via the self-sudo-skip path; a non-bot value wraps
+    the argv in `sudo -H -u <user>`. Tests monkeypatch this helper
+    to inject fake reasoners; the parameters are accepted but not
+    inspected on the test side because patches use `return_value=`.
 
     Returning a fresh instance per call (rather than a module-level
     singleton) keeps the memory path stateless and mirrors the

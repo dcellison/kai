@@ -1906,15 +1906,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--os-user",
         default=None,
         help=(
-            "OS user to run the memory reasoner as via sudo -H -u. "
-            "REQUIRED when 'codex' is in --backends because the codex "
-            "memory reasoner refuses to spawn as the bot process user. "
-            "The eval gate writes to sandbox user IDs that have no "
-            "users.yaml entry, so the resolution path used in "
-            "production (telegram_id -> users.yaml.os_user) yields "
-            "None and the codex reasoner would refuse. Supply this "
-            "flag to override the resolution and route both arms "
-            "through the same OS target."
+            "Optional OS user override to run the memory reasoner as "
+            "via sudo -H -u. The eval gate writes to sandbox user IDs "
+            "that have no users.yaml entry, so the production "
+            "resolution path (telegram_id -> users.yaml.os_user) "
+            "yields None; both codex and claude follow the same "
+            "self-sudo-skip path on None and spawn in-process as the "
+            "bot user. Supply this flag to force both arms through a "
+            "specific non-bot OS target instead."
         ),
     )
     parser.add_argument(
@@ -1962,20 +1961,6 @@ async def _run_cli(args: argparse.Namespace) -> int:
         validate_fixture_minimums(probes)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 2
-    # Routing preflight: the codex memory reasoner refuses to run
-    # when its os_user is None. Sandbox user IDs do not resolve to
-    # users.yaml entries, so the gate must supply an --os-user
-    # override whenever the codex arm is in scope. Reject the
-    # missing-flag case before any model call so the operator gets
-    # an immediate exit-2 instead of a per-probe routing_error
-    # cascade in the artifacts.
-    if "codex" in args.backends and not args.os_user:
-        print(
-            "error: --os-user is required when 'codex' is in --backends; "
-            "the codex memory reasoner refuses to run as the bot process user",
-            file=sys.stderr,
-        )
         return 2
     if args.validate_only:
         print(f"fixture ok: {len(probes)} probes, {sum(len(p.retrieval) for p in probes)} retrieval queries")
