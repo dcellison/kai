@@ -627,6 +627,13 @@ async def _run_one_probe(
         # separately so the v6 delta is attributed to v6 only -
         # lumping the two arms together would inflate the v6 metric
         # with v5's more numerous rejections.
+        # Per-user dispatch (issue #515): `_run_extractor` now requires
+        # an explicit `effective_backend`. The eval harness runs in
+        # single-backend mode (one prompt-pair comparison per run, no
+        # mixed-backend cascade), so the global `agent_backend` is the
+        # correct backend for both arms; threading it explicitly avoids
+        # relying on a default we no longer have.
+        effective_backend = config.agent_backend
         pre_v5 = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
         v5_result = await memory_extraction._run_extractor(
             payload,
@@ -634,6 +641,7 @@ async def _run_one_probe(
             candidate_ids=set(),
             candidate_metadata={},
             user_id=user_id,
+            effective_backend=effective_backend,
             system_prompt=baseline_prompt,
         )
         post_v5 = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
@@ -648,6 +656,7 @@ async def _run_one_probe(
             candidate_ids=set(),
             candidate_metadata={},
             user_id=user_id,
+            effective_backend=effective_backend,
         )
         post_v6 = sum(memory_extraction._RULE_6_REJECTIONS.snapshot().values())
         v6_rule_6_delta = post_v6 - pre_v6

@@ -55,7 +55,6 @@ def _eval_config() -> Config:
         _BASE_CONFIG,
         memory_enabled=True,
         memory_extraction_enabled=True,
-        memory_extraction_model="claude-haiku-4-5-20251001",
         memory_extraction_budget_usd=0.05,
         memory_extraction_timeout_s=60,
         memory_consolidation_candidates_n=0,
@@ -108,7 +107,12 @@ async def test_episode_classifier_precision_recall():
         start = time.monotonic()
         try:
             result = await _run_extractor(
-                payload, config, candidate_ids=set(), candidate_metadata={}, user_id=f"eval-{item_id}"
+                payload,
+                config,
+                candidate_ids=set(),
+                candidate_metadata={},
+                user_id=f"eval-{item_id}",
+                effective_backend="claude",
             )
             predicted: bool = result.has_episode
             error: str | None = None
