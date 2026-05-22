@@ -2101,57 +2101,6 @@ def load_config() -> Config:
         agent_backend, user_configs, memory_extraction_enabled
     )
 
-    # Codex extraction requires users.yaml. The codex reasoner
-    # spawns codex under each user's `os_user`; ALLOWED_USER_IDS-only
-    # authorization exposes no per-user os_user surface, so codex
-    # extraction would collapse to a zero-state miss every turn. Fail
-    # fast at config-load with a clear remediation hint.
-    if memory_extraction_enabled and "codex" in extraction_eligible_backends and user_configs is None:
-        raise SystemExit(
-            "Codex memory extraction requires users.yaml with a per-user 'os_user' entry "
-            "for every codex-effective chat_id. ALLOWED_USER_IDS alone does not provide "
-            "the OS-user routing the codex reasoner needs. Run 'make config' to generate "
-            "users.yaml, or set MEMORY_EXTRACTION_ENABLED=false to run with retrieval-only "
-            "memory."
-        )
-
-    # Every codex-effective user must have a non-bot-user os_user.
-    # Claude-effective users are NOT gated on os_user because
-    # ClaudeOneShotReasoner accepts os_user=None (the historical
-    # Max-plan self-sudo-skip path that spawns claude as the bot user).
-    # Codex has no equivalent safe path: spawning codex as the bot
-    # user would give it access to /etc/kai/env and other bot-user-only
-    # state, so the runtime CodexOneShotReasoner refuses; surface the
-    # same boundary at config-load.
-    if memory_extraction_enabled and user_configs is not None and "codex" in extraction_eligible_backends:
-        codex_users = [uc for uc in user_configs.values() if (uc.agent_backend or agent_backend) == "codex"]
-        missing = [uc.telegram_id for uc in codex_users if not uc.os_user]
-        if missing:
-            raise SystemExit(
-                "Codex memory extraction requires every codex-effective users.yaml entry "
-                "to set 'os_user'. The following chat_ids are missing 'os_user': "
-                f"{sorted(missing)}. Edit users.yaml to add an 'os_user' field for each "
-                "entry (the OS user the codex subprocess will run as), or set "
-                "MEMORY_EXTRACTION_ENABLED=false to run with retrieval-only memory."
-            )
-        try:
-            current_user = pwd.getpwuid(os.getuid()).pw_name
-        except KeyError:
-            # No passwd entry for the running UID (e.g., container
-            # with --user <uid>); the runtime falls through to honor
-            # the configured os_user, so config-load does too.
-            current_user = None
-        if current_user is not None:
-            same_user = [uc.telegram_id for uc in codex_users if uc.os_user == current_user]
-            if same_user:
-                raise SystemExit(
-                    "Codex memory extraction refuses to run codex as the bot user "
-                    f"({current_user!r}). The following users.yaml chat_ids have 'os_user' "
-                    f"set to the bot user: {sorted(same_user)}. Set 'os_user' to a "
-                    "different OS account, or set MEMORY_EXTRACTION_ENABLED=false to "
-                    "run with retrieval-only memory."
-                )
-
     # Registry completeness and binary resolution per
     # eligible backend. With model env vars retired, get_model_for()
     # is the only check that a (role, backend) registry row exists;

@@ -930,22 +930,19 @@ class CodexOneShotReasoner:
                 the run does not touch the real DATA_DIR. Production
                 callers leave this unset; the reasoner uses
                 `_EXTRACTOR_CWD` and ensures it exists on first call.
-            os_user: REQUIRED for production routing. Codex memory
-                must NOT run as the bot process user; the boundary
-                policy says any agent subprocess that inherits the
-                bot's sudoers permissions can be coerced into reading
-                kai-only protected files. `run()` raises
-                `OneShotRoutingError` when `os_user is None`, AND
-                when a supplied `os_user` resolves to the current
-                process user via `resolve_claude_user` (the same-
-                user case). Unlike claude, the self-sudo-skip is
-                NOT a legitimate path here: claude can safely run
-                in-process because Max-plan OAuth state lives under
-                the bot user's home, but codex would gain unintended
-                access to bot-user-only protected files (/etc/kai/
-                env, etc.). load_config() mirrors the refusal at
-                startup so a misconfigured users.yaml fails fast
-                rather than silently no-opping every extraction.
+            os_user: Optional target OS user for the codex subprocess,
+                symmetric with claude. `None` (or a value that
+                `resolve_claude_user` collapses to the current process
+                user) spawns codex in-process as the bot user - the
+                self-sudo-skip path. A non-bot username wraps the
+                argv in `sudo -H -u <user>` for cross-user isolation.
+                Operators who want the cross-user separation set
+                `os_user` to a different OS account in users.yaml;
+                operators running kai under their own account leave
+                it unset and codex runs in-process the same way
+                claude does. The persistent codex chat backend in
+                `src/kai/codex.py` already uses this resolution
+                shape; this reasoner now follows it.
         """
         self._cwd = cwd if cwd is not None else _EXTRACTOR_CWD
         self._os_user = os_user
@@ -960,20 +957,6 @@ class CodexOneShotReasoner:
         purpose: str,
         json_schema: dict[str, Any] | None = None,
     ) -> OneShotResult:
-        # Routing refusal. Codex memory must not run as the bot user;
-        # surfaces as a typed error before any subprocess spawn so the
-        # caller (memory_extraction) collapses to the zero-state
-        # extraction result. Claude does NOT raise this for the
-        # corresponding None case because the historical Max-plan
-        # OAuth path already runs claude as the bot user.
-        if self._os_user is None:
-            log.info(
-                "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=0 outcome=routing_error error_category=missing_os_user os_user=self",
-                purpose,
-                model,
-            )
-            raise OneShotRoutingError("codex memory routing requires os_user; refusing to run as the bot user")
-
         # Lazy mkdir + chmod: deferred from import time so a
         # permission failure surfaces as a logged miss rather than
         # crashing the bot at startup. The unconditional chmod
@@ -1007,31 +990,16 @@ class CodexOneShotReasoner:
         if model is not None:
             cmd.extend(["--model", model])
 
-        # Per-user OS routing. The construction-level None case was
-        # refused at the top of run(). resolve_claude_user returns
-        # None when the target user matches the current process user
-        # (the historical self-sudo-skip path). For claude, the
-        # self-sudo-skip is legitimate (Max-plan OAuth state lives
-        # under the bot user's home). For codex, it is a security
-        # boundary violation: codex MUST NOT run as the bot user, or
-        # it gains access to /etc/kai/env and other bot-user-only
-        # state. Refuse the same-user case here with the same typed
-        # error as the construction-level None case so the caller's
-        # collapse-to-zero-state path applies uniformly. The refusal
-        # fires BEFORE the schema temp file is written so there is
-        # nothing to clean up on this branch.
+        # Per-user OS routing target. resolve_claude_user returns
+        # None when `os_user` is unset OR when it resolves to the
+        # current process user (the self-sudo-skip path). Codex
+        # treats None the same way claude does: spawn in-process as
+        # the bot user, skipping the sudo wrap. A non-None target
+        # produces the sudo-wrapped argv assembled below. Mirrors
+        # the persistent codex chat backend's resolution shape so
+        # both codex spawn paths share the same direct-vs-wrapped
+        # decision logic.
         effective_user = resolve_claude_user(self._os_user)
-        if effective_user is None:
-            log.info(
-                "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=0 outcome=routing_error error_category=same_user_refused os_user=self",
-                purpose,
-                model,
-            )
-            raise OneShotRoutingError(
-                "codex memory routing refuses same-user spawn; "
-                f"os_user={self._os_user!r} resolves to the bot user. "
-                "Set users.yaml os_user to a different OS account."
-            )
 
         # Schema temp file lifecycle. Written before subprocess spawn
         # so the CLI sees a populated file; removed in `finally` so
@@ -1076,9 +1044,15 @@ class CodexOneShotReasoner:
             cmd.extend(["--output-schema", str(schema_path)])
 
         # Wrap codex in `sudo -H -u <target>` with the auth preserve
-        # list. Same-user routing is already refused above; this
-        # branch always wraps.
-        cmd = _wrap_cmd_for_user(cmd, effective_user, "codex")
+        # list when running cross-user. When `effective_user is None`
+        # (same-user spawn: os_user unset OR matches the bot user),
+        # the argv stays direct - codex runs in-process as the bot
+        # user, the same shape the persistent codex chat backend
+        # uses for self-sudo-skip. The `start_new_session` flag and
+        # the timeout-escalation branch below already gate on the
+        # same predicate so the cross-user path stays unchanged.
+        if effective_user is not None:
+            cmd = _wrap_cmd_for_user(cmd, effective_user, "codex")
 
         # Allow-listed env: only forward keys present in the parent
         # env. Defense-in-depth against a future regression that

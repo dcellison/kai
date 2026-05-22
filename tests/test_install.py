@@ -2251,23 +2251,20 @@ class TestCmdConfig:
         assert get_model_for(ModelRole.MEMORY_EPISODE, "codex") in CODEX_MODELS
 
     def test_codex_fresh_install_with_memory_extraction_yields_valid_users_yaml(self, tmp_path, monkeypatch):
-        """Fresh-install regression for the codex memory wizard gate.
+        """Fresh-install integration contract for codex memory.
 
         When the wizard drives the path 'no users.yaml -> codex backend
-        -> enable memory -> enable extraction -> codex reasoner' AND the
-        operator accepts the default 'Configure advanced user options =
-        false' earlier in the prompt sequence, the wizard re-prompts for
-        a non-service os_user at the memory-reasoner-backend gate and
-        rewrites users.yaml in place before the env is persisted. The
-        produced env + generated users.yaml together must pass
-        load_config(); without the gate the wizard emits a users.yaml
-        with no os_user and load_config() SystemExits at next daemon
-        start ('chat_ids are missing os_user' on the codex precondition).
+        -> enable memory -> enable extraction' AND the operator accepts
+        the default 'Configure advanced user options = false', the
+        wizard writes users.yaml with NO `os_user`. Issue #522 makes
+        that valid: codex memory follows claude's `resolve_claude_user`
+        symmetry and spawns in-process when os_user is unset. The
+        produced env + users.yaml must pass load_config() without any
+        codex-memory-specific precondition firing.
 
-        This test pins the full fresh-install integration contract, in
-        contrast to test_codex_install_accept_all_defaults_yields_load_
-        config_compatible_env which hand-seeds users.yaml and only
-        checks the env emission.
+        Pre-#522 this same input shape required a separate reprompt
+        for a non-bot os_user; that reprompt is now gone along with
+        the load_config precondition that motivated it.
         """
         from unittest.mock import MagicMock
 
@@ -2297,7 +2294,7 @@ class TestCmdConfig:
                 "fake-token",  # bot token
                 "12345",  # admin telegram ID
                 "admin",  # admin display name
-                "false",  # advanced user options - the failure-mode entry
+                "false",  # advanced user options (no os_user)
                 "polling",  # transport
                 "codex",  # agent backend
                 "subscription",  # codex auth mode
@@ -2321,7 +2318,7 @@ class TestCmdConfig:
                 # claude_user skipped on agent_backend != claude
                 "true",  # memory enabled
                 "true",  # memory extraction enabled
-                "codex_runner",  # re-prompted os_user after codex gate
+                # No codex-memory os_user reprompt (#522 removed it).
                 "10",  # extraction timeout
                 "8",  # consolidation candidates
                 "3",  # episode classifier context turns
@@ -2336,15 +2333,15 @@ class TestCmdConfig:
 
         _cmd_config()
 
-        # users.yaml must carry the re-prompted os_user. The wizard
-        # rewrote it in place after the codex memory gate fired; the
-        # pre-fix path left os_user absent here.
+        # users.yaml is written without os_user; same-user spawn is
+        # the supported deployment shape for an operator who accepts
+        # the default "Configure advanced user options = false".
         users_yaml_path = tmp_path / "users.yaml"
         assert users_yaml_path.exists()
         data = yaml.safe_load(users_yaml_path.read_text())
         entry = data["users"][0]
         assert entry["telegram_id"] == 12345
-        assert entry["os_user"] == "codex_runner"
+        assert entry.get("os_user") is None
 
         # Integration pin: feed the produced env + users.yaml into
         # load_config and assert it accepts the shape. Neuter the
@@ -2370,7 +2367,9 @@ class TestCmdConfig:
         assert config.agent_backend == "codex"
         assert config.user_configs is not None
         assert 12345 in config.user_configs
-        assert config.user_configs[12345].os_user == "codex_runner"
+        # No os_user → in-process spawn at runtime via the
+        # self-sudo-skip path.
+        assert config.user_configs[12345].os_user is None
 
 
 # ── Apply subcommand ─────────────────────────────────────────────────

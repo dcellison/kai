@@ -1648,36 +1648,72 @@ class TestMemoryReasonerBinaryValidation:
         assert called == []
 
 
-class TestCodexMemoryRequiresOsUser:
-    """The codex reasoner refuses to spawn without an `os_user` (the
-    security boundary that keeps codex from running as the bot user).
-    Per-user dispatch (issue #515) means codex eligibility is computed
-    from each user's effective `agent_backend`; the precondition is
-    expressed against that effective cascade rather than a single
-    `MEMORY_REASONER_BACKEND` global. Config-load enforces it so a
-    wizard-generated config that enables codex memory without per-user
-    os_user entries fails fast instead of silently no-opping every
-    extraction at runtime."""
+class TestCodexMemorySameUserSymmetry:
+    """Codex memory follows claude's `resolve_claude_user` symmetry
+    (issue #522): `os_user` is optional and same-user spawn is a
+    supported deployment shape. config-load does NOT refuse any of:
+    AGENT_BACKEND=codex without users.yaml, codex-effective user
+    without os_user, or codex-effective user with os_user matching
+    the bot user. Pinning these as starts-cleanly cases guards
+    against a future change that re-introduces the pre-#522
+    deployment-shape assumption."""
 
-    def test_no_users_yaml_raises_systemexit(self, monkeypatch):
-        """AGENT_BACKEND=codex without users.yaml. ALLOWED_USER_IDS
-        exposes no per-user os_user surface, so codex extraction
-        cannot be wired; SystemExit at config-load."""
+    def test_codex_no_users_yaml_starts_cleanly(self, monkeypatch):
+        """AGENT_BACKEND=codex with extraction enabled and no
+        users.yaml loads successfully. Per-user dispatch falls back
+        to the global agent_backend; the spawn target is the bot
+        user via the self-sudo-skip path."""
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
         monkeypatch.setenv("AGENT_BACKEND", "codex")
-        with pytest.raises(SystemExit) as exc:
-            load_config()
-        msg = str(exc.value)
-        assert "users.yaml" in msg
-        assert "os_user" in msg
-        assert "odex" in msg  # 'codex' or 'Codex'
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
+        config = load_config()
+        assert config.agent_backend == "codex"
+        assert config.memory_extraction_enabled is True
 
-    def test_users_yaml_with_os_user_passes(self, tmp_path, monkeypatch):
-        """The happy path: users.yaml with a per-user os_user entry
-        for every codex-effective chat_id. Config-load completes;
-        codex memory is wired per user."""
+    def test_codex_users_yaml_missing_os_user_starts_cleanly(self, tmp_path, monkeypatch):
+        """A codex-effective users.yaml entry without `os_user`
+        loads successfully. The runtime treats missing os_user as
+        in-process spawn (claude's existing pattern), so config-load
+        does not refuse the shape."""
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 67890\n    name: bob\n    role: user\n")
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
+        config = load_config()
+        assert config.user_configs is not None
+        assert config.user_configs[67890].os_user is None
+
+    def test_codex_users_yaml_same_user_as_bot_starts_cleanly(self, tmp_path, monkeypatch):
+        """A codex-effective users.yaml entry with `os_user`
+        matching the bot user loads successfully. The runtime
+        detects same-user via `resolve_claude_user` and spawns
+        codex in-process - the same path claude has always used
+        for same-user."""
+        bot_user = pwd.getpwuid(os.getuid()).pw_name
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            f"users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: {bot_user}\n"
+        )
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
+        _set_required(monkeypatch)
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
+        monkeypatch.setenv("AGENT_BACKEND", "codex")
+        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
+        config = load_config()
+        assert config.user_configs[12345].os_user == bot_user
+
+    def test_codex_users_yaml_cross_user_os_user_passes(self, tmp_path, monkeypatch):
+        """The cross-user deployment shape still works: an `os_user`
+        set to a non-bot account loads cleanly and is preserved on
+        the UserConfig entry. Regression guard for the multi-user
+        case."""
         users_yaml = tmp_path / "users.yaml"
         users_yaml.write_text(
             "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: alice_os\n"
@@ -1687,125 +1723,9 @@ class TestCodexMemoryRequiresOsUser:
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
         monkeypatch.setenv("AGENT_BACKEND", "codex")
-        # DEFAULT_MODEL must be a codex-valid SKU when AGENT_BACKEND=codex.
         monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
         config = load_config()
-        assert config.agent_backend == "codex"
-        assert config.user_configs is not None
         assert config.user_configs[12345].os_user == "alice_os"
-
-    def test_users_yaml_with_missing_os_user_raises_systemexit(self, tmp_path, monkeypatch):
-        """At least one codex-effective users.yaml entry without
-        os_user must fail config-load. The error names the
-        offending chat_id so the operator can find the entry to
-        fix."""
-        users_yaml = tmp_path / "users.yaml"
-        users_yaml.write_text(
-            "users:\n"
-            "  - telegram_id: 12345\n"
-            "    name: alice\n"
-            "    role: admin\n"
-            "    os_user: alice_os\n"
-            "  - telegram_id: 67890\n"
-            "    name: bob\n"
-            "    role: user\n"
-        )
-        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_ENABLED", "true")
-        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("AGENT_BACKEND", "codex")
-        with pytest.raises(SystemExit) as exc:
-            load_config()
-        msg = str(exc.value)
-        assert "67890" in msg
-        assert "12345" not in msg  # alice has os_user; should not appear
-        assert "os_user" in msg
-
-    def test_claude_memory_does_not_require_os_user(self, monkeypatch):
-        """ClaudeOneShotReasoner accepts os_user=None (Max-plan
-        self-sudo-skip path), so claude-only installs do NOT require
-        users.yaml. The precondition fires only when codex is in the
-        extraction-eligible set."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_ENABLED", "true")
-        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        # AGENT_BACKEND defaults to claude. No users.yaml.
-        config = load_config()
-        assert config.agent_backend == "claude"
-
-    def test_users_yaml_os_user_matches_bot_user_raises_systemexit(self, tmp_path, monkeypatch):
-        """Codex must NOT run as the bot user. The runtime refuses
-        same-user spawn; config-load surfaces the same boundary so
-        a misconfigured users.yaml does not silently no-op every
-        extraction. The check names the bot user and the offending
-        chat_ids so the operator can locate the misconfiguration."""
-        bot_user = pwd.getpwuid(os.getuid()).pw_name
-        users_yaml = tmp_path / "users.yaml"
-        users_yaml.write_text(
-            f"users:\n  - telegram_id: 12345\n    name: misconfigured\n    role: admin\n    os_user: {bot_user}\n"
-        )
-        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_ENABLED", "true")
-        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("AGENT_BACKEND", "codex")
-        with pytest.raises(SystemExit) as exc:
-            load_config()
-        msg = str(exc.value)
-        assert "bot user" in msg
-        assert "12345" in msg
-        assert bot_user in msg
-
-    def test_goose_user_without_os_user_does_not_block_codex_memory(self, tmp_path, monkeypatch):
-        """Mixed-backend deployment: a global codex install where one
-        user has `agent_backend: goose` should not be required to
-        give that goose user an `os_user`. The runtime gate at
-        `bot.py:3739` skips extraction for goose users (effective
-        backend not in claude/codex), so the precondition must
-        mirror the same effective-backend cascade rather than
-        enforce os_user on every entry blindly."""
-        users_yaml = tmp_path / "users.yaml"
-        users_yaml.write_text(
-            "users:\n"
-            "  - telegram_id: 1\n"
-            "    name: codex_user\n"
-            "    role: admin\n"
-            "    os_user: codex_os\n"
-            "  - telegram_id: 2\n"
-            "    name: goose_user\n"
-            "    role: user\n"
-            "    agent_backend: goose\n"
-            "    llm_provider: openai\n"
-        )
-        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_ENABLED", "true")
-        monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
-        monkeypatch.setenv("AGENT_BACKEND", "codex")
-        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
-        # No SystemExit: the goose user is not extraction-eligible.
-        config = load_config()
-        assert config.agent_backend == "codex"
-        # Both users load; the precondition skipped chat 2
-        # because its effective backend is goose, not codex.
-        assert 1 in config.user_configs
-        assert 2 in config.user_configs
-
-    def test_codex_memory_retrieval_only_skips_precondition(self, monkeypatch):
-        """Retrieval-only memory (extraction disabled) does NOT
-        require os_user even on codex; the precondition fires only
-        when extraction is actually enabled (the eligible set is
-        empty when extraction is off)."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_ENABLED", "true")
-        # MEMORY_EXTRACTION_ENABLED unset = retrieval-only.
-        monkeypatch.setenv("AGENT_BACKEND", "codex")
-        monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
-        # No users.yaml; precondition should not fire.
-        config = load_config()
-        assert config.memory_enabled is True
-        assert config.memory_extraction_enabled is False
 
 
 class TestMemoryReasonerModelResolution:

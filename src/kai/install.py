@@ -468,14 +468,15 @@ def _cmd_config() -> None:
 
         if advanced:
             # Default os_user to CLAUDE_USER if previously set, else $USER.
-            # Note: on the claude backend, an os_user that matches the bot
-            # process user is fine; the runtime detects self-sudo via
-            # `resolve_claude_user` and spawns claude in-process (the
-            # Max-plan OAuth path under the bot user's home). The codex
-            # memory branch enforces a separate non-bot-user precondition
-            # further down in the wizard (after the operator picks codex
-            # extraction) so the security boundary that block exists for
-            # is not silently bypassed by accepting the default here.
+            # `os_user` is optional on both backends and follows the same
+            # semantics: an empty value (or a value matching the bot
+            # process user) spawns the agent in-process via the
+            # self-sudo-skip path detected by `resolve_claude_user`;
+            # a different OS account wraps the agent argv in `sudo -H
+            # -u <user>` for cross-user isolation. Operators who run
+            # kai under their own account leave this empty; operators
+            # with a dedicated kai service user and separate per-user
+            # OS accounts set it to those accounts.
             default_os_user = existing_env.get("CLAUDE_USER", "") or os.environ.get("USER", "")
             while True:
                 admin_os_user = _prompt("OS user for subprocess isolation", default_os_user).strip() or None
@@ -534,16 +535,16 @@ def _cmd_config() -> None:
         existing_env.get("AGENT_BACKEND", "claude"),
     )
 
-    # Compute the two codex predicates the wizard branches on. Both
-    # use the authoritative-source rule: when users.yaml exists, the
-    # configured users alone determine whether codex runs; without
-    # users.yaml, the global AGENT_BACKEND is the only signal (every
-    # authorized user inherits it). `codex_runs_anywhere` gates
-    # everything codex needs to run AT ALL (CODEX_BIN, sudoers,
-    # login reminder) regardless of memory state. `codex_extraction_
-    # needed` narrows to memory-specific gates (codex memory os_user
-    # precondition surfaces at load_config; the fresh-install os_user
-    # re-prompt fires here).
+    # Compute the codex predicate the wizard branches on. Uses the
+    # authoritative-source rule: when users.yaml exists, the configured
+    # users alone determine whether codex runs; without users.yaml,
+    # the global AGENT_BACKEND is the only signal (every authorized
+    # user inherits it). `codex_runs_anywhere` gates everything codex
+    # needs (CODEX_BIN collection, sudoers SETENV rule, post-install
+    # `codex login` reminder) regardless of memory state. Memory
+    # extraction has no codex-specific wizard gate of its own; codex
+    # memory follows claude's symmetry now (`os_user` optional,
+    # in-process when unset or matching the bot user).
     #
     # Re-read users.yaml here in case the wizard wrote a fresh
     # admin entry above (lines ~485-493 for the not-users_yaml_exists
@@ -1035,69 +1036,14 @@ def _cmd_config() -> None:
                 # backend). There is no global reasoner or model
                 # config; the wizard prompts that used to ask for both
                 # were retired with the env vars they emitted.
-                codex_extraction_needed = codex_runs_anywhere
-                # Codex extraction requires every codex-effective
-                # users.yaml entry to set a non-bot-user `os_user`.
-                # The runtime CodexOneShotReasoner.run() refuses
-                # missing-os_user and same-user spawning; load_config
-                # refuses the same shapes at startup. Without this
-                # wizard-time check, a fresh install that accepted
-                # the default "Configure advanced user options = false"
-                # earlier in the prompt sequence produces a users.yaml
-                # with no `os_user`, and load_config then SystemExits
-                # on the next daemon start. Re-prompt and rewrite the
-                # wizard-owned users.yaml in-place so the generated
-                # config passes load_config. The check fires only
-                # when the wizard owns the file (`not users_yaml_
-                # exists`); when the operator owns users.yaml, the
-                # load_config SystemExit surfaces the same diagnostic.
-                if codex_extraction_needed and not users_yaml_exists:
-                    needs_reprompt = (
-                        not admin_os_user or admin_os_user == service_user or not _validate_os_user(admin_os_user)
-                    )
-                    if needs_reprompt:
-                        print()
-                        print("  Codex memory extraction requires the admin user to spawn")
-                        print(f"  under a non-service OS account (service runs as '{service_user}';")
-                        print("  codex must run as a different account so the subprocess")
-                        print("  cannot read bot-user-only files such as /etc/kai/env).")
-                        while True:
-                            admin_os_user = _prompt(
-                                "OS account for codex memory extraction",
-                                "",
-                                required=True,
-                            ).strip()
-                            if not _validate_os_user(admin_os_user):
-                                print("  Username may only contain letters, numbers, dots, hyphens, and underscores.")
-                                continue
-                            if admin_os_user == service_user:
-                                print(
-                                    f"  Must not match the service user '{service_user}' "
-                                    "(codex would run as the bot user)."
-                                )
-                                continue
-                            break
-                        users_yaml_content = _generate_users_yaml(
-                            admin_telegram_id,
-                            admin_name,
-                            os_user=admin_os_user,
-                            home_workspace=admin_home_workspace,
-                        )
-                        users_yaml_path.write_text(users_yaml_content)
-                        os.chmod(users_yaml_path, 0o600)
-                        print(f"  Updated {users_yaml_path} with os_user={admin_os_user}")
-                        # users.yaml just gained a codex user; refresh
-                        # the codex_users set so codex_runs_anywhere
-                        # reflects the new state for any downstream
-                        # check that consults it (the env-emission
-                        # block reads codex_runs_anywhere via the
-                        # codex_bin emission gate).
-                        try:
-                            _codex_users_now = _codex_users_from_yaml(users_yaml_path, agent_backend)
-                        except (OSError, ValueError):
-                            _codex_users_now = []
-                        codex_runs_anywhere = _compute_codex_runs_anywhere(agent_backend, True, _codex_users_now)
-                        codex_extraction_needed = codex_runs_anywhere
+                #
+                # No codex-memory-specific os_user gate fires here.
+                # Codex now follows claude's `resolve_claude_user`
+                # symmetry: missing `os_user` spawns codex in-process
+                # as the bot user, the same self-sudo-skip path
+                # claude uses. The earlier `codex_runs_anywhere`
+                # block already collected CODEX_BIN; nothing else
+                # specific to codex memory needs setup at this point.
                 # CODEX_BIN must be collected whenever codex runs
                 # anywhere on the install. The earlier codex agent
                 # block already prompts for the binary path when
@@ -1934,9 +1880,10 @@ def _compute_codex_runs_anywhere(
     "codex"` determines the answer.
 
     The wizard uses this predicate for everything codex needs to run
-    AT ALL (CODEX_BIN collection, sudoers, login reminder); the
-    `codex_extraction_needed` companion narrows to memory-specific
-    sites by AND-ing with `memory_extraction_enabled`.
+    AT ALL (CODEX_BIN collection, sudoers, login reminder). Memory
+    extraction has no codex-specific gate of its own; codex memory
+    spawns in-process when `os_user` is unset or matches the bot
+    user, the same self-sudo-skip path claude uses.
     """
     if users_yaml_exists:
         return bool(codex_users)

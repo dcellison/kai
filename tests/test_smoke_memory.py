@@ -191,27 +191,32 @@ class TestSmokeMemoryProductionMode:
 
 class TestSmokeMemoryRoutingPrecondition:
     @pytest.mark.asyncio
-    async def test_codex_without_os_user_exits_with_message(self, monkeypatch, capsys):
-        """The codex reasoner refuses to spawn without an os_user.
-        Smoke must surface this requirement explicitly with a clear
-        message rather than fail at the routing layer; exit 1 before
-        any subprocess fires."""
+    async def test_codex_without_os_user_proceeds(self, monkeypatch, capsys):
+        """Issue #522: codex same-user spawn is supported. Smoke
+        without --os-user against AGENT_BACKEND=codex no longer
+        exits 1 on the precondition; it proceeds to the reasoner
+        call. Pins the symmetry with claude same-user."""
         from kai.smoke import memory as smoke_module
 
         monkeypatch.setattr(smoke_module, "load_config", lambda: _config(agent_backend="codex"))
-
-        # Reasoner should NEVER be constructed on the os_user-missing
-        # path; the precondition fires before _build_memory_reasoner.
-        def fail_factory(*args, **kwargs):
-            pytest.fail("_build_memory_reasoner must not run when --os-user is missing")
-
-        monkeypatch.setattr(smoke_module, "_build_memory_reasoner", fail_factory)
-
-        rc = await smoke_module._run(user_id=None, os_user=None)
-        captured = capsys.readouterr()
-        assert rc == 1
-        assert "--os-user" in captured.err
-        assert "users.yaml" in captured.err
+        fake_run = AsyncMock(
+            return_value=OneShotResult(
+                text=_success_envelope(),
+                backend="codex",
+                model="gpt-5.4-mini",
+                raw_metadata={
+                    "cmd": ["codex"],
+                    "resolved_binary": "/fake/codex",
+                    "returncode": 0,
+                    "stderr": b"",
+                    "cwd": "/tmp",
+                },
+                duration_ms=10,
+            )
+        )
+        with patch.object(smoke_module, "_build_memory_reasoner", return_value=type("R", (), {"run": fake_run})()):
+            rc = await smoke_module._run(user_id=None, os_user=None)
+        assert rc == 0
 
     @pytest.mark.asyncio
     async def test_claude_without_os_user_proceeds(self, monkeypatch, capsys):

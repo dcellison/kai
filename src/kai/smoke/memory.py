@@ -116,13 +116,6 @@ async def _run(user_id: str | None, os_user: str | None) -> int:
         )
         return 1
 
-    if effective_backend == "codex" and not os_user:
-        sys.stderr.write(
-            "smoke: --os-user is required when the effective backend is codex; "
-            "pass the per-user OS account configured in users.yaml.\n"
-        )
-        return 1
-
     extraction_model = get_model_for(ModelRole.MEMORY_EXTRACTION, effective_backend)
     episode_model = get_model_for(ModelRole.MEMORY_EPISODE, effective_backend)
     print(f"backend: {effective_backend}")

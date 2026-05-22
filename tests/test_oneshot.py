@@ -62,27 +62,24 @@ def _mock_binary_resolver():
 
 @pytest.fixture(autouse=True)
 def _bypass_codex_routing_for_argv_tests(request):
-    """The codex reasoner now refuses to spawn under the bot user
-    (same-user routing rejected on the codex branch). The existing
-    argv/env/schema/output tests in this file use `os_user=_current_user()`
-    so resolve_claude_user short-circuits to None (the historical
-    test-friendly self-sudo-skip path), which is no longer valid for
-    codex.
+    """The argv/env/schema/output tests in this file run with
+    `os_user=_current_user()` so `resolve_claude_user` short-circuits
+    to None (the self-sudo-skip path). Codex now treats that the
+    same way claude does: spawn in-process, no sudo wrap. But the
+    pre-#522 surface those tests assert against expects unwrapped
+    argv even on the cross-user path, so this autouse fixture keeps
+    both halves working without per-test shim:
 
-    To keep the surface those tests check (argv flag layout, env
-    allow-list, stdin payload, JSON parsing) without each test having
-    to wire a sudo-wrap shim, this autouse fixture:
+      - makes resolve_claude_user a pass-through (so a non-None
+        `os_user` survives into argv assembly rather than collapsing
+        to the self-sudo-skip None)
+      - makes _wrap_cmd_for_user a no-op (so the argv assertions
+        that expect cmd[0] == "codex" stay valid; the real wrap
+        is exercised explicitly by the tests marked `routing_test`)
 
-      - makes resolve_claude_user a pass-through (so the same-user
-        refusal does not fire on os_user=_current_user())
-      - makes _wrap_cmd_for_user a no-op (so the argv assertions that
-        expect cmd[0] == "codex" stay valid; the wrap is exercised
-        explicitly by the tests marked `routing_test` below)
-
-    Tests that exercise real routing behavior (the routing classes,
-    the same-user refusal test, etc.) are marked with
-    `@pytest.mark.routing_test` and opt out of this bypass so they
-    can assert against the production wrap shape and refusal."""
+    Tests that exercise real routing behavior (the routing classes
+    that assert against the production wrap shape) are marked with
+    `@pytest.mark.routing_test` and opt out of this bypass."""
     if request.node.get_closest_marker("routing_test"):
         yield
         return
@@ -1297,35 +1294,26 @@ class TestRoutingArgvAndPreserveEnv:
         assert mock_exec.call_args.kwargs["start_new_session"] is True
 
     @pytest.mark.asyncio
-    async def test_codex_refuses_same_user_spawn(self, tmp_path):
-        """Codex memory MUST NOT run as the bot user. The
-        construction-level None case is already refused; this test
-        pins the same-user case (os_user resolves to the current
-        process user). The refusal fires BEFORE the subprocess
-        spawn so no codex process ever starts under the bot
-        identity.
-
-        Replaces the historical direct-spawn behavior pinned by the
-        prior `test_codex_direct_spawn_when_os_user_is_current`
-        test. The old behavior contradicted the safety claim in
-        CodexOneShotReasoner.run() and the operator's standing
-        kai/daniel separation policy: codex running as the bot
-        user would have access to /etc/kai/env and other bot-only
-        state through sudoers."""
+    async def test_codex_runs_in_process_when_os_user_matches_bot(self, tmp_path):
+        """Codex follows claude's `resolve_claude_user` symmetry
+        (issue #522): when `os_user` resolves to the current process
+        user, the argv stays direct - no sudo wrap. This is the
+        same self-sudo-skip path claude uses. Pins the matches-bot-
+        user branch so a regression that re-introduces the
+        unconditional `_wrap_cmd_for_user` call fails here."""
         reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
-        spawn_called = []
-
-        async def fail_exec(*args, **kwargs):
-            spawn_called.append(args)
-            raise AssertionError("subprocess must not spawn on the same-user refusal path")
-
+        proc = _make_proc(stdout=b"")
         with (
-            patch("kai.oneshot.asyncio.create_subprocess_exec", side_effect=fail_exec),
-            pytest.raises(OneShotRoutingError) as exc,
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec,
+            pytest.raises(OneShotOutputError),
         ):
             await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
-        assert "same-user spawn" in str(exc.value)
-        assert spawn_called == []
+        cmd = mock_exec.call_args[0]
+        assert cmd[0] != "sudo"
+        # start_new_session only fires on the wrap path; pin the
+        # in-process default for parity with the persistent codex
+        # chat backend.
+        assert mock_exec.call_args.kwargs["start_new_session"] is False
 
     @pytest.mark.asyncio
     async def test_codex_wraps_with_preserve_env(self, tmp_path):
@@ -1352,30 +1340,30 @@ class TestRoutingArgvAndPreserveEnv:
 
 
 @pytest.mark.routing_test
-class TestRoutingRefusal:
-    """Codex with `os_user=None` refuses to run; Claude does not.
-
-    The asymmetry is deliberate: existing Max-plan Claude installs
-    have always run claude as the bot user, and breaking those
-    installs without an explicit operator opt-in would be hostile.
-    Codex memory is brand new in #497 / PR #501; the refusal is
-    its safe default.
+class TestRoutingSymmetry:
+    """Codex and claude both spawn in-process on the self-sudo-skip
+    path (issue #522). Either `os_user=None` or `os_user` matching
+    the current process user produces a direct argv with no sudo
+    wrap; a non-bot `os_user` wraps via `sudo -H -u <user>` on both
+    backends. Pinning the symmetry guards against a future change
+    that re-introduces an asymmetric refusal on either backend.
     """
 
     @pytest.mark.asyncio
-    async def test_codex_with_no_os_user_raises_routing_error(self, tmp_path, caplog):
+    async def test_codex_with_no_os_user_runs_in_process(self, tmp_path):
+        """`CodexOneShotReasoner(os_user=None).run()` does not raise
+        and produces a direct argv (no sudo prefix). Mirror of the
+        claude self-sudo-skip path."""
         reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=None)
+        proc = _make_proc(stdout=b"")
         with (
-            caplog.at_level(logging.INFO, logger="kai.oneshot"),
-            pytest.raises(OneShotRoutingError),
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec,
+            pytest.raises(OneShotOutputError),
         ):
             await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
-        records = [r for r in caplog.records if r.message.startswith("oneshot_reasoner")]
-        assert len(records) == 1
-        msg = records[0].getMessage()
-        assert "outcome=routing_error" in msg
-        assert "error_category=missing_os_user" in msg
-        assert "os_user=self" in msg
+        cmd = mock_exec.call_args[0]
+        assert cmd[0] != "sudo"
+        assert mock_exec.call_args.kwargs["start_new_session"] is False
 
     @pytest.mark.asyncio
     async def test_claude_with_no_os_user_still_spawns(self, tmp_path):
@@ -1387,6 +1375,25 @@ class TestRoutingRefusal:
             await reasoner.run(prompt="p", purpose="fact_extraction")
         cmd = mock_exec.call_args[0]
         assert "sudo" not in cmd
+
+    @pytest.mark.asyncio
+    async def test_codex_with_non_bot_user_wraps_in_sudo(self, tmp_path):
+        """The cross-user codex path stays unchanged: a non-bot
+        `os_user` wraps the argv in `sudo -H -u <user>`. Regression
+        guard for the multi-user/service-user deployment shape."""
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user="other-user")
+        proc = _make_proc(stdout=b"")
+        with (
+            patch("kai.oneshot.resolve_claude_user", return_value="other-user"),
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec,
+            pytest.raises(OneShotOutputError),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
+        cmd = mock_exec.call_args[0]
+        assert cmd[0] == "sudo"
+        assert "-u" in cmd
+        assert "other-user" in cmd
+        assert mock_exec.call_args.kwargs["start_new_session"] is True
 
 
 @pytest.mark.routing_test
