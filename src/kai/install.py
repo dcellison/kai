@@ -315,6 +315,38 @@ def _validate_codex_bin(value: str) -> bool:
     return p.is_file() and os.access(p, os.X_OK)
 
 
+def _read_users_yaml_text(path: Path) -> str | None:
+    """Return the contents of a users.yaml file, falling back to sudo
+    for root-owned protected copies.
+
+    The wizard reads users.yaml as the operator account, not as root.
+    `/etc/kai/users.yaml` is installed mode 0600 root-owned, so a
+    direct `read_text()` raises `PermissionError`. The fallback uses
+    interactive `sudo cat` (no `-n` flag) because the operator is at
+    the terminal during `make config`; a password prompt mid-wizard
+    is acceptable UX. Returns the file content on success, None on
+    missing file, no sudo rights, or unreadable content.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        pass
+    try:
+        result = subprocess.run(
+            ["sudo", "cat", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
 # ── Config subcommand ────────────────────────────────────────────────
 
 
@@ -398,14 +430,14 @@ def _cmd_config() -> None:
     users_yaml_exists = users_yaml_path.exists()
 
     if not users_yaml_exists:
-        # /etc/kai/users.yaml is mode 0600 owned by root. Whether
-        # Path.exists() works depends on the parent directory permissions;
-        # it may return True even if the file isn't readable. Either way,
-        # the worst case is re-prompting and the next 'make install'
-        # overwrites the deployed copy with the new one.
+        # `/etc/kai/users.yaml` is mode 0600 owned by root.
+        # `Path.exists()` works as long as the parent directory is
+        # listable; downstream reads from `users_yaml_path` go through
+        # `_read_users_yaml_text` which sudo-cats protected copies.
         etc_users = Path("/etc/kai/users.yaml")
         if etc_users.exists():
             users_yaml_exists = True
+            users_yaml_path = etc_users
 
     # Track whether advanced mode set os_user, so we can skip the
     # CLAUDE_USER prompt later (section 8). Needs to be in scope
@@ -422,27 +454,25 @@ def _cmd_config() -> None:
     admin_home_workspace: str | None = None
 
     if users_yaml_exists:
-        # Summarize the existing config without modifying it.
-        # Note: if only the /etc/kai/ copy exists (not the local one),
-        # users_yaml_path still points to PROJECT_ROOT / "users.yaml"
-        # which doesn't exist. Guard with .exists() so we skip the
-        # summary gracefully rather than relying on the bare except.
+        # Summarize the existing config without modifying it. Reads
+        # go through `_read_users_yaml_text` so the protected
+        # `/etc/kai/users.yaml` path works via sudo cat. Empty
+        # summary on unreadable / malformed - the summary is
+        # cosmetic, the downstream codex predicate is what matters.
         summary = ""
-        if users_yaml_path.exists():
+        raw_yaml = _read_users_yaml_text(users_yaml_path)
+        if raw_yaml is not None:
             try:
-                data = yaml.safe_load(users_yaml_path.read_text())
-                if isinstance(data, dict) and isinstance(data.get("users"), list):
-                    entries = data["users"]
-                    n_users = len(entries)
-                    n_admins = sum(
-                        1 for e in entries if isinstance(e, dict) and str(e.get("role", "")).lower() == "admin"
-                    )
-                    summary = (
-                        f" ({n_users} user{'s' if n_users != 1 else ''}, "
-                        f"{n_admins} admin{'s' if n_admins != 1 else ''})"
-                    )
-            except Exception:
-                pass  # Malformed YAML - skip the summary
+                data = yaml.safe_load(raw_yaml)
+            except yaml.YAMLError:
+                data = None
+            if isinstance(data, dict) and isinstance(data.get("users"), list):
+                entries = data["users"]
+                n_users = len(entries)
+                n_admins = sum(1 for e in entries if isinstance(e, dict) and str(e.get("role", "")).lower() == "admin")
+                summary = (
+                    f" ({n_users} user{'s' if n_users != 1 else ''}, {n_admins} admin{'s' if n_admins != 1 else ''})"
+                )
         print(f"  users.yaml already configured{summary}.")
         print("  To modify users, edit users.yaml directly or use Telegram commands.")
     else:
@@ -1812,11 +1842,14 @@ def _codex_users_from_yaml(users_yaml_path: str | Path, global_agent_backend: st
     non-dict entries are skipped. Telegram IDs that do not parse as
     int are skipped (the entry is invalid and the same logic exists
     in `_load_user_configs`).
+
+    The read path goes through `_read_users_yaml_text` so the
+    protected `/etc/kai/users.yaml` file (mode 0600 root-owned) is
+    reachable via sudo cat when the wizard runs as the operator.
     """
     path = Path(users_yaml_path)
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    text = _read_users_yaml_text(path)
+    if text is None:
         return []
 
     if not text.strip():

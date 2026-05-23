@@ -28,6 +28,7 @@ from kai.install import (
     _cmd_apply,
     _cmd_config,
     _cmd_status,
+    _codex_users_from_yaml,
     _collect_os_users_from_yaml,
     _collect_user_memory_owners,
     _copy_tree,
@@ -40,6 +41,7 @@ from kai.install import (
     _generate_users_yaml,
     _migrate_identity_to_claude_md,
     _prompt_choice,
+    _read_users_yaml_text,
     _retire_install_home_claude,
     _retire_install_home_dir,
     _set_ownership,
@@ -712,6 +714,107 @@ class TestCollectOsUsersFromYaml:
         )
         with pytest.raises(ValueError, match=str(path)):
             _collect_os_users_from_yaml(path)
+
+
+class TestReadUsersYamlText:
+    """The wizard reads users.yaml as the operator account. The
+    deployed `/etc/kai/users.yaml` is mode 0600 root-owned, so a
+    direct `read_text()` raises `PermissionError`; `_read_users_yaml_text`
+    falls back to `sudo cat`. Both branches plus the missing-file
+    and unreadable-via-sudo cases are pinned here so a future
+    refactor of the helper does not regress the protected path."""
+
+    def test_local_readable_path_returns_content(self, tmp_path):
+        """Direct read works when the file is operator-readable."""
+        path = tmp_path / "users.yaml"
+        path.write_text("users: []\n", encoding="utf-8")
+        assert _read_users_yaml_text(path) == "users: []\n"
+
+    def test_missing_file_returns_none(self, tmp_path):
+        assert _read_users_yaml_text(tmp_path / "absent.yaml") is None
+
+    def test_permission_error_falls_back_to_sudo_cat(self, monkeypatch, tmp_path):
+        """The protected `/etc/kai/users.yaml` path: direct read
+        raises PermissionError, the fallback shells out to `sudo cat`
+        and returns its stdout."""
+        path = tmp_path / "protected.yaml"
+
+        def _raise_perm(self, encoding="utf-8"):
+            raise PermissionError(13, "Permission denied", str(self))
+
+        monkeypatch.setattr(Path, "read_text", _raise_perm)
+
+        captured: dict = {}
+
+        def _fake_subprocess_run(argv, capture_output, text, timeout):
+            captured["argv"] = argv
+
+            class _R:
+                returncode = 0
+                stdout = "users:\n  - telegram_id: 1\n    name: alice\n    role: admin\n"
+
+            return _R()
+
+        monkeypatch.setattr("kai.install.subprocess.run", _fake_subprocess_run)
+        out = _read_users_yaml_text(path)
+        assert captured["argv"] == ["sudo", "cat", str(path)]
+        assert "alice" in out
+
+    def test_sudo_failure_returns_none(self, monkeypatch, tmp_path):
+        """When sudo refuses (no password, no rule, timeout, etc.)
+        the helper returns None so the caller's missing-content
+        branch fires."""
+        path = tmp_path / "protected.yaml"
+
+        def _raise_perm(self, encoding="utf-8"):
+            raise PermissionError(13, "Permission denied", str(self))
+
+        monkeypatch.setattr(Path, "read_text", _raise_perm)
+
+        def _fake_subprocess_run(argv, capture_output, text, timeout):
+            class _R:
+                returncode = 1
+                stdout = ""
+
+            return _R()
+
+        monkeypatch.setattr("kai.install.subprocess.run", _fake_subprocess_run)
+        assert _read_users_yaml_text(path) is None
+
+
+class TestCodexUsersFromYamlProtectedFallback:
+    """Regression for the failure mode where the wizard skipped the
+    entire codex setup block because it read users.yaml from the
+    project-root path while only `/etc/kai/users.yaml` existed. The
+    fix routes `_codex_users_from_yaml` through `_read_users_yaml_text`
+    so the protected-path fallback works."""
+
+    def test_protected_path_yields_codex_users(self, monkeypatch, tmp_path):
+        """When the path raises PermissionError on direct read, the
+        helper sudo-cats the file and returns the codex-effective
+        users. Without this, the wizard predicate `codex_runs_anywhere`
+        evaluates False on installs with only `/etc/kai/users.yaml`
+        present, and the codex setup block silently skips - the
+        symptom the operator hit on a real deployment."""
+        path = Path("/etc/kai/users.yaml")
+
+        def _raise_perm(self, encoding="utf-8"):
+            raise PermissionError(13, "Permission denied", str(self))
+
+        monkeypatch.setattr(Path, "read_text", _raise_perm)
+
+        def _fake_subprocess_run(argv, capture_output, text, timeout):
+            class _R:
+                returncode = 0
+                stdout = "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: alice_os\n"
+
+            return _R()
+
+        monkeypatch.setattr("kai.install.subprocess.run", _fake_subprocess_run)
+        refs = _codex_users_from_yaml(path, "codex")
+        assert len(refs) == 1
+        assert refs[0].telegram_id == 12345
+        assert refs[0].os_user == "alice_os"
 
 
 class TestCollectUserMemoryOwners:
