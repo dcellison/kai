@@ -49,16 +49,17 @@ from pathlib import Path
 
 import kai
 from kai.backend import (
+    USER_MESSAGE_MARKER,
     AgentBackend,
     AgentResponse,
     ApiContext,
     StreamEvent,
     apply_workspace_model,
+    assemble_turn_context,
     build_foreign_workspace_reminder,
     build_session_context,
     ensure_user_memory,
     ensure_user_preferences,
-    prepend_to_prompt,
 )
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
 
@@ -561,18 +562,18 @@ class CodexBackend(AgentBackend):
             )
             return
 
-        # Inject identity, memory, history, and API context on the
-        # first message of a new session. Context injection logic
-        # lives in backend.py as shared functions.
+        # Per-turn prompt context. Build the fresh-session bootstrap
+        # (MEMORY.md / PREFERENCES.md seed + session_context block)
+        # and the foreign-workspace reminder LOCALLY, then hand both
+        # to `assemble_turn_context` so the shared helper owns the
+        # ordering invariant (USER_MESSAGE_MARKER closest to user
+        # text; session_context, semantic memory, workspace reminder
+        # stacked above in that order). Mirrors the ClaudeCodeBackend
+        # wire-through; backend-owned lifecycle stays here, shared
+        # string composition stays in the helper.
+        session_ctx = ""
         if self._fresh_session:
             self._fresh_session = False
-            # Mirror the ClaudeCodeBackend / GooseBackend send() path:
-            # ensure the per-user MEMORY.md and PREFERENCES.md surfaces
-            # exist before building the session context. The codex
-            # backend ships with memory_enabled=False by default, so
-            # the MEMORY.md path is created but the subsystem marker
-            # in the injected context is "disabled" until backend-
-            # agnostic semantic memory lands.
             ensure_user_memory(chat_id, DATA_DIR)
             ensure_user_preferences(chat_id, DATA_DIR)
             session_ctx = build_session_context(
@@ -584,13 +585,21 @@ class CodexBackend(AgentBackend):
                 data_dir=DATA_DIR,
                 memory_enabled=self.memory_enabled,
             )
-            prompt = prepend_to_prompt(prompt, session_ctx)
 
-        # When in a foreign workspace, remind on every message to only
-        # respond to what the user asks.
-        reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace)
-        if reminder:
-            prompt = prepend_to_prompt(prompt, reminder)
+        # Foreign-workspace reminder is built fresh per turn (its
+        # value depends on the current workspace, which the operator
+        # can change between messages via `/workspace`).
+        # `assemble_turn_context` no-ops on an empty string, so
+        # coerce the None to "" rather than threading the optional
+        # through the helper signature.
+        reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace) or ""
+
+        prompt = await assemble_turn_context(
+            prompt,
+            chat_id=chat_id,
+            session_context=session_ctx,
+            workspace_reminder=reminder,
+        )
 
         # Coerce prompt to the JSON-RPC content-block format.
         # The codex CLI accepts text content blocks; image / audio
@@ -608,8 +617,17 @@ class CodexBackend(AgentBackend):
                         "CodexBackend: dropping non-text content block type=%s",
                         block.get("type"),
                     )
+            # Empty after the drop pass: codex needs a non-empty
+            # `input`, so synthesize a placeholder. The "marker only"
+            # case (all real content blocks dropped, leaving just the
+            # USER_MESSAGE_MARKER prepended by assemble_turn_context)
+            # also counts as empty user input - the marker is a
+            # structural delimiter, not a message - so add the
+            # placeholder beneath it.
             if not rpc_prompt:
                 rpc_prompt = [{"type": "text", "text": "(empty prompt)"}]
+            elif len(rpc_prompt) == 1 and rpc_prompt[0].get("text") == USER_MESSAGE_MARKER:
+                rpc_prompt.append({"type": "text", "text": "(empty prompt)"})
 
         # Send the turn/start request. The codex app-server protocol
         # uses `input` (array of typed content blocks) plus `threadId`;

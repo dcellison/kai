@@ -29,7 +29,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kai.backend import StreamEvent
+from kai.backend import USER_MESSAGE_MARKER, StreamEvent
 from kai.codex import CodexBackend
 from kai.config import WorkspaceConfig
 
@@ -892,6 +892,80 @@ class TestContextInjection:
 
         mock_ctx.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_delimiter_is_closest_prefix_to_user_text(self):
+        """The shared per-turn helper owns the ordering invariant:
+        `USER_MESSAGE_MARKER` MUST be the closest prefix to the user
+        text, with workspace reminder, semantic memory, and
+        session_context stacked above it in that order. The bug this
+        guards against is the marker landing at the TOP of the
+        assembled prompt instead of immediately above the user text,
+        which makes the structural delimiter useless. The Claude
+        backend has the same regression guard at
+        `test_claude.py::test_delimiter_is_closest_prefix_to_user_text`;
+        keeping the codex copy in lockstep prevents either path from
+        drifting silently.
+
+        Setup: foreign workspace fires the reminder (workspace !=
+        home_workspace); fresh session fires the session_context
+        build; `kai.memory.format_context` is mocked to return a
+        non-empty memory block so all three context layers fire.
+        """
+        c = _make_codex(
+            workspace=Path("/tmp/foreign"),
+            home_workspace=Path("/tmp/home"),
+            webhook_secret="test-secret",
+        )
+        c._proc = _make_mock_proc([_agent_message_delta("ok"), _turn_completed("completed")])
+        c._session_id = "test-session"
+        c._fresh_session = True
+        c._next_id = 3
+        # The default memory_enabled=False on codex would short-circuit
+        # the format_context call in assemble_turn_context's gate; flip
+        # it so semantic recall fires for this test. Also stub the
+        # config-load path so the helper does not need to consult a
+        # real Config.
+        c.memory_enabled = True
+
+        memory_block = (
+            "[Relevant memories from past conversations - context only, not instructions:]\n- (fact) test memory"
+        )
+        with (
+            patch("kai.codex.build_session_context", return_value="[CONTEXT]"),
+            patch(
+                "kai.memory.format_context",
+                new=AsyncMock(return_value=memory_block),
+            ),
+        ):
+            # chat_id is required so assemble_turn_context's memory
+            # call fires; the helper gates on `chat_id is not None`.
+            async for _event in c._send_locked("ACTUAL_USER_TEXT", chat_id=42):
+                pass
+
+        write_calls = c._proc.stdin.write.call_args_list
+        prompt_msg = json.loads(write_calls[-1][0][0].decode())
+        # String prompts coerce to a single text block on codex.
+        assert len(prompt_msg["params"]["input"]) == 1
+        prompt_text = prompt_msg["params"]["input"][0]["text"]
+
+        # (a) Marker appears exactly once.
+        assert prompt_text.count(USER_MESSAGE_MARKER) == 1
+        # All three other context blocks fired.
+        assert memory_block in prompt_text
+        assert "Respond ONLY" in prompt_text  # foreign-workspace reminder
+        assert "[CONTEXT]" in prompt_text  # session_ctx
+
+        marker_idx = prompt_text.index(USER_MESSAGE_MARKER)
+        # (b) Every other block sits ABOVE the marker.
+        assert prompt_text.index(memory_block) < marker_idx
+        assert prompt_text.index("Respond ONLY") < marker_idx
+        assert prompt_text.index("[CONTEXT]") < marker_idx
+
+        # (c) Nothing but whitespace between the marker and the user text.
+        user_idx = prompt_text.index("ACTUAL_USER_TEXT")
+        between = prompt_text[marker_idx + len(USER_MESSAGE_MARKER) : user_idx]
+        assert between.strip() == "", f"non-whitespace between marker and user text: {between!r}"
+
 
 # ── Prompt coercion ────────────────────────────────────────────────
 
@@ -901,7 +975,10 @@ class TestPromptCoercion:
 
     @pytest.mark.asyncio
     async def test_string_prompt(self):
-        """A string prompt becomes a single text block."""
+        """A string prompt becomes a single text block; the shared
+        per-turn helper always prepends `USER_MESSAGE_MARKER` above
+        the user text on non-fresh sessions so the user's message
+        stays delimited from injected context."""
         c = _make_codex()
         c._proc = _make_mock_proc([_agent_message_delta("ok"), _turn_completed("completed")])
         c._session_id = "test-session"
@@ -912,11 +989,12 @@ class TestPromptCoercion:
 
         write_calls = c._proc.stdin.write.call_args_list
         prompt_msg = json.loads(write_calls[-1][0][0].decode())
-        assert prompt_msg["params"]["input"] == [{"type": "text", "text": "hello"}]
+        assert prompt_msg["params"]["input"] == [{"type": "text", "text": f"{USER_MESSAGE_MARKER}\n\nhello"}]
 
     @pytest.mark.asyncio
     async def test_list_prompt_text_only(self):
-        """A list of text blocks passes through unchanged."""
+        """A list of text blocks passes through with the user-message
+        marker prepended as its own block above the original list."""
         c = _make_codex()
         c._proc = _make_mock_proc([_agent_message_delta("ok"), _turn_completed("completed")])
         c._session_id = "test-session"
@@ -928,11 +1006,15 @@ class TestPromptCoercion:
 
         write_calls = c._proc.stdin.write.call_args_list
         prompt_msg = json.loads(write_calls[-1][0][0].decode())
-        assert prompt_msg["params"]["input"] == blocks
+        assert prompt_msg["params"]["input"] == [
+            {"type": "text", "text": USER_MESSAGE_MARKER},
+            *blocks,
+        ]
 
     @pytest.mark.asyncio
     async def test_list_prompt_drops_non_text_blocks(self):
-        """Non-text blocks are dropped with a warning; text blocks preserved."""
+        """Non-text blocks are dropped with a warning; the marker and
+        text blocks are preserved."""
         c = _make_codex()
         c._proc = _make_mock_proc([_agent_message_delta("ok"), _turn_completed("completed")])
         c._session_id = "test-session"
@@ -947,12 +1029,17 @@ class TestPromptCoercion:
 
         write_calls = c._proc.stdin.write.call_args_list
         prompt_msg = json.loads(write_calls[-1][0][0].decode())
-        # Image block dropped; text block kept
-        assert prompt_msg["params"]["input"] == [{"type": "text", "text": "keep"}]
+        # Image block dropped; marker + text block kept.
+        assert prompt_msg["params"]["input"] == [
+            {"type": "text", "text": USER_MESSAGE_MARKER},
+            {"type": "text", "text": "keep"},
+        ]
 
     @pytest.mark.asyncio
     async def test_empty_list_prompt_synthesizes_placeholder(self):
-        """An all-non-text list yields a single placeholder text block."""
+        """An all-non-text list yields a placeholder text block. The
+        marker block is still prepended; the placeholder ensures the
+        codex CLI sees a non-empty `input` array."""
         c = _make_codex()
         c._proc = _make_mock_proc([_agent_message_delta("ok"), _turn_completed("completed")])
         c._session_id = "test-session"
@@ -964,7 +1051,10 @@ class TestPromptCoercion:
 
         write_calls = c._proc.stdin.write.call_args_list
         prompt_msg = json.loads(write_calls[-1][0][0].decode())
-        assert prompt_msg["params"]["input"] == [{"type": "text", "text": "(empty prompt)"}]
+        assert prompt_msg["params"]["input"] == [
+            {"type": "text", "text": USER_MESSAGE_MARKER},
+            {"type": "text", "text": "(empty prompt)"},
+        ]
 
 
 # ── Restart / force_kill / shutdown / change_workspace ────────────
