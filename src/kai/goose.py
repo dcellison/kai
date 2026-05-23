@@ -33,11 +33,11 @@ from kai.backend import (
     ApiContext,
     StreamEvent,
     apply_workspace_model,
+    assemble_turn_context,
     build_foreign_workspace_reminder,
     build_session_context,
     ensure_user_memory,
     ensure_user_preferences,
-    prepend_to_prompt,
 )
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file
 
@@ -368,29 +368,25 @@ class GooseBackend(AgentBackend):
             )
             return
 
-        # Inject identity, memory, history, and API context on the
-        # first message of a new session. Context injection logic
-        # lives in backend.py as shared functions.
+        # Per-turn prompt context. Build the fresh-session bootstrap
+        # (MEMORY.md / PREFERENCES.md seed + session_context block)
+        # and the foreign-workspace reminder LOCALLY, then hand both
+        # to `assemble_turn_context` so the shared helper owns the
+        # ordering invariant (USER_MESSAGE_MARKER closest to user
+        # text; session_context, semantic memory, workspace reminder
+        # stacked above).
+        #
+        # The ensure_user_memory / ensure_user_preferences calls
+        # below run exactly once per session because _fresh_session
+        # flips to False unconditionally. A transient OSError inside
+        # either helper is logged as a warning but not retried on
+        # subsequent messages of the same session. Failure modes are
+        # persistent (permissions, missing parent dir), not
+        # transient, so the one-shot behavior is acceptable.
+        session_ctx = ""
         if self._fresh_session:
             self._fresh_session = False
-            # Mirror the ClaudeCodeBackend.send() path: ensure the
-            # per-user MEMORY.md directory exists before building the
-            # session context. See backend.ensure_user_memory() for
-            # why this is a cheap, idempotent no-op in production.
-            #
-            # Retry limitation: this call is gated on _fresh_session,
-            # which the line above flips to False unconditionally. A
-            # transient OSError inside ensure_user_memory (logged as a
-            # warning, not raised) is not retried later in the same
-            # session. Failure modes here are persistent (permissions,
-            # missing parent dir), not transient, so this is
-            # acceptable; documenting it so future readers do not
-            # assume self-healing.
             ensure_user_memory(chat_id, DATA_DIR)
-            # Sibling bootstrap for the per-user PREFERENCES.md surface.
-            # Same scope, same OSError-swallow semantics; see
-            # backend.ensure_user_preferences() for the multi-user
-            # ownership caveats.
             ensure_user_preferences(chat_id, DATA_DIR)
             session_ctx = build_session_context(
                 workspace=self.workspace,
@@ -401,31 +397,54 @@ class GooseBackend(AgentBackend):
                 data_dir=DATA_DIR,
                 memory_enabled=self.memory_enabled,
             )
-            prompt = prepend_to_prompt(prompt, session_ctx)
 
-        # When in a foreign workspace, remind on every message to only
-        # respond to what the user asks.
-        reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace)
-        if reminder:
-            prompt = prepend_to_prompt(prompt, reminder)
+        reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace) or ""
 
-        # Coerce prompt to ACP format (array of content blocks).
-        # Goose supports images but the initial implementation handles
-        # text only. Non-text blocks are logged and skipped.
-        acp_prompt: list[dict] = []
-        if isinstance(prompt, str):
-            acp_prompt = [{"type": "text", "text": prompt}]
-        else:
+        # Strip non-text user blocks before per-turn assembly. Goose
+        # accepts text content blocks only; the strip must run BEFORE
+        # assemble_turn_context so the marker it prepends labels a
+        # real user-text region. Stripping after the helper would
+        # leave injected text layers (session_context, reminder,
+        # memory) above the marker and nothing below it.
+        had_user_text = isinstance(prompt, str)
+        if isinstance(prompt, list):
+            text_blocks: list[dict] = []
             for block in prompt:
                 if block.get("type") == "text":
-                    acp_prompt.append({"type": "text", "text": block["text"]})
+                    text_blocks.append({"type": "text", "text": block["text"]})
                 else:
                     log.warning(
                         "GooseBackend: dropping non-text content block type=%s",
                         block.get("type"),
                     )
-            if not acp_prompt:
-                acp_prompt = [{"type": "text", "text": "(empty prompt)"}]
+            had_user_text = bool(text_blocks)
+            # Goose requires a non-empty prompt array. An all-non-text
+            # input becomes a single placeholder so the marker has a
+            # user region to label.
+            prompt = text_blocks or [{"type": "text", "text": "(empty prompt)"}]
+
+        # `chat_id=None` to the helper suppresses semantic recall for
+        # this turn. The placeholder "(empty prompt)" is backend-
+        # synthetic and must not become a memory search query; only
+        # real user text drives recall. Session context still uses
+        # the real chat_id - it was built above this point.
+        recall_chat_id = chat_id if had_user_text else None
+        prompt = await assemble_turn_context(
+            prompt,
+            chat_id=recall_chat_id,
+            session_context=session_ctx,
+            workspace_reminder=reminder,
+        )
+
+        # Coerce to the ACP content-block shape. `prompt` is either a
+        # str (from a str input; the helper preserves the input type
+        # family) or a list of text blocks (every non-text block was
+        # stripped above).
+        acp_prompt: list[dict]
+        if isinstance(prompt, str):
+            acp_prompt = [{"type": "text", "text": prompt}]
+        else:
+            acp_prompt = prompt
 
         # Send the session/prompt request
         assert self._proc is not None

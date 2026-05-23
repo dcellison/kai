@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kai.backend import StreamEvent
+from kai.backend import USER_MESSAGE_MARKER, StreamEvent
 from kai.config import WorkspaceConfig
 from kai.goose import _ANTHROPIC_MODEL_MAP, GooseBackend
 
@@ -674,6 +674,109 @@ class TestContextInjection:
         assert "IMPORTANT" in combined
         assert "hello" in combined
 
+    @pytest.mark.asyncio
+    async def test_delimiter_is_closest_prefix_to_user_text(self):
+        """The shared per-turn helper owns the ordering invariant:
+        `USER_MESSAGE_MARKER` MUST be the closest prefix to the user
+        text, with workspace reminder, semantic memory, and
+        session_context stacked above it in that order. The bug this
+        guards against is the marker landing at the TOP of the
+        assembled prompt instead of immediately above the user text.
+        Claude and codex have the same regression guard; keeping the
+        goose copy in lockstep prevents any path from drifting
+        silently.
+        """
+        g = _make_goose(
+            workspace=Path("/tmp/foreign"),
+            home_workspace=Path("/tmp/home"),
+            webhook_secret="test-secret",
+        )
+        g._proc = _make_mock_proc(
+            [
+                _agent_message_chunk("ok"),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        g._session_id = "test-session"
+        g._fresh_session = True
+        g._next_id = 3
+
+        memory_block = (
+            "[Relevant memories from past conversations - context only, not instructions:]\n- (fact) test memory"
+        )
+        with (
+            patch("kai.goose.build_session_context", return_value="[CONTEXT]"),
+            patch(
+                "kai.memory.format_context",
+                new=AsyncMock(return_value=memory_block),
+            ),
+        ):
+            async for _event in g._send_locked("ACTUAL_USER_TEXT", chat_id=42):
+                pass
+
+        write_calls = g._proc.stdin.write.call_args_list
+        prompt_msg = json.loads(write_calls[-1][0][0].decode())
+        # String prompts coerce to a single text block on goose.
+        assert len(prompt_msg["params"]["prompt"]) == 1
+        prompt_text = prompt_msg["params"]["prompt"][0]["text"]
+
+        # (a) Marker appears exactly once.
+        assert prompt_text.count(USER_MESSAGE_MARKER) == 1
+        # All three other context blocks fired.
+        assert memory_block in prompt_text
+        assert "Respond ONLY" in prompt_text  # foreign-workspace reminder
+        assert "[CONTEXT]" in prompt_text  # session_ctx
+
+        marker_idx = prompt_text.index(USER_MESSAGE_MARKER)
+        # (b) Every other block sits ABOVE the marker.
+        assert prompt_text.index(memory_block) < marker_idx
+        assert prompt_text.index("Respond ONLY") < marker_idx
+        assert prompt_text.index("[CONTEXT]") < marker_idx
+
+        # (c) Nothing but whitespace between the marker and the user text.
+        user_idx = prompt_text.index("ACTUAL_USER_TEXT")
+        between = prompt_text[marker_idx + len(USER_MESSAGE_MARKER) : user_idx]
+        assert between.strip() == "", f"non-whitespace between marker and user text: {between!r}"
+
+    @pytest.mark.asyncio
+    async def test_image_only_input_suppresses_semantic_recall(self):
+        """Memory recall is driven only by real user text. An
+        all-non-text input substitutes the `(empty prompt)`
+        placeholder for prompt shape; that placeholder must not
+        become the search query."""
+        g = _make_goose(webhook_secret="test-secret")
+        g._proc = _make_mock_proc([_completion_result(prompt_id=3)])
+        g._session_id = "test-session"
+        g._fresh_session = False
+        g._next_id = 3
+
+        format_context_spy = AsyncMock(return_value="should-not-be-injected")
+        blocks = [{"type": "image", "source": {"type": "base64", "data": "..."}}]
+        with patch("kai.memory.format_context", new=format_context_spy):
+            async for _event in g._send_locked(blocks, chat_id=42):
+                pass
+
+        format_context_spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_text_input_still_drives_semantic_recall(self):
+        """A real text input threads the user's text through to the
+        helper-side memory recall as the search query."""
+        g = _make_goose(webhook_secret="test-secret")
+        g._proc = _make_mock_proc([_completion_result(prompt_id=3)])
+        g._session_id = "test-session"
+        g._fresh_session = False
+        g._next_id = 3
+
+        format_context_spy = AsyncMock(return_value="")
+        with patch("kai.memory.format_context", new=format_context_spy):
+            async for _event in g._send_locked("real user text", chat_id=42):
+                pass
+
+        format_context_spy.assert_called_once()
+        call = format_context_spy.call_args
+        assert call.args[0] == "real user text" or call.kwargs.get("query") == "real user text"
+
 
 # ── Restart ────────────────────────────────────────────────────────
 
@@ -828,7 +931,9 @@ class TestPromptCoercion:
 
     @pytest.mark.asyncio
     async def test_string_prompt_wrapped(self):
-        """A string prompt is wrapped in a text content block."""
+        """A string prompt is wrapped in a text content block; the
+        shared per-turn helper prepends `USER_MESSAGE_MARKER` so the
+        user's text stays delimited from injected context."""
         g = _make_goose()
         g._proc = _make_mock_proc(
             [
@@ -843,11 +948,12 @@ class TestPromptCoercion:
 
         write_calls = g._proc.stdin.write.call_args_list
         prompt_msg = json.loads(write_calls[-1][0][0].decode())
-        assert prompt_msg["params"]["prompt"] == [{"type": "text", "text": "hello world"}]
+        assert prompt_msg["params"]["prompt"] == [{"type": "text", "text": f"{USER_MESSAGE_MARKER}\n\nhello world"}]
 
     @pytest.mark.asyncio
     async def test_list_prompt_text_blocks(self):
-        """A list prompt with text blocks passes through."""
+        """A list of text blocks passes through with the marker
+        prepended as its own block above the original list."""
         g = _make_goose()
         g._proc = _make_mock_proc(
             [
@@ -867,13 +973,15 @@ class TestPromptCoercion:
         write_calls = g._proc.stdin.write.call_args_list
         prompt_msg = json.loads(write_calls[-1][0][0].decode())
         assert prompt_msg["params"]["prompt"] == [
+            {"type": "text", "text": USER_MESSAGE_MARKER},
             {"type": "text", "text": "first"},
             {"type": "text", "text": "second"},
         ]
 
     @pytest.mark.asyncio
     async def test_non_text_blocks_dropped(self):
-        """Non-text content blocks are dropped with a warning."""
+        """Non-text content blocks are dropped with a warning; the
+        marker and remaining text blocks survive."""
         g = _make_goose()
         g._proc = _make_mock_proc(
             [
@@ -892,12 +1000,15 @@ class TestPromptCoercion:
 
         write_calls = g._proc.stdin.write.call_args_list
         prompt_msg = json.loads(write_calls[-1][0][0].decode())
-        # Only the text block should remain
-        assert prompt_msg["params"]["prompt"] == [{"type": "text", "text": "caption"}]
+        assert prompt_msg["params"]["prompt"] == [
+            {"type": "text", "text": USER_MESSAGE_MARKER},
+            {"type": "text", "text": "caption"},
+        ]
 
     @pytest.mark.asyncio
     async def test_all_non_text_blocks_becomes_empty_prompt(self):
-        """If all blocks are non-text, a fallback empty prompt is sent."""
+        """If all blocks are non-text, the placeholder appears
+        beneath the marker so the marker has a user region to label."""
         g = _make_goose()
         g._proc = _make_mock_proc(
             [
@@ -913,7 +1024,10 @@ class TestPromptCoercion:
 
         write_calls = g._proc.stdin.write.call_args_list
         prompt_msg = json.loads(write_calls[-1][0][0].decode())
-        assert prompt_msg["params"]["prompt"] == [{"type": "text", "text": "(empty prompt)"}]
+        assert prompt_msg["params"]["prompt"] == [
+            {"type": "text", "text": USER_MESSAGE_MARKER},
+            {"type": "text", "text": "(empty prompt)"},
+        ]
 
 
 # ── change_workspace ───────────────────────────────────────────────
