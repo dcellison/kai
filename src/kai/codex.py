@@ -49,7 +49,6 @@ from pathlib import Path
 
 import kai
 from kai.backend import (
-    USER_MESSAGE_MARKER,
     AgentBackend,
     AgentResponse,
     ApiContext,
@@ -594,6 +593,27 @@ class CodexBackend(AgentBackend):
         # through the helper signature.
         reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace) or ""
 
+        # Strip non-text user blocks before per-turn assembly. The
+        # codex CLI accepts text blocks only; the drop must run BEFORE
+        # assemble_turn_context so the marker it prepends labels a
+        # real user-text region. Stripping after the helper would
+        # leave injected text layers (session_context, reminder,
+        # memory) above the marker and nothing below it.
+        if isinstance(prompt, list):
+            text_blocks: list[dict] = []
+            for block in prompt:
+                if block.get("type") == "text":
+                    text_blocks.append({"type": "text", "text": block["text"]})
+                else:
+                    log.warning(
+                        "CodexBackend: dropping non-text content block type=%s",
+                        block.get("type"),
+                    )
+            # Codex requires a non-empty `input` array. An all-non-text
+            # input becomes a single placeholder so the marker has a
+            # user region to label.
+            prompt = text_blocks or [{"type": "text", "text": "(empty prompt)"}]
+
         prompt = await assemble_turn_context(
             prompt,
             chat_id=chat_id,
@@ -601,33 +621,15 @@ class CodexBackend(AgentBackend):
             workspace_reminder=reminder,
         )
 
-        # Coerce prompt to the JSON-RPC content-block format.
-        # The codex CLI accepts text content blocks; image / audio
-        # support is deferred until the smoke test confirms which
-        # block types the pinned version handles.
-        rpc_prompt: list[dict] = []
+        # Coerce to the JSON-RPC content-block shape. `prompt` is
+        # either a str (from a str input; the helper preserves the
+        # input type family) or a list of text blocks (every non-
+        # text block was stripped above).
+        rpc_prompt: list[dict]
         if isinstance(prompt, str):
             rpc_prompt = [{"type": "text", "text": prompt}]
         else:
-            for block in prompt:
-                if block.get("type") == "text":
-                    rpc_prompt.append({"type": "text", "text": block["text"]})
-                else:
-                    log.warning(
-                        "CodexBackend: dropping non-text content block type=%s",
-                        block.get("type"),
-                    )
-            # Empty after the drop pass: codex needs a non-empty
-            # `input`, so synthesize a placeholder. The "marker only"
-            # case (all real content blocks dropped, leaving just the
-            # USER_MESSAGE_MARKER prepended by assemble_turn_context)
-            # also counts as empty user input - the marker is a
-            # structural delimiter, not a message - so add the
-            # placeholder beneath it.
-            if not rpc_prompt:
-                rpc_prompt = [{"type": "text", "text": "(empty prompt)"}]
-            elif len(rpc_prompt) == 1 and rpc_prompt[0].get("text") == USER_MESSAGE_MARKER:
-                rpc_prompt.append({"type": "text", "text": "(empty prompt)"})
+            rpc_prompt = prompt
 
         # Send the turn/start request. The codex app-server protocol
         # uses `input` (array of typed content blocks) plus `threadId`;
