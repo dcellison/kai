@@ -599,6 +599,7 @@ class CodexBackend(AgentBackend):
         # real user-text region. Stripping after the helper would
         # leave injected text layers (session_context, reminder,
         # memory) above the marker and nothing below it.
+        had_user_text = isinstance(prompt, str)
         if isinstance(prompt, list):
             text_blocks: list[dict] = []
             for block in prompt:
@@ -609,14 +610,21 @@ class CodexBackend(AgentBackend):
                         "CodexBackend: dropping non-text content block type=%s",
                         block.get("type"),
                     )
+            had_user_text = bool(text_blocks)
             # Codex requires a non-empty `input` array. An all-non-text
             # input becomes a single placeholder so the marker has a
             # user region to label.
             prompt = text_blocks or [{"type": "text", "text": "(empty prompt)"}]
 
+        # `chat_id=None` to the helper suppresses semantic recall for
+        # this turn. The placeholder text "(empty prompt)" is backend-
+        # synthetic and must not become a memory search query; only
+        # real user text drives recall. Session context still uses
+        # the real chat_id - it was built above this point.
+        recall_chat_id = chat_id if had_user_text else None
         prompt = await assemble_turn_context(
             prompt,
-            chat_id=chat_id,
+            chat_id=recall_chat_id,
             session_context=session_ctx,
             workspace_reminder=reminder,
         )
