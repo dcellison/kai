@@ -123,8 +123,11 @@ log = logging.getLogger(__name__)
 # not just whether the artifact is durable. IGNORE rules unchanged.
 # The bias-to-false sentence is replaced with a calibrated
 # trade-off note that names the false-negative cost (a missed
-# debugging arc) against the false-positive cost (one extra
-# subprocess; stage-2 validation catches workflow-shape goals).
+# debugging arc) against the false-positive cost (one stage-2
+# subprocess and a stored row unless the goal matches the
+# narrow workflow-shape backstop) and asks the model to keep
+# the QUALITY TEST strict for analytical / status / artifact-only
+# updates.
 # Schema unchanged; the bump lets post-rollout log analysis partition
 # episodes classified under the looser criteria from earlier ones.
 _EXTRACTION_PROMPT_VERSION: str = "10"
@@ -588,10 +591,15 @@ EPISODE IGNORE rules above are the canonical list.
 
 Trade-off: a missed debugging arc is a real loss because the
 diagnostic content is exactly what re-derivation needs. A false
-positive costs one stage-2 subprocess and is caught downstream by
-the workflow-shape validator on the generated goal. When the
-diagnostic arc is concrete and the resolution is visible in the
-current exchange, prefer true even when the framing is implicit.
+positive costs at least one stage-2 subprocess and can enter the
+memory store unless the generated goal matches the workflow-shape
+backstop (which catches canonical Evaluate / Approve / File / Push
+shapes only, not a general non-diagnostic episode). Keep the
+QUALITY TEST strict for analytical replies, status-like updates,
+and explanations whose only takeaway is the artifact itself. When
+the diagnostic arc is concrete and the resolution is visible in
+the current exchange, prefer true even when the framing is
+implicit.
 
 CONSOLIDATION:
 You will sometimes receive an EXISTING FACTS block before the USER/ASSISTANT

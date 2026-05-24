@@ -2620,10 +2620,10 @@ class TestExtractionPromptSoftVocab:
         fragments so a future unrelated edit that introduces a `vN:`
         token elsewhere cannot satisfy this test vacuously.
 
-        v5, v6, v7, v8, and v9 fragments are pinned: each prior entry
-        stays in source unchanged across the next bump, and the v9
-        entry was appended for the QUALITY TEST positive-criterion
-        swap."""
+        v5 through v10 fragments are pinned: each prior entry stays
+        in source unchanged across the next bump. The latest entry
+        (v10) gets its own date + phrase pin so the version-history
+        discipline keeps protecting the freshest revision."""
         from pathlib import Path
 
         import kai.memory_extraction
@@ -2642,6 +2642,12 @@ class TestExtractionPromptSoftVocab:
         # v9 history comment specifically.
         assert "v9 (2026-05-12)" in src
         assert "QUALITY TEST" in src
+        # v10 entry: episode-side loosening for implicit-framing
+        # technical-debugging arcs. Pinning the literal date plus the
+        # distinguishing phrase keeps the history-discipline rule
+        # honest at the current head of the version sequence.
+        assert "v10 (2026-05-24)" in src
+        assert "implicit resolution framing" in src
 
 
 class TestRule6WorkflowEventRegex:
