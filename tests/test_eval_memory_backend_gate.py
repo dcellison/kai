@@ -415,12 +415,56 @@ class TestCompareThresholds:
         assert "T1.parse_failure_rate" in failed
 
     def test_fails_codex_on_p_at_5_below_floor(self):
+        """With claude at the perfect baseline (1.0), the floor binds
+        on the relative arm: max(0.70, 1.0 - 0.05) = 0.95. Codex at
+        0.79 falls below the relative floor and fails."""
         claude = _clean_metrics()
         codex = _clean_metrics(precision_at_5=0.79)
         report = g.compare_thresholds(claude, codex)
         assert report.overall == "fail"
         failed = [c.name for c in report.checks if not c.passed]
         assert "T5.precision_at_5_floor" in failed
+
+    def test_passes_p_at_5_when_codex_above_relative_floor(self):
+        """Regression for the originating-issue calibration error: a
+        baseline run where claude=0.72 and codex=0.78 must pass the
+        floor under the max(0.70, claude - 0.05) shape. The previous
+        absolute 0.80 floor failed both arms on every run regardless
+        of whether codex was actually regressing.
+
+        max(0.70, 0.72 - 0.05) = max(0.70, 0.67) = 0.70; codex at
+        0.78 clears comfortably. The band check also passes because
+        codex >= claude."""
+        claude = _clean_metrics(precision_at_5=0.72, fraction_in_prompt=0.72)
+        codex = _clean_metrics(precision_at_5=0.78, fraction_in_prompt=0.79)
+        report = g.compare_thresholds(claude, codex)
+        failed = [c.name for c in report.checks if not c.passed]
+        assert "T5.precision_at_5_floor" not in failed
+        assert "T5.fraction_in_prompt_floor" not in failed
+
+    def test_fails_p_at_5_when_codex_below_absolute_minimum(self):
+        """The absolute minimum (0.70) fires when the entire system
+        gets fundamentally worse, even if claude is also poor. With
+        claude at 0.60 the relative term would yield 0.55, but the
+        absolute term holds the floor at 0.70; codex at 0.69 falls
+        below that and fails. Catches the case where everyone is
+        sliding together rather than codex specifically regressing."""
+        claude = _clean_metrics(precision_at_5=0.60)
+        codex = _clean_metrics(precision_at_5=0.69)
+        report = g.compare_thresholds(claude, codex)
+        failed = [c.name for c in report.checks if not c.passed]
+        assert "T5.precision_at_5_floor" in failed
+
+    def test_fails_fraction_in_prompt_floor_with_same_shape(self):
+        """`fraction_in_prompt_floor` mirrors `precision_at_5_floor`.
+        With claude high (0.95) and codex significantly below
+        (0.85), the relative arm fires: floor = max(0.70, 0.95 -
+        0.05) = 0.90; codex 0.85 falls below it."""
+        claude = _clean_metrics(fraction_in_prompt=0.95)
+        codex = _clean_metrics(fraction_in_prompt=0.85)
+        report = g.compare_thresholds(claude, codex)
+        failed = [c.name for c in report.checks if not c.passed]
+        assert "T5.fraction_in_prompt_floor" in failed
 
     def test_fails_codex_on_hallucinated_ids(self):
         claude = _clean_metrics()
