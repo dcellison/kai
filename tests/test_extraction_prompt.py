@@ -82,23 +82,26 @@ def test_store_block_does_not_reference_durability_test():
     DURABILITY TEST that no longer exists.
 
     The colon-suffixed `DURABILITY TEST:` header check above is too
-    narrow: a bare-form `DURABILITY TEST below` inside the STORE block
-    leaves the model pointing at a section that was deleted in the v9
-    swap. The PR #467 review (M-1) flagged exactly this: the STORE
-    block's "Apply the DURABILITY TEST below" reference survived the
-    swap because the spec's deletion range was line-based and the
-    STORE block sat outside it.
+    narrow: a bare-form `DURABILITY TEST below` inside the STORE
+    block leaves the model pointing at a section that was deleted in
+    the v9 swap. The originating regression: the STORE block's
+    "Apply the DURABILITY TEST below" reference survived that swap
+    because the deletion range was line-based and the STORE block
+    sat outside it.
 
     Pinning the absence of any "DURABILITY TEST" substring in the
     fact-side STORE block - regardless of suffix - closes the
-    recurrence path. The episode-side `EPISODE DURABILITY TEST` is
-    after this block, so a substring search bounded to the fact-side
-    STORE region is safe.
+    recurrence path for that orphan-pointer shape. The sibling
+    `test_durability_test_removed` covers global absence; this test
+    bounds itself to the fact-side STORE region so the assertion
+    error message stays attributable to the original failure
+    surface rather than a generic prompt-wide grep.
     """
-    # Bound the search to the fact-side region: from "STORE these
-    # fact types:" through (but not including) "EPISODE
-    # CLASSIFICATION" (the episode-side header that opens the
-    # DURABILITY TEST surface we DO want to keep).
+    # Bound the search to the fact-side STORE region: from "STORE
+    # these fact types:" through (but not including) "EPISODE
+    # CLASSIFICATION". The bound keeps this test focused on the
+    # historical orphan-pointer site even though `DURABILITY TEST`
+    # is now absent everywhere (also asserted by the sibling test).
     store_idx = _EXTRACTION_SYSTEM_PROMPT.index("STORE these fact types:")
     episode_idx = _EXTRACTION_SYSTEM_PROMPT.index("EPISODE CLASSIFICATION")
     fact_side = _EXTRACTION_SYSTEM_PROMPT[store_idx:episode_idx]
