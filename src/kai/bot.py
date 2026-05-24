@@ -173,6 +173,25 @@ _QUEUED_MESSAGE_MARKER = (
 _LOCK_ACQUIRE_TIMEOUT = 3600  # 1 hour
 
 
+# Strong references to in-flight memory-ingestion tasks.
+#
+# `asyncio.create_task` returns a Task that the runtime holds only by
+# WEAK reference. Without a strong reference somewhere, a heap-pressure
+# GC cycle can reap a still-running task; the failure mode is silent
+# because the task simply disappears and the exchange never makes it
+# into semantic memory. The set holds a strong reference until the
+# task completes; the done-callback `_pending_memory_tasks.discard`
+# registered at spawn keeps the set self-pruning so a long-running
+# deployment does not accumulate references without bound.
+#
+# Same pattern as `webhook.py`'s `_background_tasks` and
+# `memory_extraction.py`'s `_pending_episode_tasks`. Each module owns
+# its own set so the ownership boundary stays explicit; consolidating
+# into a single global set would obscure which subsystem is responsible
+# for a given task's lifetime.
+_pending_memory_tasks: set[asyncio.Task[None]] = set()
+
+
 # Budget-exhaustion recovery directive.
 #
 # When the inner Claude session hits BUDGET_CEILING (default $10), the
@@ -3770,7 +3789,9 @@ async def _handle_response(
             except Exception:
                 log.warning("Memory ingestion failed", exc_info=True)
 
-        asyncio.create_task(_ingest_memory())  # noqa: RUF006
+        task = asyncio.create_task(_ingest_memory())
+        _pending_memory_tasks.add(task)
+        task.add_done_callback(_pending_memory_tasks.discard)
 
     # Voice-only mode: synthesize and send voice, fall back to text on failure
     if voice_only and final_text:

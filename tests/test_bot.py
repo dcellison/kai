@@ -3095,6 +3095,93 @@ class TestHandleResponse:
 
         extract_mock.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_memory_ingest_task_held_by_module_set(self, monkeypatch):
+        """The ingest task is added to `_pending_memory_tasks` at
+        schedule time and discarded by the done-callback after the
+        task completes. Pinning both sides of the lifecycle prevents
+        a regression that reverts to `asyncio.create_task(...)` with
+        no strong reference, which Python's GC can reap mid-flight.
+
+        Drives the lifecycle with an asyncio.Event so the test can
+        observe the set membership at three points: pre-call (empty
+        baseline), mid-task (one entry, task in flight), and
+        post-task (back to empty after the done-callback fires)."""
+        from kai import bot
+        from kai.bot import _handle_response, _pending_memory_tasks
+
+        # Baseline: prior tests may have left the set populated if
+        # they did not wait for their tasks to complete. Snapshot the
+        # baseline rather than asserting empty so test ordering does
+        # not couple this test to its siblings.
+        baseline = set(_pending_memory_tasks)
+
+        monkeypatch.setattr("kai.memory.is_enabled", lambda: True)
+
+        # extract_and_store waits on this event so the test can
+        # inspect the set while the task is in flight. The mid-task
+        # assertion races the done-callback only if extract returns
+        # immediately; the event keeps the task pending until the
+        # test releases it.
+        in_flight = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_extract(*args, **kwargs):
+            in_flight.set()
+            await release.wait()
+
+        monkeypatch.setattr("kai.memory_extraction.extract_and_store", blocking_extract)
+
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Hello world", session_id="sess-1")))
+        config = _make_config(
+            memory_extraction_enabled=True,
+            episode_classifier_context_turns=0,
+        )
+        ctx = _make_context(config=config, pool=pool)
+
+        with patch.multiple("kai.bot", **self._base_patches()):
+            await _handle_response(update, ctx, 12345, "test prompt", pool, "claude-opus")
+
+        # The ingest task is scheduled inside _handle_response and
+        # blocked at the extract_and_store await. Wait for the
+        # in-flight signal so the assertion does not race the
+        # task's first await.
+        await asyncio.wait_for(in_flight.wait(), timeout=1.0)
+
+        # Mid-task: exactly one new entry above baseline. The
+        # add() at schedule time put it there; the done-callback
+        # has not fired because the task is still blocked.
+        assert len(_pending_memory_tasks - baseline) == 1, (
+            "ingest task should be held in _pending_memory_tasks while it runs"
+        )
+
+        # Release the task so it can complete and the done-callback
+        # can run.
+        release.set()
+
+        # Wait for the done-callback to discard the task. The
+        # task itself completes inside extract_and_store; the
+        # discard runs as a callback after. A short asyncio.sleep
+        # loop lets the runtime schedule both.
+        for _ in range(100):
+            if not (_pending_memory_tasks - baseline):
+                break
+            await asyncio.sleep(0.01)
+
+        # Post-task: the set is back to baseline. The discard
+        # callback fired and self-pruned the entry, so a
+        # long-running deployment does not accumulate references.
+        assert _pending_memory_tasks - baseline == set(), (
+            "done-callback should have discarded the completed task from _pending_memory_tasks"
+        )
+
+        # Silence pyflakes/ruff: `bot` is imported above to anchor
+        # the patched attribute path; the assertions read from the
+        # re-imported `_pending_memory_tasks` reference.
+        _ = bot
+
 
 # ── _notify_if_queued ────────────────────────────────────────────────
 
