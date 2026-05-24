@@ -33,6 +33,7 @@ from kai.memory_extraction import (
     _GENERIC_CONFIRMATION_RE,
     _RULE_6_REJECTIONS,
     _WORKFLOW_EVENT_RE,
+    _WORKFLOW_SELF_ANNOUNCEMENT_QUOTE_RE,
     _build_extraction_payload,
     _capped_assistant,
     _emit_intent_log,
@@ -2764,12 +2765,15 @@ class TestRule6WorkflowEventRegex:
         after = sum(_RULE_6_REJECTIONS.snapshot().values())
         assert after - before == 1
 
-    def test_rule_6_skips_confirmed_action_rows(self):
-        """Pin the confirmed_action skip ahead of Rule 6: a
-        confirmation row whose content matches arm 2 ("User
-        confirmed PR #299 was merged on 2026-04-12") must NOT be
-        rejected, because the existing Rule 1/2/4/4b chain already
-        gates the confirmed_action path."""
+    def test_rule_6_keeps_legitimate_confirmed_action_rows(self):
+        """A legitimate confirmation row (assistant claimed an
+        action; user confirmed via perceiver-framed quote) must
+        survive Rule 6. The content matches arm 2 of
+        `_WORKFLOW_EVENT_RE` but the confirmed_action arm skips the
+        content check; the quote is perceiver-framed ("I see ...")
+        and does not match
+        `_WORKFLOW_SELF_ANNOUNCEMENT_QUOTE_RE`, so neither path
+        rejects."""
         before = sum(_RULE_6_REJECTIONS.snapshot().values())
         facts = [
             {
@@ -2784,15 +2788,82 @@ class TestRule6WorkflowEventRegex:
             facts,
             candidate_ids=set(),
             candidate_metadata={},
-            user_id="test-user-rule6-skip",
+            user_id="test-user-rule6-keep",
         )
         kept = [f["content"] for f in validated]
-        # The fact survives. The regex matches the content, but the
-        # confirmed_action skip protects it.
         assert "User confirmed PR #299 was merged on 2026-04-12." in kept
-        # Counter unchanged: Rule 6 did not fire on this fact.
         after = sum(_RULE_6_REJECTIONS.snapshot().values())
         assert after - before == 0
+
+    def test_rule_6_rejects_self_announcement_confirmation_quote(self):
+        """The originating-issue bypass: codex emits a
+        confirmed_action row whose confirmation_quote is the user's
+        own announcement of a completed workflow action ("Just
+        merged PR #501 finally."). The content-side skip would let
+        this pass under the prior contract; the quote-side arm
+        rejects it now. Pinning both the regex match and the
+        end-to-end rejection prevents accidental relaxation."""
+        before = sum(_RULE_6_REJECTIONS.snapshot().values())
+        facts = [
+            {
+                "content": "User confirmed PR #501 was merged.",
+                "tags": ["confirmed_action"],
+                "confidence": 0.9,
+                "intent": "new",
+                "confirmation_quote": "Just merged PR #501 finally.",
+            },
+        ]
+        validated = _validate_facts(
+            facts,
+            candidate_ids=set(),
+            candidate_metadata={},
+            user_id="test-user-rule6-reject",
+        )
+        kept = [f["content"] for f in validated]
+        assert "User confirmed PR #501 was merged." not in kept
+        after = sum(_RULE_6_REJECTIONS.snapshot().values())
+        assert after - before == 1
+
+    def test_self_announcement_regex_positives(self):
+        """The self-announcement regex catches the canonical
+        software-workflow announcement verbs: merge, deploy, ship,
+        push, roll back, release, land. Each verb is pinned with
+        the bare-verb and the "Just"-prefixed shape."""
+        positives = [
+            "Just merged PR #501 finally.",
+            "Merged the migration; tests are green.",
+            "Just deployed the v3.2 release to prod.",
+            "Deployed the build to staging.",
+            "Just shipped the feature behind the new flag.",
+            "Shipped v4.0 this morning.",
+            "Just pushed the wiki update.",
+            "Pushed the fix to fix/512.",
+            "Just rolled back the bad migration.",
+            "Rolled back the deploy at 14:30.",
+            "Just released the beta to the test cohort.",
+            "Released v2.1 ahead of schedule.",
+            "Just landed the spec change in main.",
+            "Landed the rename in PR #404.",
+        ]
+        for quote in positives:
+            assert _WORKFLOW_SELF_ANNOUNCEMENT_QUOTE_RE.match(quote), quote
+
+    def test_self_announcement_regex_negatives(self):
+        """Legitimate confirmation quotes lead with a perceiver
+        pronoun ("I see", "I noticed") or otherwise place the user
+        as observer, not agent. They must not match the
+        self-announcement regex, or the Rule 6 quote-side arm would
+        reject valid confirmations."""
+        negatives = [
+            "I see PR #299 is merged, thanks for the update.",
+            "I noticed the deploy went out this morning.",
+            "Confirmed - the migration shipped at 10am EST.",
+            "Thanks, I see the rollback completed.",
+            "Yes, the build passed for me too.",
+            "Got it; the spec is approved.",
+        ]
+        for quote in negatives:
+            assert not _WORKFLOW_SELF_ANNOUNCEMENT_QUOTE_RE.match(quote), quote
 
     def test_get_extractor_stats_exposes_rule_6_counter(self):
         """`get_extractor_stats()` returns the documented top-level

@@ -1183,6 +1183,38 @@ _WORKFLOW_EVENT_RE = re.compile(
 )
 
 
+# Workflow self-announcement regex (Rule 6 confirmation-quote arm).
+# Matches confirmation_quote strings where the user speaks as the
+# AGENT of a completed workflow action ("Just merged PR #501",
+# "Deployed X", "Shipped Y") rather than as the OBSERVER confirming
+# an assistant-stated claim ("I see PR #299 is merged, thanks", "I
+# noticed the deploy went out"). The discriminator is the leading
+# verb: legitimate confirmation quotes lead with a perceiver
+# pronoun ("I see", "I noticed", "Confirmed -") because the user is
+# positioning themselves as the observer of an event the assistant
+# claimed. Self-announcement quotes lead with the action verb
+# itself, optionally prefixed with "Just".
+#
+# Used to close the confirmed_action route on the user-announces-
+# workflow-status shape that the QUALITY TEST negative example
+# targets at the prompt level. The model can mis-route an
+# announcement into confirmed_action; this regex backstops that
+# routing without rejecting the legitimate confirmation pattern
+# (where the user did not utter the action verb as their leading
+# claim).
+#
+# The verb set covers the canonical software-workflow announcement
+# verbs surfaced in the originating gate runs. It is intentionally
+# narrow: broader paraphrases ("I shipped a new release of X today,
+# thanks for the heads up") are left to the prompt's QUALITY TEST
+# because they pair the action verb with first-person perceiver
+# framing and are a real edge case worth not over-rejecting.
+_WORKFLOW_SELF_ANNOUNCEMENT_QUOTE_RE = re.compile(
+    r"^(Just\s+)?(merged|deployed|shipped|pushed|rolled\s+back|released|landed)\b",
+    re.IGNORECASE,
+)
+
+
 class _Counter:
     """Per-user rejection counter for `_validate_facts` Rule 6.
 
@@ -1609,19 +1641,39 @@ def _validate_facts(
         # `_RULE_6_REJECTIONS` increments per user so the rate is
         # observable via `get_extractor_stats()` without grepping logs.
         #
-        # Confirmed-action rows are skipped because the canonical
-        # confirmation example "User confirmed PR #299 was merged on
-        # 2026-04-12" matches arm 2 of `_WORKFLOW_EVENT_RE`. The
-        # existing Rule 1/2/4/4b chain already gates the
-        # confirmed_action path with strict quote and tag rules;
-        # trusting them here keeps Rule 6 narrowly scoped to its
-        # purpose (workflow-event noise without a confirmation anchor).
+        # The rule has two arms keyed on whether the fact is tagged
+        # `confirmed_action`:
+        #
+        # Non-confirmed_action arm: the canonical Rule 6 path. Reject
+        # if `_WORKFLOW_EVENT_RE` matches the content.
+        #
+        # confirmed_action arm: the content-side check is skipped
+        # because the canonical legitimate confirmation example "User
+        # confirmed PR #299 was merged on 2026-04-12" matches arm 2
+        # of `_WORKFLOW_EVENT_RE` and would otherwise be rejected.
+        # Instead, inspect the confirmation_quote: if the quote is
+        # itself a user-announced workflow status event ("Just merged
+        # PR #501 finally", "Deployed X"), the user spoke the action
+        # as the agent rather than confirming an assistant claim, and
+        # the row is workflow noise wearing a confirmation tag.
+        # Legitimate confirmation quotes lead with a perceiver
+        # pronoun ("I see PR #299 is merged, thanks") and do not
+        # match `_WORKFLOW_SELF_ANNOUNCEMENT_QUOTE_RE`.
         if "confirmed_action" not in tags:
             content = fact.get("content", "")
             if isinstance(content, str) and _WORKFLOW_EVENT_RE.search(content):
                 log.info(
                     "_validate_facts: rejecting workflow-event-shaped fact: %r",
                     content[:120],
+                )
+                _RULE_6_REJECTIONS.increment(user_id=user_id)
+                continue
+        else:
+            quote = fact.get("confirmation_quote", "")
+            if isinstance(quote, str) and _WORKFLOW_SELF_ANNOUNCEMENT_QUOTE_RE.match(quote):
+                log.info(
+                    "_validate_facts: rejecting confirmed_action with self-announcement quote: %r",
+                    quote[:120],
                 )
                 _RULE_6_REJECTIONS.increment(user_id=user_id)
                 continue
