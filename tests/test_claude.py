@@ -392,8 +392,13 @@ class TestCommandConstruction:
             assert "--settings" not in cmd
 
     @pytest.mark.asyncio
-    async def test_autocompact_pct_in_env(self):
+    async def test_autocompact_pct_in_env(self, monkeypatch):
         """CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is set in subprocess env when configured."""
+        # Defense against a parent shell that already exports the var
+        # at a different value; the assertion below pins the value to
+        # the config setting, so a leaked parent value would otherwise
+        # silently satisfy the `in env` half of the check.
+        monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
         claude = _make_claude(autocompact_pct=80)
 
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
@@ -408,8 +413,43 @@ class TestCommandConstruction:
             assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "80"
 
     @pytest.mark.asyncio
-    async def test_no_autocompact_env_when_zero(self):
-        """CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is not set when autocompact_pct is 0."""
+    async def test_no_autocompact_env_when_zero(self, monkeypatch):
+        """CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is not set when autocompact_pct is 0.
+
+        Belt-and-suspenders: the monkeypatch.delenv ensures the test
+        passes regardless of the developer's parent env. The
+        production-side fix (the else-branch pop in _ensure_started)
+        is what makes the assertion hold under a parent that DOES
+        set the var; the dedicated parent-env-set test below
+        exercises that path directly."""
+        monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
+        claude = _make_claude(autocompact_pct=0)
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            env = mock_exec.call_args[1]["env"]
+            assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in env
+
+    @pytest.mark.asyncio
+    async def test_no_autocompact_env_when_zero_with_parent_env_set(self, monkeypatch):
+        """The originating-issue bug: parent process has
+        CLAUDE_AUTOCOMPACT_PCT_OVERRIDE set (a dotfile, /etc/kai/env
+        loaded via load_dotenv, a launchd plist EnvironmentVariables,
+        or a manual export). Without the symmetric pop in
+        _ensure_started, the var leaks through unconditionally even
+        when autocompact_pct=0; the operator's "disable" setting is
+        silently ignored.
+
+        Pins the contract: set-or-absent on this exact key,
+        independent of what the parent env carried. Regression for
+        the same failure class the rest of the PR is closing."""
+        monkeypatch.setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "75")
         claude = _make_claude(autocompact_pct=0)
 
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:

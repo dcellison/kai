@@ -289,8 +289,19 @@ class ClaudeCodeBackend(AgentBackend):
         # Set autocompact threshold so Claude compacts earlier, reducing
         # token usage. Passed as an env var (not a CLI flag) because
         # Claude Code reads it from its process environment.
+        #
+        # The else-branch pop is load-bearing: without it, a parent
+        # process that has CLAUDE_AUTOCOMPACT_PCT_OVERRIDE set (a
+        # profile dotfile, /etc/kai/env loaded via load_dotenv, a
+        # launchd plist EnvironmentVariables, or a manual export in
+        # the shell that started the daemon) leaks the var into the
+        # subprocess even when autocompact_pct=0. The contract is
+        # set-or-absent on this exact key, independent of what the
+        # parent env carried.
         if self.autocompact_pct > 0:
             env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(self.autocompact_pct)
+        else:
+            env.pop("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", None)
 
         # Per-os-user TMPDIR (cross-user mode only). The claude binary
         # writes its --settings JSON into `$TMPDIR/claude-settings-<hex>
