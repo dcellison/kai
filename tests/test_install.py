@@ -938,6 +938,29 @@ class TestGenerateLaunchdPlist:
         assert result.startswith("<?xml")
         assert "</plist>" in result
 
+    def test_captures_stderr_and_stdout_to_log_files(self):
+        """Without StandardErrorPath / StandardOutPath, launchd routes
+        Python's stderr and stdout to /dev/null. An early-init crash
+        (missing env var, SystemExit before logging is configured)
+        then leaves no trail while the bash wrapper's tracked PID
+        keeps `launchctl print` reporting `state = running`. Pin both
+        keys plus the {data_dir}/logs/ derivation so a future refactor
+        cannot silently drop the visibility surface."""
+        result = _generate_launchd_plist("/opt/kai", "/var/lib/kai", "kai")
+        assert "<key>StandardErrorPath</key>" in result
+        assert "<string>/var/lib/kai/logs/kai.stderr.log</string>" in result
+        assert "<key>StandardOutPath</key>" in result
+        assert "<string>/var/lib/kai/logs/kai.stdout.log</string>" in result
+
+    def test_log_paths_derive_from_data_dir(self):
+        """A non-default data_dir lands the log files under that
+        directory, not under a hardcoded /var/lib/kai/. Catches a
+        regression where the paths were ever inlined as literal
+        strings instead of f-string interpolations of `data_dir`."""
+        result = _generate_launchd_plist("/opt/kai", "/srv/kai", "kai")
+        assert "<string>/srv/kai/logs/kai.stderr.log</string>" in result
+        assert "<string>/srv/kai/logs/kai.stdout.log</string>" in result
+
 
 class TestGenerateSystemdUnit:
     def test_contains_user(self):

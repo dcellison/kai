@@ -2350,6 +2350,16 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
     launchd to lose track of the process. The launcher script stays as the
     tracked parent and forwards signals to Python.
 
+    StandardErrorPath and StandardOutPath capture Python's stderr/stdout to
+    files under {data_dir}/logs/ rather than the launchd default of /dev/null.
+    Without these keys, an early-init crash (a missing env var, an unimportable
+    module, a SystemExit before logging is configured) goes nowhere visible
+    and the bash wrapper's tracked PID stays alive, so `launchctl print`
+    reports `state = running` even when the actual Python process is dead.
+    The {data_dir}/logs/ directory is created with service-user ownership
+    earlier in the install path; launchd creates the files themselves on
+    first write.
+
     Args:
         install_dir: Root of the protected installation (e.g., /opt/kai).
         data_dir: Writable data directory (e.g., /var/lib/kai).
@@ -2389,6 +2399,12 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
                 <key>KAI_INSTALL_DIR</key>
                 <string>{install_dir}</string>
             </dict>
+
+            <key>StandardErrorPath</key>
+            <string>{data_dir}/logs/kai.stderr.log</string>
+
+            <key>StandardOutPath</key>
+            <string>{data_dir}/logs/kai.stdout.log</string>
 
             <key>RunAtLoad</key>
             <true/>
