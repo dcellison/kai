@@ -13,6 +13,7 @@ import yaml
 
 from kai.install import (
     _LAUNCHD_LABEL,
+    ServiceStartError,
     _apply_directories,
     _apply_goose_config,
     _apply_migrate,
@@ -2587,6 +2588,92 @@ class TestCmdApply:
         assert "[Service]" in unit
         assert "KAI_DATA_DIR=/var/lib/kai" in unit
 
+    def _minimal_install_conf(self, tmp_path):
+        """Write the smallest valid install.conf that lets _cmd_apply
+        reach its try/finally block; the rest of the apply path is
+        either short-circuited by dry-run or monkey-patched per test.
+        Returns the conf path."""
+        conf_path = tmp_path / "install.conf"
+        conf_path.write_text(
+            json.dumps(
+                {
+                    "install_dir": str(tmp_path / "opt" / "kai"),
+                    "data_dir": str(tmp_path / "var" / "lib" / "kai"),
+                    "service_user": "nobody",
+                    "platform": "darwin",
+                    "env": {"TELEGRAM_BOT_TOKEN": "tok"},
+                }
+            )
+        )
+        return conf_path
+
+    def test_apply_propagates_service_start_error_when_apply_succeeds(self, monkeypatch, tmp_path, capsys):
+        """The originating-issue propagation contract: when the apply
+        path completes cleanly but _start_service raises
+        ServiceStartError (verify exhausted), _cmd_apply re-raises so
+        the install exits non-zero rather than reporting success with
+        a dead daemon.
+
+        Uses DRY_RUN=1 so the apply helpers no-op cleanly, then
+        patches _start_service to simulate the verify-exhaustion
+        path that the dry-run branch would otherwise skip."""
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        monkeypatch.setenv("DRY_RUN", "1")
+
+        def fake_start(platform, dry_run, **kw):
+            raise ServiceStartError("simulated verify exhaustion")
+
+        monkeypatch.setattr("kai.install._start_service", fake_start)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", self._minimal_install_conf(tmp_path))
+
+        with pytest.raises(ServiceStartError):
+            _cmd_apply()
+
+        # Recovery hint should reach the operator regardless of
+        # propagation; pinning it here documents that the message
+        # is part of the contract, not a side effect.
+        out = capsys.readouterr().out
+        assert "Manual recovery" in out
+
+    def test_apply_swallows_service_start_error_when_apply_failed(self, monkeypatch, tmp_path, capsys):
+        """The mask-prevention contract: when an apply step has
+        already raised, a subsequent _start_service failure must NOT
+        replace the original exception. Python normally swaps the
+        propagating exception when a finally block raises; the
+        finally guard explicitly checks apply_succeeded and skips
+        the raise so the original failure is what the operator
+        sees.
+
+        Constructs an apply failure by patching _apply_secrets to
+        raise; that step runs deep enough in the try block that the
+        apply_succeeded flag has not been set yet."""
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        monkeypatch.setenv("DRY_RUN", "1")
+
+        class ApplyBlewUp(RuntimeError):
+            pass
+
+        def fake_apply_secrets(env, dry_run):
+            raise ApplyBlewUp("simulated apply step failure")
+
+        def fake_start(platform, dry_run, **kw):
+            raise ServiceStartError("would otherwise replace ApplyBlewUp")
+
+        monkeypatch.setattr("kai.install._apply_secrets", fake_apply_secrets)
+        monkeypatch.setattr("kai.install._start_service", fake_start)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", self._minimal_install_conf(tmp_path))
+
+        # The ORIGINAL apply exception propagates, not the
+        # ServiceStartError raised inside the finally.
+        with pytest.raises(ApplyBlewUp):
+            _cmd_apply()
+
+        # The recovery hint is still printed; the swallowing only
+        # affects the propagating exception type, not the operator's
+        # visibility into both failure modes.
+        out = capsys.readouterr().out
+        assert "Manual recovery" in out
+
 
 class TestCmdConfigDefaultModelDispatch:
     """
@@ -4591,8 +4678,10 @@ class TestStopService:
 
 
 class TestStartService:
-    def test_darwin(self, monkeypatch, tmp_path):
-        """Calls launchctl bootstrap on macOS with system domain."""
+    def test_darwin(self, monkeypatch):
+        """Calls launchctl bootstrap then launchctl print to verify on
+        macOS. Two calls per attempt because the bootstrap exit code is
+        treated as advisory; verify is the authoritative check."""
         calls: list[list[str]] = []
 
         def mock_run(cmd, **kwargs):
@@ -4600,16 +4689,18 @@ class TestStartService:
             return subprocess.CompletedProcess(args=cmd, returncode=0)
 
         monkeypatch.setattr("kai.install.subprocess.run", mock_run)
+        monkeypatch.setattr("kai.install.time.sleep", lambda _s: None)
 
         _start_service("darwin", svc_uid=501, service_user="kai", dry_run=False)
 
-        assert len(calls) == 1
-        assert calls[0][0] == "launchctl"
-        assert calls[0][1] == "bootstrap"
-        assert calls[0][2] == "system"
+        assert len(calls) == 2
+        assert calls[0][:3] == ["launchctl", "bootstrap", "system"]
+        assert calls[1] == ["launchctl", "print", "system/com.syrinx.kai"]
 
     def test_linux(self, monkeypatch):
-        """Calls systemctl start on Linux."""
+        """Calls systemctl start then systemctl is-active to verify on
+        Linux. Mirrors the macOS verify-after-start shape so an
+        operator does not see different success contracts per platform."""
         calls: list[list[str]] = []
 
         def mock_run(cmd, **kwargs):
@@ -4617,10 +4708,14 @@ class TestStartService:
             return subprocess.CompletedProcess(args=cmd, returncode=0)
 
         monkeypatch.setattr("kai.install.subprocess.run", mock_run)
+        monkeypatch.setattr("kai.install.time.sleep", lambda _s: None)
 
         _start_service("linux", svc_uid=1000, service_user="kai", dry_run=False)
 
-        assert calls == [["systemctl", "start", "kai"]]
+        assert calls == [
+            ["systemctl", "start", "kai"],
+            ["systemctl", "is-active", "kai"],
+        ]
 
     def test_dry_run(self, monkeypatch, capsys):
         """Dry run prints the command without executing."""
@@ -4635,6 +4730,106 @@ class TestStartService:
         output = capsys.readouterr().out
         assert "[DRY RUN]" in output
         assert len(calls) == 0
+
+    def test_succeeds_when_bootstrap_returns_nonzero_but_verify_passes(self, monkeypatch):
+        """The originating-issue pattern: launchctl bootstrap returns
+        exit code 5 ("Input/output error") but the daemon is actually
+        registered. The previous implementation trusted the bootstrap
+        exit code and reported failure; the new contract checks the
+        verify post-condition and returns success.
+
+        Pinning this prevents a regression that re-introduces the
+        `if start.returncode == 0: return` short-circuit."""
+
+        def mock_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "bootstrap"]:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=5,
+                    stderr=b"Bootstrap failed: 5: Input/output error",
+                )
+            return subprocess.CompletedProcess(args=cmd, returncode=0)
+
+        monkeypatch.setattr("kai.install.subprocess.run", mock_run)
+        monkeypatch.setattr("kai.install.time.sleep", lambda _s: None)
+
+        # No exception means the verify was treated as authoritative.
+        _start_service("darwin", svc_uid=501, service_user="kai", dry_run=False)
+
+    def test_retries_then_succeeds_when_first_verify_fails(self, monkeypatch):
+        """Two settling attempts to absorb the transient launchd-
+        domain-not-yet-released window. The retry cycle should succeed
+        when an early verify fails but a later one confirms
+        registration; budget exhaustion is a separate test below."""
+        verify_calls = 0
+
+        def mock_run(cmd, **kwargs):
+            nonlocal verify_calls
+            if cmd[:2] == ["launchctl", "print"]:
+                verify_calls += 1
+                rc = 0 if verify_calls >= 2 else 1
+                return subprocess.CompletedProcess(args=cmd, returncode=rc)
+            return subprocess.CompletedProcess(args=cmd, returncode=0)
+
+        monkeypatch.setattr("kai.install.subprocess.run", mock_run)
+        monkeypatch.setattr("kai.install.time.sleep", lambda _s: None)
+
+        # Returns cleanly on the second attempt; no exception raised.
+        _start_service("darwin", svc_uid=501, service_user="kai", dry_run=False)
+        assert verify_calls == 2
+
+    def test_raises_service_start_error_when_verify_never_passes(self, monkeypatch):
+        """The verify-failure exhaustion path: every retry attempt
+        sees a passing-looking bootstrap and a failing verify. The
+        contract is that this raises ServiceStartError rather than
+        warning and returning, so the caller in _cmd_apply can
+        propagate the failure and the install does not exit 0 with
+        the daemon unregistered.
+
+        The error message names the verify command so the operator
+        sees the authoritative failure rather than the misleading
+        bootstrap exit code."""
+
+        def mock_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "print"]:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=1,
+                    stderr=b'Could not find service "com.syrinx.kai" in domain for system',
+                )
+            return subprocess.CompletedProcess(args=cmd, returncode=0)
+
+        monkeypatch.setattr("kai.install.subprocess.run", mock_run)
+        monkeypatch.setattr("kai.install.time.sleep", lambda _s: None)
+
+        with pytest.raises(ServiceStartError) as excinfo:
+            _start_service("darwin", svc_uid=501, service_user="kai", dry_run=False)
+
+        msg = str(excinfo.value)
+        assert "launchctl print" in msg
+        assert "Could not find service" in msg
+
+    def test_raises_service_start_error_on_linux_when_is_active_fails(self, monkeypatch):
+        """Same exhaustion contract on Linux: a passing systemctl
+        start with a failing systemctl is-active still raises so the
+        platform contracts stay symmetric."""
+
+        def mock_run(cmd, **kwargs):
+            if cmd[:2] == ["systemctl", "is-active"]:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=3,
+                    stdout=b"inactive\n",
+                )
+            return subprocess.CompletedProcess(args=cmd, returncode=0)
+
+        monkeypatch.setattr("kai.install.subprocess.run", mock_run)
+        monkeypatch.setattr("kai.install.time.sleep", lambda _s: None)
+
+        with pytest.raises(ServiceStartError) as excinfo:
+            _start_service("linux", svc_uid=1000, service_user="kai", dry_run=False)
+
+        assert "systemctl is-active" in str(excinfo.value)
 
 
 # ── CLI dispatch ─────────────────────────────────────────────────────

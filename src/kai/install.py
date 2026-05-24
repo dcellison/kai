@@ -70,6 +70,41 @@ _CONF_VERSION = 1
 # Plist label for the launchd service
 _LAUNCHD_LABEL = "com.syrinx.kai"
 
+
+# Retry budget for `_start_service`. The bootstrap-then-verify cycle
+# runs at most _SERVICE_START_MAX_ATTEMPTS times: a brief settle
+# delay after each bootstrap call gives the service manager time to
+# update its bookkeeping before the verify query, and a longer retry
+# delay between attempts absorbs the transient launchd-domain-not-yet-
+# released window that follows a bootout. Total worst-case wait is
+# (settle + retry) * (attempts - 1) + settle = 7 seconds at the
+# current values, which is generous enough to cover the failure
+# pattern observed in the originating incident while staying short
+# enough that an install run does not feel hung.
+_SERVICE_START_MAX_ATTEMPTS = 3
+_SERVICE_START_SETTLE_SECONDS = 1
+_SERVICE_START_RETRY_SECONDS = 2
+
+
+class ServiceStartError(Exception):
+    """Raised by `_start_service` when the post-condition verify
+    confirms the service is not actually registered/running after the
+    retry budget is exhausted.
+
+    The platform service managers do not always report start failures
+    reliably via exit code: launchctl bootstrap returns 5 ("Input/
+    output error") for several distinct conditions including
+    "actually succeeded" and "actually failed". The authoritative
+    check is the verify query (`launchctl print system/<label>` on
+    macOS, `systemctl is-active <unit>` on Linux). This exception
+    distinguishes "tried, verified, definitely failed" from any
+    other failure mode so the caller in `_cmd_apply` can decide
+    whether to swallow (apply already failed; don't mask the
+    original) or propagate (apply succeeded; the install has not
+    produced a working system).
+    """
+
+
 # Files and directories to copy from source to the install location.
 # Excludes __pycache__, .pyc, and other build artifacts.
 _SOURCE_EXCLUDES = {"__pycache__", "*.pyc", "*.egg-info", ".git", ".venv", ".env"}
@@ -2502,52 +2537,99 @@ def _stop_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
 
 def _start_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
     """
-    Start the Kai service after applying changes.
+    Start the Kai service after applying changes and verify it actually
+    registered.
 
-    Best-effort: uses check=False since launchctl/systemctl may report
-    warnings that aren't actually failures (e.g., service already running).
+    The platform start commands (`launchctl bootstrap` on macOS,
+    `systemctl start` on Linux) do not always report failures
+    reliably via exit code. launchctl bootstrap is the worst
+    offender: it returns exit code 5 ("Input/output error") for
+    several distinct conditions including "actually succeeded" and
+    "actually failed". The previous implementation trusted that
+    exit code, which let installs report a passing warning while
+    the daemon was actually unregistered, leaving the operator
+    with a silently broken bot.
 
-    On macOS, launchctl bootstrap can fail transiently after a bootout
-    if launchd hasn't fully released the service domain (common with
-    KeepAlive daemons). We retry once after a brief delay to handle this.
+    The bootstrap/start exit code is now treated as advisory; the
+    authoritative check is the post-condition verify query
+    (`launchctl print system/<label>` on macOS, `systemctl
+    is-active <unit>` on Linux). The cycle is retried up to
+    _SERVICE_START_MAX_ATTEMPTS times with a brief settle delay
+    after each start and a longer retry delay between attempts to
+    absorb transient launchd-domain-not-yet-released windows.
 
     Args:
         platform: "darwin" or "linux".
         dry_run: If True, print the command without executing.
+
+    Raises:
+        ServiceStartError: The verify query confirmed the service
+            is not registered after every attempt in the retry
+            budget. The caller in `_cmd_apply` decides whether to
+            propagate (apply succeeded; the install has not produced
+            a working system) or swallow (apply already failed; do
+            not mask the original exception).
     """
     if platform == "darwin":
         plist_path = Path("/Library/LaunchDaemons") / f"{_LAUNCHD_LABEL}.plist"
-        cmd = ["launchctl", "bootstrap", "system", str(plist_path)]
+        start_cmd = ["launchctl", "bootstrap", "system", str(plist_path)]
+        verify_cmd = ["launchctl", "print", f"system/{_LAUNCHD_LABEL}"]
     elif platform == "linux":
-        cmd = ["systemctl", "start", "kai"]
+        start_cmd = ["systemctl", "start", "kai"]
+        verify_cmd = ["systemctl", "is-active", "kai"]
     else:
         print(f"  Warning: cannot start service on platform '{platform}'")
         return
 
     if dry_run:
-        print(f"[DRY RUN] Would run: {' '.join(cmd)}")
+        print(f"[DRY RUN] Would run: {' '.join(start_cmd)}")
         return
 
-    result = subprocess.run(cmd, check=False, capture_output=True)
-    if result.returncode == 0:
-        print(f"  Started service ({' '.join(cmd[:2])})")
-        return
-
-    # On macOS, bootstrap can fail transiently after bootout.
-    # Wait briefly for launchd to finish tearing down, then retry.
-    if platform == "darwin":
-        stderr_msg = result.stderr.decode().strip()
-        print(f"  Bootstrap failed ({stderr_msg or 'unknown'}), retrying...")
-        time.sleep(2)
-        result = subprocess.run(cmd, check=False, capture_output=True)
-        if result.returncode == 0:
-            print(f"  Started service ({' '.join(cmd[:2])})")
+    last_start_stderr = ""
+    last_verify_stderr = ""
+    for attempt in range(1, _SERVICE_START_MAX_ATTEMPTS + 1):
+        # Exit code from the start command is advisory only. The
+        # authoritative check is the verify query below.
+        start = subprocess.run(start_cmd, check=False, capture_output=True)
+        # Brief settle window so the service manager finishes its
+        # internal bookkeeping before we query state.
+        time.sleep(_SERVICE_START_SETTLE_SECONDS)
+        verify = subprocess.run(verify_cmd, check=False, capture_output=True)
+        if verify.returncode == 0:
+            print(f"  Started service ({' '.join(start_cmd[:2])})")
             return
+        # Verify failed. Capture both stderrs for the retry hint and
+        # the eventual exhaustion error. Guard with `or b""` so a
+        # CompletedProcess with stderr=None (only reachable via test
+        # mocks; production capture_output=True always populates the
+        # field) does not raise AttributeError mid-error-handling.
+        last_start_stderr = (start.stderr or b"").decode().strip()
+        last_verify_stderr = (verify.stderr or b"").decode().strip()
+        if attempt < _SERVICE_START_MAX_ATTEMPTS:
+            # Hint at the cause when available; an empty start stderr
+            # under a verify-failure is itself diagnostic (the start
+            # command exited cleanly but the daemon still is not
+            # registered, which is exactly the launchctl bootstrap
+            # exit-code-5-but-actually-failed pattern).
+            hint = last_start_stderr or "start command exited cleanly but verify did not confirm registration"
+            print(
+                f"  Service not yet registered after attempt {attempt}/{_SERVICE_START_MAX_ATTEMPTS} "
+                f"({hint}); retrying in {_SERVICE_START_RETRY_SECONDS}s..."
+            )
+            time.sleep(_SERVICE_START_RETRY_SECONDS)
 
-    # Show the actual error so the user knows what went wrong
-    stderr_text = result.stderr.decode().strip()
-    hint = f": {stderr_text}" if stderr_text else ""
-    print(f"  Warning: service start failed ({' '.join(cmd[:2])}){hint}")
+    # Retry budget exhausted. Surface both the start stderr and the
+    # verify stderr so the operator sees the authoritative failure
+    # state rather than only the unreliable start exit code.
+    detail = (
+        f"verify command ({' '.join(verify_cmd)}) reported the service is not registered "
+        f"after {_SERVICE_START_MAX_ATTEMPTS} attempts"
+    )
+    if last_verify_stderr:
+        detail += f"; verify stderr: {last_verify_stderr}"
+    if last_start_stderr:
+        detail += f"; last start stderr: {last_start_stderr}"
+    raise ServiceStartError(detail)
 
 
 def _apply_migrate(
@@ -3376,7 +3458,15 @@ def _cmd_apply() -> None:
         # -- Step 9: Generate service definition --
         webhook_port = int(env.get("WEBHOOK_PORT", "8080"))
         _apply_service(install_dir, data_dir, service_user, platform, dry_run, webhook_port)
+        # Apply path completed without an exception. Setting the flag
+        # at the bottom of the try block (rather than relying on a
+        # missed except below) keeps the apply_succeeded state local
+        # and unambiguous: True iff every step above ran cleanly. The
+        # finally block reads it to decide how to handle a service
+        # start failure.
+        apply_succeeded = True
     except Exception:
+        apply_succeeded = False
         print("\nInstallation failed. See error above.")
         print("The installation may be in a partial state.")
         print("Fix the issue and re-run: sudo python -m kai install apply")
@@ -3385,17 +3475,42 @@ def _cmd_apply() -> None:
         # Always restart the service, even after failure. A partially updated
         # installation is better than an offline bot. Most steps are idempotent,
         # so re-running apply after fixing the cause will complete the update.
-        # Wrapped in its own try/except so a start failure does not mask the
-        # original exception (Python replaces the propagating exception if
-        # finally raises).
         try:
             _start_service(platform, dry_run)
-        except Exception:
-            print("WARNING: Failed to restart service after apply.")
+        except ServiceStartError as e:
+            # Verify confirmed the service is not registered after the
+            # retry budget. Two paths:
+            #
+            # - apply already failed: emit a recovery hint and SWALLOW
+            #   the start error. Python replaces the propagating
+            #   exception if the finally block raises, and the original
+            #   apply failure is the more important one to surface.
+            #
+            # - apply succeeded: re-raise. Without this propagation
+            #   the install would print "Installed" and exit 0 with
+            #   the daemon unregistered, which is the originating
+            #   silent-failure mode this rewrite closes.
+            print(f"ERROR: service failed to start after apply: {e}")
             if platform == "darwin":
-                print("Manually restart with: sudo launchctl kickstart system/com.syrinx.kai")
+                print("Manual recovery: sudo launchctl kickstart system/com.syrinx.kai")
+                print("Then verify: sudo launchctl print system/com.syrinx.kai")
             else:
-                print("Manually restart with: sudo systemctl start kai")
+                print("Manual recovery: sudo systemctl start kai")
+                print("Then verify: systemctl is-active kai")
+            if apply_succeeded:
+                raise
+        except Exception:
+            # Any other exception from _start_service is an unexpected
+            # bug, not the verified-failure path. Same masking rule:
+            # propagate only when apply succeeded, so a pre-existing
+            # apply failure is not hidden.
+            print("ERROR: unexpected failure while starting service.")
+            if platform == "darwin":
+                print("Manual recovery: sudo launchctl kickstart system/com.syrinx.kai")
+            else:
+                print("Manual recovery: sudo systemctl start kai")
+            if apply_succeeded:
+                raise
 
     # -- Summary --
     print()
