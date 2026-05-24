@@ -110,7 +110,24 @@ log = logging.getLogger(__name__)
 # not seen. Schema unchanged; the bump lets post-rollout log analysis
 # distinguish facts produced under the positive-criterion prompt from
 # earlier exclusion-list iterations.
-_EXTRACTION_PROMPT_VERSION: str = "9"
+# v10 (2026-05-24): loosened the EPISODE CLASSIFICATION block to admit
+# technical-debugging arcs with implicit resolution framing.
+# Criterion 1 now accepts "expressed or evident" closure instead of
+# strictly "stated", so a diagnosis-plus-fix exchange without a
+# ceremonial "Lesson:" or "Decided:" wrap-up still classifies as an
+# episode when the situation it closes is durable. Criterion 3 allows
+# the closure quote to be the resolution itself (e.g. "test now
+# passes after the await swap") rather than requiring closure-shaped
+# framing. The EPISODE DURABILITY TEST became EPISODE QUALITY TEST,
+# asking whether the diagnostic or reasoning arc is worth recalling,
+# not just whether the artifact is durable. IGNORE rules unchanged.
+# The bias-to-false sentence is replaced with a calibrated
+# trade-off note that names the false-negative cost (a missed
+# debugging arc) against the false-positive cost (one extra
+# subprocess; stage-2 validation catches workflow-shape goals).
+# Schema unchanged; the bump lets post-rollout log analysis partition
+# episodes classified under the looser criteria from earlier ones.
+_EXTRACTION_PROMPT_VERSION: str = "10"
 
 # Sibling of _EXTRACTION_PROMPT_VERSION for stage-2 episode generation.
 # Stored in each episode's metadata so future cleanups can target a
@@ -500,17 +517,23 @@ turn of an episode. PRIOR CONTEXT shows the lead-up; it is background,
 NEVER the unit being classified.
 
 Set `has_episode: true` ONLY when ALL of the following hold:
-1. The CURRENT exchange contains a stated decision, lesson, outcome,
-   or resolution AT THE LEVEL OF A DURABLE SITUATION (an architectural
-   choice, an empirical finding, a design tradeoff resolved). Closure
-   must be visible in the current turn itself. A workflow-loop closure
-   (a review-round verdict, an evaluation result, a routine artifact
-   filed) is NOT a durable situation; see the EPISODE IGNORE list
-   below.
+1. The CURRENT exchange resolves a durable situation: a decision
+   between alternatives, an architectural choice, an empirical
+   finding, a design tradeoff settled, or a debugging arc closed by
+   a concrete fix. The resolution can be expressed implicitly
+   ("root cause was X; replaced Y with Z; the test now passes",
+   "moved from package A to B because of ordering guarantees") or
+   explicitly ("Lesson:", "Decided:", "Net:"). Ceremonial framing
+   is NOT required. A workflow-loop closure (a review-round
+   verdict, an evaluation result, a routine artifact filed) is
+   NOT a durable situation; see the EPISODE IGNORE list below.
 2. The PRIOR CONTEXT (if non-empty) sets up that closure: a problem,
    a question, a deliberation, an incident in progress.
 3. You can quote a fragment from the CURRENT exchange (not from
-   prior turns) that signals the closure.
+   prior turns) that conveys the closure. The fragment can be the
+   resolution itself (the named root cause, the fix that was
+   applied, the choice that was made); it does not have to be a
+   ceremonial wrap-up sentence.
 
 Set `has_episode: false` when:
 - The current exchange is itself a question, a request, an analytical
@@ -544,18 +567,31 @@ these match the CURRENT exchange, has_episode is false):
   The lesson belongs to a methodology document if it belongs
   anywhere; it is not a per-situation episode.
 
-EPISODE DURABILITY TEST:
+EPISODE QUALITY TEST:
 
 Before setting has_episode: true, ask: "would a future session
-benefit from retrieving this situation, or only from the artifact
-it produced?" If the answer is "only the artifact", set
-has_episode: false. The artifact (issue, PR, spec, commit, wiki
-page) is durable on its own; an episode about the act of producing
-it is not.
+benefit from recalling how this situation was diagnosed or
+resolved, not just the resulting artifact?" Technical-debugging
+arcs almost always pass this test: the artifact is the code
+change, but the diagnosis path (the hypothesis ruled out, the cue
+that pointed to the root cause, the fix shape) is what a future
+session needs to recall when a similar symptom recurs.
+Architectural choices and design tradeoffs pass too: the artifact
+is the decision, but the reasoning behind it is what a future
+session needs when revisiting the tradeoff.
 
-When in doubt, prefer false. The cost of a false negative is one
-missed episode; the cost of a false positive is a hallucinated
-episode entering the memory store.
+Set has_episode: false only when the situation has no diagnostic
+or reasoning content worth re-deriving and the artifact alone
+captures everything useful. Routine workflow transactions and
+workflow-loop closures fall into that artifact-only bucket; the
+EPISODE IGNORE rules above are the canonical list.
+
+Trade-off: a missed debugging arc is a real loss because the
+diagnostic content is exactly what re-derivation needs. A false
+positive costs one stage-2 subprocess and is caught downstream by
+the workflow-shape validator on the generated goal. When the
+diagnostic arc is concrete and the resolution is visible in the
+current exchange, prefer true even when the framing is implicit.
 
 CONSOLIDATION:
 You will sometimes receive an EXISTING FACTS block before the USER/ASSISTANT
@@ -1159,10 +1195,9 @@ _RULE_6_REJECTIONS = _Counter()
 #
 # Defense-in-depth backstop on the stage-2 episode generator output.
 # Stage-1 classifier (`_EXTRACTION_SYSTEM_PROMPT`'s EPISODE
-# CLASSIFICATION block under v7) is the primary gate; this regex
-# rejects workflow-event-shape episodes whose `goal` starts with the
-# canonical verbs that named ~57% of the 2026-04-30 production episode
-# snapshot. The arms catch the leading-verb shape; the noun
+# CLASSIFICATION block) is the primary gate; this regex rejects
+# workflow-event-shape episodes whose `goal` starts with the canonical
+# verbs that named ~57% of the 2026-04-30 production episode snapshot. The arms catch the leading-verb shape; the noun
 # alternation is a single union list rather than a per-verb split
 # because the verb itself is the workflow signal and a per-verb noun
 # split would only narrow false positives that are already rare.
@@ -2199,7 +2234,7 @@ async def _generate_episode(
                 # episodes before they reach add_structured. The
                 # backstop catches the canonical `Evaluate spec`,
                 # `Approve PR`, `File issue`, `Push wiki` shapes that
-                # the v7 EPISODE IGNORE list aims to suppress at the
+                # the EPISODE IGNORE list aims to suppress at the
                 # prompt level. The reject path counts the rejection
                 # per-user-per-arm (when applicable) and emits a
                 # `validate_rejected` outcome on the memory.episode

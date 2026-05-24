@@ -64,16 +64,17 @@ def test_ignore_block_removed():
     )
 
 
-def test_durability_test_appears_once():
-    """DURABILITY TEST: now appears only on the episode side.
+def test_durability_test_removed():
+    """DURABILITY TEST: no longer appears anywhere in the prompt.
 
-    The fact-side DURABILITY TEST is gone; the episode-side
-    `EPISODE DURABILITY TEST:` (which contains DURABILITY TEST: as a
-    substring) remains. `count == 1` is the formulation that survives
-    the substring-containment trap a `not in` assertion would fall
-    into. Documented in the spec's M-1 v2 review fix.
+    The fact-side DURABILITY TEST was replaced by QUALITY TEST in the
+    fact-side revision; the episode-side EPISODE DURABILITY TEST was
+    replaced by EPISODE QUALITY TEST in the episode-side revision.
+    Asserting absence (count == 0) guards both removals; a future
+    edit re-introducing the legacy header on either side fails this
+    test before the stale wording reaches production.
     """
-    assert _EXTRACTION_SYSTEM_PROMPT.count("DURABILITY TEST:") == 1
+    assert _EXTRACTION_SYSTEM_PROMPT.count("DURABILITY TEST") == 0
 
 
 def test_store_block_does_not_reference_durability_test():
@@ -109,7 +110,7 @@ def test_store_block_does_not_reference_durability_test():
 
 def test_prompt_version_bumped():
     """Version stamp matches the prompt revision."""
-    assert _EXTRACTION_PROMPT_VERSION == "9"
+    assert _EXTRACTION_PROMPT_VERSION == "10"
 
 
 def test_no_em_or_en_dashes_in_quality_test_block():

@@ -2610,7 +2610,7 @@ class TestExtractionPromptSoftVocab:
     def test_extraction_prompt_version_bumped(self):
         """The version stamp on every fact's metadata; bumped
         whenever the schema or prompt changes meaningfully."""
-        assert _EXTRACTION_PROMPT_VERSION == "9"
+        assert _EXTRACTION_PROMPT_VERSION == "10"
 
     def test_extraction_prompt_version_history_extended(self):
         """The prompt-version history comment block (the sequence
@@ -2946,11 +2946,11 @@ class TestValidateFactsRule4b:
 
 
 class TestEpisodeClassificationIgnoreList:
-    """The v7 EPISODE CLASSIFICATION block adds three IGNORE bullets
+    """The EPISODE CLASSIFICATION block carries three IGNORE bullets
     (workflow-loop iterations, routine workflow transactions, process
-    meta-lessons) plus an EPISODE DURABILITY TEST gate. These tests
-    pin the prompt-side wording in source so a future edit cannot
-    silently drop any of the four sections (issue #428)."""
+    meta-lessons) plus an EPISODE QUALITY TEST gate. These tests pin
+    the prompt-side wording in source so a future edit cannot silently
+    drop any of the four sections."""
 
     def test_workflow_loop_iterations_bullet_present(self):
         """The first IGNORE bullet calls out review-round verdicts and
@@ -2968,19 +2968,17 @@ class TestEpisodeClassificationIgnoreList:
         outcome is a generalization about how a workflow runs."""
         assert "Process meta-lessons: situations whose only outcome" in _EXTRACTION_SYSTEM_PROMPT
 
-    def test_episode_durability_test_present(self):
-        """The episode-scoped DURABILITY TEST asks "would a future
-        session benefit from retrieving this situation, or only from
-        the artifact it produced?". Both the section header and the
-        load-bearing artifact-vs-situation phrase are pinned so a
-        future edit cannot silently drop either. The pinned answer
-        phrase `"only the artifact"` (with quotes) is the unique
-        single-line fragment of the gate's verdict clause; the
-        question phrasing wraps across lines and is not pinned
-        directly."""
-        assert "EPISODE DURABILITY TEST:" in _EXTRACTION_SYSTEM_PROMPT
-        assert "would a future session" in _EXTRACTION_SYSTEM_PROMPT
-        assert '"only the artifact"' in _EXTRACTION_SYSTEM_PROMPT
+    def test_episode_quality_test_present(self):
+        """The episode-scoped QUALITY TEST asks whether the diagnostic
+        or reasoning arc is worth recalling, not just whether the
+        artifact is durable. The section header and the load-bearing
+        "diagnostic content" phrase are pinned so a future edit cannot
+        silently drop either; the trade-off note that names the
+        missed-debugging-arc cost is also pinned because the
+        positive-criterion shape depends on it."""
+        assert "EPISODE QUALITY TEST:" in _EXTRACTION_SYSTEM_PROMPT
+        assert "no diagnostic" in _EXTRACTION_SYSTEM_PROMPT
+        assert "missed debugging arc" in _EXTRACTION_SYSTEM_PROMPT
 
 
 class TestValidateEpisodeWorkflowRegex:
