@@ -941,6 +941,51 @@ class TestResolveHomeWorkspace:
         assert result == tmp_path / "home" / "anon"
         assert result.is_dir()
 
+    def test_notification_only_chat_id_does_not_create_directory(self, tmp_path):
+        """
+        The originating-issue bug: a chat_id that has no users.yaml
+        entry (a GitHub notification group chat, a deploy broadcast
+        room) used to trigger ensure_user_home and silently mkdir
+        an empty `home/<chat_id>/` directory on first contact. The
+        directory then lingered indefinitely.
+
+        With the notification-only check, the path is returned
+        verbatim but the directory is NOT created. Downstream
+        callers that try to use the path will fail naturally,
+        which is the right behavior for a chat_id without an
+        interactive session.
+
+        Pinning both halves of the contract: path computed
+        deterministically AND directory absence.
+        """
+        config = self._config(
+            user_configs={42: UserConfig(telegram_id=42, name="real-user")},
+        )
+        notify_chat = -5241088228
+
+        result = resolve_home_workspace(notify_chat, config, data_dir=tmp_path)
+
+        assert result == tmp_path / "home" / str(notify_chat)
+        assert not result.exists(), "notification-only chat_id must not auto-provision a home directory"
+
+    def test_single_user_mode_preserves_legacy_provisioning(self, tmp_path):
+        """
+        When users.yaml is empty or absent (config.user_configs is
+        falsy), there is no basis for discriminating interactive vs
+        notification chat_ids. Every chat_id is treated as
+        interactive and the directory is provisioned as before.
+
+        Pinning this case prevents an over-eager future tightening
+        of the notification check from breaking single-user dev /
+        test installations that have always used the legacy
+        permissive behavior.
+        """
+        config = self._config()  # user_configs=None
+        result = resolve_home_workspace(99999, config, data_dir=tmp_path)
+
+        assert result == tmp_path / "home" / "99999"
+        assert result.is_dir(), "single-user mode must continue to auto-provision the home dir"
+
 
 # ── Test prepend_to_prompt ──────────────────────────────────────────
 

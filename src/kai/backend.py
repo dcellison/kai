@@ -721,6 +721,41 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
     return path
 
 
+def _is_notification_only_chat_id(chat_id: int | None, config: Config) -> bool:
+    """
+    True iff this chat_id has no interactive user entry in users.yaml.
+
+    A chat_id is "notification-only" when it appears in the running
+    system (a github_notify_chat_id field on another user's config, or
+    an /api/send-message target, or any chat that received a
+    notification and is therefore in allowed_user_ids) but is NOT the
+    primary telegram_id key of any user entry. Examples: a GitHub
+    notification group chat, a deploy-status broadcast channel, a
+    review-summary destination room.
+
+    Returns False (treat as interactive) for:
+    - chat_id is None: test / health-check / anon paths; preserved by
+      the existing ensure_user_home(None, ...) -> data_dir/home/anon
+      contract.
+    - config.user_configs is empty or None: legacy single-user mode
+      with no users.yaml. There is no basis for discriminating;
+      every chat_id is interactive by default. Same permissive
+      behavior the codebase had before the multi-user split.
+
+    Returns True (skip auto-provisioning) when users.yaml is in use
+    AND this chat_id is not a key in user_configs. The contract on
+    True: the caller must NOT create a per-user directory for this
+    chat_id. The chat_id remains valid for outbound notification
+    sending (it lives in allowed_user_ids); only the home-workspace
+    provisioning is suppressed.
+    """
+    if chat_id is None:
+        return False
+    if not config.user_configs:
+        return False
+    return chat_id not in config.user_configs
+
+
 def resolve_home_workspace(
     chat_id: int | None,
     config: Config,
@@ -732,7 +767,12 @@ def resolve_home_workspace(
     Resolution order:
     1. `user.home_workspace` from users.yaml when set (admin override,
        returned as-is with no second-guessing).
-    2. `<data_dir>/home/<chat_id>/`, auto-created via ensure_user_home().
+    2. `<data_dir>/home/<chat_id>/`, auto-created via ensure_user_home()
+       for interactive users. For notification-only chat_ids (a chat
+       that received a routed notification but has no users.yaml
+       entry of its own) the path is returned without bootstrapping,
+       so the bot does not silently provision an empty home directory
+       for a chat that will never have an interactive session.
 
     All call sites (pool.py session init / get_workspace fallback,
     bot.py `/workspace home` handler and workspace listings) MUST go
@@ -765,13 +805,28 @@ def resolve_home_workspace(
     if user and user.home_workspace:
         return user.home_workspace
 
-    # No users.yaml override: use the per-user Kai-managed directory
-    # under data_dir. Resolve DATA_DIR from the module here (not as a
-    # default arg value) so monkeypatching `kai.backend.DATA_DIR` in
-    # tests still flows through. ensure_user_home is idempotent so
-    # calling it on every resolution is cheap.
     if data_dir is None:
         data_dir = DATA_DIR
+
+    # Notification-only chat_ids must not auto-provision a home
+    # directory. The chat_id is real enough to receive outbound
+    # notifications (it was added to allowed_user_ids at config-load
+    # time), but it has no interactive user entry in users.yaml. The
+    # previous unconditional ensure_user_home call mkdir'd an empty
+    # `home/<chat_id>/` on first contact - either a stray inbound
+    # message from the notification chat (a human in the GitHub
+    # notification group typing in the room) or a code path that
+    # resolves the workspace eagerly. The empty directory then
+    # lingered indefinitely, requiring manual cleanup. Returning
+    # the path without bootstrapping leaves the downstream caller
+    # to fail naturally on a missing directory, which is the right
+    # behavior for a chat_id without an interactive session.
+    if _is_notification_only_chat_id(chat_id, config):
+        return data_dir / "home" / str(chat_id)
+
+    # Interactive user: use the per-user Kai-managed directory under
+    # data_dir. ensure_user_home is idempotent so calling it on every
+    # resolution is cheap.
     return ensure_user_home(chat_id, data_dir)
 
 
