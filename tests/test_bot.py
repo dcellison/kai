@@ -734,6 +734,43 @@ class TestHandleHelp:
         assert "/new" in reply
         assert "/workspace" in reply
 
+    @pytest.mark.asyncio
+    async def test_help_text_matches_current_command_surface(self):
+        """Pin each line that drifted from the actual handler surface
+        in the past so a future drift fails this test before reaching
+        an operator. The corrected forms come from the runtime
+        handlers and the canonical _HELP_TEXT in memory_command.py."""
+        update = _make_update()
+        ctx = _make_context()
+        await handle_help(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+
+        # /github notify accepts <chat_id|reset>, not [on|off]. The
+        # [on|off] shape belongs to /github reviews and /github triage;
+        # confusing them sent operators down the wrong path when
+        # routing notifications.
+        assert "/github notify <chat_id|reset>" in reply
+        assert "/github notify [on|off]" not in reply
+
+        # /memory browses facts and episodes; the tag-browse axis was
+        # retired when the dashboard was redesigned as Facts/Episodes/
+        # Stats. Tags survive only as decoration on individual rows.
+        assert "Browse remembered facts and episodes" in reply
+        assert "Browse remembered facts by tag" not in reply
+
+        # /memory forget <tag> as a command-line subcommand was
+        # retired; the forget button still exists inside the
+        # dashboard but the slash-command form is gone.
+        assert "/memory forget" not in reply
+
+        # /voice toggles between "off" and "only" (voice-only), not
+        # "off" and "on". The "on" form requires an explicit
+        # /voice on. The /voice off command is real (handle_voice
+        # accepts it as one of the explicit-mode args) and now listed.
+        assert "/voice - Toggle voice off / voice-only" in reply
+        assert "/voice off" in reply
+        assert "/voice - Toggle voice on/off" not in reply
+
 
 class TestHandleUnknownCommand:
     @pytest.mark.asyncio
