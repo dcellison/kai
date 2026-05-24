@@ -1342,16 +1342,16 @@ class TestRecallLogging:
             )
 
     async def test_memory_recall_log_snippet_and_query_truncated_and_sanitized(self, caplog):
-        """Both the query field and per-hit snippets honor the 80-char
-        truncation cap and rewrite \\n and \\r into single spaces. The
-        eval harness treats snippets as fingerprints and parses log
-        lines as single-line JSON; either escape leaking through
-        breaks both contracts at once."""
+        """The query field honors the 256-char cap and per-hit snippets
+        honor the 80-char cap. Both rewrite \\n and \\r into single
+        spaces. The eval harness reproduces the search input from the
+        query field and treats snippets as fingerprints; either
+        escape leaking through breaks the single-line JSON contract."""
         import kai.memory as mem_mod
         from kai.memory import format_context
 
         # Long memory text that contains both \n and \r. The text is
-        # well over 80 chars so truncation is exercised.
+        # well over 80 chars so snippet truncation is exercised.
         long_text = "Line one of stored memory\nLine two with newline\rAnd a CR plus more padding text " * 5
         mock_mem = MagicMock()
         mock_mem.search.return_value = {
@@ -1368,26 +1368,84 @@ class TestRecallLogging:
         mem_mod._memory = mock_mem
         mem_mod._config = _make_config(memory_token_budget=2000)
 
-        # Query also contains both escapes and exceeds 80 chars so the
-        # query-field path is exercised on the same call.
-        long_query = "what do I prefer for editing\nplus a newline\rand carriage return then a long tail" * 3
+        # Query also contains both escapes and exceeds 256 chars so
+        # the query-field truncation path is exercised on the same
+        # call.
+        long_query = "what do I prefer for editing\nplus a newline\rand carriage return then a long tail" * 6
 
         with caplog.at_level(logging.INFO, logger="kai.memory"):
             await format_context(long_query, user_id="7")
 
         payload = _parse_recall_log(caplog)
 
-        # Query field must be capped and free of newlines / CRs.
-        assert len(payload["query"]) <= 80
+        # Query field must be capped at 256 (the wider cap that
+        # supports eval-harness reproducibility) and free of escapes.
+        assert len(payload["query"]) <= 256
         assert "\n" not in payload["query"]
         assert "\r" not in payload["query"]
 
-        # Every snippet must be capped and free of newlines / CRs.
+        # Every snippet must be capped at 80 (the narrower
+        # fingerprint cap) and free of escapes.
         assert payload["hits"], "expected at least one hit"
         for hit in payload["hits"]:
             assert len(hit["snippet"]) <= 80
             assert "\n" not in hit["snippet"]
             assert "\r" not in hit["snippet"]
+
+    @pytest.mark.asyncio
+    async def test_memory_recall_log_preserves_medium_query_for_eval_harness(self, caplog):
+        """The originating-issue use case: an eval harness reads the
+        recall log to reproduce the search input. A typical user
+        message in the 80-256 char range used to truncate to 80,
+        forcing the harness to join against chat-history JSONL by
+        timestamp. With the query cap raised to 256, the harness
+        can reproduce the input directly from the log.
+
+        Pins the contract: a ~170-char query lands in the log at
+        full length (well below 256, well above the old 80 cap).
+        Regression for the same observability gap the issue is
+        closing."""
+        import kai.memory as mem_mod
+        from kai.memory import format_context
+
+        mock_mem = MagicMock()
+        mock_mem.search.return_value = {
+            "results": [
+                {
+                    "id": "fact-1",
+                    "memory": "stored fact",
+                    "score": 0.9,
+                    "metadata": {"type": "fact", "source": "extracted"},
+                    "created_at": "2026-04-01T00:00:00",
+                }
+            ]
+        }
+        mem_mod._memory = mock_mem
+        mem_mod._config = _make_config(memory_token_budget=2000)
+
+        # 200-char query: representative of a typical user turn that
+        # describes context plus a request. Above the old 80 cap so
+        # the previous behavior would have lost the bulk of it;
+        # below the new 256 cap so the full text survives.
+        query = (
+            "what do I prefer for editing when working on long-form prose "
+            "as opposed to code, particularly around line wrapping and "
+            "whether to break at semantic units or fixed widths"
+        )
+        assert 80 < len(query) <= 256, "test fixture must sit in the gap the new cap covers"
+
+        with caplog.at_level(logging.INFO, logger="kai.memory"):
+            await format_context(query, user_id="7")
+
+        payload = _parse_recall_log(caplog)
+
+        # Full query reaches the log; an eval harness can reproduce
+        # the search input without joining against chat-history.
+        assert payload["query"] == query
+        # query_len carries the actual length regardless; sanity
+        # check that the two stay in agreement on a query that
+        # fits under the cap.
+        assert payload["query_len"] == len(query)
 
 
 class TestGetAll:

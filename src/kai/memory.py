@@ -476,14 +476,25 @@ def _estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
-# Maximum characters of query and per-hit snippet to embed in the
-# memory.recall log line. 80 is enough to fingerprint a hit for an
-# eval harness (which treats the snippet as an identifier, not as
-# full retrieved text) while keeping the log line within a single
-# terminal width and avoiding the ingestion of multi-paragraph user
-# messages verbatim. Single source of truth so query and snippet
-# stay in lockstep.
-_RECALL_TRUNC = 80
+# Maximum characters of the query field to embed in the memory.recall
+# log line. The full query reaches the semantic search; this cap
+# applies only to the log copy. 256 covers the common single-message
+# user turn so an eval harness can reproduce the search input from
+# logs alone without joining against chat-history JSONL by timestamp.
+# Queries longer than 256 chars still hit the fallback path (the eval
+# harness reads the full text from chat history); the cap exists to
+# bound multi-paragraph paste cases that would otherwise inflate
+# every recall log line.
+_RECALL_QUERY_TRUNC = 256
+
+# Maximum characters of each per-hit snippet in the memory.recall log
+# line. 80 is enough to fingerprint a hit for an eval harness, which
+# treats the snippet as an identifier rather than full retrieved
+# text. The snippet cap stays narrower than the query cap because a
+# single recall returns up to MEMORY_K hits; raising both together
+# would multiply the log-line length by the hit count for a use case
+# (full hit-text recovery) that the eval harness does not need.
+_RECALL_SNIPPET_TRUNC = 80
 
 
 def _truncate(s: str, n: int) -> str:
@@ -543,7 +554,7 @@ def _base_recall_payload(user_id: str, query: str) -> dict[str, object]:
     return {
         "user_id": user_id,
         "query_len": len(query),
-        "query": _truncate(query, _RECALL_TRUNC),
+        "query": _truncate(query, _RECALL_QUERY_TRUNC),
         "fetch_limit": 0,
         "hits_raw": 0,
         "hits_after_floor": 0,
@@ -973,7 +984,7 @@ async def format_context(
             "confidence": confidence,
             "score": round(r.score, 4),
             "adj": round(r.score * w, 4),
-            "snippet": _truncate(r.text, _RECALL_TRUNC),
+            "snippet": _truncate(r.text, _RECALL_SNIPPET_TRUNC),
         }
         for r, w, speaker, confidence in weighted
     ]
