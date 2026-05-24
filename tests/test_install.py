@@ -2635,6 +2635,40 @@ class TestCmdApply:
         out = capsys.readouterr().out
         assert "Manual recovery" in out
 
+    def test_apply_swallows_service_start_error_when_apply_raised_systemexit(self, monkeypatch, tmp_path):
+        """SystemExit is a BaseException, not an Exception, so it
+        bypasses the apply try block's `except Exception` handler.
+        An earlier implementation only initialized apply_succeeded
+        inside the try body or the except clause; a SystemExit apply
+        failure (`_apply_venv` Python-version gate, missing Goose
+        template, visudo validation failure) left apply_succeeded
+        unbound, and the finally block then raised UnboundLocalError,
+        replacing the actionable apply failure with an internal
+        control-flow error.
+
+        Pre-initializing apply_succeeded = False before the try
+        block is the fix. This test patches an apply step to raise
+        SystemExit and asserts the SystemExit propagates intact, not
+        UnboundLocalError, even when _start_service also raises.
+        Regression for the same failure class the rest of the PR
+        is closing."""
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        monkeypatch.setenv("DRY_RUN", "1")
+
+        def fake_apply_secrets(env, dry_run):
+            raise SystemExit("simulated apply SystemExit (e.g. venv version gate)")
+
+        def fake_start(platform, dry_run, **kw):
+            raise ServiceStartError("would otherwise replace the SystemExit")
+
+        monkeypatch.setattr("kai.install._apply_secrets", fake_apply_secrets)
+        monkeypatch.setattr("kai.install._start_service", fake_start)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", self._minimal_install_conf(tmp_path))
+
+        with pytest.raises(SystemExit) as excinfo:
+            _cmd_apply()
+        assert "simulated apply SystemExit" in str(excinfo.value)
+
     def test_apply_swallows_service_start_error_when_apply_failed(self, monkeypatch, tmp_path, capsys):
         """The mask-prevention contract: when an apply step has
         already raised, a subsequent _start_service failure must NOT

@@ -3373,6 +3373,18 @@ def _cmd_apply() -> None:
     # -- Stop service before making changes --
     _stop_service(platform, dry_run)
 
+    # apply_succeeded is initialized BEFORE the try block so the
+    # finally handler can always read it. Several apply-time
+    # failures raise SystemExit (a BaseException, not an Exception)
+    # rather than going through the `except Exception` handler;
+    # without the pre-initialization, those paths would propagate
+    # SystemExit out of the try, the finally would read
+    # apply_succeeded, and Python would raise UnboundLocalError -
+    # replacing the actionable apply failure with an internal
+    # control-flow error. The default value of False is correct
+    # because the flag flips True only after the last apply step
+    # returns cleanly.
+    apply_succeeded = False
     try:
         # -- Step 1: Create directories --
         # Resolve WORKSPACE_BASE, expanding ~ relative to the service user's home
@@ -3458,15 +3470,14 @@ def _cmd_apply() -> None:
         # -- Step 9: Generate service definition --
         webhook_port = int(env.get("WEBHOOK_PORT", "8080"))
         _apply_service(install_dir, data_dir, service_user, platform, dry_run, webhook_port)
-        # Apply path completed without an exception. Setting the flag
-        # at the bottom of the try block (rather than relying on a
-        # missed except below) keeps the apply_succeeded state local
-        # and unambiguous: True iff every step above ran cleanly. The
+        # Apply path completed without exception. Flipping the flag
+        # at the bottom of the try block (rather than in the
+        # except branch) keeps the apply_succeeded state local and
+        # unambiguous: True iff every step above ran cleanly. The
         # finally block reads it to decide how to handle a service
         # start failure.
         apply_succeeded = True
     except Exception:
-        apply_succeeded = False
         print("\nInstallation failed. See error above.")
         print("The installation may be in a partial state.")
         print("Fix the issue and re-run: sudo python -m kai install apply")
