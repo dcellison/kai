@@ -130,7 +130,17 @@ log = logging.getLogger(__name__)
 # updates.
 # Schema unchanged; the bump lets post-rollout log analysis partition
 # episodes classified under the looser criteria from earlier ones.
-_EXTRACTION_PROMPT_VERSION: str = "10"
+# v11 (2026-05-24): added a fifth QUALITY TEST negative worked
+# example covering user-announced completed workflow actions (PR
+# merges, deploys, builds, rollbacks). The four prior negatives
+# covered assistant-spoken approvals, future intent, in-progress
+# task state, and assistant self-report; none of them named the
+# user-announced completed-status shape that the codex extractor
+# was storing at a 100% rate on the merge-PR probe while the claude
+# extractor classified the same probe correctly. Schema unchanged;
+# the bump lets post-rollout log analysis partition facts produced
+# after the merge-PR negative landed from those produced before it.
+_EXTRACTION_PROMPT_VERSION: str = "11"
 
 # Sibling of _EXTRACTION_PROMPT_VERSION for stage-2 episode generation.
 # Stored in each episode's metadata so future cleanups can target a
@@ -450,6 +460,16 @@ Worked examples (emit / do not emit):
   or the world.
 - User says "I'm writing the spec now." -> do not emit. In-progress
   task state; loses meaning once the spec is shipped.
+- User says "Just merged PR #501 finally." -> do not emit. The user
+  announced a completed workflow action; the merge event is
+  workflow status that loses recall value within hours. The
+  artifact (the closed PR, the merged commit) is its own durable
+  record. The same logic applies to deployment-status announcements
+  ("deploy is up", "the build passed", "rolled back the X change").
+  Do not store these as confirmed_action facts either; the
+  confirmed_action machinery exists to prevent laundered assistant
+  claims, not to authorize storing every user-announced workflow
+  event.
 
 If a candidate fact passes this test, proceed to STORE-block
 classification (above). If it fails, return an empty facts list

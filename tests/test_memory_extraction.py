@@ -2610,7 +2610,7 @@ class TestExtractionPromptSoftVocab:
     def test_extraction_prompt_version_bumped(self):
         """The version stamp on every fact's metadata; bumped
         whenever the schema or prompt changes meaningfully."""
-        assert _EXTRACTION_PROMPT_VERSION == "10"
+        assert _EXTRACTION_PROMPT_VERSION == "11"
 
     def test_extraction_prompt_version_history_extended(self):
         """The prompt-version history comment block (the sequence
@@ -2620,9 +2620,9 @@ class TestExtractionPromptSoftVocab:
         fragments so a future unrelated edit that introduces a `vN:`
         token elsewhere cannot satisfy this test vacuously.
 
-        v5 through v10 fragments are pinned: each prior entry stays
+        v5 through v11 fragments are pinned: each prior entry stays
         in source unchanged across the next bump. The latest entry
-        (v10) gets its own date + phrase pin so the version-history
+        (v11) gets its own date + phrase pin so the version-history
         discipline keeps protecting the freshest revision."""
         from pathlib import Path
 
@@ -2645,9 +2645,15 @@ class TestExtractionPromptSoftVocab:
         # v10 entry: episode-side loosening for implicit-framing
         # technical-debugging arcs. Pinning the literal date plus the
         # distinguishing phrase keeps the history-discipline rule
-        # honest at the current head of the version sequence.
+        # honest at the prior head of the version sequence.
         assert "v10 (2026-05-24)" in src
         assert "implicit resolution framing" in src
+        # v11 entry: PR-merge / deploy-status negative worked
+        # example added to the QUALITY TEST. Pinning the literal
+        # date plus the distinguishing phrase keeps the rule honest
+        # at the current head of the version sequence.
+        assert "v11 (2026-05-24)" in src
+        assert "user-announced completed workflow actions" in src
 
 
 class TestRule6WorkflowEventRegex:

@@ -113,7 +113,7 @@ def test_store_block_does_not_reference_durability_test():
 
 def test_prompt_version_bumped():
     """Version stamp matches the prompt revision."""
-    assert _EXTRACTION_PROMPT_VERSION == "10"
+    assert _EXTRACTION_PROMPT_VERSION == "11"
 
 
 def test_no_em_or_en_dashes_in_quality_test_block():
@@ -156,15 +156,15 @@ def test_positive_worked_examples_present():
 
 
 def test_negative_worked_examples_present():
-    """The four negative (do-not-emit) worked examples are in the block.
+    """The five negative (do-not-emit) worked examples are in the block.
 
-    Same pinning rationale as the positive set. The four negatives
-    cover the four classes the prior IGNORE list targeted: workflow-
-    event metadata, decision-to-do, assistant self-report, and
-    in-progress task state ("ephemeral state"). PR #467 review (W-2)
-    added the ephemeral-state example to reconcile the spec prose
-    that named four classes against the original block which only
-    carried three.
+    Same pinning rationale as the positive set. The five negatives
+    cover assistant-spoken approvals, future intent, assistant
+    self-report, in-progress task state, and user-announced completed
+    workflow actions (PR merges, deploys, builds). The merge-PR
+    example was added because the codex backend was storing the
+    user-announced completed-status shape that none of the prior
+    four negatives named.
     """
     block = _extract_quality_test_block()
     for snippet in (
@@ -172,5 +172,6 @@ def test_negative_worked_examples_present():
         '"Let\'s file an issue about X."',
         '"I\'m extracting facts now"',
         '"I\'m writing the spec now."',
+        '"Just merged PR #501 finally."',
     ):
         assert snippet in block, f"negative worked example missing: {snippet}"
