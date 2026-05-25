@@ -4008,3 +4008,433 @@ class TestAddStructured:
 
         assert result is None
         assert "add_structured failed" in caplog.text
+
+
+class TestResolveMemoryScope:
+    """Read-time scope interpretation for memory rows.
+
+    The resolver gives downstream callers a single place to interpret
+    the five scope fields (`scope`, `project_id`, `workspace_root`,
+    `scope_confidence`, `scope_source`) for rows that may or may not
+    have them. Three branches: missing scope (legacy), invalid scope
+    (corrupted), and valid stored scope.
+
+    These tests pin the legacy-safe defaults so a future refactor
+    cannot quietly reclassify legacy rows or merge the legacy and
+    invalid branches together. The two branches use distinct
+    `scope_source` values precisely so audit queries can tell the two
+    populations apart.
+    """
+
+    def test_defaults_missing_metadata_to_legacy_global(self):
+        """A row written before scope existed has no `scope` key. The
+        resolver returns global with `legacy_default` provenance and
+        full confidence (the row was a deliberate pre-scope write)."""
+        from kai.memory import (
+            SCOPE_GLOBAL,
+            SCOPE_SOURCE_LEGACY_DEFAULT,
+            resolve_memory_scope,
+        )
+
+        resolved = resolve_memory_scope({"source": "extracted", "type": "fact"})
+
+        assert resolved.scope == SCOPE_GLOBAL
+        assert resolved.project_id is None
+        assert resolved.workspace_root is None
+        assert resolved.scope_confidence == 1.0
+        assert resolved.scope_source == SCOPE_SOURCE_LEGACY_DEFAULT
+        assert resolved.legacy_defaulted is True
+        assert resolved.invalid_defaulted is False
+
+    def test_defaults_invalid_scope_to_invalid_global(self):
+        """A row carrying an unknown `scope` value is corrupted, not
+        legacy. The resolver still returns global so retrieval keeps
+        working, but uses `invalid_default` provenance and zero
+        confidence so audit queries can find these rows separately
+        from genuine legacy rows."""
+        from kai.memory import (
+            SCOPE_GLOBAL,
+            SCOPE_SOURCE_INVALID_DEFAULT,
+            resolve_memory_scope,
+        )
+
+        resolved = resolve_memory_scope({"scope": "garbage", "project_id": "kai"})
+
+        assert resolved.scope == SCOPE_GLOBAL
+        assert resolved.project_id is None
+        assert resolved.workspace_root is None
+        assert resolved.scope_confidence == 0.0
+        assert resolved.scope_source == SCOPE_SOURCE_INVALID_DEFAULT
+        assert resolved.legacy_defaulted is False
+        assert resolved.invalid_defaulted is True
+
+    def test_preserves_complete_global_scope(self):
+        """A row written with a complete global scope round-trips
+        through the resolver unchanged. Neither default flag is set."""
+        from kai.memory import (
+            SCOPE_GLOBAL,
+            SCOPE_SOURCE_OPERATOR,
+            resolve_memory_scope,
+        )
+
+        resolved = resolve_memory_scope(
+            {
+                "scope": SCOPE_GLOBAL,
+                "project_id": None,
+                "workspace_root": None,
+                "scope_confidence": 1.0,
+                "scope_source": SCOPE_SOURCE_OPERATOR,
+            }
+        )
+
+        assert resolved.scope == SCOPE_GLOBAL
+        assert resolved.project_id is None
+        assert resolved.workspace_root is None
+        assert resolved.scope_confidence == 1.0
+        assert resolved.scope_source == SCOPE_SOURCE_OPERATOR
+        assert resolved.legacy_defaulted is False
+        assert resolved.invalid_defaulted is False
+
+    def test_preserves_complete_project_scope(self):
+        """A row written with a complete project scope round-trips
+        through the resolver unchanged. The project_id and
+        workspace_root pass through; both default flags stay False."""
+        from kai.memory import (
+            SCOPE_PROJECT,
+            SCOPE_SOURCE_CLASSIFIER,
+            resolve_memory_scope,
+        )
+
+        resolved = resolve_memory_scope(
+            {
+                "scope": SCOPE_PROJECT,
+                "project_id": "kai",
+                "workspace_root": "/Users/kai/Projects/kai",
+                "scope_confidence": 0.92,
+                "scope_source": SCOPE_SOURCE_CLASSIFIER,
+            }
+        )
+
+        assert resolved.scope == SCOPE_PROJECT
+        assert resolved.project_id == "kai"
+        assert resolved.workspace_root == "/Users/kai/Projects/kai"
+        assert resolved.scope_confidence == 0.92
+        assert resolved.scope_source == SCOPE_SOURCE_CLASSIFIER
+        assert resolved.legacy_defaulted is False
+        assert resolved.invalid_defaulted is False
+
+    def test_preserves_complete_task_scope(self):
+        """Task scope is structurally valid and round-trips even though
+        no retrieval semantics consume it yet. The resolver preserves
+        the value so a future task-aware retrieval path can act on it
+        without a separate migration."""
+        from kai.memory import (
+            SCOPE_SOURCE_OPERATOR,
+            SCOPE_TASK,
+            resolve_memory_scope,
+        )
+
+        resolved = resolve_memory_scope(
+            {
+                "scope": SCOPE_TASK,
+                "project_id": "kai",
+                "workspace_root": "/Users/kai/Projects/kai",
+                "scope_confidence": 0.7,
+                "scope_source": SCOPE_SOURCE_OPERATOR,
+            }
+        )
+
+        assert resolved.scope == SCOPE_TASK
+        assert resolved.project_id == "kai"
+        assert resolved.workspace_root == "/Users/kai/Projects/kai"
+        assert resolved.scope_confidence == 0.7
+        assert resolved.scope_source == SCOPE_SOURCE_OPERATOR
+        assert resolved.legacy_defaulted is False
+        assert resolved.invalid_defaulted is False
+
+    def test_normalizes_global_project_fields(self):
+        """A global row that carries stray `project_id` or
+        `workspace_root` (a malformed write) gets normalized to None
+        for both. Downstream callers can rely on the invariant that
+        `scope=global` implies both are None, without re-checking the
+        scope value."""
+        from kai.memory import (
+            SCOPE_GLOBAL,
+            SCOPE_SOURCE_OPERATOR,
+            resolve_memory_scope,
+        )
+
+        resolved = resolve_memory_scope(
+            {
+                "scope": SCOPE_GLOBAL,
+                "project_id": "stray-leftover",
+                "workspace_root": "/some/path",
+                "scope_confidence": 1.0,
+                "scope_source": SCOPE_SOURCE_OPERATOR,
+            }
+        )
+
+        assert resolved.scope == SCOPE_GLOBAL
+        assert resolved.project_id is None
+        assert resolved.workspace_root is None
+        assert resolved.scope_source == SCOPE_SOURCE_OPERATOR
+
+
+class TestWrapResultScopePreservation:
+    """`_wrap_result` is the read-path entry point; it must stay free of
+    scope-aware behavior so legacy rows do not get auto-classified at
+    read time. The single test below pins that the wrapper neither
+    injects default scope keys nor mutates the upstream metadata dict.
+
+    The invariant matters because a row that picked up phantom scope
+    keys at read time would look deliberately classified the next time
+    something inspected its metadata, defeating the audit boundary
+    between legacy and operator/classifier writes.
+    """
+
+    def test_does_not_inject_scope_keys(self):
+        """A legacy raw row has no scope fields. Wrapping it must
+        produce a MemoryResult whose metadata still has no scope
+        fields; the upstream dict must not be mutated either."""
+        from kai.memory import _wrap_result
+
+        raw = {
+            "id": "row-1",
+            "memory": "operator likes terse responses",
+            "score": 0.42,
+            "metadata": {"source": "extracted", "type": "fact"},
+            "created_at": "2026-05-25T00:00:00Z",
+            "updated_at": "2026-05-25T00:00:00Z",
+        }
+        original_metadata_snapshot = dict(raw["metadata"])
+
+        result = _wrap_result(raw)
+
+        # No scope key injected anywhere.
+        for scope_key in (
+            "scope",
+            "project_id",
+            "workspace_root",
+            "scope_confidence",
+            "scope_source",
+        ):
+            assert scope_key not in result.metadata
+            assert scope_key not in raw["metadata"]
+
+        # Upstream metadata dict matches the snapshot taken before the
+        # wrap call; the wrapper did not mutate it.
+        assert raw["metadata"] == original_metadata_snapshot
+
+
+class TestBuildScopeMetadata:
+    """Write-time scope-metadata builder. Centralizes field assembly so
+    extraction, operator tools, and future classifier code cannot
+    diverge on field names or silently ship invalid values.
+
+    All validation is fail-fast: out-of-range or unknown values raise
+    `ValueError` rather than silently clamping or substituting. The
+    rejection tests pin that no write path can mint a row that the
+    resolver would have to interpret as legacy or invalid.
+    """
+
+    def test_rejects_unknown_scope(self):
+        """An unknown scope value is a programmer bug; reject loudly
+        so the caller learns at write time rather than at read time."""
+        from kai.memory import SCOPE_SOURCE_OPERATOR, build_scope_metadata
+
+        with pytest.raises(ValueError, match="scope must be one of"):
+            build_scope_metadata(scope="garbage", scope_source=SCOPE_SOURCE_OPERATOR)
+
+    def test_rejects_invalid_confidence(self):
+        """Confidence outside [0.0, 1.0] indicates a classifier bug.
+        Reject rather than clamp so the bug surfaces at the write
+        boundary instead of producing rows whose confidence does not
+        match what the classifier intended."""
+        from kai.memory import (
+            SCOPE_GLOBAL,
+            SCOPE_SOURCE_CLASSIFIER,
+            build_scope_metadata,
+        )
+
+        for bad_confidence in (-0.1, 1.5, 2.0):
+            with pytest.raises(ValueError, match="scope_confidence must be in"):
+                build_scope_metadata(
+                    scope=SCOPE_GLOBAL,
+                    scope_source=SCOPE_SOURCE_CLASSIFIER,
+                    scope_confidence=bad_confidence,
+                )
+
+    def test_rejects_legacy_default_source(self):
+        """`legacy_default` is a resolver-only output for rows that
+        predate scope. No write path should ever mint such a row: a
+        new write is by definition not legacy. Builder rejects."""
+        from kai.memory import (
+            SCOPE_GLOBAL,
+            SCOPE_SOURCE_LEGACY_DEFAULT,
+            build_scope_metadata,
+        )
+
+        with pytest.raises(ValueError, match="scope_source must be one of"):
+            build_scope_metadata(
+                scope=SCOPE_GLOBAL,
+                scope_source=SCOPE_SOURCE_LEGACY_DEFAULT,
+            )
+
+    def test_rejects_invalid_default_source(self):
+        """`invalid_default` is the resolver's output for corrupted
+        rows. As with `legacy_default`, the builder rejects it so the
+        write boundary cannot reproduce a state that only the resolver
+        is supposed to construct."""
+        from kai.memory import (
+            SCOPE_GLOBAL,
+            SCOPE_SOURCE_INVALID_DEFAULT,
+            build_scope_metadata,
+        )
+
+        with pytest.raises(ValueError, match="scope_source must be one of"):
+            build_scope_metadata(
+                scope=SCOPE_GLOBAL,
+                scope_source=SCOPE_SOURCE_INVALID_DEFAULT,
+            )
+
+    def test_requires_project_id_for_project_scope(self):
+        """Project-scoped rows must carry a matching `project_id`; the
+        design doc treats this as the invariant that downstream
+        filtering relies on. Builder enforces at write time so no
+        project-scoped row without an id can be created through the
+        sanctioned path. Repair tooling that needs to construct
+        anomalous rows can bypass the builder."""
+        from kai.memory import (
+            SCOPE_PROJECT,
+            SCOPE_SOURCE_OPERATOR,
+            build_scope_metadata,
+        )
+
+        for empty in (None, ""):
+            with pytest.raises(ValueError, match="project scope requires"):
+                build_scope_metadata(
+                    scope=SCOPE_PROJECT,
+                    scope_source=SCOPE_SOURCE_OPERATOR,
+                    project_id=empty,
+                )
+
+
+class TestScopeMetadataPersistence:
+    """End-to-end pins for scope metadata flowing through the write
+    surfaces that exist today: `add_structured` for new rows and
+    `update_metadata` for in-place edits. These tests demonstrate the
+    caller patterns later issues will rely on, and pin them so a
+    future refactor cannot quietly drop scope fields on the way to
+    Mem0.
+    """
+
+    def test_add_structured_preserves_scope_metadata(self):
+        """`add_structured` already copies caller metadata before
+        overwriting the reserved `type` and `tags` keys. Scope fields
+        supplied through `build_scope_metadata` must reach Mem0
+        unchanged, while `type` and `tags` still get set from the
+        explicit arguments."""
+        import kai.memory as mem_mod
+        from kai.memory import (
+            SCOPE_GLOBAL,
+            SCOPE_SOURCE_OPERATOR,
+            add_structured,
+            build_scope_metadata,
+        )
+
+        mock_mem = MagicMock()
+        mock_mem.add.return_value = {"results": [{"id": "abc", "memory": "test"}]}
+        mem_mod._memory = mock_mem
+
+        scope_metadata = build_scope_metadata(
+            scope=SCOPE_GLOBAL,
+            scope_source=SCOPE_SOURCE_OPERATOR,
+        )
+
+        add_structured(
+            "operator prefers terse responses",
+            user_id="123",
+            memory_type="fact",
+            tags=["style"],
+            metadata=scope_metadata,
+        )
+
+        passed_metadata = mock_mem.add.call_args.kwargs["metadata"]
+        # All five scope keys reach Mem0 unchanged.
+        assert passed_metadata["scope"] == SCOPE_GLOBAL
+        assert passed_metadata["project_id"] is None
+        assert passed_metadata["workspace_root"] is None
+        assert passed_metadata["scope_confidence"] == 1.0
+        assert passed_metadata["scope_source"] == SCOPE_SOURCE_OPERATOR
+        # Reserved keys still come from the explicit arguments.
+        assert passed_metadata["type"] == "fact"
+        assert passed_metadata["tags"] == ["style"]
+
+    def test_scope_metadata_survives_caller_merged_update(self):
+        """`update_metadata` is replace-all by design. A caller that
+        wants to change one scope field without losing the others
+        (and without losing `source`, `tags`, etc.) must read the
+        existing metadata, merge the new scope fields, and pass the
+        full merged dict. This test demonstrates the pattern and pins
+        that the wrapper forwards the merged dict literally so no
+        scope field is dropped on the way to Mem0.
+
+        The complementary anti-pattern (passing only the changed
+        scope key, which would silently drop everything else) is
+        already pinned by `test_sparse_metadata_passes_through_unchanged`
+        on the wrapper."""
+        import kai.memory as mem_mod
+        from kai.memory import (
+            SCOPE_PROJECT,
+            SCOPE_SOURCE_CLASSIFIER,
+            SCOPE_SOURCE_OPERATOR,
+            update_metadata,
+        )
+
+        existing_metadata = {
+            "source": "extracted",
+            "type": "fact",
+            "tags": ["semantic-memory"],
+            "confidence": 0.9,
+            "scope": SCOPE_PROJECT,
+            "project_id": "kai",
+            "workspace_root": "/Users/kai/Projects/kai",
+            "scope_confidence": 0.7,
+            "scope_source": SCOPE_SOURCE_CLASSIFIER,
+        }
+        mock_mem = MagicMock()
+        mock_mem.get.return_value = {
+            "id": "abc",
+            "user_id": "123",
+            "metadata": existing_metadata,
+        }
+        mem_mod._memory = mock_mem
+
+        # Caller pattern: read existing, merge new scope fields, write
+        # back the full dict. Here the operator is upgrading the
+        # provenance from classifier to operator and raising confidence
+        # to 1.0; everything else must survive.
+        merged = dict(existing_metadata)
+        merged["scope_source"] = SCOPE_SOURCE_OPERATOR
+        merged["scope_confidence"] = 1.0
+
+        result = update_metadata(
+            user_id="123",
+            memory_id="abc",
+            data="fact text",
+            metadata=merged,
+        )
+        assert result is True
+
+        passed_metadata = mock_mem.update.call_args.kwargs["metadata"]
+        # All scope fields preserved (only the two intentionally
+        # changed values differ).
+        assert passed_metadata["scope"] == SCOPE_PROJECT
+        assert passed_metadata["project_id"] == "kai"
+        assert passed_metadata["workspace_root"] == "/Users/kai/Projects/kai"
+        assert passed_metadata["scope_confidence"] == 1.0
+        assert passed_metadata["scope_source"] == SCOPE_SOURCE_OPERATOR
+        # Non-scope fields also preserved by the merge.
+        assert passed_metadata["source"] == "extracted"
+        assert passed_metadata["tags"] == ["semantic-memory"]
+        assert passed_metadata["confidence"] == 0.9

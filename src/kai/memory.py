@@ -324,6 +324,104 @@ _DELETE_PAGE_SIZE = 10_000
 USER_VISIBLE_SOURCES: frozenset[str] = frozenset({"extracted", "episode", "migration"})
 
 
+# ── Scope metadata: schema for scoped global/project memory ──────────
+#
+# Adds scope fields (`scope`, `project_id`, `workspace_root`,
+# `scope_confidence`, `scope_source`) to memory metadata without
+# changing retrieval behavior. The keys live inside the existing
+# Mem0 metadata dict and are not promoted to MemoryResult fields,
+# because retrieval, prompt rendering, and write routing all still
+# operate on the legacy unscoped shape until later issues land
+# filter-before-rank, separate prompt sections, and write-scope
+# classification.
+#
+# Two read-time helpers (`ResolvedMemoryScope` and
+# `resolve_memory_scope()`, defined after _wrap_result below) give
+# downstream callers one place to interpret these fields safely for
+# rows that may or may not have them. `_wrap_result()` deliberately
+# does not call the resolver: read-time defaults are compatibility
+# behavior, not a migration, and mutating the visible metadata dict
+# would make legacy rows look deliberately classified when they
+# were not.
+#
+# `source` and `scope_source` are different provenance axes. `source`
+# describes where the memory content came from ("extracted",
+# "episode", "migration"). `scope_source` describes how the scope
+# assignment was chosen ("legacy_default", "invalid_default",
+# "classifier", "operator", "extraction_default"). Do not overload
+# `source` to infer scope; migration rows can be global or project
+# in the future, and so can extracted rows.
+
+SCOPE_GLOBAL = "global"
+SCOPE_PROJECT = "project"
+SCOPE_TASK = "task"
+
+# Frozenset of valid scope values used by the resolver and builder.
+# A row whose stored `scope` is outside this set is treated as
+# invalid-defaulted (not legacy-defaulted) so the audit boundary
+# between "row predates scope" and "row has corrupted scope" stays
+# visible to later reclassification passes.
+_VALID_SCOPES: frozenset[str] = frozenset({SCOPE_GLOBAL, SCOPE_PROJECT, SCOPE_TASK})
+
+# `legacy_default` and `invalid_default` are read-time resolver
+# outputs only; `build_scope_metadata` rejects them so no write path
+# can mint a legacy-shaped or invalid-shaped row.
+SCOPE_SOURCE_LEGACY_DEFAULT = "legacy_default"
+SCOPE_SOURCE_INVALID_DEFAULT = "invalid_default"
+SCOPE_SOURCE_CLASSIFIER = "classifier"
+SCOPE_SOURCE_OPERATOR = "operator"
+SCOPE_SOURCE_EXTRACTION_DEFAULT = "extraction_default"
+
+# Only write-path scope_source values are accepted by
+# `build_scope_metadata`. The two resolver-only values are excluded.
+_BUILDER_SCOPE_SOURCES: frozenset[str] = frozenset(
+    {
+        SCOPE_SOURCE_CLASSIFIER,
+        SCOPE_SOURCE_OPERATOR,
+        SCOPE_SOURCE_EXTRACTION_DEFAULT,
+    }
+)
+
+
+@dataclass(frozen=True)
+class ResolvedMemoryScope:
+    """
+    Read-time interpretation of a memory row's scope metadata.
+
+    Returned by `resolve_memory_scope()`. The flags
+    `legacy_defaulted` and `invalid_defaulted` are mutually
+    exclusive by construction (only one of the three resolver
+    branches sets each); both False means the stored `scope` field
+    was present and valid.
+
+    Attributes:
+        scope: One of "global", "project", or "task".
+        project_id: Project identifier for project-scoped rows;
+            None for global rows or for project rows missing an id
+            (the resolver does not guess).
+        workspace_root: Absolute workspace path associated with the
+            scope when known; None for global rows.
+        scope_confidence: Stored confidence for valid rows; 1.0 for
+            legacy-default (pre-scope deliberate write), 0.0 for
+            invalid-default (corrupted scope value).
+        scope_source: How the scope assignment was chosen. See
+            SCOPE_SOURCE_* constants.
+        legacy_defaulted: True if the row had no `scope` field and
+            was defaulted to global by the resolver.
+        invalid_defaulted: True if the row had a `scope` field with
+            an unknown value and was defaulted to global by the
+            resolver.
+    """
+
+    scope: str
+    project_id: str | None
+    workspace_root: str | None
+    scope_confidence: float
+    scope_source: str
+    legacy_defaulted: bool
+    invalid_defaulted: bool
+
+
 @dataclass(frozen=True)
 class MemoryResult:
     """A single memory from search or retrieval."""
@@ -469,6 +567,174 @@ def _wrap_result(raw: dict) -> MemoryResult:
         created_at=raw.get("created_at", ""),
         updated_at=raw.get("updated_at", ""),
     )
+
+
+def resolve_memory_scope(metadata: dict[str, Any] | None) -> ResolvedMemoryScope:
+    """
+    Interpret scope metadata for a memory row, with legacy-safe defaults.
+
+    Three resolution branches:
+    1. Legacy row (no `scope` key): default to global with
+       `scope_source="legacy_default"` and `scope_confidence=1.0`.
+       The high confidence reflects that the row was a deliberate
+       pre-scope write; the audit boundary for later reclassification
+       is the `scope_source` value, not the confidence.
+    2. Corrupted row (`scope` key present but not in `_VALID_SCOPES`):
+       default to global with `scope_source="invalid_default"` and
+       `scope_confidence=0.0`. Distinct from legacy so audit queries
+       can tell the two populations apart.
+    3. Valid row (`scope` key present and recognized): return the
+       stored values. Global rows have their `project_id` and
+       `workspace_root` normalized to None even if a bad row carries
+       stray values. Project rows missing `project_id` keep their
+       project scope with a None id; later retrieval filtering is
+       responsible for excluding them when project matching is
+       required.
+
+    Args:
+        metadata: The memory row's full metadata dict (typically
+            `MemoryResult.metadata`), or None for callers that may
+            pass a missing dict.
+
+    Returns:
+        A frozen `ResolvedMemoryScope`. The underlying metadata dict
+        is not mutated.
+    """
+    md = metadata or {}
+    raw_scope = md.get("scope")
+
+    # Branch 1: legacy row with no scope field.
+    if raw_scope is None:
+        return ResolvedMemoryScope(
+            scope=SCOPE_GLOBAL,
+            project_id=None,
+            workspace_root=None,
+            scope_confidence=1.0,
+            scope_source=SCOPE_SOURCE_LEGACY_DEFAULT,
+            legacy_defaulted=True,
+            invalid_defaulted=False,
+        )
+
+    # Branch 2: scope field present but unknown value.
+    if raw_scope not in _VALID_SCOPES:
+        return ResolvedMemoryScope(
+            scope=SCOPE_GLOBAL,
+            project_id=None,
+            workspace_root=None,
+            scope_confidence=0.0,
+            scope_source=SCOPE_SOURCE_INVALID_DEFAULT,
+            legacy_defaulted=False,
+            invalid_defaulted=True,
+        )
+
+    # Branch 3: valid stored scope. Pull the optional fields with
+    # safe defaults so callers do not have to repeat .get() chains.
+    # Defaulting `scope_source` to legacy_default here covers the
+    # case where a row was hand-written with `scope` but no
+    # provenance; future write paths always go through
+    # `build_scope_metadata` and will set an explicit source.
+    project_id = md.get("project_id")
+    workspace_root = md.get("workspace_root")
+    scope_confidence = md.get("scope_confidence", 1.0)
+    scope_source = md.get("scope_source", SCOPE_SOURCE_LEGACY_DEFAULT)
+
+    # Global rows should never carry project_id or workspace_root.
+    # Normalize so downstream callers can rely on the invariant
+    # without re-checking the scope value.
+    if raw_scope == SCOPE_GLOBAL:
+        project_id = None
+        workspace_root = None
+
+    return ResolvedMemoryScope(
+        scope=raw_scope,
+        project_id=project_id,
+        workspace_root=workspace_root,
+        scope_confidence=scope_confidence,
+        scope_source=scope_source,
+        legacy_defaulted=False,
+        invalid_defaulted=False,
+    )
+
+
+def build_scope_metadata(
+    *,
+    scope: str,
+    project_id: str | None = None,
+    workspace_root: str | None = None,
+    scope_confidence: float = 1.0,
+    scope_source: str,
+) -> dict[str, Any]:
+    """
+    Build a scope-metadata dict for a new memory write.
+
+    Centralizes scope-field assembly so extraction, operator tools,
+    and future classifier code cannot diverge on field names or
+    silently ship invalid values. Returns a plain dict that the
+    caller merges with other metadata before passing to
+    `add_structured()` or `update_metadata()`.
+
+    Validation rules (all raise `ValueError` on violation):
+    - `scope` must be one of `global`, `project`, or `task`.
+    - `scope_source` must be one of `operator`, `classifier`, or
+      `extraction_default`. The resolver-only values
+      `legacy_default` and `invalid_default` are rejected so no
+      write path can mint a legacy- or invalid-shaped row.
+    - `scope_confidence` must lie in [0.0, 1.0]; out-of-range values
+      raise rather than clamp so classifier bugs are visible.
+    - Global scope discards any caller-supplied `project_id` and
+      `workspace_root` so the write shape matches the resolver's
+      read-time invariant.
+    - Project scope requires a non-empty `project_id`. Repair
+      tooling that needs to construct anomalous rows can bypass
+      this builder and rely on `resolve_memory_scope()` at read
+      time.
+
+    Args:
+        scope: Scope value (global/project/task).
+        project_id: Required for project scope; ignored for global;
+            optional for task.
+        workspace_root: Optional absolute workspace path; ignored
+            for global.
+        scope_confidence: Confidence in the scope assignment, in
+            [0.0, 1.0]. Defaults to 1.0 (confident write).
+        scope_source: How the scope assignment was chosen.
+
+    Returns:
+        A dict containing the five canonical scope keys, ready to
+        be merged into a memory row's metadata.
+
+    Raises:
+        ValueError: If any validation rule fails. The message names
+            the offending field so callers can fix the input.
+    """
+    if scope not in _VALID_SCOPES:
+        raise ValueError(f"build_scope_metadata: scope must be one of {sorted(_VALID_SCOPES)}, got {scope!r}")
+    if scope_source not in _BUILDER_SCOPE_SOURCES:
+        raise ValueError(
+            "build_scope_metadata: scope_source must be one of "
+            f"{sorted(_BUILDER_SCOPE_SOURCES)}, got {scope_source!r} "
+            "(legacy_default and invalid_default are resolver-only)"
+        )
+    if not (0.0 <= scope_confidence <= 1.0):
+        raise ValueError(f"build_scope_metadata: scope_confidence must be in [0.0, 1.0], got {scope_confidence!r}")
+
+    # Global scope discards stray project/workspace values so the
+    # write shape matches the resolver's read-time invariant. Project
+    # scope requires a non-empty id; task scope allows None because
+    # task rows that belong to no detected project are valid.
+    if scope == SCOPE_GLOBAL:
+        project_id = None
+        workspace_root = None
+    elif scope == SCOPE_PROJECT and not project_id:
+        raise ValueError("build_scope_metadata: project scope requires a non-empty project_id")
+
+    return {
+        "scope": scope,
+        "project_id": project_id,
+        "workspace_root": workspace_root,
+        "scope_confidence": scope_confidence,
+        "scope_source": scope_source,
+    }
 
 
 def _estimate_tokens(text: str) -> int:
@@ -1649,13 +1915,18 @@ def update_metadata(*, user_id: str, memory_id: str, data: str, metadata: dict[s
     absent in new), `actor_id` (always), `role` (when absent in new).
     Every other field on the existing row (e.g. `source`, `confidence`,
     `prompt_version`, `confirmation_quote`, `tags`, `outcome_quality`,
-    `approach`, `outcome`, `lessons`, `actors`) is DESTROYED unless the
-    caller passes it explicitly. Callers that want to change only
-    specific fields must read the existing row first, modify those
-    fields on the existing metadata dict, and pass the merged dict to
-    this wrapper. Failure to follow this pattern silently erases
-    metadata that may matter for downstream reads (UI rendering,
-    extractor consolidation gates, etc.).
+    `approach`, `outcome`, `lessons`, `actors`, and the scope fields
+    `scope`, `project_id`, `workspace_root`, `scope_confidence`,
+    `scope_source`) is DESTROYED unless the caller passes it
+    explicitly. Callers that want to change only specific fields must
+    read the existing row first, modify those fields on the existing
+    metadata dict, and pass the merged dict to this wrapper. Failure
+    to follow this pattern silently erases metadata that may matter
+    for downstream reads (UI rendering, extractor consolidation gates,
+    scope interpretation, etc.). Scope loss is especially quiet
+    because a row that loses its scope fields falls back to legacy-
+    global interpretation through `resolve_memory_scope()` instead of
+    raising.
 
     Mem0's `update` requires the row's text content (`data`) and
     recomputes the embedding regardless. Callers that want to change
