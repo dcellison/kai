@@ -390,12 +390,16 @@ class ResolvedMemoryScope:
 
     Returned by `resolve_memory_scope()`. The flags
     `legacy_defaulted` and `invalid_defaulted` are mutually
-    exclusive by construction (only one of the three resolver
-    branches sets each); both False means the stored `scope` field
-    was present and valid.
+    exclusive by construction; both False means the stored `scope`
+    field was present and valid AND the stored `scope_source` was a
+    recognized write-path value.
 
     Attributes:
-        scope: One of "global", "project", or "task".
+        scope: One of "global", "project", or "task". Preserved from
+            the stored row when the scope value is recognized; forced
+            to "global" only when the row predates scope metadata
+            (legacy_defaulted) or carries a scope value outside the
+            valid set (invalid_defaulted).
         project_id: Project identifier for project-scoped rows;
             None for global rows or for project rows missing an id
             (the resolver does not guess).
@@ -408,9 +412,10 @@ class ResolvedMemoryScope:
             SCOPE_SOURCE_* constants.
         legacy_defaulted: True if the row had no `scope` field and
             was defaulted to global by the resolver.
-        invalid_defaulted: True if the row had a `scope` field with
-            an unknown value and was defaulted to global by the
-            resolver.
+        invalid_defaulted: True if the row was malformed - either a
+            `scope` field with an unknown value (collapsed to global)
+            or a valid `scope` with a missing or unrecognized
+            `scope_source` (scope preserved, provenance flagged).
     """
 
     scope: str
@@ -583,13 +588,24 @@ def resolve_memory_scope(metadata: dict[str, Any] | None) -> ResolvedMemoryScope
        default to global with `scope_source="invalid_default"` and
        `scope_confidence=0.0`. Distinct from legacy so audit queries
        can tell the two populations apart.
-    3. Valid row (`scope` key present and recognized): return the
+    3. Valid scope with valid provenance (`scope` key present and
+       recognized, `scope_source` in the write-path set): return the
        stored values. Global rows have their `project_id` and
        `workspace_root` normalized to None even if a bad row carries
        stray values. Project rows missing `project_id` keep their
        project scope with a None id; later retrieval filtering is
        responsible for excluding them when project matching is
        required.
+    4. Valid scope with missing or unrecognized `scope_source`:
+       preserve the stored scope, project_id, workspace_root, and
+       scope_confidence (operator intent is meaningful), but tag the
+       row `scope_source="invalid_default"` and
+       `invalid_defaulted=True`. `legacy_default` is reserved for
+       rows with no `scope` key at all; a row that carries scope but
+       no provenance was either written by a code path that bypassed
+       `build_scope_metadata` or written before scope_source was
+       required, so the audit boundary lumps it in with corrupted
+       rows rather than genuine legacy rows.
 
     Args:
         metadata: The memory row's full metadata dict (typically
@@ -627,16 +643,12 @@ def resolve_memory_scope(metadata: dict[str, Any] | None) -> ResolvedMemoryScope
             invalid_defaulted=True,
         )
 
-    # Branch 3: valid stored scope. Pull the optional fields with
+    # Branch 3 / 4: valid stored scope. Pull the optional fields with
     # safe defaults so callers do not have to repeat .get() chains.
-    # Defaulting `scope_source` to legacy_default here covers the
-    # case where a row was hand-written with `scope` but no
-    # provenance; future write paths always go through
-    # `build_scope_metadata` and will set an explicit source.
     project_id = md.get("project_id")
     workspace_root = md.get("workspace_root")
     scope_confidence = md.get("scope_confidence", 1.0)
-    scope_source = md.get("scope_source", SCOPE_SOURCE_LEGACY_DEFAULT)
+    raw_scope_source = md.get("scope_source")
 
     # Global rows should never carry project_id or workspace_root.
     # Normalize so downstream callers can rely on the invariant
@@ -645,12 +657,34 @@ def resolve_memory_scope(metadata: dict[str, Any] | None) -> ResolvedMemoryScope
         project_id = None
         workspace_root = None
 
+    # Branch 4: valid scope but missing or unrecognized provenance.
+    # `legacy_default` is reserved for rows with no `scope` key at
+    # all (branch 1); a row that carries scope but no provenance is
+    # malformed, not legacy. Preserve the stored scope so operator
+    # intent is not lost, but flag invalid_defaulted=True so audit
+    # queries can find the row. The accepted provenance set is the
+    # builder's write-path set: the two resolver-only values
+    # (legacy_default, invalid_default) appearing in stored metadata
+    # indicate a write path bypassed `build_scope_metadata` and are
+    # treated as malformed.
+    if raw_scope_source not in _BUILDER_SCOPE_SOURCES:
+        return ResolvedMemoryScope(
+            scope=raw_scope,
+            project_id=project_id,
+            workspace_root=workspace_root,
+            scope_confidence=scope_confidence,
+            scope_source=SCOPE_SOURCE_INVALID_DEFAULT,
+            legacy_defaulted=False,
+            invalid_defaulted=True,
+        )
+
+    # Branch 3: valid scope with recognized provenance.
     return ResolvedMemoryScope(
         scope=raw_scope,
         project_id=project_id,
         workspace_root=workspace_root,
         scope_confidence=scope_confidence,
-        scope_source=scope_source,
+        scope_source=raw_scope_source,
         legacy_defaulted=False,
         invalid_defaulted=False,
     )

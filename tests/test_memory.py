@@ -4152,6 +4152,70 @@ class TestResolveMemoryScope:
         assert resolved.legacy_defaulted is False
         assert resolved.invalid_defaulted is False
 
+    def test_missing_scope_source_on_scoped_row_is_invalid_default(self):
+        """A row with a valid `scope` but no `scope_source` is
+        malformed provenance, not legacy. `legacy_default` is
+        reserved for rows with no `scope` key at all (branch 1);
+        mixing genuine pre-scope rows with scoped rows missing
+        provenance would break the audit boundary the resolver
+        exists to maintain. The stored scope value is preserved
+        because it reflects operator intent; only provenance is
+        flagged."""
+        from kai.memory import (
+            SCOPE_PROJECT,
+            SCOPE_SOURCE_INVALID_DEFAULT,
+            resolve_memory_scope,
+        )
+
+        resolved = resolve_memory_scope(
+            {
+                "scope": SCOPE_PROJECT,
+                "project_id": "kai",
+                "workspace_root": "/Users/kai/Projects/kai",
+                "scope_confidence": 0.8,
+            }
+        )
+
+        # Scope value preserved (not collapsed to global).
+        assert resolved.scope == SCOPE_PROJECT
+        assert resolved.project_id == "kai"
+        assert resolved.workspace_root == "/Users/kai/Projects/kai"
+        assert resolved.scope_confidence == 0.8
+        # Provenance flagged as malformed, not legacy.
+        assert resolved.scope_source == SCOPE_SOURCE_INVALID_DEFAULT
+        assert resolved.legacy_defaulted is False
+        assert resolved.invalid_defaulted is True
+
+    def test_unrecognized_scope_source_on_scoped_row_is_invalid_default(self):
+        """The resolver-only sources (`legacy_default`,
+        `invalid_default`) and any unknown provenance string appearing
+        in stored metadata indicate a write path bypassed
+        `build_scope_metadata`. Treat as malformed provenance: preserve
+        the stored scope, flag invalid_defaulted=True."""
+        from kai.memory import (
+            SCOPE_PROJECT,
+            SCOPE_SOURCE_INVALID_DEFAULT,
+            SCOPE_SOURCE_LEGACY_DEFAULT,
+            resolve_memory_scope,
+        )
+
+        for bad_source in (SCOPE_SOURCE_LEGACY_DEFAULT, SCOPE_SOURCE_INVALID_DEFAULT, "weird_thing"):
+            resolved = resolve_memory_scope(
+                {
+                    "scope": SCOPE_PROJECT,
+                    "project_id": "kai",
+                    "scope_confidence": 0.9,
+                    "scope_source": bad_source,
+                }
+            )
+
+            assert resolved.scope == SCOPE_PROJECT
+            assert resolved.project_id == "kai"
+            assert resolved.scope_confidence == 0.9
+            assert resolved.scope_source == SCOPE_SOURCE_INVALID_DEFAULT
+            assert resolved.legacy_defaulted is False
+            assert resolved.invalid_defaulted is True
+
     def test_normalizes_global_project_fields(self):
         """A global row that carries stray `project_id` or
         `workspace_root` (a malformed write) gets normalized to None
