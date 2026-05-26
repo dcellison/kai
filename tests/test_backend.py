@@ -1808,3 +1808,39 @@ class TestAssembleTurnContext:
         )
         assert format_called is True
         assert scoped_called is False
+
+    async def test_assemble_turn_context_still_uses_format_context_not_scoped_renderer(self, monkeypatch):
+        """Companion to the *_not_scoped_helper test above.
+
+        That earlier test pins that the #544 retrieval helper
+        (`retrieve_scoped_memories`) is not wired into production
+        prompt assembly. This test pins the same property for the
+        #545 renderer (`format_scoped_context`). Both pins are
+        needed because each new symbol could be misrouted into the
+        live path independently; flipping one would not be caught
+        by the other test."""
+        from kai.backend import assemble_turn_context
+
+        format_called = False
+        renderer_called = False
+
+        async def fake_format_context(query, *, user_id, **kwargs):
+            nonlocal format_called
+            format_called = True
+            return "[Relevant memories]"
+
+        def fake_format_scoped_context(*args, **kwargs):
+            nonlocal renderer_called
+            renderer_called = True
+            raise AssertionError("format_scoped_context must not be called from assemble_turn_context in #545")
+
+        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        monkeypatch.setattr("kai.memory.format_scoped_context", fake_format_scoped_context)
+        await assemble_turn_context(
+            "user message",
+            chat_id=42,
+            session_context="",
+            workspace_reminder="",
+        )
+        assert format_called is True
+        assert renderer_called is False
