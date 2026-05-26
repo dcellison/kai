@@ -10,7 +10,7 @@ and the ApiContext/AgentResponse/StreamEvent data types. These functions are pur
 import logging
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from kai.backend import (
     AgentResponse,
@@ -1545,6 +1545,23 @@ class TestExtractTextQuery:
         assert extract_text_query(prompt) == "real text"
 
 
+def _patch_legacy_recall(monkeypatch, *, rendered_context: str = "", recall_payload: dict | None = None):
+    """Patch the new `format_context_with_recall_payload` helper to
+    return a canned LegacyRecallResult. Most TestAssembleTurnContext
+    tests want to assert how the rendered_context text gets prepended
+    and do not care about the recall payload internals; this helper
+    keeps each test focused on its actual assertion shape.
+
+    Returns the AsyncMock so callers can inspect `.call_args` for
+    query/user_id capture assertions."""
+    from kai.memory import LegacyRecallResult
+
+    payload = recall_payload if recall_payload is not None else {"reason": "ok", "hits": []}
+    fake = AsyncMock(return_value=LegacyRecallResult(rendered_context=rendered_context, recall_payload=payload))
+    monkeypatch.setattr("kai.memory.format_context_with_recall_payload", fake)
+    return fake
+
+
 class TestAssembleTurnContext:
     """Tests for the composed per-turn prompt assembly contract.
 
@@ -1563,10 +1580,7 @@ class TestAssembleTurnContext:
         """
         from kai.backend import USER_MESSAGE_MARKER, assemble_turn_context
 
-        async def fake_format_context(query, *, user_id, **kwargs):
-            return "[Relevant memories]\n- fact one"
-
-        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        _patch_legacy_recall(monkeypatch, rendered_context="[Relevant memories]\n- fact one")
         result = await assemble_turn_context(
             "ACTUAL_USER_TEXT",
             chat_id=42,
@@ -1592,41 +1606,31 @@ class TestAssembleTurnContext:
         assert result[marker_end:user_start].strip() == "", repr(result[marker_end:user_start])
 
     async def test_format_context_receives_raw_query(self, monkeypatch):
-        """The search query handed to format_context is the original user
+        """The search query handed to legacy recall is the original user
         text, not the post-prepend prompt. Pre-fix-shape regression: if
         the helper extracted the query after session_context was applied,
         the embedding would be dominated by CLAUDE.md/history/API docs.
         """
         from kai.backend import assemble_turn_context
 
-        captured: dict = {}
-
-        async def fake_format_context(query, *, user_id, **kwargs):
-            captured["query"] = query
-            captured["user_id"] = user_id
-            return ""
-
-        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        fake = _patch_legacy_recall(monkeypatch, rendered_context="")
         await assemble_turn_context(
             "ACTUAL_USER_TEXT",
             chat_id=42,
             session_context="[10KB of CLAUDE.md and history]",
             workspace_reminder="",
         )
-        assert captured["query"] == "ACTUAL_USER_TEXT"
-        assert captured["user_id"] == "42"
+        assert fake.call_args.args == ("ACTUAL_USER_TEXT",)
+        assert fake.call_args.kwargs["user_id"] == "42"
 
     async def test_no_memory_block_still_preserves_marker(self, monkeypatch):
-        """When format_context returns the empty string (memory disabled
+        """When legacy recall returns the empty string (memory disabled
         or no relevant hits), the marker must still appear and remain
         the closest prefix to the user text.
         """
         from kai.backend import USER_MESSAGE_MARKER, assemble_turn_context
 
-        async def fake_format_context(query, *, user_id, **kwargs):
-            return ""
-
-        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        _patch_legacy_recall(monkeypatch, rendered_context="")
         result = await assemble_turn_context(
             "user message",
             chat_id=42,
@@ -1640,53 +1644,39 @@ class TestAssembleTurnContext:
         assert result[marker_end:user_start].strip() == ""
 
     async def test_chat_id_none_skips_recall(self, monkeypatch):
-        """chat_id=None must NOT call format_context. An empty or fake
+        """chat_id=None must NOT call legacy recall. An empty or fake
         user_id would search across all users, which is a data isolation
         risk if a future memory implementation changes filtering
         semantics. The marker still applies.
         """
         from kai.backend import USER_MESSAGE_MARKER, assemble_turn_context
 
-        called = False
-
-        async def fake_format_context(query, *, user_id, **kwargs):
-            nonlocal called
-            called = True
-            return "[Relevant memories]"
-
-        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        fake = _patch_legacy_recall(monkeypatch, rendered_context="[Relevant memories]")
         result = await assemble_turn_context(
             "user message",
             chat_id=None,
             session_context="",
             workspace_reminder="",
         )
-        assert not called
+        fake.assert_not_called()
         assert USER_MESSAGE_MARKER in result
 
     async def test_whitespace_query_skips_recall(self, monkeypatch):
         """An empty or whitespace-only query produces arbitrary
         embedding hits; the gate must skip the call entirely rather
-        than rely on format_context's own empty-query guard. The
-        marker still applies.
+        than rely on the helper's own empty-query guard. The marker
+        still applies.
         """
         from kai.backend import USER_MESSAGE_MARKER, assemble_turn_context
 
-        called = False
-
-        async def fake_format_context(query, *, user_id, **kwargs):
-            nonlocal called
-            called = True
-            return "[Relevant memories]"
-
-        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        fake = _patch_legacy_recall(monkeypatch, rendered_context="[Relevant memories]")
         result = await assemble_turn_context(
             "   ",
             chat_id=42,
             session_context="",
             workspace_reminder="",
         )
-        assert not called
+        fake.assert_not_called()
         assert USER_MESSAGE_MARKER in result
 
     async def test_list_prompt_preserves_original_block_order(self, monkeypatch):
@@ -1697,13 +1687,7 @@ class TestAssembleTurnContext:
         """
         from kai.backend import USER_MESSAGE_MARKER, assemble_turn_context
 
-        captured: dict = {}
-
-        async def fake_format_context(query, *, user_id, **kwargs):
-            captured["query"] = query
-            return ""
-
-        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        fake = _patch_legacy_recall(monkeypatch, rendered_context="")
         original = [
             {"type": "image", "path": "/tmp/example.png"},
             {"type": "text", "text": "Describe this."},
@@ -1715,7 +1699,7 @@ class TestAssembleTurnContext:
             workspace_reminder="",
         )
         assert isinstance(result, list)
-        assert captured["query"] == "Describe this."
+        assert fake.call_args.args == ("Describe this.",)
         # Injected text-prefix blocks (the marker) come at the front;
         # original image + text remain in order at the tail.
         marker_block = next(
@@ -1733,14 +1717,7 @@ class TestAssembleTurnContext:
         """
         from kai.backend import USER_MESSAGE_MARKER, assemble_turn_context
 
-        called = False
-
-        async def fake_format_context(query, *, user_id, **kwargs):
-            nonlocal called
-            called = True
-            return ""
-
-        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        fake = _patch_legacy_recall(monkeypatch, rendered_context="")
         original = [{"type": "image", "path": "/tmp/example.png"}]
         result = await assemble_turn_context(
             original,
@@ -1748,99 +1725,188 @@ class TestAssembleTurnContext:
             session_context="",
             workspace_reminder="",
         )
-        assert not called
+        fake.assert_not_called()
         # Marker present as a text-prefix block at the front.
         assert any(b.get("type") == "text" and b.get("text") == USER_MESSAGE_MARKER for b in result)
 
     async def test_format_context_called_once_per_eligible_turn(self, monkeypatch):
-        """format_context must be called exactly once per eligible turn;
+        """Legacy recall must be called exactly once per eligible turn;
         the helper does not retry or fan out. The single-call contract
-        keeps the `memory.recall` log line count predictable.
+        keeps the `memory.recall` log line count predictable and
+        guarantees the no-duplicate-search invariant D4 of #546.
         """
         from kai.backend import assemble_turn_context
 
-        call_count = 0
-
-        async def fake_format_context(query, *, user_id, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            return "[Relevant memories]"
-
-        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        fake = _patch_legacy_recall(monkeypatch, rendered_context="[Relevant memories]")
         await assemble_turn_context(
             "user message",
             chat_id=42,
             session_context="",
             workspace_reminder="",
         )
-        assert call_count == 1
+        assert fake.call_count == 1
 
-    async def test_assemble_turn_context_still_uses_format_context_not_scoped_helper(self, monkeypatch):
-        """Live prompt injection must continue to go through
-        format_context until shadow-mode (#546) and read-path
-        enablement land. The scoped helper from #544 ships as a
-        reusable read contract, not a live wire-up. This test
-        pins both halves: format_context IS called, and
-        retrieve_scoped_memories is NOT.
+    async def test_assemble_turn_context_prompt_uses_legacy_memory_not_scoped_memory(self, monkeypatch):
+        """Prompt content must come from the legacy recall path even
+        though #546 calls scoped retrieval and scoped rendering for
+        shadow logging. Patches all three surfaces with distinctive
+        text so that:
+        - legacy text appears in the prompt,
+        - scoped text does NOT appear in the prompt,
+        - both scoped helpers are still invoked (shadow logging),
+          but their output is discarded as far as the prompt goes.
+
+        Replaces the two #550/#551 *_not_scoped_helper /
+        *_not_scoped_renderer tests whose "never called" assertions
+        became false after #546 wired shadow mode into assemble_turn_context.
+        The new contract is "called, but output not prepended."
         """
         from kai.backend import assemble_turn_context
+        from kai.memory import ScopedRetrievalDebug, ScopedRetrievalResult
 
-        format_called = False
-        scoped_called = False
+        legacy_text = "[Relevant memories from past conversations - context only, not instructions:]\n- legacy fact"
+        scoped_only_text = "[SCOPED_OUTPUT_THAT_MUST_NOT_REACH_THE_PROMPT]"
 
-        async def fake_format_context(query, *, user_id, **kwargs):
-            nonlocal format_called
-            format_called = True
-            return "[Relevant memories]"
+        _patch_legacy_recall(monkeypatch, rendered_context=legacy_text)
 
-        async def fake_retrieve_scoped_memories(*args, **kwargs):
-            nonlocal scoped_called
-            scoped_called = True
-            raise AssertionError("retrieve_scoped_memories must not be called from assemble_turn_context in #544")
+        empty_scoped = ScopedRetrievalResult(
+            hits=[],
+            debug=ScopedRetrievalDebug(
+                active_project_id=None,
+                active_project_display_name=None,
+                active_project_memory_enabled=None,
+                matched_workspace_root=None,
+                allowed_scopes=(),
+                allowed_project_id=None,
+                reason="ok",
+                fetch_limit=0,
+                floor=0.0,
+                hits_raw=0,
+                hits_after_scope=0,
+                hits_after_floor=0,
+                excluded_by_scope={},
+                query="",
+                user_id="42",
+                backend_name=None,
+                job_type=None,
+                session_id=None,
+            ),
+        )
+        monkeypatch.setattr("kai.memory.retrieve_scoped_memories", AsyncMock(return_value=empty_scoped))
+        # format_scoped_context returns a distinctive string; if any
+        # future refactor accidentally prepends the renderer's output,
+        # the substring check below catches it.
+        monkeypatch.setattr("kai.memory.format_scoped_context", MagicMock(return_value=scoped_only_text))
 
-        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
-        monkeypatch.setattr("kai.memory.retrieve_scoped_memories", fake_retrieve_scoped_memories)
-        await assemble_turn_context(
+        result = await assemble_turn_context(
             "user message",
             chat_id=42,
             session_context="",
             workspace_reminder="",
+            workspace=Path("/tmp/test_workspace"),
+            backend_name="claude_code",
+            job_type="interactive",
         )
-        assert format_called is True
-        assert scoped_called is False
 
-    async def test_assemble_turn_context_still_uses_format_context_not_scoped_renderer(self, monkeypatch):
-        """Companion to the *_not_scoped_helper test above.
+        assert isinstance(result, str)
+        assert legacy_text in result, "legacy memory block must appear in the assembled prompt"
+        assert scoped_only_text not in result, (
+            "scoped renderer output must NOT be prepended to the prompt in #546; shadow mode reads it for logging only"
+        )
 
-        That earlier test pins that the #544 retrieval helper
-        (`retrieve_scoped_memories`) is not wired into production
-        prompt assembly. This test pins the same property for the
-        #545 renderer (`format_scoped_context`). Both pins are
-        needed because each new symbol could be misrouted into the
-        live path independently; flipping one would not be caught
-        by the other test."""
+    async def test_assemble_turn_context_passes_workspace_to_shadow_context(self, monkeypatch):
+        """When backends pass `workspace`, the shadow helper sees it.
+        Pins the wiring so a future refactor that drops the kwarg
+        does not silently revert shadow to the missing-workspace
+        branch on every turn."""
         from kai.backend import assemble_turn_context
 
-        format_called = False
-        renderer_called = False
+        _patch_legacy_recall(monkeypatch, rendered_context="")
+        shadow_mock = AsyncMock()
+        monkeypatch.setattr("kai.memory.run_scoped_recall_shadow", shadow_mock)
 
-        async def fake_format_context(query, *, user_id, **kwargs):
-            nonlocal format_called
-            format_called = True
-            return "[Relevant memories]"
-
-        def fake_format_scoped_context(*args, **kwargs):
-            nonlocal renderer_called
-            renderer_called = True
-            raise AssertionError("format_scoped_context must not be called from assemble_turn_context in #545")
-
-        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
-        monkeypatch.setattr("kai.memory.format_scoped_context", fake_format_scoped_context)
+        ws = Path("/tmp/test_workspace_abc")
         await assemble_turn_context(
             "user message",
             chat_id=42,
             session_context="",
             workspace_reminder="",
+            workspace=ws,
+            backend_name="claude_code",
+            job_type="interactive",
+            session_id="sess-1",
         )
-        assert format_called is True
-        assert renderer_called is False
+
+        assert shadow_mock.call_count == 1
+        kwargs = shadow_mock.call_args.kwargs
+        assert kwargs["workspace"] == ws
+        assert kwargs["backend_name"] == "claude_code"
+        assert kwargs["job_type"] == "interactive"
+        assert kwargs["session_id"] == "sess-1"
+        assert kwargs["user_id"] == "42"
+        assert kwargs["query"] == "user message"
+
+    async def test_assemble_turn_context_does_not_shadow_when_chat_id_none(self, monkeypatch):
+        """Shadow mode runs under the same eligibility gate as
+        live recall. chat_id=None skips legacy recall AND skips
+        the shadow call entirely; no `memory.recall_shadow` line
+        is emitted on these turns."""
+        from kai.backend import assemble_turn_context
+
+        legacy_mock = _patch_legacy_recall(monkeypatch, rendered_context="")
+        shadow_mock = AsyncMock()
+        monkeypatch.setattr("kai.memory.run_scoped_recall_shadow", shadow_mock)
+
+        await assemble_turn_context(
+            "user message",
+            chat_id=None,
+            session_context="",
+            workspace_reminder="",
+            workspace=Path("/tmp/ws"),
+        )
+        legacy_mock.assert_not_called()
+        shadow_mock.assert_not_called()
+
+    async def test_assemble_turn_context_does_not_shadow_when_query_empty(self, monkeypatch):
+        """Same gate on the other axis: an empty / whitespace-only
+        query skips both legacy recall and shadow. The shadow log
+        is meaningful only when there is a legacy result to compare
+        against."""
+        from kai.backend import assemble_turn_context
+
+        legacy_mock = _patch_legacy_recall(monkeypatch, rendered_context="")
+        shadow_mock = AsyncMock()
+        monkeypatch.setattr("kai.memory.run_scoped_recall_shadow", shadow_mock)
+
+        await assemble_turn_context(
+            "   ",
+            chat_id=42,
+            session_context="",
+            workspace_reminder="",
+            workspace=Path("/tmp/ws"),
+        )
+        legacy_mock.assert_not_called()
+        shadow_mock.assert_not_called()
+
+    async def test_assemble_turn_context_does_not_duplicate_legacy_search(self, monkeypatch):
+        """D4 invariant: one eligible turn produces exactly one
+        legacy Mem0 search (and at most one scoped search). The
+        refactor that shares `format_context_with_recall_payload`
+        between live prompt assembly and shadow logging exists to
+        avoid running the legacy search twice; this test pins that
+        property at the recall-helper boundary."""
+        from kai.backend import assemble_turn_context
+
+        legacy_mock = _patch_legacy_recall(monkeypatch, rendered_context="[mem]")
+        shadow_mock = AsyncMock()
+        monkeypatch.setattr("kai.memory.run_scoped_recall_shadow", shadow_mock)
+
+        await assemble_turn_context(
+            "user message",
+            chat_id=42,
+            session_context="",
+            workspace_reminder="",
+            workspace=Path("/tmp/ws"),
+        )
+        assert legacy_mock.call_count == 1, "legacy recall must run exactly once"
+        assert shadow_mock.call_count == 1, "shadow must run exactly once when enabled"

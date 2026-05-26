@@ -1115,6 +1115,27 @@ def _emit_recall_log(payload: dict[str, object]) -> None:
     log.info("memory.recall %s", json.dumps(payload, separators=(",", ":")))
 
 
+def _emit_recall_shadow_log(payload: dict[str, object]) -> None:
+    """
+    Write a single memory.recall_shadow log line as compact JSON.
+
+    Companion to `_emit_recall_log` for the #546 shadow-mode
+    comparison line. The two log surfaces are intentionally
+    separate: `memory.recall` is parsed by the existing retrieval
+    eval harness under a stable schema, and overloading it with
+    scoped fields would force a contract migration. Downstream
+    parsers can grep `memory.recall_shadow ` (note trailing space)
+    as a stable tag and json.load the rest.
+
+    Same PII posture as `_emit_recall_log`: query and per-hit
+    snippets are logged in their truncated form (80 chars), not
+    hashed. The shadow line uses the same `_RECALL_QUERY_TRUNC`
+    and `_RECALL_SNIPPET_TRUNC` constants as the legacy line so
+    log volume scales identically.
+    """
+    log.info("memory.recall_shadow %s", json.dumps(payload, separators=(",", ":")))
+
+
 # ── Public API ──────────────────────────────────────────────────────
 
 
@@ -1312,6 +1333,20 @@ def is_enabled() -> bool:
     return _memory is not None
 
 
+def is_recall_shadow_enabled() -> bool:
+    """
+    True when scoped shadow-mode comparison should run alongside
+    live recall.
+
+    Backed by `Config.memory_recall_shadow_enabled`, which defaults
+    on but can be killed via `MEMORY_RECALL_SHADOW_ENABLED=0`. The
+    composition with `memory_enabled` happens in `load_config` so
+    that flag is already false when memory is off; here we just
+    return what config says.
+    """
+    return _config is not None and _config.memory_recall_shadow_enabled
+
+
 def search(query: str, *, user_id: str, limit: int | None = None) -> list[MemoryResult]:
     """
     Search for memories semantically similar to the query.
@@ -1392,54 +1427,73 @@ def _format_memory_result_line(r: MemoryResult) -> str:
     return f"- ({source_short}) {r.text}"
 
 
-async def format_context(
+@dataclass(frozen=True)
+class LegacyRecallResult:
+    """
+    Internal-only result type for `format_context_with_recall_payload`.
+
+    Bundles the rendered legacy memory block alongside the
+    `memory.recall` payload that the legacy path has computed but
+    not yet emitted. Shadow-mode logging (#546) reads both fields
+    so it can compare legacy vs scoped retrieval on the same turn
+    without re-running legacy search or parsing log text.
+
+    Attributes:
+        rendered_context: The legacy memory block ready to prepend
+            to the prompt, or `""` for any short-circuit path
+            (disabled / empty query / no results / etc.).
+        recall_payload: The fully populated `memory.recall` dict
+            (uniform schema described by `_base_recall_payload`).
+            The caller is responsible for emitting it exactly once
+            via `_emit_recall_log`.
+    """
+
+    rendered_context: str
+    recall_payload: dict[str, object]
+
+
+async def format_context_with_recall_payload(
     query: str,
     *,
     user_id: str,
     token_budget: int | None = None,
-) -> str:
+) -> LegacyRecallResult:
     """
-    Search for relevant memories and format them for context injection.
+    Run the legacy recall pipeline; return rendered text + payload.
 
-    Returns a formatted string ready to prepend to the user's message,
-    or an empty string if no relevant memories are found or memory is
-    disabled.
+    Same logic as `format_context()` minus the `memory.recall` log
+    emit. The caller decides when to emit so shadow-mode logging
+    can reuse one legacy search per eligible turn instead of
+    triggering two (one for the prompt, one for the comparison
+    log). This is a Kai-internal helper, not a public API.
 
-    Async because the underlying Mem0 search (embedding computation +
-    Qdrant lookup) is CPU-bound (~50-100ms). Running it in an executor
-    keeps the asyncio event loop free for other users' messages, typing
-    indicators, and webhook handling.
+    Args:
+        query, user_id, token_budget: identical to format_context.
 
-    The header explicitly marks these as context, not instructions,
-    to prevent the inner Claude from treating recalled memories as
-    directives.
-
-    Observability: every call emits exactly one structured log line
-    with the prefix `memory.recall` and a compact JSON payload, both
-    on success and at every short-circuit return. See _emit_recall_log
-    and _base_recall_payload for the schema. Designed to be parsed by
-    a downstream retrieval eval harness without re-running search.
+    Returns:
+        LegacyRecallResult with the rendered block and the populated
+        `memory.recall` payload. Both are valid for every code
+        path (disabled, empty query, no results, all-below-floor,
+        budget-exhausted, success); short-circuits set the `reason`
+        field and return `rendered_context=""`.
     """
     # Build the recall payload up-front with sentinel values for
     # every uniform-shape field. Each downstream branch updates the
-    # fields it knows about, then emits exactly one log line at its
-    # return site. Centralizing construction here guarantees that
-    # query and user_id (the always-populated fields) cannot be
-    # forgotten at any single emit site.
+    # fields it knows about. Centralizing construction here guarantees
+    # that query and user_id (always-populated fields) cannot be
+    # forgotten on any return path.
     payload = _base_recall_payload(user_id, query)
 
     if not is_enabled() or _config is None:
         payload["reason"] = _RECALL_REASON_DISABLED
-        _emit_recall_log(payload)
-        return ""
+        return LegacyRecallResult(rendered_context="", recall_payload=payload)
 
     # Empty queries (e.g. image-only prompts with no text) produce a
     # non-zero embedding in sentence-transformers, returning arbitrary
     # results that pass the relevance threshold. Skip entirely.
     if not query.strip():
         payload["reason"] = _RECALL_REASON_EMPTY_QUERY
-        _emit_recall_log(payload)
-        return ""
+        return LegacyRecallResult(rendered_context="", recall_payload=payload)
 
     budget = token_budget if token_budget is not None else _config.memory_token_budget
     payload["budget_tokens"] = budget
@@ -1458,12 +1512,9 @@ async def format_context(
     # consistently here AND in the `/memory search` UI. _config is non-None
     # inside this branch because is_enabled() returned True above.
     #
-    # Captured BEFORE the search call so post-search short-circuit log
-    # lines (no_results, all_below_floor) carry the real floor value in
-    # their payload rather than the 0.0 sentinel that
-    # _base_recall_payload sets, matching how budget_tokens and
-    # fetch_limit are populated up-front. The actual filter step using
-    # `floor` happens later, after the search returns results to filter.
+    # Captured BEFORE the search call so post-search short-circuit
+    # payloads (no_results, all_below_floor) carry the real floor value
+    # rather than the 0.0 sentinel that _base_recall_payload sets.
     floor = _config.memory_search_floor
     payload["floor"] = floor
 
@@ -1478,36 +1529,25 @@ async def format_context(
     payload["hits_raw"] = len(results)
     if not results:
         payload["reason"] = _RECALL_REASON_NO_RESULTS
-        _emit_recall_log(payload)
-        return ""
+        return LegacyRecallResult(rendered_context="", recall_payload=payload)
 
     # Quality gate: drop low-relevance noise before any ranking adjustment.
     # Weighting happens AFTER this filter so a downweighted legacy row
     # cannot survive on raw score, and a boosted extracted fact cannot
-    # be rescued below threshold. `floor` was read from _config above
-    # so the all_below_floor short-circuit log line carries the real
-    # threshold rather than a sentinel.
+    # be rescued below threshold.
     results = [r for r in results if r.score >= floor]
     payload["hits_after_floor"] = len(results)
     if not results:
         payload["reason"] = _RECALL_REASON_ALL_BELOW_FLOOR
-        _emit_recall_log(payload)
-        return ""
+        return LegacyRecallResult(rendered_context="", recall_payload=payload)
 
-    # Speaker-weighted adjusted score for ranking only. Sort is required
-    # regardless of Mem0's incoming order; the walk order below reads
-    # adjusted_score via the sort key, not Mem0's.
-    #
-    # Resolve (speaker, confidence) ONCE per row via _read_time_speaker
-    # and compute the weight from those two factors directly, then
-    # carry all three alongside the result row through the sort. The
-    # per-hit log payload below reads speaker / confidence off the
-    # same tuple, so the metadata dict is parsed exactly once per row
-    # for both the ranking and the log path. Going through
-    # _speaker_weight(r) at the sort step would re-parse the metadata
-    # a second time below; threading the resolved values through
-    # avoids that without losing the demote-only invariant (the
-    # multiplier is still speaker_weight * confidence).
+    # Speaker-weighted adjusted score for ranking only. Resolve
+    # (speaker, confidence) ONCE per row via _read_time_speaker and
+    # compute the weight from those two factors directly, then carry
+    # all three alongside the result row through the sort. The per-hit
+    # log payload below reads speaker / confidence off the same tuple,
+    # so the metadata dict is parsed exactly once per row for both the
+    # ranking and the log path.
     def _resolved_row(r: MemoryResult) -> tuple[MemoryResult, float, str, float]:
         # Duplicates the body of _speaker_weight (minus its
         # _read_time_speaker call) so the resolved (speaker,
@@ -1533,23 +1573,6 @@ async def format_context(
     # "what the agent actually saw" and `hits[lines_used:]` for
     # "survived ranking but lost to budget"; distinguishing these two
     # is what makes precision/recall scoring accurate.
-    # `id` is the Mem0 row identifier (MemoryResult.id, required field
-    # at line 120). Carried in the per-hit object so a downstream parser
-    # can match a probe's expected_fact_id against the actual hit
-    # without re-issuing get_by_id per hit or fragile snippet-substring
-    # matching (snippet is truncated to 80 chars and not unique).
-    # Without this field, precision/recall scoring against a known
-    # expected_fact_id has no honest way to identify which hit corresponds.
-    #
-    # `speaker` and `confidence` ride alongside `source` so a log
-    # analyst can reconstruct the demote multiplier (`speaker_weight
-    # * confidence`) from the line without a re-fetch. Both fields
-    # come from the resolved tuple above, so legacy rows log the
-    # same defaulted values that drove their ranking, rather than a
-    # missing-field marker. The `source` field stays so analysts can
-    # still distinguish episode rows from extracted rows; speaker and
-    # source describe two different axes (whose claim vs which write
-    # path) and are not redundant.
     payload["hits"] = [
         {
             "id": r.id,
@@ -1595,13 +1618,50 @@ async def format_context(
     # "survived but dropped by budget" slice.
     if len(lines) <= 1:
         payload["reason"] = _RECALL_REASON_BUDGET_EXHAUSTED
-        _emit_recall_log(payload)
-        return ""
+        return LegacyRecallResult(rendered_context="", recall_payload=payload)
 
     payload["lines_used"] = lines_used
     payload["returned_empty"] = False
-    _emit_recall_log(payload)
-    return "\n".join(lines)
+    return LegacyRecallResult(rendered_context="\n".join(lines), recall_payload=payload)
+
+
+async def format_context(
+    query: str,
+    *,
+    user_id: str,
+    token_budget: int | None = None,
+) -> str:
+    """
+    Search for relevant memories and format them for context injection.
+
+    Returns a formatted string ready to prepend to the user's message,
+    or an empty string if no relevant memories are found or memory is
+    disabled.
+
+    Async because the underlying Mem0 search (embedding computation +
+    Qdrant lookup) is CPU-bound (~50-100ms). Running it in an executor
+    keeps the asyncio event loop free for other users' messages, typing
+    indicators, and webhook handling.
+
+    The header explicitly marks these as context, not instructions,
+    to prevent the inner Claude from treating recalled memories as
+    directives.
+
+    Observability: every call emits exactly one structured log line
+    with the prefix `memory.recall` and a compact JSON payload, both
+    on success and at every short-circuit return. See _emit_recall_log
+    and _base_recall_payload for the schema. Designed to be parsed by
+    a downstream retrieval eval harness without re-running search.
+
+    Implementation: thin wrapper around
+    `format_context_with_recall_payload`. The split lets shadow-mode
+    logging (#546) reuse the legacy payload without re-running
+    legacy search; this wrapper preserves the public signature and
+    log-emission contract every existing caller depends on.
+    """
+    result = await format_context_with_recall_payload(query, user_id=user_id, token_budget=token_budget)
+    _emit_recall_log(result.recall_payload)
+    return result.rendered_context
 
 
 async def retrieve_scoped_memories(
@@ -2011,6 +2071,278 @@ def format_scoped_context(
     # over two it inserts a single blank line. Same separator
     # literal that the budget charge above used.
     return _SCOPED_SECTION_SEPARATOR.join("\n".join(section) for section in rendered_sections)
+
+
+# ── Shadow-mode comparison logging (#546) ────────────────────────────
+
+
+# Maximum chars of an exception message echoed into the shadow log
+# on a scoped failure. Long messages (e.g. a Mem0 connection error
+# with a serialized request body) would otherwise blow up the
+# shadow line. Match the per-hit snippet truncation so log volume
+# scales consistently with the other text fields.
+_SHADOW_ERROR_MESSAGE_TRUNC = 200
+
+
+def _ordered_difference(left: list[str], right: list[str]) -> list[str]:
+    """
+    Return items in `left` not present in `right`, preserving left
+    order. Stable for the shadow `removed_ids` / `added_ids`
+    fields where rank-order in the source list is the analyst
+    signal (oldest scoped removal first vs newest, etc.).
+    """
+    right_set = set(right)
+    return [item for item in left if item not in right_set]
+
+
+def _ordered_intersection(left: list[str], right: list[str]) -> list[str]:
+    """
+    Return items present in both lists, preserving left order. Used
+    for `same_ids` so the shadow line shows legacy rank order on
+    the surviving rows rather than scoped order.
+    """
+    right_set = set(right)
+    return [item for item in left if item in right_set]
+
+
+def _scoped_debug_to_payload(debug: ScopedRetrievalDebug) -> dict[str, object]:
+    """
+    Convert a `ScopedRetrievalDebug` to a JSON-safe dict for the
+    `scoped_debug` field of `memory.recall_shadow`. All values are
+    already JSON-safe primitives or containers thereof; `allowed_scopes`
+    is a tuple and is converted to a list for json.dumps friendliness.
+    Tuples serialize to JSON arrays under json.dumps already, but a
+    list is the standard wire shape for parsers that round-trip back
+    through Python via json.loads.
+    """
+    return {
+        "active_project_id": debug.active_project_id,
+        "active_project_display_name": debug.active_project_display_name,
+        "active_project_memory_enabled": debug.active_project_memory_enabled,
+        "matched_workspace_root": debug.matched_workspace_root,
+        "allowed_scopes": list(debug.allowed_scopes),
+        "allowed_project_id": debug.allowed_project_id,
+        "reason": debug.reason,
+        "fetch_limit": debug.fetch_limit,
+        "floor": debug.floor,
+        "hits_raw": debug.hits_raw,
+        "hits_after_scope": debug.hits_after_scope,
+        "hits_after_floor": debug.hits_after_floor,
+        "excluded_by_scope": dict(debug.excluded_by_scope),
+        "backend_name": debug.backend_name,
+        "job_type": debug.job_type,
+        "session_id": debug.session_id,
+    }
+
+
+def _scoped_hit_to_shadow_payload(hit: ScopedMemoryHit) -> dict[str, object]:
+    """
+    Convert a `ScopedMemoryHit` to a JSON-safe dict for the
+    `scoped_hits` array. Mirrors the per-hit shape from `memory.recall`
+    (id/source/speaker/confidence/score/adj/snippet) plus the scope
+    discriminators (scope/project_id) so log analysts can tell at a
+    glance whether each surviving hit is global or matching-project.
+    Snippet uses `_RECALL_SNIPPET_TRUNC` so the two log lines have
+    matching per-hit text shape.
+    """
+    r = hit.result
+    return {
+        "id": r.id,
+        "scope": hit.resolved_scope.scope,
+        "project_id": hit.resolved_scope.project_id,
+        "source": (r.metadata.get("source") if r.metadata else None) or "",
+        "speaker": hit.speaker,
+        "confidence": hit.confidence,
+        "score": round(r.score, 4),
+        "adj": round(hit.adjusted_score, 4),
+        "snippet": _truncate(r.text, _RECALL_SNIPPET_TRUNC),
+    }
+
+
+def _shadow_base_payload(
+    *,
+    user_id: str,
+    query: str,
+    workspace: Path | None,
+    backend_name: str | None,
+    job_type: str | None,
+    session_id: str | None,
+    legacy_payload: dict[str, object],
+) -> dict[str, object]:
+    """
+    Build the uniform-shape base of a `memory.recall_shadow` payload.
+
+    Populates every top-level key from D7 with sentinel values for
+    fields the caller has not computed yet. Every emit path
+    (success, missing-workspace, shadow-error) starts from this
+    base and overrides only the fields it knows about, so the
+    log schema is uniform and downstream parsers do not need to
+    branch on `if "scoped_ids" in record`.
+
+    `legacy_*` fields are populated from the legacy recall payload
+    that `format_context_with_recall_payload` already computed,
+    avoiding a second legacy search.
+    """
+    # legacy_hits is the same per-hit array the legacy memory.recall
+    # line carries; reuse it directly so log analysts see identical
+    # per-hit shape on both sides of the comparison.
+    legacy_hits = legacy_payload.get("hits") or []
+    legacy_ids = [h.get("id") for h in legacy_hits if isinstance(h, dict)] if isinstance(legacy_hits, list) else []
+
+    return {
+        "user_id": user_id,
+        "query_len": len(query),
+        "query": _truncate(query, _RECALL_QUERY_TRUNC),
+        "backend_name": backend_name,
+        "job_type": job_type,
+        "session_id": session_id,
+        "workspace": str(workspace) if workspace is not None else "",
+        "legacy_reason": legacy_payload.get("reason", "ok"),
+        "legacy_returned_empty": legacy_payload.get("returned_empty", True),
+        "legacy_lines_used": legacy_payload.get("lines_used", 0),
+        "legacy_budget_tokens": legacy_payload.get("budget_tokens", 0),
+        "legacy_fetch_limit": legacy_payload.get("fetch_limit", 0),
+        "legacy_floor": legacy_payload.get("floor", 0.0),
+        "legacy_ids": legacy_ids,
+        "legacy_hits": legacy_hits,
+        "scoped_reason": "",
+        "scoped_rendered_empty": True,
+        "scoped_rendered_chars": 0,
+        "scoped_debug": None,
+        "scoped_ids": [],
+        "scoped_hits": [],
+        "removed_ids": [],
+        "added_ids": [],
+        "same_ids": [],
+        "shadow_error": False,
+        "shadow_error_type": "",
+        "shadow_error_message": "",
+    }
+
+
+async def run_scoped_recall_shadow(
+    *,
+    query: str,
+    user_id: str,
+    legacy_result: LegacyRecallResult,
+    workspace: Path | None,
+    backend_name: str | None = None,
+    job_type: str | None = None,
+    session_id: str | None = None,
+    token_budget: int | None = None,
+) -> None:
+    """
+    Run scoped retrieval and scoped rendering as a shadow of the
+    legacy recall already produced, then emit one
+    `memory.recall_shadow` log line.
+
+    Best-effort: any exception from scoped retrieval or rendering is
+    caught and logged as a shadow line with `shadow_error=true`.
+    The function never raises out, so the live prompt path that
+    called the helper is not affected by scoped bugs.
+
+    Behavioral branches (each emits exactly one shadow line):
+
+    - `workspace is None`: skip scoped retrieval entirely. Emit a
+      shadow line with `scoped_reason="missing_workspace"` and
+      empty scoped fields. Lets unattended callers and tests opt
+      out cleanly without failing the live path.
+    - Scoped retrieval + rendering succeed: emit the full
+      success-shape payload with legacy/scoped IDs, removed/added/
+      same diffs, scoped debug, and rendered-output preview metadata
+      (chars, empty flag).
+    - Scoped retrieval or rendering raises: emit a shadow line with
+      `shadow_error=true`, the exception class name, a truncated
+      message, and the failure-path sentinels from D7.
+
+    The legacy `_emit_recall_log` is NOT called from here; the
+    caller is responsible for emitting `memory.recall` exactly once
+    before invoking shadow, matching the D3/D4 contract.
+
+    Disabled via `Config.memory_recall_shadow_enabled = False`
+    (env: `MEMORY_RECALL_SHADOW_ENABLED=0/false/no`). When
+    disabled, the function returns immediately and emits no log,
+    so callers can invoke it unconditionally on every eligible
+    turn without their own flag check.
+    """
+    if not is_recall_shadow_enabled():
+        return
+
+    base = _shadow_base_payload(
+        user_id=user_id,
+        query=query,
+        workspace=workspace,
+        backend_name=backend_name,
+        job_type=job_type,
+        session_id=session_id,
+        legacy_payload=legacy_result.recall_payload,
+    )
+
+    # Missing-workspace branch: shadow logger sets a string the
+    # retrieval helper's reason enum does not contain. Per D7+D8
+    # this is shadow-logger-only; do not add it to
+    # retrieve_scoped_memories.
+    if workspace is None:
+        base["scoped_reason"] = "missing_workspace"
+        _emit_recall_shadow_log(base)
+        return
+
+    try:
+        # Build the per-turn context using the same chat_id-as-user_id
+        # shape that the legacy path used. ScopedRetrievalContext
+        # accepts int|str; pass the user_id string through to match
+        # what retrieve_scoped_memories will hand to Mem0.
+        context = ScopedRetrievalContext(
+            chat_id=user_id,
+            message=query,
+            workspace=workspace,
+            job_type=job_type,
+            backend_name=backend_name,
+            session_id=session_id,
+        )
+        legacy_budget = base["legacy_budget_tokens"] if isinstance(base["legacy_budget_tokens"], int) else None
+        scoped_result = await retrieve_scoped_memories(
+            context,
+            token_budget=token_budget if token_budget is not None else legacy_budget,
+        )
+        rendered = format_scoped_context(
+            scoped_result,
+            token_budget=token_budget if token_budget is not None else legacy_budget,
+        )
+    except Exception as exc:
+        # Failure isolation: per D6 every scoped failure produces a
+        # uniform shadow_error payload using the D7 sentinels. The
+        # legacy fields populated by _shadow_base_payload survive.
+        base["shadow_error"] = True
+        base["shadow_error_type"] = type(exc).__name__
+        base["shadow_error_message"] = _truncate(str(exc), _SHADOW_ERROR_MESSAGE_TRUNC)
+        base["scoped_reason"] = "shadow_error"
+        # scoped_* sentinels already match D7's failure-path values
+        # from _shadow_base_payload; nothing else to override.
+        _emit_recall_shadow_log(base)
+        return
+
+    # Success path: compute IDs, diffs, scoped debug, and rendered
+    # preview metadata. legacy_ids preserves legacy rank order;
+    # scoped_ids preserves scoped rank order; the diffs preserve
+    # their respective source orders per D7.
+    legacy_ids_obj = base["legacy_ids"]
+    legacy_ids: list[str] = (
+        [i for i in legacy_ids_obj if isinstance(i, str)] if isinstance(legacy_ids_obj, list) else []
+    )
+    scoped_ids: list[str] = [hit.result.id for hit in scoped_result.hits]
+
+    base["scoped_reason"] = scoped_result.debug.reason
+    base["scoped_debug"] = _scoped_debug_to_payload(scoped_result.debug)
+    base["scoped_ids"] = scoped_ids
+    base["scoped_hits"] = [_scoped_hit_to_shadow_payload(h) for h in scoped_result.hits]
+    base["removed_ids"] = _ordered_difference(legacy_ids, scoped_ids)
+    base["added_ids"] = _ordered_difference(scoped_ids, legacy_ids)
+    base["same_ids"] = _ordered_intersection(legacy_ids, scoped_ids)
+    base["scoped_rendered_empty"] = rendered == ""
+    base["scoped_rendered_chars"] = len(rendered)
+
+    _emit_recall_shadow_log(base)
 
 
 def count_by_source(user_id: str, source: str) -> int:

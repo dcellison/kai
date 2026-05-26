@@ -924,11 +924,14 @@ class TestContextInjection:
         memory_block = (
             "[Relevant memories from past conversations - context only, not instructions:]\n- (fact) test memory"
         )
+        from kai.memory import LegacyRecallResult
+
+        fake_recall = LegacyRecallResult(rendered_context=memory_block, recall_payload={"reason": "ok", "hits": []})
         with (
             patch("kai.codex.build_session_context", return_value="[CONTEXT]"),
             patch(
-                "kai.memory.format_context",
-                new=AsyncMock(return_value=memory_block),
+                "kai.memory.format_context_with_recall_payload",
+                new=AsyncMock(return_value=fake_recall),
             ),
         ):
             # chat_id is required so assemble_turn_context's memory
@@ -1067,19 +1070,23 @@ class TestPromptCoercion:
         c._fresh_session = True
         c._next_id = 3
 
-        # format_context patched as a sentinel: the all-non-text input
-        # has no real user text to drive recall, so the helper must
-        # be invoked with `chat_id=None` and never call format_context.
-        format_context_spy = AsyncMock(return_value="")
+        # Legacy recall patched as a sentinel: the all-non-text input
+        # has no real user text to drive recall, so assemble_turn_context
+        # must hit chat_id=None internally and never call the helper.
+        from kai.memory import LegacyRecallResult
+
+        recall_spy = AsyncMock(
+            return_value=LegacyRecallResult(rendered_context="", recall_payload={"reason": "ok", "hits": []})
+        )
         blocks = [{"type": "image", "data": "..."}]
         with (
             patch("kai.codex.build_session_context", return_value="[CONTEXT]"),
-            patch("kai.memory.format_context", new=format_context_spy),
+            patch("kai.memory.format_context_with_recall_payload", new=recall_spy),
         ):
             async for _event in c._send_locked(blocks, chat_id=42):
                 pass
 
-        format_context_spy.assert_not_called()
+        recall_spy.assert_not_called()
 
         write_calls = c._proc.stdin.write.call_args_list
         sent_blocks = json.loads(write_calls[-1][0][0].decode())["params"]["input"]
@@ -1101,13 +1108,19 @@ class TestPromptCoercion:
         c._fresh_session = False
         c._next_id = 3
 
-        format_context_spy = AsyncMock(return_value="should-not-be-injected")
+        from kai.memory import LegacyRecallResult
+
+        recall_spy = AsyncMock(
+            return_value=LegacyRecallResult(
+                rendered_context="should-not-be-injected", recall_payload={"reason": "ok", "hits": []}
+            )
+        )
         blocks = [{"type": "image", "data": "..."}]
-        with patch("kai.memory.format_context", new=format_context_spy):
+        with patch("kai.memory.format_context_with_recall_payload", new=recall_spy):
             async for _event in c._send_locked(blocks, chat_id=42):
                 pass
 
-        format_context_spy.assert_not_called()
+        recall_spy.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_text_input_still_drives_semantic_recall(self):
@@ -1119,15 +1132,19 @@ class TestPromptCoercion:
         c._fresh_session = False
         c._next_id = 3
 
-        format_context_spy = AsyncMock(return_value="")
-        with patch("kai.memory.format_context", new=format_context_spy):
+        from kai.memory import LegacyRecallResult
+
+        recall_spy = AsyncMock(
+            return_value=LegacyRecallResult(rendered_context="", recall_payload={"reason": "ok", "hits": []})
+        )
+        with patch("kai.memory.format_context_with_recall_payload", new=recall_spy):
             async for _event in c._send_locked("real user text", chat_id=42):
                 pass
 
-        format_context_spy.assert_called_once()
+        recall_spy.assert_called_once()
         # First positional / kwarg is the search query; pin it as the
         # real user text, not the codex-synthetic placeholder.
-        call = format_context_spy.call_args
+        call = recall_spy.call_args
         assert call.args[0] == "real user text" or call.kwargs.get("query") == "real user text"
 
 

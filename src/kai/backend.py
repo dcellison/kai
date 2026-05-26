@@ -169,6 +169,13 @@ class AgentBackend(ABC):
     workspace_config: WorkspaceConfig | None
     provider: str
 
+    # Stable identifier the shadow-mode logger (#546) and any future
+    # backend-aware code path can read off the instance. Concrete
+    # backends override the class-level default with their canonical
+    # name. Default `""` keeps the ABC importable for tests that
+    # construct a stub backend without thinking about logging.
+    backend_name: str = ""
+
     @abstractmethod
     async def send(self, prompt: str | list, chat_id: int | None = None) -> AsyncIterator[StreamEvent]:
         """Send a message and yield streaming events.
@@ -925,6 +932,10 @@ async def assemble_turn_context(
     chat_id: int | None,
     session_context: str = "",
     workspace_reminder: str = "",
+    workspace: Path | None = None,
+    backend_name: str | None = None,
+    job_type: str | None = None,
+    session_id: str | None = None,
 ) -> str | list:
     """
     Assemble the per-turn prompt context for an interactive backend.
@@ -999,15 +1010,49 @@ async def assemble_turn_context(
     # Semantic recall on every eligible turn (~50-100ms via the
     # executor inside format_context). Skip entirely when chat_id
     # is None (cross-user leakage risk) or the query is whitespace-
-    # only (random embedding hits). The function-local import
-    # mirrors the claude.py shape pre-extraction so test patching
-    # of kai.memory.format_context stays valid.
+    # only (random embedding hits). Function-local imports keep
+    # backend.py's import surface lean and let tests patch
+    # `kai.memory.format_context` (and the new `_emit_recall_log`
+    # / `run_scoped_recall_shadow` symbols) without import-order
+    # surprises.
     if chat_id is not None and search_query.strip():
-        from kai.memory import format_context as memory_format_context
+        # Legacy recall is the live prompt content. The split
+        # introduced in #546 (format_context_with_recall_payload +
+        # _emit_recall_log) lets shadow-mode logging reuse the
+        # same legacy search and payload without re-running search;
+        # the wrapper format_context still exists for callers that
+        # do not need the payload, but assemble_turn_context owns
+        # the shadow-mode call site and so reads the payload
+        # directly. memory.recall stays "exactly one line per
+        # eligible turn" - emitted here, never twice.
+        from kai.memory import (
+            _emit_recall_log,
+            format_context_with_recall_payload,
+            run_scoped_recall_shadow,
+        )
 
-        memory_ctx = await memory_format_context(search_query, user_id=str(chat_id))
-        if memory_ctx:
-            prompt = prepend_to_prompt(prompt, memory_ctx)
+        legacy_recall = await format_context_with_recall_payload(search_query, user_id=str(chat_id))
+        _emit_recall_log(legacy_recall.recall_payload)
+        if legacy_recall.rendered_context:
+            prompt = prepend_to_prompt(prompt, legacy_recall.rendered_context)
+
+        # Shadow-mode comparison log (#546). Best-effort; the helper
+        # is failure-isolated internally and short-circuits when
+        # disabled, so the live prompt path above is unaffected by
+        # any scoped retrieval or rendering bug. Backends pass
+        # workspace/backend_name/job_type so the shadow log can
+        # detect the active project and identify the caller; tests
+        # that omit those kwargs land on the missing-workspace
+        # branch which still emits a uniform shadow line.
+        await run_scoped_recall_shadow(
+            query=search_query,
+            user_id=str(chat_id),
+            legacy_result=legacy_recall,
+            workspace=workspace,
+            backend_name=backend_name,
+            job_type=job_type,
+            session_id=session_id,
+        )
 
     # Foreign-workspace reminder is built fresh by the caller on
     # every turn (it depends on the workspace state at call time).

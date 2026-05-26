@@ -73,6 +73,10 @@ class GooseBackend(AgentBackend):
     all tool calls, so no permission write-back is needed.
     """
 
+    # Stable identifier read by the shadow-mode logger (#546) to
+    # tag `memory.recall_shadow` lines with the caller backend.
+    backend_name = "goose"
+
     def __init__(
         self,
         *,
@@ -434,6 +438,9 @@ class GooseBackend(AgentBackend):
             chat_id=recall_chat_id,
             session_context=session_ctx,
             workspace_reminder=reminder,
+            workspace=self.workspace,
+            backend_name=self.backend_name,
+            job_type="interactive",
         )
 
         # Coerce to the ACP content-block shape. `prompt` is either a

@@ -69,6 +69,10 @@ class ClaudeCodeBackend(AgentBackend):
     the executor indefinitely.
     """
 
+    # Stable identifier read by the shadow-mode logger (#546) to
+    # tag `memory.recall_shadow` lines with the caller backend.
+    backend_name = "claude_code"
+
     def __init__(
         self,
         *,
@@ -816,6 +820,9 @@ class ClaudeCodeBackend(AgentBackend):
             chat_id=chat_id,
             session_context=session_ctx,
             workspace_reminder=reminder,
+            workspace=self.workspace,
+            backend_name=self.backend_name,
+            job_type="interactive",
         )
 
         content = prompt if isinstance(prompt, list) else [{"type": "text", "text": prompt}]

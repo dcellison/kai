@@ -3062,3 +3062,63 @@ class TestLoadMemoryProjects:
         # ...but did NOT promote its root into allowed_workspaces.
         assert registry_root.resolve() not in cfg.allowed_workspaces
         assert registry_root not in cfg.allowed_workspaces
+
+
+# ── Shadow-mode toggle (#546) ────────────────────────────────────────
+
+
+class TestMemoryRecallShadowConfig:
+    """Tests for `Config.memory_recall_shadow_enabled` and its
+    `MEMORY_RECALL_SHADOW_ENABLED` env-var parse.
+
+    The toggle is default-on (inverted convention compared to the
+    usual memory_* env vars) because the point of #546 is to
+    collect real turn evidence before the read-path switch. A
+    default-off flag would defeat that. The off-switch is the
+    rollback path if shadow code misbehaves under load."""
+
+    def _base_env(self, monkeypatch):
+        """Minimal env so load_config builds cleanly. Caller adds
+        MEMORY_RECALL_SHADOW_ENABLED on top to drive the test."""
+        for v in _CONFIG_ENV_VARS:
+            monkeypatch.delenv(v, raising=False)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+        monkeypatch.setenv("ALLOWED_USER_IDS", "12345")
+        monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
+        monkeypatch.setenv("MEMORY_ENABLED", "true")  # gate for shadow to be on
+
+    def test_memory_recall_shadow_config_defaults_enabled(self, monkeypatch):
+        """Unset env var → shadow enabled when memory is on. The
+        default-on posture is the load-bearing decision in D10;
+        flipping it to default-off would erase evidence collection."""
+        self._base_env(monkeypatch)
+        monkeypatch.delenv("MEMORY_RECALL_SHADOW_ENABLED", raising=False)
+        cfg = load_config()
+        assert cfg.memory_recall_shadow_enabled is True
+
+    def test_memory_recall_shadow_config_can_disable(self, monkeypatch):
+        """Each of the three disable strings turns the toggle off,
+        case-insensitively. The disable set is intentionally
+        conservative; truthy alternatives keep shadow on."""
+        for disable_value in ("0", "false", "no", "False", "NO", "FALSE"):
+            self._base_env(monkeypatch)
+            monkeypatch.setenv("MEMORY_RECALL_SHADOW_ENABLED", disable_value)
+            cfg = load_config()
+            assert cfg.memory_recall_shadow_enabled is False, f"failed to disable with {disable_value!r}"
+
+    def test_memory_recall_shadow_config_disabled_when_memory_off(self, monkeypatch):
+        """Sub-toggle composition: shadow is gated on memory_enabled
+        even when MEMORY_RECALL_SHADOW_ENABLED is unset/truthy. No
+        legacy recall = no baseline to compare against = pointless
+        shadow runs."""
+        for v in _CONFIG_ENV_VARS:
+            monkeypatch.delenv(v, raising=False)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+        monkeypatch.setenv("ALLOWED_USER_IDS", "12345")
+        monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
+        # MEMORY_ENABLED unset / off; shadow must also fall to off
+        # regardless of the shadow env var.
+        monkeypatch.setenv("MEMORY_RECALL_SHADOW_ENABLED", "true")
+        cfg = load_config()
+        assert cfg.memory_enabled is False
+        assert cfg.memory_recall_shadow_enabled is False

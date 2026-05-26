@@ -1807,11 +1807,14 @@ class TestContextInjection:
         memory_block = (
             "[Relevant memories from past conversations - context only, not instructions:]\n- (fact) test memory"
         )
+        from kai.memory import LegacyRecallResult
+
+        fake_recall = LegacyRecallResult(rendered_context=memory_block, recall_payload={"reason": "ok", "hits": []})
         with (
             patch("kai.backend.get_recent_history", return_value="prior turn"),
             patch(
-                "kai.memory.format_context",
-                new=AsyncMock(return_value=memory_block),
+                "kai.memory.format_context_with_recall_payload",
+                new=AsyncMock(return_value=fake_recall),
             ),
         ):
             # chat_id is required so the memory_format_context branch runs
@@ -1875,14 +1878,16 @@ class TestContextInjection:
 
         captured: dict = {}
 
-        async def fake_format_context(query, *, user_id, **kwargs):
+        async def fake_helper(query, *, user_id, **kwargs):
+            from kai.memory import LegacyRecallResult
+
             captured["query"] = query
             captured["user_id"] = user_id
-            return ""
+            return LegacyRecallResult(rendered_context="", recall_payload={"reason": "ok", "hits": []})
 
         with (
             patch("kai.backend.get_recent_history", return_value="prior turn"),
-            patch("kai.memory.format_context", new=fake_format_context),
+            patch("kai.memory.format_context_with_recall_payload", new=fake_helper),
         ):
             events = []
             async for event in claude._send_locked("What do I prefer?", chat_id=42):

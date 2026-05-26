@@ -912,6 +912,22 @@ class Config:
     # without re-running `make config`.
     memory_duplicate_threshold: float = 0.9
 
+    # Shadow-mode retrieval comparison toggle. When True (the
+    # default) and legacy memory recall runs for a turn, scoped
+    # retrieval also runs and emits a `memory.recall_shadow` log
+    # line alongside the existing `memory.recall` line so legacy
+    # vs scoped result sets can be compared on real conversation
+    # turns before the live read path switches. Default-on is
+    # deliberate: the comparison log is the evidence base for the
+    # eventual switch, and a default-off flag would block that
+    # evidence collection. Operators who hit performance or log-
+    # volume problems can disable with MEMORY_RECALL_SHADOW_ENABLED=0
+    # (or "false" / "no", case-insensitive) for an immediate kill
+    # without redeploying. Like memory_extraction_enabled, this is
+    # a sub-toggle of memory_enabled: shadow only runs when memory
+    # is enabled (legacy recall provides the baseline to compare).
+    memory_recall_shadow_enabled: bool = True
+
     def get_workspace_config(self, workspace: Path) -> WorkspaceConfig | None:
         """
         Get per-workspace config for a path, or None for global defaults.
@@ -2207,6 +2223,17 @@ def load_config() -> Config:
     # closed regardless of operator env-var ordering.
     memory_extraction_enabled = memory_extraction_enabled and memory_enabled
 
+    # Shadow-mode retrieval comparison toggle. Default-on, inverted
+    # parse compared to the usual default-off memory env vars: any
+    # absent or non-disable value keeps shadow on; only the explicit
+    # disable strings turn it off. Like memory_extraction_enabled,
+    # composed with memory_enabled so shadow never runs when memory
+    # is off (no legacy recall to compare against, and the helper
+    # short-circuits anyway).
+    _shadow_raw = os.environ.get("MEMORY_RECALL_SHADOW_ENABLED", "")
+    memory_recall_shadow_enabled = _shadow_raw.strip().lower() not in ("0", "false", "no")
+    memory_recall_shadow_enabled = memory_recall_shadow_enabled and memory_enabled
+
     # Deprecation warnings for the three retired memory env vars. The
     # reasoner and model used for memory extraction now derive entirely
     # from each user's effective `agent_backend` (per-user dispatch via
@@ -2538,6 +2565,7 @@ def load_config() -> Config:
         memory_token_budget=memory_token_budget,
         memory_embedding_model=memory_embedding_model,
         memory_extraction_enabled=memory_extraction_enabled,
+        memory_recall_shadow_enabled=memory_recall_shadow_enabled,
         memory_extraction_budget_usd=memory_extraction_budget_usd,
         memory_extraction_timeout_s=memory_extraction_timeout_s,
         episode_classifier_context_turns=episode_classifier_context_turns,
