@@ -1774,3 +1774,37 @@ class TestAssembleTurnContext:
             workspace_reminder="",
         )
         assert call_count == 1
+
+    async def test_assemble_turn_context_still_uses_format_context_not_scoped_helper(self, monkeypatch):
+        """Live prompt injection must continue to go through
+        format_context until shadow-mode (#546) and read-path
+        enablement land. The scoped helper from #544 ships as a
+        reusable read contract, not a live wire-up. This test
+        pins both halves: format_context IS called, and
+        retrieve_scoped_memories is NOT.
+        """
+        from kai.backend import assemble_turn_context
+
+        format_called = False
+        scoped_called = False
+
+        async def fake_format_context(query, *, user_id, **kwargs):
+            nonlocal format_called
+            format_called = True
+            return "[Relevant memories]"
+
+        async def fake_retrieve_scoped_memories(*args, **kwargs):
+            nonlocal scoped_called
+            scoped_called = True
+            raise AssertionError("retrieve_scoped_memories must not be called from assemble_turn_context in #544")
+
+        monkeypatch.setattr("kai.memory.format_context", fake_format_context)
+        monkeypatch.setattr("kai.memory.retrieve_scoped_memories", fake_retrieve_scoped_memories)
+        await assemble_turn_context(
+            "user message",
+            chat_id=42,
+            session_context="",
+            workspace_reminder="",
+        )
+        assert format_called is True
+        assert scoped_called is False

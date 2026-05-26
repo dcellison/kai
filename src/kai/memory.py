@@ -27,6 +27,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from kai.config import DATA_DIR, Config
@@ -503,6 +504,165 @@ class MemoryStats:
     by_prompt_version: dict[str, int] = field(default_factory=dict)
 
 
+# ── Scoped retrieval helper data shapes ──────────────────────────────
+#
+# The shared helper (`retrieve_scoped_memories`, defined after
+# `format_context` below) returns structured candidates plus debug
+# metadata instead of rendering prompt text. Rendering, shadow-mode
+# logging, and the live-prompt switch live in later issues; this
+# layer just owns the admission decision and per-row ranking signals
+# so every future caller can share one filter-before-rank shape.
+#
+# The four dataclasses below split the helper's I/O into three
+# concerns: caller context in (ScopedRetrievalContext), per-row
+# ranking outputs (ScopedMemoryHit), and observability fields
+# (ScopedRetrievalDebug). ScopedRetrievalResult bundles the hit list
+# and the debug payload so a caller can carry the structured result
+# through async boundaries as one value.
+
+
+@dataclass(frozen=True)
+class ScopedRetrievalContext:
+    """
+    Per-turn input to `retrieve_scoped_memories`.
+
+    Carries every field named in the issue so backends and scheduled
+    jobs can populate the same shape. Only `chat_id`, `message`, and
+    `workspace` drive behavior in this issue; `job_type`,
+    `backend_name`, and `session_id` are debug metadata now and
+    forward-looking policy inputs for later issues (write-scope
+    routing, scheduled-job project binding).
+
+    Attributes:
+        chat_id: Mem0's user-isolation key. Accepts int or str
+            because different backends carry chat IDs differently;
+            the helper stringifies at the Mem0 boundary.
+        message: The raw user query to search against.
+        workspace: Active workspace path. The helper resolves it
+            through `detect_active_memory_project` to find the
+            active memory project.
+        job_type: Optional job-type tag (e.g. "interactive",
+            "scheduled"). Recorded in debug metadata.
+        backend_name: Optional backend identifier (e.g. "claude",
+            "codex"). Recorded in debug metadata.
+        session_id: Optional active session identifier when the
+            caller has one. Recorded in debug metadata.
+    """
+
+    chat_id: int | str
+    message: str
+    workspace: Path
+    job_type: str | None = None
+    backend_name: str | None = None
+    session_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ScopedMemoryHit:
+    """
+    A surviving memory row plus the per-row ranking signals.
+
+    The helper computes speaker/confidence/weight/adjusted-score
+    once and carries them here so downstream renderers and
+    shadow-mode loggers do not have to re-parse the metadata or
+    re-multiply the demote factor. `resolved_scope` carries the
+    full read-time scope interpretation so the per-hit channel can
+    surface legacy-default and invalid-default rows without a
+    second audit field on the debug payload.
+
+    Attributes:
+        result: The raw Mem0 row.
+        resolved_scope: Read-time scope interpretation from
+            `resolve_memory_scope`. Includes the legacy/invalid
+            default flags.
+        speaker: Resolved speaker class (user / assistant /
+            episode_summary), defaulted for legacy rows.
+        confidence: Resolved confidence in [0.0, 1.0].
+        speaker_weight: Lookup from `_SPEAKER_WEIGHTS` (falling
+            back to `_UNKNOWN_SPEAKER_WEIGHT` for unrecognized
+            speakers).
+        adjusted_score: `result.score * speaker_weight *
+            confidence`. Demote-only because both multipliers live
+            in (0.0, 1.0].
+    """
+
+    result: MemoryResult
+    resolved_scope: ResolvedMemoryScope
+    speaker: str
+    confidence: float
+    speaker_weight: float
+    adjusted_score: float
+
+
+@dataclass(frozen=True)
+class ScopedRetrievalDebug:
+    """
+    Observability payload from `retrieve_scoped_memories`.
+
+    Stable enough that shadow-mode logging (#546) can serialize it
+    directly without changing this helper. The helper itself does
+    not emit `memory.recall` or any other log line; it returns this
+    structure and lets the downstream logger decide what to record.
+
+    `reason` carries one of six stable strings:
+        disabled               - memory subsystem is disabled or
+                                 `_config` is unavailable. Not used
+                                 for "active project has
+                                 memory_enabled=False"; that case
+                                 still runs the helper and reports
+                                 `ok` / `no_results` / `no_results_after_scope`
+                                 / `all_below_floor`.
+        empty_query            - message stripped to empty.
+        no_results             - Mem0 returned zero candidates.
+        no_results_after_scope - candidates existed but none
+                                 survived scope admission.
+        all_below_floor        - scope-admitted candidates existed
+                                 but all fell below the raw-score
+                                 floor.
+        ok                     - at least one hit returned.
+
+    `excluded_by_scope` counts only exclusions (admission reasons
+    from `_scoped_memory_admission_reason`). Admitted rows that
+    were resolved as legacy- or invalid-default are visible
+    through `ScopedMemoryHit.resolved_scope`; the spec prefers the
+    per-hit channel over a second audit dict.
+    """
+
+    active_project_id: str | None
+    active_project_display_name: str | None
+    active_project_memory_enabled: bool | None
+    matched_workspace_root: str | None
+    allowed_scopes: tuple[str, ...]
+    allowed_project_id: str | None
+    reason: str
+    fetch_limit: int
+    floor: float
+    hits_raw: int
+    hits_after_scope: int
+    hits_after_floor: int
+    excluded_by_scope: dict[str, int]
+    query: str
+    user_id: str
+    backend_name: str | None
+    job_type: str | None
+    session_id: str | None
+
+
+@dataclass(frozen=True)
+class ScopedRetrievalResult:
+    """
+    Return type for `retrieve_scoped_memories`.
+
+    Bundles the per-row hit list and the debug metadata so the
+    helper's two outputs travel through async boundaries as one
+    value. Callers that only need hits read `result.hits`;
+    shadow-mode callers serialize `result.debug`.
+    """
+
+    hits: list[ScopedMemoryHit]
+    debug: ScopedRetrievalDebug
+
+
 # ── Singleton state ─────────────────────────────────────────────────
 
 # Module-level singleton, initialized by init_memory().
@@ -769,6 +929,72 @@ def build_scope_metadata(
         "scope_confidence": scope_confidence,
         "scope_source": scope_source,
     }
+
+
+# Stable exclusion-reason strings returned by
+# `_scoped_memory_admission_reason`. The strings appear as keys in
+# `ScopedRetrievalDebug.excluded_by_scope` and as discriminators in
+# shadow-mode logging, so they must stay stable across refactors -
+# downstream log readers will key on them.
+_ADMISSION_PROJECT_SCOPE_NOT_ALLOWED = "project_scope_not_allowed"
+_ADMISSION_PROJECT_SCOPE_MISSING_PROJECT_ID = "project_scope_missing_project_id"
+_ADMISSION_PROJECT_ID_MISMATCH = "project_id_mismatch"
+_ADMISSION_TASK_SCOPE_NOT_SUPPORTED = "task_scope_not_supported"
+_ADMISSION_UNKNOWN_SCOPE = "unknown_scope"
+
+
+def _scoped_memory_admission_reason(
+    resolved_scope: ResolvedMemoryScope,
+    *,
+    allowed_project_id: str | None,
+) -> str | None:
+    """
+    Decide whether a resolved row is admitted under the active
+    scope policy. Pure function, no I/O, no globals.
+
+    Returns None when the row is admitted. Returns a stable reason
+    string when excluded. Extracted as a separate helper so tests
+    can exercise the full admission matrix without invoking Mem0,
+    the project detector, or the singleton.
+
+    Admission matrix:
+    - scope=global: admit. (Includes rows that resolved to global
+      via legacy_default and invalid_default branches in
+      `resolve_memory_scope`; the per-hit `resolved_scope` channel
+      preserves the audit trail.)
+    - scope=project with allowed_project_id None: exclude as
+      `project_scope_not_allowed`. Covers both "no active project
+      detected" and "active project has memory_enabled=False"; the
+      debug payload distinguishes the two cases through the
+      active_project_* fields.
+    - scope=project with `resolved_scope.project_id` None: exclude
+      as `project_scope_missing_project_id`. Resolver branch 3 can
+      leave project rows with a None id; admission refuses to
+      guess.
+    - scope=project with mismatched project_id: exclude as
+      `project_id_mismatch`. The vocabulary-overlap failure mode
+      this whole epic guards against.
+    - scope=project with matching project_id: admit.
+    - scope=task: exclude as `task_scope_not_supported`. Task
+      retrieval semantics do not exist yet.
+    - Any other scope value reaching this helper: exclude as
+      `unknown_scope`. Defensive belt for future schema drift; in
+      practice the resolver never emits a non-recognized scope.
+    """
+    scope = resolved_scope.scope
+    if scope == SCOPE_GLOBAL:
+        return None
+    if scope == SCOPE_PROJECT:
+        if allowed_project_id is None:
+            return _ADMISSION_PROJECT_SCOPE_NOT_ALLOWED
+        if resolved_scope.project_id is None:
+            return _ADMISSION_PROJECT_SCOPE_MISSING_PROJECT_ID
+        if resolved_scope.project_id != allowed_project_id:
+            return _ADMISSION_PROJECT_ID_MISMATCH
+        return None
+    if scope == SCOPE_TASK:
+        return _ADMISSION_TASK_SCOPE_NOT_SUPPORTED
+    return _ADMISSION_UNKNOWN_SCOPE
 
 
 def _estimate_tokens(text: str) -> int:
@@ -1360,6 +1586,240 @@ async def format_context(
     payload["returned_empty"] = False
     _emit_recall_log(payload)
     return "\n".join(lines)
+
+
+async def retrieve_scoped_memories(
+    context: ScopedRetrievalContext,
+    *,
+    token_budget: int | None = None,
+    limit: int | None = None,
+) -> ScopedRetrievalResult:
+    """
+    Backend-neutral scoped retrieval helper.
+
+    Returns structured candidates plus debug metadata; does NOT
+    render prompt text and does NOT emit `memory.recall` (or any
+    other) log line. Live prompt injection still goes through
+    `format_context`; this helper is the shared read-path contract
+    that later prompt rendering, shadow-mode logging, and the
+    eventual read-path switch will consume.
+
+    Pipeline (filter-before-rank):
+
+    1. Validate memory/query state.
+    2. Detect the active memory project from `context.workspace`
+       and `_config.memory_projects`.
+    3. Build allowed scopes: always global; project too when an
+       active project is detected AND `memory_enabled=True`.
+    4. Run Mem0 `search` in an executor with the overfetch-
+       preserving limit.
+    5. Resolve each row's scope via `resolve_memory_scope`.
+    6. Apply scope admission (`_scoped_memory_admission_reason`)
+       BEFORE the raw-score floor, speaker/confidence weighting,
+       and the adjusted-score sort. This is the load-bearing
+       "filter-before-rank" property; applying scope later would
+       let wrong-project rows influence ranking and accounting.
+    7. Apply the raw cosine floor from
+       `_config.memory_search_floor`.
+    8. Resolve speaker/confidence once per surviving row, compute
+       `adjusted_score = r.score * speaker_weight * confidence`,
+       and sort descending. The multiplier sits in (0.0, 1.0] so
+       the adjusted score is demote-only.
+
+    Args:
+        context: Per-turn input. Only `chat_id`, `message`, and
+            `workspace` drive behavior in this issue. The other
+            fields ride through to debug metadata for shadow-mode
+            and future policy use.
+        token_budget: Forward-looking parameter so shadow-mode and
+            later renderers can request the same budget as live
+            `format_context`. Not consumed in this issue because
+            the helper does not render prompt lines.
+        limit: Caller-supplied limit, clamped up to
+            `_SEARCH_OVERFETCH` so scoped admission still has room
+            to discard wrong-scope rows.
+
+    Returns:
+        ScopedRetrievalResult with the ranked hit list and a
+        ScopedRetrievalDebug payload carrying active-project
+        fields, allowed scopes, counts at each pipeline stage,
+        per-reason exclusion counts, and the caller's per-turn
+        context fields.
+    """
+    # Forward-looking: accepted so callers can pass it through
+    # unchanged once #545/#546 wire prompt rendering and shadow-mode
+    # logging. Reading it once silences static analysis about an
+    # unused-but-required parameter.
+    _ = token_budget
+
+    user_id_str = str(context.chat_id)
+    query = context.message
+
+    # Mutable debug-source values populated as the pipeline
+    # advances. Captured by the inner builder closure so the early-
+    # exit short-circuits read whatever state the pipeline reached
+    # before bailing out.
+    active_project = None
+    allowed_scopes: tuple[str, ...] = ()
+    allowed_project_id: str | None = None
+    fetch_limit = 0
+    floor = 0.0
+
+    def _build_debug(
+        reason: str,
+        *,
+        hits_raw: int = 0,
+        hits_after_scope: int = 0,
+        hits_after_floor: int = 0,
+        excluded: dict[str, int] | None = None,
+    ) -> ScopedRetrievalDebug:
+        return ScopedRetrievalDebug(
+            active_project_id=active_project.project_id if active_project else None,
+            active_project_display_name=active_project.display_name if active_project else None,
+            active_project_memory_enabled=active_project.memory_enabled if active_project else None,
+            matched_workspace_root=str(active_project.matched_root) if active_project else None,
+            allowed_scopes=allowed_scopes,
+            allowed_project_id=allowed_project_id,
+            reason=reason,
+            fetch_limit=fetch_limit,
+            floor=floor,
+            hits_raw=hits_raw,
+            hits_after_scope=hits_after_scope,
+            hits_after_floor=hits_after_floor,
+            excluded_by_scope=excluded if excluded is not None else {},
+            query=query,
+            user_id=user_id_str,
+            backend_name=context.backend_name,
+            job_type=context.job_type,
+            session_id=context.session_id,
+        )
+
+    # Step 1: validate memory/query state. The two short-circuits
+    # below mirror format_context's contract so a disabled
+    # subsystem or an empty user query produces an empty result
+    # without touching the executor or Mem0.
+    if not is_enabled() or _config is None:
+        return ScopedRetrievalResult(hits=[], debug=_build_debug("disabled"))
+    if not query.strip():
+        return ScopedRetrievalResult(hits=[], debug=_build_debug("empty_query"))
+
+    # Step 2: detect active project. Function-local import keeps
+    # config.py's import surface lean and matches the pattern from
+    # #543's lazy import of the scope constants.
+    from kai.memory_projects import detect_active_memory_project
+
+    active_project = detect_active_memory_project(context.workspace, _config.memory_projects)
+
+    # Step 3: build allowed scopes. Project scope is admitted only
+    # when an active project is detected AND that project has
+    # memory enabled. A disabled active project is preserved in
+    # debug metadata (active_project_memory_enabled=False) but
+    # produces global-only allowed scopes, matching D4.
+    if active_project is not None and active_project.memory_enabled:
+        allowed_scopes = ("global", "project")
+        allowed_project_id = active_project.project_id
+    else:
+        allowed_scopes = ("global",)
+        allowed_project_id = None
+
+    # Step 4: read floor and overfetch-preserving fetch limit from
+    # config; mirrors format_context so a `MEMORY_SEARCH_FLOOR`
+    # change applied via service restart takes effect consistently.
+    # The max() against _SEARCH_OVERFETCH keeps the candidate pool
+    # large enough for scope admission to discard wrong-scope rows
+    # without immediately starving the rest of the pipeline.
+    floor = _config.memory_search_floor
+    base_limit = limit if limit is not None else _config.memory_search_limit
+    fetch_limit = max(base_limit, _SEARCH_OVERFETCH)
+
+    loop = asyncio.get_running_loop()
+    results = await loop.run_in_executor(
+        None,
+        lambda: search(query, user_id=user_id_str, limit=fetch_limit),
+    )
+    hits_raw = len(results)
+
+    if not results:
+        return ScopedRetrievalResult(hits=[], debug=_build_debug("no_results"))
+
+    # Step 5: resolve scope per row. The pairs persist through the
+    # admission and floor steps so the per-row ScopedMemoryHit can
+    # carry the resolver output (legacy_defaulted / invalid_defaulted
+    # flags) without re-parsing metadata.
+    resolved_rows: list[tuple[MemoryResult, ResolvedMemoryScope]] = [
+        (r, resolve_memory_scope(r.metadata)) for r in results
+    ]
+
+    # Step 6: scope admission. Exclusion reasons are tallied per
+    # stable key so shadow-mode logs can compare excluded counts
+    # across the same query under legacy and scoped retrieval.
+    admitted: list[tuple[MemoryResult, ResolvedMemoryScope]] = []
+    excluded: dict[str, int] = {}
+    for r, resolved in resolved_rows:
+        reason = _scoped_memory_admission_reason(resolved, allowed_project_id=allowed_project_id)
+        if reason is None:
+            admitted.append((r, resolved))
+        else:
+            excluded[reason] = excluded.get(reason, 0) + 1
+
+    hits_after_scope = len(admitted)
+    if hits_after_scope == 0:
+        return ScopedRetrievalResult(
+            hits=[],
+            debug=_build_debug("no_results_after_scope", hits_raw=hits_raw, excluded=excluded),
+        )
+
+    # Step 7: raw cosine floor. Same comparison as format_context:
+    # the floor runs against r.score (raw cosine), before
+    # speaker/confidence weighting, so the demote-only invariant
+    # cannot rescue a below-floor row.
+    after_floor: list[tuple[MemoryResult, ResolvedMemoryScope]] = [pair for pair in admitted if pair[0].score >= floor]
+    hits_after_floor = len(after_floor)
+    if hits_after_floor == 0:
+        return ScopedRetrievalResult(
+            hits=[],
+            debug=_build_debug(
+                "all_below_floor",
+                hits_raw=hits_raw,
+                hits_after_scope=hits_after_scope,
+                excluded=excluded,
+            ),
+        )
+
+    # Step 8: per-row ranking. Resolve (speaker, confidence) ONCE
+    # via _read_time_speaker (same pattern format_context uses to
+    # avoid double-parsing metadata) and compute the demote-only
+    # multiplier from those two factors directly. Carrying every
+    # signal on ScopedMemoryHit means downstream renderers and
+    # shadow-mode loggers do not have to redo this work.
+    hits: list[ScopedMemoryHit] = []
+    for r, resolved in after_floor:
+        speaker, confidence = _read_time_speaker(r.metadata)
+        weight = _SPEAKER_WEIGHTS.get(speaker, _UNKNOWN_SPEAKER_WEIGHT)
+        adjusted = r.score * weight * confidence
+        hits.append(
+            ScopedMemoryHit(
+                result=r,
+                resolved_scope=resolved,
+                speaker=speaker,
+                confidence=confidence,
+                speaker_weight=weight,
+                adjusted_score=adjusted,
+            )
+        )
+
+    hits.sort(key=lambda h: h.adjusted_score, reverse=True)
+
+    return ScopedRetrievalResult(
+        hits=hits,
+        debug=_build_debug(
+            "ok",
+            hits_raw=hits_raw,
+            hits_after_scope=hits_after_scope,
+            hits_after_floor=hits_after_floor,
+            excluded=excluded,
+        ),
+    )
 
 
 def count_by_source(user_id: str, source: str) -> int:
