@@ -1845,6 +1845,15 @@ async def retrieve_scoped_memories(
 # may use the full available budget.
 _SCOPED_GLOBAL_ROW_CAP_WHEN_PROJECT = 5
 
+# Blank-line separator inserted between scoped sections when both
+# global and project sections render. Defined as a constant so the
+# budget-accounting charge below and the final join below share one
+# source of truth. Today `_estimate_tokens` returns 0 for this
+# literal, but any future change to the estimator (e.g. charging for
+# whitespace) would otherwise drift between the charge and the
+# rendered text and silently overrun the intended budget.
+_SCOPED_SECTION_SEPARATOR = "\n\n"
+
 
 def _scoped_project_header(display_name: str | None) -> str:
     """
@@ -1969,9 +1978,10 @@ def format_scoped_context(
         if not hits:
             return
         # Reserve separator cost if another section already rendered.
-        # _estimate_tokens("") is zero today, but the explicit charge
-        # keeps the budget walk honest if that ever changes.
-        sep_cost = _estimate_tokens("") if rendered_sections else 0
+        # Use the same literal that the final join produces so the
+        # charge and the rendered text cannot drift if a future
+        # `_estimate_tokens` starts charging for whitespace.
+        sep_cost = _estimate_tokens(_SCOPED_SECTION_SEPARATOR) if rendered_sections else 0
         budget_for_section = token_budget - used_total - sep_cost
         header_tokens = _estimate_tokens(header)
         first_line = _format_memory_result_line(hits[0].result)
@@ -1998,8 +2008,9 @@ def format_scoped_context(
 
     # Blank line between sections gives the model a visible
     # boundary. join() over one section produces no separator;
-    # over two it inserts a single blank line.
-    return "\n\n".join("\n".join(section) for section in rendered_sections)
+    # over two it inserts a single blank line. Same separator
+    # literal that the budget charge above used.
+    return _SCOPED_SECTION_SEPARATOR.join("\n".join(section) for section in rendered_sections)
 
 
 def count_by_source(user_id: str, source: str) -> int:
