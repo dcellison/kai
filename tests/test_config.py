@@ -4,6 +4,7 @@ import logging
 import os
 import pwd
 import subprocess
+import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +16,7 @@ from kai.config import (
     ModelRole,
     UserConfig,
     _check_model_registry_complete,
+    _load_memory_project_configs,
     _read_protected_file,
     get_model_for,
     load_config,
@@ -2649,3 +2651,414 @@ class TestLoadConfigBackendAwareModelValidation:
         self._env(monkeypatch, AGENT_BACKEND="codex", DEFAULT_MODEL="gpt-5.5")
         cfg = load_config()
         assert cfg.default_model == "gpt-5.5"
+
+
+# ── Memory project registry loader (memory-projects.yaml) ────────────
+
+
+class TestLoadMemoryProjects:
+    """Tests for `_load_memory_project_configs()` and the
+    surrounding integration with `load_config()`.
+
+    The loader is fail-closed by design: malformed entries are
+    skipped (logged) so detection later returns no project rather
+    than producing accidental project-scoped recall. These tests
+    pin that posture across every validation rule plus the
+    interaction with `Config.allowed_workspaces`.
+    """
+
+    def _write_yaml(self, tmp_path: Path, content: str) -> Path:
+        """Write a memory-projects.yaml under tmp_path; PROJECT_ROOT
+        is patched to tmp_path so the loader's local-fallback branch
+        picks it up without touching real config files."""
+        yaml_file = tmp_path / "memory-projects.yaml"
+        yaml_file.write_text(textwrap.dedent(content))
+        return yaml_file
+
+    def test_load_memory_projects_from_local_yaml(self, tmp_path):
+        """Parses a valid two-project file and returns canonical
+        resolved roots, the strict bool memory_enabled value, and
+        the optional default-scope policy."""
+        root_a = tmp_path / "project_a"
+        root_a.mkdir()
+        root_b = tmp_path / "project_b"
+        root_b.mkdir()
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            projects:
+              - project_id: alpha
+                display_name: Alpha
+                workspace_roots:
+                  - {root_a}
+                memory_enabled: true
+                default_scope_for_new_facts: project
+              - project_id: beta
+                display_name: Beta
+                workspace_roots:
+                  - {root_b}
+                memory_enabled: false
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_memory_project_configs()
+
+        assert set(configs.keys()) == {"alpha", "beta"}
+        assert configs["alpha"].display_name == "Alpha"
+        assert configs["alpha"].workspace_roots == (root_a.resolve(),)
+        assert configs["alpha"].memory_enabled is True
+        assert configs["alpha"].default_scope_for_new_facts == "project"
+        assert configs["beta"].memory_enabled is False
+        assert configs["beta"].default_scope_for_new_facts is None
+
+    def test_memory_projects_absent_defaults_empty(self, tmp_path):
+        """Neither protected nor local file exists -> empty dict."""
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_memory_project_configs()
+        assert configs == {}
+
+    def test_malformed_protected_memory_projects_returns_empty(self, tmp_path, caplog):
+        """A malformed protected file fails closed at empty rather
+        than silently falling through to the local-dev file. Pinning
+        this stops a future refactor from re-introducing the
+        dev-config-on-prod failure mode."""
+        # _YAML_MALFORMED is the sentinel _read_protected_yaml returns
+        # when YAML parsing fails. We import it from kai.config to
+        # avoid leaking the sentinel value into the test surface.
+        from kai.config import _YAML_MALFORMED
+
+        # Even with a perfectly valid local file present, malformed
+        # protected stops loading. Write the local file too so the
+        # test would fail loudly if the fallthrough regressed.
+        root = tmp_path / "p"
+        root.mkdir()
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            projects:
+              - project_id: should_not_load
+                display_name: Nope
+                workspace_roots:
+                  - {root}
+                memory_enabled: true
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=_YAML_MALFORMED),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+            caplog.at_level("WARNING", logger="kai.config"),
+        ):
+            configs = _load_memory_project_configs()
+
+        assert configs == {}
+        assert "malformed" in caplog.text.lower() or "malformed" in caplog.text
+
+    def test_invalid_memory_project_entry_is_skipped(self, tmp_path, caplog):
+        """A missing required field on one entry skips only that
+        entry; subsequent valid entries still load."""
+        good_root = tmp_path / "good"
+        good_root.mkdir()
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            projects:
+              - display_name: Missing Project Id
+                workspace_roots:
+                  - {good_root}
+                memory_enabled: true
+              - project_id: good
+                display_name: Good
+                workspace_roots:
+                  - {good_root}
+                memory_enabled: true
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+            caplog.at_level("WARNING", logger="kai.config"),
+        ):
+            configs = _load_memory_project_configs()
+
+        assert list(configs.keys()) == ["good"]
+
+    def test_memory_project_requires_boolean_memory_enabled(self, tmp_path):
+        """memory_enabled set to a string is rejected outright. The
+        loader does not coerce; the operator must use a real YAML
+        bool."""
+        root = tmp_path / "p"
+        root.mkdir()
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            projects:
+              - project_id: p
+                display_name: P
+                workspace_roots:
+                  - {root}
+                memory_enabled: "true"
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_memory_project_configs()
+        assert configs == {}
+
+    def test_memory_project_requires_boolean_memory_enabled_rejects_yaml_truthy_non_bools(self, tmp_path):
+        """Beyond the "true" string, YAML's other truthy non-bools
+        (int 1/0 and "yes"/"no" strings) must also be rejected. Each
+        variant gets its own project so a single passing variant
+        cannot mask the others."""
+        root = tmp_path / "p"
+        root.mkdir()
+        # YAML 1.1 would parse "yes" as bool True; PyYAML's default
+        # safe_load is YAML 1.1, so "yes" already comes through as a
+        # real bool. To genuinely test the "string yes" rejection we
+        # quote it, forcing it to remain a string after parsing.
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            projects:
+              - project_id: int_one
+                display_name: One
+                workspace_roots:
+                  - {root}
+                memory_enabled: 1
+              - project_id: int_zero
+                display_name: Zero
+                workspace_roots:
+                  - {root}
+                memory_enabled: 0
+              - project_id: str_yes
+                display_name: Yes
+                workspace_roots:
+                  - {root}
+                memory_enabled: "yes"
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_memory_project_configs()
+        # None of the three should have made it through; coercion of
+        # YAML truthy non-bools is the failure mode we are gating.
+        assert configs == {}
+
+    def test_memory_project_rejects_invalid_default_scope(self, tmp_path):
+        """default_scope_for_new_facts is gated to SCOPE_GLOBAL or
+        SCOPE_PROJECT. SCOPE_TASK is not a write target in this
+        issue and must be rejected; arbitrary strings likewise."""
+        root = tmp_path / "p"
+        root.mkdir()
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            projects:
+              - project_id: task_scope
+                display_name: T
+                workspace_roots:
+                  - {root}
+                memory_enabled: true
+                default_scope_for_new_facts: task
+              - project_id: nonsense
+                display_name: N
+                workspace_roots:
+                  - {root}
+                memory_enabled: true
+                default_scope_for_new_facts: not_a_scope
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_memory_project_configs()
+        assert configs == {}
+
+    def test_memory_project_allows_nonexistent_roots(self, tmp_path):
+        """Roots are NOT required to exist at load time. Registry
+        may be authored before checkout exists or while a mount is
+        unavailable; detection's longest-prefix match handles the
+        absent-root case by failing to match (no false positive)."""
+        nonexistent = tmp_path / "does_not_exist_yet"
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            projects:
+              - project_id: ghost
+                display_name: Ghost
+                workspace_roots:
+                  - {nonexistent}
+                memory_enabled: true
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_memory_project_configs()
+        assert "ghost" in configs
+        # Root is still resolved canonically even though it does not
+        # exist. resolve() on a non-existing path returns the
+        # absolute form without raising on macOS/Linux.
+        assert configs["ghost"].workspace_roots == (nonexistent.resolve(),)
+
+    def test_duplicate_memory_project_id_uses_first(self, tmp_path, caplog):
+        """When the same project_id appears twice, the first entry
+        wins and the later entry is logged + skipped. Pins the
+        documented duplicate-id behavior."""
+        root_a = tmp_path / "first"
+        root_a.mkdir()
+        root_b = tmp_path / "second"
+        root_b.mkdir()
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            projects:
+              - project_id: dup
+                display_name: First
+                workspace_roots:
+                  - {root_a}
+                memory_enabled: true
+              - project_id: dup
+                display_name: Second
+                workspace_roots:
+                  - {root_b}
+                memory_enabled: false
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+            caplog.at_level("WARNING", logger="kai.config"),
+        ):
+            configs = _load_memory_project_configs()
+        assert configs["dup"].display_name == "First"
+        assert configs["dup"].memory_enabled is True
+        assert "duplicate project_id" in caplog.text
+
+    def test_duplicate_memory_project_root_drops_later_duplicate_root(self, tmp_path, caplog):
+        """When two distinct projects list the same root, the root
+        is dropped from the LATER project only. The later project
+        survives with its remaining unique roots."""
+        shared_root = tmp_path / "shared"
+        shared_root.mkdir()
+        unique_root = tmp_path / "unique"
+        unique_root.mkdir()
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            projects:
+              - project_id: first_owner
+                display_name: First
+                workspace_roots:
+                  - {shared_root}
+                memory_enabled: true
+              - project_id: second_owner
+                display_name: Second
+                workspace_roots:
+                  - {shared_root}
+                  - {unique_root}
+                memory_enabled: true
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+            caplog.at_level("WARNING", logger="kai.config"),
+        ):
+            configs = _load_memory_project_configs()
+        assert "first_owner" in configs
+        assert "second_owner" in configs
+        # The shared root went to first_owner; second_owner keeps
+        # only its unique root.
+        assert configs["first_owner"].workspace_roots == (shared_root.resolve(),)
+        assert configs["second_owner"].workspace_roots == (unique_root.resolve(),)
+        assert "already owned" in caplog.text
+
+    def test_duplicate_memory_project_root_drops_project_when_no_roots_remain(self, tmp_path, caplog):
+        """When ALL of a later project's roots are duplicates of an
+        earlier project's roots, the entire later project is dropped
+        so detection never returns a project with no roots to match
+        against."""
+        shared_root = tmp_path / "shared"
+        shared_root.mkdir()
+        self._write_yaml(
+            tmp_path,
+            f"""\
+            projects:
+              - project_id: first_owner
+                display_name: First
+                workspace_roots:
+                  - {shared_root}
+                memory_enabled: true
+              - project_id: orphaned
+                display_name: Orphaned
+                workspace_roots:
+                  - {shared_root}
+                memory_enabled: true
+            """,
+        )
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+            caplog.at_level("WARNING", logger="kai.config"),
+        ):
+            configs = _load_memory_project_configs()
+        assert "first_owner" in configs
+        assert "orphaned" not in configs
+        assert "no valid workspace_roots remain" in caplog.text
+
+    def test_memory_project_roots_do_not_extend_allowed_workspaces(self, monkeypatch, tmp_path):
+        """End-to-end load_config check: registry roots must NOT
+        sneak into Config.allowed_workspaces. Workspace access is
+        still owned by ALLOWED_WORKSPACES / workspaces.yaml; the
+        memory registry describes scope, not access."""
+        # Start with a fully minimal env to keep this independent of
+        # other env-based test pollution.
+        for v in _CONFIG_ENV_VARS:
+            monkeypatch.delenv(v, raising=False)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+        monkeypatch.setenv("ALLOWED_USER_IDS", "12345")
+        monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
+
+        registry_root = tmp_path / "registry_root"
+        registry_root.mkdir()
+        # Write only the memory-projects.yaml; do NOT add the root to
+        # workspaces.yaml or ALLOWED_WORKSPACES. The assertion is that
+        # the registry root does not pull itself into allowed access.
+        yaml_file = tmp_path / "memory-projects.yaml"
+        yaml_file.write_text(
+            textwrap.dedent(
+                f"""\
+                projects:
+                  - project_id: scope_only
+                    display_name: Scope Only
+                    workspace_roots:
+                      - {registry_root}
+                    memory_enabled: true
+                """
+            )
+        )
+
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            cfg = load_config()
+
+        # Registry loaded the project as expected.
+        assert "scope_only" in cfg.memory_projects
+        assert cfg.memory_projects["scope_only"].workspace_roots == (registry_root.resolve(),)
+        # ...but did NOT promote its root into allowed_workspaces.
+        assert registry_root.resolve() not in cfg.allowed_workspaces
+        assert registry_root not in cfg.allowed_workspaces

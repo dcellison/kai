@@ -1,0 +1,60 @@
+# Memory project registry for Kai.
+#
+# Copy to memory-projects.yaml (or /etc/kai/memory-projects.yaml for
+# protected installations) and customize.
+#
+# This registry maps workspace paths to memory authority boundaries.
+# It is separate from workspaces.yaml on purpose: workspaces.yaml
+# answers "how should the backend run in this directory?" (model,
+# system prompt, env) while this file answers "what memory authority
+# boundary does this directory belong to?" The two often overlap on
+# paths but should not be conflated.
+#
+# Entries here do NOT grant workspace access. Workspace access is
+# still owned by users.yaml and /workspace configuration. A registry
+# entry only describes the memory scope for a workspace the operator
+# is otherwise allowed to enter.
+#
+# Each entry must define:
+#   project_id          stable identifier, used as the registry key
+#                       and stored on memory rows in the project_id
+#                       field. Surrounding whitespace is stripped at
+#                       load time.
+#   display_name        human-readable name for logs and operator UI.
+#   workspace_roots     non-empty list of absolute paths whose
+#                       descendants belong to this project. Paths
+#                       are resolved (~ expanded, symlinks followed)
+#                       at load time and do not need to exist yet.
+#                       When multiple registered roots match the
+#                       current path, the longest matching root wins.
+#                       Duplicate roots across projects are dropped
+#                       from the later project.
+#   memory_enabled      true or false (real YAML booleans only;
+#                       "true"/"yes"/1 are rejected). Disabled
+#                       projects are still detectable for logs but
+#                       cannot use project-scoped retrieval or
+#                       writes.
+#
+# Optional:
+#   default_scope_for_new_facts   either "global" or "project". A
+#                                 policy hint for the future
+#                                 write-scope routing path. Inert
+#                                 today.
+
+projects:
+  # Example: enabled project with two roots
+  # - project_id: kai
+  #   display_name: Kai
+  #   workspace_roots:
+  #     - /Users/kai/Projects/kai
+  #     - /var/lib/kai/home/2114582497
+  #   memory_enabled: true
+  #   default_scope_for_new_facts: project
+
+  # Example: known project with memory off (detectable but no
+  # project-scoped retrieval or writes)
+  # - project_id: experimental
+  #   display_name: Experimental
+  #   workspace_roots:
+  #     - /Users/kai/Projects/experimental
+  #   memory_enabled: false

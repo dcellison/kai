@@ -490,6 +490,50 @@ class WorkspaceConfig:
     system_prompt_file: Path | None = None
 
 
+# ── Memory project registry ──────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class MemoryProjectConfig:
+    """
+    Per-project memory configuration loaded from memory-projects.yaml.
+
+    The memory project registry answers "what memory authority
+    boundary does this directory belong to?" - a separate question
+    from WorkspaceConfig's "how should the backend run in this
+    directory?" The two surfaces overlap on paths but not on meaning;
+    keeping them separate avoids accidentally enabling project memory
+    just because a workspace has a prompt or model override.
+
+    Attributes:
+        project_id: Stable identifier used as the registry key and as
+            the value stored in memory rows' `project_id` field.
+            Normalized at load time by stripping surrounding
+            whitespace.
+        display_name: Human-readable name used in logs and future
+            operator UI.
+        workspace_roots: Canonical resolved absolute paths whose
+            descendants belong to this project. Stored as a tuple
+            because MemoryProjectConfig is frozen and equality should
+            treat root order as significant for the longest-prefix
+            tie-breaker.
+        memory_enabled: When False, the project is still detectable
+            for logs and diagnostics, but later retrieval and write
+            paths treat it as global-only.
+        default_scope_for_new_facts: Optional policy hint for the
+            future write-scope routing path. Only `kai.memory.SCOPE_GLOBAL`
+            or `kai.memory.SCOPE_PROJECT` are accepted; `SCOPE_TASK` is
+            not because task scope is not a write target yet. The
+            field is inert until the write-routing issue lands.
+    """
+
+    project_id: str
+    display_name: str
+    workspace_roots: tuple[Path, ...]
+    memory_enabled: bool
+    default_scope_for_new_facts: str | None = None
+
+
 # ── Per-user configuration ──────────────────────────────────────────
 
 
@@ -670,6 +714,14 @@ class Config:
     # Per-workspace configuration from workspaces.yaml. Keyed by
     # canonical resolved path. Empty dict if no config file exists.
     workspace_configs: dict[Path, WorkspaceConfig] = field(default_factory=dict)
+
+    # Memory project registry from memory-projects.yaml. Keyed by
+    # project_id. Empty dict if no config file exists. The detector
+    # in kai.memory_projects consumes this; no retrieval or write
+    # routing path reads it yet (those land in #544 and later).
+    # Workspace access is still owned by allowed_workspaces and is
+    # NOT extended by registry roots.
+    memory_projects: dict[str, MemoryProjectConfig] = field(default_factory=dict)
 
     # User separation: run Claude as a different OS user for process isolation.
     # When set, the bot spawns Claude via 'sudo -u <user> claude ...'.
@@ -1164,6 +1216,226 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
             env_file=env_file,
             system_prompt=system_prompt,
             system_prompt_file=system_prompt_file,
+        )
+
+    return configs
+
+
+def _load_memory_project_configs() -> dict[str, MemoryProjectConfig]:
+    """
+    Load the memory project registry from memory-projects.yaml.
+
+    Tries /etc/kai/memory-projects.yaml first (protected
+    installation), falls back to PROJECT_ROOT/memory-projects.yaml
+    (development). Returns an empty dict if neither file exists.
+
+    The registry is keyed by project_id. Each MemoryProjectConfig
+    holds the canonical resolved workspace_roots tuple plus the
+    enablement flag and optional default-scope policy. Detection
+    logic lives in kai.memory_projects and consumes this dict.
+
+    Validation is fail-closed: any malformed entry is skipped (with
+    a warning) so an unmatched cwd returns no active project rather
+    than producing accidental project-scoped recall. Path existence
+    is NOT required at load time; registry config may be authored
+    before a checkout exists or while a mount is unavailable, and
+    detection's longest-prefix match handles the absent-root case
+    naturally by failing to match.
+
+    Duplicate handling:
+    - Duplicate project_id: first entry wins, later entries logged
+      and skipped.
+    - Duplicate workspace_root across distinct projects: the root is
+      dropped from the later project only. If the later project ends
+      up with no roots, the whole project is also skipped.
+    """
+    # Mirrors _load_workspace_configs: protected-first, fall back to
+    # PROJECT_ROOT for dev. A malformed protected file does NOT fall
+    # through to the local file (avoid silently using dev config on
+    # a production system); fail closed with an empty registry
+    # instead.
+    data = _read_protected_yaml("memory-projects.yaml")
+    if data is _YAML_MALFORMED:
+        log.warning("Skipping memory project registry: /etc/kai/memory-projects.yaml is malformed or empty")
+        return {}
+    if data is None:
+        local_path = PROJECT_ROOT / "memory-projects.yaml"
+        if not local_path.exists():
+            return {}
+        try:
+            with open(local_path) as f:
+                data = yaml.safe_load(f)
+        except (yaml.YAMLError, OSError) as e:
+            log.error("Cannot load %s: %s", local_path, e)
+            return {}
+        if not isinstance(data, dict):
+            log.warning("%s: expected a YAML dict, got %s", local_path, type(data).__name__)
+            return {}
+
+    entries = data.get("projects")
+    if not isinstance(entries, list):
+        if entries is not None:
+            log.warning(
+                "memory-projects.yaml: 'projects' must be a list, got %s",
+                type(entries).__name__,
+            )
+        return {}
+
+    # Lazy import: kai.memory imports kai.config at module load time,
+    # so importing the scope constants at module scope here would
+    # create a circular import. Importing inside the function body
+    # breaks the cycle and keeps config.py's import surface lean.
+    from kai.memory import SCOPE_GLOBAL, SCOPE_PROJECT
+
+    valid_default_scopes = {SCOPE_GLOBAL, SCOPE_PROJECT}
+
+    configs: dict[str, MemoryProjectConfig] = {}
+    # Track which resolved root path is already owned by which
+    # project_id so the "drop duplicate root from later project"
+    # rule is enforceable across the loop.
+    root_owners: dict[Path, str] = {}
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            log.warning("memory-projects.yaml: skipping non-dict entry: %s", entry)
+            continue
+
+        # project_id: non-empty string after whitespace strip.
+        raw_project_id = entry.get("project_id")
+        if not isinstance(raw_project_id, str):
+            log.warning(
+                "memory-projects.yaml: skipping entry; project_id must be a string, got %s",
+                type(raw_project_id).__name__,
+            )
+            continue
+        project_id = raw_project_id.strip()
+        if not project_id:
+            log.warning("memory-projects.yaml: skipping entry with empty project_id")
+            continue
+
+        # First-wins on duplicate project_id.
+        if project_id in configs:
+            log.warning(
+                "memory-projects.yaml: duplicate project_id %r; using first entry",
+                project_id,
+            )
+            continue
+
+        # display_name: non-empty string.
+        display_name = entry.get("display_name")
+        if not isinstance(display_name, str) or not display_name.strip():
+            log.warning(
+                "memory-projects.yaml: skipping project %r; display_name must be a non-empty string",
+                project_id,
+            )
+            continue
+
+        # memory_enabled: strict boolean. YAML truthy values like
+        # "true", "yes", 1 must NOT be coerced; force a hard reject
+        # so the operator notices the typo at load time. bool is a
+        # subclass of int in Python, so even though isinstance(True,
+        # int) is True, isinstance(1, bool) is False, which gives
+        # the correct rejection here.
+        memory_enabled = entry.get("memory_enabled")
+        if not isinstance(memory_enabled, bool):
+            log.warning(
+                "memory-projects.yaml: skipping project %r; memory_enabled must be a real boolean (true/false), got %r",
+                project_id,
+                memory_enabled,
+            )
+            continue
+
+        # workspace_roots: non-empty list of paths. Each is resolved
+        # (expanduser + resolve) but NOT required to exist - registry
+        # config may pre-date a checkout. Cross-project duplicates
+        # are dropped from later projects via the root_owners gate.
+        raw_roots = entry.get("workspace_roots")
+        if not isinstance(raw_roots, list) or not raw_roots:
+            log.warning(
+                "memory-projects.yaml: skipping project %r; workspace_roots must be a non-empty list",
+                project_id,
+            )
+            continue
+
+        resolved_roots: list[Path] = []
+        intra_project_seen: set[Path] = set()
+        for raw_root in raw_roots:
+            if not isinstance(raw_root, (str, Path)):
+                log.warning(
+                    "memory-projects.yaml: project %r: skipping non-string root %r",
+                    project_id,
+                    raw_root,
+                )
+                continue
+            try:
+                resolved = Path(str(raw_root)).expanduser().resolve()
+            except (OSError, ValueError) as e:
+                log.warning(
+                    "memory-projects.yaml: project %r: cannot resolve root %r: %s",
+                    project_id,
+                    raw_root,
+                    e,
+                )
+                continue
+            # Within-project duplicate: keep first only.
+            if resolved in intra_project_seen:
+                log.warning(
+                    "memory-projects.yaml: project %r: duplicate root %s within project; keeping first",
+                    project_id,
+                    resolved,
+                )
+                continue
+            # Cross-project duplicate: drop from the LATER project.
+            owner = root_owners.get(resolved)
+            if owner is not None:
+                log.warning(
+                    "memory-projects.yaml: root %s already owned by project %r; dropping from %r",
+                    resolved,
+                    owner,
+                    project_id,
+                )
+                continue
+            intra_project_seen.add(resolved)
+            resolved_roots.append(resolved)
+
+        if not resolved_roots:
+            # All roots were duplicates or malformed; drop the
+            # project entirely so detection never returns a project
+            # with no roots to match against.
+            log.warning(
+                "memory-projects.yaml: skipping project %r; no valid workspace_roots remain after deduplication",
+                project_id,
+            )
+            continue
+
+        # default_scope_for_new_facts: optional. When present, must
+        # match SCOPE_GLOBAL or SCOPE_PROJECT. SCOPE_TASK is rejected
+        # because task scope is not a write target in this issue.
+        default_scope = entry.get("default_scope_for_new_facts")
+        if default_scope is not None and (
+            not isinstance(default_scope, str) or default_scope not in valid_default_scopes
+        ):
+            log.warning(
+                "memory-projects.yaml: skipping project %r; default_scope_for_new_facts must be %r or %r, got %r",
+                project_id,
+                SCOPE_GLOBAL,
+                SCOPE_PROJECT,
+                default_scope,
+            )
+            continue
+
+        # Record ownership only after every validation has passed so
+        # a rejected project does not "claim" a root and lock it out
+        # of a later valid project.
+        for resolved in resolved_roots:
+            root_owners[resolved] = project_id
+
+        configs[project_id] = MemoryProjectConfig(
+            project_id=project_id,
+            display_name=display_name,
+            workspace_roots=tuple(resolved_roots),
+            memory_enabled=memory_enabled,
+            default_scope_for_new_facts=default_scope,
         )
 
     return configs
@@ -2062,6 +2334,16 @@ def load_config() -> Config:
             seen_allowed.add(p)
             allowed_workspaces.append(p)
 
+    # Memory project registry. Loaded independently of workspace_configs
+    # because memory authority and backend overrides are different
+    # concepts that happen to overlap on paths. Memory project roots
+    # are NOT merged into allowed_workspaces: workspace access is
+    # still owned by /workspace access configuration. Per-user
+    # workspace permissions still gate which workspaces the operator
+    # can enter; the registry only describes the memory boundary of
+    # workspaces the user is otherwise allowed to enter.
+    memory_projects = _load_memory_project_configs()
+
     # Per-user configuration. If users.yaml exists, it is authoritative;
     # ALLOWED_USER_IDS is ignored. If users.yaml does not exist,
     # ALLOWED_USER_IDS works as before (backward-compatible).
@@ -2233,6 +2515,7 @@ def load_config() -> Config:
         workspace_base=workspace_base,
         allowed_workspaces=allowed_workspaces,
         workspace_configs=workspace_configs,
+        memory_projects=memory_projects,
         claude_user=os.environ.get("CLAUDE_USER") or None,
         pr_review_enabled=pr_review_enabled,
         pr_review_cooldown=pr_review_cooldown,
