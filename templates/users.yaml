@@ -35,10 +35,13 @@ users:
     # context_window: 200000  # context window in tokens (0 = default)
 
     # Agent backend. Overrides the global AGENT_BACKEND from .env for
-    # this user only. Default is "claude" (Claude Code CLI). Set to
-    # "goose" to use Goose ACP with the specified LLM provider.
+    # this user only. Default is "claude" (Claude Code CLI). Other
+    # options: "goose" (Goose ACP, requires llm_provider + API key),
+    # "codex" (OpenAI Codex CLI), "opencode" (OpenCode ACP; model is
+    # a full "provider/model" ID, auth managed by `opencode auth login`).
     # agent_backend: goose
-    # llm_provider: openai    # required for non-Claude backends
+    # llm_provider: openai    # required for goose; ignored for opencode
+    # model: anthropic/claude-sonnet-4-6   # opencode example (full provider/model ID)
 
     # GitHub notification settings. github_repos controls which repos
     # route events to this user. pr_review and issue_triage toggle

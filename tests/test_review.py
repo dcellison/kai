@@ -1128,6 +1128,37 @@ class TestRunReviewGoose:
             await run_review("prompt", agent_backend="goose", provider="")
 
 
+class TestRunReviewRejectsOpenCode:
+    """
+    OpenCode has no one-shot reasoner; run_review must surface this
+    as a clean ValueError rather than silently dispatching the
+    Claude branch (which would spawn `claude --print` and bill the
+    operator's Claude auth for what should have been an opencode
+    operation). Pin both the rejection AND the absence of any
+    subprocess spawn for `agent_backend="opencode"`.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_review_rejects_opencode_backend(self):
+        """`agent_backend="opencode"` raises ValueError before any subprocess spawn."""
+        with (
+            patch("kai.review.asyncio.create_subprocess_exec") as mock_exec,
+            pytest.raises(ValueError, match=r"opencode.*not supported"),
+        ):
+            await run_review("prompt", agent_backend="opencode")
+        mock_exec.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_review_does_not_spawn_claude_for_opencode(self):
+        """No fall-through to the claude branch for opencode users."""
+        with patch("kai.review.asyncio.create_subprocess_exec") as mock_exec, pytest.raises(ValueError):
+            await run_review("prompt", agent_backend="opencode", provider="anthropic")
+        # Confirm no `claude --print` was even attempted.
+        for call in mock_exec.call_args_list:
+            argv = call[0]
+            assert "claude" not in argv, f"Unexpected claude spawn: {argv}"
+
+
 class TestResolveGooseModelReview:
     """Tests for _resolve_goose_model in review.py."""
 

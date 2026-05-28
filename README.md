@@ -5,13 +5,13 @@
 [![License](https://img.shields.io/github/license/dcellison/kai)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dcellison/kai?label=version)](https://github.com/dcellison/kai/releases)
 
-Kai is an AI agent, not a chatbot. It manages persistent agent subprocesses running on your hardware - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) by default, with [Goose](https://block.github.io/goose/) as an alternative backend - and connects them to Telegram as a control surface. Shell, filesystem, git, web search, scheduling - the agent has real access to your system and can take real action on it. It reviews PRs when code is pushed, triages issues when they're opened, monitors conditions on a schedule, and operates across any project on your machine. Multiple users can share a single Kai instance, each with their own isolated subprocess, workspace, conversation history, and optional OS-level process separation.
+Kai is an AI agent, not a chatbot. It manages persistent agent subprocesses running on your hardware - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) by default, with [Goose](https://block.github.io/goose/), [OpenAI Codex CLI](https://github.com/openai/codex), or [OpenCode](https://opencode.ai/) as alternative backends - and connects them to Telegram as a control surface. Shell, filesystem, git, web search, scheduling - the agent has real access to your system and can take real action on it. It reviews PRs when code is pushed, triages issues when they're opened, monitors conditions on a schedule, and operates across any project on your machine. Multiple users can share a single Kai instance, each with their own isolated subprocess, workspace, conversation history, and optional OS-level process separation.
 
 For detailed guides on setup, architecture, and optional features, see the **[Wiki](https://github.com/dcellison/kai/wiki)**.
 
 ## Architecture
 
-Kai is two layers: an outer Python application that handles Telegram, HTTP, and scheduling, and one or more inner agent subprocesses that do the thinking and acting. The outer process programs against an `AgentBackend` ABC (`backend.py`), so it manages lifecycle, authentication, and transport identically regardless of which backend is running. Claude Code is the default; Goose ACP is an alternative. Both follow the same lifecycle: one subprocess per user, lazy creation, idle eviction. Resource usage scales with active users, not registered ones.
+Kai is two layers: an outer Python application that handles Telegram, HTTP, and scheduling, and one or more inner agent subprocesses that do the thinking and acting. The outer process programs against an `AgentBackend` ABC (`backend.py`), so it manages lifecycle, authentication, and transport identically regardless of which backend is running. Claude Code is the default; Goose ACP, OpenAI Codex CLI, and OpenCode ACP are alternatives. All four follow the same lifecycle: one subprocess per user, lazy creation, idle eviction. Resource usage scales with active users, not registered ones. The two ACP-based backends (Goose and OpenCode) share a transport layer in `acp.py`; each adds a thin adapter for the harness-specific argv, env, and notification shapes.
 
 This is what separates Kai from API-wrapper bots that send text to a model endpoint and relay the response. The inner agent is a full agentic runtime - it reads files, runs shell commands, searches the web, writes and commits code, and maintains context across a session. Claude Code and Goose each bring their own model ecosystem. Kai gives the runtime a durable home, a scheduling system, event-driven inputs, persistent memory, and a security model designed around the fact that it has all of this power.
 
@@ -120,7 +120,7 @@ Responses stream into Telegram in real time, updating the message every 2 second
 
 ### Model switching
 
-Switch models via `/models` (interactive picker) or `/model <name>` (direct). Available models depend on the configured backend: Claude Code offers Opus, Sonnet, and Haiku; Goose offers whatever the user's configured provider supports. Changing models restarts the session.
+Switch models via `/models` (interactive picker) or `/model <name>` (direct). Available models depend on the configured backend: Claude Code offers Opus, Sonnet, and Haiku; Goose offers whatever the user's configured provider supports; Codex offers the Codex CLI's curated model list; OpenCode accepts free-text `provider/model` IDs (for example `anthropic/claude-sonnet-4-6`) that OpenCode resolves at runtime against the credentials in `~/.local/share/opencode/auth.json`. Changing models restarts the session.
 
 ### Voice input
 
@@ -184,7 +184,7 @@ If interrupted mid-response, Kai notifies you on restart and asks you to resend 
 ## Requirements
 
 - Python 3.13+
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (default) or [Goose CLI](https://block.github.io/goose/) installed and authenticated
+- One of: [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (default), [Goose CLI](https://block.github.io/goose/), [OpenAI Codex CLI](https://github.com/openai/codex), or [OpenCode CLI](https://opencode.ai/) - installed and authenticated for the backend you select
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - Your Telegram user ID (get it from [@userinfobot](https://t.me/userinfobot))
 
@@ -346,7 +346,9 @@ kai/
 │   ├── bot.py                # Telegram handlers, commands, message routing
 │   ├── claude.py             # Persistent Claude Code subprocess management
 │   ├── config.py             # Environment and per-workspace config loading
-│   ├── goose.py              # Goose ACP backend (JSON-RPC subprocess)
+│   ├── acp.py                # Shared ACP transport (Goose + OpenCode base layer)
+│   ├── goose.py              # Goose ACP backend (adapter over acp.py)
+│   ├── opencode.py           # OpenCode ACP backend (adapter over acp.py)
 │   ├── sessions.py           # SQLite session, job, and settings storage
 │   ├── cron.py               # Scheduled job execution (APScheduler)
 │   ├── webhook.py            # HTTP server: GitHub/generic webhooks, scheduling API

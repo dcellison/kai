@@ -251,6 +251,44 @@ class AcpBackend(AgentBackend):
             return msg["error"].get("message", "unknown ACP error")
         return None
 
+    def handle_server_request(self, msg: dict) -> dict | None:
+        """
+        Return a JSON-RPC `result` payload for a server-initiated request.
+
+        Some ACP harnesses (OpenCode in particular) emit JSON-RPC
+        requests TO the client mid-stream, expecting a matching-id
+        response before the prompt can continue. The classic example is
+        `session/request_permission` for a tool call: OpenCode waits for
+        the client to pick an `optionId` before the tool runs. Goose
+        never does this (auto-approves via `--with-builtin developer`),
+        so the default returns None (the shared read loop logs and
+        skips) and Goose's behavior is unchanged.
+
+        Concrete adapters override to recognize specific server methods
+        and return the response body. The shared layer wraps the
+        returned dict as `{jsonrpc: "2.0", id: <request_id>, result: <dict>}`
+        and writes it back on stdin. Returning None for an unrecognized
+        request method is the safe default; the harness either retries,
+        times out, or proceeds without the answer.
+        """
+        return None
+
+    async def _send_server_response(self, request_id: int, result: dict) -> None:
+        """
+        Write a JSON-RPC response back to the subprocess for a
+        server-initiated request.
+
+        Distinct from `_write_rpc` (which sends a new request and
+        consumes a fresh `_next_id`); this writes a response using the
+        id the SERVER sent us. Helper kept out of the read loop so the
+        ordering and error handling stay clear.
+        """
+        assert self._proc is not None and self._proc.stdin is not None
+        payload = {"jsonrpc": "2.0", "id": request_id, "result": result}
+        line = (json.dumps(payload) + "\n").encode()
+        self._proc.stdin.write(line)
+        await self._proc.stdin.drain()
+
     # ── Lifecycle properties ──────────────────────────────────────────
 
     @property
@@ -642,6 +680,34 @@ class AcpBackend(AgentBackend):
                     if text:
                         accumulated += text
                         yield StreamEvent(text_so_far=accumulated)
+                    continue
+
+                # Server-initiated JSON-RPC request (has BOTH method AND
+                # id). OpenCode emits these for tool-permission decisions
+                # and waits on a matching-id response before continuing.
+                # The shape-keyed branch keeps the no-backend_name-in-
+                # shared-loop rule intact: the hook does the per-backend
+                # work. Goose never reaches this branch in practice
+                # because its `--with-builtin developer` auto-approves.
+                if "method" in msg and "id" in msg:
+                    server_id = msg["id"]
+                    result = self.handle_server_request(msg)
+                    if result is not None:
+                        try:
+                            await self._send_server_response(server_id, result)
+                        except OSError as e:
+                            log.error(
+                                "Failed to write server-request response to %s: %s",
+                                self.backend_label,
+                                e,
+                            )
+                    else:
+                        log.debug(
+                            "%s emitted server request method=%s id=%s; hook returned None, skipping",
+                            self.backend_label,
+                            msg.get("method"),
+                            server_id,
+                        )
                     continue
 
                 # Final result for our prompt (has matching id).

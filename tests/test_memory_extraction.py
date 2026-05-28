@@ -3661,6 +3661,17 @@ class TestMemoryReasonerSelection:
         reasoner = memory_extraction._build_memory_reasoner("codex")
         assert isinstance(reasoner, CodexOneShotReasoner)
 
+    def test_opencode_backend_raises_defensive_runtime_error(self):
+        """OpenCode has no memory reasoner; the defensive raise fires.
+
+        Production flow never reaches here (the bot.py eligibility gate
+        filters opencode users out upstream, same way it filters goose
+        out), but the defensive branch guards against a future gate
+        regression silently selecting Claude for opencode users.
+        """
+        with pytest.raises(RuntimeError, match=r"non-extraction backend.*opencode"):
+            memory_extraction._build_memory_reasoner("opencode")
+
 
 class TestRunExtractorWithCodexEnvelope:
     """A fake Codex reasoner returning a normalized envelope

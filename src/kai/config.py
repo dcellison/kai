@@ -42,14 +42,21 @@ DATA_DIR = Path(os.environ.get("KAI_DATA_DIR") or str(PROJECT_ROOT))
 
 # Valid agent backend choices. "claude" uses Claude Code CLI,
 # "goose" uses Goose ACP, "codex" uses OpenAI Codex CLI's app-server
-# JSON-RPC protocol. Shared between load_config() and install.py.
-VALID_BACKENDS = {"claude", "goose", "codex"}
+# JSON-RPC protocol, "opencode" uses OpenCode's ACP (model selected
+# via OPENCODE_CONFIG_CONTENT; auth managed by the operator through
+# `opencode auth login`). Shared between load_config() and install.py.
+VALID_BACKENDS = {"claude", "goose", "codex", "opencode"}
 
 # Valid LLM providers per backend. Claude always uses Anthropic
 # (hardcoded in get_effective_provider), so it has no entry here.
 # Backends that don't appear in this dict accept no provider config.
-# NOTE: Non-Claude entries in VALID_BACKENDS should have a matching
-# key here. Missing entries silently skip provider validation.
+# OpenCode is also absent: its model string is a full `provider/model`
+# ID (e.g. `anthropic/claude-sonnet-4-6`) that encodes the provider
+# inline, and auth is managed by the OpenCode CLI itself rather than
+# by Kai's wizard. The wizard therefore skips provider/API-key
+# prompts for opencode and asks for a free-text model instead.
+# NOTE: Backends in VALID_BACKENDS that should have a provider prompt
+# need a matching key here; missing entries silently skip the prompt.
 VALID_PROVIDERS: dict[str, frozenset[str]] = {
     "goose": frozenset({"anthropic", "openai", "google", "openrouter", "ollama"}),
 }
@@ -297,9 +304,14 @@ def get_effective_provider(backend: str, llm_provider: str) -> str:
     Claude is always anthropic; codex is always openai (codex CLI has
     no other provider surface, so a wizard-generated codex install with
     LLM_PROVIDER unset still needs the runtime to know its provider is
-    openai). Goose is the only backend that consults the raw
-    llm_provider, because it routes to whatever provider the user
-    configured. Kept identical to the backend->provider rule
+    openai). Goose consults the raw llm_provider because it routes to
+    whatever provider the user configured. OpenCode also returns the
+    raw llm_provider: the provider lives inside the full `provider/model`
+    string OpenCode resolves at runtime, so Kai's effective_provider
+    is informational (used for shadow recall logging metadata and the
+    /stats display) rather than load-bearing for OpenCode dispatch.
+
+    Kept identical to the backend->provider rule
     get_user_backend_and_provider uses so the two cascade helpers do
     not drift; any caller resolving an effective provider for a
     backend gets the same answer regardless of which helper it uses.
@@ -368,27 +380,42 @@ def validate_model_for_backend(model: str, backend: str, eff_provider: str) -> b
     its own CLI's curated set); other backends delegate to the existing
     provider-only validator, which is unchanged for goose / claude.
 
+    OpenCode is open-ended: model strings are full `provider/model`
+    IDs OpenCode resolves at runtime (75+ providers via AI SDK and
+    Models.dev), so any non-empty string is accepted. Curating a list
+    here would either go stale or block valid models; OpenCode itself
+    is the source of truth on which IDs work.
+
     Canonical model validator: every model-selection site in the
-    codebase routes through this function so codex and goose share
-    no fallback path.
+    codebase routes through this function so codex / goose / opencode
+    share no fallback path.
     """
     if backend == "codex":
         return model in CODEX_MODELS
+    if backend == "opencode":
+        return bool(model)
     return validate_model_for_provider(model, eff_provider)
 
 
 def models_for_backend(agent_backend: str, eff_provider: str) -> dict[str, str] | None:
     """Curated model list for the given (backend, provider) pair.
 
-    Codex consults its own CODEX_MODELS surface; everything else falls
-    back to PROVIDER_MODELS[eff_provider]. Returns None for open-ended
-    providers (caller falls back to a free-text prompt rather than a
-    fixed-choice keyboard). Used by both install.py (wizard prompt +
-    apply-time validator) and bot.py (/model keyboard + selection
-    validator).
+    Codex consults its own CODEX_MODELS surface; OpenCode and the
+    open-ended providers return None (caller falls back to a free-text
+    prompt rather than a fixed-choice keyboard). Used by both
+    install.py (wizard prompt + apply-time validator) and bot.py
+    (/model keyboard + selection validator).
+
+    OpenCode returns None unconditionally: model strings are full
+    `provider/model` IDs and the supported set depends on which
+    providers the operator authenticated via `opencode auth login`.
+    A curated keyboard would mislead users into picking IDs their
+    OpenCode install cannot resolve.
     """
     if agent_backend == "codex":
         return CODEX_MODELS
+    if agent_backend == "opencode":
+        return None
     if eff_provider in OPEN_ENDED_PROVIDERS:
         return None
     return PROVIDER_MODELS.get(eff_provider)
@@ -401,8 +428,10 @@ def get_user_backend_and_provider(user_config: "UserConfig | None", config: "Con
     > config.agent_backend, similar for llm_provider); this function
     consolidates it in one place so every runtime model-validation site
     sees the same effective backend for a given user. Backend determines
-    provider 1:1 for codex (openai) and claude (anthropic); goose's
-    provider comes from the same cascade as its backend.
+    provider 1:1 for codex (openai) and claude (anthropic); goose and
+    opencode both consult the raw llm_provider cascade (opencode's
+    value is informational - the real provider/model resolution lives
+    inside OpenCode's full `provider/model` string at runtime).
     """
     backend = user_config.agent_backend if user_config and user_config.agent_backend else config.agent_backend
     if backend == "claude":

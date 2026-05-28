@@ -413,7 +413,26 @@ async def run_triage(
 
     Raises:
         RuntimeError: If the subprocess fails or times out.
+        ValueError: If agent_backend has no supported one-shot path
+            here (e.g. "opencode"). The conversational OpenCode adapter
+            does not bring a one-shot reasoner; a per-user opencode
+            override must surface this gap loudly rather than silently
+            falling through to Claude.
     """
+    if agent_backend == "opencode":
+        # Reject before the codex / goose / claude dispatch below.
+        # OpenCode has no one-shot reasoner today; the conversational
+        # backend cannot be reused for triage because the wire shapes
+        # and lifecycle differ. Surface this as a clean ValueError so
+        # the operator gets a deterministic failure mode instead of an
+        # unexpected Claude-billed triage.
+        raise ValueError(
+            "Issue triage with agent_backend='opencode' is not supported. "
+            "OpenCode users currently have no one-shot reasoner; configure "
+            "a per-user agent_backend override of 'claude', 'codex', or 'goose' "
+            "for issue triage, or disable issue triage for opencode users."
+        )
+
     if agent_backend == "codex":
         # Codex one-shot mode: --json emits NDJSON events on stdout
         # (thread.started, turn.started, item.*, turn.completed, error).

@@ -158,6 +158,21 @@ class SubprocessPool:
             # which goose-on-openai still consults and which would
             # bypass the codex/goose surface separation.
             model = CODEX_DEFAULT_MODEL
+        elif backend == "opencode":
+            # Per-user opencode override on a non-opencode global install
+            # with no user.model. There is no safe per-provider default
+            # we can guess (opencode model strings are full provider/model
+            # IDs and we do not know which providers the operator has
+            # authenticated). Pass empty so OpenCodeBackend.build_env
+            # skips OPENCODE_CONFIG_CONTENT and OpenCode falls back to
+            # its own config files. Warn so the operator notices.
+            log.warning(
+                "No model configured for opencode user %d; OpenCode will use "
+                "its own config defaults (set DEFAULT_MODEL globally or per-user "
+                "in users.yaml to override)",
+                chat_id,
+            )
+            model = ""
         else:
             model = PROVIDER_DEFAULTS.get(effective_provider, "")
             if not model:
@@ -197,11 +212,33 @@ class SubprocessPool:
         # clarity of two separate resolution calls is worth it.
         home_ws = resolve_home_workspace(chat_id, self._config)
 
-        # Backend selection: "goose" uses Goose ACP, "codex" uses
-        # OpenAI Codex CLI's app-server JSON-RPC protocol, anything
-        # else (including the default "claude") uses Claude Code CLI.
+        # Backend selection: "goose" uses Goose ACP, "opencode" uses
+        # OpenCode ACP, "codex" uses OpenAI Codex CLI's app-server
+        # JSON-RPC protocol, anything else (including the default
+        # "claude") uses Claude Code CLI.
         if backend == "goose":
             return GooseBackend(
+                model=model,
+                workspace=workspace,
+                home_workspace=home_ws,
+                webhook_port=self._config.webhook_port,
+                webhook_secret=self._config.webhook_secret,
+                max_budget_usd=budget,
+                timeout_seconds=timeout,
+                services_info=self._services_info,
+                workspace_config=ws_config,
+                max_context_window=context_window,
+                provider=effective_provider,
+                memory_enabled=self._config.memory_enabled,
+            )
+
+        if backend == "opencode":
+            # Import locally so opencode.py is only imported on an
+            # opencode-active install. Mirrors the codex pattern below
+            # rather than goose's module-top import.
+            from kai.opencode import OpenCodeBackend
+
+            return OpenCodeBackend(
                 model=model,
                 workspace=workspace,
                 home_workspace=home_ws,
@@ -219,9 +256,11 @@ class SubprocessPool:
         # os_user for sudo -u isolation. None = run as bot user.
         # Resolved here (rather than inside each branch) because both
         # ClaudeCodeBackend and CodexBackend consume it for per-user
-        # subprocess isolation. Goose is the only backend that does
-        # not: goose runs as the service user and bills against a
-        # single GOOSE_PROVIDER auth set in /etc/kai/env.
+        # subprocess isolation. Goose and OpenCode do not: both run as
+        # the service user. Goose bills against a single GOOSE_PROVIDER
+        # auth set in /etc/kai/env; OpenCode reads its auth from
+        # ~/.local/share/opencode/auth.json which is per-OS-user but
+        # operator-managed via `opencode auth login` outside the wizard.
         os_user = user.os_user if user else self._config.claude_user
 
         if backend == "codex":

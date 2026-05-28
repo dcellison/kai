@@ -881,6 +881,144 @@ class TestContentStripping:
         assert "(empty prompt)" in joined
 
 
+# ── Server-initiated request handling ───────────────────────────────
+
+
+class TestServerInitiatedRequest:
+    """
+    OpenCode emits server-initiated JSON-RPC requests (e.g.
+    session/request_permission) and BLOCKS until the client returns
+    a matching-id response. The shared read loop must dispatch these
+    to handle_server_request and write the response back; the branch
+    is keyed on message shape (method AND id), not backend_name, so
+    Goose's behavior (no server requests) is unchanged.
+    """
+
+    @pytest.mark.asyncio
+    async def test_default_hook_returns_none_skips_request(self):
+        """Default handle_server_request returns None; loop continues and the request is skipped."""
+        b = _make_fake()
+        server_request = _json_line(
+            {
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "session/request_permission",
+                "params": {"sessionId": "sess-1", "options": [{"optionId": "always"}]},
+            }
+        )
+        b._proc = _make_mock_proc(
+            [
+                server_request,  # default hook returns None -> skip
+                _text_chunk("ok"),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+
+        events = await _collect_events(b, prompt="hi")
+        # No response sent back to the server (only the initial session/prompt).
+        write_calls = b._proc.stdin.write.call_args_list
+        assert len(write_calls) == 1
+        # Prompt completed normally.
+        assert events[-1].done is True
+        assert events[-1].response is not None
+        assert events[-1].response.success is True
+
+    @pytest.mark.asyncio
+    async def test_hook_returning_dict_writes_response_with_matching_id(self):
+        """A hook that returns a dict triggers a JSON-RPC response with the server's id."""
+
+        class _AutoApprove(_FakeAcp):
+            def handle_server_request(self, msg):
+                if msg.get("method") == "session/request_permission":
+                    return {"optionId": "always"}
+                return None
+
+        b = _AutoApprove(model="x", workspace=Path("/tmp/ws"))
+        server_request = _json_line(
+            {
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "session/request_permission",
+                "params": {"sessionId": "sess-1"},
+            }
+        )
+        b._proc = _make_mock_proc(
+            [
+                server_request,
+                _text_chunk("ok"),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+
+        await _collect_events(b, prompt="hi")
+
+        write_calls = b._proc.stdin.write.call_args_list
+        # Two writes: original session/prompt + the server-request response.
+        assert len(write_calls) == 2
+        response = json.loads(write_calls[1][0][0].decode())
+        assert response["jsonrpc"] == "2.0"
+        # Response carries the SERVER's id, not the next client id.
+        assert response["id"] == 42
+        assert response["result"] == {"optionId": "always"}
+
+    @pytest.mark.asyncio
+    async def test_notifications_still_skip_hook(self):
+        """A plain notification (method, no id) does NOT call handle_server_request."""
+
+        class _RecordingHook(_FakeAcp):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = []
+
+            def handle_server_request(self, msg):
+                self.calls.append(msg)
+                return None
+
+        b = _RecordingHook(model="x", workspace=Path("/tmp/ws"))
+        b._proc = _make_mock_proc(
+            [
+                _text_chunk("hello"),  # notification (no id)
+                _completion_result(prompt_id=3),
+            ]
+        )
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+
+        await _collect_events(b, prompt="hi")
+        # Hook never invoked - text chunks remain in the notification branch.
+        assert b.calls == []
+
+    @pytest.mark.asyncio
+    async def test_response_writes_match_jsonrpc_shape(self):
+        """The response payload is well-formed JSON-RPC: jsonrpc + id + result keys only."""
+
+        class _AutoApprove(_FakeAcp):
+            def handle_server_request(self, msg):
+                return {"optionId": "always", "kind": "allow_always"}
+
+        b = _AutoApprove(model="x", workspace=Path("/tmp/ws"))
+        b._proc = _make_mock_proc(
+            [
+                _json_line({"jsonrpc": "2.0", "id": 7, "method": "session/request_permission", "params": {}}),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+
+        await _collect_events(b, prompt="hi")
+        response = json.loads(b._proc.stdin.write.call_args_list[1][0][0].decode())
+        assert set(response.keys()) == {"jsonrpc", "id", "result"}
+
+
 # ── Env layering ────────────────────────────────────────────────────
 
 

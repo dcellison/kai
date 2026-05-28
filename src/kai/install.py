@@ -672,10 +672,29 @@ def _cmd_config() -> None:
             print("    e.g.   <os_user> ~$ codex login")
             print("  Run as the os_user themselves, not via sudo from another account.")
 
+    # OpenCode setup: PATH check + post-install auth reminder. OpenCode
+    # is intentionally absent from VALID_PROVIDERS (its auth lives in
+    # ~/.local/share/opencode/auth.json, operator-managed via
+    # `opencode auth login`), so the provider/API-key block below is
+    # skipped naturally. Model selection routes through
+    # _prompt_default_model later in this function; since
+    # models_for_backend("opencode", _) returns None, the operator gets
+    # a free-text prompt for a full `provider/model` ID.
+    if agent_backend == "opencode":
+        if not shutil.which("opencode"):
+            print("  WARNING: 'opencode' binary not found on PATH.")
+            print("  Install it from https://opencode.ai/docs/install/ before starting Kai.")
+        print("  After install, authenticate OpenCode for at least one provider:")
+        print("    <service_user> ~$ opencode auth login")
+        print("  Kai writes the active model into OPENCODE_CONFIG_CONTENT at process spawn;")
+        print("  OpenCode resolves it against the credentials in ~/.local/share/opencode/auth.json.")
+
     # Non-Claude backends: provider and API key. The provider choice
     # determines which env var to prompt for (or none for ollama).
-    # Codex is intentionally absent from VALID_PROVIDERS, so this block
-    # only fires for goose; codex is handled in the dedicated branch above.
+    # Codex and OpenCode are intentionally absent from VALID_PROVIDERS,
+    # so this block only fires for goose; codex is handled in the
+    # dedicated branch above and opencode in the block immediately
+    # above (no API key needed; auth is opencode-cli-managed).
     llm_provider = ""
     llm_api_key_var = ""
     llm_api_key = ""

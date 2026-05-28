@@ -238,6 +238,62 @@ class TestPerUserBackendRouting:
             # "opus" is invalid for openai - should be ignored, model stays at gpt-5.4
             assert instance.model == "gpt-5.4"
 
+    def test_opencode_user_on_claude_global_install(self):
+        """
+        Per-user `agent_backend: opencode` on a globally-claude install
+        with a free-text model gets an OpenCodeBackend with the supplied
+        model intact. OpenCode model strings are full provider/model
+        IDs; no per-provider default substitution applies.
+        """
+        from kai.opencode import OpenCodeBackend
+
+        user = UserConfig(
+            telegram_id=111,
+            name="alice",
+            agent_backend="opencode",
+            model="anthropic/claude-sonnet-4-6",
+        )
+        config = _make_config(
+            agent_backend="claude",
+            llm_provider="anthropic",
+            default_model="sonnet",
+            user_configs={111: user},
+        )
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+        assert isinstance(instance, OpenCodeBackend)
+        assert instance.model == "anthropic/claude-sonnet-4-6"
+
+    def test_opencode_user_without_model_falls_back_to_empty(self, caplog):
+        """
+        Per-user `agent_backend: opencode` with no model and global
+        backend != opencode: OpenCodeBackend gets model="" so OPENCODE_
+        CONFIG_CONTENT is omitted and OpenCode uses its own config
+        files. A warning is logged so the operator notices the gap.
+        """
+        import logging
+
+        from kai.opencode import OpenCodeBackend
+
+        user = UserConfig(
+            telegram_id=111,
+            name="alice",
+            agent_backend="opencode",
+            # NO model: tests the bare opencode-override case.
+        )
+        config = _make_config(
+            agent_backend="claude",
+            llm_provider="anthropic",
+            default_model="sonnet",
+            user_configs={111: user},
+        )
+        pool = SubprocessPool(config=config, services_info=[])
+        with caplog.at_level(logging.WARNING, logger="kai.pool"):
+            instance = pool.get(111)
+        assert isinstance(instance, OpenCodeBackend)
+        assert instance.model == ""
+        assert any("No model configured for opencode" in rec.message for rec in caplog.records)
+
     def test_codex_user_on_claude_global_install_gets_codex_default(self):
         """
         Per-user `agent_backend: codex` on a globally-claude install
