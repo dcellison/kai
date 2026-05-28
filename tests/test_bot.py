@@ -146,6 +146,64 @@ class TestBackendNameForInstance:
         assert any("empty backend_name" in rec.message for rec in caplog.records)
 
 
+# ── _get_user_models warning suppression ─────────────────────────────
+
+
+class TestGetUserModelsWarningSuppression:
+    """
+    `_get_user_models` warns when models_for_backend returns None for a
+    provider that should have a curated list (programming oversight).
+    Codex AND opencode are intentionally excluded: both return None for
+    legitimate reasons (codex curates separately; opencode model IDs
+    are open-ended provider/model strings whose set Kai cannot curate).
+    Pin the exclusion so a real missing-registry-entry warning is not
+    drowned out by per-turn opencode noise.
+    """
+
+    def test_opencode_does_not_log_missing_registry_warning(self, caplog):
+        """Global opencode install with empty llm_provider should NOT log the warning."""
+        import logging
+
+        from kai.bot import _get_user_models
+        from kai.pool import SubprocessPool
+
+        # Empty llm_provider is the realistic global-opencode case
+        # (VALID_PROVIDERS["opencode"] does not exist; the wizard never
+        # prompts for an llm_provider). The pre-fix code path warns
+        # because "" is not in OPEN_ENDED_PROVIDERS.
+        config = MagicMock()
+        config.agent_backend = "opencode"
+        config.llm_provider = ""
+        config.get_user_config = MagicMock(return_value=None)
+        pool = MagicMock(spec=SubprocessPool)
+        pool.get_if_exists = MagicMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger="kai.bot"):
+            result = _get_user_models(pool, 111, config)
+        # OpenCode returns None deliberately (free-text /model input).
+        assert result is None
+        # And no false warning was logged.
+        assert not any("no curated model list" in rec.message for rec in caplog.records)
+
+    def test_codex_does_not_log_missing_registry_warning(self, caplog):
+        """Confirm the pre-existing codex exclusion still works (regression guard)."""
+        import logging
+
+        from kai.bot import _get_user_models
+        from kai.pool import SubprocessPool
+
+        config = MagicMock()
+        config.agent_backend = "codex"
+        config.llm_provider = ""
+        config.get_user_config = MagicMock(return_value=None)
+        pool = MagicMock(spec=SubprocessPool)
+        pool.get_if_exists = MagicMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger="kai.bot"):
+            _get_user_models(pool, 111, config)
+        assert not any("no curated model list" in rec.message for rec in caplog.records)
+
+
 # ── _resolve_workspace_path ──────────────────────────────────────────
 
 

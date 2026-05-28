@@ -2504,22 +2504,39 @@ class TestValidateModelForBackend:
 
         assert validate_model_for_backend("opus", "claude", "anthropic") is True
 
-    def test_opencode_accepts_any_nonempty_string(self):
-        """OpenCode is open-ended: full provider/model IDs are not curated by Kai."""
+    def test_opencode_accepts_provider_slash_model_shape(self):
+        """OpenCode requires the `provider/model` structural shape."""
         from kai.config import validate_model_for_backend
 
         assert validate_model_for_backend("anthropic/claude-sonnet-4-6", "opencode", "") is True
         assert validate_model_for_backend("openai/gpt-5.5", "opencode", "") is True
-        # Curated codex/goose model strings are also accepted by opencode because
-        # the validator simply checks non-empty (OpenCode resolves the actual
-        # provider/model at runtime against operator's ~/.local/share/opencode/auth.json).
-        assert validate_model_for_backend("opus", "opencode", "anthropic") is True
+        assert validate_model_for_backend("opencode/big-pickle", "opencode", "") is True
 
-    def test_opencode_rejects_empty_model(self):
-        """Empty model is the one case opencode rejects."""
+    def test_opencode_rejects_bare_anthropic_names(self):
+        """`opus` / `sonnet` are valid on claude/goose/codex but typos on opencode.
+
+        The operator footgun the structural check guards against: a
+        bare Anthropic name typed into /model on an opencode install
+        would otherwise persist as OPENCODE_CONFIG_CONTENT='{"model":
+        "opus"}' and fail at handshake without pointing back to the
+        Kai-side typo.
+        """
+        from kai.config import validate_model_for_backend
+
+        assert validate_model_for_backend("opus", "opencode", "anthropic") is False
+        assert validate_model_for_backend("sonnet", "opencode", "anthropic") is False
+        assert validate_model_for_backend("haiku", "opencode", "anthropic") is False
+
+    def test_opencode_rejects_malformed_shapes(self):
+        """Empty segments, missing separator, and extra separators all fail."""
         from kai.config import validate_model_for_backend
 
         assert validate_model_for_backend("", "opencode", "") is False
+        assert validate_model_for_backend("/foo", "opencode", "") is False
+        assert validate_model_for_backend("foo/", "opencode", "") is False
+        assert validate_model_for_backend("foo//bar", "opencode", "") is False
+        assert validate_model_for_backend("foo/bar/baz", "opencode", "") is False
+        assert validate_model_for_backend("/", "opencode", "") is False
 
 
 class TestModelsForBackend:

@@ -818,6 +818,98 @@ class TestCodexUsersFromYamlProtectedFallback:
         assert refs[0].os_user == "alice_os"
 
 
+class TestComputeOpencodeRunsAnywhere:
+    """
+    Mirrors `_compute_codex_runs_anywhere` semantics for opencode.
+    Without users.yaml, the global AGENT_BACKEND alone decides.
+    With users.yaml, ANY user whose effective backend resolves to
+    opencode flips the predicate True so the PATH check and auth
+    reminder still fire on mixed installs.
+    """
+
+    def _yaml_at(self, tmp_path, contents: str) -> Path:
+        p = tmp_path / "users.yaml"
+        p.write_text(contents)
+        return p
+
+    def test_no_yaml_global_opencode_true(self, tmp_path):
+        from kai.install import _compute_opencode_runs_anywhere
+
+        assert _compute_opencode_runs_anywhere("opencode", False, tmp_path / "missing.yaml") is True
+
+    def test_no_yaml_global_claude_false(self, tmp_path):
+        from kai.install import _compute_opencode_runs_anywhere
+
+        assert _compute_opencode_runs_anywhere("claude", False, tmp_path / "missing.yaml") is False
+
+    def test_yaml_with_per_user_opencode_on_claude_global(self, tmp_path):
+        """The mixed-backend case the reviewer flagged: global=claude, one user opencode."""
+        from kai.install import _compute_opencode_runs_anywhere
+
+        path = self._yaml_at(
+            tmp_path,
+            "users:\n"
+            "  - telegram_id: 111\n"
+            "    name: alice\n"
+            "  - telegram_id: 222\n"
+            "    name: bob\n"
+            "    agent_backend: opencode\n",
+        )
+        assert _compute_opencode_runs_anywhere("claude", True, path) is True
+
+    def test_yaml_with_no_opencode_users_returns_false(self, tmp_path):
+        from kai.install import _compute_opencode_runs_anywhere
+
+        path = self._yaml_at(
+            tmp_path,
+            "users:\n"
+            "  - telegram_id: 111\n"
+            "    name: alice\n"
+            "  - telegram_id: 222\n"
+            "    name: bob\n"
+            "    agent_backend: codex\n",
+        )
+        assert _compute_opencode_runs_anywhere("claude", True, path) is False
+
+    def test_yaml_with_inherited_global_opencode(self, tmp_path):
+        """A user with no agent_backend inherits global, so global=opencode + yaml = True."""
+        from kai.install import _compute_opencode_runs_anywhere
+
+        path = self._yaml_at(
+            tmp_path,
+            "users:\n  - telegram_id: 111\n    name: alice\n",
+        )
+        assert _compute_opencode_runs_anywhere("opencode", True, path) is True
+
+    def test_yaml_overrides_all_users_off_opencode(self, tmp_path):
+        """Authoritative-source rule: global opencode + every user overrides = False."""
+        from kai.install import _compute_opencode_runs_anywhere
+
+        path = self._yaml_at(
+            tmp_path,
+            "users:\n"
+            "  - telegram_id: 111\n"
+            "    name: alice\n"
+            "    agent_backend: claude\n"
+            "  - telegram_id: 222\n"
+            "    name: bob\n"
+            "    agent_backend: codex\n",
+        )
+        assert _compute_opencode_runs_anywhere("opencode", True, path) is False
+
+    def test_empty_yaml_returns_false(self, tmp_path):
+        from kai.install import _compute_opencode_runs_anywhere
+
+        path = self._yaml_at(tmp_path, "")
+        assert _compute_opencode_runs_anywhere("claude", True, path) is False
+
+    def test_yaml_without_users_key_returns_false(self, tmp_path):
+        from kai.install import _compute_opencode_runs_anywhere
+
+        path = self._yaml_at(tmp_path, "other: thing\n")
+        assert _compute_opencode_runs_anywhere("claude", True, path) is False
+
+
 class TestCollectUserMemoryOwners:
     """
     Tests for the (telegram_id, os_user) loader used by the per-user

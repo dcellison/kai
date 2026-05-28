@@ -510,10 +510,15 @@ def _get_user_models(pool: SubprocessPool, chat_id: int, config: Config) -> dict
     """
     backend, provider = _get_user_backend_provider(pool, chat_id, config)
     models = models_for_backend(backend, provider)
-    if models is None and backend != "codex" and provider not in OPEN_ENDED_PROVIDERS:
+    if models is None and backend != "codex" and backend != "opencode" and provider not in OPEN_ENDED_PROVIDERS:
         # Provider is not open-ended but has no curated list. This means
         # PROVIDER_MODELS is missing an entry for a valid provider -
-        # programming oversight, not user error.
+        # programming oversight, not user error. OpenCode is excluded
+        # alongside codex because its None return is intentional (full
+        # provider/model IDs are open-ended, not a missing registry
+        # entry), and the global llm_provider for opencode is usually
+        # empty so the OPEN_ENDED_PROVIDERS check above would not catch
+        # it.
         log.warning(
             "Provider '%s' has no curated model list; falling back to text input",
             provider,

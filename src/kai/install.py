@@ -680,7 +680,19 @@ def _cmd_config() -> None:
     # _prompt_default_model later in this function; since
     # models_for_backend("opencode", _) returns None, the operator gets
     # a free-text prompt for a full `provider/model` ID.
-    if agent_backend == "opencode":
+    #
+    # Gate on `opencode_runs_anywhere` rather than `agent_backend ==
+    # "opencode"` for the same reason codex uses `codex_runs_anywhere`:
+    # an install with global claude but a users.yaml that includes
+    # opencode-effective users still needs the PATH check and the auth
+    # reminder. Conversely, an install with global opencode whose
+    # users.yaml overrides every entry to non-opencode skips this
+    # block entirely.
+    try:
+        opencode_runs_anywhere = _compute_opencode_runs_anywhere(agent_backend, users_yaml_exists, users_yaml_path)
+    except (OSError, ValueError):
+        opencode_runs_anywhere = agent_backend == "opencode"
+    if opencode_runs_anywhere:
         if not shutil.which("opencode"):
             print("  WARNING: 'opencode' binary not found on PATH.")
             print("  Install it from https://opencode.ai/docs/install/ before starting Kai.")
@@ -1975,6 +1987,54 @@ def _compute_codex_runs_anywhere(
     if users_yaml_exists:
         return bool(codex_users)
     return global_agent_backend == "codex"
+
+
+def _compute_opencode_runs_anywhere(
+    global_agent_backend: str,
+    users_yaml_exists: bool,
+    users_yaml_path: str | Path,
+) -> bool:
+    """Return True when any user on this install routes to opencode.
+
+    Same authoritative-source rule as `_compute_codex_runs_anywhere`:
+    when `users_yaml_exists` is True the users.yaml is the user set
+    and global `AGENT_BACKEND` is only the inherited default; when it
+    does NOT exist every authorized user inherits the global and the
+    global value alone decides.
+
+    Folds the yaml read into the predicate because, unlike codex, the
+    wizard does not need per-user os_user / telegram_id details for
+    opencode (auth lives in ~/.local/share/opencode/auth.json and
+    OpenCode runs as the service user). A boolean is sufficient to
+    gate the PATH check and the post-install auth reminder.
+
+    Mirrors the read-then-cascade pattern in `_codex_users_from_yaml`:
+    missing file returns False; malformed yaml propagates (the wizard
+    caller wraps in try/except so a transient read failure does not
+    crash the wizard).
+    """
+    if not users_yaml_exists:
+        return global_agent_backend == "opencode"
+    text = _read_users_yaml_text(Path(users_yaml_path))
+    if text is None or not text.strip():
+        return False
+    data = yaml.safe_load(text)
+    if not isinstance(data, dict):
+        return False
+    users = data.get("users")
+    if not isinstance(users, list):
+        return False
+    for entry in users:
+        if not isinstance(entry, dict):
+            continue
+        per_user_backend = entry.get("agent_backend")
+        if isinstance(per_user_backend, str) and per_user_backend.strip():
+            effective = per_user_backend.strip().lower()
+        else:
+            effective = global_agent_backend
+        if effective == "opencode":
+            return True
+    return False
 
 
 def _build_codex_login_reminder(

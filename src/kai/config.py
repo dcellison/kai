@@ -371,6 +371,35 @@ def validate_model_for_provider(model: str, provider: str) -> bool:
     return model in models
 
 
+def is_opencode_model_shape(model: str) -> bool:
+    """Structural check: OpenCode model IDs are `provider_id/model_id`.
+
+    OpenCode resolves models against its own provider registry at
+    runtime; Kai cannot enumerate the supported set (75+ providers
+    via AI SDK and Models.dev, varying by what the operator has
+    authenticated through `opencode auth login`). What IS knowable
+    upfront is the structural contract documented at
+    https://opencode.ai/docs/models/: every accepted model string
+    splits on `/` into exactly two non-empty segments.
+
+    Rejecting strings that violate that contract catches the common
+    operator footgun where a bare Anthropic name like `sonnet` or
+    `opus` (correct for the claude / goose / codex surfaces) is
+    typed into `/model` on an opencode install. Without this check,
+    such a value persists through DB write -> pool restore ->
+    OpenCodeBackend.build_env, where it becomes
+    `OPENCODE_CONFIG_CONTENT='{"model": "sonnet"}'` and OpenCode
+    fails model resolution at handshake time with no clear pointer
+    back to the Kai-side typo.
+    """
+    if not model:
+        return False
+    parts = model.split("/")
+    if len(parts) != 2:
+        return False
+    return all(parts)
+
+
 def validate_model_for_backend(model: str, backend: str, eff_provider: str) -> bool:
     """Check if a model is valid for the active backend.
 
@@ -380,11 +409,12 @@ def validate_model_for_backend(model: str, backend: str, eff_provider: str) -> b
     its own CLI's curated set); other backends delegate to the existing
     provider-only validator, which is unchanged for goose / claude.
 
-    OpenCode is open-ended: model strings are full `provider/model`
-    IDs OpenCode resolves at runtime (75+ providers via AI SDK and
-    Models.dev), so any non-empty string is accepted. Curating a list
-    here would either go stale or block valid models; OpenCode itself
-    is the source of truth on which IDs work.
+    OpenCode validates STRUCTURALLY: model strings must match
+    `provider/model` (both segments non-empty). The supported provider/
+    model SET is not curated here - OpenCode is the source of truth on
+    which IDs resolve - but the structural contract blocks the obvious
+    operator typo (bare Anthropic names like "opus" or "sonnet" that
+    are correct on other backends but unusable on OpenCode).
 
     Canonical model validator: every model-selection site in the
     codebase routes through this function so codex / goose / opencode
@@ -393,7 +423,7 @@ def validate_model_for_backend(model: str, backend: str, eff_provider: str) -> b
     if backend == "codex":
         return model in CODEX_MODELS
     if backend == "opencode":
-        return bool(model)
+        return is_opencode_model_shape(model)
     return validate_model_for_provider(model, eff_provider)
 
 
