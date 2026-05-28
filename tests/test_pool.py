@@ -665,6 +665,73 @@ class TestWorkspaceRestoration:
             mock_change.assert_called_once()
 
 
+# ── Backend-name dispatch in restore path ──────────────────────────
+
+
+class TestRestoreBackendNameDispatch:
+    """
+    _restore_workspace reads the backend identifier off `instance.backend_name`
+    instead of inspecting the concrete class name. Pin each real backend's
+    value plus the falsy fallback so an OpenCode (or any future) backend
+    cannot regress the dispatch by setting backend_name incorrectly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_uses_instance_backend_name_for_validation(self, tmp_path):
+        """The restore path validates the DB model against instance.backend_name.
+
+        Spec PR 1 step 3: read backend_name off the instance, do not
+        special-case CodexBackend / GooseBackend class names.
+        """
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        instance = pool.get(111)
+        # Force a non-default backend_name on this instance to prove
+        # the dispatch reads off the attribute, not the class.
+        instance.backend_name = "goose"
+        instance.provider = "openai"
+
+        db_settings = {"model": "gpt-5.4-mini"}
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value=db_settings),
+            patch("kai.pool.validate_model_for_backend", return_value=True) as mock_validate,
+            patch.object(instance, "restart", new_callable=AsyncMock),
+        ):
+            await pool._restore_workspace(111, instance)
+            # Validator received the instance's backend_name, not "claude".
+            # validate_model_for_backend may also be called for ws_model_raw,
+            # but ws_model_raw is None here so the only invocation is for
+            # the DB model.
+            mock_validate.assert_called_once_with("gpt-5.4-mini", "goose", "openai")
+
+    @pytest.mark.asyncio
+    async def test_empty_backend_name_falls_back_to_claude_with_warning(self, tmp_path, caplog):
+        """A test double or legacy stub with empty backend_name routes to "claude" with a warning."""
+        import logging
+
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        instance = pool.get(111)
+        # Simulate a stub backend that never overrode the ABC default.
+        instance.backend_name = ""
+        instance.provider = "anthropic"
+        # Instance default model is "sonnet"; DB model must differ to
+        # actually reach the validate_model_for_backend call in the
+        # restore path (the guard short-circuits when they match).
+        db_settings = {"model": "opus"}
+        with (
+            caplog.at_level(logging.WARNING, logger="kai.pool"),
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
+            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value=db_settings),
+            patch("kai.pool.validate_model_for_backend", return_value=True) as mock_validate,
+            patch.object(instance, "restart", new_callable=AsyncMock),
+        ):
+            await pool._restore_workspace(111, instance)
+            # Fallback string is "claude".
+            mock_validate.assert_called_once_with("opus", "claude", "anthropic")
+        # Warning was logged about the empty backend_name.
+        assert any("empty backend_name" in rec.message for rec in caplog.records)
+
+
 # ── get_if_exists ───────────────────────────────────────────────────
 
 

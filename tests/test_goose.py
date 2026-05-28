@@ -610,8 +610,9 @@ class TestContextInjection:
         g._fresh_session = True
         g._next_id = 3
 
-        # Patch build_session_context to return a known prefix
-        with patch("kai.goose.build_session_context", return_value="[CONTEXT]"):
+        # Patch build_session_context to return a known prefix. After the
+        # ACP extraction, the call site lives in kai.acp, not kai.goose.
+        with patch("kai.acp.build_session_context", return_value="[CONTEXT]"):
             await _collect_events(g, prompt="hello")
 
         # Verify the written prompt includes the context prefix
@@ -639,7 +640,7 @@ class TestContextInjection:
         g._fresh_session = False  # Already sent first message
         g._next_id = 3
 
-        with patch("kai.goose.build_session_context") as mock_ctx:
+        with patch("kai.acp.build_session_context") as mock_ctx:
             await _collect_events(g, prompt="second")
 
         # build_session_context should NOT be called
@@ -708,7 +709,7 @@ class TestContextInjection:
 
         fake_recall = LegacyRecallResult(rendered_context=memory_block, recall_payload={"reason": "ok", "hits": []})
         with (
-            patch("kai.goose.build_session_context", return_value="[CONTEXT]"),
+            patch("kai.acp.build_session_context", return_value="[CONTEXT]"),
             patch(
                 "kai.memory.format_context_with_recall_payload",
                 new=AsyncMock(return_value=fake_recall),

@@ -336,17 +336,23 @@ class SubprocessPool:
             # because the value is baked into the CLI command at startup)
             needs_restart = False
 
-            # Class-name inspection rather than an explicit instance
-            # attribute keeps the ABC free of backend-name leakage;
-            # mirrors the same shape bot.py uses for runtime backend
-            # resolution. Hoisted out of the DB-model branch because the
-            # ws_model guard below also needs it.
-            instance_cls = type(instance).__name__
-            if instance_cls == "CodexBackend":
-                instance_backend = "codex"
-            elif instance_cls == "GooseBackend":
-                instance_backend = "goose"
-            else:
+            # Read the backend identifier off the instance. Every
+            # concrete backend sets `backend_name` as a class attribute
+            # (claude_code / goose / codex / opencode). The ABC default
+            # is the empty string, so a test double or legacy stub that
+            # never overrides falls through to "claude" with a warning;
+            # this preserves the historical default for unknown shapes
+            # while keeping real backends out of the class-name if-chain
+            # that previously had to be extended for every new backend.
+            # Hoisted out of the DB-model branch because the ws_model
+            # guard below also needs it.
+            instance_backend = instance.backend_name
+            if not instance_backend:
+                log.warning(
+                    "Instance %s has empty backend_name; falling back to 'claude'. "
+                    "Concrete backends must set the backend_name class attribute.",
+                    type(instance).__name__,
+                )
                 instance_backend = "claude"
 
             # Model: only apply if workspace config has a VALID model

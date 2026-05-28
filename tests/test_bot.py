@@ -21,6 +21,7 @@ from kai.bot import (
     _FIELD_ALIASES,
     _QUEUED_MESSAGE_MARKER,
     _acquire_lock_or_kill,
+    _backend_name_for_instance,
     _clear_responding,
     _do_switch_workspace,
     _edit_message_safe,
@@ -76,6 +77,74 @@ from kai.bot import (
 from kai.config import PROVIDER_MODELS, Config, UserConfig
 from kai.tts import DEFAULT_VOICE, VOICES
 from kai.workspace_utils import is_workspace_allowed
+
+# ── _backend_name_for_instance ───────────────────────────────────────
+
+
+class TestBackendNameForInstance:
+    """
+    Verify the bot-side runtime backend dispatch reads `backend_name`
+    off the instance rather than inspecting the concrete class name.
+
+    Real backends each set the attribute to their canonical identifier
+    (claude.py: "claude_code"; goose.py: "goose"; codex.py: "codex").
+    A test double or legacy stub that never overrode the ABC default
+    falls back to "claude" with a warning so model validation still
+    routes through the provider-only path.
+    """
+
+    def test_claude_backend_returns_class_attribute(self):
+        """ClaudeCodeBackend.backend_name is "claude_code" (the shadow-log tag)."""
+        from kai.claude import ClaudeCodeBackend
+
+        instance = MagicMock(spec=ClaudeCodeBackend)
+        instance.backend_name = ClaudeCodeBackend.backend_name
+        assert _backend_name_for_instance(instance) == "claude_code"
+
+    def test_goose_backend_returns_goose(self):
+        """GooseBackend.backend_name is "goose"."""
+        from kai.goose import GooseBackend
+
+        instance = MagicMock(spec=GooseBackend)
+        instance.backend_name = GooseBackend.backend_name
+        assert _backend_name_for_instance(instance) == "goose"
+
+    def test_codex_backend_returns_codex(self):
+        """CodexBackend.backend_name is "codex"."""
+        from kai.codex import CodexBackend
+
+        instance = MagicMock(spec=CodexBackend)
+        instance.backend_name = CodexBackend.backend_name
+        assert _backend_name_for_instance(instance) == "codex"
+
+    def test_falsy_backend_name_falls_back_to_claude_with_warning(self, caplog):
+        """A stub with empty backend_name returns "claude" and logs a warning."""
+        import logging
+
+        # Plain object with empty backend_name to simulate a test double or
+        # legacy stub that never overrode the ABC default of "".
+        stub = MagicMock()
+        stub.backend_name = ""
+
+        with caplog.at_level(logging.WARNING, logger="kai.bot"):
+            result = _backend_name_for_instance(stub)
+        assert result == "claude"
+        assert any("empty backend_name" in rec.message for rec in caplog.records)
+
+    def test_missing_backend_name_attribute_falls_back_to_claude(self, caplog):
+        """A stub without the attribute at all routes through the same fallback."""
+        import logging
+
+        # Use a bare object so MagicMock's auto-attributes don't synthesize
+        # a non-empty backend_name on access. getattr returns the default.
+        class _Stub:
+            pass
+
+        with caplog.at_level(logging.WARNING, logger="kai.bot"):
+            result = _backend_name_for_instance(_Stub())
+        assert result == "claude"
+        assert any("empty backend_name" in rec.message for rec in caplog.records)
+
 
 # ── _resolve_workspace_path ──────────────────────────────────────────
 

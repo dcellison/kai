@@ -456,14 +456,21 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 def _backend_name_for_instance(instance: object) -> str:
     """Map a backend instance to its config-key backend name.
 
-    Class-name inspection keeps the ABC free of backend-name leakage.
+    Reads the `backend_name` class attribute every concrete backend sets
+    (claude_code / goose / codex / opencode). A falsy value indicates a
+    test double or legacy stub that never overrode the ABC default of
+    `""`; for those, log a warning and fall back to "claude" so the
+    historical default for unknown shapes is preserved.
     """
-    cls = type(instance).__name__
-    if cls == "CodexBackend":
-        return "codex"
-    if cls == "GooseBackend":
-        return "goose"
-    return "claude"
+    name = getattr(instance, "backend_name", "")
+    if not name:
+        log.warning(
+            "Instance %s has empty backend_name; falling back to 'claude'. "
+            "Concrete backends must set the backend_name class attribute.",
+            type(instance).__name__,
+        )
+        return "claude"
+    return name
 
 
 def _get_user_backend_provider(pool: SubprocessPool, chat_id: int, config: Config) -> tuple[str, str]:
