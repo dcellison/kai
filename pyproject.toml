@@ -34,7 +34,7 @@ tts = [
 ]
 totp = [
     "pyotp>=2.9",
-    "qrcode>=7.4",
+    "qrcode>=8.2",
 ]
 
 [tool.setuptools.packages.find]
