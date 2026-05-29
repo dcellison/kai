@@ -29,7 +29,6 @@ from kai.install import (
     _cmd_apply,
     _cmd_config,
     _cmd_status,
-    _codex_users_from_yaml,
     _collect_os_users_from_yaml,
     _collect_user_memory_owners,
     _copy_tree,
@@ -781,133 +780,6 @@ class TestReadUsersYamlText:
 
         monkeypatch.setattr("kai.install.subprocess.run", _fake_subprocess_run)
         assert _read_users_yaml_text(path) is None
-
-
-class TestCodexUsersFromYamlProtectedFallback:
-    """Regression for the failure mode where the wizard skipped the
-    entire codex setup block because it read users.yaml from the
-    project-root path while only `/etc/kai/users.yaml` existed. The
-    fix routes `_codex_users_from_yaml` through `_read_users_yaml_text`
-    so the protected-path fallback works."""
-
-    def test_protected_path_yields_codex_users(self, monkeypatch, tmp_path):
-        """When the path raises PermissionError on direct read, the
-        helper sudo-cats the file and returns the codex-effective
-        users. Without this, the wizard predicate `codex_runs_anywhere`
-        evaluates False on installs with only `/etc/kai/users.yaml`
-        present, and the codex setup block silently skips - the
-        symptom the operator hit on a real deployment."""
-        path = Path("/etc/kai/users.yaml")
-
-        def _raise_perm(self, encoding="utf-8"):
-            raise PermissionError(13, "Permission denied", str(self))
-
-        monkeypatch.setattr(Path, "read_text", _raise_perm)
-
-        def _fake_subprocess_run(argv, capture_output, text, timeout):
-            class _R:
-                returncode = 0
-                stdout = "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: alice_os\n"
-
-            return _R()
-
-        monkeypatch.setattr("kai.install.subprocess.run", _fake_subprocess_run)
-        refs = _codex_users_from_yaml(path, "codex")
-        assert len(refs) == 1
-        assert refs[0].telegram_id == 12345
-        assert refs[0].os_user == "alice_os"
-
-
-class TestComputeOpencodeRunsAnywhere:
-    """
-    Mirrors `_compute_codex_runs_anywhere` semantics for opencode.
-    Without users.yaml, the global AGENT_BACKEND alone decides.
-    With users.yaml, ANY user whose effective backend resolves to
-    opencode flips the predicate True so the PATH check and auth
-    reminder still fire on mixed installs.
-    """
-
-    def _yaml_at(self, tmp_path, contents: str) -> Path:
-        p = tmp_path / "users.yaml"
-        p.write_text(contents)
-        return p
-
-    def test_no_yaml_global_opencode_true(self, tmp_path):
-        from kai.install import _compute_opencode_runs_anywhere
-
-        assert _compute_opencode_runs_anywhere("opencode", False, tmp_path / "missing.yaml") is True
-
-    def test_no_yaml_global_claude_false(self, tmp_path):
-        from kai.install import _compute_opencode_runs_anywhere
-
-        assert _compute_opencode_runs_anywhere("claude", False, tmp_path / "missing.yaml") is False
-
-    def test_yaml_with_per_user_opencode_on_claude_global(self, tmp_path):
-        """The mixed-backend case the reviewer flagged: global=claude, one user opencode."""
-        from kai.install import _compute_opencode_runs_anywhere
-
-        path = self._yaml_at(
-            tmp_path,
-            "users:\n"
-            "  - telegram_id: 111\n"
-            "    name: alice\n"
-            "  - telegram_id: 222\n"
-            "    name: bob\n"
-            "    agent_backend: opencode\n",
-        )
-        assert _compute_opencode_runs_anywhere("claude", True, path) is True
-
-    def test_yaml_with_no_opencode_users_returns_false(self, tmp_path):
-        from kai.install import _compute_opencode_runs_anywhere
-
-        path = self._yaml_at(
-            tmp_path,
-            "users:\n"
-            "  - telegram_id: 111\n"
-            "    name: alice\n"
-            "  - telegram_id: 222\n"
-            "    name: bob\n"
-            "    agent_backend: codex\n",
-        )
-        assert _compute_opencode_runs_anywhere("claude", True, path) is False
-
-    def test_yaml_with_inherited_global_opencode(self, tmp_path):
-        """A user with no agent_backend inherits global, so global=opencode + yaml = True."""
-        from kai.install import _compute_opencode_runs_anywhere
-
-        path = self._yaml_at(
-            tmp_path,
-            "users:\n  - telegram_id: 111\n    name: alice\n",
-        )
-        assert _compute_opencode_runs_anywhere("opencode", True, path) is True
-
-    def test_yaml_overrides_all_users_off_opencode(self, tmp_path):
-        """Authoritative-source rule: global opencode + every user overrides = False."""
-        from kai.install import _compute_opencode_runs_anywhere
-
-        path = self._yaml_at(
-            tmp_path,
-            "users:\n"
-            "  - telegram_id: 111\n"
-            "    name: alice\n"
-            "    agent_backend: claude\n"
-            "  - telegram_id: 222\n"
-            "    name: bob\n"
-            "    agent_backend: codex\n",
-        )
-        assert _compute_opencode_runs_anywhere("opencode", True, path) is False
-
-    def test_empty_yaml_returns_false(self, tmp_path):
-        from kai.install import _compute_opencode_runs_anywhere
-
-        path = self._yaml_at(tmp_path, "")
-        assert _compute_opencode_runs_anywhere("claude", True, path) is False
-
-    def test_yaml_without_users_key_returns_false(self, tmp_path):
-        from kai.install import _compute_opencode_runs_anywhere
-
-        path = self._yaml_at(tmp_path, "other: thing\n")
-        assert _compute_opencode_runs_anywhere("claude", True, path) is False
 
 
 class TestCollectUserMemoryOwners:
@@ -3102,16 +2974,6 @@ class TestCmdConfigDefaultModelDispatch:
         assert env.get("AGENT_BACKEND") == "codex"
         # MEMORY_REASONER_BACKEND retired; the wizard must not emit it.
         assert "MEMORY_REASONER_BACKEND" not in env
-
-    # The old test_claude_install_codex_reasoner_emits_codex_bin_and_matches_sudoers
-    # tested a wizard prompt path that issue #515 retired (global
-    # MEMORY_REASONER_BACKEND=codex with AGENT_BACKEND=claude). The
-    # mixed-backend scenario it covered now requires a users.yaml entry
-    # with per-user `agent_backend: codex`, which the wizard does not
-    # prompt for - operators edit users.yaml directly. The CODEX_BIN
-    # sudoers wiring is covered by other tests in the suite; a
-    # dedicated regression for the codex_runs_anywhere predicate
-    # belongs in the new-tests pass for issue #515.
 
 
 class TestCmdApplyDefaultModelGate:
@@ -6571,16 +6433,18 @@ class TestApplyAgentTimeoutMigration:
         assert "CLAUDE_TIMEOUT_SECONDS" not in env
 
 
-class TestPerOsUserCodexLoginHint:
-    """Post-install hint enumerates per-os_user codex login.
+class TestBuildCodexLoginReminder:
+    """Post-install codex subscription-auth reminder policy.
 
-    The reminder fires when codex actually runs on this install: agent
-    backend = codex OR memory reasoner = codex. Subscription auth lives
-    under each spawning user's home, so the reminder must enumerate
-    every distinct os_user in users.yaml (falling back to the service
-    user only when none are configured). The gate and enumeration are
-    factored into `_build_codex_login_reminder` so this test exercises
-    them directly without driving the full _cmd_apply pipeline.
+    The reminder is global-only: it fires when AGENT_BACKEND=codex AND
+    auth mode is subscription. Per-user `agent_backend: codex` entries
+    in users.yaml DO NOT trigger the reminder; mixed-backend installs
+    are operator-managed and the reminder would be wizard noise for
+    operators who chose a non-codex global backend.
+
+    The reminder text is generic ("log in as the target os_user") and
+    does NOT enumerate per-user os_users. Operators read users.yaml
+    themselves to know which accounts need codex login.
     """
 
     @staticmethod
@@ -6589,14 +6453,62 @@ class TestPerOsUserCodexLoginHint:
         path.write_text(yaml.safe_dump({"users": entries}))
         return path
 
-    def test_claude_agent_with_per_user_codex_emits_reminder(self, tmp_path):
-        """Mixed-backend regression. With AGENT_BACKEND=claude but a
-        users.yaml entry pinned to `agent_backend: codex`, codex still
-        runs per-user; the operator must run `codex login` as the
-        target os_user or the first turn fails with no auth.
-        Pre-#515 fix the reminder was suppressed because the gate
-        keyed on AGENT_BACKEND alone; now the gate honors per-user
-        agent_backend overrides via `_codex_users_from_yaml`.
+    def test_global_codex_subscription_emits_reminder(self, tmp_path):
+        """The one case the reminder should fire."""
+        from kai.install import _build_codex_login_reminder
+
+        users_yaml = self._write_users_yaml(
+            tmp_path,
+            [{"telegram_id": 1, "name": "alice", "role": "admin", "os_user": "alice"}],
+        )
+        env = {"AGENT_BACKEND": "codex", "CODEX_AUTH_MODE": "subscription"}
+        text = _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml)
+        assert text is not None
+        assert "Codex subscription auth required:" in text
+        assert "codex login" in text
+
+    def test_default_auth_mode_is_subscription(self, tmp_path):
+        """Missing CODEX_AUTH_MODE defaults to subscription; reminder fires."""
+        from kai.install import _build_codex_login_reminder
+
+        users_yaml = self._write_users_yaml(tmp_path, [])
+        env = {"AGENT_BACKEND": "codex"}
+        text = _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml)
+        assert text is not None
+
+    def test_reminder_is_generic_no_per_user_enumeration(self, tmp_path):
+        """The reminder text does NOT enumerate users.yaml os_users.
+
+        Pre-#556 the reminder listed `    alice ~$ codex login`,
+        `    bob ~$ codex login`, etc. Post-#556 it's a single generic
+        line. The wizard does not read users.yaml for this reminder
+        any more; mixed-backend installs are operator-managed.
+        """
+        from kai.install import _build_codex_login_reminder
+
+        users_yaml = self._write_users_yaml(
+            tmp_path,
+            [
+                {"telegram_id": 1, "name": "alice", "role": "admin", "os_user": "alice"},
+                {"telegram_id": 2, "name": "bob", "role": "user", "os_user": "bob"},
+            ],
+        )
+        env = {"AGENT_BACKEND": "codex"}
+        text = _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml)
+        assert text is not None
+        # No per-user enumeration. Specific os_user lines must NOT appear.
+        assert "alice ~$ codex login" not in text
+        assert "bob ~$ codex login" not in text
+        # Generic <os_user> placeholder DOES appear.
+        assert "<os_user> ~$ codex login" in text
+
+    def test_claude_global_with_per_user_codex_returns_none(self, tmp_path):
+        """Mixed-backend installs receive no reminder.
+
+        Pre-#556 the reminder fired when users.yaml had any codex-
+        effective entry. Post-#556 the gate is global-only: a per-user
+        codex override on a non-codex global install means the operator
+        owns codex setup out-of-band; the wizard does not preflight it.
         """
         from kai.install import _build_codex_login_reminder
 
@@ -6604,7 +6516,7 @@ class TestPerOsUserCodexLoginHint:
             tmp_path,
             [
                 {
-                    "telegram_id": 12345,
+                    "telegram_id": 1,
                     "name": "alice",
                     "role": "admin",
                     "agent_backend": "codex",
@@ -6613,32 +6525,10 @@ class TestPerOsUserCodexLoginHint:
             ],
         )
         env = {"AGENT_BACKEND": "claude"}
-        text = _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml)
-        assert text is not None
-        assert "Codex subscription auth required:" in text
-        assert "alice ~$ codex login" in text
-        # service-user fallback must NOT fire when users.yaml has entries.
-        assert "kai ~$ codex login" not in text
+        assert _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml) is None
 
-    def test_codex_agent_backend_still_emits_reminder(self, tmp_path):
-        """Defense-in-depth for the original gate: AGENT_BACKEND=codex
-        alone (no memory) still produces the reminder.
-        """
-        from kai.install import _build_codex_login_reminder
-
-        users_yaml = self._write_users_yaml(
-            tmp_path,
-            [{"telegram_id": 1, "name": "alice", "role": "admin", "os_user": "alice"}],
-        )
-        env = {"AGENT_BACKEND": "codex"}
-        text = _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml)
-        assert text is not None
-        assert "alice ~$ codex login" in text
-
-    def test_pure_claude_no_codex_anywhere_returns_none(self, tmp_path):
-        """No codex surface, no reminder. Claude memory extraction does
-        not spawn codex; emitting the hint here would be wizard noise.
-        """
+    def test_pure_claude_returns_none(self, tmp_path):
+        """No codex surface, no reminder."""
         from kai.install import _build_codex_login_reminder
 
         users_yaml = self._write_users_yaml(
@@ -6649,73 +6539,19 @@ class TestPerOsUserCodexLoginHint:
         assert _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml) is None
 
     def test_codex_api_key_mode_returns_none(self, tmp_path):
-        """API-key auth needs no per-user login; the env var ships the
-        token. The reminder must skip both codex-anywhere cases when
-        CODEX_AUTH_MODE=api_key.
-        """
+        """API-key auth needs no per-user login; the env var ships the token."""
         from kai.install import _build_codex_login_reminder
 
         users_yaml = self._write_users_yaml(
             tmp_path,
             [{"telegram_id": 1, "name": "alice", "role": "admin", "os_user": "alice"}],
         )
-        # First env: global codex with api_key auth, users.yaml has
-        # alice as a generic claude-effective user (no agent_backend
-        # override). Second env: claude global with per-user codex
-        # override via users.yaml + api_key auth. Both must return None
-        # because api_key auth needs no per-user codex login.
-        env_codex_global = {"AGENT_BACKEND": "codex", "CODEX_AUTH_MODE": "api_key"}
-        assert _build_codex_login_reminder(env_codex_global, "kai", users_yaml_path=users_yaml) is None
+        env = {"AGENT_BACKEND": "codex", "CODEX_AUTH_MODE": "api_key"}
+        assert _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml) is None
 
-        users_yaml_mixed = self._write_users_yaml(
-            tmp_path,
-            [
-                {
-                    "telegram_id": 2,
-                    "name": "alice",
-                    "role": "admin",
-                    "agent_backend": "codex",
-                    "os_user": "alice",
-                }
-            ],
-        )
-        env_mixed = {"AGENT_BACKEND": "claude", "CODEX_AUTH_MODE": "api_key"}
-        assert _build_codex_login_reminder(env_mixed, "kai", users_yaml_path=users_yaml_mixed) is None
-
-    def test_no_os_users_falls_back_to_service_user(self, tmp_path):
-        """When users.yaml has no os_user entries (legacy single-user
-        mode or empty file), the fallback hint names the service user.
-        """
+    def test_missing_agent_backend_returns_none(self, tmp_path):
+        """No AGENT_BACKEND key in env defaults to claude; reminder skipped."""
         from kai.install import _build_codex_login_reminder
 
-        users_yaml = self._write_users_yaml(
-            tmp_path,
-            [{"telegram_id": 1, "name": "alice", "role": "admin"}],
-        )
-        env = {"AGENT_BACKEND": "codex"}
-        text = _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml)
-        assert text is not None
-        assert "kai ~$ codex login" in text
-
-    def test_multiple_os_users_enumerated_and_deduplicated(self, tmp_path):
-        """Each distinct os_user gets one line. Duplicates in users.yaml
-        collapse so the operator does not see redundant hints; order is
-        deterministic (sorted) so the post-install output is stable
-        across runs.
-        """
-        from kai.install import _build_codex_login_reminder
-
-        users_yaml = self._write_users_yaml(
-            tmp_path,
-            [
-                {"telegram_id": 1, "name": "alice", "role": "admin", "os_user": "alice"},
-                {"telegram_id": 2, "name": "bob", "role": "user", "os_user": "bob"},
-                {"telegram_id": 3, "name": "carol", "role": "user", "os_user": "alice"},
-            ],
-        )
-        env = {"AGENT_BACKEND": "codex"}
-        text = _build_codex_login_reminder(env, "kai", users_yaml_path=users_yaml)
-        assert text is not None
-        # alice once (dedup), bob once; sorted ordering puts alice first.
-        login_lines = [line for line in text.splitlines() if "~$ codex login" in line]
-        assert login_lines == ["    alice ~$ codex login", "    bob ~$ codex login"]
+        users_yaml = self._write_users_yaml(tmp_path, [])
+        assert _build_codex_login_reminder({}, "kai", users_yaml_path=users_yaml) is None

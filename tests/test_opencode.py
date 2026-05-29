@@ -19,6 +19,9 @@ AcpBackend layer:
 
 import json
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from kai.opencode import OpenCodeBackend
 
@@ -326,3 +329,44 @@ class TestConstructor:
         assert b._proc is None
         assert b._session_id is None
         assert b._fresh_session is True
+
+
+# ── Startup-failure surface ──────────────────────────────────────────
+
+
+class TestStartupFailureSurface:
+    """
+    Spec #556 acceptance criterion: a per-user `agent_backend: opencode`
+    entry on a non-opencode install must produce a chat-visible
+    startup-failure StreamEvent (not silent failure, not fall-through
+    to claude) when `opencode` is missing from PATH.
+
+    `AcpBackend._send_locked` wraps `_ensure_started` in a try/except
+    that catches OSError / RuntimeError / TimeoutError and yields a
+    done StreamEvent with `error="<backend_label> startup failed: <exc>"`.
+    This is the runtime safety net for the wizard-decoupling change
+    that stopped preflighting per-user opencode tooling at install time.
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_opencode_binary_yields_startup_failure_event(self):
+        """FileNotFoundError from subprocess spawn becomes a done event with chat-visible error."""
+        b = _make_opencode()
+
+        async def _raise_filenotfound(*args, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "opencode")
+
+        events = []
+        with patch("kai.acp.asyncio.create_subprocess_exec", side_effect=_raise_filenotfound):
+            async for event in b._send_locked("hello"):
+                events.append(event)
+
+        assert events, "expected at least one StreamEvent"
+        final = events[-1]
+        assert final.done is True
+        assert final.response is not None
+        assert final.response.success is False
+        # Error message identifies OpenCode specifically (via backend_label)
+        # so the chat reply tells the operator which backend failed.
+        assert final.response.error is not None
+        assert "OpenCode startup failed:" in final.response.error

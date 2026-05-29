@@ -1813,3 +1813,42 @@ class TestCodexGrandchildEscalation:
         assert first_kill_argv[6] == "33333"
         assert second_kill_argv[6] == "22222"
         mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
+
+
+class TestStartupFailureSurface:
+    """
+    Spec #556 acceptance criterion: a per-user `agent_backend: codex`
+    entry on a non-codex install must produce a chat-visible
+    startup-failure StreamEvent (not silent failure, not fall-through
+    to claude) when codex tooling is missing.
+
+    `CodexBackend._send_locked` wraps `_ensure_started` in a
+    try/except that catches OSError / RuntimeError / TimeoutError
+    and yields a done StreamEvent with
+    `error="Codex startup failed: <exc>"`. This is the runtime safety
+    net for the wizard-decoupling change that stopped preflighting
+    per-user codex tooling at install time.
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_codex_binary_yields_startup_failure_event(self):
+        """FileNotFoundError from subprocess spawn becomes a done event with chat-visible error."""
+        c = _make_codex()
+
+        async def _raise_filenotfound(*args, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "codex")
+
+        events = []
+        with patch("kai.codex.asyncio.create_subprocess_exec", side_effect=_raise_filenotfound):
+            async for event in c._send_locked("hello"):
+                events.append(event)
+
+        assert events, "expected at least one StreamEvent"
+        final = events[-1]
+        assert final.done is True
+        assert final.response is not None
+        assert final.response.success is False
+        # Error message identifies codex specifically so the chat reply
+        # tells the operator which backend failed, not just "spawn error".
+        assert final.response.error is not None
+        assert "Codex startup failed:" in final.response.error
