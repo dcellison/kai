@@ -1,7 +1,9 @@
 # Per-user configuration for Kai.
 #
-# Copy to users.yaml (or /etc/kai/users.yaml for protected
-# installations) and customize with your users' details.
+# Copy to /etc/kai/users.yaml (the canonical location) and customize
+# with your users' details. Alternatively, run `make config`; the
+# wizard stages a generated file at `~/.cache/kai-install/users.yaml`
+# that `sudo make install` then copies into /etc/kai/users.yaml.
 #
 # Required fields: telegram_id, name.
 # All other fields are optional.

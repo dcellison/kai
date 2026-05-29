@@ -47,7 +47,7 @@ Per-workspace configuration is supported via `workspaces.yaml` (or `/etc/kai/wor
 
 ### Multi-user
 
-A single Kai instance can serve multiple Telegram users, each fully isolated. Define users in `users.yaml` (or `/etc/kai/users.yaml` for protected installations):
+A single Kai instance can serve multiple Telegram users, each fully isolated. Define users in `/etc/kai/users.yaml` (the canonical location for protected installations):
 
 ```yaml
 users:
@@ -68,7 +68,7 @@ Each user gets:
 - **Per-user home workspace** - each user can have their own default workspace directory.
 - **Role-based routing** - admins receive unattributed webhook events (GitHub pushes, generic webhooks). Regular users interact only through Telegram messages.
 
-Run `make config` to generate `users.yaml`, or create one manually from `templates/users.yaml`. See the [Multi-User Setup](https://github.com/dcellison/kai/wiki/Multi-User-Setup) wiki page for the full field reference. When `users.yaml` is absent, Kai falls back to `ALLOWED_USER_IDS` for backward compatibility. If neither is set, Kai refuses to start (fail-closed). The `CLAUDE_USER` env var acts as a global fallback for subprocess isolation; per-user `os_user` in `users.yaml` takes precedence when set.
+Run `make config` to stage a first-time `users.yaml` (written to `~/.cache/kai-install/users.yaml`; `sudo make install` copies it to `/etc/kai/users.yaml` and removes the staging file). Alternatively, create one manually from `templates/users.yaml`. See the [Multi-User Setup](https://github.com/dcellison/kai/wiki/Multi-User-Setup) wiki page for the full field reference. When `/etc/kai/users.yaml` is absent, Kai falls back to `ALLOWED_USER_IDS` for backward compatibility. If neither is set, Kai refuses to start (fail-closed). The `CLAUDE_USER` env var acts as a global fallback for subprocess isolation; per-user `os_user` in `users.yaml` takes precedence when set.
 
 ### Memory
 

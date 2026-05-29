@@ -119,6 +119,21 @@ def _set_required(monkeypatch, token="fake-token", user_ids="123"):
     monkeypatch.setenv("ALLOWED_USER_IDS", user_ids)
 
 
+def _patch_protected_users_yaml(monkeypatch, content: str) -> None:
+    """Feed `content` to `_load_user_configs` as if `/etc/kai/users.yaml`
+    held it. The loader reads via `_read_protected_file`; this helper
+    dispatches only the users.yaml path and returns None for every
+    other protected file (the default load_config shape on dev hosts).
+    """
+
+    def _fake_read(path):
+        if path == "/etc/kai/users.yaml":
+            return content
+        return None
+
+    monkeypatch.setattr("kai.config._read_protected_file", _fake_read)
+
+
 # ── Happy path ───────────────────────────────────────────────────────
 
 
@@ -1583,11 +1598,10 @@ class TestMemoryReasonerBinaryValidation:
         shape as claude."""
         from kai.oneshot_binary import BinaryResolutionError
 
-        users_yaml = tmp_path / "users.yaml"
-        users_yaml.write_text(
-            "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    agent_backend: codex\n    os_user: alice_os\n"
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    agent_backend: codex\n    os_user: alice_os\n",
         )
-        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
@@ -1674,14 +1688,15 @@ class TestCodexMemorySameUserSymmetry:
         assert config.agent_backend == "codex"
         assert config.memory_extraction_enabled is True
 
-    def test_codex_users_yaml_missing_os_user_starts_cleanly(self, tmp_path, monkeypatch):
+    def test_codex_users_yaml_missing_os_user_starts_cleanly(self, monkeypatch):
         """A codex-effective users.yaml entry without `os_user`
         loads successfully. The runtime treats missing os_user as
         in-process spawn (claude's existing pattern), so config-load
         does not refuse the shape."""
-        users_yaml = tmp_path / "users.yaml"
-        users_yaml.write_text("users:\n  - telegram_id: 67890\n    name: bob\n    role: user\n")
-        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 67890\n    name: bob\n    role: user\n",
+        )
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
@@ -1691,18 +1706,17 @@ class TestCodexMemorySameUserSymmetry:
         assert config.user_configs is not None
         assert config.user_configs[67890].os_user is None
 
-    def test_codex_users_yaml_same_user_as_bot_starts_cleanly(self, tmp_path, monkeypatch):
+    def test_codex_users_yaml_same_user_as_bot_starts_cleanly(self, monkeypatch):
         """A codex-effective users.yaml entry with `os_user`
         matching the bot user loads successfully. The runtime
         detects same-user via `resolve_claude_user` and spawns
         codex in-process - the same path claude has always used
         for same-user."""
         bot_user = pwd.getpwuid(os.getuid()).pw_name
-        users_yaml = tmp_path / "users.yaml"
-        users_yaml.write_text(
-            f"users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: {bot_user}\n"
+        _patch_protected_users_yaml(
+            monkeypatch,
+            f"users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: {bot_user}\n",
         )
-        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
@@ -1711,16 +1725,15 @@ class TestCodexMemorySameUserSymmetry:
         config = load_config()
         assert config.user_configs[12345].os_user == bot_user
 
-    def test_codex_users_yaml_cross_user_os_user_passes(self, tmp_path, monkeypatch):
+    def test_codex_users_yaml_cross_user_os_user_passes(self, monkeypatch):
         """The cross-user deployment shape still works: an `os_user`
         set to a non-bot account loads cleanly and is preserved on
         the UserConfig entry. Regression guard for the multi-user
         case."""
-        users_yaml = tmp_path / "users.yaml"
-        users_yaml.write_text(
-            "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: alice_os\n"
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: alice_os\n",
         )
-        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
@@ -1751,15 +1764,14 @@ class TestMemoryReasonerModelResolution:
         assert get_model_for(ModelRole.MEMORY_EXTRACTION, "claude") == "claude-haiku-4-5-20251001"
         assert get_model_for(ModelRole.MEMORY_EPISODE, "claude") == "claude-haiku-4-5-20251001"
 
-    def test_codex_default_resolves_to_codex_model(self, tmp_path, monkeypatch):
+    def test_codex_default_resolves_to_codex_model(self, monkeypatch):
         """Codex install: registry resolves to a codex-CLI-valid SKU.
         Test path is the per-user dispatch surface that production
         will follow: AGENT_BACKEND=codex + users.yaml with os_user."""
-        users_yaml = tmp_path / "users.yaml"
-        users_yaml.write_text(
-            "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: alice_os\n"
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: alice_os\n",
         )
-        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
@@ -1883,7 +1895,7 @@ class TestRegistryValidationPerEligibleBackend:
     codex override on a global-claude install must not reach
     runtime without its codex memory-role rows being validated."""
 
-    def test_missing_codex_memory_extraction_row_systemexits(self, monkeypatch, tmp_path):
+    def test_missing_codex_memory_extraction_row_systemexits(self, monkeypatch):
         """Mixed install: AGENT_BACKEND=claude with one users.yaml
         entry pinned to `agent_backend: codex`. Patch the registry
         so the codex MEMORY_EXTRACTION row is missing; load_config
@@ -1891,13 +1903,12 @@ class TestRegistryValidationPerEligibleBackend:
         import kai.config as config_mod
         from kai.config import ModelRole
 
-        users_yaml = tmp_path / "users.yaml"
-        users_yaml.write_text(
+        _patch_protected_users_yaml(
+            monkeypatch,
             "users:\n"
             "  - telegram_id: 1\n    name: alice\n    role: admin\n"
-            "    agent_backend: codex\n    os_user: alice_os\n"
+            "    agent_backend: codex\n    os_user: alice_os\n",
         )
-        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")

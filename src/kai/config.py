@@ -1559,11 +1559,14 @@ def _load_user_configs(
     global_llm_provider: str,
 ) -> dict[int, UserConfig] | None:
     """
-    Load per-user configs from users.yaml.
+    Load per-user configs from /etc/kai/users.yaml.
 
-    Tries /etc/kai/users.yaml first (protected), falls back to
-    PROJECT_ROOT/users.yaml (dev). Returns None if neither exists
-    (signals the caller to fall back to ALLOWED_USER_IDS).
+    Reads the protected file via `_read_protected_yaml` (sudo-cat for
+    root-owned mode 0600 copies). Returns None when the file is absent
+    or malformed; the caller then falls back to the legacy
+    `ALLOWED_USER_IDS` auth path. There is no project-root fallback:
+    users.yaml is canonical at `/etc/kai/users.yaml` and a stray copy
+    inside the source tree is never consulted.
 
     Args:
         global_backend: The global agent_backend from env config.
@@ -1573,7 +1576,6 @@ def _load_user_configs(
 
     Returns a dict keyed by telegram_id for O(1) lookup.
     """
-    # Same dual-mode loading pattern as _load_workspace_configs.
     data = _read_protected_yaml("users.yaml")
     if data is _YAML_MALFORMED:
         # Fail closed: return None so the caller falls back to
@@ -1582,23 +1584,12 @@ def _load_user_configs(
         log.warning("Skipping user config: /etc/kai/users.yaml is malformed or empty")
         return None
     if data is None:
-        local_path = PROJECT_ROOT / "users.yaml"
-        if not local_path.exists():
-            return None
-        try:
-            with open(local_path) as f:
-                data = yaml.safe_load(f)
-        except (yaml.YAMLError, OSError) as e:
-            log.error("Cannot load %s: %s", local_path, e)
-            return None
-        if not isinstance(data, dict):
-            log.warning("%s: expected a YAML dict, got %s", local_path, type(data).__name__)
-            return None
+        return None
 
-    # After the _YAML_MALFORMED and None checks, data should be a dict
-    # (protected path returns _YAML_MALFORMED for non-dicts, local path
-    # checks isinstance explicitly). Guard defensively rather than assert
-    # since assertions are stripped under Python -O.
+    # After the _YAML_MALFORMED and None checks, `data` is guaranteed
+    # to be a dict (`_read_protected_yaml` returns `_YAML_MALFORMED`
+    # for any non-dict top-level value). Guard defensively rather than
+    # assert since assertions are stripped under Python -O.
     if not isinstance(data, dict):
         log.warning("users.yaml: expected a YAML dict, got %s", type(data).__name__)
         return None

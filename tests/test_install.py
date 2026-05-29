@@ -276,16 +276,16 @@ class TestGenerateUsersYaml:
         assert entry["os_user"] == "kai"
         assert entry["home_workspace"] == "/opt/kai/home"
 
-    def test_roundtrip_with_loader(self, tmp_path, monkeypatch):
+    def test_roundtrip_with_loader(self, monkeypatch):
         """Generated YAML can be parsed by _load_user_configs("claude", "")."""
         from kai.config import _load_user_configs
 
         content = _generate_users_yaml("123456789", "alice", os_user="kai")
-        yaml_path = tmp_path / "users.yaml"
-        yaml_path.write_text(content)
-        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
-        # Skip the protected /etc/kai/ path so we read the tmp_path copy.
-        monkeypatch.setattr("kai.config._read_protected_yaml", lambda _: None)
+        parsed = yaml.safe_load(content)
+        # The runtime loader consumes the parsed dict returned by
+        # `_read_protected_yaml`. Patch that surface directly rather
+        # than writing a file the loader no longer reads.
+        monkeypatch.setattr("kai.config._read_protected_yaml", lambda _: parsed)
         configs = _load_user_configs("claude", "")
         assert configs is not None
         assert 123456789 in configs
@@ -1093,12 +1093,48 @@ class TestCmdConfig:
 
         monkeypatch.setattr(Path, "exists", _exists_no_etc)
 
+    @staticmethod
+    def _redirect_staging(monkeypatch, tmp_path):
+        """Redirect the staging-path helper so the wizard writes under tmp_path.
+
+        Tests that exercise the first-time wizard branch read the
+        generated file back from `tmp_path / "users.yaml"`; without this
+        redirect, the wizard would write to the operator's actual
+        `~/.cache/kai-install/users.yaml` and leak across test runs.
+        """
+        monkeypatch.setattr(
+            "kai.install._install_staging_path",
+            lambda filename: tmp_path / filename,
+        )
+
+    @staticmethod
+    def _simulate_existing_etc_users_yaml(monkeypatch, content):
+        """Simulate `/etc/kai/users.yaml` already existing with the given content.
+
+        Used by tests that want to exercise the wizard's "skip user
+        prompts; summarize existing config" branch without touching the
+        real `/etc/kai/`. Patches the path's existence check AND the
+        sudo-cat reader that the wizard goes through (`Path.exists` for
+        the existence gate; `_read_users_yaml_text` for the body the
+        wizard prints a summary of).
+        """
+        _real_exists = Path.exists
+
+        def _exists_with_etc(self):
+            if str(self) == "/etc/kai/users.yaml":
+                return True
+            return _real_exists(self)
+
+        monkeypatch.setattr(Path, "exists", _exists_with_etc)
+        monkeypatch.setattr("kai.install._read_users_yaml_text", lambda path: content)
+
     def test_writes_install_conf(self, tmp_path, monkeypatch):
         """Config subcommand writes valid JSON to install.conf."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         # Simulate user inputs for each prompt (in order)
         inputs = iter(
@@ -1172,6 +1208,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         inputs = iter(
             [
@@ -1253,6 +1290,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         inputs_basic = iter(
             [
@@ -1316,6 +1354,9 @@ class TestCmdConfig:
         monkeypatch.chdir(adv_root)
         monkeypatch.setattr("kai.install.INSTALL_CONF", adv_root / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", adv_root)
+        # Redirect staging again because the leg above changed PROJECT_ROOT
+        # but the staging helper is anchored to its own filename.
+        self._redirect_staging(monkeypatch, adv_root)
 
         inputs_advanced = iter(
             [
@@ -1368,6 +1409,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         # Pre-seed existing config with goose backend so the prompt
         # appears (it is gated behind an existing non-claude value).
@@ -1423,6 +1465,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         existing = {"version": 1, "env": {"AGENT_BACKEND": "goose"}}
         conf_path.write_text(json.dumps(existing))
@@ -1491,8 +1534,10 @@ class TestCmdConfig:
         }
         conf_path.write_text(json.dumps(existing))
 
-        # Place an existing users.yaml so the wizard skips user prompts
-        (tmp_path / "users.yaml").write_text("users:\n  - telegram_id: 999\n    name: existing\n    role: admin\n")
+        # Pretend /etc/kai/users.yaml is already in place; the wizard
+        # then summarizes it and skips the user-creation prompts.
+        existing_users_yaml = "users:\n  - telegram_id: 999\n    name: existing\n    role: admin\n"
+        self._simulate_existing_etc_users_yaml(monkeypatch, existing_users_yaml)
 
         # Press Enter for everything (accept all defaults)
         monkeypatch.setattr("builtins.input", lambda prompt: "")
@@ -1503,11 +1548,11 @@ class TestCmdConfig:
         # Should preserve existing values when user accepts defaults
         assert conf["install_dir"] == "/custom/path"
         assert conf["env"]["TELEGRAM_BOT_TOKEN"] == "existing-token"
-        # users.yaml should not have been overwritten
+        # Summary path printed; the wizard never staged a new users.yaml
+        # so no top-level staging key was written.
         output = capsys.readouterr().out
         assert "already configured" in output
-        data = yaml.safe_load((tmp_path / "users.yaml").read_text())
-        assert data["users"][0]["telegram_id"] == 999
+        assert "users_yaml_staging_path" not in conf
 
     def test_validates_required_fields(self):
         """Required-field validation rejects empty input."""
@@ -1649,6 +1694,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         inputs = iter(self._base_inputs(["false"]))  # memory disabled
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
@@ -1669,6 +1715,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         inputs = iter(self._base_inputs(["false"], effort=""))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
@@ -1691,6 +1738,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         inputs = iter(self._base_inputs(["false"], effort="xhigh"))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
@@ -1719,6 +1767,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         inputs = iter(self._base_inputs(["false"], agent_backend="goose"))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
@@ -1755,6 +1804,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         # Pre-seed: an install.conf as if the operator had previously
         # configured the wizard under claude with non-default values
@@ -1791,6 +1841,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         # Memory on, extraction on, custom timeout + consolidation candidates + episode tunables + token budget + search limit.
         # Budget prompts (extraction, episode) are skipped on the claude
@@ -1851,6 +1902,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         # Every input matches the corresponding dataclass default so
         # the emission gates suppress every key in the memory block.
@@ -1892,6 +1944,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         # Inputs in wizard order: enabled, ext enabled, timeout, consolidation, classifier-window, episode timeout, dedup threshold, token budget, search limit.
         # Budget prompts (extraction, episode) are skipped on the claude
@@ -1945,7 +1998,10 @@ class TestCmdConfig:
         conf_path = tmp_path / "install.conf"
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
+        self._simulate_existing_etc_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 999\n    name: existing\n    role: admin\n",
+        )
 
         # AGENT_BACKEND seeded explicitly so the extraction-keys cleanup (non-claude pops them) doesn't depend on the wizard's implicit default.
         existing = {
@@ -1967,8 +2023,9 @@ class TestCmdConfig:
             },
         }
         conf_path.write_text(json.dumps(existing))
-        # users.yaml prevents per-user prompts that lack defaults.
-        (tmp_path / "users.yaml").write_text("users:\n  - telegram_id: 999\n    name: existing\n    role: admin\n")
+        # users.yaml is simulated above via _simulate_existing_etc_users_yaml,
+        # which keeps the wizard on the existing-config branch and skips
+        # the per-user prompts that lack defaults.
 
         monkeypatch.setattr("builtins.input", lambda prompt: "")
 
@@ -1997,6 +2054,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         # Disabling memory must strip stale keys; otherwise the daemon keeps memory live after the operator opts out.
         existing = {
@@ -2028,6 +2086,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         # Switching claude -> goose must drop extraction keys: bot.py:3609 silently ignores them on non-claude.
         # MEMORY_EXTRACTION_TIMEOUT_S seeded so the cleanup pop is exercised, not just defaulted away.
@@ -2110,6 +2169,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         memory_block = [
             "true",  # memory enabled
@@ -2150,6 +2210,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         # All other fields at default; only the classifier window is
         # non-default so the test isolates the new emission path from
@@ -2182,6 +2243,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         memory_block = [
             "true",  # memory enabled
@@ -2213,6 +2275,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         # On goose, the extraction-enabled prompt itself is skipped, so
         # memory_block is shaped like a no-extraction run. The entire
@@ -2244,6 +2307,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
 
         # Goose install: extraction is gated out, so no reasoner prompt.
         # Inputs match the existing goose-skip test shape (memory_enabled,
@@ -2365,6 +2429,7 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
         # Pin the model + codex-binary helpers so the test does not
         # depend on the host having codex installed or a curated
         # model registry on disk. The mock value below is a real
@@ -2435,16 +2500,24 @@ class TestCmdConfig:
         assert entry.get("os_user") is None
 
         # Integration pin: feed the produced env + users.yaml into
-        # load_config and assert it accepts the shape. Neuter the
-        # /etc/kai/ readers and PROJECT_ROOT so load_config consumes
-        # the wizard-generated artifacts under tmp_path. The
-        # oneshot-binary resolver is mocked because the test host
-        # has no codex binary; load_config validates the resolved
-        # path on the codex extraction-eligible branch.
+        # load_config and assert it accepts the shape. The wizard
+        # staged users.yaml under tmp_path; loaded by load_config via
+        # the sudo-cat shim that we redirect here so it returns the
+        # staged content for /etc/kai/users.yaml. The oneshot-binary
+        # resolver is mocked because the test host has no codex
+        # binary; load_config validates the resolved path on the
+        # codex extraction-eligible branch.
         env_block = json.loads((tmp_path / "install.conf").read_text())["env"]
+        staged_users_yaml_text = users_yaml_path.read_text()
         monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
         monkeypatch.setattr("kai.config.load_dotenv", lambda *a, **kw: None)
-        monkeypatch.setattr("kai.config._read_protected_file", lambda path: None)
+
+        def _fake_read(path):
+            if path == "/etc/kai/users.yaml":
+                return staged_users_yaml_text
+            return None
+
+        monkeypatch.setattr("kai.config._read_protected_file", _fake_read)
         monkeypatch.setattr(
             "kai.oneshot_binary.resolve_oneshot_binary",
             lambda backend: f"/fake/{backend}",
@@ -2619,7 +2692,7 @@ class TestCmdApply:
         monkeypatch.setattr("os.geteuid", lambda: 0)
         monkeypatch.setenv("DRY_RUN", "1")
 
-        def fake_apply_secrets(env, dry_run):
+        def fake_apply_secrets(env, dry_run, users_yaml_staging_path=None):
             raise SystemExit("simulated apply SystemExit (e.g. venv version gate)")
 
         def fake_start(platform, dry_run, **kw):
@@ -2651,7 +2724,7 @@ class TestCmdApply:
         class ApplyBlewUp(RuntimeError):
             pass
 
-        def fake_apply_secrets(env, dry_run):
+        def fake_apply_secrets(env, dry_run, users_yaml_staging_path=None):
             raise ApplyBlewUp("simulated apply step failure")
 
         def fake_start(platform, dry_run, **kw):
@@ -2694,28 +2767,26 @@ class TestCmdConfigDefaultModelDispatch:
         """
         Configure the wizard sandbox so users_yaml_exists=True.
 
-        Writes a users.yaml under tmp_path (PROJECT_ROOT) so the wizard
-        takes the per-user branch. Optionally seeds install.conf with the
+        Simulates `/etc/kai/users.yaml` already in place (canonical
+        path) so the wizard takes the existing-config branch and skips
+        the per-user prompts. Optionally seeds install.conf with the
         given env so existing_env reflects the desired pre-existing state.
         """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        # Block /etc/kai/users.yaml detection so only tmp_path/users.yaml
-        # determines users_yaml_exists.
+        # Pretend /etc/kai/users.yaml exists with empty user list; only
+        # the presence flag matters for this dispatch test, not the
+        # content.
         _real_exists = Path.exists
 
-        def _exists_no_etc(self):
+        def _exists_with_etc(self):
             if str(self) == "/etc/kai/users.yaml":
-                return False
+                return True
             return _real_exists(self)
 
-        monkeypatch.setattr(Path, "exists", _exists_no_etc)
-
-        # Seed users.yaml; content does not matter for this dispatch test,
-        # only its presence (PROJECT_ROOT / "users.yaml").exists() drives
-        # the branch.
-        (tmp_path / "users.yaml").write_text("users: []\n")
+        monkeypatch.setattr(Path, "exists", _exists_with_etc)
+        monkeypatch.setattr("kai.install._read_users_yaml_text", lambda path: "users: []\n")
 
         if existing_env is not None:
             (tmp_path / "install.conf").write_text(json.dumps({"env": existing_env, "version": 1}))
@@ -5876,6 +5947,474 @@ class TestApplySecretsDryRun:
         output = capsys.readouterr().out
         assert "DRY RUN" in output
         assert "env" in output
+
+    def test_dry_run_users_yaml_staging_path_previewed(self, tmp_path, capsys):
+        """Dry run with a staged users.yaml previews the copy step.
+
+        Pins the dry-run contract for the canonical-users-yaml flow:
+        when the wizard recorded `users_yaml_staging_path` and the
+        file is present, apply prints the source -> destination line
+        without touching the filesystem.
+        """
+        staging = tmp_path / "users.yaml"
+        staging.write_text("users: []\n")
+        _apply_secrets(
+            {"TELEGRAM_BOT_TOKEN": "test"},
+            dry_run=True,
+            users_yaml_staging_path=str(staging),
+        )
+        output = capsys.readouterr().out
+        assert str(staging) in output
+        assert "/etc/kai/users.yaml" in output
+
+
+# ── _apply_secrets staging copy precedence ───────────────────────────
+
+
+class TestApplySecretsUsersYamlStaging:
+    """Precedence rules for the new `users_yaml_staging_path` parameter.
+
+    The presence of a non-empty path plus an existing file on disk is
+    the entire signal: anything else (None, empty string, missing file)
+    silently skips the copy.
+    """
+
+    @staticmethod
+    def _no_other_yamls(monkeypatch, tmp_path):
+        """Make `PROJECT_ROOT/services.yaml` and `workspaces.yaml` absent.
+
+        Keeps the test focused on the users.yaml staging path; the
+        legacy project-tree copy for the other two files is out of
+        scope here.
+        """
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+
+    @staticmethod
+    def _intercept_filesystem(monkeypatch):
+        """Capture copy2 / chmod / chown calls; suppress real env file write.
+
+        Returns three call-log lists the test can assert against, plus
+        a `Path.write_text` no-op that lets `_apply_secrets` skip the
+        actual `/etc/kai/env` write (the test process is unprivileged).
+        """
+        copied: list[tuple[str, str]] = []
+        chmodded: list[tuple[str, int]] = []
+        chowned: list[tuple[str, int, int]] = []
+        monkeypatch.setattr("shutil.copy2", lambda src, dst: copied.append((str(src), str(dst))))
+        monkeypatch.setattr("os.chmod", lambda path, mode: chmodded.append((str(path), mode)))
+        monkeypatch.setattr("os.chown", lambda path, uid, gid: chowned.append((str(path), uid, gid)))
+        real_write_text = Path.write_text
+
+        def _maybe_write(self, *args, **kwargs):
+            if str(self).startswith("/etc/kai/"):
+                return None
+            return real_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", _maybe_write)
+        return copied, chmodded, chowned
+
+    def test_copies_when_path_set_and_file_exists(self, tmp_path, monkeypatch):
+        """Non-empty path + existing file -> copy + 0600 + root-owned."""
+        self._no_other_yamls(monkeypatch, tmp_path)
+        copied, chmodded, chowned = self._intercept_filesystem(monkeypatch)
+        staging = tmp_path / "staged-users.yaml"
+        staging.write_text("users:\n  - telegram_id: 1\n    name: alice\n")
+
+        _apply_secrets(
+            {"TELEGRAM_BOT_TOKEN": "test"},
+            dry_run=False,
+            users_yaml_staging_path=str(staging),
+        )
+
+        users_copies = [(src, dst) for src, dst in copied if dst == "/etc/kai/users.yaml"]
+        assert users_copies == [(str(staging), "/etc/kai/users.yaml")]
+        users_modes = [m for p, m in chmodded if p == "/etc/kai/users.yaml"]
+        assert 0o600 in users_modes
+        users_owners = [(uid, gid) for p, uid, gid in chowned if p == "/etc/kai/users.yaml"]
+        assert (0, 0) in users_owners
+
+    def test_skips_when_path_is_none(self, tmp_path, monkeypatch):
+        """No staging path -> no users.yaml copy."""
+        self._no_other_yamls(monkeypatch, tmp_path)
+        copied, _, _ = self._intercept_filesystem(monkeypatch)
+
+        _apply_secrets({"TELEGRAM_BOT_TOKEN": "test"}, dry_run=False, users_yaml_staging_path=None)
+
+        assert not any(dst.endswith("users.yaml") for _src, dst in copied)
+
+    def test_skips_when_path_is_empty_string(self, tmp_path, monkeypatch):
+        """Empty string -> treated as None; no copy."""
+        self._no_other_yamls(monkeypatch, tmp_path)
+        copied, _, _ = self._intercept_filesystem(monkeypatch)
+
+        _apply_secrets({"TELEGRAM_BOT_TOKEN": "test"}, dry_run=False, users_yaml_staging_path="")
+
+        assert not any(dst.endswith("users.yaml") for _src, dst in copied)
+
+    def test_skips_when_path_set_but_file_missing(self, tmp_path, monkeypatch):
+        """Non-empty path that points at a missing file -> no copy, no error.
+
+        A hand-edited install.conf with a stale staging path silently
+        skips rather than failing the apply. The defensive check
+        protects the operator from a partial-install failure mode.
+        """
+        self._no_other_yamls(monkeypatch, tmp_path)
+        copied, _, _ = self._intercept_filesystem(monkeypatch)
+
+        _apply_secrets(
+            {"TELEGRAM_BOT_TOKEN": "test"},
+            dry_run=False,
+            users_yaml_staging_path=str(tmp_path / "does-not-exist.yaml"),
+        )
+
+        assert not any(dst.endswith("users.yaml") for _src, dst in copied)
+
+
+# ── _strip_install_conf_keys helper ──────────────────────────────────
+
+
+class TestStripInstallConfKeys:
+    """Unit coverage for the install.conf top-level key remover used
+    by `_cmd_apply` to drop the one-shot `users_yaml_staging_path`
+    after a successful apply.
+    """
+
+    def test_strips_named_key_only(self, tmp_path, monkeypatch):
+        """Targeted key removed; siblings preserved; mode stays 0600."""
+        from kai.install import _strip_install_conf_keys
+
+        conf_path = tmp_path / "install.conf"
+        original = {
+            "version": 1,
+            "install_dir": "/opt/kai",
+            "users_yaml_staging_path": "/tmp/staged",
+            "env": {"TELEGRAM_BOT_TOKEN": "tok"},
+        }
+        conf_path.write_text(json.dumps(original, indent=2) + "\n")
+        os.chmod(conf_path, 0o600)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+
+        _strip_install_conf_keys("users_yaml_staging_path")
+
+        rewritten = json.loads(conf_path.read_text())
+        assert "users_yaml_staging_path" not in rewritten
+        assert rewritten["version"] == 1
+        assert rewritten["install_dir"] == "/opt/kai"
+        assert rewritten["env"] == {"TELEGRAM_BOT_TOKEN": "tok"}
+        assert stat.S_IMODE(conf_path.stat().st_mode) == 0o600
+
+    def test_idempotent_when_key_absent(self, tmp_path, monkeypatch):
+        """A second call (or a call against a conf that never had the
+        key) is a no-op rather than an error.
+        """
+        from kai.install import _strip_install_conf_keys
+
+        conf_path = tmp_path / "install.conf"
+        conf_path.write_text(json.dumps({"version": 1, "env": {}}, indent=2) + "\n")
+        os.chmod(conf_path, 0o600)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+
+        _strip_install_conf_keys("users_yaml_staging_path")
+        _strip_install_conf_keys("users_yaml_staging_path")
+
+        rewritten = json.loads(conf_path.read_text())
+        assert rewritten == {"version": 1, "env": {}}
+
+    def test_missing_conf_is_noop(self, tmp_path, monkeypatch):
+        """No install.conf on disk -> silent no-op, not a SystemExit."""
+        from kai.install import _strip_install_conf_keys
+
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "nope.conf")
+        _strip_install_conf_keys("users_yaml_staging_path")
+
+
+# ── _cmd_config: users.yaml canonicalization ─────────────────────────
+
+
+class TestCmdConfigCanonicalUsersYaml:
+    """The wizard reads /etc/kai/users.yaml only and writes any new
+    file to a per-operator staging path recorded as a top-level
+    install.conf key, never inside the env dict.
+    """
+
+    @staticmethod
+    def _base_inputs() -> list[str]:
+        """Inputs that drive the wizard through a minimal first-install
+        flow (no advanced options, claude backend, no memory, no
+        external services).
+        """
+        return [
+            "/opt/kai",
+            "/var/lib/kai",
+            "kai",
+            "darwin",
+            "fake-token",
+            "12345",  # admin telegram id
+            "admin",  # admin name
+            "false",  # advanced
+            "polling",
+            "claude",
+            "sonnet",
+            "120",
+            "10.0",
+            "200000",
+            "80",
+            "",  # effort level (default)
+            "8080",
+            "test-secret",
+            "~/Projects",
+            "",
+            "false",
+            "900",
+            "1.0",
+            "false",
+            "",
+            "false",
+            "false",
+            "",  # claude_user
+            "false",  # memory enabled
+            "",  # perplexity key
+        ]
+
+    def test_stray_project_root_users_yaml_warns_and_is_ignored(self, tmp_path, monkeypatch, capsys):
+        """Stray PROJECT_ROOT/users.yaml triggers a deprecation notice
+        and the wizard still treats the install as first-time.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        TestCmdConfig._block_etc_kai(monkeypatch)
+        TestCmdConfig._redirect_staging(monkeypatch, tmp_path)
+
+        stray = tmp_path / "users.yaml"
+        stray.write_text("users:\n  - telegram_id: 999\n    name: stale\n    role: admin\n")
+
+        inputs = iter(self._base_inputs())
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        _cmd_config()
+
+        output = capsys.readouterr().out
+        assert str(stray) in output
+        assert "no longer used" in output
+        # Wizard ignored the stray file: it prompted for a new admin
+        # and produced a fresh staging file at the redirected location.
+        # The redirect maps "users.yaml" -> tmp_path/users.yaml, which
+        # IS the stray path we wrote above. So the generated content
+        # overwrote the stray. Verify by parsing for the wizard-supplied
+        # telegram_id (12345), not the stray (999).
+        staged = yaml.safe_load(stray.read_text())
+        assert staged["users"][0]["telegram_id"] == 12345
+
+    def test_first_time_install_records_top_level_staging_path(self, tmp_path, monkeypatch):
+        """install.conf carries `users_yaml_staging_path` at the top
+        level, NOT inside the env dict.
+        """
+        monkeypatch.chdir(tmp_path)
+        conf_path = tmp_path / "install.conf"
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        TestCmdConfig._block_etc_kai(monkeypatch)
+        # Use a sibling staging location so we can distinguish "top-level
+        # key matches the actual staging path" from "test stuffed the
+        # value via redirect at tmp_path/users.yaml".
+        staging_dir = tmp_path / "stage"
+        staging_dir.mkdir()
+        monkeypatch.setattr(
+            "kai.install._install_staging_path",
+            lambda filename: staging_dir / filename,
+        )
+
+        inputs = iter(self._base_inputs())
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        _cmd_config()
+
+        conf = json.loads(conf_path.read_text())
+        assert "users_yaml_staging_path" in conf
+        assert conf["users_yaml_staging_path"] == str(staging_dir / "users.yaml")
+        # MUST NOT leak into env (would otherwise reach /etc/kai/env as
+        # runtime daemon configuration).
+        assert "users_yaml_staging_path" not in conf["env"]
+        assert "USERS_YAML_STAGING_PATH" not in conf["env"]
+
+    def test_env_file_does_not_carry_staging_path(self, tmp_path, monkeypatch):
+        """Regression guard: `_generate_env_file(env)` never emits a
+        `USERS_YAML_STAGING_PATH` line. Pins the schema discipline that
+        keeps installer metadata out of `/etc/kai/env`.
+        """
+        monkeypatch.chdir(tmp_path)
+        conf_path = tmp_path / "install.conf"
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        TestCmdConfig._block_etc_kai(monkeypatch)
+        TestCmdConfig._redirect_staging(monkeypatch, tmp_path)
+
+        inputs = iter(self._base_inputs())
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        _cmd_config()
+
+        env = json.loads(conf_path.read_text())["env"]
+        rendered = _generate_env_file(env)
+        assert "USERS_YAML_STAGING_PATH" not in rendered
+
+
+# ── _cmd_apply: staging handoff ──────────────────────────────────────
+
+
+class TestCmdApplyStagingHandoff:
+    """`_cmd_apply` consumes the top-level `users_yaml_staging_path`
+    key from install.conf, threads it through to `_apply_secrets`, and
+    cleans up the staging file plus the conf key after the apply
+    succeeds (real run only; dry-run preserves both for a retry).
+    """
+
+    @staticmethod
+    def _minimal_conf(tmp_path, staging_path: str | None) -> Path:
+        """Write a minimal install.conf the apply path can validate.
+
+        Mirrors what `_cmd_config` would have produced for a claude
+        backend install. When `staging_path` is non-empty, persists it
+        as the top-level key the apply expects.
+        """
+        conf = {
+            "version": 1,
+            "install_dir": str(tmp_path / "opt-kai"),
+            "data_dir": str(tmp_path / "var-lib-kai"),
+            "service_user": "kai",
+            "platform": "darwin",
+            "env": {
+                "TELEGRAM_BOT_TOKEN": "tok",
+                "WEBHOOK_SECRET": "secret",
+                "DEFAULT_MODEL": "sonnet",
+                "AGENT_BACKEND": "claude",
+            },
+        }
+        if staging_path is not None:
+            conf["users_yaml_staging_path"] = staging_path
+        path = tmp_path / "install.conf"
+        path.write_text(json.dumps(conf, indent=2) + "\n")
+        os.chmod(path, 0o600)
+        return path
+
+    @staticmethod
+    def _stub_apply_internals(monkeypatch, captured: dict) -> None:
+        """Stub everything except staging-handoff cleanup.
+
+        The test runs as a non-root user so the real apply steps
+        cannot mutate `/etc/`. We replace each step with a stub and
+        capture the `users_yaml_staging_path` kwarg that flowed into
+        `_apply_secrets`.
+        """
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+
+        class _FakePwd:
+            pw_uid = 4242
+            pw_gid = 4242
+
+        monkeypatch.setattr("pwd.getpwnam", lambda name: _FakePwd)
+
+        def _fake_apply_secrets(env, dry_run, users_yaml_staging_path=None):
+            captured["users_yaml_staging_path"] = users_yaml_staging_path
+
+        monkeypatch.setattr("kai.install._stop_service", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_directories", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_source", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_venv", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_models", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_secrets", _fake_apply_secrets)
+        monkeypatch.setattr("kai.install._apply_sudoers", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_migrate", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_service", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._start_service", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._check_traversal", lambda *a, **kw: None)
+
+    def test_real_apply_unlinks_and_strips(self, tmp_path, monkeypatch):
+        """Successful real apply removes the staging file AND drops the
+        top-level conf key, preserving env and other top-level keys.
+        """
+        staging = tmp_path / "users.yaml"
+        staging.write_text("users: []\n")
+        conf_path = self._minimal_conf(tmp_path, str(staging))
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.delenv("DRY_RUN", raising=False)
+        captured: dict = {}
+        self._stub_apply_internals(monkeypatch, captured)
+
+        _cmd_apply()
+
+        # _apply_secrets received the staging path from the top-level key.
+        assert captured["users_yaml_staging_path"] == str(staging)
+        # Cleanup removed the staging file and the conf key.
+        assert not staging.exists()
+        rewritten = json.loads(conf_path.read_text())
+        assert "users_yaml_staging_path" not in rewritten
+        assert rewritten["env"]["TELEGRAM_BOT_TOKEN"] == "tok"
+        assert rewritten["install_dir"] == str(tmp_path / "opt-kai")
+        # Mode preservation: install.conf still carries secrets.
+        assert stat.S_IMODE(conf_path.stat().st_mode) == 0o600
+
+    def test_dry_run_preserves_staging_and_conf_key(self, tmp_path, monkeypatch, capsys):
+        """DRY_RUN=1 must leave the staging file in place AND keep the
+        top-level conf key so a subsequent real apply completes the
+        handoff exactly as if the dry run had never happened.
+        """
+        staging = tmp_path / "users.yaml"
+        staging.write_text("users: []\n")
+        conf_path = self._minimal_conf(tmp_path, str(staging))
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setenv("DRY_RUN", "1")
+        captured: dict = {}
+        self._stub_apply_internals(monkeypatch, captured)
+
+        _cmd_apply()
+
+        assert staging.exists()
+        rewritten = json.loads(conf_path.read_text())
+        assert rewritten.get("users_yaml_staging_path") == str(staging)
+        # Operator-visible notice that the dry run skipped the cleanup.
+        out = capsys.readouterr().out
+        assert "[DRY RUN] Would unlink staging file" in out
+        assert "[DRY RUN] Would strip users_yaml_staging_path" in out
+
+    def test_no_staging_path_means_no_cleanup(self, tmp_path, monkeypatch):
+        """install.conf without the top-level key -> apply does not
+        invent a path or attempt cleanup; `_apply_secrets` receives None.
+        """
+        conf_path = self._minimal_conf(tmp_path, staging_path=None)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.delenv("DRY_RUN", raising=False)
+        captured: dict = {}
+        self._stub_apply_internals(monkeypatch, captured)
+
+        _cmd_apply()
+
+        assert captured["users_yaml_staging_path"] is None
+        rewritten = json.loads(conf_path.read_text())
+        assert "users_yaml_staging_path" not in rewritten
+
+    def test_home_mismatch_resolved_via_conf_key(self, tmp_path, monkeypatch):
+        """Apply locates the staging file from install.conf even when
+        HOME differs from the HOME under which `make config` ran.
+        Pins the cross-account contract: the wizard runs as the
+        operator; apply runs as root. They share the recorded path,
+        not `Path.home()`.
+        """
+        operator_cache = tmp_path / "operator-cache"
+        operator_cache.mkdir()
+        staging = operator_cache / "users.yaml"
+        staging.write_text("users: []\n")
+        conf_path = self._minimal_conf(tmp_path, str(staging))
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.delenv("DRY_RUN", raising=False)
+        # Apply-side HOME points somewhere unrelated to the operator
+        # cache; the only signal that survives is the recorded path.
+        monkeypatch.setenv("HOME", str(tmp_path / "root-home"))
+        captured: dict = {}
+        self._stub_apply_internals(monkeypatch, captured)
+
+        _cmd_apply()
+
+        assert captured["users_yaml_staging_path"] == str(staging)
+        assert not staging.exists()
 
 
 # ── _apply_sudoers dry run ───────────────────────────────────────────

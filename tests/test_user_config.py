@@ -15,8 +15,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from kai.config import (
+    _YAML_MALFORMED,
     Config,
     UserConfig,
     _load_user_configs,
@@ -94,18 +96,22 @@ class TestUserConfig:
 
 
 class TestLoadUserConfigs:
-    def _write_yaml(self, tmp_path, content):
-        """Write a users.yaml file."""
-        yaml_file = tmp_path / "users.yaml"
-        yaml_file.write_text(textwrap.dedent(content))
-        return yaml_file
+    def _yaml_dict(self, content):
+        """Parse YAML content as the loader would see it after sudo-cat.
+
+        The runtime path is `_read_protected_yaml('users.yaml')` which
+        returns a parsed dict (or `_YAML_MALFORMED` / None). Tests patch
+        that function with the dict this helper produces; no file is
+        written because the loader no longer reads from PROJECT_ROOT.
+        """
+        result = yaml.safe_load(textwrap.dedent(content))
+        return result if isinstance(result, dict) else _YAML_MALFORMED
 
     def test_basic_loading(self, tmp_path):
         """Loads two users with correct fields."""
         ws = tmp_path / "ws"
         ws.mkdir()
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             f"""\
             users:
               - telegram_id: 111
@@ -121,8 +127,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
 
@@ -137,39 +142,42 @@ class TestLoadUserConfigs:
         assert configs[222].name == "bob"
         assert configs[222].role == "user"
 
-    def test_missing_file(self, tmp_path):
-        """Returns None when no YAML file exists."""
-        with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
-        ):
+    def test_missing_file(self):
+        """Returns None when /etc/kai/users.yaml is absent.
+
+        The protected reader returns None for missing files (distinct
+        from `_YAML_MALFORMED`); the loader maps that to None so the
+        caller falls back to the legacy ALLOWED_USER_IDS path.
+        """
+        with patch("kai.config._read_protected_yaml", return_value=None):
             configs = _load_user_configs("claude", "")
         assert configs is None
 
-    def test_empty_file(self, tmp_path):
-        """Returns None for an empty YAML file."""
-        self._write_yaml(tmp_path, "")
-        with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
-        ):
+    def test_empty_file(self):
+        """Returns None when /etc/kai/users.yaml exists but is empty.
+
+        The protected reader normalizes an empty / non-dict top-level
+        to `_YAML_MALFORMED`; the loader treats that as "fail closed"
+        and returns None rather than silently constructing an empty
+        config.
+        """
+        with patch("kai.config._read_protected_yaml", return_value=_YAML_MALFORMED):
             configs = _load_user_configs("claude", "")
         assert configs is None
 
-    def test_invalid_yaml(self, tmp_path):
-        """Returns None for malformed YAML."""
-        (tmp_path / "users.yaml").write_text("{{bad yaml[")
-        with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
-        ):
+    def test_invalid_yaml(self):
+        """Returns None when /etc/kai/users.yaml is malformed.
+
+        Same code path as the empty-file case: the protected reader
+        already raised on parse and returned `_YAML_MALFORMED`.
+        """
+        with patch("kai.config._read_protected_yaml", return_value=_YAML_MALFORMED):
             configs = _load_user_configs("claude", "")
         assert configs is None
 
     def test_missing_telegram_id(self, tmp_path):
         """Entry without telegram_id is skipped."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - name: alice
@@ -177,8 +185,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -186,8 +193,7 @@ class TestLoadUserConfigs:
 
     def test_whitespace_only_name(self, tmp_path):
         """Whitespace-only name is treated as missing."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -195,8 +201,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -204,8 +209,7 @@ class TestLoadUserConfigs:
 
     def test_missing_name(self, tmp_path):
         """Entry without name is skipped."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -213,8 +217,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -222,8 +225,7 @@ class TestLoadUserConfigs:
 
     def test_invalid_role(self, tmp_path):
         """Invalid role causes the entry to be skipped."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -232,8 +234,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -241,8 +242,7 @@ class TestLoadUserConfigs:
 
     def test_invalid_budget(self, tmp_path):
         """Negative budget causes the entry to be skipped."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -251,8 +251,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -260,8 +259,7 @@ class TestLoadUserConfigs:
 
     def test_bool_budget_rejected(self, tmp_path):
         """Boolean budget is rejected (same bool guard as workspace config)."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -270,8 +268,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -279,8 +276,7 @@ class TestLoadUserConfigs:
 
     def test_bool_telegram_id_rejected(self, tmp_path):
         """Boolean telegram_id is rejected."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: true
@@ -288,8 +284,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -297,8 +292,7 @@ class TestLoadUserConfigs:
 
     def test_duplicate_ids(self, tmp_path):
         """Duplicate telegram_id: first wins."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -308,8 +302,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -318,8 +311,7 @@ class TestLoadUserConfigs:
 
     def test_home_workspace_empty_string(self, tmp_path):
         """Empty home_workspace string is treated as None, not CWD."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -328,8 +320,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -338,8 +329,7 @@ class TestLoadUserConfigs:
 
     def test_home_workspace_nonexistent_warns_but_keeps_user(self, tmp_path):
         """Non-existent home_workspace warns and falls back to None, not skip."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -348,8 +338,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -357,18 +346,36 @@ class TestLoadUserConfigs:
         # home_workspace falls back to None (global default)
         assert configs[111].home_workspace is None
 
-    def test_protected_installation_tried_first(self, tmp_path):
-        """Protected file (/etc/kai/users.yaml) is tried before local."""
+    def test_protected_path_is_the_only_path(self, tmp_path):
+        """`/etc/kai/users.yaml` is canonical; the loader reads it via
+        `_read_protected_yaml` and uses whatever that returns.
+        """
         protected_data = {"users": [{"telegram_id": 111, "name": "alice", "role": "admin"}]}
         with patch("kai.config._read_protected_yaml", return_value=protected_data):
             configs = _load_user_configs("claude", "")
         assert configs is not None
         assert configs[111].name == "alice"
 
+    def test_stray_project_root_users_yaml_is_ignored(self, tmp_path):
+        """A stray `PROJECT_ROOT/users.yaml` does not affect the loader.
+
+        The dual-path fallback was removed: when the protected reader
+        returns None (canonical file absent), the loader returns None
+        and the caller falls back to ALLOWED_USER_IDS. A leftover
+        users.yaml inside the source tree must not feed the daemon.
+        """
+        stray = tmp_path / "users.yaml"
+        stray.write_text("users:\n  - telegram_id: 999\n    name: stray\n    role: admin\n")
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            patch("kai.config.PROJECT_ROOT", tmp_path),
+        ):
+            configs = _load_user_configs("claude", "")
+        assert configs is None
+
     def test_no_admin_warning(self, tmp_path, caplog):
         """All users with role 'user' logs a warning but does not fail."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -380,8 +387,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -390,8 +396,7 @@ class TestLoadUserConfigs:
 
     def test_default_role_is_user(self, tmp_path):
         """Omitting role defaults to 'user'."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -399,8 +404,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -408,8 +412,7 @@ class TestLoadUserConfigs:
 
     def test_os_user_stored(self, tmp_path):
         """os_user is stored as a string (not validated in Phase 1)."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -418,8 +421,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -429,8 +431,7 @@ class TestLoadUserConfigs:
 
     def test_model_parsed(self, tmp_path):
         """Valid model name is stored, lowercased."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -439,8 +440,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -448,8 +448,7 @@ class TestLoadUserConfigs:
 
     def test_invalid_model_ignored(self, tmp_path, caplog):
         """Invalid model name is ignored (set to None), user still loads."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -458,8 +457,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -468,8 +466,7 @@ class TestLoadUserConfigs:
 
     def test_timeout_parsed(self, tmp_path):
         """Valid timeout is stored as int."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -478,8 +475,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -487,8 +483,7 @@ class TestLoadUserConfigs:
 
     def test_invalid_timeout_ignored(self, tmp_path, caplog):
         """Negative timeout is ignored, user still loads."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -497,8 +492,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -507,8 +501,7 @@ class TestLoadUserConfigs:
 
     def test_context_window_parsed(self, tmp_path):
         """Valid context_window is stored as int."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -517,8 +510,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -526,8 +518,7 @@ class TestLoadUserConfigs:
 
     def test_context_window_zero_allowed(self, tmp_path):
         """context_window of 0 means 'use default' and is valid."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -536,8 +527,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -545,8 +535,7 @@ class TestLoadUserConfigs:
 
     def test_context_window_below_minimum_ignored(self, tmp_path, caplog):
         """context_window below 50000 (and not 0) is ignored."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -555,8 +544,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -565,8 +553,7 @@ class TestLoadUserConfigs:
 
     def test_new_fields_default_none(self, tmp_path):
         """New optional fields default to None when omitted."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -574,8 +561,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -594,8 +580,7 @@ class TestLoadUserConfigs:
         """Valid workspace_base directory is stored as resolved Path."""
         ws_base = tmp_path / "projects"
         ws_base.mkdir()
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             f"""\
             users:
               - telegram_id: 111
@@ -604,8 +589,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -613,8 +597,7 @@ class TestLoadUserConfigs:
 
     def test_workspace_base_missing_dir_warns(self, tmp_path, caplog):
         """Non-existent workspace_base warns and falls back to None."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -623,8 +606,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -634,8 +616,7 @@ class TestLoadUserConfigs:
 
     def test_workspace_base_empty_string(self, tmp_path):
         """Empty workspace_base string is treated as None."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -644,8 +625,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -655,8 +635,7 @@ class TestLoadUserConfigs:
 
     def test_github_repos_parsed(self, tmp_path):
         """Valid github_repos list is stored as list of strings."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -667,8 +646,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -676,8 +654,7 @@ class TestLoadUserConfigs:
 
     def test_github_repos_invalid_format(self, tmp_path, caplog):
         """Invalid repo format (no slash) is skipped with warning."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -692,8 +669,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -703,8 +679,7 @@ class TestLoadUserConfigs:
 
     def test_github_repos_not_list(self, tmp_path, caplog):
         """Non-list github_repos is ignored with warning."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -713,8 +688,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -723,8 +697,7 @@ class TestLoadUserConfigs:
 
     def test_github_repos_default(self, tmp_path):
         """Omitted github_repos defaults to empty list."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -732,8 +705,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -743,8 +715,7 @@ class TestLoadUserConfigs:
 
     def test_github_notify_chat_id_parsed(self, tmp_path):
         """Valid github_notify_chat_id is stored as int."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -753,8 +724,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -762,8 +732,7 @@ class TestLoadUserConfigs:
 
     def test_github_notify_chat_id_negative(self, tmp_path):
         """Negative chat IDs (group chats) are valid."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -772,8 +741,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -781,8 +749,7 @@ class TestLoadUserConfigs:
 
     def test_github_notify_chat_id_invalid(self, tmp_path, caplog):
         """Invalid github_notify_chat_id warns and uses None."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -791,8 +758,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -803,8 +769,7 @@ class TestLoadUserConfigs:
 
     def test_pr_review_bool(self, tmp_path):
         """pr_review True/False parsed from yaml."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -816,8 +781,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -826,8 +790,7 @@ class TestLoadUserConfigs:
 
     def test_pr_review_none_when_omitted(self, tmp_path):
         """Omitted pr_review defaults to None (use global)."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -835,8 +798,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -844,8 +806,7 @@ class TestLoadUserConfigs:
 
     def test_issue_triage_bool(self, tmp_path):
         """issue_triage True/False parsed from yaml."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -854,8 +815,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -863,8 +823,7 @@ class TestLoadUserConfigs:
 
     def test_pr_review_non_bool_warns(self, tmp_path, caplog):
         """Non-boolean pr_review warns and uses None."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -873,8 +832,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -884,8 +842,7 @@ class TestLoadUserConfigs:
 
     def test_issue_triage_non_bool_warns(self, tmp_path, caplog):
         """Non-boolean issue_triage warns and uses None."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -894,8 +851,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -906,8 +862,7 @@ class TestLoadUserConfigs:
 
     def test_valid_agent_backend(self, tmp_path):
         """Valid agent_backend is parsed and stored."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -918,8 +873,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -929,8 +883,7 @@ class TestLoadUserConfigs:
 
     def test_invalid_agent_backend_exits(self, tmp_path):
         """Invalid agent_backend causes SystemExit."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -939,16 +892,14 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
             pytest.raises(SystemExit, match="invalid agent_backend"),
         ):
             _load_user_configs("claude", "")
 
     def test_invalid_llm_provider_exits(self, tmp_path):
         """Invalid llm_provider for the user's backend causes SystemExit."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -958,16 +909,14 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
             pytest.raises(SystemExit, match="invalid llm_provider"),
         ):
             _load_user_configs("claude", "")
 
     def test_goose_backend_without_provider_exits(self, tmp_path):
         """Goose backend with no resolvable provider is a fatal error."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -976,8 +925,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
             # Global provider is "" (empty), user has none set
             pytest.raises(SystemExit, match="no llm_provider"),
         ):
@@ -985,8 +933,7 @@ class TestLoadUserConfigs:
 
     def test_goose_backend_inherits_global_provider(self, tmp_path):
         """User with goose backend inherits global llm_provider."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -996,8 +943,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             # Global provider is "openai"
             configs = _load_user_configs("goose", "openai")
@@ -1008,8 +954,7 @@ class TestLoadUserConfigs:
 
     def test_model_validated_against_user_provider(self, tmp_path):
         """Model invalid for user's effective provider is rejected."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -1020,8 +965,7 @@ class TestLoadUserConfigs:
             """,
         )
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
@@ -1030,8 +974,7 @@ class TestLoadUserConfigs:
 
     def test_open_ended_provider_warns_no_model(self, tmp_path, caplog):
         """Open-ended provider with no model emits a warning."""
-        self._write_yaml(
-            tmp_path,
+        data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
@@ -1043,8 +986,7 @@ class TestLoadUserConfigs:
         import logging
 
         with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
+            patch("kai.config._read_protected_yaml", return_value=data),
             caplog.at_level(logging.WARNING, logger="kai.config"),
         ):
             configs = _load_user_configs("claude", "")

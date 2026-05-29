@@ -349,6 +349,62 @@ def _validate_codex_bin(value: str) -> bool:
     return p.is_file() and os.access(p, os.X_OK)
 
 
+def _install_staging_path(filename: str) -> Path:
+    """Return the per-operator staging path for a first-time install file.
+
+    `make config` runs as the unprivileged operator account; `sudo make
+    install` runs as root. The staging file produced by config has to
+    live somewhere both runs can reach without crossing the secret-
+    discipline boundary at `/etc/kai/`. The operator's `${HOME}/.cache/
+    kai-install/` directory satisfies both: the operator owns it (config
+    can write without elevation) and root can read it during apply. We
+    deliberately avoid the project tree because the spec for #557
+    canonicalizes config locations outside the source checkout.
+
+    The parent directory is created mode 0700 on every call so the
+    staging file inherits a restrictive enclosing scope even before
+    its own 0600 chmod lands. Idempotent: a pre-existing directory
+    keeps its current mode.
+    """
+    cache_dir = Path.home() / ".cache" / "kai-install"
+    cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return cache_dir / filename
+
+
+def _strip_install_conf_keys(*keys: str) -> None:
+    """Remove the named top-level keys from `install.conf` and rewrite.
+
+    Used by `_cmd_apply` after `apply_succeeded = True` to drop one-
+    shot installer-metadata keys (currently just `users_yaml_staging_
+    path`) so a subsequent re-run does not redo a handoff that already
+    completed. Top-level only: keys inside the `env` dict belong to
+    `/etc/kai/env` and are not touched by this helper.
+
+    Preserves the 0600 mode because `install.conf` still carries
+    secrets (bot token, webhook secret) until the operator explicitly
+    deletes it. Missing keys are silently ignored so the helper is
+    idempotent against repeated apply runs. A missing or unreadable
+    `install.conf` is a no-op rather than an error because the helper
+    is called during the success path of an apply that already
+    validated the file at start.
+    """
+    if not INSTALL_CONF.exists():
+        return
+    try:
+        conf = json.loads(INSTALL_CONF.read_text())
+    except (json.JSONDecodeError, OSError):
+        return
+    mutated = False
+    for key in keys:
+        if key in conf:
+            conf.pop(key)
+            mutated = True
+    if not mutated:
+        return
+    INSTALL_CONF.write_text(json.dumps(conf, indent=2) + "\n")
+    os.chmod(INSTALL_CONF, 0o600)
+
+
 def _read_users_yaml_text(path: Path) -> str | None:
     """Return the contents of a users.yaml file, falling back to sudo
     for root-owned protected copies.
@@ -455,23 +511,27 @@ def _cmd_config() -> None:
     )
 
     # -- User setup --
-    # Check for an existing users.yaml. Try local project root first,
-    # then the deployed copy at /etc/kai/ (for protected installs).
-    # If either exists, skip the user prompt to avoid overwriting
-    # manual edits.
+    # `/etc/kai/users.yaml` is the only canonical source for the wizard.
+    # The wizard reads it via `_read_users_yaml_text` which sudo-cats
+    # the mode 0600 root-owned file. `Path.exists()` works through the
+    # listable parent directory even though the file is unreadable to
+    # the operator account, so the existence check does not require
+    # elevation.
+    #
+    # If no canonical file exists, the first-time branch writes to a
+    # per-operator staging path at `${HOME}/.cache/kai-install/
+    # users.yaml`. `_apply_secrets` (invoked under `sudo make install`)
+    # reads the path back from `install.conf` and copies it into
+    # `/etc/kai/users.yaml`. A stray `PROJECT_ROOT/users.yaml` from a
+    # previous install cycle is ignored; a one-line deprecation
+    # warning tells the operator to remove it or move it to
+    # `/etc/kai/users.yaml`.
     print("-- User setup --")
-    users_yaml_path = PROJECT_ROOT / "users.yaml"
+    stray_project_users_yaml = PROJECT_ROOT / "users.yaml"
+    if stray_project_users_yaml.exists():
+        print(f"  Note: {stray_project_users_yaml} is no longer used. Move it to /etc/kai/users.yaml or remove it.")
+    users_yaml_path = Path("/etc/kai/users.yaml")
     users_yaml_exists = users_yaml_path.exists()
-
-    if not users_yaml_exists:
-        # `/etc/kai/users.yaml` is mode 0600 owned by root.
-        # `Path.exists()` works as long as the parent directory is
-        # listable; downstream reads from `users_yaml_path` go through
-        # `_read_users_yaml_text` which sudo-cats protected copies.
-        etc_users = Path("/etc/kai/users.yaml")
-        if etc_users.exists():
-            users_yaml_exists = True
-            users_yaml_path = etc_users
 
     # Track whether advanced mode set os_user, so we can skip the
     # CLAUDE_USER prompt later (section 8). Needs to be in scope
@@ -486,6 +546,16 @@ def _cmd_config() -> None:
     admin_telegram_id: str = ""
     admin_name: str = ""
     admin_home_workspace: str | None = None
+    # First-time wizard sets this to the absolute path of the staging
+    # file written below; on every other branch it stays None. The
+    # value is persisted as a top-level `install.conf` key (NOT inside
+    # the env dict) so `_cmd_apply` can locate the staging file when
+    # `sudo make install` runs under a different HOME than the wizard.
+    # When the canonical `/etc/kai/users.yaml` already exists we
+    # deliberately leave it None and DO NOT carry forward any prior
+    # value from `existing`: a stale key would cause apply to overwrite
+    # the canonical file from a no-longer-current staging artifact.
+    users_yaml_staging_path: str | None = None
 
     if users_yaml_exists:
         # Summarize the existing config without modifying it. Reads
@@ -558,8 +628,16 @@ def _cmd_config() -> None:
             # spec exists to eliminate.
             admin_home_workspace = None
 
-        # Write users.yaml to project root. _apply_secrets() copies it
-        # to /etc/kai/users.yaml during 'make install'.
+        # Stage the generated users.yaml at `${HOME}/.cache/kai-install/
+        # users.yaml`. `_apply_secrets` copies from this staging path
+        # into `/etc/kai/users.yaml` during `sudo make install`; the
+        # path is persisted as a top-level key in install.conf below so
+        # apply can resolve it even when running under a different HOME
+        # (root vs the operator account). After `apply_succeeded`,
+        # `_cmd_apply` unlinks the staging file and strips the conf key
+        # so a subsequent re-run does not redo a handoff that already
+        # completed.
+        users_yaml_path = _install_staging_path("users.yaml")
         users_yaml_content = _generate_users_yaml(
             admin_telegram_id,
             admin_name,
@@ -568,6 +646,7 @@ def _cmd_config() -> None:
         )
         users_yaml_path.write_text(users_yaml_content)
         os.chmod(users_yaml_path, 0o600)
+        users_yaml_staging_path = str(users_yaml_path)
         print(f"  Generated {users_yaml_path}")
     print()
 
@@ -1548,6 +1627,17 @@ def _cmd_config() -> None:
         "platform": platform,
         "env": env,
     }
+
+    # Pending first-install handoff: `_cmd_apply` reads this top-level
+    # key to locate the staging file written above and copies it to
+    # `/etc/kai/users.yaml`. The key sits alongside `version`/
+    # `install_dir`/`env` (NOT inside `env`) because it is installer
+    # metadata; routing it through `env` would surface it in
+    # `/etc/kai/env` and pollute runtime daemon configuration. The
+    # presence of this key is also the only signal apply uses: a stale
+    # staging file without a matching key in install.conf is ignored.
+    if users_yaml_staging_path:
+        conf["users_yaml_staging_path"] = users_yaml_staging_path
 
     INSTALL_CONF.write_text(json.dumps(conf, indent=2) + "\n")
     # Restrict permissions since the file contains secrets (bot token, webhook secret)
@@ -3155,6 +3245,14 @@ def _cmd_apply() -> None:
     service_user = conf.get("service_user")
     platform = conf.get("platform")
     env = conf.get("env", {})
+    # Top-level installer metadata: present only when the wizard
+    # staged a first-time users.yaml that has not yet been applied.
+    # The empty-string -> None coercion treats a hand-edited conf
+    # with an empty value the same as a missing key (apply skips
+    # the copy). `_apply_secrets` defends against a missing file
+    # behind a non-empty path so a wrong value silently skips
+    # rather than failing the apply.
+    users_yaml_staging_path = conf.get("users_yaml_staging_path", "") or None
 
     if not all([install_dir, data_dir, service_user, platform]):
         raise SystemExit("install.conf is missing required fields.")
@@ -3306,7 +3404,7 @@ def _cmd_apply() -> None:
         if "AGENT_TIMEOUT_SECONDS" not in env and "CLAUDE_TIMEOUT_SECONDS" in env:
             env["AGENT_TIMEOUT_SECONDS"] = env["CLAUDE_TIMEOUT_SECONDS"]
         env.pop("CLAUDE_TIMEOUT_SECONDS", None)
-        _apply_secrets(env, dry_run)
+        _apply_secrets(env, dry_run, users_yaml_staging_path=users_yaml_staging_path)
 
         # -- Step 6: Deploy Goose config (if backend=goose) --
         if env.get("AGENT_BACKEND") == "goose":
@@ -3329,6 +3427,24 @@ def _cmd_apply() -> None:
         # finally block reads it to decide how to handle a service
         # start failure.
         apply_succeeded = True
+
+        # First-install staging handoff cleanup. Gated on `not dry_run`
+        # because the dry-run contract is "no changes will be made";
+        # unguarded cleanup would consume the one-shot staging file
+        # during an inspection run and leave the next real apply with
+        # nothing to copy. Cleanup runs inside the try block (rather
+        # than after the finally) so it cannot delete the staging file
+        # before service-start results are known - cleanup completes
+        # before the service-start retry budget begins, and a
+        # service-start failure after this point does not invalidate
+        # the apply itself.
+        if users_yaml_staging_path:
+            if dry_run:
+                print(f"[DRY RUN] Would unlink staging file: {users_yaml_staging_path}")
+                print("[DRY RUN] Would strip users_yaml_staging_path from install.conf")
+            else:
+                Path(users_yaml_staging_path).unlink(missing_ok=True)
+                _strip_install_conf_keys("users_yaml_staging_path")
     except Exception:
         print("\nInstallation failed. See error above.")
         print("The installation may be in a partial state.")
@@ -4255,15 +4371,49 @@ def _apply_models(install_path: Path, dry_run: bool) -> None:
     print(f"  Copied models to {models_dst}")
 
 
-def _apply_secrets(env: dict[str, str], dry_run: bool) -> None:
-    """Write the /etc/kai/env file from install.conf environment values."""
+def _apply_secrets(
+    env: dict[str, str],
+    dry_run: bool,
+    users_yaml_staging_path: str | None = None,
+) -> None:
+    """Write the /etc/kai/env file from install.conf environment values.
+
+    `users_yaml_staging_path` is the absolute path of the first-time
+    install staging file as recorded by the wizard at the top level of
+    `install.conf`. It is passed explicitly (not read from `env`)
+    because routing it through `env` would surface it in `/etc/kai/env`
+    as runtime daemon configuration; the staging path is installer
+    metadata and must never leak there. The caller in `_cmd_apply`
+    handles post-success cleanup (unlink + strip the conf key); this
+    function only performs the copy.
+    """
     etc_kai = Path("/etc/kai")
     env_path = etc_kai / "env"
     env_content = _generate_env_file(env)
 
+    # Resolve users.yaml staging once so the dry-run preview and the
+    # real-apply branch share the same precedence rule. The presence
+    # of a non-empty path AND a readable file on disk is the entire
+    # signal: a stale staging file with no matching install.conf key
+    # never reaches this function (the caller passes None), and a
+    # recorded key that points at a missing file silently skips the
+    # copy rather than failing the apply.
+    users_yaml_src: Path | None = None
+    if users_yaml_staging_path:
+        candidate = Path(users_yaml_staging_path)
+        if candidate.is_file():
+            users_yaml_src = candidate
+
     if dry_run:
         print(f"[DRY RUN] Would write: {env_path} (mode 0600)")
-        for yaml_name in ("services.yaml", "users.yaml", "workspaces.yaml"):
+        if users_yaml_src is not None:
+            print(f"[DRY RUN] Would copy: {users_yaml_src} -> {etc_kai / 'users.yaml'} (mode 0600)")
+        # TODO: services.yaml and workspaces.yaml still copy from
+        # PROJECT_ROOT pending follow-up issues that mirror the
+        # users.yaml staging flow for those files. The asymmetry is
+        # intentional and tracked; users.yaml moves first because it
+        # is auth-bearing.
+        for yaml_name in ("services.yaml", "workspaces.yaml"):
             if (PROJECT_ROOT / yaml_name).exists():
                 print(f"[DRY RUN] Would copy: {etc_kai / yaml_name} (mode 0600)")
         return
@@ -4273,11 +4423,28 @@ def _apply_secrets(env: dict[str, str], dry_run: bool) -> None:
     os.chown(env_path, 0, 0)
     print(f"  Wrote {env_path}")
 
+    # users.yaml is handled separately from the other YAML files. Its
+    # source is the per-operator staging file recorded in install.conf
+    # by the wizard, not PROJECT_ROOT/users.yaml; the spec for #557
+    # canonicalizes users.yaml on /etc/kai/users.yaml and removes the
+    # project-tree path. Cleanup of the staging file and the conf key
+    # happens in `_cmd_apply` after `apply_succeeded = True` so a
+    # failed apply preserves both for a clean retry.
+    if users_yaml_src is not None:
+        users_yaml_dst = etc_kai / "users.yaml"
+        shutil.copy2(users_yaml_src, users_yaml_dst)
+        os.chmod(users_yaml_dst, 0o600)
+        os.chown(users_yaml_dst, 0, 0)
+        print(f"  Copied {users_yaml_dst}")
+
     # Copy optional YAML config files to /etc/kai/ if they exist in the
     # source directory. All get root-only permissions (mode 0600) since
-    # they may contain sensitive configuration (API keys in services.yaml,
-    # user IDs in users.yaml).
-    for yaml_name in ("services.yaml", "users.yaml", "workspaces.yaml"):
+    # they may contain sensitive configuration (API keys in services.yaml).
+    # TODO: services.yaml and workspaces.yaml still read from
+    # PROJECT_ROOT pending follow-up issues that mirror the users.yaml
+    # staging flow. The asymmetry is documented in-code so it is
+    # visible to anyone touching this function.
+    for yaml_name in ("services.yaml", "workspaces.yaml"):
         yaml_src = PROJECT_ROOT / yaml_name
         yaml_dst = etc_kai / yaml_name
         if yaml_src.exists():
