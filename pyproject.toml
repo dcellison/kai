@@ -30,7 +30,7 @@ memory = [
     "sentence-transformers>=3.0.0",
 ]
 tts = [
-    "piper-tts>=1.4.0",
+    "piper-tts>=1.4.2",
 ]
 totp = [
     "pyotp>=2.9",
