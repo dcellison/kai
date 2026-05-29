@@ -3288,11 +3288,13 @@ def _cmd_apply() -> None:
         # without round-tripping through the wizard. Apply-time env
         # wins over any value already in install.conf.
         #
-        # Gate on the global AGENT_BACKEND only. A non-codex global
-        # install does not pick up an apply-time CODEX_BIN override:
-        # per-user `agent_backend: codex` entries are operator-managed
-        # and should configure their own CODEX_BIN via the wizard
-        # rather than through an apply-time env var.
+        # Gate on the global AGENT_BACKEND only. The wizard and the
+        # apply-time CODEX_BIN env pass-through are both scoped to
+        # global Codex installs. A per-user `agent_backend: codex`
+        # entry on a non-Codex global install is operator-managed:
+        # ensure Codex is installed and authenticated out of band for
+        # that user's os_user; the runtime startup-failure event
+        # surfaces missing tooling at first message.
         env_codex_bin = os.environ.get("CODEX_BIN")
         if env_codex_bin and env.get("AGENT_BACKEND") == "codex":
             env["CODEX_BIN"] = env_codex_bin
