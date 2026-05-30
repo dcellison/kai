@@ -569,8 +569,6 @@ async def _get_subscribed_users(config: Config, repo_full_name: str) -> list[Use
         List of UserConfig objects for users who should receive this event.
         May contain both explicitly-subscribed users and admin wildcards.
     """
-    if config.user_configs is None:
-        return []
     repo_lower = repo_full_name.lower()
 
     explicitly_subscribed: list[UserConfig] = []
@@ -613,26 +611,19 @@ async def _process_github_event(request: web.Request, payload: dict, event_type:
     subscribed_users = await _get_subscribed_users(config, repo_full_name)
 
     if not subscribed_users:
-        # No subscribers and no admin wildcards for this repo.
-        # This can happen when:
-        #   - No users.yaml exists (env-var only mode, debug-log to avoid noise)
-        #   - All admins have explicit github_repos that don't include this repo
-        #   - No admins are configured (unusual; warned at config load time)
-        if config.user_configs:
-            log.warning(
-                "GitHub %s event for %s: no subscribed users. "
-                "Add 'github_repos: [%s]' to users.yaml to receive "
-                "events for this repo.",
-                event_type,
-                repo_full_name,
-                repo_full_name,
-            )
-        else:
-            log.debug(
-                "GitHub %s event for %s: no user_configs, using admin fallback",
-                event_type,
-                repo_full_name,
-            )
+        # No subscribers and no admin wildcards for this repo. With
+        # users.yaml mandatory the cause is now narrowly that all
+        # admins have explicit github_repos that don't include this
+        # repo, or that no admin is configured at all (a warning at
+        # config load time covers the latter).
+        log.warning(
+            "GitHub %s event for %s: no subscribed users. "
+            "Add 'github_repos: [%s]' to users.yaml to receive "
+            "events for this repo.",
+            event_type,
+            repo_full_name,
+            repo_full_name,
+        )
         # Fall back to the first admin in the app config so the event is
         # not silently dropped. Wrapped in try/except for consistency with
         # the fan-out path - a transient failure should return 200, not 500.
@@ -2050,30 +2041,22 @@ async def start(telegram_app, config) -> None:
     _app["webhook_secret"] = config.webhook_secret
 
     # Set the default chat_id for API calls that don't specify a target.
-    # When users.yaml exists, the first admin is the default. When no
-    # admin is defined, fall back to the first user with a warning.
-    # Without users.yaml, use the first ALLOWED_USER_IDS entry.
-    if config.user_configs:
-        admins = config.get_admins()
-        if admins:
-            _app["chat_id"] = admins[0].telegram_id
-        else:
-            # No admin defined - fall back to arbitrary first user.
-            fallback = next(iter(config.user_configs.values()))
-            log.warning(
-                "No admin users defined in users.yaml; using %s "
-                "(telegram_id: %d) as default webhook target. "
-                "External notifications may route unexpectedly.",
-                fallback.name,
-                fallback.telegram_id,
-            )
-            _app["chat_id"] = fallback.telegram_id
+    # users.yaml is mandatory so the first admin is the default; when
+    # no admin is defined, fall back to the first user with a warning
+    # (the same warning at config load time covers the no-admin case).
+    admins = config.get_admins()
+    if admins:
+        _app["chat_id"] = admins[0].telegram_id
     else:
-        # Legacy: ALLOWED_USER_IDS only
-        chat_id = next(iter(config.allowed_user_ids), None)
-        if chat_id is None:
-            raise SystemExit("No allowed user IDs configured; cannot start webhook server")
-        _app["chat_id"] = chat_id
+        fallback = next(iter(config.user_configs.values()))
+        log.warning(
+            "No admin users defined in users.yaml; using %s "
+            "(telegram_id: %d) as default webhook target. "
+            "External notifications may route unexpectedly.",
+            fallback.name,
+            fallback.telegram_id,
+        )
+        _app["chat_id"] = fallback.telegram_id
 
     # Store allowed user IDs for chat_id validation in _resolve_chat_id.
     # Prevents prompt injection from routing messages to arbitrary users.
@@ -2105,23 +2088,22 @@ async def start(telegram_app, config) -> None:
     # Add per-user github_notify_chat_id values to allowed_user_ids
     # so review/triage agents can POST to /api/send-message with
     # these chat_ids. Loads from both users.yaml and DB.
-    if config.user_configs:
-        for uc in config.user_configs.values():
-            if uc.github_notify_chat_id is not None:
-                _app["allowed_user_ids"].add(uc.github_notify_chat_id)
-        # Also add any DB-stored notify chat IDs (set via /github notify).
-        # webhook.start() is already async so the await is fine.
-        for uid in config.user_configs:
-            val = await sessions.get_setting(f"github_notify_chat:{uid}")
-            if val:
-                try:
-                    _app["allowed_user_ids"].add(int(val))
-                except ValueError:
-                    log.warning(
-                        "Invalid github_notify_chat for user %s in DB: %s (ignoring)",
-                        uid,
-                        val,
-                    )
+    for uc in config.user_configs.values():
+        if uc.github_notify_chat_id is not None:
+            _app["allowed_user_ids"].add(uc.github_notify_chat_id)
+    # Also add any DB-stored notify chat IDs (set via /github notify).
+    # webhook.start() is already async so the await is fine.
+    for uid in config.user_configs:
+        val = await sessions.get_setting(f"github_notify_chat:{uid}")
+        if val:
+            try:
+                _app["allowed_user_ids"].add(int(val))
+            except ValueError:
+                log.warning(
+                    "Invalid github_notify_chat for user %s in DB: %s (ignoring)",
+                    uid,
+                    val,
+                )
     # Also add the global env var fallback if set
     if config.github_notify_chat_id is not None:
         _app["allowed_user_ids"].add(config.github_notify_chat_id)
@@ -2280,10 +2262,6 @@ def remove_allowed_chat_id(chat_id: int) -> None:
     chat_id we previously added via add_allowed_chat_id() would also
     appear there. Instead, check config.user_configs (a dict keyed
     by telegram_id, populated at load time, never mutated at runtime).
-
-    In legacy mode (no users.yaml), config.user_configs is None and
-    this guard does not fire. The caller in bot.py must handle the
-    self-ID case before calling this function.
     """
     if _app is not None:
         allowed = _app.get("allowed_user_ids")
@@ -2292,6 +2270,6 @@ def remove_allowed_chat_id(chat_id: int) -> None:
         # Never remove a chat_id that belongs to an actual user.
         # user_configs keys are telegram_ids of real users.
         config = _app.get("config")
-        if config and config.user_configs and chat_id in config.user_configs:
+        if config and chat_id in config.user_configs:
             return
         allowed.discard(chat_id)

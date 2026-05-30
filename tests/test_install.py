@@ -2365,8 +2365,7 @@ class TestCmdConfig:
         # builds this alongside the env block; here we set up a
         # minimal users.yaml inline so the test focuses on the
         # memory env contract.
-        users_yaml = tmp_path / "users.yaml"
-        users_yaml.write_text("users:\n  - telegram_id: 1\n    name: tester\n    role: admin\n    os_user: tester_os\n")
+        users_yaml_text = "users:\n  - telegram_id: 1\n    name: tester\n    role: admin\n    os_user: tester_os\n"
         monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
         # Pin protected-env / dotenv to be inert. Without this,
         # load_config reads /etc/kai/env (when present on the dev
@@ -2379,7 +2378,15 @@ class TestCmdConfig:
         # its scope; this test is in test_install.py and has to do
         # it explicitly.
         monkeypatch.setattr("kai.config.load_dotenv", lambda *a, **kw: None)
-        monkeypatch.setattr("kai.config._read_protected_file", lambda path: None)
+
+        def _fake_read(path):
+            # users.yaml is mandatory post-#565 tranche A; serve the
+            # inline content so the loader's auth contract is met.
+            if path == "/etc/kai/users.yaml":
+                return users_yaml_text
+            return None
+
+        monkeypatch.setattr("kai.config._read_protected_file", _fake_read)
         # Seed only the env keys the wizard would emit. Everything
         # else falls back to dataclass defaults via load_config.
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")

@@ -740,25 +740,18 @@ def _is_notification_only_chat_id(chat_id: int | None, config: Config) -> bool:
     notification group chat, a deploy-status broadcast channel, a
     review-summary destination room.
 
-    Returns False (treat as interactive) for:
-    - chat_id is None: test / health-check / anon paths; preserved by
-      the existing ensure_user_home(None, ...) -> data_dir/home/anon
-      contract.
-    - config.user_configs is empty or None: legacy single-user mode
-      with no users.yaml. There is no basis for discriminating;
-      every chat_id is interactive by default. Same permissive
-      behavior the codebase had before the multi-user split.
+    Returns False (treat as interactive) for chat_id=None (test /
+    health-check / anon paths; preserved by the existing
+    ensure_user_home(None, ...) -> data_dir/home/anon contract).
 
-    Returns True (skip auto-provisioning) when users.yaml is in use
-    AND this chat_id is not a key in user_configs. The contract on
-    True: the caller must NOT create a per-user directory for this
-    chat_id. The chat_id remains valid for outbound notification
-    sending (it lives in allowed_user_ids); only the home-workspace
-    provisioning is suppressed.
+    Returns True (skip auto-provisioning) when the chat_id is not a
+    key in user_configs. The contract on True: the caller must NOT
+    create a per-user directory for this chat_id. The chat_id
+    remains valid for outbound notification sending (it lives in
+    allowed_user_ids); only the home-workspace provisioning is
+    suppressed.
     """
     if chat_id is None:
-        return False
-    if not config.user_configs:
         return False
     return chat_id not in config.user_configs
 

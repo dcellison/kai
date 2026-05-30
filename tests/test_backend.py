@@ -889,12 +889,17 @@ class TestResolveHomeWorkspace:
     answer cannot drift between session init and `/workspace home`.
     """
 
-    def _config(self, user_configs=None) -> Config:
-        """Build a minimal Config with optional user_configs dict."""
+    def _config(self, user_configs: dict | None = None) -> Config:
+        """Build a minimal Config with optional user_configs dict.
+
+        Post-#565 tranche A `Config.user_configs` is a non-optional
+        dict; a None argument here is coerced to `{}` to preserve the
+        empty-dict test ergonomics callers expect.
+        """
         return Config(
             telegram_bot_token="test",
             allowed_user_ids={1},
-            user_configs=user_configs,
+            user_configs=user_configs if user_configs is not None else {},
         )
 
     def test_prefers_users_yaml(self, tmp_path):
@@ -922,11 +927,11 @@ class TestResolveHomeWorkspace:
 
     def test_falls_back_to_data_dir(self, tmp_path):
         """
-        When no users.yaml override exists, the resolver lands the user
-        in data_dir/home/<chat_id>/ via ensure_user_home (which creates
-        the directory as a side effect).
+        When the user is in users.yaml without a home_workspace override,
+        the resolver lands them in data_dir/home/<chat_id>/ via
+        ensure_user_home (which creates the directory as a side effect).
         """
-        config = self._config()
+        config = self._config(user_configs={42: UserConfig(telegram_id=42, name="real-user")})
         result = resolve_home_workspace(42, config, data_dir=tmp_path)
         assert result == tmp_path / "home" / "42"
         assert result.is_dir()
@@ -967,24 +972,6 @@ class TestResolveHomeWorkspace:
 
         assert result == tmp_path / "home" / str(notify_chat)
         assert not result.exists(), "notification-only chat_id must not auto-provision a home directory"
-
-    def test_single_user_mode_preserves_legacy_provisioning(self, tmp_path):
-        """
-        When users.yaml is empty or absent (config.user_configs is
-        falsy), there is no basis for discriminating interactive vs
-        notification chat_ids. Every chat_id is treated as
-        interactive and the directory is provisioned as before.
-
-        Pinning this case prevents an over-eager future tightening
-        of the notification check from breaking single-user dev /
-        test installations that have always used the legacy
-        permissive behavior.
-        """
-        config = self._config()  # user_configs=None
-        result = resolve_home_workspace(99999, config, data_dir=tmp_path)
-
-        assert result == tmp_path / "home" / "99999"
-        assert result.is_dir(), "single-user mode must continue to auto-provision the home dir"
 
 
 # ── Test prepend_to_prompt ──────────────────────────────────────────

@@ -395,7 +395,7 @@ def _build_test_app(
     """Build a minimal aiohttp app with _handle_github wired up.
 
     The config parameter controls per-user routing. When None, a mock
-    Config with user_configs=None is used, which causes _get_subscribed_users
+    Config with user_configs={} is used, which causes _get_subscribed_users
     to return empty and the fallback path (admin chat_id) to fire. To test
     per-user routing, pass a mock with user_configs populated.
 
@@ -427,7 +427,7 @@ def _build_test_app(
     # so all events fall through to admin chat_id.
     if config is None:
         mock_config = AsyncMock()
-        mock_config.user_configs = None
+        mock_config.user_configs = {}
         # get_user_config is synchronous in real Config; must not
         # return a coroutine. With no users configured, always None.
         mock_config.get_user_config = lambda uid: None
@@ -1232,9 +1232,14 @@ class TestGetSubscribedUsers:
             yield
 
     def _make_config(self, user_configs: dict | None = None) -> AsyncMock:
-        """Build a mock Config with the given user_configs dict."""
+        """Build a mock Config with the given user_configs dict.
+
+        Post-#565 tranche A `Config.user_configs` is a non-optional
+        dict; a None argument here is coerced to `{}` to preserve the
+        empty-dict test ergonomics callers expect.
+        """
         config = AsyncMock()
-        config.user_configs = user_configs
+        config.user_configs = user_configs if user_configs is not None else {}
         return config
 
     def _make_user(
@@ -1284,8 +1289,8 @@ class TestGetSubscribedUsers:
         assert result == []
 
     async def test_no_user_configs(self):
-        """Config with user_configs=None returns empty list."""
-        config = self._make_config(None)
+        """Config with empty user_configs returns empty list."""
+        config = self._make_config({})
         result = await _get_subscribed_users(config, "dcellison/kai")
         assert result == []
 
@@ -1829,7 +1834,7 @@ class TestPerUserRouting:
         app = _build_test_app()
         # Set the global fallback on the mock config
         app["config"].claude_user = "global-user"
-        app["config"].user_configs = None
+        app["config"].user_configs = {}
         app["config"].get_user_config = lambda uid: None
         payload = _make_pr_payload("opened")
         body = json.dumps(payload).encode()
@@ -1890,7 +1895,7 @@ class TestPerUserRouting:
         """Legacy mode (no user_configs) falls back to global claude_user for triage."""
         app = _build_test_app()
         app["config"].claude_user = "global-user"
-        app["config"].user_configs = None
+        app["config"].user_configs = {}
         app["config"].get_user_config = lambda uid: None
         payload = _make_issue_payload("opened")
         body = json.dumps(payload).encode()
@@ -2186,7 +2191,7 @@ class TestAllowedChatIdMutations:
         app["allowed_user_ids"] = {100, -100123}
         # No config needed for this case - group IDs are never in user_configs
         mock_config = AsyncMock()
-        mock_config.user_configs = None
+        mock_config.user_configs = {}
         app["config"] = mock_config
         old_app = wh._app
         wh._app = app

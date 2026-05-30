@@ -2591,21 +2591,14 @@ async def _handle_github_remove(
 
     # Check if any other user is still subscribed to this repo.
     # A linear scan of all users is fine for small deployments.
-    # Note: when user_configs is None (env-var-only mode without
-    # users.yaml), we cannot enumerate other users. The check is
-    # skipped and the webhook may be deregistered while other users
-    # who added the repo via /github add are still subscribed. This
-    # is a known limitation of env-var-only deployments; users.yaml
-    # is required for accurate cross-user subscriber tracking.
     other_subscribers = False
-    if config.user_configs:
-        for uid, uc in config.user_configs.items():
-            if uid == chat_id:
-                continue
-            uc_effective = await sessions.get_effective_repos(uc.telegram_id, uc.github_repos)
-            if repo in uc_effective:
-                other_subscribers = True
-                break
+    for uid, uc in config.user_configs.items():
+        if uid == chat_id:
+            continue
+        uc_effective = await sessions.get_effective_repos(uc.telegram_id, uc.github_repos)
+        if repo in uc_effective:
+            other_subscribers = True
+            break
 
     token = await sessions.get_setting(f"github_token:{chat_id}")
 
@@ -2741,23 +2734,20 @@ async def _is_notify_chat_used(
     Note: this does a linear scan of all users with one DB query per
     user. Fine for a personal assistant with a handful of users.
     """
-    # In legacy mode (user_configs is None) there are no other users
-    # to check - skip straight to the global env var fallback.
-    if config.user_configs:
-        for uid, uc in config.user_configs.items():
-            if uid == exclude_user:
+    for uid, uc in config.user_configs.items():
+        if uid == exclude_user:
+            continue
+        # Check the users.yaml entry for this user
+        if uc.github_notify_chat_id == notify_chat_id:
+            return True
+        # Check DB override for this user
+        val = await sessions.get_setting(f"github_notify_chat:{uid}")
+        if val:
+            try:
+                if int(val) == notify_chat_id:
+                    return True
+            except ValueError:
                 continue
-            # Check the users.yaml entry for this user
-            if uc.github_notify_chat_id == notify_chat_id:
-                return True
-            # Check DB override for this user
-            val = await sessions.get_setting(f"github_notify_chat:{uid}")
-            if val:
-                try:
-                    if int(val) == notify_chat_id:
-                        return True
-                except ValueError:
-                    continue
 
     # Also check the global env var fallback
     return config.github_notify_chat_id == notify_chat_id

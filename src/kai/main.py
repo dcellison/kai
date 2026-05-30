@@ -222,19 +222,15 @@ def main() -> None:
         await sessions.init_db(config.session_db_path)
         app = create_bot(config, use_webhook=use_webhook)
 
-        # Determine the default user (admin or first allowed user) for
-        # per-user data migrations and workspace restoration. Config
-        # validation ensures at least one user exists, but guard against
-        # edge cases to avoid a StopIteration crash at startup.
-        default_chat_id: int | None = None
-        if config.user_configs:
-            admins = config.get_admins()
-            if admins:
-                default_chat_id = admins[0].telegram_id
-            else:
-                default_chat_id = next(iter(config.user_configs))
-        elif config.allowed_user_ids:
-            default_chat_id = next(iter(config.allowed_user_ids))
+        # Determine the default user (admin or first user) for per-user
+        # data migrations and workspace restoration. users.yaml is
+        # mandatory so user_configs is always non-empty; the admin
+        # branch is preferred, otherwise the first entry wins.
+        admins = config.get_admins()
+        if admins:
+            default_chat_id: int | None = admins[0].telegram_id
+        else:
+            default_chat_id = next(iter(config.user_configs))
 
         # One-time migration: rename global "workspace" setting to
         # "workspace:{chat_id}" for per-user namespacing (Phase 2).

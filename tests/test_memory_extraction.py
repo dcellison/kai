@@ -3764,7 +3764,7 @@ class TestResolveOsUser:
     def test_returns_none_when_user_configs_absent(self):
         """Legacy ALLOWED_USER_IDS install: no users.yaml means no
         os_user mapping exists."""
-        config = replace(_BASE_CONFIG, user_configs=None)
+        config = replace(_BASE_CONFIG, user_configs={})
         assert memory_extraction._resolve_os_user("42", config) is None
 
     def test_returns_none_for_non_numeric_user_id(self):

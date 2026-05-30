@@ -142,38 +142,59 @@ class TestLoadUserConfigs:
         assert configs[222].name == "bob"
         assert configs[222].role == "user"
 
-    def test_missing_file(self):
-        """Returns None when /etc/kai/users.yaml is absent.
+    def test_missing_file(self, monkeypatch):
+        """Raises SystemExit when /etc/kai/users.yaml is absent.
 
-        The protected reader returns None for missing files (distinct
-        from `_YAML_MALFORMED`); the loader maps that to None so the
-        caller falls back to the legacy ALLOWED_USER_IDS path.
+        users.yaml is mandatory. The protected reader returns None
+        for missing files; the loader raises with an operator-facing
+        error naming the path and pointing at `make config`. No
+        fallback to ALLOWED_USER_IDS at runtime.
         """
-        with patch("kai.config._read_protected_yaml", return_value=None):
-            configs = _load_user_configs("claude", "")
-        assert configs is None
+        monkeypatch.delenv("ALLOWED_USER_IDS", raising=False)
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            pytest.raises(SystemExit, match=r"users\.yaml is required"),
+        ):
+            _load_user_configs("claude", "")
+
+    def test_missing_file_with_allowed_user_ids_appends_migration_hint(self, monkeypatch):
+        """Missing-file error appends a migration hint when ALLOWED_USER_IDS is set.
+
+        Operator UX: a legacy env-only install needs to know that the
+        old auth path no longer works and that `make config` will
+        migrate the existing telegram_ids into users.yaml.
+        """
+        monkeypatch.setenv("ALLOWED_USER_IDS", "12345")
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            pytest.raises(SystemExit, match="ALLOWED_USER_IDS is set in env but is no longer honored"),
+        ):
+            _load_user_configs("claude", "")
 
     def test_empty_file(self):
-        """Returns None when /etc/kai/users.yaml exists but is empty.
+        """Raises SystemExit when /etc/kai/users.yaml is empty / non-dict top-level.
 
-        The protected reader normalizes an empty / non-dict top-level
-        to `_YAML_MALFORMED`; the loader treats that as "fail closed"
-        and returns None rather than silently constructing an empty
-        config.
+        The protected reader normalizes an empty or non-dict top-level
+        to `_YAML_MALFORMED`; the loader treats that as fail-closed and
+        raises rather than silently constructing an empty config.
         """
-        with patch("kai.config._read_protected_yaml", return_value=_YAML_MALFORMED):
-            configs = _load_user_configs("claude", "")
-        assert configs is None
+        with (
+            patch("kai.config._read_protected_yaml", return_value=_YAML_MALFORMED),
+            pytest.raises(SystemExit, match="malformed"),
+        ):
+            _load_user_configs("claude", "")
 
     def test_invalid_yaml(self):
-        """Returns None when /etc/kai/users.yaml is malformed.
+        """Raises SystemExit when /etc/kai/users.yaml is malformed.
 
         Same code path as the empty-file case: the protected reader
         already raised on parse and returned `_YAML_MALFORMED`.
         """
-        with patch("kai.config._read_protected_yaml", return_value=_YAML_MALFORMED):
-            configs = _load_user_configs("claude", "")
-        assert configs is None
+        with (
+            patch("kai.config._read_protected_yaml", return_value=_YAML_MALFORMED),
+            pytest.raises(SystemExit, match="malformed"),
+        ):
+            _load_user_configs("claude", "")
 
     def test_missing_telegram_id(self, tmp_path):
         """Entry without telegram_id is skipped."""
@@ -186,10 +207,9 @@ class TestLoadUserConfigs:
         )
         with (
             patch("kai.config._read_protected_yaml", return_value=data),
+            pytest.raises(SystemExit, match="no valid user entries"),
         ):
-            configs = _load_user_configs("claude", "")
-        assert configs is not None
-        assert len(configs) == 0
+            _load_user_configs("claude", "")
 
     def test_whitespace_only_name(self, tmp_path):
         """Whitespace-only name is treated as missing."""
@@ -202,10 +222,9 @@ class TestLoadUserConfigs:
         )
         with (
             patch("kai.config._read_protected_yaml", return_value=data),
+            pytest.raises(SystemExit, match="no valid user entries"),
         ):
-            configs = _load_user_configs("claude", "")
-        assert configs is not None
-        assert len(configs) == 0
+            _load_user_configs("claude", "")
 
     def test_missing_name(self, tmp_path):
         """Entry without name is skipped."""
@@ -218,10 +237,9 @@ class TestLoadUserConfigs:
         )
         with (
             patch("kai.config._read_protected_yaml", return_value=data),
+            pytest.raises(SystemExit, match="no valid user entries"),
         ):
-            configs = _load_user_configs("claude", "")
-        assert configs is not None
-        assert len(configs) == 0
+            _load_user_configs("claude", "")
 
     def test_invalid_role(self, tmp_path):
         """Invalid role causes the entry to be skipped."""
@@ -235,10 +253,9 @@ class TestLoadUserConfigs:
         )
         with (
             patch("kai.config._read_protected_yaml", return_value=data),
+            pytest.raises(SystemExit, match="no valid user entries"),
         ):
-            configs = _load_user_configs("claude", "")
-        assert configs is not None
-        assert len(configs) == 0
+            _load_user_configs("claude", "")
 
     def test_invalid_budget(self, tmp_path):
         """Negative budget causes the entry to be skipped."""
@@ -252,10 +269,9 @@ class TestLoadUserConfigs:
         )
         with (
             patch("kai.config._read_protected_yaml", return_value=data),
+            pytest.raises(SystemExit, match="no valid user entries"),
         ):
-            configs = _load_user_configs("claude", "")
-        assert configs is not None
-        assert len(configs) == 0
+            _load_user_configs("claude", "")
 
     def test_bool_budget_rejected(self, tmp_path):
         """Boolean budget is rejected (same bool guard as workspace config)."""
@@ -269,10 +285,9 @@ class TestLoadUserConfigs:
         )
         with (
             patch("kai.config._read_protected_yaml", return_value=data),
+            pytest.raises(SystemExit, match="no valid user entries"),
         ):
-            configs = _load_user_configs("claude", "")
-        assert configs is not None
-        assert len(configs) == 0
+            _load_user_configs("claude", "")
 
     def test_bool_telegram_id_rejected(self, tmp_path):
         """Boolean telegram_id is rejected."""
@@ -285,10 +300,9 @@ class TestLoadUserConfigs:
         )
         with (
             patch("kai.config._read_protected_yaml", return_value=data),
+            pytest.raises(SystemExit, match="no valid user entries"),
         ):
-            configs = _load_user_configs("claude", "")
-        assert configs is not None
-        assert len(configs) == 0
+            _load_user_configs("claude", "")
 
     def test_duplicate_ids(self, tmp_path):
         """Duplicate telegram_id: first wins."""
@@ -356,22 +370,24 @@ class TestLoadUserConfigs:
         assert configs is not None
         assert configs[111].name == "alice"
 
-    def test_stray_project_root_users_yaml_is_ignored(self, tmp_path):
+    def test_stray_project_root_users_yaml_is_ignored(self, tmp_path, monkeypatch):
         """A stray `PROJECT_ROOT/users.yaml` does not affect the loader.
 
-        The dual-path fallback was removed: when the protected reader
-        returns None (canonical file absent), the loader returns None
-        and the caller falls back to ALLOWED_USER_IDS. A leftover
-        users.yaml inside the source tree must not feed the daemon.
+        The dual-path fallback was removed in #559: when the protected
+        reader returns None (canonical file absent), the loader raises
+        SystemExit (mandatory users.yaml). A leftover users.yaml inside
+        the source tree must not feed the daemon and must not bypass
+        the mandatory-users contract.
         """
+        monkeypatch.delenv("ALLOWED_USER_IDS", raising=False)
         stray = tmp_path / "users.yaml"
         stray.write_text("users:\n  - telegram_id: 999\n    name: stray\n    role: admin\n")
         with (
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
+            pytest.raises(SystemExit, match=r"users\.yaml is required"),
         ):
-            configs = _load_user_configs("claude", "")
-        assert configs is None
+            _load_user_configs("claude", "")
 
     def test_no_admin_warning(self, tmp_path, caplog):
         """All users with role 'user' logs a warning but does not fail."""
@@ -999,11 +1015,15 @@ class TestLoadUserConfigs:
 
 
 class TestConfigUserMethods:
-    def _make_config(self, user_configs=None):
+    def _make_config(self, user_configs: dict | None = None):
+        # user_configs is non-optional on Config post-#565 tranche A.
+        # Tests that previously passed None now default to empty dict;
+        # the loader's mandatory-users contract is verified elsewhere
+        # in TestLoadUserConfigs.
         return Config(
             telegram_bot_token="test",
             allowed_user_ids={1},
-            user_configs=user_configs,
+            user_configs=user_configs if user_configs is not None else {},
         )
 
     def test_get_user_config_found(self):
@@ -1016,11 +1036,6 @@ class TestConfigUserMethods:
         """Returns None for unknown telegram_id."""
         config = self._make_config({})
         assert config.get_user_config(999) is None
-
-    def test_get_user_config_no_yaml(self):
-        """Returns None when user_configs is None (no users.yaml)."""
-        config = self._make_config(None)
-        assert config.get_user_config(111) is None
 
     def test_get_user_by_github(self):
         """Finds user by GitHub login."""
@@ -1041,11 +1056,6 @@ class TestConfigUserMethods:
         config = self._make_config({111: uc})
         assert config.get_user_by_github("unknown") is None
 
-    def test_get_user_by_github_no_yaml(self):
-        """Returns None when user_configs is None."""
-        config = self._make_config(None)
-        assert config.get_user_by_github("alice") is None
-
     def test_get_admins(self):
         """Returns list of admin users only."""
         admin = UserConfig(telegram_id=111, name="alice", role="admin")
@@ -1059,9 +1069,4 @@ class TestConfigUserMethods:
         """Returns empty list when no admins exist."""
         user = UserConfig(telegram_id=222, name="bob", role="user")
         config = self._make_config({222: user})
-        assert config.get_admins() == []
-
-    def test_get_admins_no_yaml(self):
-        """Returns empty list when user_configs is None."""
-        config = self._make_config(None)
         assert config.get_admins() == []

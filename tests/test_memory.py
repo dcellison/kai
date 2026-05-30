@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kai.config import Config
+from kai.config import Config, UserConfig
 
 # Default config for tests - memory disabled unless explicitly enabled.
 # Real tests override memory_enabled=True via the memory_config fixture.
@@ -234,10 +234,13 @@ class TestInitMemory:
         # `agent_backend` (legacy ALLOWED_USER_IDS auth has no
         # users.yaml, so every user inherits the global). A
         # single-backend install logs the uniform-mode flat keys plus
-        # the per-backend maps.
+        # the per-backend maps. users.yaml is mandatory post-#565
+        # tranche A, so we provide a minimal user whose effective
+        # backend matches the global.
         config = _make_config(
             memory_extraction_enabled=True,
             agent_backend="codex",
+            user_configs={1: UserConfig(telegram_id=1, name="alice", os_user="a")},
         )
         with (
             caplog.at_level(logging.INFO, logger="kai.memory"),

@@ -90,14 +90,18 @@ class TestInstanceCreation:
 
     def test_get_falls_back_to_defaults(self, tmp_path, monkeypatch):
         """
-        User not in users.yaml gets global defaults plus the per-user
-        DATA_DIR/home/<chat_id>/ landing directory (#353). The shared
-        global home was removed; the new fallback is keyed by chat_id.
+        User in users.yaml with no per-user overrides gets global
+        defaults plus the per-user DATA_DIR/home/<chat_id>/ landing
+        directory. The shared global home was removed; the new
+        fallback is keyed by chat_id.
         """
         # Point the resolver at a tmp DATA_DIR so the test does not
         # touch the host's real /var/lib/kai or PROJECT_ROOT tree.
         monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
-        config = _make_config(claude_user=None)
+        config = _make_config(
+            claude_user=None,
+            user_configs={999: UserConfig(telegram_id=999, name="bob")},
+        )
         pool = SubprocessPool(config=config, services_info=[])
         instance = pool.get(999)
         assert instance.claude_user is None

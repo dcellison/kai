@@ -567,12 +567,12 @@ def _sign_body(secret: str, body: bytes) -> str:
 def github_request():
     """Create a mock request for the GitHub webhook endpoint.
 
-    Includes a mock config with user_configs=None (no per-user routing)
+    Includes a mock config with user_configs={} (no per-user routing)
     and mocks resolve_github_settings to return defaults. This simulates
     fallback routing where events go to the admin chat_id.
     """
     mock_config = MagicMock()
-    mock_config.user_configs = None
+    mock_config.user_configs = {}
     request = MagicMock(spec=web.Request)
     request.app = {
         "webhook_secret": "test-secret",

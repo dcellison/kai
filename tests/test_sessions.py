@@ -549,7 +549,7 @@ class TestUserSettings:
 class TestResolveUserDefaults:
     """Tests for the per-user settings resolution function."""
 
-    def _make_config(self, user_configs=None, **kwargs):
+    def _make_config(self, user_configs: dict | None = None, **kwargs):
         """Build a minimal Config with overridable defaults."""
         from kai.config import Config
 
@@ -769,7 +769,7 @@ class TestAllowedWorkspaces:
 class TestResolveWorkspaceAccess:
     """Tests for per-user workspace_base and allowed_workspaces resolution."""
 
-    def _make_config(self, user_configs=None, **kwargs):
+    def _make_config(self, user_configs: dict | None = None, **kwargs):
         """Build a minimal Config with overridable defaults."""
         from kai.config import Config
 
@@ -1086,7 +1086,7 @@ class TestEffectiveRepos:
 class TestResolveGitHubSettings:
     """Tests for per-user GitHub notification settings resolution."""
 
-    def _make_config(self, user_configs=None, **kwargs):
+    def _make_config(self, user_configs: dict | None = None, **kwargs):
         """Build a minimal Config with overridable defaults."""
         from kai.config import Config
 

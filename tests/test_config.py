@@ -110,13 +110,33 @@ def _mock_binary_resolver(monkeypatch):
 
 
 def _set_required(monkeypatch, token="fake-token", user_ids="123"):
-    """Set only the truly required env vars (token + user IDs).
+    """Set the truly required env vars and the mandatory users.yaml.
+
+    Post-#565 tranche A, users.yaml is mandatory: load_config raises
+    SystemExit when it cannot resolve the file. Most config tests
+    exercise env-driven behavior orthogonal to auth, so this helper
+    auto-patches a minimal users.yaml derived from `user_ids` so the
+    auth contract is satisfied without each test caller wiring it.
+
+    Tests that specifically exercise the mandatory-users contract or
+    a custom users.yaml shape should call `_patch_protected_users_yaml`
+    directly and skip this helper (or override its protected-file
+    patch afterwards).
 
     TELEGRAM_WEBHOOK_URL is no longer required - omitting it selects polling mode.
     Tests that need webhook mode should set it explicitly.
     """
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
     monkeypatch.setenv("ALLOWED_USER_IDS", user_ids)
+    # Build a minimal valid users.yaml from `user_ids` so the
+    # mandatory-users contract is met. Names are auto-generated;
+    # role=admin so the no-admin-warning does not fire.
+    user_entries = "\n".join(
+        f"  - telegram_id: {uid.strip()}\n    name: test-user-{uid.strip()}\n    role: admin"
+        for uid in user_ids.split(",")
+        if uid.strip()
+    )
+    _patch_protected_users_yaml(monkeypatch, f"users:\n{user_entries}\n")
 
 
 def _patch_protected_users_yaml(monkeypatch, content: str) -> None:
@@ -181,15 +201,29 @@ class TestLoadConfigErrors:
         with pytest.raises(SystemExit, match="TELEGRAM_BOT_TOKEN"):
             load_config()
 
-    def test_missing_user_ids(self, monkeypatch):
+    def test_missing_users_yaml(self, monkeypatch):
+        """Missing /etc/kai/users.yaml is a hard startup failure
+        (#565 tranche A). ALLOWED_USER_IDS no longer authorizes the
+        daemon to start; it only contributes a migration hint.
+        """
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
-        with pytest.raises(SystemExit, match="No user authorization configured"):
+        monkeypatch.delenv("ALLOWED_USER_IDS", raising=False)
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            pytest.raises(SystemExit, match=r"users\.yaml is required"),
+        ):
             load_config()
 
-    def test_non_numeric_user_ids(self, monkeypatch):
+    def test_missing_users_yaml_with_allowed_user_ids_includes_migration_hint(self, monkeypatch):
+        """Operator UX: env-only legacy installs need to see the
+        ALLOWED_USER_IDS migration hint in the error message.
+        """
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
-        monkeypatch.setenv("ALLOWED_USER_IDS", "notanumber")
-        with pytest.raises(SystemExit, match="non-numeric"):
+        monkeypatch.setenv("ALLOWED_USER_IDS", "12345")
+        with (
+            patch("kai.config._read_protected_yaml", return_value=None),
+            pytest.raises(SystemExit, match="ALLOWED_USER_IDS is set in env but is no longer honored"),
+        ):
             load_config()
 
     def test_workspace_base_nonexistent(self, monkeypatch, tmp_path):
@@ -585,13 +619,31 @@ class TestReadProtectedFile:
 
 
 class TestDualModeLoading:
+    @staticmethod
+    def _protected_reader(env_content: str):
+        """Lambda that responds to both /etc/kai/env and /etc/kai/users.yaml.
+
+        users.yaml is mandatory post-#565 tranche A, so the dual-mode
+        loader tests must provide a minimal admin entry to satisfy
+        the auth contract; otherwise load_config raises before
+        reaching the env-file assertions these tests exist for.
+        """
+        users_yaml = "users:\n  - telegram_id: 999\n    name: test\n    role: admin\n"
+
+        def _read(path):
+            if path == "/etc/kai/env":
+                return env_content
+            if path == "/etc/kai/users.yaml":
+                return users_yaml
+            return None
+
+        return _read
+
     def test_loads_from_protected_env(self, monkeypatch):
         """When /etc/kai/env is readable, values are used as config."""
         monkeypatch.setattr(
             "kai.config._read_protected_file",
-            lambda path: (
-                "TELEGRAM_BOT_TOKEN=protected-token\nALLOWED_USER_IDS=999\n" if path == "/etc/kai/env" else None
-            ),
+            self._protected_reader("TELEGRAM_BOT_TOKEN=protected-token\nALLOWED_USER_IDS=999\n"),
         )
         config = load_config()
         assert config.telegram_bot_token == "protected-token"
@@ -601,9 +653,7 @@ class TestDualModeLoading:
         """Quote marks around values in /etc/kai/env are stripped."""
         monkeypatch.setattr(
             "kai.config._read_protected_file",
-            lambda path: (
-                "TELEGRAM_BOT_TOKEN=\"quoted-token\"\nALLOWED_USER_IDS='999'\n" if path == "/etc/kai/env" else None
-            ),
+            self._protected_reader("TELEGRAM_BOT_TOKEN=\"quoted-token\"\nALLOWED_USER_IDS='999'\n"),
         )
         config = load_config()
         assert config.telegram_bot_token == "quoted-token"
@@ -613,9 +663,7 @@ class TestDualModeLoading:
         """Comments and blank lines in /etc/kai/env are ignored."""
         monkeypatch.setattr(
             "kai.config._read_protected_file",
-            lambda path: (
-                "# comment\n\nTELEGRAM_BOT_TOKEN=tok\n\nALLOWED_USER_IDS=1\n" if path == "/etc/kai/env" else None
-            ),
+            self._protected_reader("# comment\n\nTELEGRAM_BOT_TOKEN=tok\n\nALLOWED_USER_IDS=999\n"),
         )
         config = load_config()
         assert config.telegram_bot_token == "tok"
@@ -636,7 +684,7 @@ class TestDualModeLoading:
         """Explicitly set env vars override values from /etc/kai/env."""
         monkeypatch.setattr(
             "kai.config._read_protected_file",
-            lambda path: "TELEGRAM_BOT_TOKEN=from-file\nALLOWED_USER_IDS=1\n" if path == "/etc/kai/env" else None,
+            self._protected_reader("TELEGRAM_BOT_TOKEN=from-file\nALLOWED_USER_IDS=999\n"),
         )
         # Set token explicitly in env - should override file value
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "from-env")
@@ -863,21 +911,6 @@ class TestDeprecationWarnings:
             load_config()
         assert f"{var} in env is deprecated" in caplog.text
 
-    def test_no_warning_without_users_yaml(self, monkeypatch, caplog):
-        """Per-user deprecated env vars do NOT warn when users.yaml is absent.
-
-        Note: CLAUDE_MODEL still emits a standalone rename warning (it was
-        renamed to DEFAULT_MODEL) regardless of users.yaml. This test uses
-        a non-CLAUDE_MODEL var to verify the users.yaml-gated warnings.
-        """
-        _set_required(monkeypatch)
-        monkeypatch.setenv("CLAUDE_USER", "somebody")
-        # _load_user_configs returns None (no users.yaml) by default
-        # because _clean_env patches _read_protected_file to None
-        with caplog.at_level(logging.WARNING, logger="kai.config"):
-            load_config()
-        assert "deprecated" not in caplog.text.lower()
-
     def test_empty_var_does_not_warn(self, monkeypatch, caplog):
         """Empty string env vars are not treated as 'set'."""
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
@@ -958,19 +991,6 @@ class TestGitHubReposWarning:
         """No warning when neither feature is enabled (empty repos is fine)."""
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
         _mock_user_configs(monkeypatch)
-        with caplog.at_level(logging.WARNING, logger="kai.config"):
-            load_config()
-        repo_warnings = [
-            r
-            for r in caplog.records
-            if r.levelno >= logging.WARNING and "github_repos" in r.message and "deprecated" not in r.message
-        ]
-        assert repo_warnings == []
-
-    def test_no_warn_when_no_user_configs(self, monkeypatch, caplog):
-        """No warning in env-var-only mode (no users.yaml)."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("PR_REVIEW_ENABLED", "true")
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             load_config()
         repo_warnings = [
@@ -1196,24 +1216,16 @@ class TestResolutionWithoutEnvVars:
 # ── Legacy env-only backward compatibility ──────────────────────────
 
 
-class TestLegacyEnvOnlyMode:
-    """Verify backward compatibility when users.yaml does not exist.
+class TestLegacyEnvBackwardCompat:
+    """Backward-compat coverage for env-var renames that still apply
+    even though users.yaml is now mandatory (#565 tranche A).
 
-    Single-user installs with only env vars (no users.yaml) must
-    continue to work exactly as before.
+    Pre-tranche-A this class covered the "single-user install via
+    env vars only" path; that path is gone (the loader raises
+    SystemExit on absent users.yaml). What remains is the env-var
+    rename surface (BUDGET_CEILING <- CLAUDE_MAX_BUDGET_USD,
+    AGENT_TIMEOUT_SECONDS <- CLAUDE_TIMEOUT_SECONDS).
     """
-
-    def test_loads_from_env_only(self, monkeypatch):
-        """Full config from env vars works when users.yaml is absent."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("CLAUDE_MODEL", "opus")
-        monkeypatch.setenv("BUDGET_CEILING", "25.0")
-        monkeypatch.setenv("CLAUDE_TIMEOUT_SECONDS", "300")
-        config = load_config()
-        assert config.default_model == "opus"
-        assert config.budget_ceiling == 25.0
-        assert config.claude_timeout_seconds == 300
-        assert config.user_configs is None
 
     def test_old_budget_env_var_backward_compat(self, monkeypatch):
         """CLAUDE_MAX_BUDGET_USD still works as fallback when BUDGET_CEILING is not set."""
@@ -1598,11 +1610,11 @@ class TestMemoryReasonerBinaryValidation:
         shape as claude."""
         from kai.oneshot_binary import BinaryResolutionError
 
+        _set_required(monkeypatch)
         _patch_protected_users_yaml(
             monkeypatch,
             "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    agent_backend: codex\n    os_user: alice_os\n",
         )
-        _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
 
@@ -1693,11 +1705,11 @@ class TestCodexMemorySameUserSymmetry:
         loads successfully. The runtime treats missing os_user as
         in-process spawn (claude's existing pattern), so config-load
         does not refuse the shape."""
+        _set_required(monkeypatch)
         _patch_protected_users_yaml(
             monkeypatch,
             "users:\n  - telegram_id: 67890\n    name: bob\n    role: user\n",
         )
-        _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
         monkeypatch.setenv("AGENT_BACKEND", "codex")
@@ -1713,11 +1725,11 @@ class TestCodexMemorySameUserSymmetry:
         codex in-process - the same path claude has always used
         for same-user."""
         bot_user = pwd.getpwuid(os.getuid()).pw_name
+        _set_required(monkeypatch)
         _patch_protected_users_yaml(
             monkeypatch,
             f"users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: {bot_user}\n",
         )
-        _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
         monkeypatch.setenv("AGENT_BACKEND", "codex")
@@ -1730,11 +1742,11 @@ class TestCodexMemorySameUserSymmetry:
         set to a non-bot account loads cleanly and is preserved on
         the UserConfig entry. Regression guard for the multi-user
         case."""
+        _set_required(monkeypatch)
         _patch_protected_users_yaml(
             monkeypatch,
             "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: alice_os\n",
         )
-        _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
         monkeypatch.setenv("AGENT_BACKEND", "codex")
@@ -1768,11 +1780,11 @@ class TestMemoryReasonerModelResolution:
         """Codex install: registry resolves to a codex-CLI-valid SKU.
         Test path is the per-user dispatch surface that production
         will follow: AGENT_BACKEND=codex + users.yaml with os_user."""
+        _set_required(monkeypatch)
         _patch_protected_users_yaml(
             monkeypatch,
             "users:\n  - telegram_id: 12345\n    name: alice\n    role: admin\n    os_user: alice_os\n",
         )
-        _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
         monkeypatch.setenv("AGENT_BACKEND", "codex")
@@ -1817,29 +1829,11 @@ class TestExtractionEligibleBackendsHelper:
     def test_returns_empty_when_memory_extraction_disabled(self):
         """Retrieval-only and memory-disabled installs do not run any
         reasoner, so the eligible set is empty regardless of
-        agent_backend and users.yaml."""
+        agent_backend and users.yaml content."""
         from kai.config import _compute_extraction_eligible_backends
 
-        assert _compute_extraction_eligible_backends("claude", None, False) == set()
-        assert _compute_extraction_eligible_backends("codex", None, False) == set()
-
-    def test_no_users_yaml_uses_global_backend(self):
-        """ALLOWED_USER_IDS-only authorization (no users.yaml): every
-        authorized user inherits the global agent backend, so the
-        eligible set is `{agent_backend}` when extraction-eligible."""
-        from kai.config import _compute_extraction_eligible_backends
-
-        assert _compute_extraction_eligible_backends("claude", None, True) == {"claude"}
-        assert _compute_extraction_eligible_backends("codex", None, True) == {"codex"}
-
-    def test_goose_global_with_no_users_yaml_returns_empty(self):
-        """Goose is not extraction-eligible (no OneShotReasoner
-        implementation). ALLOWED_USER_IDS install with
-        AGENT_BACKEND=goose produces an empty set; no reasoner
-        plumbing fires."""
-        from kai.config import _compute_extraction_eligible_backends
-
-        assert _compute_extraction_eligible_backends("goose", None, True) == set()
+        assert _compute_extraction_eligible_backends("claude", {}, False) == set()
+        assert _compute_extraction_eligible_backends("codex", {}, False) == set()
 
     def test_mixed_users_yaml_contributes_each_effective_backend(self):
         """users.yaml with both claude and codex users: the eligible
@@ -1903,13 +1897,13 @@ class TestRegistryValidationPerEligibleBackend:
         import kai.config as config_mod
         from kai.config import ModelRole
 
+        _set_required(monkeypatch)
         _patch_protected_users_yaml(
             monkeypatch,
             "users:\n"
             "  - telegram_id: 1\n    name: alice\n    role: admin\n"
             "    agent_backend: codex\n    os_user: alice_os\n",
         )
-        _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_ENABLED", "true")
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
         # Patch the registry to drop the codex MEMORY_EXTRACTION row.
@@ -2665,6 +2659,12 @@ class TestAgentTimeoutSecondsRename:
         base.update(overrides)
         for k, v in base.items():
             monkeypatch.setenv(k, v)
+        # users.yaml is mandatory post-#565 tranche A; patch a minimal
+        # admin entry so load_config completes for these env-driven tests.
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n",
+        )
 
     def test_agent_timeout_seconds_preferred(self, monkeypatch):
         self._required_env(
@@ -2704,6 +2704,12 @@ class TestLoadConfigBackendAwareModelValidation:
         base.update(overrides)
         for k, v in base.items():
             monkeypatch.setenv(k, v)
+        # users.yaml is mandatory post-#565 tranche A; patch a minimal
+        # admin entry so the validation tests reach the model check.
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n",
+        )
 
     def test_codex_rejects_goose_only_model(self, monkeypatch):
         self._env(monkeypatch, AGENT_BACKEND="codex", DEFAULT_MODEL="gpt-5.4-nano")
@@ -3098,6 +3104,10 @@ class TestLoadMemoryProjects:
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
         monkeypatch.setenv("ALLOWED_USER_IDS", "12345")
         monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n",
+        )
 
         registry_root = tmp_path / "registry_root"
         registry_root.mkdir()
@@ -3118,10 +3128,7 @@ class TestLoadMemoryProjects:
             )
         )
 
-        with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
-        ):
+        with patch("kai.config.PROJECT_ROOT", tmp_path):
             cfg = load_config()
 
         # Registry loaded the project as expected.
@@ -3154,6 +3161,10 @@ class TestMemoryRecallShadowConfig:
         monkeypatch.setenv("ALLOWED_USER_IDS", "12345")
         monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
         monkeypatch.setenv("MEMORY_ENABLED", "true")  # gate for shadow to be on
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n",
+        )
 
     def test_memory_recall_shadow_config_defaults_enabled(self, monkeypatch):
         """Unset env var → shadow enabled when memory is on. The
@@ -3184,6 +3195,10 @@ class TestMemoryRecallShadowConfig:
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
         monkeypatch.setenv("ALLOWED_USER_IDS", "12345")
         monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n",
+        )
         # MEMORY_ENABLED unset / off; shadow must also fall to off
         # regardless of the shadow env var.
         monkeypatch.setenv("MEMORY_RECALL_SHADOW_ENABLED", "true")

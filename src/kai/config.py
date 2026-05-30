@@ -829,10 +829,13 @@ class Config:
     # 0 = no cleanup (default). Cleanup runs once every 24 hours.
     file_retention_days: int = 0
 
-    # Per-user configuration from users.yaml. Keyed by telegram_id.
-    # None means users.yaml does not exist (fall back to allowed_user_ids).
-    # Empty dict means users.yaml exists but has no valid entries.
-    user_configs: dict[int, UserConfig] | None = None
+    # Per-user configuration from users.yaml, keyed by telegram_id.
+    # users.yaml is mandatory: _load_user_configs raises SystemExit
+    # if the file is missing, malformed, or has no valid entries, so
+    # this field is always a populated dict at runtime. The default
+    # factory is for tests that construct Config directly; production
+    # code goes through load_config.
+    user_configs: dict[int, UserConfig] = field(default_factory=dict)
 
     # TOTP two-factor authentication timing (only relevant when TOTP is enabled)
     totp_session_minutes: int = 30
@@ -998,14 +1001,10 @@ class Config:
 
     def get_user_config(self, user_id: int) -> UserConfig | None:
         """Get per-user config by Telegram user ID, or None if not configured."""
-        if self.user_configs is None:
-            return None
         return self.user_configs.get(user_id)
 
     def get_user_by_github(self, github_login: str) -> UserConfig | None:
         """Look up a user by GitHub username. Used for webhook actor routing."""
-        if self.user_configs is None:
-            return None
         for uc in self.user_configs.values():
             if uc.github and uc.github.lower() == github_login.lower():
                 return uc
@@ -1013,8 +1012,6 @@ class Config:
 
     def get_admins(self) -> list[UserConfig]:
         """Get all admin users. Used for unattributed webhook fallback routing."""
-        if self.user_configs is None:
-            return []
         return [uc for uc in self.user_configs.values() if uc.role == "admin"]
 
 
@@ -1522,7 +1519,7 @@ _VALID_ROLES = {"admin", "user"}
 
 def _compute_extraction_eligible_backends(
     agent_backend: str,
-    user_configs: "dict[int, UserConfig] | None",
+    user_configs: dict[int, UserConfig],
     memory_extraction_enabled: bool,
 ) -> set[str]:
     """
@@ -1530,11 +1527,8 @@ def _compute_extraction_eligible_backends(
 
     Mirrors `_ingest_memory`'s extraction gate (effective backend in
     {"claude", "codex"}; goose users are filtered out because they
-    have no `OneShotReasoner` implementation). With users.yaml: each
-    user contributes its effective backend (per-user override or
-    global default). Without users.yaml (legacy ALLOWED_USER_IDS auth):
-    every authorized user inherits the global, so the set is
-    `{agent_backend}` when that is extraction-eligible, else empty.
+    have no `OneShotReasoner` implementation). Each user contributes
+    its effective backend (per-user override or global default).
 
     Returns an empty set when `memory_extraction_enabled` is False;
     callers that gate codex plumbing or registry validation off the
@@ -1543,10 +1537,6 @@ def _compute_extraction_eligible_backends(
     if not memory_extraction_enabled:
         return set()
     eligible: set[str] = set()
-    if user_configs is None:
-        if agent_backend in ("claude", "codex"):
-            eligible.add(agent_backend)
-        return eligible
     for uc in user_configs.values():
         effective = uc.agent_backend or agent_backend
         if effective in ("claude", "codex"):
@@ -1557,16 +1547,33 @@ def _compute_extraction_eligible_backends(
 def _load_user_configs(
     global_backend: str,
     global_llm_provider: str,
-) -> dict[int, UserConfig] | None:
+) -> dict[int, UserConfig]:
     """
     Load per-user configs from /etc/kai/users.yaml.
 
     Reads the protected file via `_read_protected_yaml` (sudo-cat for
-    root-owned mode 0600 copies). Returns None when the file is absent
-    or malformed; the caller then falls back to the legacy
-    `ALLOWED_USER_IDS` auth path. There is no project-root fallback:
-    users.yaml is canonical at `/etc/kai/users.yaml` and a stray copy
-    inside the source tree is never consulted.
+    root-owned mode 0600 copies). users.yaml is mandatory: any failure
+    raises SystemExit with a message naming the resolved path. There
+    is no None return path and no fallback to ALLOWED_USER_IDS at
+    runtime. The fail-closed shape is load-bearing for the daemon's
+    auth contract: a malformed or unreadable users file must not
+    silently degrade to env-only auth, because the wizard and the
+    runtime would then disagree about whose value wins.
+
+    Failure cases (each raises SystemExit):
+        - File absent: error names the path and points at `make config`.
+          When ALLOWED_USER_IDS is set in env, appends a one-line
+          migration hint mentioning that the env var is no longer
+          honored as a fallback.
+        - Malformed YAML, non-dict top-level, missing or non-list
+          `users` key: error names the path and the parse/schema fault.
+        - Zero valid user entries after per-entry validation: error
+          names the path and refers the operator to the warnings
+          logged above.
+
+    Per-entry validation errors continue to log a warning and skip
+    the entry rather than abort; the SystemExit at the end fires only
+    when every entry was rejected.
 
     Args:
         global_backend: The global agent_backend from env config.
@@ -1576,34 +1583,40 @@ def _load_user_configs(
 
     Returns a dict keyed by telegram_id for O(1) lookup.
     """
+    users_yaml_path = "/etc/kai/users.yaml"
     data = _read_protected_yaml("users.yaml")
     if data is _YAML_MALFORMED:
-        # Fail closed: return None so the caller falls back to
-        # ALLOWED_USER_IDS (or exits if that is also unset). Auth
-        # config must not silently degrade.
-        log.warning("Skipping user config: /etc/kai/users.yaml is malformed or empty")
-        return None
+        raise SystemExit(
+            f"{users_yaml_path} is malformed or has an invalid top-level YAML shape. "
+            "Fix the file or re-run 'make config' to regenerate it."
+        )
     if data is None:
-        return None
+        msg = (
+            f"users.yaml is required for authorization and was not found at {users_yaml_path}. "
+            "Run 'make config' to generate it."
+        )
+        if os.environ.get("ALLOWED_USER_IDS"):
+            msg += (
+                " ALLOWED_USER_IDS is set in env but is no longer honored as an "
+                "auth fallback; 'make config' will migrate it into users.yaml."
+            )
+        raise SystemExit(msg)
 
     # After the _YAML_MALFORMED and None checks, `data` is guaranteed
     # to be a dict (`_read_protected_yaml` returns `_YAML_MALFORMED`
     # for any non-dict top-level value). Guard defensively rather than
     # assert since assertions are stripped under Python -O.
     if not isinstance(data, dict):
-        log.warning("users.yaml: expected a YAML dict, got %s", type(data).__name__)
-        return None
+        raise SystemExit(f"{users_yaml_path}: expected a YAML dict, got {type(data).__name__}")
 
     entries = data.get("users")
     if not isinstance(entries, list):
-        # Warn for any non-list value, including None (missing key).
         # A users.yaml file without a 'users' key is almost certainly
-        # a typo (e.g., 'user:' instead of 'users:').
+        # a typo (e.g., 'user:' instead of 'users:'). Either shape is
+        # fatal at this point because there is no auth fallback.
         if entries is not None:
-            log.warning("users.yaml: 'users' must be a list, got %s", type(entries).__name__)
-        else:
-            log.warning("users.yaml: no 'users' key found; check for typos")
-        return None
+            raise SystemExit(f"{users_yaml_path}: 'users' must be a list, got {type(entries).__name__}")
+        raise SystemExit(f"{users_yaml_path}: no 'users' key found; check for typos (e.g. 'user:' vs 'users:')")
 
     configs: dict[int, UserConfig] = {}
     for entry in entries:
@@ -1955,9 +1968,16 @@ def _load_user_configs(
             issue_triage=issue_triage,
         )
 
+    if not configs:
+        raise SystemExit(
+            f"{users_yaml_path}: no valid user entries; every entry was rejected "
+            "by per-entry validation. See the warnings logged above for the "
+            "individual rejection reasons."
+        )
+
     # Warn if no admin is defined - external webhooks will route to
     # an arbitrary user, which may be surprising.
-    if configs and not any(uc.role == "admin" for uc in configs.values()):
+    if not any(uc.role == "admin" for uc in configs.values()):
         log.warning(
             "users.yaml: no admin users defined. External webhook notifications "
             "(GitHub, generic) will route to an arbitrary user."
@@ -2028,25 +2048,6 @@ def load_config() -> Config:
         log.info("Telegram transport: webhook (%s)", telegram_webhook_url)
     else:
         log.info("Telegram transport: polling (TELEGRAM_WEBHOOK_URL not set)")
-
-    # Parse allowed user IDs. users.yaml is the primary authorization
-    # source. ALLOWED_USER_IDS is a legacy fallback for installations
-    # that haven't migrated yet.
-    # Defer the ValueError until after users.yaml is checked so that
-    # a malformed env var doesn't block startup when users.yaml is
-    # authoritative and would make the env var irrelevant.
-    raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
-    allowed_ids: set[int] = set()
-    allowed_ids_error: str | None = None
-    try:
-        allowed_ids = {int(uid.strip()) for uid in raw_ids.split(",") if uid.strip()}
-    except ValueError:
-        allowed_ids_error = (
-            "ALLOWED_USER_IDS contains non-numeric values. "
-            "Consider migrating to users.yaml (run 'make config' or "
-            "see README for the schema). If using ALLOWED_USER_IDS, values must be "
-            "numeric Telegram user IDs - message @userinfobot to find yours."
-        )
 
     # Validate optional: workspace base directory (must exist if provided)
     workspace_base = None
@@ -2421,32 +2422,21 @@ def load_config() -> Config:
     # workspaces the user is otherwise allowed to enter.
     memory_projects = _load_memory_project_configs()
 
-    # Per-user configuration. If users.yaml exists, it is authoritative;
-    # ALLOWED_USER_IDS is ignored. If users.yaml does not exist,
-    # ALLOWED_USER_IDS works as before (backward-compatible).
+    # Per-user configuration. users.yaml is mandatory; the loader
+    # raises SystemExit on any failure with a path-naming message
+    # (and a one-line ALLOWED_USER_IDS migration hint when that env
+    # var is set on a missing-file install). The legacy env-var
+    # fallback is gone: a malformed users file used to silently
+    # degrade to ALLOWED_USER_IDS, which the wizard and the loader
+    # then disagreed about; fail-closed is the contract now.
     user_configs = _load_user_configs(agent_backend, llm_provider)
-    if user_configs is not None:
-        if raw_ids:
-            log.warning("ALLOWED_USER_IDS is set but users.yaml exists; using users.yaml")
-        # Users in the YAML replace the ALLOWED_USER_IDS set.
-        # Any ALLOWED_USER_IDS parse error is irrelevant since users.yaml is authoritative.
-        allowed_ids = set(user_configs.keys())
-        if not allowed_ids:
-            raise SystemExit("users.yaml exists but contains no valid user entries")
-    elif allowed_ids_error:
-        # No users.yaml and ALLOWED_USER_IDS had a parse error
-        raise SystemExit(allowed_ids_error)
-    elif not allowed_ids:
-        # No users.yaml and no ALLOWED_USER_IDS - can't start
-        raise SystemExit(
-            "No user authorization configured. "
-            "Run 'make config' to generate users.yaml, "
-            "or create one manually (see README for the schema)."
+    allowed_ids = set(user_configs.keys())
+    if os.environ.get("ALLOWED_USER_IDS", "").strip():
+        log.warning(
+            "ALLOWED_USER_IDS is set in env but is no longer honored; "
+            "users.yaml is authoritative. Remove the env var from /etc/kai/env "
+            "(or re-run 'make config') to clear this warning."
         )
-    else:
-        # ALLOWED_USER_IDS is valid and no users.yaml exists. This works
-        # but is the legacy path - nudge toward users.yaml.
-        log.info("Using ALLOWED_USER_IDS from env (legacy). Run 'make config' to migrate to users.yaml.")
 
     # Memory extraction preconditions, validated per the
     # extraction-eligible backend set. Reasoner and model both derive
@@ -2490,58 +2480,56 @@ def load_config() -> Config:
                 ) from None
 
     # Deprecation warnings for env vars superseded by users.yaml.
-    # The vars still work as global fallbacks, but users.yaml is the
-    # primary configuration path. Warnings guide admins to migrate.
-    # Only fire when users.yaml parsed successfully. If users.yaml is
-    # malformed, the system falls back to ALLOWED_USER_IDS and the env
-    # vars are actively needed (not deprecated in that context).
-    if user_configs is not None:
-        _deprecated_env_vars = {
-            "CLAUDE_MODEL": "Renamed to DEFAULT_MODEL. Set per-user 'model' in users.yaml or use /settings model",
-            "CLAUDE_MAX_BUDGET_USD": "Renamed to BUDGET_CEILING (global ceiling). Per-user defaults go in users.yaml 'max_budget'",
-            "CLAUDE_TIMEOUT_SECONDS": "Set per-user 'timeout' in users.yaml or use /settings timeout",
-            "CLAUDE_MAX_CONTEXT_WINDOW": "Set per-user 'context_window' in users.yaml or use /settings context",
-            "CLAUDE_USER": "Set per-user 'os_user' in users.yaml",
-            "WORKSPACE_BASE": "Set per-user 'workspace_base' in users.yaml",
-            "ALLOWED_WORKSPACES": "Users can manage their own via /workspace allow",
-            "PR_REVIEW_ENABLED": "Set per-user 'pr_review' in users.yaml or use /github reviews",
-            "ISSUE_TRIAGE_ENABLED": "Set per-user 'issue_triage' in users.yaml or use /github triage",
-            "GITHUB_NOTIFY_CHAT_ID": "Set per-user 'github_notify_chat_id' in users.yaml or use /github notify",
-        }
-        for var, guidance in _deprecated_env_vars.items():
-            if os.environ.get(var, "").strip():
-                log.warning(
-                    "%s in env is deprecated (users.yaml exists). %s. "
-                    "This env var will be removed in a future release.",
-                    var,
-                    guidance,
-                )
+    # users.yaml is mandatory now, so the previous "only fire when
+    # users.yaml exists" guard is gone: any of these env vars in
+    # /etc/kai/env is unconditionally redundant. A later tranche
+    # removes the Class A entries from this block entirely along
+    # with the runtime reads they describe.
+    _deprecated_env_vars = {
+        "CLAUDE_MODEL": "Renamed to DEFAULT_MODEL. Set per-user 'model' in users.yaml or use /settings model",
+        "CLAUDE_MAX_BUDGET_USD": "Renamed to BUDGET_CEILING (global ceiling). Per-user defaults go in users.yaml 'max_budget'",
+        "CLAUDE_TIMEOUT_SECONDS": "Set per-user 'timeout' in users.yaml or use /settings timeout",
+        "CLAUDE_MAX_CONTEXT_WINDOW": "Set per-user 'context_window' in users.yaml or use /settings context",
+        "CLAUDE_USER": "Set per-user 'os_user' in users.yaml",
+        "WORKSPACE_BASE": "Set per-user 'workspace_base' in users.yaml",
+        "ALLOWED_WORKSPACES": "Users can manage their own via /workspace allow",
+        "PR_REVIEW_ENABLED": "Set per-user 'pr_review' in users.yaml or use /github reviews",
+        "ISSUE_TRIAGE_ENABLED": "Set per-user 'issue_triage' in users.yaml or use /github triage",
+        "GITHUB_NOTIFY_CHAT_ID": "Set per-user 'github_notify_chat_id' in users.yaml or use /github notify",
+    }
+    for var, guidance in _deprecated_env_vars.items():
+        if os.environ.get(var, "").strip():
+            log.warning(
+                "%s in env is deprecated (users.yaml exists). %s. This env var will be removed in a future release.",
+                var,
+                guidance,
+            )
 
-        # Warn when GitHub agent features are enabled but no users have
-        # github_repos configured. Events will never reach the agents
-        # because _get_subscribed_users() returns empty for every
-        # incoming webhook. The fallback path in _process_github_event()
-        # delivers basic notifications but does not guarantee the agents
-        # fire.
-        no_repos = not any(uc.github_repos for uc in user_configs.values())
-        if no_repos:
-            review_on = pr_review_enabled or any(uc.pr_review is True for uc in user_configs.values())
-            triage_on = issue_triage_enabled or any(uc.issue_triage is True for uc in user_configs.values())
-            if review_on or triage_on:
-                features = []
-                if review_on:
-                    features.append("PR review")
-                if triage_on:
-                    features.append("issue triage")
-                log.warning(
-                    "GitHub features enabled (%s) but no users have "
-                    "github_repos configured. GitHub webhook events will "
-                    "not be delivered to these features. Add 'github_repos' "
-                    "to users.yaml entries. See: https://github.com/"
-                    "dcellison/kai/wiki/Multi-User-Setup"
-                    "#what-you-must-set-manually",
-                    ", ".join(features),
-                )
+    # Warn when GitHub agent features are enabled but no users have
+    # github_repos configured. Events will never reach the agents
+    # because _get_subscribed_users() returns empty for every
+    # incoming webhook. The fallback path in _process_github_event()
+    # delivers basic notifications but does not guarantee the agents
+    # fire.
+    no_repos = not any(uc.github_repos for uc in user_configs.values())
+    if no_repos:
+        review_on = pr_review_enabled or any(uc.pr_review is True for uc in user_configs.values())
+        triage_on = issue_triage_enabled or any(uc.issue_triage is True for uc in user_configs.values())
+        if review_on or triage_on:
+            features = []
+            if review_on:
+                features.append("PR review")
+            if triage_on:
+                features.append("issue triage")
+            log.warning(
+                "GitHub features enabled (%s) but no users have "
+                "github_repos configured. GitHub webhook events will "
+                "not be delivered to these features. Add 'github_repos' "
+                "to users.yaml entries. See: https://github.com/"
+                "dcellison/kai/wiki/Multi-User-Setup"
+                "#what-you-must-set-manually",
+                ", ".join(features),
+            )
 
     # Read DEFAULT_MODEL, falling back to CLAUDE_MODEL for backward
     # compat with existing /etc/kai/env files that haven't been

@@ -1789,8 +1789,6 @@ def _resolve_os_user(user_id: str, config: Config) -> str | None:
     Returns None for any path that does not produce a per-user OS
     routing target:
 
-    - `config.user_configs is None` (legacy ALLOWED_USER_IDS install
-      that never built a users.yaml).
     - `user_id` does not parse as an int (eval-gate sandbox IDs like
       `sandbox-498-claude`).
     - The parsed telegram_id is not present in `user_configs`.
@@ -1807,8 +1805,6 @@ def _resolve_os_user(user_id: str, config: Config) -> str | None:
     threading `Config.user_configs` into deeper call sites for no
     extra correctness benefit.
     """
-    if config.user_configs is None:
-        return None
     try:
         tid = int(user_id)
     except ValueError:
@@ -1841,8 +1837,6 @@ def _resolve_effective_backend(user_id: str, config: Config) -> str:
     `_build_memory_reasoner` below catches a future regression where
     the gate moves or changes.
     """
-    if config.user_configs is None:
-        return config.agent_backend
     try:
         tid = int(user_id)
     except ValueError:

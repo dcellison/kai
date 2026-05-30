@@ -1557,7 +1557,10 @@ class TestHandleWorkspace:
 
         # No claude_workspace= override -> no UserConfig.home_workspace,
         # so resolve_home_workspace must fall through to ensure_user_home.
-        config = _make_config()
+        # users.yaml is mandatory post-#565 tranche A; supply a minimal
+        # entry for the default test chat_id so the resolver treats it
+        # as interactive rather than a runtime-added notification chat.
+        config = _make_config(user_configs={12345: UserConfig(telegram_id=12345, name="test")})
         claude = _make_mock_claude(workspace=Path("/other"))
         # _make_update defaults to chat_id=12345; the per-user home
         # directory therefore lands at tmp_path/home/12345.
