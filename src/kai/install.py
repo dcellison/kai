@@ -779,9 +779,17 @@ def _cmd_config() -> None:
     print()
 
     # -- Claude --
-    # When users.yaml exists, model/timeout/budget/context are per-user
-    # settings managed via /settings commands or users.yaml fields.
-    # Only prompt for truly global Claude settings (autocompact).
+    # DEFAULT_MODEL, AGENT_TIMEOUT_SECONDS, BUDGET_CEILING, and
+    # CLAUDE_MAX_CONTEXT_WINDOW are inheritable installation defaults:
+    # users.yaml entries that omit a per-user override fall back to
+    # these values at runtime. The prompts therefore fire on every
+    # wizard run regardless of users.yaml presence. The previous
+    # users_yaml_exists gate skipped them entirely on the
+    # re-run-with-users.yaml path, which let a stale global model
+    # survive a backend switch (the operator-visible bug: switching
+    # AGENT_BACKEND from one model surface to another left the prior
+    # value unchanged because the re-validation path never ran).
+    #
     # Determine the effective provider for model choices. Claude
     # backend always uses Anthropic; Goose uses the selected provider.
     eff_provider = "anthropic" if agent_backend == "claude" else llm_provider
@@ -797,98 +805,78 @@ def _cmd_config() -> None:
             return CODEX_DEFAULT_MODEL
         return PROVIDER_DEFAULTS.get(eff_provider, "")
 
-    if users_yaml_exists:
-        print("-- Claude --")
-        print("  Model, timeout, budget, and context window are now per-user.")
-        print("  Set defaults in users.yaml or let users configure via /settings.")
-        # Read DEFAULT_MODEL, falling back to CLAUDE_MODEL for backward compat
-        existing_model = existing_env.get("DEFAULT_MODEL", existing_env.get("CLAUDE_MODEL", ""))
-        # Re-validate the existing value against the (possibly newly chosen)
-        # backend - backend-aware, not provider-only, so codex rejects
-        # gpt-5.4-nano even though it's valid for goose-on-openai.
-        # Empty existing_model fails validation for any curated backend;
-        # the _prompt(required=True) branch in _prompt_default_model
-        # handles the open-ended case.
-        if existing_model and validate_model_for_backend(existing_model, agent_backend, eff_provider):
-            model = existing_model
-        else:
-            if existing_model:
-                surface = "codex" if agent_backend == "codex" else f"provider '{eff_provider}'"
-                print(f"  DEFAULT_MODEL '{existing_model}' is not valid for {surface}. Please choose a new default.")
-            # Prefill always uses the backend-aware default rather than
-            # existing_env["DEFAULT_MODEL"]. We entered this branch because
-            # the existing value is missing or invalid; offering it as the
-            # prefill would let the operator accept the just-rejected value
-            # with Enter, since _prompt_choice returns its default parameter
-            # without validating it against the choices list.
-            model = _prompt_default_model(agent_backend, eff_provider, _default_model_prefill())
-        # AGENT_TIMEOUT_SECONDS is the canonical key; fall back to the
-        # legacy CLAUDE_TIMEOUT_SECONDS for installs that haven't re-run
-        # the wizard since the rename.
-        timeout = existing_env.get("AGENT_TIMEOUT_SECONDS", existing_env.get("CLAUDE_TIMEOUT_SECONDS", ""))
-        budget = existing_env.get("BUDGET_CEILING", existing_env.get("CLAUDE_MAX_BUDGET_USD", ""))
-        max_context_window = existing_env.get("CLAUDE_MAX_CONTEXT_WINDOW", "")
+    print("-- Claude --")
+    # Re-validate any existing DEFAULT_MODEL against the (possibly
+    # newly chosen) backend so a switch from claude to codex doesn't
+    # silently keep an anthropic model. Backend-aware, not provider-
+    # only: codex rejects gpt-5.4-nano even though it's valid for
+    # goose-on-openai. Empty raw_existing_model fails validation for
+    # any curated backend; the _prompt(required=True) branch in
+    # _prompt_default_model handles the open-ended case.
+    raw_existing_model = existing_env.get("DEFAULT_MODEL", existing_env.get("CLAUDE_MODEL", ""))
+    if raw_existing_model and validate_model_for_backend(raw_existing_model, agent_backend, eff_provider):
+        model = raw_existing_model
     else:
-        print("-- Claude --")
-        # Re-validate any existing DEFAULT_MODEL against the chosen
-        # backend so a switch from claude to codex doesn't silently
-        # keep an anthropic model.
-        raw_existing = existing_env.get("DEFAULT_MODEL", existing_env.get("CLAUDE_MODEL", ""))
-        if raw_existing and validate_model_for_backend(raw_existing, agent_backend, eff_provider):
-            default_model_val = raw_existing
-        else:
-            default_model_val = _default_model_prefill()
-        model = _prompt_default_model(agent_backend, eff_provider, default_model_val)
+        if raw_existing_model:
+            # Surface the rejection reason so the operator sees why the
+            # prior value is being re-prompted rather than getting a
+            # bare default with no explanation.
+            surface = "codex" if agent_backend == "codex" else f"provider '{eff_provider}'"
+            print(f"  DEFAULT_MODEL '{raw_existing_model}' is not valid for {surface}. Please choose a new default.")
+        # Prefill uses the backend-aware default rather than the
+        # rejected raw_existing_model. _prompt_default_model returns
+        # its default parameter without validating it against the
+        # choices list, so prefilling the bad value would let the
+        # operator accept the just-rejected value with Enter.
+        model = _prompt_default_model(agent_backend, eff_provider, _default_model_prefill())
 
+    while True:
+        # AGENT_TIMEOUT_SECONDS is canonical; legacy
+        # CLAUDE_TIMEOUT_SECONDS is the fallback for upgrades.
+        timeout_default = existing_env.get("AGENT_TIMEOUT_SECONDS", existing_env.get("CLAUDE_TIMEOUT_SECONDS", "120"))
+        timeout = _prompt(
+            "Agent timeout (seconds)",
+            timeout_default,
+        )
+        if _validate_positive_int(timeout):
+            break
+        print("  Must be a positive integer.")
+
+    # Skip the budget prompt on the claude backend: --max-budget-usd
+    # is no longer emitted to claude --print argv (Max-plan OAuth
+    # makes the CLI's computed-cost ceiling a phantom signal), so
+    # asking the operator for a value that is never enforced would
+    # be wizard noise. Pre-init `budget = ""` here; the BUDGET_CEILING
+    # env emission below (in the env-build block) skips writing the
+    # key entirely on the claude branch, leaving Config.budget_ceiling
+    # at its dataclass default for the (informational) /settings
+    # budget readback.
+    if agent_backend != "claude":
         while True:
-            # AGENT_TIMEOUT_SECONDS is canonical; legacy
-            # CLAUDE_TIMEOUT_SECONDS is the fallback for upgrades.
-            timeout_default = existing_env.get(
-                "AGENT_TIMEOUT_SECONDS", existing_env.get("CLAUDE_TIMEOUT_SECONDS", "120")
+            budget = _prompt(
+                "Claude budget (USD)",
+                existing_env.get("BUDGET_CEILING", existing_env.get("CLAUDE_MAX_BUDGET_USD", "10.0")),
             )
-            timeout = _prompt(
-                "Agent timeout (seconds)",
-                timeout_default,
-            )
-            if _validate_positive_int(timeout):
+            if _validate_positive_float(budget):
                 break
-            print("  Must be a positive integer.")
+            print("  Must be a positive number.")
+    else:
+        budget = ""
 
-        # Skip the budget prompt on the claude backend: --max-budget-usd
-        # is no longer emitted to claude --print argv (Max-plan OAuth
-        # makes the CLI's computed-cost ceiling a phantom signal), so
-        # asking the operator for a value that is never enforced would
-        # be wizard noise. Pre-init `budget = ""` here; the BUDGET_CEILING
-        # env emission below (in the env-build block) skips writing the
-        # key entirely on the claude branch, leaving Config.budget_ceiling
-        # at its dataclass default for the (informational) /settings
-        # budget readback.
-        if agent_backend != "claude":
-            while True:
-                budget = _prompt(
-                    "Claude budget (USD)",
-                    existing_env.get("BUDGET_CEILING", existing_env.get("CLAUDE_MAX_BUDGET_USD", "10.0")),
-                )
-                if _validate_positive_float(budget):
-                    break
-                print("  Must be a positive number.")
-        else:
-            budget = ""
-
-        # Context window tuning - smaller windows reduce token usage and
-        # cache invalidation pressure on the inner Claude process.
-        while True:
-            max_context_window = _prompt(
-                "Max context window (tokens, 0 = default 1M)",
-                existing_env.get("CLAUDE_MAX_CONTEXT_WINDOW", "200000"),
-            )
-            try:
-                val = int(max_context_window)
-                if 0 <= val <= MAX_CONTEXT_CEILING:
-                    break
-            except ValueError:
-                pass
-            print(f"  Must be 0-{MAX_CONTEXT_CEILING} (0 = use default).")
+    # Context window tuning - smaller windows reduce token usage and
+    # cache invalidation pressure on the inner Claude process.
+    while True:
+        max_context_window = _prompt(
+            "Max context window (tokens, 0 = default 1M)",
+            existing_env.get("CLAUDE_MAX_CONTEXT_WINDOW", "200000"),
+        )
+        try:
+            val = int(max_context_window)
+            if 0 <= val <= MAX_CONTEXT_CEILING:
+                break
+        except ValueError:
+            pass
+        print(f"  Must be 0-{MAX_CONTEXT_CEILING} (0 = use default).")
 
     # Autocompact threshold controls when Claude automatically compresses
     # conversation history. Lower values compact sooner, reducing token
@@ -961,24 +949,27 @@ def _cmd_config() -> None:
     print()
 
     # -- Workspaces --
+    # WORKSPACE_BASE is an inheritable installation default: users.yaml
+    # entries that omit `workspace_base` fall back to it. The prompt
+    # fires on every wizard run. ALLOWED_WORKSPACES remains a legacy
+    # per-user-mirror env var and stays gated on users.yaml absence;
+    # users.yaml carries per-user `allowed_workspaces` lists and the
+    # global env emission is preserved for installs that have not
+    # migrated yet (tranche D removes the gate when the env var goes
+    # away entirely).
+    print("-- Workspaces --")
+    workspace_base = _prompt(
+        "Workspace base directory",
+        existing_env.get("WORKSPACE_BASE", ""),
+    )
+    # Expand ~ for display but store as-is (load_config handles expansion)
+    if workspace_base.startswith("~"):
+        expanded = os.path.expanduser(workspace_base)
+        print(f"  (expands to {expanded})")
+
     if users_yaml_exists:
-        print("-- Workspaces --")
-        print("  Workspace base and allowed workspaces are now per-user.")
-        print("  Set workspace_base in users.yaml. Users manage allowed")
-        print("  workspaces via /workspace allow and /workspace deny.")
-        workspace_base = existing_env.get("WORKSPACE_BASE", "")
         allowed_workspaces = existing_env.get("ALLOWED_WORKSPACES", "")
     else:
-        print("-- Workspaces --")
-        workspace_base = _prompt(
-            "Workspace base directory",
-            existing_env.get("WORKSPACE_BASE", ""),
-        )
-        # Expand ~ for display but store as-is (load_config handles expansion)
-        if workspace_base.startswith("~"):
-            expanded = os.path.expanduser(workspace_base)
-            print(f"  (expands to {expanded})")
-
         allowed_workspaces = _prompt(
             "Allowed workspaces (comma-separated paths, optional)",
             existing_env.get("ALLOWED_WORKSPACES", ""),
@@ -986,34 +977,37 @@ def _cmd_config() -> None:
     print()
 
     # -- PR review agent --
-    # pr_review_timeout_s and pr_review_budget_usd are global resource limits
-    # for the review subprocess, not per-user preferences. They are prompted
-    # unconditionally below (unlike pr_review_cooldown, which is only
-    # prompted when users.yaml is absent and pr_review is enabled) because
-    # any review can time out or hit budget regardless of how users are
-    # configured.
+    # PR_REVIEW_COOLDOWN, PR_REVIEW_TIMEOUT_S, and PR_REVIEW_BUDGET_USD
+    # are global resource controls for the review subprocess: any
+    # review by any user counts against the same cooldown, the same
+    # subprocess timeout, and (on non-claude backends) the same USD
+    # budget per run. All three fire on every wizard run regardless
+    # of users.yaml presence. PR_REVIEW_ENABLED is the Class A per-user
+    # mirror and remains gated on users.yaml absence until tranche D
+    # removes it.
+    print("-- PR review agent --")
     if users_yaml_exists:
-        print("-- PR review agent --")
-        print("  PR review is now per-user. Set 'pr_review' in users.yaml")
+        print("  Global PR review toggle is now per-user. Set 'pr_review' in users.yaml")
         print("  or let users toggle via /github reviews on|off.")
         pr_review_enabled = existing_env.get("PR_REVIEW_ENABLED", "false").lower() in ("1", "true", "yes")
-        pr_review_cooldown = existing_env.get("PR_REVIEW_COOLDOWN", "300")
     else:
-        print("-- PR review agent --")
         pr_review_enabled = _prompt_bool(
             "Enable PR review agent",
             existing_env.get("PR_REVIEW_ENABLED", "false").lower() in ("1", "true", "yes"),
         )
-        pr_review_cooldown = "300"
-        if pr_review_enabled:
-            while True:
-                pr_review_cooldown = _prompt(
-                    "Review cooldown in seconds (prevents spam from rapid pushes)",
-                    existing_env.get("PR_REVIEW_COOLDOWN", "300"),
-                )
-                if _validate_positive_int(pr_review_cooldown):
-                    break
-                print("  Must be a positive integer.")
+
+    # Global cooldown always prompts: a per-user opt-in via users.yaml
+    # or /github reviews can drive reviews even when the global env
+    # toggle is absent, so the cooldown must be configurable for any
+    # install that has any opted-in user.
+    while True:
+        pr_review_cooldown = _prompt(
+            "Review cooldown in seconds (prevents spam from rapid pushes)",
+            existing_env.get("PR_REVIEW_COOLDOWN", "300"),
+        )
+        if _validate_positive_int(pr_review_cooldown):
+            break
+        print("  Must be a positive integer.")
 
     # Timeout + budget for the review subprocess. Always collectable: they
     # apply to any review whether or not the global env flag is set.
@@ -1437,18 +1431,20 @@ def _cmd_config() -> None:
     # to own the validation responsibility.
     env["DEFAULT_MODEL"] = model
 
-    # AGENT_TIMEOUT_SECONDS remains gated on the legacy single-user
-    # path; per-user timeouts live in users.yaml and override the
-    # global default at runtime. (Renamed from CLAUDE_TIMEOUT_SECONDS;
-    # the legacy key is migrated to the new name at apply time.)
-    if not users_yaml_exists:
-        env["AGENT_TIMEOUT_SECONDS"] = timeout
+    # AGENT_TIMEOUT_SECONDS is an inheritable installation default;
+    # per-user timeouts in users.yaml override at runtime. Always
+    # emitted because the prompt always fires. (Renamed from
+    # CLAUDE_TIMEOUT_SECONDS; the legacy key is migrated to the new
+    # name at apply time.)
+    env["AGENT_TIMEOUT_SECONDS"] = timeout
 
     # Context window tuning - only include if non-default.
     # Compare as int to handle inputs like "000" that pass validation.
-    # CLAUDE_MAX_CONTEXT_WINDOW is deprecated (per-user), but
-    # CLAUDE_AUTOCOMPACT_PCT is truly global (machine resource limit).
-    if not users_yaml_exists and max_context_window and int(max_context_window) != 0:
+    # CLAUDE_MAX_CONTEXT_WINDOW is an inheritable installation default
+    # (per-user override in users.yaml `context_window`). Emitted
+    # whenever non-default regardless of users.yaml presence so the
+    # global value the wizard just collected actually reaches runtime.
+    if max_context_window and int(max_context_window) != 0:
         env["CLAUDE_MAX_CONTEXT_WINDOW"] = max_context_window
     if int(autocompact_pct) != 0:
         env["CLAUDE_AUTOCOMPACT_PCT"] = autocompact_pct
@@ -1473,28 +1469,34 @@ def _cmd_config() -> None:
     if perplexity_key:
         env["PERPLEXITY_API_KEY"] = perplexity_key
 
-    # Deprecated per-user optional vars: only write without users.yaml
+    # WORKSPACE_BASE is an inheritable installation default; per-user
+    # `workspace_base` in users.yaml overrides at runtime. Always
+    # emitted when set, regardless of users.yaml presence.
+    if workspace_base:
+        env["WORKSPACE_BASE"] = workspace_base
+
+    # PR_REVIEW_COOLDOWN is a global resource control. Always written
+    # when non-default because any user can drive reviews via users.yaml
+    # or /github reviews even when the global PR_REVIEW_ENABLED toggle
+    # is unset.
+    if pr_review_cooldown != "300":
+        env["PR_REVIEW_COOLDOWN"] = pr_review_cooldown
+
+    # Class A per-user mirrors. The prompts and emissions are gated on
+    # users.yaml absence so legacy single-user installs continue to
+    # work via env; tranche D removes the Class A surface entirely
+    # once users.yaml is mandatory.
     if not users_yaml_exists:
-        if workspace_base:
-            env["WORKSPACE_BASE"] = workspace_base
         if allowed_workspaces:
             env["ALLOWED_WORKSPACES"] = allowed_workspaces
         if claude_user:
             env["CLAUDE_USER"] = claude_user
         if pr_review_enabled:
             env["PR_REVIEW_ENABLED"] = "true"
-            if pr_review_cooldown != "300":
-                env["PR_REVIEW_COOLDOWN"] = pr_review_cooldown
         if issue_triage_enabled:
             env["ISSUE_TRIAGE_ENABLED"] = "true"
         if github_notify_chat_id:
             env["GITHUB_NOTIFY_CHAT_ID"] = github_notify_chat_id
-    else:
-        # PR_REVIEW_COOLDOWN is a global rate limit - always write it
-        # if non-default, since any user may have PR review enabled
-        # via users.yaml even when the global env var is unset.
-        if pr_review_cooldown != "300":
-            env["PR_REVIEW_COOLDOWN"] = pr_review_cooldown
 
     # Review subprocess resource limits. Written in both branches because
     # they apply globally to any review, regardless of users.yaml presence.
