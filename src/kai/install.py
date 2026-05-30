@@ -806,29 +806,36 @@ def _cmd_config() -> None:
         return PROVIDER_DEFAULTS.get(eff_provider, "")
 
     print("-- Claude --")
-    # Re-validate any existing DEFAULT_MODEL against the (possibly
-    # newly chosen) backend so a switch from claude to codex doesn't
-    # silently keep an anthropic model. Backend-aware, not provider-
-    # only: codex rejects gpt-5.4-nano even though it's valid for
-    # goose-on-openai. Empty raw_existing_model fails validation for
-    # any curated backend; the _prompt(required=True) branch in
+    # DEFAULT_MODEL is an inheritable installation default; the prompt
+    # fires on every wizard run with the existing env value prefilled
+    # when it validates for the (possibly newly chosen) backend.
+    # Always routing through _prompt_default_model is load-bearing for
+    # the operator who wants to change the global model without
+    # changing backends: the previous "keep silently on valid match"
+    # shortcut left them with no path to update it via the wizard.
+    #
+    # Re-validation is backend-aware, not provider-only: codex rejects
+    # gpt-5.4-nano even though it's valid for goose-on-openai, so a
+    # backend switch with a model that lives only on the prior surface
+    # falls through to the curated default. Empty raw_existing_model
+    # also fails validation; the _prompt(required=True) branch in
     # _prompt_default_model handles the open-ended case.
+    #
+    # When the existing value fails validation, the rejection reason
+    # is printed and the prefill becomes the backend-aware default
+    # rather than the rejected value, because _prompt_default_model
+    # returns its default parameter without re-validating against the
+    # choices list. Prefilling the bad value would let the operator
+    # accept the just-rejected value with Enter.
     raw_existing_model = existing_env.get("DEFAULT_MODEL", existing_env.get("CLAUDE_MODEL", ""))
     if raw_existing_model and validate_model_for_backend(raw_existing_model, agent_backend, eff_provider):
-        model = raw_existing_model
+        default_model_prefill_value = raw_existing_model
     else:
         if raw_existing_model:
-            # Surface the rejection reason so the operator sees why the
-            # prior value is being re-prompted rather than getting a
-            # bare default with no explanation.
             surface = "codex" if agent_backend == "codex" else f"provider '{eff_provider}'"
             print(f"  DEFAULT_MODEL '{raw_existing_model}' is not valid for {surface}. Please choose a new default.")
-        # Prefill uses the backend-aware default rather than the
-        # rejected raw_existing_model. _prompt_default_model returns
-        # its default parameter without validating it against the
-        # choices list, so prefilling the bad value would let the
-        # operator accept the just-rejected value with Enter.
-        model = _prompt_default_model(agent_backend, eff_provider, _default_model_prefill())
+        default_model_prefill_value = _default_model_prefill()
+    model = _prompt_default_model(agent_backend, eff_provider, default_model_prefill_value)
 
     while True:
         # AGENT_TIMEOUT_SECONDS is canonical; legacy

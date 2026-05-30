@@ -2760,10 +2760,17 @@ class TestCmdConfigDefaultModelDispatch:
     Wizard dispatch for DEFAULT_MODEL when users.yaml exists.
 
     Dispatch shape:
-    - if the existing model is non-empty and validates against the effective
-      provider, keep it (no prompt);
-    - otherwise call _prompt_default_model with the provider's curated
-      default as the prefill (never the just-rejected value).
+    - _prompt_default_model fires on every wizard run, regardless of
+      whether the existing value validates;
+    - the prefill is the existing value when it validates against the
+      effective backend, otherwise the backend-aware curated default
+      (never the just-rejected value).
+
+    Always routing through the prompt is load-bearing: it lets an
+    operator with users.yaml present change the inherited global
+    model via `make config` instead of needing to hand-edit
+    /etc/kai/env. The previous "keep silently on valid match"
+    shortcut closed that path.
 
     The wizard has many prompts that fire before and after the model
     dispatch. The helper below mocks _prompt_default_model to capture
@@ -2946,21 +2953,28 @@ class TestCmdConfigDefaultModelDispatch:
         assert helper.call_args.args[1] == "openai"
         assert env["DEFAULT_MODEL"] == "gpt-5.4-mini"
 
-    def test_no_reprompt_when_claude_backend_unchanged(self, tmp_path, monkeypatch):
+    def test_prompt_fires_with_valid_existing_as_prefill(self, tmp_path, monkeypatch):
         """
-        With users.yaml present, DEFAULT_MODEL=sonnet, and the wizard kept
-        on claude, no model prompt fires AND install.conf still emits
-        DEFAULT_MODEL=sonnet (the unconditional-emission half of the fix).
+        With users.yaml present, DEFAULT_MODEL=sonnet, and the wizard
+        kept on claude, the model prompt STILL fires and the existing
+        value is passed as the prefill. The operator's choice (from
+        the helper return) lands in install.conf. Pins the contract
+        that the operator can always edit the global model via
+        `make config`, not just when it is invalid for the backend.
         """
         self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_MODEL": "sonnet"})
         helper, env = self._run(
             monkeypatch,
             tmp_path,
             self._inputs_for_claude_backend(),
-            helper_return="should-not-be-used",
+            helper_return="haiku",
         )
-        helper.assert_not_called()
-        assert env["DEFAULT_MODEL"] == "sonnet"
+        helper.assert_called_once()
+        # Prefill is the existing value because it validates for claude.
+        assert helper.call_args.args[0] == "claude"
+        assert helper.call_args.args[1] == "anthropic"
+        assert helper.call_args.args[2] == "sonnet"
+        assert env["DEFAULT_MODEL"] == "haiku"
 
     def test_reprompts_on_empty_existing_model_claude(self, tmp_path, monkeypatch):
         """
