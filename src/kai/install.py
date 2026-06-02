@@ -405,6 +405,21 @@ def _strip_install_conf_keys(*keys: str) -> None:
     os.chmod(INSTALL_CONF, 0o600)
 
 
+def _xdg_users_yaml_path() -> Path:
+    """Return the canonical single-user users.yaml location.
+
+    Mirrors the runtime resolver in `config._resolve_users_yaml_path`
+    for the non-protected branch: `${XDG_CONFIG_HOME:-$HOME/.config}/
+    kai/users.yaml`. The wizard writes directly to this path in
+    single-user mode (no staging handoff is needed because the
+    operator owns the destination and there is no privilege boundary
+    to cross on apply).
+    """
+    explicit = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(explicit).expanduser() if explicit else Path.home() / ".config"
+    return base / "kai" / "users.yaml"
+
+
 def _read_users_yaml_text(path: Path) -> str | None:
     """Return the contents of a users.yaml file, falling back to sudo
     for root-owned protected copies.
@@ -450,7 +465,7 @@ def _cmd_config() -> None:
 
     No sudo required - this runs as the current user.
     """
-    print("Kai Protected Installation - Configuration")
+    print("Kai Installation - Configuration")
     print("=" * 45)
     print()
 
@@ -473,34 +488,75 @@ def _cmd_config() -> None:
     else:
         detected_platform = sys.platform
 
-    # -- Installation paths --
-    print("-- Installation paths --")
-    install_dir = _prompt(
-        "Install location",
-        existing.get("install_dir", _DEFAULT_INSTALL_DIR),
-    )
-    if not os.path.isabs(install_dir):
-        raise SystemExit("Install location must be an absolute path.")
-
-    data_dir = _prompt(
-        "Data directory",
-        existing.get("data_dir", _DEFAULT_DATA_DIR),
-    )
-    if not os.path.isabs(data_dir):
-        raise SystemExit("Data directory must be an absolute path.")
-
-    service_user = _prompt(
-        "Service user",
-        existing.get("service_user", _DEFAULT_SERVICE_USER),
-        required=True,
-    )
-
-    platform = _prompt_choice(
-        "Platform",
-        ["darwin", "linux"],
-        existing.get("platform", detected_platform),
+    # -- Deployment mode --
+    # `protected`: root-owned install at /opt/kai with /etc/kai/ secrets,
+    # the service-management apply flow, and `sudo make install` to
+    # finalize. This is the existing multi-user / production shape.
+    #
+    # `single_user`: the operator runs Kai directly from the repo
+    # without root. Secrets and per-user config live under the
+    # operator's home (.env in PROJECT_ROOT, users.yaml under XDG
+    # config home). `make config` writes everything and there is no
+    # `sudo make install` step; `make run` (or `python -m kai`) starts
+    # the daemon. This is the on-ramp for evaluators and the
+    # documented dev workflow.
+    #
+    # Default to `protected` when install.conf has no mode so existing
+    # operators on the long-standing path see no behavior change on a
+    # re-run.
+    print("-- Deployment mode --")
+    deployment_mode = _prompt_choice(
+        "Deployment mode",
+        ["protected", "single_user"],
+        existing.get("deployment_mode", "protected"),
     )
     print()
+
+    # In single-user mode the install location, data directory,
+    # service user, and platform service manager are not relevant:
+    # Kai runs from the cloned repo under the operator's account.
+    # We initialize these fields with stable defaults so downstream
+    # install.conf shape stays consistent across modes; nothing reads
+    # them in single-user mode but consumers that check for the keys
+    # do not need a mode-aware lookup.
+    if deployment_mode == "protected":
+        # -- Installation paths --
+        print("-- Installation paths --")
+        install_dir = _prompt(
+            "Install location",
+            existing.get("install_dir", _DEFAULT_INSTALL_DIR),
+        )
+        if not os.path.isabs(install_dir):
+            raise SystemExit("Install location must be an absolute path.")
+
+        data_dir = _prompt(
+            "Data directory",
+            existing.get("data_dir", _DEFAULT_DATA_DIR),
+        )
+        if not os.path.isabs(data_dir):
+            raise SystemExit("Data directory must be an absolute path.")
+
+        service_user = _prompt(
+            "Service user",
+            existing.get("service_user", _DEFAULT_SERVICE_USER),
+            required=True,
+        )
+
+        platform = _prompt_choice(
+            "Platform",
+            ["darwin", "linux"],
+            existing.get("platform", detected_platform),
+        )
+        print()
+    else:
+        # Single-user defaults. install_dir points at PROJECT_ROOT so
+        # any code that resolves paths through install.conf still
+        # finds a real directory; data_dir defaults to PROJECT_ROOT
+        # for the same reason. service_user is the current account.
+        install_dir = str(PROJECT_ROOT)
+        data_dir = str(PROJECT_ROOT)
+        service_user = os.environ.get("USER", _DEFAULT_SERVICE_USER)
+        platform = detected_platform
 
     # -- Telegram --
     print("-- Telegram --")
@@ -518,19 +574,27 @@ def _cmd_config() -> None:
     # the operator account, so the existence check does not require
     # elevation.
     #
-    # If no canonical file exists, the first-time branch writes to a
-    # per-operator staging path at `${HOME}/.cache/kai-install/
-    # users.yaml`. `_apply_secrets` (invoked under `sudo make install`)
-    # reads the path back from `install.conf` and copies it into
-    # `/etc/kai/users.yaml`. A stray `PROJECT_ROOT/users.yaml` from a
-    # previous install cycle is ignored; a one-line deprecation
-    # warning tells the operator to remove it or move it to
-    # `/etc/kai/users.yaml`.
+    # The canonical users.yaml location depends on deployment mode:
+    # - protected: `/etc/kai/users.yaml` (mode 0600 root-owned). The
+    #   wizard reads it via `_read_users_yaml_text`'s sudo-cat path
+    #   when it cannot read directly; the existence check goes through
+    #   the listable parent directory and does not require elevation.
+    # - single_user: `${XDG_CONFIG_HOME:-$HOME/.config}/kai/users.yaml`,
+    #   owned by the operator. Direct read.
+    #
+    # If no canonical file exists, the first-time branch writes to the
+    # appropriate location for the chosen mode (see below). A stray
+    # `PROJECT_ROOT/users.yaml` from a previous install cycle is
+    # ignored; a one-line deprecation warning tells the operator to
+    # remove it or move it to the canonical location.
     print("-- User setup --")
     stray_project_users_yaml = PROJECT_ROOT / "users.yaml"
+    if deployment_mode == "protected":
+        users_yaml_path = Path("/etc/kai/users.yaml")
+    else:
+        users_yaml_path = _xdg_users_yaml_path()
     if stray_project_users_yaml.exists():
-        print(f"  Note: {stray_project_users_yaml} is no longer used. Move it to /etc/kai/users.yaml or remove it.")
-    users_yaml_path = Path("/etc/kai/users.yaml")
+        print(f"  Note: {stray_project_users_yaml} is no longer used. Move it to {users_yaml_path} or remove it.")
     users_yaml_exists = users_yaml_path.exists()
 
     # Track whether advanced mode set os_user, so we can skip the
@@ -628,25 +692,35 @@ def _cmd_config() -> None:
             # spec exists to eliminate.
             admin_home_workspace = None
 
-        # Stage the generated users.yaml at `${HOME}/.cache/kai-install/
-        # users.yaml`. `_apply_secrets` copies from this staging path
-        # into `/etc/kai/users.yaml` during `sudo make install`; the
-        # path is persisted as a top-level key in install.conf below so
-        # apply can resolve it even when running under a different HOME
-        # (root vs the operator account). After `apply_succeeded`,
-        # `_cmd_apply` unlinks the staging file and strips the conf key
-        # so a subsequent re-run does not redo a handoff that already
-        # completed.
-        users_yaml_path = _install_staging_path("users.yaml")
+        # First-time write target depends on deployment mode:
+        # - protected: stage at `${HOME}/.cache/kai-install/users.yaml`
+        #   so `sudo make install` can copy it into `/etc/kai/users.yaml`
+        #   without the operator running the wizard as root. The path
+        #   is persisted as a top-level key in install.conf below;
+        #   `_cmd_apply` unlinks the staging file and strips the conf
+        #   key after `apply_succeeded`.
+        # - single_user: write directly to the XDG users.yaml path
+        #   (`${XDG_CONFIG_HOME:-$HOME/.config}/kai/users.yaml`). No
+        #   staging handoff is needed because the operator owns the
+        #   destination and there is no privilege boundary to cross
+        #   on apply. The staging key stays unset so apply (if it ever
+        #   runs by mistake) does not try to copy this file anywhere.
         users_yaml_content = _generate_users_yaml(
             admin_telegram_id,
             admin_name,
             os_user=admin_os_user,
             home_workspace=admin_home_workspace,
         )
-        users_yaml_path.write_text(users_yaml_content)
-        os.chmod(users_yaml_path, 0o600)
-        users_yaml_staging_path = str(users_yaml_path)
+        if deployment_mode == "protected":
+            users_yaml_path = _install_staging_path("users.yaml")
+            users_yaml_path.write_text(users_yaml_content)
+            os.chmod(users_yaml_path, 0o600)
+            users_yaml_staging_path = str(users_yaml_path)
+        else:
+            users_yaml_path = _xdg_users_yaml_path()
+            users_yaml_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            users_yaml_path.write_text(users_yaml_content)
+            os.chmod(users_yaml_path, 0o600)
         print(f"  Generated {users_yaml_path}")
     print()
 
@@ -1630,6 +1704,7 @@ def _cmd_config() -> None:
     # Build and write install.conf
     conf = {
         "version": _CONF_VERSION,
+        "deployment_mode": deployment_mode,
         "install_dir": install_dir,
         "data_dir": data_dir,
         "service_user": service_user,
@@ -1645,6 +1720,10 @@ def _cmd_config() -> None:
     # `/etc/kai/env` and pollute runtime daemon configuration. The
     # presence of this key is also the only signal apply uses: a stale
     # staging file without a matching key in install.conf is ignored.
+    # Single-user mode never sets this key because the wizard writes
+    # directly to the XDG users.yaml destination; the apply guard
+    # below double-checks by requiring deployment_mode == "protected"
+    # before honoring any recorded staging path.
     if users_yaml_staging_path:
         conf["users_yaml_staging_path"] = users_yaml_staging_path
 
@@ -1652,7 +1731,24 @@ def _cmd_config() -> None:
     # Restrict permissions since the file contains secrets (bot token, webhook secret)
     os.chmod(INSTALL_CONF, 0o600)
     print(f"Configuration written to {INSTALL_CONF}")
-    print("Review the file, then run: sudo python -m kai install apply")
+    if deployment_mode == "protected":
+        print("Review the file, then run: sudo python -m kai install apply")
+    else:
+        # In single-user mode, also write the local .env so the
+        # daemon can find runtime env config via `load_dotenv`
+        # (protected mode reads `/etc/kai/env` via `_read_protected_file`
+        # which is not available without root). `_generate_env_file`
+        # produces the same KEY=VALUE shape `/etc/kai/env` would carry;
+        # we restrict the mode to 0600 because the file holds the same
+        # secrets (bot token, webhook secret).
+        env_path = PROJECT_ROOT / ".env"
+        env_path.write_text(_generate_env_file(env))
+        os.chmod(env_path, 0o600)
+        print(f"Wrote runtime env to {env_path}")
+        print(f"users.yaml is at {users_yaml_path}")
+        print()
+        print("Single-user mode does not require 'sudo make install'.")
+        print("Start the daemon with: make run")
 
 
 # ── Apply subcommand ─────────────────────────────────────────────────
@@ -3248,6 +3344,26 @@ def _cmd_apply() -> None:
     except (json.JSONDecodeError, OSError) as e:
         raise SystemExit(f"Could not read {INSTALL_CONF}: {e}") from e
 
+    # Deployment mode gate. Apply is meaningful only for protected
+    # installs: it copies the staged users.yaml into /etc/kai/, writes
+    # /etc/kai/env, installs the systemd / launchd service, and
+    # configures sudoers. None of that applies to a single-user
+    # install, where `make config` already wrote everything the
+    # daemon reads (PROJECT_ROOT/.env, XDG users.yaml) and `make run`
+    # starts the daemon from the repo.
+    #
+    # Default missing `deployment_mode` to `protected` so a legacy
+    # install.conf written before this key existed continues to apply
+    # cleanly. Single-user installs always carry the key because the
+    # wizard writes it.
+    deployment_mode = conf.get("deployment_mode", "protected")
+    if deployment_mode == "single_user":
+        raise SystemExit(
+            "single_user mode is already applied by 'make config'; "
+            "run 'make run' (or 'python -m kai') from the repo. "
+            "'make install' is a no-op in this mode."
+        )
+
     # Validate required fields
     install_dir = conf.get("install_dir")
     data_dir = conf.get("data_dir")
@@ -3261,6 +3377,13 @@ def _cmd_apply() -> None:
     # the copy). `_apply_secrets` defends against a missing file
     # behind a non-empty path so a wrong value silently skips
     # rather than failing the apply.
+    #
+    # The staging path is consumed only in protected mode (the gate
+    # above already refused single-user). A stale top-level key
+    # carried forward across a mode switch would point at a path
+    # under the operator's home that this apply has no business
+    # touching; the protected-mode gate ensures we never reach here
+    # with that combination.
     users_yaml_staging_path = conf.get("users_yaml_staging_path", "") or None
 
     if not all([install_dir, data_dir, service_user, platform]):

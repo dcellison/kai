@@ -1071,6 +1071,84 @@ def _read_protected_yaml(filename: str) -> dict | object | None:
         return _YAML_MALFORMED
 
 
+def _xdg_config_home() -> Path:
+    """Return `$XDG_CONFIG_HOME` (if set) or `$HOME/.config` otherwise.
+
+    Used by single-user installs that run without root to locate
+    `kai/users.yaml` under the operator's config tree. The XDG variable
+    is honored when set so operators who have configured an alternate
+    config home for other tools see the same convention apply here.
+    """
+    explicit = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    return Path.home() / ".config"
+
+
+def _resolve_users_yaml_path(protected_env_was_loaded: bool) -> Path:
+    """Resolve the canonical users.yaml path for this deployment.
+
+    Resolution order, first match wins:
+      1. `KAI_USERS_YAML` env var. Test / explicit-development override
+         only; the README does not document this as a normal operator
+         path. Lets tests pin a tmp path without faking
+         protected-env-loaded state.
+      2. `/etc/kai/users.yaml` when `protected_env_was_loaded` is True.
+         The signal is "_read_protected_file('/etc/kai/env') returned
+         non-empty content during this load_config call." Ambient env
+         vars like `KAI_INSTALL_DIR` and `KAI_DATA_DIR` deliberately
+         do NOT participate: they are path overrides for data and
+         install layout but do not imply protected deployment mode.
+      3. `${XDG_CONFIG_HOME:-$HOME/.config}/kai/users.yaml` otherwise.
+         The single-user repo install lives entirely under the
+         operator's home; no `/etc/kai/` writes, no sudo at startup.
+
+    Returning a Path (not a string) lets callers stat the file
+    directly when reading without round-tripping through the
+    protected-file sudo shim.
+    """
+    override = os.environ.get("KAI_USERS_YAML", "").strip()
+    if override:
+        return Path(override).expanduser()
+    if protected_env_was_loaded:
+        return Path("/etc/kai/users.yaml")
+    return _xdg_config_home() / "kai" / "users.yaml"
+
+
+def _read_users_yaml(path: Path) -> dict | object | None:
+    """Read users.yaml at `path` with read mechanism keyed to location.
+
+    `/etc/kai/users.yaml` is root-owned mode 0600 and goes through the
+    `_read_protected_yaml` sudo-cat shim. Any other path (XDG
+    single-user, `KAI_USERS_YAML` test override) is read directly with
+    `Path.read_text` because the operator owns it and no privilege
+    escalation is needed or appropriate.
+
+    Returns the same tri-state as `_read_protected_yaml`: parsed dict
+    on success, None when the file does not exist or cannot be read,
+    `_YAML_MALFORMED` when the file exists but parses to an invalid
+    shape.
+    """
+    if path == Path("/etc/kai/users.yaml"):
+        return _read_protected_yaml("users.yaml")
+    if not path.is_file():
+        return None
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as e:
+        log.warning("Cannot read %s: %s", path, e)
+        return None
+    try:
+        result = yaml.safe_load(content)
+    except yaml.YAMLError as e:
+        log.error("Invalid YAML in %s: %s", path, e)
+        return _YAML_MALFORMED
+    if isinstance(result, dict):
+        return result
+    log.warning("%s: expected a YAML dict, got %s", path, type(result).__name__)
+    return _YAML_MALFORMED
+
+
 def _strip_quotes(value: str) -> str:
     """
     Remove matched surrounding quotes from a value string.
@@ -1547,18 +1625,21 @@ def _compute_extraction_eligible_backends(
 def _load_user_configs(
     global_backend: str,
     global_llm_provider: str,
+    users_yaml_path: Path | None = None,
 ) -> dict[int, UserConfig]:
     """
-    Load per-user configs from /etc/kai/users.yaml.
+    Load per-user configs from users.yaml at the given path.
 
-    Reads the protected file via `_read_protected_yaml` (sudo-cat for
-    root-owned mode 0600 copies). users.yaml is mandatory: any failure
-    raises SystemExit with a message naming the resolved path. There
-    is no None return path and no fallback to ALLOWED_USER_IDS at
-    runtime. The fail-closed shape is load-bearing for the daemon's
-    auth contract: a malformed or unreadable users file must not
-    silently degrade to env-only auth, because the wizard and the
-    runtime would then disagree about whose value wins.
+    Reads via `_read_users_yaml`, which routes `/etc/kai/users.yaml`
+    through the sudo-cat shim and any other path (XDG single-user,
+    `KAI_USERS_YAML` override) through a direct `Path.read_text`.
+    users.yaml is mandatory: any failure raises SystemExit with a
+    message naming the resolved path. There is no None return path
+    and no fallback to ALLOWED_USER_IDS at runtime. The fail-closed
+    shape is load-bearing for the daemon's auth contract: a
+    malformed or unreadable users file must not silently degrade to
+    env-only auth, because the wizard and the runtime would then
+    disagree about whose value wins.
 
     Failure cases (each raises SystemExit):
         - File absent: error names the path and points at `make config`.
@@ -1580,11 +1661,17 @@ def _load_user_configs(
         global_llm_provider: The global llm_provider from env config.
             Both are needed to cascade per-user model validation:
             a user's effective provider determines which models are valid.
+        users_yaml_path: Resolved users.yaml path for this deployment.
+            Defaults to `/etc/kai/users.yaml` to preserve protected-install
+            ergonomics for tests that do not exercise XDG resolution.
+            Production callers in `load_config` pass the result of
+            `_resolve_users_yaml_path(protected_env_was_loaded)`.
 
     Returns a dict keyed by telegram_id for O(1) lookup.
     """
-    users_yaml_path = "/etc/kai/users.yaml"
-    data = _read_protected_yaml("users.yaml")
+    if users_yaml_path is None:
+        users_yaml_path = Path("/etc/kai/users.yaml")
+    data = _read_users_yaml(users_yaml_path)
     if data is _YAML_MALFORMED:
         raise SystemExit(
             f"{users_yaml_path} is malformed or has an invalid top-level YAML shape. "
@@ -2435,7 +2522,15 @@ def load_config() -> Config:
     # fallback is gone: a malformed users file used to silently
     # degrade to ALLOWED_USER_IDS, which the wizard and the loader
     # then disagreed about; fail-closed is the contract now.
-    user_configs = _load_user_configs(agent_backend, llm_provider)
+    #
+    # The path resolves based on whether `/etc/kai/env` had readable
+    # content at the top of this load_config call (protected install)
+    # or not (single-user install reads from PROJECT_ROOT/.env and
+    # places users.yaml under XDG config home). KAI_USERS_YAML is an
+    # explicit override for tests and ad-hoc development; the operator
+    # path is always one of the two resolved defaults.
+    users_yaml_path = _resolve_users_yaml_path(bool(protected_env))
+    user_configs = _load_user_configs(agent_backend, llm_provider, users_yaml_path)
     allowed_ids = set(user_configs.keys())
     if os.environ.get("ALLOWED_USER_IDS", "").strip():
         log.warning(

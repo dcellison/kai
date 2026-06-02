@@ -1139,6 +1139,7 @@ class TestCmdConfig:
         # Simulate user inputs for each prompt (in order)
         inputs = iter(
             [
+                "protected",  # deployment mode
                 "/opt/kai",  # install dir
                 "/var/lib/kai",  # data dir
                 "kai",  # service user
@@ -1213,6 +1214,7 @@ class TestCmdConfig:
 
         inputs = iter(
             [
+                "protected",  # deployment mode
                 "/opt/kai",  # install dir
                 "/var/lib/kai",  # data dir
                 "kai",  # service user
@@ -1296,6 +1298,7 @@ class TestCmdConfig:
 
         inputs_basic = iter(
             [
+                "protected",  # deployment mode
                 "/opt/kai",  # install dir
                 "/var/lib/kai",  # data dir
                 "kai",  # service user
@@ -1363,6 +1366,7 @@ class TestCmdConfig:
 
         inputs_advanced = iter(
             [
+                "protected",
                 "/opt/kai",
                 "/var/lib/kai",
                 "kai",
@@ -1422,6 +1426,7 @@ class TestCmdConfig:
 
         inputs = iter(
             [
+                "protected",  # deployment mode
                 "/opt/kai",  # install dir
                 "/var/lib/kai",  # data dir
                 "kai",  # service user
@@ -1478,6 +1483,7 @@ class TestCmdConfig:
         # No API key input after "ollama" - the prompt is skipped.
         inputs = iter(
             [
+                "protected",  # deployment mode
                 "/opt/kai",  # install dir
                 "/var/lib/kai",  # data dir
                 "kai",  # service user
@@ -1662,6 +1668,7 @@ class TestCmdConfig:
             pr_review_budget_entry = ["1.0"]  # PR_REVIEW_BUDGET_USD
 
         return [
+            "protected",  # deployment mode
             "/opt/kai",  # install dir
             "/var/lib/kai",  # data dir
             "kai",  # service user
@@ -2111,6 +2118,7 @@ class TestCmdConfig:
 
         inputs = iter(
             [
+                "protected",  # deployment mode
                 "/opt/kai",  # install dir
                 "/var/lib/kai",  # data dir
                 "kai",  # service user
@@ -2384,6 +2392,12 @@ class TestCmdConfig:
             # inline content so the loader's auth contract is met.
             if path == "/etc/kai/users.yaml":
                 return users_yaml_text
+            if path == "/etc/kai/env":
+                # Non-empty content satisfies the protected-mode
+                # predicate so the resolver picks /etc/kai/users.yaml
+                # instead of XDG. The comment line is skipped by
+                # the parser.
+                return "# test sentinel: protected install\n"
             return None
 
         monkeypatch.setattr("kai.config._read_protected_file", _fake_read)
@@ -2458,6 +2472,7 @@ class TestCmdConfig:
 
         inputs = iter(
             [
+                "protected",  # deployment mode
                 "/opt/kai",  # install dir
                 "/var/lib/kai",  # data dir
                 "kai",  # service user
@@ -2531,6 +2546,11 @@ class TestCmdConfig:
         def _fake_read(path):
             if path == "/etc/kai/users.yaml":
                 return staged_users_yaml_text
+            if path == "/etc/kai/env":
+                # Mark the load as protected-mode so the resolver
+                # routes at /etc/kai/users.yaml. The comment line is
+                # skipped by the env-file parser.
+                return "# test sentinel: protected install\n"
             return None
 
         monkeypatch.setattr("kai.config._read_protected_file", _fake_read)
@@ -2825,6 +2845,7 @@ class TestCmdConfigDefaultModelDispatch:
         skipped silently.
         """
         return [
+            "protected",  # deployment mode
             "/opt/kai",  # install dir
             "/var/lib/kai",  # data dir
             "kai",  # service user
@@ -2859,6 +2880,7 @@ class TestCmdConfigDefaultModelDispatch:
         The codex auth-mode prompt is the new line vs the goose chain.
         """
         return [
+            "protected",  # deployment mode
             "/opt/kai",  # install dir
             "/var/lib/kai",  # data dir
             "kai",  # service user
@@ -2891,6 +2913,7 @@ class TestCmdConfigDefaultModelDispatch:
     def _inputs_for_goose_openai() -> list[str]:
         """Input chain for the users_yaml_exists=True + goose+openai path."""
         return [
+            "protected",  # deployment mode
             "/opt/kai",  # install dir
             "/var/lib/kai",  # data dir
             "kai",  # service user
@@ -6325,6 +6348,7 @@ class TestCmdConfigCanonicalUsersYaml:
         external services).
         """
         return [
+            "protected",
             "/opt/kai",
             "/var/lib/kai",
             "kai",
@@ -6597,6 +6621,266 @@ class TestCmdApplyStagingHandoff:
 
         assert captured["users_yaml_staging_path"] == str(staging)
         assert not staging.exists()
+
+
+# ── Runtime users.yaml path resolution ────────────────────────────────
+
+
+class TestResolveUsersYamlPath:
+    """Pins the runtime predicate for choosing /etc/kai/users.yaml vs
+    the XDG single-user path. The spec carves three rules:
+
+      1. KAI_USERS_YAML wins outright when set (test / development override).
+      2. Otherwise, protected_env_was_loaded -> /etc/kai/users.yaml.
+      3. Otherwise -> ${XDG_CONFIG_HOME:-$HOME/.config}/kai/users.yaml.
+
+    `KAI_INSTALL_DIR` and `KAI_DATA_DIR` deliberately do NOT participate
+    in the predicate; they are pure path overrides for data and install
+    layout and must not make runtime select the protected path.
+    """
+
+    def test_protected_env_loaded_routes_protected(self, monkeypatch):
+        from kai.config import _resolve_users_yaml_path
+
+        monkeypatch.delenv("KAI_USERS_YAML", raising=False)
+        assert _resolve_users_yaml_path(True) == Path("/etc/kai/users.yaml")
+
+    def test_no_protected_env_routes_xdg(self, monkeypatch, tmp_path):
+        from kai.config import _resolve_users_yaml_path
+
+        monkeypatch.delenv("KAI_USERS_YAML", raising=False)
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert _resolve_users_yaml_path(False) == tmp_path / ".config" / "kai" / "users.yaml"
+
+    def test_xdg_config_home_overrides_home(self, monkeypatch, tmp_path):
+        from kai.config import _resolve_users_yaml_path
+
+        monkeypatch.delenv("KAI_USERS_YAML", raising=False)
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        monkeypatch.setenv("HOME", str(tmp_path / "should-not-be-used"))
+        assert _resolve_users_yaml_path(False) == tmp_path / "xdg" / "kai" / "users.yaml"
+
+    def test_explicit_override_wins_in_both_modes(self, monkeypatch, tmp_path):
+        from kai.config import _resolve_users_yaml_path
+
+        override = tmp_path / "explicit-users.yaml"
+        monkeypatch.setenv("KAI_USERS_YAML", str(override))
+        assert _resolve_users_yaml_path(True) == override
+        assert _resolve_users_yaml_path(False) == override
+
+    def test_kai_install_dir_does_not_route_protected(self, monkeypatch, tmp_path):
+        """Pins the spec's blast-radius rule: a single-user host with
+        `KAI_INSTALL_DIR` set for unrelated reasons (custom install
+        layout) must not be misclassified as a protected install.
+        """
+        from kai.config import _resolve_users_yaml_path
+
+        monkeypatch.delenv("KAI_USERS_YAML", raising=False)
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("KAI_INSTALL_DIR", "/opt/kai")
+        monkeypatch.setenv("KAI_DATA_DIR", "/var/lib/kai")
+        # protected_env_was_loaded is False (no /etc/kai/env content);
+        # the env vars above must NOT override that decision.
+        assert _resolve_users_yaml_path(False) == tmp_path / ".config" / "kai" / "users.yaml"
+
+
+# ── Single-user wizard branch ─────────────────────────────────────────
+
+
+class TestCmdConfigSingleUserMode:
+    """The wizard writes XDG users.yaml + local .env directly when the
+    operator selects `single_user`; no staging handoff, no apply step,
+    no /etc/kai/ writes.
+    """
+
+    @staticmethod
+    def _single_user_inputs() -> list[str]:
+        """Minimal single-user input chain: claude backend, no advanced
+        options, no memory, no external services.
+        """
+        return [
+            "single_user",  # deployment mode
+            # install_dir / data_dir / service_user / platform are skipped
+            "fake-token",  # bot token
+            "12345",  # admin telegram id
+            "admin",  # admin display name
+            "false",  # advanced
+            "polling",  # transport
+            "claude",  # backend
+            "sonnet",  # model
+            "120",  # timeout
+            "200000",  # max_context_window
+            "80",  # autocompact
+            "",  # effort level
+            "8080",  # webhook port
+            "test-secret",  # webhook secret
+            "~/Projects",  # workspace_base
+            "",  # allowed_workspaces
+            "false",  # pr_review_enabled
+            "300",  # pr_review_cooldown
+            "900",  # pr_review_timeout_s
+            "false",  # issue_triage
+            "",  # github_notify_chat_id
+            "false",  # voice
+            "false",  # tts
+            "",  # claude_user
+            "false",  # memory enabled
+            "",  # perplexity
+        ]
+
+    @staticmethod
+    def _redirect_xdg(monkeypatch, tmp_path):
+        """Pin XDG_CONFIG_HOME at tmp_path so the wizard writes the
+        XDG users.yaml under the test root rather than the operator's
+        real `~/.config/kai/`.
+        """
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+
+    def test_writes_xdg_users_yaml_and_local_env(self, tmp_path, monkeypatch):
+        """Single-user fresh install: users.yaml lands under XDG,
+        runtime env lands at PROJECT_ROOT/.env, install.conf records
+        deployment_mode=single_user with no staging key.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        TestCmdConfig._block_etc_kai(monkeypatch)
+        self._redirect_xdg(monkeypatch, tmp_path)
+
+        inputs = iter(self._single_user_inputs())
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        _cmd_config()
+
+        users_yaml = tmp_path / "xdg" / "kai" / "users.yaml"
+        assert users_yaml.exists()
+        assert stat.S_IMODE(users_yaml.stat().st_mode) == 0o600
+        parsed = yaml.safe_load(users_yaml.read_text())
+        assert parsed["users"][0]["telegram_id"] == 12345
+
+        env_file = tmp_path / ".env"
+        assert env_file.exists()
+        assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+        env_text = env_file.read_text()
+        assert "TELEGRAM_BOT_TOKEN" in env_text
+        assert "fake-token" in env_text
+
+        conf = json.loads((tmp_path / "install.conf").read_text())
+        assert conf["deployment_mode"] == "single_user"
+        # No staging handoff in single-user mode; apply is refused
+        # outright so a stale key would point at a path apply has no
+        # business consuming.
+        assert "users_yaml_staging_path" not in conf
+
+    def test_writes_users_yaml_parent_mode_0700(self, tmp_path, monkeypatch):
+        """Operator-private parent directory: the XDG kai/ subdir is
+        created mode 0700 so a freshly minted users.yaml inherits a
+        restrictive enclosing scope even before its own 0600 chmod.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        TestCmdConfig._block_etc_kai(monkeypatch)
+        self._redirect_xdg(monkeypatch, tmp_path)
+
+        inputs = iter(self._single_user_inputs())
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        _cmd_config()
+
+        parent = tmp_path / "xdg" / "kai"
+        assert parent.is_dir()
+        assert stat.S_IMODE(parent.stat().st_mode) == 0o700
+
+
+# ── _cmd_apply: single-user refusal ───────────────────────────────────
+
+
+class TestCmdApplySingleUserRefuses:
+    """`make install` (the apply subcommand) is meaningful only for
+    protected mode. Single-user installs are fully configured by
+    `make config`; running apply against a single-user install would
+    silently leave the operator confused about what changed. The
+    wizard's success message points at `make run`; the apply gate
+    enforces the same contract from the install command side.
+    """
+
+    @staticmethod
+    def _write_single_user_conf(tmp_path: Path) -> Path:
+        conf = {
+            "version": 1,
+            "deployment_mode": "single_user",
+            "install_dir": str(tmp_path),
+            "data_dir": str(tmp_path),
+            "service_user": "kai",
+            "platform": "darwin",
+            "env": {"TELEGRAM_BOT_TOKEN": "tok"},
+        }
+        path = tmp_path / "install.conf"
+        path.write_text(json.dumps(conf, indent=2) + "\n")
+        os.chmod(path, 0o600)
+        return path
+
+    def test_apply_refuses_single_user_with_no_op_message(self, tmp_path, monkeypatch):
+        """Apply on a single-user install exits with a clear message
+        pointing the operator at `make run` instead.
+        """
+        conf_path = self._write_single_user_conf(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        with pytest.raises(SystemExit, match="single_user mode is already applied"):
+            _cmd_apply()
+
+    def test_apply_protected_default_when_mode_missing(self, tmp_path, monkeypatch):
+        """Legacy install.conf written before the deployment_mode key
+        existed defaults to protected so the existing apply flow keeps
+        running. Pins the migration shape: nothing forces operators to
+        re-run `make config` purely to gain the key.
+        """
+        conf = {
+            "version": 1,
+            "install_dir": str(tmp_path / "opt-kai"),
+            "data_dir": str(tmp_path / "var-lib-kai"),
+            "service_user": "kai",
+            "platform": "darwin",
+            "env": {
+                "TELEGRAM_BOT_TOKEN": "tok",
+                "WEBHOOK_SECRET": "secret",
+                "DEFAULT_MODEL": "sonnet",
+                "AGENT_BACKEND": "claude",
+            },
+        }
+        conf_path = tmp_path / "install.conf"
+        conf_path.write_text(json.dumps(conf, indent=2) + "\n")
+        os.chmod(conf_path, 0o600)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+
+        # The legacy-shape apply runs through all the real apply steps,
+        # which is more than this regression cares about. Stub them
+        # out and verify only that the single-user refusal does NOT
+        # fire when deployment_mode is missing from the conf.
+
+        class _FakePwd:
+            pw_uid = 4242
+            pw_gid = 4242
+
+        monkeypatch.setattr("pwd.getpwnam", lambda name: _FakePwd)
+        monkeypatch.setattr("kai.install._stop_service", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_directories", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_source", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_venv", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_models", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_secrets", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_sudoers", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_migrate", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._apply_service", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._start_service", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.install._check_traversal", lambda *a, **kw: None)
+        monkeypatch.delenv("DRY_RUN", raising=False)
+
+        # No SystemExit expected; the legacy-shape apply completes.
+        _cmd_apply()
 
 
 # ── _apply_sudoers dry run ───────────────────────────────────────────

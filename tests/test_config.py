@@ -140,15 +140,29 @@ def _set_required(monkeypatch, token="fake-token", user_ids="123"):
 
 
 def _patch_protected_users_yaml(monkeypatch, content: str) -> None:
-    """Feed `content` to `_load_user_configs` as if `/etc/kai/users.yaml`
-    held it. The loader reads via `_read_protected_file`; this helper
-    dispatches only the users.yaml path and returns None for every
-    other protected file (the default load_config shape on dev hosts).
+    """Simulate a protected install with the given users.yaml content.
+
+    Patches `_read_protected_file` so:
+      - `/etc/kai/env` returns a sentinel string, which makes
+        `_resolve_users_yaml_path(protected_env_was_loaded=True)` route
+        the loader at `/etc/kai/users.yaml` instead of XDG.
+      - `/etc/kai/users.yaml` returns `content`, which the protected-
+        path branch of `_read_users_yaml` consumes via the existing
+        `_read_protected_yaml` sudo-cat shim.
+
+    Any other protected-file lookup returns None (the default shape
+    on dev hosts). Tests that specifically need the XDG / single-user
+    path should use `_patch_xdg_users_yaml` (or set `KAI_USERS_YAML`).
     """
 
     def _fake_read(path):
         if path == "/etc/kai/users.yaml":
             return content
+        if path == "/etc/kai/env":
+            # Non-empty content satisfies the protected-mode predicate
+            # without contributing any env vars (the comment line is
+            # skipped by the parser).
+            return "# test sentinel: protected install\n"
         return None
 
     monkeypatch.setattr("kai.config._read_protected_file", _fake_read)
@@ -668,15 +682,25 @@ class TestDualModeLoading:
         config = load_config()
         assert config.telegram_bot_token == "tok"
 
-    def test_falls_back_to_dotenv(self, monkeypatch):
-        """When /etc/kai/env is not readable, load_dotenv is called."""
+    def test_falls_back_to_dotenv(self, monkeypatch, tmp_path):
+        """When /etc/kai/env is not readable, load_dotenv is called.
+
+        Single-user mode (no protected env): the resolver picks the
+        XDG users.yaml path. We pin that path via `KAI_USERS_YAML` so
+        the loader's mandatory-users contract is satisfied from a
+        tmp file the test owns.
+        """
         load_dotenv_called = []
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake-token")
+        monkeypatch.setenv("ALLOWED_USER_IDS", "123")
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 123\n    name: test\n    role: admin\n")
+        monkeypatch.setenv("KAI_USERS_YAML", str(users_yaml))
         monkeypatch.setattr("kai.config._read_protected_file", lambda path: None)
         monkeypatch.setattr(
             "kai.config.load_dotenv",
             lambda *a, **kw: load_dotenv_called.append(True),
         )
-        _set_required(monkeypatch)
         load_config()
         assert load_dotenv_called, "load_dotenv should have been called"
 
