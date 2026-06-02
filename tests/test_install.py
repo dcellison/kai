@@ -2824,6 +2824,7 @@ class TestCmdConfigDefaultModelDispatch:
             "8080",  # webhook port
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base (global default)
+            "",  # allowed workspaces (global default, empty)
             "300",  # pr review cooldown (global resource control)
             "900",  # pr review subprocess timeout
             "false",  # voice
@@ -2863,6 +2864,7 @@ class TestCmdConfigDefaultModelDispatch:
             "8080",  # webhook port
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base (global default)
+            "",  # allowed workspaces (global default, empty)
             "300",  # pr review cooldown (global resource control)
             "900",  # pr review subprocess timeout
             "1.0",  # pr review subprocess budget (non-claude only)
@@ -2894,6 +2896,7 @@ class TestCmdConfigDefaultModelDispatch:
             "8080",  # webhook port
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base (global default)
+            "",  # allowed workspaces (global default, empty)
             "300",  # pr review cooldown (global resource control)
             "900",  # pr review subprocess timeout
             "1.0",  # pr review subprocess budget (non-claude only)
@@ -6273,6 +6276,44 @@ class TestCmdConfigGlobalDefaultsRegardlessOfUsersYaml:
 
         env = json.loads((tmp_path / "install.conf").read_text())["env"]
         assert env["PR_REVIEW_COOLDOWN"] == "450"
+
+    def test_allowed_workspaces_lands_with_users_yaml(self, tmp_path, monkeypatch):
+        """ALLOWED_WORKSPACES reaches env when users.yaml is present.
+
+        Pre-fix: the prompt was gated on `not users_yaml_exists`, so a
+        re-run on an existing install silently carried forward the
+        previous env value (or stayed empty), with no operator-facing
+        path to add or change a machine-wide allowed workspace.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._existing_etc_users(monkeypatch)
+
+        # Real, existing paths under tmp_path because the env emission
+        # block only writes ALLOWED_WORKSPACES when non-empty, and
+        # downstream loaders skip non-existent entries on apply.
+        ws_a = tmp_path / "ws_a"
+        ws_a.mkdir()
+        ws_b = tmp_path / "ws_b"
+        ws_b.mkdir()
+
+        base = list(TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend())
+        # ALLOWED_WORKSPACES is the slot immediately after WORKSPACE_BASE
+        # (~/Projects). Locate it by neighbor anchor rather than `.index("")`
+        # because other slots (effort level, perplexity key) are also empty.
+        allowed_idx = base.index("~/Projects") + 1
+        base[allowed_idx] = f"{ws_a},{ws_b}"
+        inputs = iter(base)
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        monkeypatch.setattr(
+            "kai.install._prompt_default_model",
+            lambda backend, prov, default: "sonnet",
+        )
+        _cmd_config()
+
+        env = json.loads((tmp_path / "install.conf").read_text())["env"]
+        assert env["ALLOWED_WORKSPACES"] == f"{ws_a},{ws_b}"
 
     def test_budget_ceiling_lands_with_users_yaml_on_non_claude(self, tmp_path, monkeypatch):
         """BUDGET_CEILING reaches env on non-claude backends when

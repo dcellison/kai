@@ -1052,14 +1052,11 @@ def _cmd_config() -> None:
     print()
 
     # -- Workspaces --
-    # WORKSPACE_BASE is an inheritable installation default: users.yaml
-    # entries that omit `workspace_base` fall back to it. The prompt
-    # fires on every wizard run. ALLOWED_WORKSPACES remains a legacy
-    # per-user-mirror env var and stays gated on users.yaml absence;
-    # users.yaml carries per-user `allowed_workspaces` lists and the
-    # global env emission is preserved for installs that have not
-    # migrated yet (tranche D removes the gate when the env var goes
-    # away entirely).
+    # WORKSPACE_BASE and ALLOWED_WORKSPACES are inheritable installation
+    # defaults. users.yaml entries can override `workspace_base` per user
+    # and add per-user allowed_workspaces, but the global env values
+    # apply across every user without an override. Both prompts fire on
+    # every wizard run.
     print("-- Workspaces --")
     workspace_base = _prompt(
         "Workspace base directory",
@@ -1070,13 +1067,10 @@ def _cmd_config() -> None:
         expanded = os.path.expanduser(workspace_base)
         print(f"  (expands to {expanded})")
 
-    if users_yaml_exists:
-        allowed_workspaces = existing_env.get("ALLOWED_WORKSPACES", "")
-    else:
-        allowed_workspaces = _prompt(
-            "Allowed workspaces (comma-separated paths, optional)",
-            existing_env.get("ALLOWED_WORKSPACES", ""),
-        )
+    allowed_workspaces = _prompt(
+        "Allowed workspaces (comma-separated paths, optional)",
+        existing_env.get("ALLOWED_WORKSPACES", ""),
+    )
     print()
 
     # -- PR review agent --
