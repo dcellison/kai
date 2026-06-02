@@ -1593,12 +1593,18 @@ def _load_user_configs(
     if data is None:
         msg = (
             f"users.yaml is required for authorization and was not found at {users_yaml_path}. "
-            "Run 'make config' to generate it."
+            "Run 'make config' to generate it; the wizard prompts for the admin Telegram ID."
         )
         if os.environ.get("ALLOWED_USER_IDS"):
+            # Surface the breaking change explicitly so a legacy
+            # env-only operator understands why the daemon stopped
+            # starting. The hint does NOT claim the wizard auto-seeds
+            # the new users.yaml from the env var; that auto-seed
+            # behavior is not implemented here and the wizard will
+            # prompt for the Telegram ID manually.
             msg += (
                 " ALLOWED_USER_IDS is set in env but is no longer honored as an "
-                "auth fallback; 'make config' will migrate it into users.yaml."
+                "auth fallback; copy each ID into the wizard prompt when it asks."
             )
         raise SystemExit(msg)
 
