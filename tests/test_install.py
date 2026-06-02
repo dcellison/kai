@@ -347,12 +347,12 @@ class TestGenerateSudoers:
         result = _generate_sudoers("kai")
         assert "NOPASSWD" in result
 
-    def test_no_claude_user_rule_by_default(self):
-        """No claude binary rule when claude_user is None."""
+    def test_no_per_user_rule_without_os_users(self):
+        """No claude binary rule when os_users is empty."""
         result = _generate_sudoers("kai")
         assert "claude" not in result
 
-    def test_claude_user_rule_anchored_to_service_user_home(self, monkeypatch):
+    def test_os_user_rule_anchored_to_service_user_home(self, monkeypatch):
         """
         The rule's claude binary path is anchored to the SERVICE user's
         home (~/.local/bin/claude under the service user, NOT the target
@@ -362,7 +362,7 @@ class TestGenerateSudoers:
         actually try to execute.
         """
         monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
-        result = _generate_sudoers("kai", claude_user="alice")
+        result = _generate_sudoers("kai", os_users=["alice"])
         assert "kai ALL=(alice) SETENV: NOPASSWD: /home/kai/.local/bin/claude" in result
 
     def test_claude_bin_ignores_caller_path(self, monkeypatch):
@@ -386,7 +386,7 @@ class TestGenerateSudoers:
             "which",
             lambda n: "/some/other/users/local/bin/claude" if n == "claude" else real_which(n),
         )
-        result = _generate_sudoers("kai", claude_user="alice")
+        result = _generate_sudoers("kai", os_users=["alice"])
         assert "/home/kai/.local/bin/claude" in result
         assert "/some/other/users/local/bin/claude" not in result
 
@@ -440,19 +440,6 @@ class TestGenerateSudoers:
         bin_path = "/home/kai/.local/bin/claude"
         assert f"kai ALL=(sellison) SETENV: NOPASSWD: {bin_path}" in result
         assert result.count(f"SETENV: NOPASSWD: {bin_path}") == 1
-
-    def test_legacy_claude_user_combined_with_os_users(self, monkeypatch):
-        """Legacy CLAUDE_USER and yaml os_users coexist; deduped."""
-        monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
-        # claude_user and os_users overlap on "alice"; should produce
-        # one ruleset (claude + codex + kill rules) for each distinct
-        # target. Counting on the full claude-rule prefix verifies
-        # dedup at the target level without the codex-rule or
-        # kill-rule occurrences inflating the count.
-        result = _generate_sudoers("kai", claude_user="alice", os_users=["alice", "bob"])
-        claude_bin = "/home/kai/.local/bin/claude"
-        assert result.count(f"kai ALL=(alice) SETENV: NOPASSWD: {claude_bin}") == 1
-        assert result.count(f"kai ALL=(bob) SETENV: NOPASSWD: {claude_bin}") == 1
 
     # -- Codex per-target rule (per-user OAuth isolation) ----------------
 
@@ -868,11 +855,6 @@ class TestGenerateSudoersValidation:
         """Bad os_users values must raise even if they bypass the loader."""
         with pytest.raises(ValueError, match="Invalid sudoers target user"):
             _generate_sudoers("kai", os_users=["alice) NOPASSWD: ALL"])
-
-    def test_invalid_claude_user_raises(self):
-        """Legacy CLAUDE_USER env var path must also be validated."""
-        with pytest.raises(ValueError, match="Invalid sudoers target user"):
-            _generate_sudoers("kai", claude_user="alice\nroot ALL")
 
 
 class TestGenerateLaunchdPlist:
@@ -1606,8 +1588,8 @@ class TestCmdConfig:
           - Inserts an llm_provider prompt answer (and the API key for
             non-ollama providers) immediately after the agent_backend
             slot, matching the wizard's flow for non-claude backends.
-          - Omits the autocompact, effort, and claude_user entries that
-            the wizard now skips for non-claude backends per issue #380.
+          - Omits the autocompact and effort entries that the wizard
+            now skips for non-claude backends per issue #380.
         Defaults (anthropic + sk-ant-test-key) are sufficient for the
         gating tests. For ollama, the API key prompt is skipped by the
         wizard, so the llm_api_key default is harmless and unused (no
@@ -1645,14 +1627,6 @@ class TestCmdConfig:
                 effort,  # claude effort level ("" = default "high")
             ]
 
-        # Legacy CLAUDE_USER prompt in install.py is gated on
-        # agent_backend == "claude" by issue #380. The
-        # fixture entry is conditional so the input iterator does not
-        # carry a surplus value when the prompt is skipped.
-        claude_user_entry: list[str] = []
-        if agent_backend == "claude":
-            claude_user_entry = [""]
-
         # BUDGET_CEILING and PR_REVIEW_BUDGET_USD prompts are skipped
         # on the claude backend (issue #390): --max-budget-usd is no
         # longer emitted to claude --print argv, so prompting for a
@@ -1689,15 +1663,11 @@ class TestCmdConfig:
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base
             "",  # allowed workspaces
-            "false",  # pr review enabled
-            "300",  # pr review cooldown (global resource control, always prompts)
+            "300",  # pr review cooldown (global resource control)
             "900",  # pr review timeout
             *pr_review_budget_entry,  # PR_REVIEW_BUDGET_USD (non-claude only)
-            "false",  # issue triage
-            "",  # github notify chat id
             "false",  # voice
             "false",  # tts
-            *claude_user_entry,  # claude user (claude only)
             *memory_block,
             "",  # perplexity key
         ]
@@ -2139,12 +2109,9 @@ class TestCmdConfig:
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces
-                "false",  # pr review enabled
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout
                 "1.0",  # pr review budget
-                "false",  # issue triage
-                "",  # github notify chat id
                 "false",  # voice
                 "false",  # tts
                 "true",  # memory enabled (extraction + timeout prompts skipped: non-claude)
@@ -2494,15 +2461,11 @@ class TestCmdConfig:
                 "test-secret",  # webhook secret
                 "",  # workspace base
                 "",  # allowed workspaces
-                "false",  # pr review enabled
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout
                 "1.0",  # pr review budget (non-claude branch)
-                "false",  # issue triage enabled
-                "",  # github notify chat id
                 "false",  # voice
                 "false",  # tts
-                # claude_user skipped on agent_backend != claude
                 "true",  # memory enabled
                 "true",  # memory extraction enabled
                 # No codex-memory os_user reprompt (#522 removed it).
@@ -7405,7 +7368,6 @@ class TestGenerateSudoersCodexBinArg:
 
         out = _generate_sudoers(
             service_user="kai",
-            claude_user=None,
             os_users=["daniel"],
             codex_bin="/Users/daniel/.npm-global/bin/codex",
         )
@@ -7417,7 +7379,6 @@ class TestGenerateSudoersCodexBinArg:
 
         out = _generate_sudoers(
             service_user="kai",
-            claude_user=None,
             os_users=["daniel"],
             codex_bin=None,
         )
@@ -7431,7 +7392,6 @@ class TestGenerateSudoersCodexBinArg:
         monkeypatch.setenv("CODEX_BIN", "/should/not/be/used")
         out = _generate_sudoers(
             service_user="kai",
-            claude_user=None,
             os_users=["daniel"],
             codex_bin="/correct/path/codex",
         )

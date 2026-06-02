@@ -261,7 +261,7 @@ class SubprocessPool:
         # auth set in /etc/kai/env; OpenCode reads its auth from
         # ~/.local/share/opencode/auth.json which is per-OS-user but
         # operator-managed via `opencode auth login` outside the wizard.
-        os_user = user.os_user if user else self._config.claude_user
+        os_user = user.os_user if user else None
 
         if backend == "codex":
             # Import locally so codex.py is only imported on a

@@ -620,9 +620,9 @@ def _cmd_config() -> None:
         print(f"  Note: {stray_project_users_yaml} is no longer used. Move it to {users_yaml_path} or remove it.")
     users_yaml_exists = users_yaml_path.exists()
 
-    # Track whether advanced mode set os_user, so we can skip the
-    # CLAUDE_USER prompt later (section 8). Needs to be in scope
-    # regardless of which branch we take.
+    # Admin os_user captured by the advanced-mode prompt block below.
+    # Carried in scope here so the codex-memory branch can reuse it
+    # when re-prompting on a malformed admin entry.
     admin_os_user: str | None = None
     # Admin identity is captured in scope so the codex-memory branch
     # below can re-prompt for a valid os_user and rewrite the wizard-
@@ -688,17 +688,16 @@ def _cmd_config() -> None:
         advanced = _prompt_bool("Configure advanced user options", False)
 
         if advanced:
-            # Default os_user to CLAUDE_USER if previously set, else $USER.
-            # `os_user` is optional on both backends and follows the same
-            # semantics: an empty value (or a value matching the bot
-            # process user) spawns the agent in-process via the
+            # `os_user` is optional on both backends and follows the
+            # same semantics: an empty value (or a value matching the
+            # bot process user) spawns the agent in-process via the
             # self-sudo-skip path detected by `resolve_claude_user`;
             # a different OS account wraps the agent argv in `sudo -H
             # -u <user>` for cross-user isolation. Operators who run
             # kai under their own account leave this empty; operators
             # with a dedicated kai service user and separate per-user
             # OS accounts set it to those accounts.
-            default_os_user = existing_env.get("CLAUDE_USER", "") or os.environ.get("USER", "")
+            default_os_user = os.environ.get("USER", "")
             while True:
                 admin_os_user = _prompt("OS user for subprocess isolation", default_os_user).strip() or None
                 if admin_os_user is None or _validate_os_user(admin_os_user):
@@ -1085,25 +1084,15 @@ def _cmd_config() -> None:
     # are global resource controls for the review subprocess: any
     # review by any user counts against the same cooldown, the same
     # subprocess timeout, and (on non-claude backends) the same USD
-    # budget per run. All three fire on every wizard run regardless
-    # of users.yaml presence. PR_REVIEW_ENABLED is the Class A per-user
-    # mirror and remains gated on users.yaml absence until tranche D
-    # removes it.
+    # budget per run. All three fire on every wizard run. The per-user
+    # `pr_review` toggle lives in users.yaml (or /github reviews).
     print("-- PR review agent --")
-    if users_yaml_exists:
-        print("  Global PR review toggle is now per-user. Set 'pr_review' in users.yaml")
-        print("  or let users toggle via /github reviews on|off.")
-        pr_review_enabled = existing_env.get("PR_REVIEW_ENABLED", "false").lower() in ("1", "true", "yes")
-    else:
-        pr_review_enabled = _prompt_bool(
-            "Enable PR review agent",
-            existing_env.get("PR_REVIEW_ENABLED", "false").lower() in ("1", "true", "yes"),
-        )
+    print("  Per-user PR review toggle lives in users.yaml ('pr_review')")
+    print("  or via /github reviews on|off.")
 
-    # Global cooldown always prompts: a per-user opt-in via users.yaml
-    # or /github reviews can drive reviews even when the global env
-    # toggle is absent, so the cooldown must be configurable for any
-    # install that has any opted-in user.
+    # Global cooldown always prompts: any opted-in user can drive
+    # reviews, so the cooldown must be configurable for any install
+    # that has any opted-in user.
     while True:
         pr_review_cooldown = _prompt(
             "Review cooldown in seconds (prevents spam from rapid pushes)",
@@ -1141,41 +1130,6 @@ def _cmd_config() -> None:
         pr_review_budget_usd = "1.0"
     print()
 
-    # -- Issue triage agent --
-    # Independent from PR review - you might want one without the other.
-    if users_yaml_exists:
-        print("-- Issue triage agent --")
-        print("  Issue triage is now per-user. Set 'issue_triage' in users.yaml")
-        print("  or let users toggle via /github triage on|off.")
-        issue_triage_enabled = existing_env.get("ISSUE_TRIAGE_ENABLED", "false").lower() in ("1", "true", "yes")
-    else:
-        print("-- Issue triage agent --")
-        issue_triage_enabled = _prompt_bool(
-            "Enable issue triage agent",
-            existing_env.get("ISSUE_TRIAGE_ENABLED", "false").lower() in ("1", "true", "yes"),
-        )
-    print()
-
-    # -- GitHub notifications --
-    if users_yaml_exists:
-        print("-- GitHub notifications --")
-        print("  Notification routing is now per-user. Set 'github_notify_chat_id'")
-        print("  in users.yaml or let users configure via /github notify.")
-        github_notify_chat_id = existing_env.get("GITHUB_NOTIFY_CHAT_ID", "")
-    else:
-        print("-- GitHub notifications --")
-        github_notify_chat_id = ""
-        while True:
-            github_notify_chat_id = _prompt(
-                "GitHub notification chat ID (optional)",
-                existing_env.get("GITHUB_NOTIFY_CHAT_ID", ""),
-            )
-            # Empty is valid (feature disabled)
-            if not github_notify_chat_id or _validate_chat_id(github_notify_chat_id):
-                break
-            print("  Must be a valid Telegram chat ID (integer).")
-    print()
-
     # -- Optional features --
     print("-- Optional features --")
     voice_enabled = _prompt_bool(
@@ -1187,30 +1141,11 @@ def _cmd_config() -> None:
         existing_env.get("TTS_ENABLED", "false").lower() in ("1", "true", "yes"),
     )
 
-    # Skip if the user already set os_user via advanced user options
-    # or if users.yaml exists (os_user is per-user there).
-    # CLAUDE_USER is the global fallback; os_user in users.yaml takes
-    # precedence per-user at runtime.
-    if users_yaml_exists:
-        print("  OS user isolation is now per-user. Set 'os_user' in users.yaml.")
-        claude_user = ""
-    elif admin_os_user:
-        claude_user = ""
-    elif agent_backend != "claude":
-        # CLAUDE_USER is the legacy global fallback for sudo subprocess
-        # isolation. Only ClaudeCodeBackend wires it through (claude.py
-        # invokes `sudo -H -u <user> -- claude ...`). Goose has no sudo
-        # path - GooseBackend takes no claude_user kwarg in pool.py,
-        # so the prompt has no meaning when agent_backend is
-        # not claude. Short-circuit to "" here matches the two branches
-        # above, both of which suppress the prompt for the same shape
-        # of "this prompt does not apply" reason.
-        claude_user = ""
-    else:
-        claude_user = _prompt(
-            "Claude subprocess user (optional, for process isolation)",
-            existing_env.get("CLAUDE_USER", ""),
-        )
+    # Per-user OS isolation lives in users.yaml `os_user` (admin-set
+    # baseline) and is no longer mirrored to a global env var. The
+    # wizard surfaces this here only so an operator coming from an
+    # older install knows where the setting moved.
+    print("  Per-user OS isolation: set 'os_user' in users.yaml.")
     print()
 
     # -- Semantic memory --
@@ -1581,29 +1516,16 @@ def _cmd_config() -> None:
 
     # PR_REVIEW_COOLDOWN is a global resource control. Always written
     # when non-default because any user can drive reviews via users.yaml
-    # or /github reviews even when the global PR_REVIEW_ENABLED toggle
-    # is unset.
+    # or /github reviews on|off.
     if pr_review_cooldown != "300":
         env["PR_REVIEW_COOLDOWN"] = pr_review_cooldown
 
-    # Class A per-user mirrors. The prompts and emissions are gated on
-    # users.yaml absence so legacy single-user installs continue to
-    # work via env; tranche D removes the Class A surface entirely
-    # once users.yaml is mandatory.
-    if not users_yaml_exists:
-        if allowed_workspaces:
-            env["ALLOWED_WORKSPACES"] = allowed_workspaces
-        if claude_user:
-            env["CLAUDE_USER"] = claude_user
-        if pr_review_enabled:
-            env["PR_REVIEW_ENABLED"] = "true"
-        if issue_triage_enabled:
-            env["ISSUE_TRIAGE_ENABLED"] = "true"
-        if github_notify_chat_id:
-            env["GITHUB_NOTIFY_CHAT_ID"] = github_notify_chat_id
+    # ALLOWED_WORKSPACES is an inheritable installation default.
+    if allowed_workspaces:
+        env["ALLOWED_WORKSPACES"] = allowed_workspaces
 
-    # Review subprocess resource limits. Written in both branches because
-    # they apply globally to any review, regardless of users.yaml presence.
+    # Review subprocess resource limits. They apply globally to any
+    # review, regardless of which user opted in.
     if pr_review_timeout_s != "900":
         env["PR_REVIEW_TIMEOUT_S"] = pr_review_timeout_s
     if agent_backend != "claude" and pr_review_budget_usd != "1.0":
@@ -1973,9 +1895,8 @@ def _collect_os_users_from_yaml(users_yaml_path: str | Path) -> list[str]:
 
     The runtime (pool.py / claude.py) spawns the inner Claude as each user's
     `os_user` via `sudo -u`. That requires a matching sudoers rule for every
-    distinct os_user. Without this loader, only the legacy single CLAUDE_USER
-    env var got a rule, and additional users had to be hand-added with visudo
-    only to be wiped by the next `make install`.
+    distinct os_user. Without this loader, additional users had to be
+    hand-added with visudo only to be wiped by the next `make install`.
 
     The reader is intentionally lightweight: it does not validate roles,
     models, or providers (config._load_user_configs already does that at
@@ -2228,7 +2149,6 @@ def _collect_user_home_overrides(users_yaml_path: str | Path) -> dict[int, Path]
 
 def _generate_sudoers(
     service_user: str,
-    claude_user: str | None = None,
     os_users: Iterable[str] = (),
     codex_bin: str | None = None,
 ) -> str:
@@ -2245,19 +2165,16 @@ def _generate_sudoers(
 
     Per-user `(target_user) SETENV: NOPASSWD:` rules for the claude and codex
     binaries (plus a `NOPASSWD: /bin/kill` rule for the cross-user kill
-    escalation) are emitted for every distinct user in `os_users` and
-    `claude_user` combined. Users matching `service_user` are skipped (the
-    runtime detects self-sudo via resolve_claude_user() and spawns the agent
-    directly without sudo). The codex binary path defaults to
-    /opt/homebrew/bin/codex; Linux installs override with the CODEX_BIN env
-    var at install time.
+    escalation) are emitted for every distinct `os_user` value in users.yaml.
+    Users matching `service_user` are skipped (the runtime detects self-sudo
+    via resolve_claude_user() and spawns the agent directly without sudo).
+    The codex binary path defaults to /opt/homebrew/bin/codex; Linux installs
+    override with the CODEX_BIN env var at install time.
 
     Args:
         service_user: The OS username that runs the Kai service.
-        claude_user: Optional OS username for the inner Claude process
-            (legacy single CLAUDE_USER env var path; kept for backwards compat).
-        os_users: Distinct os_user values from users.yaml. Combined with
-            claude_user; duplicates and self-sudo entries are dropped.
+        os_users: Distinct os_user values from users.yaml. Self-sudo entries
+            (matching service_user) and duplicates are dropped.
 
     Returns:
         The sudoers file contents as a string.
@@ -2279,21 +2196,20 @@ def _generate_sudoers(
         {service_user} ALL=(root) NOPASSWD: {tee_path} /etc/kai/totp.attempts
     """)
 
-    # Merge legacy claude_user with yaml-derived os_users. Order: legacy first
-    # so behavior is stable when only claude_user is set (existing installs).
-    # Drop self-sudo entries — pool.py uses resolve_claude_user() to skip the
-    # sudo wrapper entirely when the target matches the service user, so a
-    # rule would be dead code (and slightly misleading to future readers).
+    # Yaml-derived os_users only. Drop self-sudo entries: pool.py uses
+    # resolve_claude_user() to skip the sudo wrapper entirely when the
+    # target matches the service user, so a rule would be dead code
+    # (and slightly misleading to future readers).
     #
-    # Defense-in-depth: validate every candidate before interpolating into
-    # the sudoers template. _collect_os_users_from_yaml already validates,
-    # but claude_user can come straight from the legacy CLAUDE_USER env var
-    # without going through that path. A `)` or newline in an unvalidated
-    # username would let an attacker with control of that env var inject
-    # arbitrary sudoers directives.
+    # Defense-in-depth: validate every candidate before interpolating
+    # into the sudoers template. `_collect_os_users_from_yaml` already
+    # validates, but the guard stays here so any future caller cannot
+    # bypass it. A `)` or newline in an unvalidated username would let
+    # an attacker with control of the source inject arbitrary sudoers
+    # directives.
     target_users: list[str] = []
     seen: set[str] = set()
-    for candidate in (claude_user, *os_users):
+    for candidate in os_users:
         if not candidate or candidate == service_user or candidate in seen:
             continue
         if not _validate_os_user(candidate):
@@ -3566,8 +3482,7 @@ def _cmd_apply() -> None:
             _apply_goose_config(service_user, install_path, svc_uid, svc_gid, dry_run)
 
         # -- Step 7: Configure sudoers --
-        claude_user = env.get("CLAUDE_USER") or None
-        _apply_sudoers(service_user, dry_run, claude_user, codex_bin=env.get("CODEX_BIN"))
+        _apply_sudoers(service_user, dry_run, codex_bin=env.get("CODEX_BIN"))
 
         # -- Step 8: Migrate runtime data --
         _apply_migrate(data_path, install_path, svc_uid, svc_gid, dry_run)
@@ -4674,7 +4589,6 @@ def _apply_goose_config(
 def _apply_sudoers(
     service_user: str,
     dry_run: bool,
-    claude_user: str | None = None,
     users_yaml_path: str | Path = "/etc/kai/users.yaml",
     codex_bin: str | None = None,
 ) -> None:
@@ -4698,7 +4612,7 @@ def _apply_sudoers(
     # dry run, since the operator's next step is `sudo make install` which
     # would hit the same error with worse blast radius (partial install).
     os_users = _collect_os_users_from_yaml(users_yaml_path)
-    sudoers_content = _generate_sudoers(service_user, claude_user, os_users, codex_bin=codex_bin)
+    sudoers_content = _generate_sudoers(service_user, os_users, codex_bin=codex_bin)
 
     # Backstop check: the per-user rules pin the claude binary to
     # {service_user_home}/.local/bin/claude (the native-installer
@@ -4709,8 +4623,7 @@ def _apply_sudoers(
     # runtime with no obvious cause. Warn loudly but do not abort -
     # the warning catches the simple "wrong path" case; the operator
     # still owns the symlink or reinstall to make the paths agree.
-    has_target_users = bool(claude_user) or bool(os_users)
-    if has_target_users:
+    if os_users:
         expected_bin = Path(f"{_user_home(service_user)}/.local/bin/claude")
         if not expected_bin.exists():
             print(

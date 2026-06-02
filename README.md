@@ -47,7 +47,12 @@ Per-workspace configuration is supported via `workspaces.yaml` (or `/etc/kai/wor
 
 ### Multi-user
 
-A single Kai instance can serve multiple Telegram users, each fully isolated. Define users in `/etc/kai/users.yaml` (the canonical location for protected installations):
+A single Kai instance can serve multiple Telegram users, each fully isolated. `users.yaml` is mandatory; the daemon fails closed at startup if it cannot find or parse it. The canonical path depends on the deployment mode:
+
+- **Protected install** (`sudo make install`): `/etc/kai/users.yaml` (root-owned, mode 0600).
+- **Single-user install** (`make config` then `make run`): `${XDG_CONFIG_HOME:-$HOME/.config}/kai/users.yaml` (operator-owned, mode 0600 in a 0700 parent).
+
+`make config` writes the correct location for the deployment mode you select at the first prompt.
 
 ```yaml
 users:
@@ -58,6 +63,9 @@ users:
     os_user: alice        # subprocess runs as this OS account
     home_workspace: /home/alice/workspace
     max_budget: 15.0      # default budget for this user (BUDGET_CEILING is the global ceiling)
+    pr_review: true       # enable automatic PR review for this user
+    issue_triage: true    # enable automatic issue triage for this user
+    github_notify_chat_id: -100123456789   # route GitHub notifications to a group
 ```
 
 Each user gets:
@@ -68,7 +76,7 @@ Each user gets:
 - **Per-user home workspace** - each user can have their own default workspace directory.
 - **Role-based routing** - admins receive unattributed webhook events (GitHub pushes, generic webhooks). Regular users interact only through Telegram messages.
 
-Run `make config` to stage a first-time `users.yaml` (written to `~/.cache/kai-install/users.yaml`; `sudo make install` copies it to `/etc/kai/users.yaml` and removes the staging file). Alternatively, create one manually from `templates/users.yaml`. See the [Multi-User Setup](https://github.com/dcellison/kai/wiki/Multi-User-Setup) wiki page for the full field reference. When `/etc/kai/users.yaml` is absent, Kai falls back to `ALLOWED_USER_IDS` for backward compatibility. If neither is set, Kai refuses to start (fail-closed). The `CLAUDE_USER` env var acts as a global fallback for subprocess isolation; per-user `os_user` in `users.yaml` takes precedence when set.
+Per-user GitHub agent toggles (`pr_review`, `issue_triage`) and notification routing (`github_notify_chat_id`) live in `users.yaml` and can be overridden at runtime via `/github reviews on|off`, `/github triage on|off`, and `/github notify <chat_id>`. See the [Multi-User Setup](https://github.com/dcellison/kai/wiki/Multi-User-Setup) wiki page for the full field reference.
 
 ### Memory
 
@@ -100,11 +108,11 @@ When code is pushed to a pull request, Kai automatically reviews it. A one-shot 
 
 When a new issue is opened, Kai triages it automatically. A one-shot agent subprocess reads the issue, applies labels (creating them if they don't exist), checks for duplicates and related issues, assigns it to a project board if appropriate, posts a triage summary comment, and sends you a Telegram notification. See [Issue Triage Agent](https://github.com/dcellison/kai/wiki/Issue-Triage-Agent).
 
-Both agents are fire-and-forget background tasks that run independently of your chat session. They use separate agent processes, so a review or triage can happen while you're mid-conversation. Opt-in per-user via `/github reviews on` and `/github triage on`, or in `users.yaml`. The `PR_REVIEW_ENABLED` and `ISSUE_TRIAGE_ENABLED` env vars still work as global fallbacks.
+Both agents are fire-and-forget background tasks that run independently of your chat session. They use separate agent processes, so a review or triage can happen while you're mid-conversation. Opt-in per-user via `pr_review` / `issue_triage` in `users.yaml`, or toggle at runtime with `/github reviews on|off` and `/github triage on|off`.
 
 ### GitHub notification routing
 
-GitHub event notifications (pushes, PRs, issues, comments, reviews) can be routed to a separate Telegram group via `/github notify <chat_id>` (or the deprecated `GITHUB_NOTIFY_CHAT_ID` env var as a global fallback), keeping your primary DM clean for conversation. Agent output (review comments, triage summaries) also routes to the group. See [GitHub Notification Routing](https://github.com/dcellison/kai/wiki/GitHub-Notification-Routing).
+GitHub event notifications (pushes, PRs, issues, comments, reviews) can be routed to a separate Telegram group via `github_notify_chat_id` in `users.yaml` (or `/github notify <chat_id>` at runtime), keeping your primary DM clean for conversation. Agent output (review comments, triage summaries) also routes to the group. See [GitHub Notification Routing](https://github.com/dcellison/kai/wiki/GitHub-Notification-Routing).
 
 ### Webhooks
 
@@ -201,29 +209,31 @@ cp templates/.env .env
 
 ### Environment variables
 
+Authorization, per-user model selection, per-user OS isolation, per-user GitHub routing, and per-user agent toggles all live in `users.yaml`. The variables below are global resource controls and installation-wide defaults; per-user fields are documented in [Multi-User Setup](https://github.com/dcellison/kai/wiki/Multi-User-Setup).
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | Yes | | Bot token from BotFather |
-| `ALLOWED_USER_IDS` | Deprecated* | | Comma-separated Telegram user IDs. Superseded by `users.yaml`; use `make config` instead. (*Still works if `users.yaml` absent.) |
-| `CLAUDE_MODEL` | Deprecated* | `sonnet` | Default model. Set per-user in `users.yaml` or via `/settings model`. |
-| `CLAUDE_TIMEOUT_SECONDS` | Deprecated* | `120` | Per-message timeout. Set per-user in `users.yaml` or via `/settings timeout`. |
-| `BUDGET_CEILING` | No | `10.0` | Global budget ceiling in USD. Users cannot exceed this via `/settings budget`. Per-user defaults are set via `max_budget` in `users.yaml`. |
-| `CLAUDE_MAX_CONTEXT_WINDOW` | Deprecated* | `0` | Context window size in tokens (0 = backend default). Set per-user in `users.yaml` or via `/settings context`. |
+| `AGENT_BACKEND` | No | `claude` | Global agent backend: `claude`, `goose`, `codex`, or `opencode`. Per-user override goes in `users.yaml`. |
+| `LLM_PROVIDER` | Non-claude | | Global provider for non-claude backends. Per-user override in `users.yaml`. |
+| `DEFAULT_MODEL` | No | `sonnet` | Installation-wide default model. Per-user override in `users.yaml` `model`, or `/settings model`. |
+| `AGENT_TIMEOUT_SECONDS` | No | `120` | Installation-wide default per-message timeout. Per-user override in `users.yaml` `timeout`, or `/settings timeout`. |
+| `BUDGET_CEILING` | No | `10.0` | Global budget ceiling in USD. Users cannot exceed this via `/settings budget`. Per-user defaults in `users.yaml` `max_budget`. |
+| `CLAUDE_MAX_CONTEXT_WINDOW` | No | `0` | Installation-wide default context window in tokens (0 = backend default). Per-user override in `users.yaml` `context_window`, or `/settings context`. |
 | `CLAUDE_AUTOCOMPACT_PCT` | No | `80` | Context compression threshold %, Claude Code only. When usage hits this, Claude compresses history. Can only lower the default (~83%), not raise it. |
 | `CLAUDE_MAX_SESSION_HOURS` | No | `0` | Maximum session age in hours before recycling the subprocess (0 = no limit). Recommended: 4-8 on memory-constrained machines. |
-| `WORKSPACE_BASE` | Deprecated* | | Base directory for workspace name resolution. Set per-user in `users.yaml`. |
-| `ALLOWED_WORKSPACES` | Deprecated* | | Comma-separated extra workspace paths. Users now manage their own via `/workspace allow`. |
+| `WORKSPACE_BASE` | No | | Installation-wide default workspace base directory. Per-user override in `users.yaml` `workspace_base`. |
+| `ALLOWED_WORKSPACES` | No | | Comma-separated extra workspace paths accessible by name. Users also manage their own via `/workspace allow`. |
 | `WEBHOOK_PORT` | No | `8080` | HTTP server port for webhooks and scheduling API |
 | `WEBHOOK_SECRET` | No | | Secret for webhook validation and scheduling API auth |
 | `TELEGRAM_WEBHOOK_URL` | No | | Telegram webhook URL (enables webhook mode; omit for polling) |
 | `TELEGRAM_WEBHOOK_SECRET` | No | | Separate secret for Telegram webhook auth (defaults to `WEBHOOK_SECRET`) |
-| `PR_REVIEW_ENABLED` | Deprecated* | `false` | Enable automatic PR review globally. Set per-user in `users.yaml` or via `/github reviews`. |
-| `PR_REVIEW_COOLDOWN` | No | `300` | Minimum seconds between reviews of the same PR. Machine-wide resource limit, not per-user. |
+| `PR_REVIEW_COOLDOWN` | No | `300` | Minimum seconds between reviews of the same PR. Machine-wide resource limit. |
+| `PR_REVIEW_TIMEOUT_S` | No | `900` | Subprocess timeout for a single PR review, in seconds. |
+| `PR_REVIEW_BUDGET_USD` | No | `1.0` | Hard USD ceiling for one PR review subprocess. Informational on the claude backend; enforced on non-claude backends. |
 | `SPEC_DIR` | No | `specs` | Spec directory relative to repo root, for branch-name matching in PR reviews |
-| `ISSUE_TRIAGE_ENABLED` | Deprecated* | `false` | Enable automatic issue triage globally. Set per-user in `users.yaml` or via `/github triage`. |
-| `GITHUB_NOTIFY_CHAT_ID` | Deprecated* | | Global fallback for GitHub notification routing. Set per-user in `users.yaml` or via `/github notify`. |
-| `CLAUDE_USER` | Deprecated* | | Global OS user for subprocess isolation. Set per-user via `os_user` in `users.yaml`. |
 | `CLAUDE_IDLE_TIMEOUT` | No | `1800` | Seconds before idle subprocesses are evicted (0 to disable) |
+| `CLAUDE_EFFORT_LEVEL` | No | `high` | Reasoning effort for inner Claude: `low`, `medium`, `high`, `xhigh`, `max`. |
 | `VOICE_ENABLED` | No | `false` | Enable voice message transcription |
 | `TTS_ENABLED` | No | `false` | Enable text-to-speech voice responses |
 | `TOTP_SESSION_MINUTES` | No | `30` | Minutes before TOTP re-authentication is required |
@@ -232,14 +242,27 @@ cp templates/.env .env
 | `TOTP_LOCKOUT_MINUTES` | No | `15` | TOTP lockout duration in minutes |
 | `FILE_RETENTION_DAYS` | No | `0` | Days to keep uploaded files before cleanup (0 to disable) |
 
-*Deprecated vars still work for backward compatibility when `users.yaml` is absent. When `users.yaml` is present, `users.yaml` wins and a warning is logged. Run `make config` to migrate.
-
 `BUDGET_CEILING` limits spending in a single session. On the Claude Code backend the flag is omitted on Max-plan OAuth (no real cost is incurred); runaway prevention is handled by the per-session timeout instead. Goose does not currently enforce this limit. The session resets on `/new`, model switch, or workspace switch.
 
 ## Running
 
+Run the configuration wizard first; it writes both `users.yaml` (mandatory authorization) and the runtime env file in the location that matches your deployment mode.
+
 ```bash
-make run
+make config
+```
+
+The wizard's first prompt picks the deployment mode:
+
+- **`single_user`** - Kai runs from the cloned repo under your own OS account. Secrets go to `PROJECT_ROOT/.env` (mode 0600). `users.yaml` goes to `${XDG_CONFIG_HOME:-$HOME/.config}/kai/users.yaml` (mode 0600 in a 0700 parent). No `sudo` required.
+- **`protected`** - Kai runs from a root-owned install at `/opt/kai/`. Secrets go to `/etc/kai/env`, `users.yaml` goes to `/etc/kai/users.yaml`, and a sudoers rule lets the service user read them via `sudo cat`. Requires `sudo make install` after the wizard.
+
+After the wizard:
+
+```bash
+make run    # single-user mode
+# OR
+sudo make install   # protected mode (creates /opt/kai layout; copies secrets)
 ```
 
 Or manually: `source .venv/bin/activate && python -m kai`
@@ -396,10 +419,10 @@ make run        # Start the bot
 
 ## Production deployment
 
-For a hardened installation that separates source, data, and secrets across protected directories:
+The protected install mode separates source, data, and secrets across protected directories:
 
 ```bash
-python -m kai install config       # Interactive Q&A, writes install.conf (no sudo)
+python -m kai install config       # Interactive Q&A; pick `protected` at the first prompt (no sudo)
 sudo python -m kai install apply   # Creates /opt layout, migrates data (root)
 python -m kai install status       # Shows current installation state (no sudo)
 ```
@@ -408,11 +431,13 @@ This creates a split layout:
 
 - `/opt/kai/` - read-only source and venv (root-owned)
 - `/var/lib/kai/` - writable runtime data: database, logs, files (service-user-owned)
-- `/etc/kai/` - secrets: env file, service configs, TOTP (root-owned, mode 0600)
+- `/etc/kai/` - secrets: env file, `users.yaml`, service configs, TOTP (root-owned, mode 0600)
 
 The install module handles directory creation, source copying, venv setup, secret deployment, sudoers rules, data migration, service definition generation, and service lifecycle (stop/start). Use `--dry-run` to preview changes without applying them.
 
 The service user reads secrets via narrowly-scoped sudoers rules (`sudo cat` on specific files only). The inner agent process cannot read secrets or modify source code.
+
+`make config` also supports single-user installs (pick `single_user` at the first prompt). In that mode `.env` and `users.yaml` live under the operator's account; `make install` is a no-op and Kai starts via `make run` directly from the cloned repo.
 
 ## License
 

@@ -1829,43 +1829,10 @@ class TestPerUserRouting:
             assert mock_triage.call_args[1]["claude_user"] == "bob"
 
     @pytest.mark.asyncio
-    async def test_review_falls_back_to_global_claude_user(self, _clear_cooldowns, _mock_resolve_repo):
-        """Legacy mode (no user_configs) falls back to global claude_user."""
-        app = _build_test_app()
-        # Set the global fallback on the mock config
-        app["config"].claude_user = "global-user"
-        app["config"].user_configs = {}
-        app["config"].get_user_config = lambda uid: None
-        payload = _make_pr_payload("opened")
-        body = json.dumps(payload).encode()
-        sig = _sign_payload(payload)
-
-        with (
-            _mock_settings(pr_review=True, notify_chat_id=12345),
-            patch("kai.webhook.review.review_pr", new_callable=AsyncMock) as mock_review,
-        ):
-            async with TestClient(TestServer(app)) as client:
-                resp = await client.post(
-                    "/webhook/github",
-                    data=body,
-                    headers={
-                        "X-GitHub-Event": "pull_request",
-                        "X-Hub-Signature-256": sig,
-                    },
-                )
-                assert resp.status == 200
-
-            await asyncio.sleep(0.01)
-            mock_review.assert_called_once()
-            assert mock_review.call_args[1]["claude_user"] == "global-user"
-
-    @pytest.mark.asyncio
-    async def test_review_user_without_os_user_falls_back(self, _clear_cooldowns, _mock_resolve_repo):
-        """UserConfig with os_user=None falls back to global claude_user."""
-        # No os_user set on this user
+    async def test_review_user_without_os_user_runs_as_bot(self, _clear_cooldowns, _mock_resolve_repo):
+        """UserConfig with os_user=None means run as bot user (claude_user=None)."""
         user = self._make_user_config(111, repos=["owner/repo"])
         config = self._make_config_with_users([user])
-        config.claude_user = "global-user"
         app = _build_test_app(config=config)
         payload = _make_pr_payload("opened")
         body = json.dumps(payload).encode()
@@ -1888,37 +1855,7 @@ class TestPerUserRouting:
 
             await asyncio.sleep(0.01)
             mock_review.assert_called_once()
-            assert mock_review.call_args[1]["claude_user"] == "global-user"
-
-    @pytest.mark.asyncio
-    async def test_triage_falls_back_to_global_claude_user(self, _clear_cooldowns):
-        """Legacy mode (no user_configs) falls back to global claude_user for triage."""
-        app = _build_test_app()
-        app["config"].claude_user = "global-user"
-        app["config"].user_configs = {}
-        app["config"].get_user_config = lambda uid: None
-        payload = _make_issue_payload("opened")
-        body = json.dumps(payload).encode()
-        sig = _sign_payload(payload)
-
-        with (
-            _mock_settings(issue_triage=True, notify_chat_id=12345),
-            patch("kai.webhook.triage.triage_issue", new_callable=AsyncMock) as mock_triage,
-        ):
-            async with TestClient(TestServer(app)) as client:
-                resp = await client.post(
-                    "/webhook/github",
-                    data=body,
-                    headers={
-                        "X-GitHub-Event": "issues",
-                        "X-Hub-Signature-256": sig,
-                    },
-                )
-                assert resp.status == 200
-
-            await asyncio.sleep(0.01)
-            mock_triage.assert_called_once()
-            assert mock_triage.call_args[1]["claude_user"] == "global-user"
+            assert mock_review.call_args[1]["claude_user"] is None
 
     # ── Admin wildcard integration tests ─────────────────────────
 

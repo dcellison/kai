@@ -2727,9 +2727,8 @@ async def _is_notify_chat_used(
     Check if any user other than exclude_user still uses this chat_id
     as their GitHub notification destination.
 
-    Checks users.yaml (via config), the database, and the global env
-    var fallback. Returns True if at least one other source references
-    this chat_id.
+    Checks users.yaml (via config) and the database. Returns True if
+    at least one other source references this chat_id.
 
     Note: this does a linear scan of all users with one DB query per
     user. Fine for a personal assistant with a handful of users.
@@ -2748,9 +2747,7 @@ async def _is_notify_chat_used(
                     return True
             except ValueError:
                 continue
-
-    # Also check the global env var fallback
-    return config.github_notify_chat_id == notify_chat_id
+    return False
 
 
 async def _handle_github_notify(

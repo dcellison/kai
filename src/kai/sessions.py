@@ -1081,13 +1081,12 @@ class GitHubSettings(TypedDict):
 async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSettings:
     """
     Resolve per-user GitHub settings by layering DB overrides on top
-    of users.yaml and env var defaults.
+    of users.yaml.
 
     Precedence (highest to lowest):
     1. Database (user-set via /github commands)
     2. users.yaml (admin baseline per user)
-    3. Env var (global defaults)
-    4. Hardcoded defaults
+    3. Hardcoded defaults (False / chat_id)
     """
     user_config = config.get_user_config(chat_id)
     db = await get_github_db_settings(chat_id)
@@ -1096,9 +1095,9 @@ async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSetting
     yaml_repos = user_config.github_repos if user_config else []
     repos = await get_effective_repos(chat_id, yaml_repos)
 
-    # Notification destination: DB > yaml > env > telegram_id.
+    # Notification destination: DB > yaml > telegram_id.
     # Defensive try/except matches budget/timeout/context_window above.
-    # A corrupt DB value falls through to yaml/env/default rather than
+    # A corrupt DB value falls through to yaml/default rather than
     # aborting the entire resolution.
     notify: int | None = None
     if "github_notify_chat" in db:
@@ -1114,26 +1113,25 @@ async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSetting
         if user_config and user_config.github_notify_chat_id is not None:
             notify = user_config.github_notify_chat_id
         else:
-            # Fall back to the global env var. If that is also unset,
-            # use the user's own telegram_id (notifications go to DM).
-            global_notify = config.github_notify_chat_id
-            notify = global_notify if global_notify is not None else chat_id
+            # No per-user routing configured; deliver notifications to
+            # the user's own DM (telegram_id == chat_id for private chats).
+            notify = chat_id
 
-    # PR review: DB > yaml > env > False
+    # PR review: DB > yaml > False
     if "pr_review" in db:
         pr_review = isinstance(db["pr_review"], str) and db["pr_review"].lower() == "true"
     elif user_config and user_config.pr_review is not None:
         pr_review = user_config.pr_review
     else:
-        pr_review = config.pr_review_enabled
+        pr_review = False
 
-    # Issue triage: DB > yaml > env > False
+    # Issue triage: DB > yaml > False
     if "issue_triage" in db:
         issue_triage = isinstance(db["issue_triage"], str) and db["issue_triage"].lower() == "true"
     elif user_config and user_config.issue_triage is not None:
         issue_triage = user_config.issue_triage
     else:
-        issue_triage = config.issue_triage_enabled
+        issue_triage = False
 
     return {
         "repos": repos,

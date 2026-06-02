@@ -1093,16 +1093,14 @@ class TestResolveGitHubSettings:
         defaults = {
             "telegram_bot_token": "test",
             "allowed_user_ids": {111},
-            "pr_review_enabled": False,
-            "issue_triage_enabled": False,
         }
         defaults.update(kwargs)
         if user_configs is not None:
             defaults["user_configs"] = user_configs
         return Config(**defaults)
 
-    async def test_no_config_returns_global_defaults(self, db):
-        """Without user config or DB overrides, returns global defaults."""
+    async def test_no_config_returns_defaults(self, db):
+        """Without user config or DB overrides, returns hardcoded defaults."""
         config = self._make_config()
         result = await sessions.resolve_github_settings(111, config)
         assert result["repos"] == []
@@ -1110,8 +1108,8 @@ class TestResolveGitHubSettings:
         assert result["pr_review"] is False
         assert result["issue_triage"] is False
 
-    async def test_yaml_overrides_globals(self, db):
-        """users.yaml values override global defaults."""
+    async def test_yaml_overrides_defaults(self, db):
+        """users.yaml values override hardcoded defaults."""
         from kai.config import UserConfig
 
         uc = UserConfig(
@@ -1153,42 +1151,37 @@ class TestResolveGitHubSettings:
         assert result["issue_triage"] is False
         assert result["notify_chat_id"] == -200888
 
-    async def test_db_overrides_env(self, db):
-        """DB settings override env var global defaults."""
-        config = self._make_config(
-            pr_review_enabled=True,
-            issue_triage_enabled=True,
-        )
-        await sessions.set_setting("pr_review:111", "false")
-        result = await sessions.resolve_github_settings(111, config)
-        assert result["pr_review"] is False
-        # issue_triage not in DB, falls through to env
-        assert result["issue_triage"] is True
-
-    async def test_notify_fallback_chain(self, db):
-        """Notification destination: DB > yaml > env > telegram_id."""
+    async def test_db_partial_override_falls_back(self, db):
+        """DB overrides one field; other fields take their own resolution."""
         from kai.config import UserConfig
 
-        # Level 4: no config at all - falls back to telegram_id
+        uc = UserConfig(
+            telegram_id=111,
+            name="alice",
+            issue_triage=True,
+        )
+        config = self._make_config(user_configs={111: uc})
+        await sessions.set_setting("pr_review:111", "false")
+        result = await sessions.resolve_github_settings(111, config)
+        assert result["pr_review"] is False  # DB override
+        assert result["issue_triage"] is True  # users.yaml value
+
+    async def test_notify_fallback_chain(self, db):
+        """Notification destination: DB > yaml > telegram_id."""
+        from kai.config import UserConfig
+
+        # Level 3: no config at all - falls back to telegram_id
         config = self._make_config()
         result = await sessions.resolve_github_settings(111, config)
         assert result["notify_chat_id"] == 111
 
-        # Level 3: global env var set
-        config = self._make_config(github_notify_chat_id=-300)
-        result = await sessions.resolve_github_settings(111, config)
-        assert result["notify_chat_id"] == -300
-
-        # Level 2: yaml set (overrides env)
+        # Level 2: users.yaml set
         uc = UserConfig(
             telegram_id=111,
             name="alice",
             github_notify_chat_id=-200,
         )
-        config = self._make_config(
-            user_configs={111: uc},
-            github_notify_chat_id=-300,
-        )
+        config = self._make_config(user_configs={111: uc})
         result = await sessions.resolve_github_settings(111, config)
         assert result["notify_chat_id"] == -200
 
@@ -1198,28 +1191,25 @@ class TestResolveGitHubSettings:
         assert result["notify_chat_id"] == -100
 
     async def test_partial_overrides(self, db):
-        """Some fields from DB, some from yaml, some from globals."""
+        """Some fields from DB, some from yaml."""
         from kai.config import UserConfig
 
         uc = UserConfig(
             telegram_id=111,
             name="alice",
             pr_review=True,
-            # issue_triage omitted (None) - falls to global
+            issue_triage=True,
         )
-        config = self._make_config(
-            user_configs={111: uc},
-            issue_triage_enabled=True,
-        )
+        config = self._make_config(user_configs={111: uc})
         # Override only pr_review in DB
         await sessions.set_setting("pr_review:111", "false")
 
         result = await sessions.resolve_github_settings(111, config)
         assert result["pr_review"] is False  # DB override
-        assert result["issue_triage"] is True  # global default
+        assert result["issue_triage"] is True  # users.yaml value
 
-    async def test_pr_review_none_uses_global(self, db):
-        """yaml pr_review=None falls through to global env var."""
+    async def test_pr_review_unset_defaults_false(self, db):
+        """yaml pr_review=None resolves to False (no global fallback)."""
         from kai.config import UserConfig
 
         uc = UserConfig(
@@ -1227,12 +1217,9 @@ class TestResolveGitHubSettings:
             name="alice",
             # pr_review not set (None)
         )
-        config = self._make_config(
-            user_configs={111: uc},
-            pr_review_enabled=True,
-        )
+        config = self._make_config(user_configs={111: uc})
         result = await sessions.resolve_github_settings(111, config)
-        assert result["pr_review"] is True
+        assert result["pr_review"] is False
 
     async def test_repos_from_yaml_only(self, db):
         """Repos come from users.yaml, not DB (DB repos are #220)."""
@@ -1264,14 +1251,6 @@ class TestResolveGitHubSettings:
         result = await sessions.resolve_github_settings(111, config)
         assert result["notify_chat_id"] == -100999
 
-    async def test_corrupt_db_notify_falls_through_to_env(self, db):
-        """Non-numeric DB value falls through to global env var."""
-        config = self._make_config(github_notify_chat_id=-300)
-        await sessions.set_setting("github_notify_chat:111", "abc")
-
-        result = await sessions.resolve_github_settings(111, config)
-        assert result["notify_chat_id"] == -300
-
     async def test_corrupt_db_notify_falls_through_to_telegram_id(self, db):
         """Non-numeric DB value falls through to user's own telegram_id."""
         config = self._make_config()
@@ -1293,12 +1272,12 @@ class TestResolveGitHubSettings:
         assert any("Corrupt github_notify_chat" in r.message and "xyz" in r.message for r in caplog.records)
 
     async def test_empty_string_db_notify_falls_through(self, db):
-        """Empty string in DB fails int() and falls through gracefully."""
-        config = self._make_config(github_notify_chat_id=-500)
+        """Empty string in DB fails int() and falls through to telegram_id."""
+        config = self._make_config()
         await sessions.set_setting("github_notify_chat:111", "")
 
         result = await sessions.resolve_github_settings(111, config)
-        assert result["notify_chat_id"] == -500
+        assert result["notify_chat_id"] == 111
 
     # ── Case-insensitive booleans (finding 5) ────────────────────
 
@@ -1317,15 +1296,21 @@ class TestResolveGitHubSettings:
         assert result["issue_triage"] is True
 
     async def test_pr_review_false_case_insensitive(self, db):
-        """Mixed-case 'False' in DB resolves to False, not True."""
-        config = self._make_config(pr_review_enabled=True)
+        """Mixed-case 'False' in DB resolves to False even when users.yaml says True."""
+        from kai.config import UserConfig
+
+        uc = UserConfig(telegram_id=111, name="alice", pr_review=True)
+        config = self._make_config(user_configs={111: uc})
         await sessions.set_setting("pr_review:111", "False")
         result = await sessions.resolve_github_settings(111, config)
         assert result["pr_review"] is False
 
     async def test_issue_triage_false_case_insensitive(self, db):
-        """Uppercase 'FALSE' in DB resolves to False, not True."""
-        config = self._make_config(issue_triage_enabled=True)
+        """Uppercase 'FALSE' in DB resolves to False even when users.yaml says True."""
+        from kai.config import UserConfig
+
+        uc = UserConfig(telegram_id=111, name="alice", issue_triage=True)
+        config = self._make_config(user_configs={111: uc})
         await sessions.set_setting("issue_triage:111", "FALSE")
         result = await sessions.resolve_github_settings(111, config)
         assert result["issue_triage"] is False

@@ -99,7 +99,6 @@ class TestInstanceCreation:
         # touch the host's real /var/lib/kai or PROJECT_ROOT tree.
         monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
         config = _make_config(
-            claude_user=None,
             user_configs={999: UserConfig(telegram_id=999, name="bob")},
         )
         pool = SubprocessPool(config=config, services_info=[])

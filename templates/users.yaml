@@ -1,12 +1,19 @@
-# Per-user configuration for Kai.
+# Per-user configuration for Kai. users.yaml is mandatory; the
+# daemon fails closed at startup if it cannot find or parse it.
 #
-# Copy to /etc/kai/users.yaml (the canonical location) and customize
-# with your users' details. Alternatively, run `make config`; the
-# wizard stages a generated file at `~/.cache/kai-install/users.yaml`
-# that `sudo make install` then copies into /etc/kai/users.yaml.
+# Canonical paths:
+#   protected installs (`sudo make install`): /etc/kai/users.yaml
+#   single-user installs (`make config` then `make run`):
+#       ${XDG_CONFIG_HOME:-$HOME/.config}/kai/users.yaml
 #
-# Required fields: telegram_id, name.
-# All other fields are optional.
+# `make config` writes the correct location for the deployment mode
+# you select. KAI_USERS_YAML can override either for tests/dev.
+#
+# Required fields per user: telegram_id, name.
+# All other fields are optional. Omitted fields inherit installation
+# defaults from .env / /etc/kai/env (model, timeout, context_window,
+# workspace_base) or the hardcoded defaults documented in the
+# templates/.env header.
 
 users:
   # Example: admin user with full settings
@@ -19,20 +26,20 @@ users:
 
     # workspace_base: directory for /workspace new and name resolution.
     # /workspace <name> looks for subdirectories under this path.
-    # Falls back to WORKSPACE_BASE env var if not set.
+    # Inherits the global WORKSPACE_BASE installation default if unset.
     # workspace_base: ~/projects
 
-    # max_budget serves double duty: it is both the user's default
-    # budget AND the ceiling they cannot exceed via /settings budget.
-    # If alice sets /settings budget 15, she gets $15. If she tries
-    # /settings budget 25, she gets "Budget cannot exceed $20.00
-    # (admin limit)." If she has not set any /settings budget, she
-    # gets $20 as the baseline default.
+    # max_budget serves double duty: it is the user's default budget
+    # AND the ceiling they cannot exceed via /settings budget. The
+    # global BUDGET_CEILING is the hard upper bound; /settings
+    # enforces it. If max_budget is unset, the user falls back to
+    # BUDGET_CEILING as their baseline.
     max_budget: 20.0
 
-    # Optional per-user defaults. Users can override these with
-    # /settings commands. Omitted fields use global defaults from .env.
-    # model: opus             # default model (haiku/sonnet/opus)
+    # Optional per-user defaults. Users can override these at runtime
+    # via /settings. Omitted fields inherit installation defaults
+    # (DEFAULT_MODEL, AGENT_TIMEOUT_SECONDS, CLAUDE_MAX_CONTEXT_WINDOW).
+    # model: opus             # haiku/sonnet/opus for claude; provider/model for opencode
     # timeout: 300            # response timeout in seconds (max 600)
     # context_window: 200000  # context window in tokens (0 = default)
 

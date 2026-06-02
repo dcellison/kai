@@ -4889,18 +4889,6 @@ class TestIsNotifyChatUsed:
         assert result is True
 
     @pytest.mark.asyncio
-    async def test_env_var_match(self):
-        """Returns True when the global env var fallback uses the chat_id."""
-        config = _make_config(github_notify_chat_id=-100999)
-
-        mock_sessions = AsyncMock()
-        mock_sessions.get_setting = AsyncMock(return_value=None)
-
-        with patch("kai.bot.sessions", mock_sessions):
-            result = await _is_notify_chat_used(-100999, exclude_user=111, config=config)
-        assert result is True
-
-    @pytest.mark.asyncio
     async def test_no_match(self):
         """Returns False when no other source references the chat_id."""
         from kai.config import UserConfig

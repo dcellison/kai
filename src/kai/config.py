@@ -37,7 +37,7 @@ PROJECT_ROOT = Path(os.environ.get("KAI_INSTALL_DIR") or str(_FILE_ROOT))
 # Writable data directory for runtime artifacts (database, logs, crash flag).
 # Defaults to PROJECT_ROOT for development. In a protected installation where
 # source lives in read-only /opt/kai/, this points to user-owned /var/lib/kai/.
-# Uses `or` so that an empty string also falls back (same pattern as CLAUDE_USER).
+# Uses `or` so that an empty string also falls back to the project default.
 DATA_DIR = Path(os.environ.get("KAI_DATA_DIR") or str(PROJECT_ROOT))
 
 # Valid agent backend choices. "claude" uses Claude Code CLI,
@@ -702,9 +702,6 @@ class Config:
         allowed_workspaces: Additional workspace directories accessible by name, from config only.
             These appear as pinned workspaces in /workspaces and are reachable via /workspace <name>
             without being under WORKSPACE_BASE. Non-existent paths are skipped at startup.
-        claude_user: OS user for the inner Claude process. When set, Claude is spawned
-            via 'sudo -u <user>' for OS-level isolation. Must be a non-admin user.
-            When None, Claude runs as the same user as the bot (development default).
     """
 
     # Required fields - no defaults, must be provided
@@ -735,11 +732,11 @@ class Config:
     # quality at the cost of latency and budget. Default "high" matches
     # the operator's outer-Claude default; switching to "medium" globally
     # would silently downgrade existing reasoning quality. Critical when
-    # CLAUDE_USER / users.yaml `os_user` is set, because inner Claude
-    # then runs as a different OS user and does NOT inherit the outer
-    # operator's settings.json effort default - without this CLI value,
-    # user-isolated installs would silently fall to whatever the claude
-    # binary picks as its own default. Validated at config load against
+    # users.yaml `os_user` is set, because inner Claude then runs as a
+    # different OS user and does NOT inherit the outer operator's
+    # settings.json effort default - without this CLI value, user-isolated
+    # installs would silently fall to whatever the claude binary picks
+    # as its own default. Validated at config load against
     # _VALID_EFFORT_LEVELS so a typo fails fast rather than at the
     # subprocess startup of the next chat session.
     claude_effort_level: str = "high"
@@ -782,15 +779,14 @@ class Config:
     # NOT extended by registry roots.
     memory_projects: dict[str, MemoryProjectConfig] = field(default_factory=dict)
 
-    # User separation: run Claude as a different OS user for process isolation.
-    # When set, the bot spawns Claude via 'sudo -u <user> claude ...'.
-    # The user must exist on the system and must NOT have admin/sudo privileges.
-    # When unset, Claude runs as the same user as the bot (development default).
-    claude_user: str | None = None
+    # Per-user OS isolation lives in `UserConfig.os_user` (loaded from
+    # users.yaml). The bot spawns the inner agent via
+    # `sudo -u <user>` when that field is set; when unset the agent
+    # runs as the bot's own OS user.
 
-    # PR review agent: automatically review PRs when GitHub webhooks fire.
-    # Disabled by default so existing users are not surprised by automatic reviews.
-    pr_review_enabled: bool = False
+    # PR review agent: per-user toggle lives in users.yaml `pr_review`
+    # (or the per-chat /github reviews command). Global resource
+    # controls stay on Config.
     # Minimum seconds between reviews of the same PR. Absorbs force-push bursts
     # so rapid pushes to an open PR don't trigger a review for each one.
     pr_review_cooldown: int = 300
@@ -816,14 +812,12 @@ class Config:
     # which accepts any path relative to the repo root.
     spec_dir: str = "specs"
 
-    # Issue triage agent: automatically triage new issues when webhooks fire.
-    # Disabled by default so existing users are not surprised by automatic triage.
-    issue_triage_enabled: bool = False
+    # Issue triage agent: per-user toggle lives in users.yaml
+    # `issue_triage` (or the per-chat /github triage command).
 
-    # Global notification chat override. When set, acts as fallback for
-    # users without a per-user github_notify_chat_id. Parsed from
-    # GITHUB_NOTIFY_CHAT_ID env var.
-    github_notify_chat_id: int | None = None
+    # GitHub notification routing is per-user: `github_notify_chat_id`
+    # in users.yaml, with /github notify as the per-chat override. When
+    # neither is set the runtime falls back to the user's own chat_id.
 
     # File retention: delete uploaded files older than this many days.
     # 0 = no cleanup (default). Cleanup runs once every 24 hours.
@@ -2257,8 +2251,9 @@ def load_config() -> Config:
         # expects to see in an error string.
         raise SystemExit(f"CLAUDE_EFFORT_LEVEL must be one of {list(EFFORT_LEVELS)}, got {claude_effort_level!r}")
 
-    # PR review agent config
-    pr_review_enabled = os.environ.get("PR_REVIEW_ENABLED", "").lower() in ("1", "true", "yes")
+    # PR review agent config. The global `pr_review` toggle now lives
+    # per-user in users.yaml; PR_REVIEW_COOLDOWN / PR_REVIEW_TIMEOUT_S
+    # / PR_REVIEW_BUDGET_USD remain as global resource controls.
     try:
         pr_review_cooldown = int(os.environ.get("PR_REVIEW_COOLDOWN", "300"))
     except ValueError:
@@ -2275,22 +2270,6 @@ def load_config() -> Config:
             raise SystemExit("PR_REVIEW_BUDGET_USD must be a positive number")
     except ValueError:
         raise SystemExit("PR_REVIEW_BUDGET_USD must be a number") from None
-
-    # Issue triage agent config
-    issue_triage_enabled = os.environ.get("ISSUE_TRIAGE_ENABLED", "").lower() in ("1", "true", "yes")
-
-    # Global GitHub notification chat override. When set, acts as fallback
-    # for users without a per-user github_notify_chat_id in users.yaml or DB.
-    github_notify_raw = os.environ.get("GITHUB_NOTIFY_CHAT_ID", "")
-    github_notify_chat_id: int | None = None
-    if github_notify_raw:
-        try:
-            github_notify_chat_id = int(github_notify_raw)
-        except ValueError:
-            log.warning(
-                "Invalid GITHUB_NOTIFY_CHAT_ID: %s (ignoring)",
-                github_notify_raw,
-            )
 
     try:
         totp_session_minutes = int(os.environ.get("TOTP_SESSION_MINUTES", "30"))
@@ -2580,42 +2559,33 @@ def load_config() -> Config:
                     f"rerun the wizard if you no longer want memory extraction enabled."
                 ) from None
 
-    # Deprecation warnings for env vars superseded by users.yaml.
-    # users.yaml is mandatory now, so the previous "only fire when
-    # users.yaml exists" guard is gone: any of these env vars in
-    # /etc/kai/env is unconditionally redundant. A later tranche
-    # removes the Class A entries from this block entirely along
-    # with the runtime reads they describe.
-    _deprecated_env_vars = {
-        "CLAUDE_MODEL": "Renamed to DEFAULT_MODEL. Set per-user 'model' in users.yaml or use /settings model",
-        "CLAUDE_MAX_BUDGET_USD": "Renamed to BUDGET_CEILING (global ceiling). Per-user defaults go in users.yaml 'max_budget'",
-        "CLAUDE_TIMEOUT_SECONDS": "Set per-user 'timeout' in users.yaml or use /settings timeout",
-        "CLAUDE_MAX_CONTEXT_WINDOW": "Set per-user 'context_window' in users.yaml or use /settings context",
-        "CLAUDE_USER": "Set per-user 'os_user' in users.yaml",
-        "WORKSPACE_BASE": "Set per-user 'workspace_base' in users.yaml",
-        "ALLOWED_WORKSPACES": "Users can manage their own via /workspace allow",
-        "PR_REVIEW_ENABLED": "Set per-user 'pr_review' in users.yaml or use /github reviews",
-        "ISSUE_TRIAGE_ENABLED": "Set per-user 'issue_triage' in users.yaml or use /github triage",
-        "GITHUB_NOTIFY_CHAT_ID": "Set per-user 'github_notify_chat_id' in users.yaml or use /github notify",
+    # Renamed env vars: warn when the legacy name is present so the
+    # operator knows to re-run `make config`. Only renames remain in
+    # this map. Per-user fields (model, os_user, pr_review, etc.) are
+    # not legacy renames; the runtime no longer reads them at all and
+    # the corresponding wizard prompts have been retired.
+    _renamed_env_vars = {
+        "CLAUDE_MAX_BUDGET_USD": "BUDGET_CEILING (global ceiling). Per-user defaults go in users.yaml 'max_budget'.",
+        "CLAUDE_TIMEOUT_SECONDS": "AGENT_TIMEOUT_SECONDS.",
     }
-    for var, guidance in _deprecated_env_vars.items():
+    for var, replacement in _renamed_env_vars.items():
         if os.environ.get(var, "").strip():
             log.warning(
-                "%s in env is deprecated (users.yaml exists). %s. This env var will be removed in a future release.",
+                "%s in env is deprecated; use %s Re-run 'make config' to migrate /etc/kai/env automatically.",
                 var,
-                guidance,
+                replacement,
             )
 
-    # Warn when GitHub agent features are enabled but no users have
-    # github_repos configured. Events will never reach the agents
-    # because _get_subscribed_users() returns empty for every
-    # incoming webhook. The fallback path in _process_github_event()
+    # Warn when GitHub features are configured but no user has a
+    # repo list. Events will never reach the agents because
+    # `_get_subscribed_users()` returns empty for every incoming
+    # webhook. The fallback path in `_process_github_event()` still
     # delivers basic notifications but does not guarantee the agents
     # fire.
     no_repos = not any(uc.github_repos for uc in user_configs.values())
     if no_repos:
-        review_on = pr_review_enabled or any(uc.pr_review is True for uc in user_configs.values())
-        triage_on = issue_triage_enabled or any(uc.issue_triage is True for uc in user_configs.values())
+        review_on = any(uc.pr_review is True for uc in user_configs.values())
+        triage_on = any(uc.issue_triage is True for uc in user_configs.values())
         if review_on or triage_on:
             features = []
             if review_on:
@@ -2632,15 +2602,7 @@ def load_config() -> Config:
                 ", ".join(features),
             )
 
-    # Read DEFAULT_MODEL, falling back to CLAUDE_MODEL for backward
-    # compat with existing /etc/kai/env files that haven't been
-    # regenerated via make config.
-    default_model = os.environ.get(
-        "DEFAULT_MODEL",
-        os.environ.get("CLAUDE_MODEL", "sonnet"),
-    )
-    if os.environ.get("CLAUDE_MODEL") and not os.environ.get("DEFAULT_MODEL"):
-        log.warning("CLAUDE_MODEL is deprecated, use DEFAULT_MODEL instead")
+    default_model = os.environ.get("DEFAULT_MODEL", "sonnet")
 
     # Validate DEFAULT_MODEL against the effective global backend.
     # Codex installs validate against CODEX_MODELS only - no fallback
@@ -2682,15 +2644,11 @@ def load_config() -> Config:
         allowed_workspaces=allowed_workspaces,
         workspace_configs=workspace_configs,
         memory_projects=memory_projects,
-        claude_user=os.environ.get("CLAUDE_USER") or None,
-        pr_review_enabled=pr_review_enabled,
         pr_review_cooldown=pr_review_cooldown,
         pr_review_timeout_s=pr_review_timeout_s,
         pr_review_budget_usd=pr_review_budget_usd,
         github_repo=os.getenv("GITHUB_REPO", ""),
         spec_dir=os.getenv("SPEC_DIR", "specs"),
-        issue_triage_enabled=issue_triage_enabled,
-        github_notify_chat_id=github_notify_chat_id,
         file_retention_days=file_retention_days,
         user_configs=user_configs,
         totp_session_minutes=totp_session_minutes,

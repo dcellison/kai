@@ -359,12 +359,6 @@ class TestLoadConfigOptional:
         monkeypatch.setenv("DEFAULT_MODEL", "opus")
         assert load_config().default_model == "opus"
 
-    def test_claude_model_backward_compat(self, monkeypatch):
-        """Old CLAUDE_MODEL env var is still read when DEFAULT_MODEL is absent."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("CLAUDE_MODEL", "opus")
-        assert load_config().default_model == "opus"
-
     def test_voice_enabled_true(self, monkeypatch):
         _set_required(monkeypatch)
         monkeypatch.setenv("VOICE_ENABLED", "true")
@@ -445,21 +439,6 @@ class TestLoadConfigOptional:
         monkeypatch.setenv("ALLOWED_WORKSPACES", f"{dir_a},{non_canonical}")
         config = load_config()
         assert len(config.allowed_workspaces) == 1
-
-    def test_claude_user_default_none(self, monkeypatch):
-        _set_required(monkeypatch)
-        assert load_config().claude_user is None
-
-    def test_claude_user_from_env(self, monkeypatch):
-        _set_required(monkeypatch)
-        monkeypatch.setenv("CLAUDE_USER", "daniel")
-        assert load_config().claude_user == "daniel"
-
-    def test_claude_user_empty_string_becomes_none(self, monkeypatch):
-        # Empty CLAUDE_USER is treated as unset (the `or None` coercion)
-        _set_required(monkeypatch)
-        monkeypatch.setenv("CLAUDE_USER", "")
-        assert load_config().claude_user is None
 
 
 # ── Telegram webhook config ─────────────────────────────────────────
@@ -721,22 +700,18 @@ class TestDualModeLoading:
 
 class TestPRReviewConfig:
     def test_defaults(self, monkeypatch):
-        """PR review is disabled by default with a 5-minute cooldown."""
+        """PR review resource controls take dataclass defaults when env is empty."""
         _set_required(monkeypatch)
         config = load_config()
-        assert config.pr_review_enabled is False
         assert config.pr_review_cooldown == 300
         assert config.pr_review_timeout_s == 900
         assert config.pr_review_budget_usd == 1.0
 
-    def test_enabled_with_custom_cooldown(self, monkeypatch):
-        """PR_REVIEW_ENABLED and PR_REVIEW_COOLDOWN are picked up from env."""
+    def test_custom_cooldown(self, monkeypatch):
+        """PR_REVIEW_COOLDOWN is picked up from env."""
         _set_required(monkeypatch)
-        monkeypatch.setenv("PR_REVIEW_ENABLED", "true")
         monkeypatch.setenv("PR_REVIEW_COOLDOWN", "60")
-        config = load_config()
-        assert config.pr_review_enabled is True
-        assert config.pr_review_cooldown == 60
+        assert load_config().pr_review_cooldown == 60
 
     def test_cooldown_invalid_raises(self, monkeypatch):
         """Non-numeric PR_REVIEW_COOLDOWN raises SystemExit."""
@@ -808,57 +783,6 @@ class TestPRReviewConfig:
         assert config.spec_dir == "home/specs"
 
 
-# ── Issue triage config ─────────────────────────────────────────────
-
-
-class TestIssueTriageConfig:
-    def test_defaults(self, monkeypatch):
-        """Issue triage is disabled by default."""
-        _set_required(monkeypatch)
-        config = load_config()
-        assert config.issue_triage_enabled is False
-
-    def test_enabled(self, monkeypatch):
-        """ISSUE_TRIAGE_ENABLED=true enables the triage agent."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("ISSUE_TRIAGE_ENABLED", "true")
-        config = load_config()
-        assert config.issue_triage_enabled is True
-
-
-# ── GITHUB_NOTIFY_CHAT_ID config ───────────────────────────────────
-
-
-class TestGitHubNotifyChatIdConfig:
-    def test_default_none(self, monkeypatch):
-        """Unset GITHUB_NOTIFY_CHAT_ID defaults to None."""
-        _set_required(monkeypatch)
-        config = load_config()
-        assert config.github_notify_chat_id is None
-
-    def test_valid_positive(self, monkeypatch):
-        """Positive chat ID is parsed correctly."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("GITHUB_NOTIFY_CHAT_ID", "123456789")
-        config = load_config()
-        assert config.github_notify_chat_id == 123456789
-
-    def test_valid_negative(self, monkeypatch):
-        """Negative chat ID (group chat) is parsed correctly."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("GITHUB_NOTIFY_CHAT_ID", "-100123456789")
-        config = load_config()
-        assert config.github_notify_chat_id == -100123456789
-
-    def test_invalid_warns(self, monkeypatch, caplog):
-        """Non-numeric value warns and uses None."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("GITHUB_NOTIFY_CHAT_ID", "not-a-number")
-        config = load_config()
-        assert config.github_notify_chat_id is None
-        assert "invalid github_notify_chat_id" in caplog.text.lower()
-
-
 # ── resolve_claude_user() ────────────────────────────────────────────
 
 
@@ -906,28 +830,22 @@ def _mock_user_configs(monkeypatch):
     )
 
 
-# Deprecated env vars and representative test values. /tmp is used
-# for path vars because it always exists on both macOS and Linux.
-_DEPRECATED_VARS_WITH_VALUES = {
-    "CLAUDE_MODEL": "sonnet",
-    "CLAUDE_MAX_BUDGET_USD": "10.0",  # old name, still tested for deprecation warning
+# Renamed env vars whose legacy name still triggers a one-line
+# operator-facing migration warning. Class A mirrors (CLAUDE_MODEL,
+# CLAUDE_USER, PR_REVIEW_ENABLED, ISSUE_TRIAGE_ENABLED,
+# GITHUB_NOTIFY_CHAT_ID) are no longer read at runtime and have no
+# deprecation handling here — the loader silently ignores them.
+_RENAMED_VARS_WITH_VALUES = {
+    "CLAUDE_MAX_BUDGET_USD": "10.0",
     "CLAUDE_TIMEOUT_SECONDS": "120",
-    "CLAUDE_MAX_CONTEXT_WINDOW": "200000",
-    "CLAUDE_USER": "kai",
-    "WORKSPACE_BASE": "/tmp",
-    "ALLOWED_WORKSPACES": "/tmp",
-    "PR_REVIEW_ENABLED": "true",
-    "ISSUE_TRIAGE_ENABLED": "true",
-    "GITHUB_NOTIFY_CHAT_ID": "12345",
 }
 
 
-class TestDeprecationWarnings:
-    """Verify deprecated env vars emit warnings when users.yaml exists."""
+class TestRenamedEnvWarnings:
+    """Renamed env vars surface a single migration warning."""
 
-    @pytest.mark.parametrize("var,value", _DEPRECATED_VARS_WITH_VALUES.items())
-    def test_warns_when_users_yaml_exists(self, monkeypatch, caplog, var, value):
-        """Deprecated env var emits warning when users.yaml is present."""
+    @pytest.mark.parametrize("var,value", _RENAMED_VARS_WITH_VALUES.items())
+    def test_warns_on_legacy_name(self, monkeypatch, caplog, var, value):
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
         monkeypatch.setenv(var, value)
         _mock_user_configs(monkeypatch)
@@ -938,54 +856,26 @@ class TestDeprecationWarnings:
     def test_empty_var_does_not_warn(self, monkeypatch, caplog):
         """Empty string env vars are not treated as 'set'."""
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
-        # Use CLAUDE_USER instead of CLAUDE_MODEL because an empty
-        # CLAUDE_MODEL fails the model validation step downstream.
-        monkeypatch.setenv("CLAUDE_USER", "")
+        monkeypatch.setenv("CLAUDE_MAX_BUDGET_USD", "")
         _mock_user_configs(monkeypatch)
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             load_config()
-        assert "CLAUDE_USER in env is deprecated" not in caplog.text
+        assert "CLAUDE_MAX_BUDGET_USD in env is deprecated" not in caplog.text
 
 
 # ── GitHub repos empty warning ───────────────────────────────────────
 
 
 class TestGitHubReposWarning:
-    """Verify startup warning when GitHub features are on but no repos configured."""
+    """Startup warning when GitHub features are on but no repos configured.
 
-    def test_warns_when_pr_review_enabled_no_repos(self, monkeypatch, caplog):
-        """PR review enabled globally + no github_repos = warning."""
-        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
-        monkeypatch.setenv("PR_REVIEW_ENABLED", "true")
-        _mock_user_configs(monkeypatch)
-        with caplog.at_level(logging.WARNING, logger="kai.config"):
-            load_config()
-        assert "PR review" in caplog.text
-        assert "github_repos" in caplog.text
+    With Class A globals retired, the warning's gating signal is
+    per-user (`pr_review`/`issue_triage` in users.yaml). The check
+    runs once across all users.
+    """
 
-    def test_warns_when_issue_triage_enabled_no_repos(self, monkeypatch, caplog):
-        """Issue triage enabled globally + no github_repos = warning."""
-        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
-        monkeypatch.setenv("ISSUE_TRIAGE_ENABLED", "true")
-        _mock_user_configs(monkeypatch)
-        with caplog.at_level(logging.WARNING, logger="kai.config"):
-            load_config()
-        assert "issue triage" in caplog.text
-        assert "github_repos" in caplog.text
-
-    def test_warns_when_both_features_enabled_no_repos(self, monkeypatch, caplog):
-        """Both features enabled + no github_repos = warning naming both."""
-        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
-        monkeypatch.setenv("PR_REVIEW_ENABLED", "true")
-        monkeypatch.setenv("ISSUE_TRIAGE_ENABLED", "true")
-        _mock_user_configs(monkeypatch)
-        with caplog.at_level(logging.WARNING, logger="kai.config"):
-            load_config()
-        assert "PR review" in caplog.text
-        assert "issue triage" in caplog.text
-
-    def test_warns_when_per_user_pr_review_enabled_no_repos(self, monkeypatch, caplog):
-        """Per-user pr_review=True (no global env var) + no repos = warning."""
+    def test_warns_when_per_user_pr_review_no_repos(self, monkeypatch, caplog):
+        """A user with pr_review=True but no github_repos triggers the warning."""
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
         user = UserConfig(telegram_id=123, name="testuser", pr_review=True)
         monkeypatch.setattr("kai.config._load_user_configs", lambda *_a: {123: user})
@@ -994,50 +884,54 @@ class TestGitHubReposWarning:
         assert "PR review" in caplog.text
         assert "github_repos" in caplog.text
 
-    def test_no_warn_when_repos_configured(self, monkeypatch, caplog):
-        """No warning when at least one user has github_repos set."""
+    def test_warns_when_per_user_triage_no_repos(self, monkeypatch, caplog):
+        """A user with issue_triage=True but no github_repos triggers the warning."""
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
-        monkeypatch.setenv("PR_REVIEW_ENABLED", "true")
-        user = UserConfig(telegram_id=123, name="testuser", github_repos=["owner/repo"])
+        user = UserConfig(telegram_id=123, name="testuser", issue_triage=True)
         monkeypatch.setattr("kai.config._load_user_configs", lambda *_a: {123: user})
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             load_config()
-        # The github_repos warning should not fire; filter out deprecation
-        # warnings which also mention github_repos tangentially.
-        repo_warnings = [
-            r
-            for r in caplog.records
-            if r.levelno >= logging.WARNING and "github_repos" in r.message and "deprecated" not in r.message
-        ]
+        assert "issue triage" in caplog.text
+        assert "github_repos" in caplog.text
+
+    def test_warns_when_both_features_no_repos(self, monkeypatch, caplog):
+        """A user opted into both features without repos triggers a joint warning."""
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
+        user = UserConfig(telegram_id=123, name="testuser", pr_review=True, issue_triage=True)
+        monkeypatch.setattr("kai.config._load_user_configs", lambda *_a: {123: user})
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
+        assert "PR review" in caplog.text
+        assert "issue triage" in caplog.text
+
+    def test_no_warn_when_repos_configured(self, monkeypatch, caplog):
+        """No warning when the opted-in user has github_repos set."""
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
+        user = UserConfig(telegram_id=123, name="testuser", pr_review=True, github_repos=["owner/repo"])
+        monkeypatch.setattr("kai.config._load_user_configs", lambda *_a: {123: user})
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
+        repo_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and "github_repos" in r.message]
         assert repo_warnings == []
 
     def test_no_warn_when_features_disabled(self, monkeypatch, caplog):
-        """No warning when neither feature is enabled (empty repos is fine)."""
+        """No warning when no user opts into either feature."""
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
         _mock_user_configs(monkeypatch)
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             load_config()
-        repo_warnings = [
-            r
-            for r in caplog.records
-            if r.levelno >= logging.WARNING and "github_repos" in r.message and "deprecated" not in r.message
-        ]
+        repo_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and "github_repos" in r.message]
         assert repo_warnings == []
 
     def test_no_warn_when_any_user_has_repos(self, monkeypatch, caplog):
-        """No warning when at least one of multiple users has repos."""
+        """Across users, any single user with repos suppresses the warning."""
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
-        monkeypatch.setenv("PR_REVIEW_ENABLED", "true")
-        user_a = UserConfig(telegram_id=123, name="alice", github_repos=["owner/repo"])
+        user_a = UserConfig(telegram_id=123, name="alice", pr_review=True, github_repos=["owner/repo"])
         user_b = UserConfig(telegram_id=456, name="bob")
         monkeypatch.setattr("kai.config._load_user_configs", lambda *_a: {123: user_a, 456: user_b})
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             load_config()
-        repo_warnings = [
-            r
-            for r in caplog.records
-            if r.levelno >= logging.WARNING and "github_repos" in r.message and "deprecated" not in r.message
-        ]
+        repo_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and "github_repos" in r.message]
         assert repo_warnings == []
 
 
@@ -1070,13 +964,9 @@ class TestMinimalEnvWithUsersYaml:
         assert config.claude_timeout_seconds == 120
         assert config.budget_ceiling == 10.0
         assert config.claude_max_context_window == 0
-        assert config.claude_user is None
         assert config.workspace_base is None
         assert config.allowed_workspaces == []
-        assert config.pr_review_enabled is False
-        assert config.issue_triage_enabled is False
-        assert config.github_notify_chat_id is None
-        # users.yaml IDs replace ALLOWED_USER_IDS
+        # users.yaml IDs are the authorization surface
         assert config.allowed_user_ids == {123}
         assert config.user_configs is not None
 
@@ -1125,7 +1015,7 @@ class TestMinimalEnvWithUsersYaml:
         assert config.user_configs[123].workspace_base == tmp_path
 
     def test_github_settings_from_users_yaml_only(self, monkeypatch):
-        """GitHub routing works when env var globals are all unset."""
+        """GitHub routing reads from users.yaml only; no global env fallbacks remain."""
         for var, val in _MINIMAL_GLOBAL_ENV.items():
             monkeypatch.setenv(var, val)
         user = UserConfig(
@@ -1141,10 +1031,6 @@ class TestMinimalEnvWithUsersYaml:
             lambda *_a: {123: user},
         )
         config = load_config()
-        # Global env fallbacks are all at their defaults
-        assert config.pr_review_enabled is False
-        assert config.issue_triage_enabled is False
-        assert config.github_notify_chat_id is None
         # Per-user overrides are set
         assert config.user_configs is not None
         uc = config.user_configs[123]
@@ -1283,8 +1169,8 @@ class TestClaudeEffortLevel:
     string validated against a hard-coded allow-list pulled from
     `claude --help` output. Default "high" is intentional - it must
     match the operator's outer-Claude default so user-isolated inner
-    Claude (CLAUDE_USER / users.yaml `os_user`) does not silently
-    fall to whatever the binary picks as its own default. Tests here
+    Claude (users.yaml `os_user`) does not silently fall to whatever
+    the binary picks as its own default. Tests here
     cover happy path, allow-list rejection, and the two normalization
     behaviors (case + whitespace) that exist to absorb common copy-
     paste shapes from .env files."""

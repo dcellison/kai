@@ -697,11 +697,10 @@ async def _process_github_event_for_user(
     settings = await sessions.resolve_github_settings(chat_id, config)
     target_chat_id = settings["notify_chat_id"]
 
-    # Resolve per-user os_user for subprocess isolation.
-    # Falls back to the global claude_user when the user has no os_user
-    # or no UserConfig at all (legacy mode).
+    # Resolve per-user os_user for subprocess isolation. None falls
+    # back to "run as the bot's own OS user" inside the agent backend.
     user_config = config.get_user_config(chat_id)
-    claude_user = user_config.os_user if user_config and user_config.os_user else config.claude_user
+    claude_user = user_config.os_user if user_config and user_config.os_user else None
 
     # Resolve per-user backend/provider for the review/triage agents.
     # Same resolution logic as pool.py _create_instance: per-user
@@ -2076,7 +2075,6 @@ async def start(telegram_app, config) -> None:
     _app["pr_review_timeout_s"] = config.pr_review_timeout_s
     _app["pr_review_budget_usd"] = config.pr_review_budget_usd
     _app["webhook_port"] = config.webhook_port
-    _app["claude_user"] = config.claude_user
 
     # Workspace config for review agent repo resolution. These let
     # _resolve_local_repo() match incoming PR webhook repos against
@@ -2104,10 +2102,6 @@ async def start(telegram_app, config) -> None:
                     uid,
                     val,
                 )
-    # Also add the global env var fallback if set
-    if config.github_notify_chat_id is not None:
-        _app["allowed_user_ids"].add(config.github_notify_chat_id)
-
     _app.router.add_get("/health", _handle_health)
 
     # Only register the Telegram webhook route in webhook mode. In polling mode,
