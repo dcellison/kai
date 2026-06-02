@@ -50,6 +50,7 @@ from kai.config import (
     PROVIDER_MODELS,
     VALID_BACKENDS,
     VALID_PROVIDERS,
+    _read_protected_file,
     models_for_backend,
     validate_model_for_backend,
 )
@@ -511,6 +512,28 @@ def _cmd_config() -> None:
         existing.get("deployment_mode", "protected"),
     )
     print()
+
+    # Migration safety: if the operator picks single_user but a
+    # readable `/etc/kai/env` exists from a previous protected install,
+    # the runtime predicate in `config._resolve_users_yaml_path` will
+    # still see the protected env as authoritative and route at
+    # `/etc/kai/users.yaml`, silently bypassing the single-user
+    # artifacts we are about to write. The runtime cannot tell which
+    # is the operator's intent; the wizard refuses up front so the
+    # operator removes the protected leftovers before reaching that
+    # ambiguous state. A protected install on a host whose operator
+    # has the sudoers cat rule from a prior `sudo make install` is
+    # the typical trigger.
+    if deployment_mode == "single_user" and _read_protected_file("/etc/kai/env"):
+        raise SystemExit(
+            "single_user mode was selected, but /etc/kai/env is readable from a "
+            "previous protected install. The runtime would still boot from the "
+            "protected files, silently ignoring the single-user artifacts. "
+            "Remove the protected install before retrying:\n"
+            "    sudo rm -rf /etc/kai\n"
+            "    sudo rm -f /etc/sudoers.d/kai\n"
+            "Then re-run 'make config' and pick single_user."
+        )
 
     # In single-user mode the install location, data directory,
     # service user, and platform service manager are not relevant:

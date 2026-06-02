@@ -6738,6 +6738,19 @@ class TestCmdConfigSingleUserMode:
         """
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
 
+    @staticmethod
+    def _no_protected_artifacts(monkeypatch):
+        """Pretend the host has no readable /etc/kai/env.
+
+        The wizard's single-user refusal check probes the protected env
+        file via sudo-cat; tests run against the live operator machine
+        would otherwise trip the refusal because the production install
+        leaves /etc/kai/env readable through the sudoers rule. Stubbing
+        the reader to None simulates a clean host with no protected
+        leftovers.
+        """
+        monkeypatch.setattr("kai.install._read_protected_file", lambda path: None)
+
     def test_writes_xdg_users_yaml_and_local_env(self, tmp_path, monkeypatch):
         """Single-user fresh install: users.yaml lands under XDG,
         runtime env lands at PROJECT_ROOT/.env, install.conf records
@@ -6748,6 +6761,7 @@ class TestCmdConfigSingleUserMode:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         TestCmdConfig._block_etc_kai(monkeypatch)
         self._redirect_xdg(monkeypatch, tmp_path)
+        self._no_protected_artifacts(monkeypatch)
 
         inputs = iter(self._single_user_inputs())
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
@@ -6773,6 +6787,62 @@ class TestCmdConfigSingleUserMode:
         # business consuming.
         assert "users_yaml_staging_path" not in conf
 
+    def test_refuses_single_user_when_protected_env_is_readable(self, tmp_path, monkeypatch):
+        """Migration guard: a host with a previous protected install
+        leaves /etc/kai/env readable through the sudoers rule. The
+        runtime's resolver would still see that as authoritative and
+        boot from the protected artifacts, silently ignoring the
+        single-user files the wizard is about to write. The wizard
+        refuses up front with an actionable removal recipe.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        TestCmdConfig._block_etc_kai(monkeypatch)
+        self._redirect_xdg(monkeypatch, tmp_path)
+        # Simulate the leftover sudoers rule: /etc/kai/env reads back
+        # non-empty content via sudo -n cat.
+        monkeypatch.setattr(
+            "kai.install._read_protected_file",
+            lambda path: "TELEGRAM_BOT_TOKEN=leftover\n" if path == "/etc/kai/env" else None,
+        )
+
+        # Only the deployment_mode prompt is reached before the refusal
+        # fires; the rest of the chain is unused but kept here so the
+        # test does not depend on prompt-count specifics.
+        inputs = iter(["single_user"] + ["x"] * 50)
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        with pytest.raises(SystemExit, match="single_user mode was selected"):
+            _cmd_config()
+
+    def test_protected_mode_unaffected_by_protected_env_check(self, tmp_path, monkeypatch):
+        """Protected mode does not consult the single-user refusal
+        check. Re-running `make config` on a working protected install
+        must continue to work even though /etc/kai/env is readable
+        (which is the normal protected-install state).
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        TestCmdConfig._simulate_existing_etc_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n",
+        )
+        # /etc/kai/env reads back content (sudoers rule from a real
+        # protected install). The refusal must NOT fire for protected mode.
+        monkeypatch.setattr(
+            "kai.install._read_protected_file",
+            lambda path: "TELEGRAM_BOT_TOKEN=current\n" if path == "/etc/kai/env" else None,
+        )
+
+        inputs = iter(TestCmdConfig._base_inputs(memory_block=["false"]))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        _cmd_config()
+        # install.conf written with deployment_mode=protected; no
+        # SystemExit means the refusal did not fire.
+        conf = json.loads((tmp_path / "install.conf").read_text())
+        assert conf["deployment_mode"] == "protected"
+
     def test_writes_users_yaml_parent_mode_0700(self, tmp_path, monkeypatch):
         """Operator-private parent directory: the XDG kai/ subdir is
         created mode 0700 so a freshly minted users.yaml inherits a
@@ -6783,6 +6853,7 @@ class TestCmdConfigSingleUserMode:
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         TestCmdConfig._block_etc_kai(monkeypatch)
         self._redirect_xdg(monkeypatch, tmp_path)
+        self._no_protected_artifacts(monkeypatch)
 
         inputs = iter(self._single_user_inputs())
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
