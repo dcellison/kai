@@ -1773,6 +1773,33 @@ class TestExtractionEligibleBackendsHelper:
         eligible = _compute_extraction_eligible_backends("claude", configs, True)
         assert eligible == {"claude"}
 
+    def test_opencode_users_contribute_to_eligible_set(self):
+        """An opencode user with extraction enabled appears in the
+        eligible set. Mirrors the runtime gate at bot.py that now
+        admits opencode users to the extraction path. Without this
+        widening the precondition / binary-resolution loop at
+        config-load would skip the opencode validation and the
+        per-turn extractor would race against an unvalidated binary."""
+        from kai.config import UserConfig, _compute_extraction_eligible_backends
+
+        configs = {
+            1: UserConfig(telegram_id=1, name="alice", os_user="a"),
+            2: UserConfig(telegram_id=2, name="bob", os_user="b", agent_backend="opencode"),
+        }
+        eligible = _compute_extraction_eligible_backends("claude", configs, True)
+        assert eligible == {"claude", "opencode"}
+
+    def test_global_opencode_with_no_users_yields_opencode_only(self):
+        """Single-user opencode install (global AGENT_BACKEND=opencode,
+        empty users dict) still produces an empty eligible set because
+        the cascade only counts users present in the dict. This is the
+        same shape the claude / codex paths produce for an empty
+        users dict and is intentional: the precondition check fires
+        per actual user, not per global default."""
+        from kai.config import _compute_extraction_eligible_backends
+
+        assert _compute_extraction_eligible_backends("opencode", {}, True) == set()
+
 
 class TestConfigNoMemoryModelFields:
     """Regression guard for issue #515 field removal. A future
@@ -2318,6 +2345,56 @@ class TestModelRegistry:
         from kai.config import CODEX_MODELS
 
         assert MODEL_REGISTRY[("codex", ModelRole.BEHAVIORAL_JUDGE)] in CODEX_MODELS
+
+    def test_completeness_check_passes_for_opencode(self):
+        """OpenCode has rows for every role; no exception. Mirrors
+        the claude and codex completeness gates so a future role
+        addition without an opencode row fails fast at startup."""
+        _check_model_registry_complete("opencode")  # no raise
+
+    def test_opencode_row_must_be_provider_slash_model_shape(self, monkeypatch):
+        """
+        An opencode registry row pointing at a bare name like "sonnet"
+        (correct for claude / goose / codex but wrong for opencode)
+        must fail at config-load. Without this guard the value would
+        persist through model resolution and reach
+        OPENCODE_CONFIG_CONTENT='{"model": "sonnet"}' where the
+        opencode handshake rejects it as an unknown provider/model,
+        with no Kai-side pointer back to the registry typo.
+        """
+        monkeypatch.setitem(MODEL_REGISTRY, ("opencode", ModelRole.BEHAVIORAL_JUDGE), "sonnet")
+        with pytest.raises(SystemExit) as excinfo:
+            _check_model_registry_complete("opencode")
+        msg = str(excinfo.value)
+        assert "provider/model" in msg
+        assert "behavioral_judge" in msg
+
+    def test_opencode_all_registry_rows_are_provider_slash_model_shape(self):
+        """
+        Lock the runtime invariant: every opencode registry row
+        passes is_opencode_model_shape. Belt-and-braces companion
+        to the synthetic-corruption test above; the registry rows
+        are what operators edit when calibrating, and a regression
+        here is the failure the synthetic test simulates.
+        """
+        from kai.config import is_opencode_model_shape
+
+        for role in ModelRole:
+            value = MODEL_REGISTRY[("opencode", role)]
+            assert is_opencode_model_shape(value), f"opencode {role.value}={value!r} is not provider/model"
+
+    def test_completeness_check_raises_on_missing_opencode_row(self, monkeypatch):
+        """
+        Synthetic missing-row case for opencode: drop a registry
+        entry and assert SystemExit with a clear message. Mirrors
+        the claude test above so the completeness gate's per-backend
+        symmetry stays pinned.
+        """
+        monkeypatch.delitem(MODEL_REGISTRY, ("opencode", ModelRole.PR_REVIEW))
+        with pytest.raises(SystemExit) as excinfo:
+            _check_model_registry_complete("opencode")
+        assert "pr_review" in str(excinfo.value)
+        assert "opencode" in str(excinfo.value)
 
     # ── Claude row equals prior constant (Phase 1 invariant) ──────
 

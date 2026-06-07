@@ -2588,3 +2588,78 @@ class TestOpenCodeOneShotReasonerCleanup:
             await reasoner.run(prompt="p", purpose="fact_extraction")
 
         proc.kill.assert_called_once()
+
+
+@pytest.mark.routing_test
+class TestOpenCodeOneShotReasonerSudoWrap:
+    """Cross-user routing: when `os_user` resolves to a non-bot user
+    via `resolve_claude_user`, the argv MUST be wrapped in
+    `sudo -H -u <user> --preserve-env=<csv> --` with the opencode
+    preserve list. The `routing_test` marker opts out of the autouse
+    bypass fixture so the production routing path is exercised in
+    full."""
+
+    @pytest.mark.asyncio
+    async def test_sudo_wrap_argv_shape(self, tmp_path):
+        """Argv starts with `sudo -H -u <target>`, carries the
+        opencode preserve-env CSV, then the resolved opencode binary
+        and `acp`. The exact ordering matches `_wrap_cmd_for_user`."""
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user="some_other_user")
+        proc = _make_acp_proc(
+            _opencode_handshake_lines() + [_rpc_response_line(request_id=3, result={"stopReason": "end_turn"})]
+        )
+
+        async def _noop_kill(**kwargs) -> None:
+            return None
+
+        with (
+            # Force `resolve_claude_user` to return the target as a
+            # non-bot user so the wrap fires; the routing_test marker
+            # already opts out of the autouse bypass.
+            patch("kai.oneshot.resolve_claude_user", side_effect=lambda u: u),
+            patch("kai.oneshot._kill_target_user_tree", side_effect=_noop_kill),
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec,
+        ):
+            await reasoner.run(prompt="hi", purpose="fact_extraction")
+
+        cmd = mock_exec.call_args_list[0][0]
+        assert cmd[0] == "sudo"
+        assert cmd[1] == "-H"
+        assert cmd[2] == "-u"
+        assert cmd[3] == "some_other_user"
+        # preserve-env is the fifth element; the value carries every
+        # _OPENCODE_PRESERVED_AUTH_VARS entry in a comma-separated CSV.
+        assert cmd[4].startswith("--preserve-env=")
+        csv = cmd[4][len("--preserve-env=") :]
+        preserved = set(csv.split(","))
+        assert preserved == set(_OPENCODE_PRESERVED_AUTH_VARS)
+        # `--` ends the sudo options; the wrapped argv (opencode acp)
+        # follows.
+        assert cmd[5] == "--"
+        assert cmd[6] == "opencode"
+        assert cmd[7] == "acp"
+
+    @pytest.mark.asyncio
+    async def test_sudo_wrap_uses_start_new_session_true(self, tmp_path):
+        """The wrap path passes `start_new_session=True` so a future
+        cross-user kill has a process group to target. Direct path
+        keeps the default; the wrap path needs the new session because
+        signal permissions prevent the bot user from signaling the
+        target user's descendants directly."""
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user="some_other_user")
+        proc = _make_acp_proc(
+            _opencode_handshake_lines() + [_rpc_response_line(request_id=3, result={"stopReason": "end_turn"})]
+        )
+
+        async def _noop_kill(**kwargs) -> None:
+            return None
+
+        with (
+            patch("kai.oneshot.resolve_claude_user", side_effect=lambda u: u),
+            patch("kai.oneshot._kill_target_user_tree", side_effect=_noop_kill),
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec,
+        ):
+            await reasoner.run(prompt="hi", purpose="fact_extraction")
+
+        spawn_kwargs = mock_exec.call_args_list[0].kwargs
+        assert spawn_kwargs["start_new_session"] is True

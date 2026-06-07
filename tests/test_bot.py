@@ -3263,6 +3263,94 @@ class TestHandleResponse:
         extract_mock.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_extraction_invoked_for_opencode_users(self, monkeypatch):
+        """The bot.py extraction gate now admits opencode users. Pin
+        that an effective `agent_backend="opencode"` flows through the
+        post-response ingestion path and calls extract_and_store. The
+        gate widening at bot.py:_ingest_memory is what unlocks the
+        opencode one-shot reasoner; a regression that reverts the
+        tuple literal would silently lose extraction for opencode
+        users while leaving claude / codex flowing."""
+        from kai.bot import _handle_response
+        from kai.config import UserConfig
+
+        monkeypatch.setattr("kai.memory.is_enabled", lambda: True)
+        extract_mock = AsyncMock()
+        monkeypatch.setattr("kai.memory_extraction.extract_and_store", extract_mock)
+
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Hello world", session_id="sess-1")))
+        # Per-user opencode override on a global-claude install; the
+        # bot.py gate consults the effective backend (user override
+        # wins), which is the same shape an all-opencode install
+        # produces for the gate.
+        config = _make_config(
+            memory_extraction_enabled=True,
+            episode_classifier_context_turns=0,
+            user_configs={
+                12345: UserConfig(
+                    telegram_id=12345,
+                    name="opencode-user",
+                    agent_backend="opencode",
+                ),
+            },
+        )
+        ctx = _make_context(config=config, pool=pool)
+
+        tasks_before = asyncio.all_tasks()
+
+        with patch.multiple("kai.bot", **self._base_patches()):
+            await _handle_response(update, ctx, 12345, "test prompt", pool, "anthropic/claude-sonnet-4-5")
+
+        new_tasks = asyncio.all_tasks() - tasks_before - {asyncio.current_task()}
+        if new_tasks:
+            await asyncio.gather(*new_tasks)
+
+        extract_mock.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_extraction_skipped_for_goose_users(self, monkeypatch):
+        """Symmetric guard: goose users must NOT reach the extractor.
+        The gate widening for opencode must not have widened to goose
+        too; goose has no OneShotReasoner implementation, so an
+        extraction attempt would crash."""
+        from kai.bot import _handle_response
+        from kai.config import UserConfig
+
+        monkeypatch.setattr("kai.memory.is_enabled", lambda: True)
+        extract_mock = AsyncMock()
+        monkeypatch.setattr("kai.memory_extraction.extract_and_store", extract_mock)
+
+        update = _make_update()
+        pool = _make_mock_claude()
+        pool.send = MagicMock(return_value=_fake_stream(_done_event("Hello world", session_id="sess-1")))
+        config = _make_config(
+            memory_extraction_enabled=True,
+            episode_classifier_context_turns=0,
+            user_configs={
+                12345: UserConfig(
+                    telegram_id=12345,
+                    name="goose-user",
+                    agent_backend="goose",
+                    llm_provider="openai",
+                ),
+            },
+        )
+        ctx = _make_context(config=config, pool=pool)
+
+        tasks_before = asyncio.all_tasks()
+
+        with patch.multiple("kai.bot", **self._base_patches()):
+            await _handle_response(update, ctx, 12345, "test prompt", pool, "gpt-4")
+
+        new_tasks = asyncio.all_tasks() - tasks_before - {asyncio.current_task()}
+        if new_tasks:
+            await asyncio.gather(*new_tasks, return_exceptions=True)
+
+        extract_mock.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_memory_ingest_task_held_by_module_set(self, monkeypatch):
         """The ingest task is added to `_pending_memory_tasks` at
         schedule time and discarded by the done-callback after the
