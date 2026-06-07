@@ -1663,6 +1663,142 @@ class TestCodexCrossUserTeardown:
         assert c._inner_codex_pids == []
 
 
+class TestSudoKillEsrchDemotion:
+    """
+    The `/bin/kill` ESRCH stderr means the inner codex exited on its
+    own between the PID cache time and the signal delivery; the
+    process is already reaped, not orphaned. Both signal paths
+    (`_async_sudo_kill` and `_send_signal`) must demote that case to
+    DEBUG so the WARNING stream stays focused on real failure modes
+    (sudoers missing, signal permission denied, kill binary missing).
+    The helper `CodexBackend._stderr_is_esrch` discriminates; the two
+    call sites both consult it.
+    """
+
+    def test_stderr_is_esrch_helper(self):
+        """Pure unit test of the discriminator. Matching substring is
+        the POSIX `strerror(ESRCH)` text; everything else returns
+        False, including `None` and empty bytes."""
+        # Matching: the exact macOS/Linux /bin/kill diagnostic.
+        assert CodexBackend._stderr_is_esrch(b"kill: 12345: No such process\n") is True
+        # Matching: the substring fires regardless of prefix shape.
+        assert CodexBackend._stderr_is_esrch(b"No such process") is True
+        # Non-matching: real failure modes that must keep the WARNING.
+        assert CodexBackend._stderr_is_esrch(b"a password is required") is False
+        assert CodexBackend._stderr_is_esrch(b"kill: Operation not permitted") is False
+        # Empty / None: a missing-stderr rc!=0 is itself unusual and
+        # should keep the WARNING.
+        assert CodexBackend._stderr_is_esrch(b"") is False
+        assert CodexBackend._stderr_is_esrch(None) is False
+
+    @pytest.mark.asyncio
+    async def test_async_sudo_kill_esrch_demoted_to_debug(self, caplog):
+        """The async path's rc=1 + ESRCH stderr fires the DEBUG branch
+        with the "already gone (ESRCH); benign race" message; no
+        WARNING record appears."""
+        c = _make_codex(codex_user="ci-fake-user")
+
+        sudo_proc = MagicMock()
+        sudo_proc.returncode = 1
+        sudo_proc.communicate = AsyncMock(return_value=(b"", b"kill: 99999: No such process\n"))
+
+        # Capture at DEBUG so both the new DEBUG record and any
+        # accidental WARNING land in caplog.records.
+        with (
+            patch("kai.codex.asyncio.create_subprocess_exec", AsyncMock(return_value=sudo_proc)),
+            caplog.at_level("DEBUG", logger="kai.codex"),
+        ):
+            await c._async_sudo_kill(target_user="ci-fake-user", pid=99999, sig=int(signal.SIGKILL))
+
+        # No WARNING: the benign race must not pollute the operator's
+        # WARNING stream.
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert warnings == [], f"expected no WARNING, got {warnings}"
+        # One DEBUG line carrying the distinctive ESRCH-race text so
+        # an operator grepping for it can count race frequency.
+        debugs = [r for r in caplog.records if r.levelname == "DEBUG"]
+        assert any("already gone (ESRCH); benign race" in r.message for r in debugs)
+
+    @pytest.mark.asyncio
+    async def test_async_sudo_kill_real_failure_warns(self, caplog):
+        """A non-ESRCH rc!=0 (e.g., sudoers misconfiguration) keeps the
+        existing WARNING text. Without this guard the ESRCH demotion
+        would mask real failure modes."""
+        c = _make_codex(codex_user="ci-fake-user")
+
+        sudo_proc = MagicMock()
+        sudo_proc.returncode = 1
+        sudo_proc.communicate = AsyncMock(return_value=(b"", b"sudo: a password is required\n"))
+
+        with (
+            patch("kai.codex.asyncio.create_subprocess_exec", AsyncMock(return_value=sudo_proc)),
+            caplog.at_level("WARNING", logger="kai.codex"),
+        ):
+            await c._async_sudo_kill(target_user="ci-fake-user", pid=99999, sig=int(signal.SIGKILL))
+
+        # Pin both the WARNING text and the "may orphan" suffix so a
+        # future log-format change cannot silently break the alert
+        # rules that watch this string.
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert any("sudo kill escalation failed" in r.message for r in warnings)
+        assert any("may orphan" in r.message for r in warnings)
+
+    def test_send_signal_esrch_demoted_to_debug(self, caplog):
+        """The synchronous path's rc=1 + ESRCH stderr fires the DEBUG
+        branch with no WARNING. Mirrors the async test; both paths
+        must stay in lockstep."""
+        c = _make_codex(codex_user="ci-fake-user")
+        c._proc = MagicMock()
+        c._proc.pid = 12345
+        c._pgid = 12345
+        c._effective_codex_user = "ci-fake-user"
+        c._inner_codex_pids = [67890]
+        c._stderr_task = MagicMock()
+
+        sudo_kill_result = MagicMock()
+        sudo_kill_result.returncode = 1
+        sudo_kill_result.stderr = b"kill: 67890: No such process\n"
+
+        with (
+            patch("kai.codex.subprocess.run", return_value=sudo_kill_result),
+            patch("kai.codex.os.killpg"),
+            caplog.at_level("DEBUG", logger="kai.codex"),
+        ):
+            c.force_kill()
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert warnings == [], f"expected no WARNING, got {warnings}"
+        debugs = [r for r in caplog.records if r.levelname == "DEBUG"]
+        assert any("already gone (ESRCH); benign race" in r.message for r in debugs)
+
+    def test_send_signal_real_failure_warns(self, caplog):
+        """Non-ESRCH rc!=0 at the synchronous site keeps the WARNING.
+        Symmetric guard to the async case; covers the
+        `subprocess.run`-shaped path that `force_kill` drives."""
+        c = _make_codex(codex_user="ci-fake-user")
+        c._proc = MagicMock()
+        c._proc.pid = 12345
+        c._pgid = 12345
+        c._effective_codex_user = "ci-fake-user"
+        c._inner_codex_pids = [67890]
+        c._stderr_task = MagicMock()
+
+        sudo_kill_result = MagicMock()
+        sudo_kill_result.returncode = 1
+        sudo_kill_result.stderr = b"kill: Operation not permitted\n"
+
+        with (
+            patch("kai.codex.subprocess.run", return_value=sudo_kill_result),
+            patch("kai.codex.os.killpg"),
+            caplog.at_level("WARNING", logger="kai.codex"),
+        ):
+            c.force_kill()
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert any("sudo kill escalation failed" in r.message for r in warnings)
+        assert any("may orphan" in r.message for r in warnings)
+
+
 class TestCodexGrandchildEscalation:
     """
     Codex's npm-global packaging interposes a `node` wrapper between

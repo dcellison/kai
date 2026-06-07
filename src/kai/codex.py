@@ -1108,6 +1108,39 @@ class CodexBackend(AgentBackend):
         except ValueError:
             return None
 
+    @staticmethod
+    def _stderr_is_esrch(stderr: bytes | None) -> bool:
+        """
+        True iff `stderr` contains the POSIX ESRCH diagnostic from
+        `/bin/kill` for a no-such-process condition.
+
+        Used by `_async_sudo_kill` and `_send_signal` to discriminate
+        the benign race (inner codex already exited between PID cache
+        and signal delivery; kill returns rc=1 with "No such process")
+        from real failure modes (sudoers misconfiguration, signal
+        permission denied, kill binary missing). The benign case
+        demotes to DEBUG; everything else keeps the existing WARNING.
+
+        Substring match because BSD `/bin/kill` on macOS and util-linux
+        `kill` on Linux both emit `kill: <pid>: No such process\\n`;
+        the prefix varies slightly but the "No such process" portion is
+        the stable POSIX `strerror(ESRCH)` text. Case-sensitive because
+        that diagnostic is fixed by libc and not localized for these
+        binaries on any production platform.
+
+        Returns False on `None` or empty bytes so a missing-stderr
+        rc!=0 (itself unusual and probably a real failure) keeps the
+        WARNING.
+
+        Bytes rather than decoded str because both call sites already
+        hold raw bytes from the subprocess result; keeping the helper
+        one level lower avoids duplicating the `.decode(errors="replace")`
+        rendering the WARNING line already does for display.
+        """
+        if not stderr:
+            return False
+        return b"No such process" in stderr
+
     async def _async_sudo_kill(self, target_user: str, pid: int, sig: int) -> None:
         """
         Run `sudo -n -u <target> /bin/kill -<sig> <pid>` without blocking.
@@ -1152,12 +1185,25 @@ class CodexBackend(AgentBackend):
             )
             return
         if proc.returncode != 0:
-            log.warning(
-                "sudo kill escalation failed (rc=%d, stderr=%r); inner codex pid=%d may orphan",
-                proc.returncode,
-                stderr_bytes[:200].decode(errors="replace") if stderr_bytes else "",
-                pid,
-            )
+            # ESRCH from `/bin/kill` means the inner codex exited on its
+            # own between the PID cache time and this signal delivery;
+            # the process is already reaped, not orphaned. Demoting the
+            # benign race to DEBUG keeps the WARNING stream focused on
+            # real failures (sudoers missing, signal permission denied,
+            # kill binary missing) that an operator actually needs to
+            # see.
+            if self._stderr_is_esrch(stderr_bytes):
+                log.debug(
+                    "sudo kill escalation: inner codex pid=%d already gone (ESRCH); benign race",
+                    pid,
+                )
+            else:
+                log.warning(
+                    "sudo kill escalation failed (rc=%d, stderr=%r); inner codex pid=%d may orphan",
+                    proc.returncode,
+                    stderr_bytes[:200].decode(errors="replace") if stderr_bytes else "",
+                    pid,
+                )
 
     def _send_signal(self, sig: int) -> None:
         """
@@ -1216,12 +1262,25 @@ class CodexBackend(AgentBackend):
                             check=False,
                         )
                         if result.returncode != 0:
-                            log.warning(
-                                "sudo kill escalation failed (rc=%d, stderr=%r); codex pid=%d may orphan",
-                                result.returncode,
-                                result.stderr[:200].decode(errors="replace") if result.stderr else "",
-                                pid,
-                            )
+                            # ESRCH branches to DEBUG; everything else
+                            # keeps the WARNING. See `_async_sudo_kill`
+                            # for the full rationale; the two call
+                            # sites must stay in lockstep so the
+                            # operator-visible WARNING surface is the
+                            # same regardless of which path delivered
+                            # the signal.
+                            if self._stderr_is_esrch(result.stderr):
+                                log.debug(
+                                    "sudo kill escalation: codex pid=%d already gone (ESRCH); benign race",
+                                    pid,
+                                )
+                            else:
+                                log.warning(
+                                    "sudo kill escalation failed (rc=%d, stderr=%r); codex pid=%d may orphan",
+                                    result.returncode,
+                                    result.stderr[:200].decode(errors="replace") if result.stderr else "",
+                                    pid,
+                                )
                     except (subprocess.TimeoutExpired, OSError):
                         # Inner codex already dead, sudoers rule
                         # missing on an old install, or kill timed
