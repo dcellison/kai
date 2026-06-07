@@ -374,6 +374,25 @@ class AcpBackend(AgentBackend):
             return msg["error"].get("message", "unknown ACP error")
         return None
 
+    def combine_text_chunks(self, prev: str, new: str) -> str:
+        """
+        Combine two streamed text chunks during prompt-response
+        accumulation. Default is verbatim concatenation (`prev + new`),
+        which is right for Goose and any future ACP harness whose
+        chunk boundaries already carry their own whitespace.
+        OpenCode overrides this to inject a single space at
+        sentence-boundary joins where the model dropped the space
+        between chunks; see `OpenCodeBackend.combine_text_chunks`
+        and `kai.opencode.concat_opencode_text` for the heuristic
+        and rationale.
+
+        The hook fires per chunk pair, not per accumulated string,
+        so backends that need a more elaborate normalization can
+        keep per-pair state in instance attributes if they need to.
+        Today only the simple lookahead-at-last-char shape is used.
+        """
+        return prev + new
+
     def handle_server_request(self, msg: dict) -> dict | None:
         """
         Return a JSON-RPC `result` payload for a server-initiated request.
@@ -785,10 +804,13 @@ class AcpBackend(AgentBackend):
                 # Streaming notifications (no id field) - extract user-
                 # visible text via the hook and accumulate; skip every
                 # other notification shape (tool calls, thoughts, etc.).
+                # `combine_text_chunks` is the seam where OpenCode
+                # injects sentence-boundary whitespace; Goose's default
+                # is verbatim `prev + new`.
                 if "method" in msg and "id" not in msg:
                     text = self.extract_text_delta(msg)
                     if text:
-                        accumulated += text
+                        accumulated = self.combine_text_chunks(accumulated, text)
                         yield StreamEvent(text_so_far=accumulated)
                     continue
 

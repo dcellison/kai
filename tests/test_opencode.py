@@ -607,3 +607,127 @@ class TestHandleOpencodePermissionRequestFreeFunction:
         }
         result = handle_opencode_permission_request(msg, policy="allow_always")
         assert result == {"outcome": {"outcome": "selected", "optionId": "x-id"}}
+
+
+class TestConcatOpencodeText:
+    """The sentence-boundary whitespace heuristic. Injects exactly
+    one space when prev ends in `.`, `!`, or `?` and new begins with
+    an uppercase letter; verbatim concat otherwise. Empty inputs
+    round-trip so the accumulator's first-chunk join does not
+    inject a spurious leading space."""
+
+    def test_sentence_boundary_injects_space(self):
+        from kai.opencode import concat_opencode_text
+
+        # The operator-observed example that motivated this fix.
+        assert (
+            concat_opencode_text("Let me read the rest of the diff.", "Now let me read the test files")
+            == "Let me read the rest of the diff. Now let me read the test files"
+        )
+
+    def test_question_and_exclamation_also_inject(self):
+        from kai.opencode import concat_opencode_text
+
+        assert concat_opencode_text("Ready?", "Then proceed") == "Ready? Then proceed"
+        assert concat_opencode_text("Done!", "Next step") == "Done! Next step"
+
+    def test_lowercase_start_does_not_inject(self):
+        """Lowercase sentence starts are a known miss; the false-
+        positive cost of widening the trigger is higher than the
+        rare miss. Pins the heuristic so a future widening is a
+        deliberate decision, not a drift."""
+        from kai.opencode import concat_opencode_text
+
+        assert concat_opencode_text("First.", "second sentence") == "First.second sentence"
+
+    def test_word_continuation_does_not_inject(self):
+        """A chunk split mid-word must NOT inject a space. Without
+        this guard the heuristic would damage the operator's view of
+        the streamed text in a worse way than the original gap."""
+        from kai.opencode import concat_opencode_text
+
+        # No trailing punctuation -> no space injected.
+        assert concat_opencode_text("hel", "lo world") == "hello world"
+        # Word continuation across a chunk that ends in a letter.
+        assert concat_opencode_text("write the implement", "ation") == "write the implementation"
+
+    def test_code_and_numeric_boundaries_do_not_inject(self):
+        """The heuristic must preserve verbatim joins for code (open
+        paren after a function name), version strings, URLs, and
+        markdown headers. Narrow trigger keeps these safe."""
+        from kai.opencode import concat_opencode_text
+
+        # Code: function call.
+        assert concat_opencode_text("function", "(arg)") == "function(arg)"
+        # Numeric: version string fragments. "1." + "2.3" is the
+        # canonical case where the dot is NOT a sentence terminator.
+        assert concat_opencode_text("1.", "2.3") == "1.2.3"
+        # URL: `://` shape.
+        assert concat_opencode_text("https", "://example.com") == "https://example.com"
+        # Markdown: header start without a space. `#` is not
+        # alphabetic, so `isupper()` returns False and the heuristic
+        # leaves the join verbatim. The rendered markdown is still
+        # correct because the parser treats `##` as a header regardless
+        # of the preceding punctuation, so verbatim is the right
+        # default here too.
+        assert concat_opencode_text("intro.", "## Section") == "intro.## Section"
+
+    def test_empty_inputs_round_trip(self):
+        """Empty `prev` (the accumulator's first-chunk state) must
+        return `new` verbatim; otherwise the first user-visible
+        chunk would gain a leading space. Symmetric for empty `new`."""
+        from kai.opencode import concat_opencode_text
+
+        assert concat_opencode_text("", "Hello") == "Hello"
+        assert concat_opencode_text("Hello", "") == "Hello"
+        assert concat_opencode_text("", "") == ""
+
+
+class TestCombineTextChunksHook:
+    """`combine_text_chunks` is the AcpBackend hook the conversational
+    backend's read loop calls. OpenCode overrides it to inject
+    sentence-boundary whitespace; Goose (and any other future ACP
+    harness) keeps the default verbatim concat so its behavior is
+    unaffected by this change."""
+
+    def test_opencode_backend_combines_with_smart_concat(self):
+        backend = _make_opencode()
+        assert backend.combine_text_chunks("First sentence.", "Second sentence") == "First sentence. Second sentence"
+
+    def test_opencode_backend_verbatim_for_non_sentence_boundary(self):
+        backend = _make_opencode()
+        assert backend.combine_text_chunks("partial", "continuation") == "partialcontinuation"
+
+    def test_acp_default_is_verbatim_concat(self):
+        """The default on `AcpBackend.combine_text_chunks` is
+        `prev + new`. Goose inherits this and stays unchanged; this
+        guards against an accidental widening of the new hook to
+        every backend."""
+        from kai.acp import AcpBackend
+        from kai.backend import AgentBackend
+
+        # Direct call via the class to bypass any subclass override.
+        # Mirrors the pattern existing _FakeAcp tests use to assert
+        # default hook behavior without instantiating a concrete
+        # AcpBackend subclass.
+        class _DefaultAcp(AcpBackend):
+            backend_name = "default_test"
+            backend_label = "DefaultTest"
+
+            def build_argv(self) -> list[str]:
+                return []
+
+            def build_env(self, base_env: dict[str, str]) -> dict[str, str]:
+                return base_env
+
+            def build_session_new_params(self) -> dict:
+                return {}
+
+            def extract_text_delta(self, msg: dict) -> str | None:
+                return None
+
+        assert issubclass(_DefaultAcp, AgentBackend)
+        backend = _DefaultAcp(model="m", workspace=Path("/tmp/x"), timeout_seconds=10)
+        # Sentence boundary that OpenCode would treat as a join site;
+        # the default backend leaves it verbatim.
+        assert backend.combine_text_chunks("End.", "Start") == "End.Start"

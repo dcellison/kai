@@ -42,7 +42,11 @@ from kai.acp import read_result, write_rpc
 from kai.codex_exec import extract_codex_text
 from kai.config import DATA_DIR, resolve_claude_user
 from kai.oneshot_binary import BinaryResolutionError, resolve_oneshot_binary
-from kai.opencode import extract_opencode_text_delta, handle_opencode_permission_request
+from kai.opencode import (
+    concat_opencode_text,
+    extract_opencode_text_delta,
+    handle_opencode_permission_request,
+)
 from kai.prompt_utils import make_boundary
 
 log = logging.getLogger(__name__)
@@ -1868,12 +1872,17 @@ class OpenCodeOneShotReasoner:
                 continue
 
             # Streaming notification (no `id` field). Accumulate text
-            # via the shared free function; skip every other
-            # notification shape.
+            # via the shared free functions; skip every other
+            # notification shape. `concat_opencode_text` handles the
+            # sentence-boundary whitespace join the conversational
+            # backend gets through `combine_text_chunks`; calling the
+            # free function directly here keeps the one-shot path
+            # symmetric without forcing it through the AcpBackend
+            # hook surface.
             if "method" in msg and "id" not in msg:
                 text = extract_opencode_text_delta(msg)
                 if text:
-                    accumulated += text
+                    accumulated = concat_opencode_text(accumulated, text)
                 continue
 
             # Server-initiated request (both `method` and `id`). The

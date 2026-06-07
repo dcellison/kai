@@ -66,6 +66,41 @@ _OPENCODE_POLICY_PRIORITY: dict[OpenCodePermissionPolicy, tuple[str, ...]] = {
 # ── Shared free functions (used by conversational + one-shot) ────
 
 
+def concat_opencode_text(prev: str, new: str) -> str:
+    """
+    Concatenate two OpenCode text chunks, injecting a single space
+    when the join would glue a sentence end to a new sentence start.
+
+    OpenCode's `session/update` `agent_message_chunk` notifications
+    carry text verbatim from the model. The model usually emits the
+    space between sentences inside one chunk or the next, in which
+    case verbatim concatenation produces the right output. Sometimes
+    it does not: chunk A ends with `"diff."`, chunk B starts with
+    `"Now let me read the test files"`, and verbatim concat produces
+    `"diff.Now let me read the test files"` (operator-observed
+    example). The output reads as a typo and degrades the chat feel
+    without changing what the model actually said.
+
+    Heuristic: inject a single space iff `prev` ends in
+    sentence-terminating punctuation (`.`, `!`, `?`) AND `new` begins
+    with an uppercase letter. The narrow trigger preserves verbatim
+    joins for code (`function(`), numbers (`1.2.3`, semantic version
+    strings), URLs, markdown headers (`##`), quoted strings, and
+    word continuation (`hel` + `lo` -> `hello`). Lowercase sentence
+    starts are a known miss; the false-positive cost of widening the
+    trigger to cover them is higher than the rare miss.
+
+    Empty inputs round-trip unchanged so the first chunk's
+    accumulator initialization (`""` + first chunk) does not inject
+    a spurious space.
+    """
+    if not prev or not new:
+        return prev + new
+    if prev[-1] in ".!?" and new[0].isupper():
+        return prev + " " + new
+    return prev + new
+
+
 def extract_opencode_text_delta(msg: dict) -> str | None:
     """
     Return user-visible assistant text from an OpenCode
@@ -279,6 +314,18 @@ class OpenCodeBackend(AcpBackend):
         callers.
         """
         return extract_opencode_text_delta(msg)
+
+    def combine_text_chunks(self, prev: str, new: str) -> str:
+        """
+        Smart sentence-boundary concatenation for streamed OpenCode
+        text. Overrides the AcpBackend default (verbatim `prev + new`)
+        to inject a single space when the chunk boundary glues a
+        sentence end to a new sentence start. See
+        `concat_opencode_text` for the heuristic. The one-shot
+        reasoner calls the free function directly; only the
+        conversational backend goes through this hook.
+        """
+        return concat_opencode_text(prev, new)
 
     def handle_server_request(self, msg: dict) -> dict | None:
         """
