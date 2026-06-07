@@ -36,10 +36,153 @@ OpenCode auth state.
 
 import json
 import logging
+from typing import Literal
 
 from kai.acp import AcpBackend
 
 log = logging.getLogger(__name__)
+
+
+# Policy parameter accepted by `handle_opencode_permission_request`.
+# `allow_always` matches the conversational backend's auto-approve
+# posture (tools must run in chat mode). `reject_once` is the one-shot
+# reasoner's posture: memory extraction, PR review, and triage prompts
+# must NOT execute tools, so any tool-permission prompt is denied for
+# this one call without poisoning the user's broader permission state.
+OpenCodePermissionPolicy = Literal["allow_always", "reject_once"]
+
+
+# Priority list for each policy. The free function below walks the
+# server-supplied `options` list using these kinds in order, falling
+# back to the first option only if no kind matches. The fallback
+# branch carries a distinct rationale tag so a future ACP protocol
+# drift surfaces in INFO logs without crashing the read loop.
+_OPENCODE_POLICY_PRIORITY: dict[OpenCodePermissionPolicy, tuple[str, ...]] = {
+    "allow_always": ("allow_always", "allow_once"),
+    "reject_once": ("reject_once", "reject_always"),
+}
+
+
+# ── Shared free functions (used by conversational + one-shot) ────
+
+
+def extract_opencode_text_delta(msg: dict) -> str | None:
+    """
+    Return user-visible assistant text from an OpenCode
+    `session/update` notification, or None for non-text shapes.
+
+    OpenCode's `session/update` shape matches Goose's exactly: a
+    `params.update.sessionUpdate` discriminator with text under
+    `params.update.content.text`. Other discriminators observed
+    (`agent_thought_chunk`, `available_commands_update`,
+    `usage_update`, `tool_call`, `tool_call_update`) are filtered
+    out (return None) so only user-visible assistant text streams
+    to the caller.
+
+    Shared between `OpenCodeBackend.extract_text_delta` (the
+    conversational backend's hook) and the one-shot reasoner's
+    response accumulator so both surface the same set of session
+    update shapes as text and skip the same set as non-text.
+    Changing the filter here updates both call sites in lockstep.
+    """
+    if msg.get("method") != "session/update":
+        return None
+    update = msg.get("params", {}).get("update", {})
+    if update.get("sessionUpdate") != "agent_message_chunk":
+        return None
+    text = update.get("content", {}).get("text", "")
+    return text or None
+
+
+def handle_opencode_permission_request(
+    msg: dict,
+    *,
+    policy: OpenCodePermissionPolicy,
+) -> dict | None:
+    """
+    Build the ACP v1 `RequestPermissionResult` body for an OpenCode
+    `session/request_permission` request under the given policy.
+
+    `policy="allow_always"` mirrors the conversational backend's
+    posture (tools must execute so the chat agent can do work).
+    `policy="reject_once"` is the one-shot reasoner's posture
+    (memory extraction / review / triage prompts must not execute
+    tools, but the rejection is scoped to this single one-shot
+    invocation rather than persisted to user config).
+
+    The selection order per policy is encoded in
+    `_OPENCODE_POLICY_PRIORITY`: try each kind in turn, then fall
+    back to the first available option (with a distinct rationale
+    tag) so a future ACP protocol drift remains observable in INFO
+    logs rather than crashing the read loop. Returns None when the
+    request shape carries no usable option; the caller logs and
+    skips so OpenCode times out the request gracefully.
+
+    Response shape follows the ACP v1 protocol's
+    `RequestPermissionResult`: the result body carries an `outcome`
+    object with a discriminator (`selected` or `cancelled`) and an
+    `optionId` field when `selected`. The shared
+    `_send_server_response` wraps this dict under the JSON-RPC
+    `result` key, producing `result.outcome.optionId` on the wire.
+    Sending a bare `result.optionId` (the pre-#574 shape) is
+    structurally invalid against the ACP schema and stalls or kills
+    the session. See https://agentclientprotocol.com/protocol/v1/tool-calls.
+    """
+    if msg.get("method") != "session/request_permission":
+        return None
+    options = msg.get("params", {}).get("options", []) or []
+
+    # Walk the policy's priority list in order. The first matching
+    # `kind` wins; the rationale tag carries the kind name so INFO
+    # logs name the exact selection that fired.
+    choice: dict | None = None
+    rationale: str = "no_usable_option"
+    for kind in _OPENCODE_POLICY_PRIORITY[policy]:
+        candidate = _pick_option(options, kind)
+        if candidate is not None:
+            choice = candidate
+            rationale = kind
+            break
+    if choice is None and options:
+        # Fallback: take the first option regardless of kind, but tag
+        # the rationale so a future protocol drift (a new kind name
+        # the priority list does not know about) is observable rather
+        # than silent. The fallback fires for both policies because
+        # surfacing "the schema changed" is more valuable than
+        # silently dropping the permission decision.
+        choice = options[0]
+        rationale = "fallback_first_option"
+
+    if not choice or "optionId" not in choice:
+        log.warning(
+            "OpenCode session/request_permission missing a usable option; policy=%s rationale=%s params=%s",
+            policy,
+            rationale,
+            msg.get("params"),
+        )
+        return None
+
+    option_id = choice["optionId"]
+    log.info(
+        "OpenCode session/request_permission handled: policy=%s optionId=%s rationale=%s",
+        policy,
+        option_id,
+        rationale,
+    )
+    return {
+        "outcome": {
+            "outcome": "selected",
+            "optionId": option_id,
+        }
+    }
+
+
+def _pick_option(options: list[dict], kind: str) -> dict | None:
+    """Return the first option whose `kind` matches, or None."""
+    for opt in options:
+        if opt.get("kind") == kind:
+            return opt
+    return None
 
 
 # ── OpenCode ACP backend ──────────────────────────────────────────
@@ -129,111 +272,22 @@ class OpenCodeBackend(AcpBackend):
 
     def extract_text_delta(self, msg: dict) -> str | None:
         """
-        Return text from an OpenCode `agent_message_chunk` notification.
-
-        OpenCode's `session/update` shape matches Goose's exactly: a
-        `params.update.sessionUpdate` discriminator with text under
-        `params.update.content.text`. Other discriminators observed
-        (`agent_thought_chunk`, `available_commands_update`,
-        `usage_update`, `tool_call`, `tool_call_update`) are filtered
-        out (return None) so only user-visible assistant text streams
-        to the Telegram client.
+        Conversational-backend wrapper over
+        `extract_opencode_text_delta`. The one-shot reasoner in
+        `kai.oneshot` calls the same free function directly so the
+        text-discriminator filter stays consistent across both
+        callers.
         """
-        if msg.get("method") != "session/update":
-            return None
-        update = msg.get("params", {}).get("update", {})
-        if update.get("sessionUpdate") != "agent_message_chunk":
-            return None
-        text = update.get("content", {}).get("text", "")
-        return text or None
+        return extract_opencode_text_delta(msg)
 
     def handle_server_request(self, msg: dict) -> dict | None:
         """
-        Auto-approve OpenCode `session/request_permission` requests.
-
-        OpenCode emits a server-initiated JSON-RPC request when a tool
-        needs a permission decision; the prompt does not progress
-        until the client returns a matching-id response. The request's
-        `options` array always carries an entry with
-        `kind: "allow_always"`; returning its `optionId` matches the
-        Goose `--with-builtin developer` posture (auto-approve so
-        agent tasks can actually execute tools), without baking the
-        decision into OpenCode's persistent config.
-
-        Response shape follows the ACP v1 protocol's
-        `RequestPermissionResult`: the result body carries an `outcome`
-        object with a discriminator (`selected` or `cancelled`) and an
-        `optionId` field when `selected`. The shared `_send_server_response`
-        wraps this dict under the JSON-RPC `result` key, producing
-        `result.outcome.optionId` on the wire. Sending a bare
-        `result.optionId` (the previous shape) is structurally invalid
-        against the ACP schema; OpenCode either stalls the prompt
-        indefinitely or closes the ACP session with an EOF on stdin.
-        See https://agentclientprotocol.com/protocol/v1/tool-calls for
-        the schema.
-
-        Defensive fallback: if the request shape changes and we cannot
-        find an allow_always option, look for any allow-shaped option,
-        then for any optionId at all, and only then bail with None
-        (which logs and skips at the shared-layer call site, letting
-        OpenCode time out the request gracefully instead of crashing
-        the read loop).
-
-        Every handled request emits one INFO line naming method, the
-        chosen optionId, and a rationale tag (`allow_always`,
-        `allow_once`, `fallback_first_option`, or `no_usable_option`)
-        so production logs surface what the auto-approver decided.
-        That diagnostic is load-bearing for the next time the ACP
-        protocol drifts: without it, a future change that breaks
-        option discrimination would only show up as silent stalls.
+        Conversational-backend hook for OpenCode
+        `session/request_permission` requests. Delegates to
+        `handle_opencode_permission_request` with policy
+        `"allow_always"` so tool calls auto-approve in chat. The
+        one-shot reasoner uses policy `"reject_once"` against the
+        same free function so memory extraction / review / triage
+        prompts cannot execute tools.
         """
-        if msg.get("method") != "session/request_permission":
-            return None
-        options = msg.get("params", {}).get("options", []) or []
-        # Track the rationale alongside the choice so the INFO log
-        # below tells the operator WHY a given option was picked.
-        # `_pick_option` is the fast path; the project's two known
-        # auto-approve kinds (`allow_always`, `allow_once`) are tried
-        # in priority order. The first-element fallback fires only
-        # when neither kind matches; that is a real protocol drift
-        # signal and the rationale tag makes it loud.
-        rationale: str
-        if (choice := _pick_option(options, "allow_always")) is not None:
-            rationale = "allow_always"
-        elif (choice := _pick_option(options, "allow_once")) is not None:
-            rationale = "allow_once"
-        elif options:
-            choice = options[0]
-            rationale = "fallback_first_option"
-        else:
-            choice = None
-            rationale = "no_usable_option"
-
-        if not choice or "optionId" not in choice:
-            log.warning(
-                "OpenCode session/request_permission missing a usable option; rationale=%s params=%s",
-                rationale,
-                msg.get("params"),
-            )
-            return None
-
-        option_id = choice["optionId"]
-        log.info(
-            "OpenCode session/request_permission handled: optionId=%s rationale=%s",
-            option_id,
-            rationale,
-        )
-        return {
-            "outcome": {
-                "outcome": "selected",
-                "optionId": option_id,
-            }
-        }
-
-
-def _pick_option(options: list[dict], kind: str) -> dict | None:
-    """Return the first option whose `kind` matches, or None."""
-    for opt in options:
-        if opt.get("kind") == kind:
-            return opt
-    return None
+        return handle_opencode_permission_request(msg, policy="allow_always")

@@ -18,6 +18,7 @@ import pytest
 
 from kai.oneshot import (
     _CODEX_ENV_ALLOWLIST,
+    _OPENCODE_PRESERVED_AUTH_VARS,
     _SUBPROCESS_ENV_ALLOWLIST,
     ClaudeOneShotReasoner,
     CodexOneShotReasoner,
@@ -26,6 +27,9 @@ from kai.oneshot import (
     OneShotRoutingError,
     OneShotSubprocessError,
     OneShotTimeout,
+    OpenCodeOneShotReasoner,
+    _preserved_auth_vars_for,
+    _render_opencode_session_prompt,
 )
 
 
@@ -55,6 +59,8 @@ def _mock_binary_resolver():
             return "claude"
         if backend == "codex":
             return "codex"
+        if backend == "opencode":
+            return "opencode"
         raise ValueError(f"unknown backend: {backend!r}")
 
     with patch("kai.oneshot.resolve_oneshot_binary", side_effect=fake_resolve):
@@ -2026,3 +2032,559 @@ class TestCodexReasonerWritesSanitizedSchema:
         # And the disallowed keys are absent.
         assert "minLength" not in item["properties"]["content"]
         assert "maxItems" not in disk["properties"]["facts"]
+
+
+# ── OpenCode reasoner tests ──────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _stub_cross_user_kill_for_opencode_tests(request):
+    """Patch `_kill_target_user_tree` to a no-op so the OpenCode
+    reasoner's cleanup path does not issue a second
+    `asyncio.create_subprocess_exec` call (which would otherwise
+    shadow the spawn call recorded on `mock_exec.call_args`). The
+    routing_test marker opts out so the routing classes that
+    explicitly exercise the kill escalation keep their real behavior.
+    """
+    if request.node.get_closest_marker("routing_test"):
+        yield
+        return
+
+    async def _noop(**kwargs) -> None:
+        return None
+
+    with patch("kai.oneshot._kill_target_user_tree", side_effect=_noop):
+        yield
+
+
+def _make_acp_proc(lines: list[bytes], *, returncode: int | None = None) -> MagicMock:
+    """Build a mock asyncio subprocess for the OpenCode ACP read loop.
+
+    `lines` is the queue of bytes that `proc.stdout.readline` will
+    yield in order. An empty bytes value at the tail simulates EOF
+    (the reasoner uses an empty readline result to detect subprocess
+    death). `returncode` controls `proc.returncode`: None matches a
+    still-running process, an integer matches an exited process.
+
+    `proc.stdin.write` accumulates the written bytes into
+    `proc._stdin_writes` so tests can assert on the JSON-RPC payloads
+    the reasoner sent. `proc.stderr.readline` returns empty bytes
+    immediately so the background drain task finishes without
+    consuming any test queue entries.
+
+    The mock is intentionally minimal: only the attributes the
+    reasoner reads from the subprocess are populated. Adding more
+    surface would invite drift between the reasoner's actual
+    interface and the test's mocked interface.
+    """
+    proc = MagicMock()
+
+    # Stdout readline pops from the queue. An empty bytes element
+    # (or running off the end) is treated as EOF.
+    queue = list(lines)
+
+    async def _readline() -> bytes:
+        if not queue:
+            return b""
+        return queue.pop(0)
+
+    proc.stdout = MagicMock()
+    proc.stdout.readline = _readline
+
+    # Stdin write accumulates payloads for later assertion.
+    proc._stdin_writes = []
+
+    def _stdin_write(data: bytes) -> None:
+        proc._stdin_writes.append(data)
+
+    async def _stdin_drain() -> None:
+        return None
+
+    proc.stdin = MagicMock()
+    proc.stdin.write = _stdin_write
+    proc.stdin.drain = _stdin_drain
+
+    # Stderr never yields data; the background drain task hits EOF and
+    # returns immediately.
+    async def _stderr_readline() -> bytes:
+        return b""
+
+    proc.stderr = MagicMock()
+    proc.stderr.readline = _stderr_readline
+
+    proc.returncode = returncode
+    proc.kill = MagicMock()
+    proc.pid = 12345
+
+    async def _wait() -> int:
+        # After kill, the returncode is whatever the test passed in;
+        # if None, simulate a clean exit by setting it to 0.
+        if proc.returncode is None:
+            proc.returncode = 0
+        return proc.returncode
+
+    proc.wait = _wait
+    return proc
+
+
+def _rpc_response_line(*, request_id: int, result: dict) -> bytes:
+    """JSON-RPC 2.0 response with a result body, newline-terminated."""
+    return (json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}) + "\n").encode()
+
+
+def _rpc_error_line(*, request_id: int, message: str) -> bytes:
+    """JSON-RPC 2.0 error response, newline-terminated."""
+    return (json.dumps({"jsonrpc": "2.0", "id": request_id, "error": {"code": -1, "message": message}}) + "\n").encode()
+
+
+def _session_update_line(text: str) -> bytes:
+    """Streaming `session/update` notification carrying agent text."""
+    return (
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": text},
+                    }
+                },
+            }
+        )
+        + "\n"
+    ).encode()
+
+
+def _filtered_session_update_line(kind: str) -> bytes:
+    """A session/update notification with a discriminator the reasoner
+    should filter out (e.g., agent_thought_chunk, tool_call). The text
+    inside MUST NOT appear in the accumulated output."""
+    return (
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": kind,
+                        "content": {"type": "text", "text": "FILTERED-MUST-NOT-APPEAR"},
+                    }
+                },
+            }
+        )
+        + "\n"
+    ).encode()
+
+
+def _opencode_handshake_lines() -> list[bytes]:
+    """The handshake responses every test must feed: initialize result
+    (id=1) and session/new result (id=2 with a sessionId)."""
+    return [
+        _rpc_response_line(request_id=1, result={"protocolVersion": 1}),
+        _rpc_response_line(request_id=2, result={"sessionId": "sess-abc-123"}),
+    ]
+
+
+class TestOpenCodeRenderSessionPrompt:
+    """The render helper mirrors `_render_codex_stdin`: when a system
+    prompt is supplied, wrap it in a randomized boundary block above
+    the user prompt; when None or empty, return the user prompt
+    unchanged."""
+
+    def test_no_system_prompt_returns_user_prompt_unchanged(self):
+        assert _render_opencode_session_prompt(None, "hello") == "hello"
+        assert _render_opencode_session_prompt("", "hello") == "hello"
+
+    def test_system_prompt_emits_boundary_block(self):
+        rendered = _render_opencode_session_prompt("be brief", "hello")
+        # The render must contain both BEGIN and END SYSTEM markers,
+        # the system text between them, and the user prompt below.
+        assert "--- BEGIN SYSTEM " in rendered
+        assert "--- END SYSTEM " in rendered
+        assert "be brief" in rendered
+        assert rendered.endswith("hello")
+
+    def test_per_call_boundary_token_randomized(self):
+        """Two calls produce different boundary tokens. Collision-
+        avoidance, not adversarial security; matches codex's contract."""
+        a = _render_opencode_session_prompt("sys", "user")
+        b = _render_opencode_session_prompt("sys", "user")
+        # The system content and prompts are identical; only the
+        # randomized boundary tokens should differ.
+        assert a != b
+
+
+class TestOpenCodePreservedAuthVars:
+    """`_preserved_auth_vars_for("opencode")` returns the per-provider
+    API key allow-list; the previous claude/codex-only ValueError no
+    longer fires."""
+
+    def test_returns_opencode_specific_list(self):
+        assert _preserved_auth_vars_for("opencode") == _OPENCODE_PRESERVED_AUTH_VARS
+
+    def test_unknown_backend_still_raises(self):
+        with pytest.raises(ValueError):
+            _preserved_auth_vars_for("nonsense")
+
+
+class TestOpenCodeOneShotReasonerArgvAndEnv:
+    """Argv: `opencode acp` plus the optional sudo wrap. Env:
+    OPENCODE_CONFIG_CONTENT carries the model when supplied;
+    OPENCODE_BIN-style env keys are NOT in the subprocess env (the
+    allow-list is intentional)."""
+
+    @pytest.mark.asyncio
+    async def test_argv_is_opencode_acp(self, tmp_path):
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_acp_proc(
+            _opencode_handshake_lines() + [_rpc_response_line(request_id=3, result={"stopReason": "end_turn"})]
+        )
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await reasoner.run(prompt="hi", purpose="fact_extraction")
+
+        cmd = mock_exec.call_args[0]
+        assert cmd[0] == "opencode"
+        assert cmd[1] == "acp"
+
+    @pytest.mark.asyncio
+    async def test_env_carries_model_via_opencode_config_content(self, tmp_path):
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_acp_proc(
+            _opencode_handshake_lines() + [_rpc_response_line(request_id=3, result={"stopReason": "end_turn"})]
+        )
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await reasoner.run(
+                prompt="hi",
+                model="anthropic/claude-sonnet-4-5",
+                purpose="fact_extraction",
+            )
+
+        env = mock_exec.call_args.kwargs["env"]
+        assert "OPENCODE_CONFIG_CONTENT" in env
+        cfg = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+        assert cfg == {"model": "anthropic/claude-sonnet-4-5"}
+
+    @pytest.mark.asyncio
+    async def test_env_omits_opencode_config_content_when_model_none(self, tmp_path):
+        """`model=None` lets opencode fall back to its config-file
+        defaults; emitting an empty `{"model": ""}` JSON would override
+        the fallback with a broken value."""
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_acp_proc(
+            _opencode_handshake_lines() + [_rpc_response_line(request_id=3, result={"stopReason": "end_turn"})]
+        )
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await reasoner.run(prompt="hi", purpose="fact_extraction")
+
+        env = mock_exec.call_args.kwargs["env"]
+        assert "OPENCODE_CONFIG_CONTENT" not in env
+
+    @pytest.mark.asyncio
+    async def test_env_allowlist_excludes_unrelated_keys(self, tmp_path, monkeypatch):
+        """Only keys from `_OPENCODE_ENV_ALLOWLIST` may flow into the
+        subprocess env. A stray ANTHROPIC_BASE_URL (claude-only) must
+        not appear; a webhook secret must not leak; etc."""
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://leaked.example")
+        monkeypatch.setenv("KAI_WEBHOOK_SECRET", "leaked-secret")
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_acp_proc(
+            _opencode_handshake_lines() + [_rpc_response_line(request_id=3, result={"stopReason": "end_turn"})]
+        )
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await reasoner.run(prompt="hi", purpose="fact_extraction")
+
+        env = mock_exec.call_args.kwargs["env"]
+        assert "ANTHROPIC_BASE_URL" not in env
+        assert "KAI_WEBHOOK_SECRET" not in env
+
+
+class TestOpenCodeOneShotReasonerFlow:
+    """End-to-end ACP flow: handshake, prompt, accumulate text from
+    `agent_message_chunk` notifications, return on prompt response."""
+
+    @pytest.mark.asyncio
+    async def test_accumulates_agent_message_chunk_text(self, tmp_path):
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_acp_proc(
+            _opencode_handshake_lines()
+            + [
+                _session_update_line("Hello, "),
+                _session_update_line("world!"),
+                _rpc_response_line(request_id=3, result={"stopReason": "end_turn"}),
+            ]
+        )
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(prompt="hi", purpose="fact_extraction")
+
+        assert result.text == "Hello, world!"
+        assert result.backend == "opencode"
+
+    @pytest.mark.asyncio
+    async def test_filters_non_agent_message_chunk_shapes(self, tmp_path):
+        """`agent_thought_chunk`, `tool_call`, `tool_call_update`,
+        `usage_update`, `available_commands_update` must NOT accumulate
+        as text. Only `agent_message_chunk` is user-visible."""
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_acp_proc(
+            _opencode_handshake_lines()
+            + [
+                _filtered_session_update_line("agent_thought_chunk"),
+                _filtered_session_update_line("tool_call"),
+                _filtered_session_update_line("usage_update"),
+                _session_update_line("REAL"),
+                _rpc_response_line(request_id=3, result={"stopReason": "end_turn"}),
+            ]
+        )
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(prompt="hi", purpose="fact_extraction")
+
+        assert result.text == "REAL"
+        assert "FILTERED" not in result.text
+
+    @pytest.mark.asyncio
+    async def test_session_prompt_carries_rendered_text_with_boundary(self, tmp_path):
+        """The session/prompt request's content[0].text must be the
+        boundary-wrapped render when a system_prompt is supplied."""
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_acp_proc(
+            _opencode_handshake_lines() + [_rpc_response_line(request_id=3, result={"stopReason": "end_turn"})]
+        )
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            await reasoner.run(
+                prompt="USER",
+                system_prompt="SYS",
+                purpose="fact_extraction",
+            )
+
+        # The third write is the session/prompt payload (the first
+        # two are initialize and session/new). The text content
+        # carries both SYS and USER inside the boundary block.
+        prompt_msg = json.loads(proc._stdin_writes[2].decode().strip())
+        assert prompt_msg["method"] == "session/prompt"
+        content = prompt_msg["params"]["prompt"][0]
+        assert content["type"] == "text"
+        text = content["text"]
+        assert "--- BEGIN SYSTEM " in text
+        assert "SYS" in text
+        assert text.rstrip().endswith("USER")
+
+
+class TestOpenCodeOneShotReasonerPermissionRejection:
+    """The one-shot reasoner must reject every `session/request_permission`
+    using the `reject_once` policy; memory extraction, review, and
+    triage prompts MUST NOT execute tools."""
+
+    @pytest.mark.asyncio
+    async def test_responds_to_permission_request_with_reject_once(self, tmp_path):
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        permission_req = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/request_permission",
+                    "id": 99,
+                    "params": {
+                        "options": [
+                            {"optionId": "opt-a", "kind": "allow_always"},
+                            {"optionId": "opt-r", "kind": "reject_once"},
+                        ]
+                    },
+                }
+            )
+            + "\n"
+        ).encode()
+        proc = _make_acp_proc(
+            _opencode_handshake_lines()
+            + [
+                permission_req,
+                _session_update_line("blocked-but-text-still-flows"),
+                _rpc_response_line(request_id=3, result={"stopReason": "end_turn"}),
+            ]
+        )
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            await reasoner.run(prompt="p", purpose="fact_extraction")
+
+        # The 4th stdin write (after initialize, session/new,
+        # session/prompt) is the permission response. The response
+        # body must select the reject_once option.
+        response = json.loads(proc._stdin_writes[3].decode().strip())
+        assert response["id"] == 99
+        assert response["result"]["outcome"]["outcome"] == "selected"
+        assert response["result"]["outcome"]["optionId"] == "opt-r"
+
+
+class TestOpenCodeOneShotReasonerFailures:
+    """Failure surface: JSON-RPC error on prompt id, subprocess EOF,
+    timeout, binary resolution failure. Each maps to a specific
+    typed exception so the memory extraction caller can branch."""
+
+    @pytest.mark.asyncio
+    async def test_jsonrpc_error_raises_output_error(self, tmp_path):
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_acp_proc(_opencode_handshake_lines() + [_rpc_error_line(request_id=3, message="model refused")])
+
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(OneShotOutputError) as excinfo,
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction")
+        assert "model refused" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_eof_with_returncode_raises_subprocess_error(self, tmp_path):
+        """Subprocess dies mid-stream: empty readline + non-None
+        returncode -> OneShotSubprocessError."""
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_acp_proc(
+            _opencode_handshake_lines() + [b""],
+            returncode=137,
+        )
+
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(OneShotSubprocessError) as excinfo,
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction")
+        assert excinfo.value.returncode == 137
+
+    @pytest.mark.asyncio
+    async def test_binary_resolution_failure_raises_routing_error(self, tmp_path):
+        from kai.oneshot_binary import BinaryResolutionError
+
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+
+        with (
+            patch("kai.oneshot.resolve_oneshot_binary", side_effect=BinaryResolutionError("no opencode")),
+            pytest.raises(OneShotRoutingError) as excinfo,
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction")
+        assert "no opencode" in str(excinfo.value)
+
+
+class TestOpenCodeOneShotReasonerSchema:
+    """When `json_schema` is supplied, the accumulated text must parse
+    as a JSON object containing the schema's `required` fields. The
+    reasoner wraps the parsed payload in the same envelope claude /
+    codex emit, so the memory extraction caller does not need an
+    opencode branch."""
+
+    @pytest.mark.asyncio
+    async def test_schema_backed_returns_envelope(self, tmp_path):
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        body = json.dumps({"facts": [], "has_episode": False})
+        proc = _make_acp_proc(
+            _opencode_handshake_lines()
+            + [
+                _session_update_line(body),
+                _rpc_response_line(request_id=3, result={"stopReason": "end_turn"}),
+            ]
+        )
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema={
+                    "type": "object",
+                    "required": ["facts", "has_episode"],
+                },
+            )
+
+        envelope = json.loads(result.text)
+        assert envelope == {
+            "is_error": False,
+            "structured_output": {"facts": [], "has_episode": False},
+        }
+
+    @pytest.mark.asyncio
+    async def test_schema_backed_invalid_json_raises_output_error(self, tmp_path):
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_acp_proc(
+            _opencode_handshake_lines()
+            + [
+                _session_update_line("not-json-at-all"),
+                _rpc_response_line(request_id=3, result={"stopReason": "end_turn"}),
+            ]
+        )
+
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(OneShotOutputError),
+        ):
+            await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema={"type": "object", "required": ["facts"]},
+            )
+
+    @pytest.mark.asyncio
+    async def test_schema_backed_missing_required_raises_output_error(self, tmp_path):
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        body = json.dumps({"facts": []})  # missing has_episode
+        proc = _make_acp_proc(
+            _opencode_handshake_lines()
+            + [
+                _session_update_line(body),
+                _rpc_response_line(request_id=3, result={"stopReason": "end_turn"}),
+            ]
+        )
+
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(OneShotOutputError) as excinfo,
+        ):
+            await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema={
+                    "type": "object",
+                    "required": ["facts", "has_episode"],
+                },
+            )
+        assert "has_episode" in str(excinfo.value)
+
+
+class TestOpenCodeOneShotReasonerCleanup:
+    """The subprocess must be killed (or reaped) on every exit path:
+    success, error, EOF. Prevents orphan `opencode acp` processes."""
+
+    @pytest.mark.asyncio
+    async def test_subprocess_kill_called_after_success_when_still_running(self, tmp_path):
+        """proc.returncode is None on the happy path (the subprocess
+        is still up when the prompt response arrives), so the cleanup
+        path issues a kill and reaps it."""
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_acp_proc(
+            _opencode_handshake_lines()
+            + [
+                _session_update_line("ok"),
+                _rpc_response_line(request_id=3, result={"stopReason": "end_turn"}),
+            ]
+        )
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            await reasoner.run(prompt="p", purpose="fact_extraction")
+
+        proc.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_subprocess_kill_called_on_jsonrpc_error(self, tmp_path):
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_acp_proc(_opencode_handshake_lines() + [_rpc_error_line(request_id=3, message="err")])
+
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(OneShotOutputError),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction")
+
+        proc.kill.assert_called_once()

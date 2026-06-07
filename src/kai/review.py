@@ -39,6 +39,7 @@ import aiohttp
 
 from kai.codex_exec import extract_codex_text
 from kai.config import ModelRole, get_model_for, resolve_claude_user
+from kai.oneshot import OneShotError, OneShotTimeout, OpenCodeOneShotReasoner
 from kai.prompt_utils import make_boundary
 
 log = logging.getLogger(__name__)
@@ -690,44 +691,66 @@ async def run_review(
     ~/.codex/auth.json); subprocess emits NDJSON which is collapsed
     to the final agent_message text by extract_codex_text.
 
+    OpenCode path: dispatches through `OpenCodeOneShotReasoner` in
+    `kai.oneshot`, which spawns a fresh `opencode acp` JSON-RPC
+    subprocess per call, accumulates response text from
+    `session/update` notifications, and rejects any tool-permission
+    request mid-stream (review prompts must not execute tools). The
+    reasoner handles per-OS-user routing via `sudo -H -u <user>`
+    and timeout / error mapping; we collapse its typed errors to
+    RuntimeError below so the caller's existing failure surface is
+    unchanged.
+
     Goose path: no sudo (Goose has no user isolation), simple
     proc.kill() for cleanup, --max-turns 1 as the safety limit.
 
     Args:
         prompt: The complete review prompt (from build_review_prompt).
         claude_user: Optional OS user to run the subprocess as (via
-            sudo -u for claude, sudo -H -u for codex). Ignored when
-            agent_backend is "goose".
+            sudo -u for claude, sudo -H -u for codex / opencode).
+            Ignored when agent_backend is "goose".
         agent_backend: Which LLM backend to use ("claude", "codex",
-            or "goose").
+            "opencode", or "goose").
         provider: LLM provider name (e.g. "anthropic", "openai").
             Only used when agent_backend is "goose"; codex always
-            uses openai, claude always uses anthropic.
+            uses openai, claude always uses anthropic, opencode
+            routes through `provider/model` strings on the model
+            itself.
 
     Returns:
         The review text output from the LLM.
 
     Raises:
         RuntimeError: If the subprocess fails or times out.
-        ValueError: If agent_backend has no supported one-shot path
-            here (e.g. "opencode"). The conversational OpenCode adapter
-            does not bring a one-shot reasoner; a per-user opencode
-            override must surface this gap loudly rather than silently
-            falling through to Claude.
     """
     if agent_backend == "opencode":
-        # Reject before the codex / goose / claude dispatch below.
-        # OpenCode has no one-shot reasoner today; the conversational
-        # backend cannot be reused for review because the wire shapes
-        # and lifecycle differ. Surface this as a clean ValueError so
-        # the operator gets a deterministic failure mode instead of an
-        # unexpected Claude-billed review.
-        raise ValueError(
-            "PR review with agent_backend='opencode' is not supported. "
-            "OpenCode users currently have no one-shot reasoner; configure "
-            "a per-user agent_backend override of 'claude', 'codex', or 'goose' "
-            "for PR review, or disable PR review for opencode users."
+        # Dispatch to the OpenCode one-shot reasoner. The model
+        # identifier comes from the per-role MODEL_REGISTRY; an
+        # operator-side override via PR_REVIEW_MODEL_OPENCODE is
+        # accepted on the same shape the other backends use. The
+        # reasoner returns OneShotResult.text (raw review text) when
+        # json_schema is None, which is what this function's
+        # contract returns. Typed reasoner errors collapse to
+        # RuntimeError so the webhook handler's existing catch
+        # surface does not need to widen.
+        review_model = get_model_for(
+            ModelRole.PR_REVIEW,
+            agent_backend,
+            override=os.environ.get("PR_REVIEW_MODEL_OPENCODE", ""),
         )
+        reasoner = OpenCodeOneShotReasoner(os_user=claude_user)
+        try:
+            result = await reasoner.run(
+                prompt=prompt,
+                model=review_model,
+                timeout=timeout_s,
+                purpose="pr_review",
+            )
+        except OneShotTimeout as exc:
+            raise RuntimeError(f"Review subprocess timed out after {timeout_s}s") from exc
+        except OneShotError as exc:
+            raise RuntimeError(f"OpenCode review failed: {exc}") from exc
+        return result.text
 
     if agent_backend == "codex":
         # Codex one-shot mode: --json emits NDJSON events on stdout

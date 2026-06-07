@@ -3661,16 +3661,21 @@ class TestMemoryReasonerSelection:
         reasoner = memory_extraction._build_memory_reasoner("codex")
         assert isinstance(reasoner, CodexOneShotReasoner)
 
-    def test_opencode_backend_raises_defensive_runtime_error(self):
-        """OpenCode has no memory reasoner; the defensive raise fires.
+    def test_opencode_backend_returns_opencode_reasoner(self):
+        """OpenCode users now dispatch through OpenCodeOneShotReasoner.
+        The bot.py eligibility gate now allows opencode through, so
+        the defensive RuntimeError branch only fires for unknown
+        backends (e.g. a future `goose` regression or a typo)."""
+        from kai.oneshot import OpenCodeOneShotReasoner
 
-        Production flow never reaches here (the bot.py eligibility gate
-        filters opencode users out upstream, same way it filters goose
-        out), but the defensive branch guards against a future gate
-        regression silently selecting Claude for opencode users.
-        """
-        with pytest.raises(RuntimeError, match=r"non-extraction backend.*opencode"):
-            memory_extraction._build_memory_reasoner("opencode")
+        reasoner = memory_extraction._build_memory_reasoner("opencode")
+        assert isinstance(reasoner, OpenCodeOneShotReasoner)
+
+    def test_unknown_backend_still_raises_defensive_runtime_error(self):
+        """The defensive RuntimeError remains the safety net for any
+        backend the eligibility gate does not allow through."""
+        with pytest.raises(RuntimeError, match=r"non-extraction backend.*goose"):
+            memory_extraction._build_memory_reasoner("goose")
 
 
 class TestRunExtractorWithCodexEnvelope:

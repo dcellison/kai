@@ -39,6 +39,7 @@ from kai.oneshot import (
     OneShotReasoner,
     OneShotSubprocessError,
     OneShotTimeout,
+    OpenCodeOneShotReasoner,
 )
 from kai.oneshot import _ensure_extractor_cwd as _ensure_extractor_cwd
 
@@ -1852,15 +1853,15 @@ def _build_memory_reasoner(effective_backend: str, os_user: str | None = None) -
     Build the one-shot reasoner matching the user's effective backend.
 
     Dispatches on the per-user `effective_backend` resolved by
-    `_resolve_effective_backend`. The valid set is "claude" / "codex";
-    goose users do not reach this site (gated upstream in `bot.py`).
-    The RuntimeError branch is a defensive safety net for a future
-    regression where the upstream gate widens or changes - surfacing
-    as a runtime error rather than silently selecting Claude keeps the
-    failure visible.
+    `_resolve_effective_backend`. The valid set is "claude" / "codex" /
+    "opencode"; goose users do not reach this site (gated upstream in
+    `bot.py`). The RuntimeError branch is a defensive safety net for
+    a future regression where the upstream gate widens or changes -
+    surfacing as a runtime error rather than silently selecting
+    Claude keeps the failure visible.
 
     `os_user` is resolved once at the top of `extract_and_store` and
-    threaded in. Both reasoners accept `os_user=None` and spawn
+    threaded in. All three reasoners accept `os_user=None` and spawn
     in-process via the self-sudo-skip path; a non-bot value wraps
     the argv in `sudo -H -u <user>`. Tests monkeypatch this helper
     to inject fake reasoners; the parameters are accepted but not
@@ -1874,6 +1875,8 @@ def _build_memory_reasoner(effective_backend: str, os_user: str | None = None) -
         return ClaudeOneShotReasoner(os_user=os_user)
     if effective_backend == "codex":
         return CodexOneShotReasoner(os_user=os_user)
+    if effective_backend == "opencode":
+        return OpenCodeOneShotReasoner(os_user=os_user)
     raise RuntimeError(f"extraction reached _build_memory_reasoner for non-extraction backend: {effective_backend!r}")
 
 

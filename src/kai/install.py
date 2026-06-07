@@ -2145,6 +2145,7 @@ def _generate_sudoers(
     service_user: str,
     os_users: Iterable[str] = (),
     codex_bin: str | None = None,
+    opencode_bin: str | None = None,
 ) -> str:
     """
     Generate sudoers rules for the service user to read protected config files.
@@ -2157,13 +2158,17 @@ def _generate_sudoers(
     Falls back to /bin/cat and /usr/bin/tee if the binaries aren't found
     in the current PATH (e.g., when running in a minimal environment).
 
-    Per-user `(target_user) SETENV: NOPASSWD:` rules for the claude and codex
-    binaries (plus a `NOPASSWD: /bin/kill` rule for the cross-user kill
-    escalation) are emitted for every distinct `os_user` value in users.yaml.
-    Users matching `service_user` are skipped (the runtime detects self-sudo
-    via resolve_claude_user() and spawns the agent directly without sudo).
-    The codex binary path defaults to /opt/homebrew/bin/codex; Linux installs
-    override with the CODEX_BIN env var at install time.
+    Per-user `(target_user) SETENV: NOPASSWD:` rules for the claude, codex,
+    and opencode binaries (plus a `NOPASSWD: /bin/kill` rule for the
+    cross-user kill escalation) are emitted for every distinct `os_user`
+    value in users.yaml. Users matching `service_user` are skipped (the
+    runtime detects self-sudo via resolve_claude_user() and spawns the
+    agent directly without sudo). The codex binary path defaults to
+    /opt/homebrew/bin/codex; Linux installs override with the CODEX_BIN
+    env var at install time. The opencode rule uses the service user's
+    `~/.local/bin/opencode` path (where the upstream installer drops the
+    binary by default); operators with a custom install location can
+    override via OPENCODE_BIN.
 
     Args:
         service_user: The OS username that runs the Kai service.
@@ -2234,6 +2239,13 @@ def _generate_sudoers(
         # Homebrew fallback only fires on a first-time install where
         # the wizard has not run yet.
         codex_bin_resolved = codex_bin or "/opt/homebrew/bin/codex"
+        # OpenCode binary path. Upstream's install script drops the
+        # binary under the SERVICE user's ~/.local/bin/opencode by
+        # default, so the same `svc_home` anchoring applies as the
+        # claude rule above. Operators with a custom install location
+        # override via OPENCODE_BIN (the wizard prompts for and
+        # persists the value the same way CODEX_BIN is handled).
+        opencode_bin_resolved = opencode_bin or f"{svc_home}/.local/bin/opencode"
         # kill(1) for the cross-user kill escalation (#456). The bot
         # runs `sudo -n -u <target> /bin/kill -<sig> <pid>` against
         # the inner claude grandchild because POSIX signal permissions
@@ -2272,16 +2284,18 @@ def _generate_sudoers(
         rules += textwrap.dedent("""\
 
             # Per-target sudoers rules for the cross-os-user inner agent spawn.
-            # The claude and codex rules grant arbitrary code execution as <target>
-            # (both agents have Bash/Read/Write tools); the kill rule grants signal
-            # delivery to any <target>-owned process. The kill rule's scope is
-            # broader than a PID-locked rule because sudoers argument matching is
-            # not safe per sudo(8). The kill rule is a strict subset of capabilities
-            # the agent rules already provide; the practical delta is zero. See PR #458.
+            # The claude, codex, and opencode rules grant arbitrary code execution
+            # as <target> (all three agents have Bash/Read/Write tools); the kill
+            # rule grants signal delivery to any <target>-owned process. The kill
+            # rule's scope is broader than a PID-locked rule because sudoers
+            # argument matching is not safe per sudo(8). The kill rule is a strict
+            # subset of capabilities the agent rules already provide; the practical
+            # delta is zero.
         """)
         for target in target_users:
             rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {claude_bin}\n"
             rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {codex_bin_resolved}\n"
+            rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {opencode_bin_resolved}\n"
             rules += f"{service_user} ALL=({target}) NOPASSWD: {kill_bin}\n"
 
     return rules
@@ -3461,6 +3475,16 @@ def _cmd_apply() -> None:
         env_codex_bin = os.environ.get("CODEX_BIN")
         if env_codex_bin and env.get("AGENT_BACKEND") == "codex":
             env["CODEX_BIN"] = env_codex_bin
+        # Mirror the same env pass-through for OPENCODE_BIN so an
+        # `sudo OPENCODE_BIN=... kai install apply` invocation pins
+        # the same path the running bot will resolve via
+        # resolve_oneshot_binary("opencode"). Gating on the global
+        # AGENT_BACKEND keeps per-user opencode overrides
+        # operator-managed (the runtime surfaces missing tooling on
+        # first message), same posture as CODEX_BIN.
+        env_opencode_bin = os.environ.get("OPENCODE_BIN")
+        if env_opencode_bin and env.get("AGENT_BACKEND") == "opencode":
+            env["OPENCODE_BIN"] = env_opencode_bin
         # AGENT_TIMEOUT_SECONDS migration. Operators upgrading without
         # re-running the wizard carry the legacy CLAUDE_TIMEOUT_SECONDS
         # key in install.conf; rewrite to the canonical name at apply
@@ -3476,7 +3500,12 @@ def _cmd_apply() -> None:
             _apply_goose_config(service_user, install_path, svc_uid, svc_gid, dry_run)
 
         # -- Step 7: Configure sudoers --
-        _apply_sudoers(service_user, dry_run, codex_bin=env.get("CODEX_BIN"))
+        _apply_sudoers(
+            service_user,
+            dry_run,
+            codex_bin=env.get("CODEX_BIN"),
+            opencode_bin=env.get("OPENCODE_BIN"),
+        )
 
         # -- Step 8: Migrate runtime data --
         _apply_migrate(data_path, install_path, svc_uid, svc_gid, dry_run)
@@ -4585,6 +4614,7 @@ def _apply_sudoers(
     dry_run: bool,
     users_yaml_path: str | Path = "/etc/kai/users.yaml",
     codex_bin: str | None = None,
+    opencode_bin: str | None = None,
 ) -> None:
     """
     Write sudoers rules for the service user to read protected config.
@@ -4592,13 +4622,15 @@ def _apply_sudoers(
     Loads `users_yaml_path` (default /etc/kai/users.yaml) to discover every
     distinct `os_user` the runtime may target via `sudo -u`, so each gets a
     matching SETENV: NOPASSWD: rule. Without this, hand-added per-user rules
-    were silently wiped on every `sudo make install`. See issue #341.
+    were silently wiped on every `sudo make install`.
 
-    `codex_bin` is threaded from `_cmd_apply`'s env dict (which sources
-    it from install.conf, after the apply-time env-var override block)
-    so the SETENV rule pins the same absolute path the running bot
-    will invoke. Falls back to /opt/homebrew/bin/codex only on first-
-    time installs where the wizard has not run.
+    `codex_bin` and `opencode_bin` are threaded from `_cmd_apply`'s env
+    dict (which sources them from install.conf, after the apply-time
+    env-var override block) so the SETENV rules pin the same absolute
+    paths the running bot will invoke. `codex_bin` falls back to
+    /opt/homebrew/bin/codex; `opencode_bin` falls back to the service
+    user's `~/.local/bin/opencode`. Both fallbacks fire only on first-
+    time installs where the wizard has not run yet.
     """
     sudoers_path = Path("/etc/sudoers.d/kai")
     # Load and validate users.yaml *before* the dry_run gate. Intentional:
@@ -4606,7 +4638,12 @@ def _apply_sudoers(
     # dry run, since the operator's next step is `sudo make install` which
     # would hit the same error with worse blast radius (partial install).
     os_users = _collect_os_users_from_yaml(users_yaml_path)
-    sudoers_content = _generate_sudoers(service_user, os_users, codex_bin=codex_bin)
+    sudoers_content = _generate_sudoers(
+        service_user,
+        os_users,
+        codex_bin=codex_bin,
+        opencode_bin=opencode_bin,
+    )
 
     # Backstop check: the per-user rules pin the claude binary to
     # {service_user_home}/.local/bin/claude (the native-installer

@@ -37,6 +37,7 @@ import aiohttp
 
 from kai.codex_exec import extract_codex_text
 from kai.config import ModelRole, get_model_for, resolve_claude_user
+from kai.oneshot import OneShotError, OneShotTimeout, OpenCodeOneShotReasoner
 from kai.prompt_utils import make_boundary
 
 log = logging.getLogger(__name__)
@@ -402,9 +403,11 @@ async def run_triage(
 
     Args:
         prompt: The complete triage prompt (from build_triage_prompt).
-        claude_user: Optional OS user to run Claude as (via sudo -u).
+        claude_user: Optional OS user to run the subprocess as (via
+            sudo -u for claude, sudo -H -u for codex / opencode).
             Ignored when agent_backend is "goose".
-        agent_backend: Which LLM backend to use ("claude" or "goose").
+        agent_backend: Which LLM backend to use ("claude", "codex",
+            "opencode", or "goose").
         provider: LLM provider name (e.g. "anthropic", "openai").
             Only used when agent_backend is "goose".
 
@@ -413,25 +416,36 @@ async def run_triage(
 
     Raises:
         RuntimeError: If the subprocess fails or times out.
-        ValueError: If agent_backend has no supported one-shot path
-            here (e.g. "opencode"). The conversational OpenCode adapter
-            does not bring a one-shot reasoner; a per-user opencode
-            override must surface this gap loudly rather than silently
-            falling through to Claude.
     """
     if agent_backend == "opencode":
-        # Reject before the codex / goose / claude dispatch below.
-        # OpenCode has no one-shot reasoner today; the conversational
-        # backend cannot be reused for triage because the wire shapes
-        # and lifecycle differ. Surface this as a clean ValueError so
-        # the operator gets a deterministic failure mode instead of an
-        # unexpected Claude-billed triage.
-        raise ValueError(
-            "Issue triage with agent_backend='opencode' is not supported. "
-            "OpenCode users currently have no one-shot reasoner; configure "
-            "a per-user agent_backend override of 'claude', 'codex', or 'goose' "
-            "for issue triage, or disable issue triage for opencode users."
+        # Dispatch to the OpenCode one-shot reasoner. The reasoner
+        # spawns a fresh `opencode acp` JSON-RPC subprocess per call
+        # and rejects any tool-permission request mid-stream (triage
+        # prompts must not execute tools). Triage's downstream parser
+        # parses the returned text as JSON; we deliberately pass
+        # json_schema=None here so the reasoner returns raw text
+        # (matching the claude / codex / goose contract) rather than
+        # wrapping the response in the structured-output envelope.
+        # Typed reasoner errors collapse to RuntimeError so the
+        # webhook handler's existing catch surface is unchanged.
+        triage_model = get_model_for(
+            ModelRole.ISSUE_TRIAGE,
+            agent_backend,
+            override=os.environ.get("ISSUE_TRIAGE_MODEL_OPENCODE", ""),
         )
+        reasoner = OpenCodeOneShotReasoner(os_user=claude_user)
+        try:
+            result = await reasoner.run(
+                prompt=prompt,
+                model=triage_model,
+                timeout=_TRIAGE_TIMEOUT,
+                purpose="issue_triage",
+            )
+        except OneShotTimeout as exc:
+            raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from exc
+        except OneShotError as exc:
+            raise RuntimeError(f"OpenCode triage failed: {exc}") from exc
+        return result.text
 
     if agent_backend == "codex":
         # Codex one-shot mode: --json emits NDJSON events on stdout

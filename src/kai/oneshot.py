@@ -38,9 +38,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from kai.acp import read_result, write_rpc
 from kai.codex_exec import extract_codex_text
 from kai.config import DATA_DIR, resolve_claude_user
 from kai.oneshot_binary import BinaryResolutionError, resolve_oneshot_binary
+from kai.opencode import extract_opencode_text_delta, handle_opencode_permission_request
 from kai.prompt_utils import make_boundary
 
 log = logging.getLogger(__name__)
@@ -260,6 +262,23 @@ _CODEX_PRESERVED_AUTH_VARS: tuple[str, ...] = (
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
 )
+# OpenCode authenticates via `opencode auth login` which writes to
+# `~/.local/share/opencode/auth.json` under the target user's HOME.
+# `sudo -H` rewrites HOME to the target user, so the credentials file
+# resolves automatically; what must survive `env_reset` are the per-
+# provider API keys operators commonly export when their auth flow
+# does not use the on-disk auth.json (e.g., a CI secret, a per-shell
+# `direnv` injection, or a temporary key from a vault). HOME and PATH
+# are NOT listed here for the same reason they are omitted from the
+# claude / codex lists: PATH comes through the subprocess env allow-
+# list and HOME is rewritten by `sudo -H`.
+_OPENCODE_PRESERVED_AUTH_VARS: tuple[str, ...] = (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "DEEPSEEK_API_KEY",
+)
 
 
 def _preserved_auth_vars_for(backend: str) -> tuple[str, ...]:
@@ -277,6 +296,8 @@ def _preserved_auth_vars_for(backend: str) -> tuple[str, ...]:
         return _CLAUDE_PRESERVED_AUTH_VARS
     if backend == "codex":
         return _CODEX_PRESERVED_AUTH_VARS
+    if backend == "opencode":
+        return _OPENCODE_PRESERVED_AUTH_VARS
     raise ValueError(f"unknown backend for preserve-env: {backend!r}")
 
 
@@ -1281,3 +1302,692 @@ class CodexOneShotReasoner:
             if schema_path is not None:
                 with contextlib.suppress(FileNotFoundError):
                     schema_path.unlink()
+
+
+# ── OpenCode implementation ─────────────────────────────────────────
+
+
+# Env vars forwarded to the opencode one-shot subprocess. Distinct from
+# the claude / codex allow-lists because opencode does not consume
+# CLAUDE_CONFIG_DIR or CODEX_HOME; it has its own auth state under
+# ~/.local/share/opencode/. The provider API keys mirror
+# `_OPENCODE_PRESERVED_AUTH_VARS` exactly because the same vars that
+# survive sudo's env_reset are the ones the in-process spawn also
+# needs (no-wrap path is the bot user; cross-user path is the target
+# user with the same per-provider key contract). PATH is required so
+# opencode resolves its own bundled helpers and any subprocesses it
+# spawns. HOME is required so opencode finds `~/.local/share/opencode/
+# auth.json`; on the wrap path `sudo -H` rewrites HOME to the target
+# user automatically, on the no-wrap path the bot user's HOME is the
+# right value already.
+_OPENCODE_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "DEEPSEEK_API_KEY",
+)
+
+
+# Hard handshake timeout for `initialize` and `session/new`. The
+# conversational backend uses `self.timeout_seconds` for the same
+# reads but that value is the per-turn cap (often 600+s for long
+# reasoning workloads). Handshake is a separate failure surface: a
+# stalled handshake means opencode never produced a valid initialize
+# response, so spending 10 minutes waiting on it is just dead time
+# before the reasoner fails the call. 30 seconds is generous for a
+# subprocess that normally finishes the handshake in under a second.
+_OPENCODE_HANDSHAKE_TIMEOUT_S: int = 30
+
+
+def _render_opencode_session_prompt(system_prompt: str | None, prompt: str) -> str:
+    """
+    Build a boundary-delimited session/prompt payload for an opencode
+    one-shot call.
+
+    The ACP `session/prompt` shape has no system-prompt slot. Round-2
+    smoke against opencode 1.15.11 confirmed that injecting an agent
+    definition through OPENCODE_CONFIG_CONTENT validates without
+    taking effect on the model's behavior, and `--agent` falls back
+    to the default agent on a missing-name. The remaining channel
+    that the model reliably attends to is the user prompt itself.
+
+    The render mirrors `_render_codex_stdin`: prepend the system text
+    inside a randomized boundary block, then append the user prompt
+    below it. The boundary token is `secrets.token_hex(4)` (32 bits)
+    via `make_boundary`. That entropy is collision-avoidance, NOT a
+    security barrier against adversarial prompts; the value matches
+    the codex reasoner exactly so the two boundary helpers stay
+    symmetric and a future widening can flow through `make_boundary`
+    in one place.
+
+    A None or empty `system_prompt` returns the user prompt unchanged
+    rather than emitting a free-floating boundary block with no
+    content; matches the no-system-prompt semantics callers already
+    get from claude's `--system-prompt` flag being omitted.
+    """
+    if not system_prompt:
+        return prompt
+    begin, end = make_boundary("SYSTEM")
+    return f"{begin}\n{system_prompt}\n{end}\n\n{prompt}"
+
+
+class OpenCodeOneShotReasoner:
+    """
+    Spawns `opencode acp` once per call and returns either the raw
+    accumulated agent_message text or, when a JSON schema is supplied,
+    a normalized `{"is_error": false, "structured_output": ...}`
+    envelope string that matches the shape memory_extraction.py
+    already parses.
+
+    OpenCode differs from claude and codex on every axis that matters:
+    no CLI one-shot mode that reliably emits text (round-2 smoke
+    against opencode 1.15.11 showed `opencode run --format json`
+    emits a `text` event on stdout for only two of twelve smoke
+    invocations; the other ten exited rc=0 with no text on the wire
+    while the model actually produced output internally), so the
+    transport contract is the same JSON-RPC-over-stdio ACP layer the
+    conversational backend uses. Each call spawns a fresh
+    `opencode acp` subprocess, drives the handshake, sends one
+    `session/prompt` request, accumulates response text from
+    `session/update` notifications, denies any tool-permission
+    request that appears mid-stream, and tears the subprocess down.
+
+    The transport reuses the module-level `write_rpc` and
+    `read_result` free functions from `kai.acp`, plus
+    `extract_opencode_text_delta` and
+    `handle_opencode_permission_request` from `kai.opencode`. The
+    permission policy passed in is `"reject_once"`; the
+    conversational backend uses `"allow_always"` against the same
+    free function so tool calls can run in chat. The split is
+    deliberate: memory extraction / PR review / issue triage
+    prompts must NOT execute tools, but the rejection is scoped to
+    the single one-shot invocation rather than persisted to user
+    config.
+
+    Model selection flows through `OPENCODE_CONFIG_CONTENT`. The
+    CLI accepts no `--model` flag; opencode reads inline JSON config
+    from the env var at startup. Model strings use OpenCode's full
+    `provider/model` shape (validated against `is_opencode_model_shape`
+    at config-load time so a malformed entry never reaches this
+    reasoner). When `model is None`, opencode falls back to whatever
+    its own config files specify, matching the conversational
+    backend's behavior.
+
+    System prompt injection: ACP and the `session/prompt` shape do
+    not expose a system-prompt slot, so the system text is prepended
+    to the user prompt via `_render_opencode_session_prompt` with a
+    randomized boundary block (mirroring `_render_codex_stdin`).
+
+    Per-OS-user routing: mirrors claude and codex. When
+    `os_user is None` or resolves to the bot user, opencode spawns
+    directly. A non-bot target wraps the argv in
+    `sudo -H -u <user> --preserve-env=<csv>` carrying the auth vars
+    from `_preserved_auth_vars_for("opencode")`. The sudoers rule
+    emitted by `install._generate_sudoers` for the opencode binary
+    authorizes the passthrough; without that rule the wrap path
+    fails with "a password is required" on the first call.
+
+    Subprocess cleanup runs on every exit path (success, timeout,
+    error, parse failure). The persistent backend's `_kill` /
+    `shutdown` pattern is the model: send SIGKILL, await up to 5s,
+    null all process references. The one-shot reasoner uses a
+    bounded shutdown helper kept inside `run()` so the cleanup
+    sequence stays in one place with the spawn it manages.
+    """
+
+    def __init__(self, *, cwd: Path | None = None, os_user: str | None = None) -> None:
+        """
+        Args:
+            cwd: Override for the subprocess working directory. Tests
+                pass a temp path so the run does not touch the real
+                DATA_DIR. Production callers leave this unset; the
+                reasoner uses `_EXTRACTOR_CWD` and ensures it exists
+                on first call.
+            os_user: Optional target OS user, symmetric with claude
+                and codex. `None` (or a value that
+                `resolve_claude_user` collapses to the current
+                process user) spawns opencode in-process as the bot
+                user; the self-sudo-skip path is identical to the
+                no-os_user case. A non-bot username wraps the argv
+                in `sudo -H -u <user>` with the opencode preserve
+                list.
+        """
+        self._cwd = cwd if cwd is not None else _EXTRACTOR_CWD
+        self._os_user = os_user
+
+    async def run(
+        self,
+        *,
+        prompt: str,
+        system_prompt: str | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+        purpose: str,
+        json_schema: dict[str, Any] | None = None,
+    ) -> OneShotResult:
+        # Lazy mkdir + chmod: deferred from import time so a permission
+        # failure surfaces as a logged miss rather than crashing the bot
+        # at startup. The unconditional chmod self-heals a pre-existing
+        # tighter mode (the cross-user routing target must be able to
+        # enter the cwd as a working directory).
+        self._cwd.mkdir(parents=True, exist_ok=True)
+        self._cwd.chmod(0o755)
+
+        # Resolve the opencode binary through the shared resolver so
+        # config validation, this argv, and the smoke output all see
+        # the same resolution result. BinaryResolutionError becomes
+        # OneShotRoutingError here so the existing memory_extraction
+        # `except OneShotError` catch surface is unchanged; the
+        # rewrap preserves the leaf-resolver / reasoner-error split
+        # documented on oneshot_binary.
+        try:
+            resolved_binary = resolve_oneshot_binary("opencode")
+        except BinaryResolutionError as e:
+            raise OneShotRoutingError(str(e)) from e
+
+        cmd: list[str] = [resolved_binary, "acp"]
+
+        # Per-user OS routing. Same shape claude and codex use:
+        # `resolve_claude_user` returns None when the target is unset
+        # OR matches the bot user (self-sudo-skip), and the direct
+        # spawn path is byte-identical to a no-os_user call. A
+        # non-None target wraps the argv in sudo with the opencode
+        # preserve list.
+        effective_user = resolve_claude_user(self._os_user)
+        if effective_user is not None:
+            cmd = _wrap_cmd_for_user(cmd, effective_user, "opencode")
+
+        # Allow-listed env: only forward keys present in the parent
+        # env. Defense-in-depth against a future regression that tries
+        # to reuse claude's or codex's env list. PATH is allow-listed
+        # so sudo can resolve the bare `opencode` invocation against
+        # the bot user's PATH; the sudoers rule pins the resolved
+        # absolute path so the passthrough is bounded.
+        subprocess_env: dict[str, str] = {key: os.environ[key] for key in _OPENCODE_ENV_ALLOWLIST if key in os.environ}
+        # Model selection flows through OPENCODE_CONFIG_CONTENT. The
+        # conversational backend uses the same env-driven mechanism
+        # in `OpenCodeBackend.build_env`. When model is None the env
+        # var is left out so opencode falls back to whatever its
+        # config files specify, matching the conversational shape.
+        if model is not None:
+            subprocess_env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"model": model})
+
+        rendered_prompt = _render_opencode_session_prompt(system_prompt, prompt)
+        os_user_field = _os_user_log_field(effective_user)
+
+        start = time.monotonic()
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(self._cwd),
+                env=subprocess_env,
+                # New session on the wrap path so a future
+                # `_kill_target_user_tree` on this reasoner has a pgid
+                # to target. Direct path keeps default semantics so a
+                # SIGKILL on `proc` reaches the agent alone.
+                start_new_session=bool(effective_user),
+            )
+
+            # Drain stderr in the background so the pipe buffer cannot
+            # fill and deadlock the subprocess. Discarded; opencode's
+            # diagnostic output is not load-bearing for the one-shot
+            # path. The conversational backend's `_drain_stderr`
+            # surfaces WARNING-token lines, but the one-shot reasoner
+            # is short-lived and the operator-readable failure surface
+            # is the OneShotError typed exceptions, not stderr scrape.
+            stderr_task = asyncio.create_task(_drain_proc_stderr(proc))
+
+            # Run the full one-shot exchange inside the overall timeout
+            # so timeout / handshake-error / response-parse failures
+            # all map to typed errors with the elapsed time captured.
+            # `asyncio.wait_for(timeout=None)` is a no-op timeout when
+            # the caller did not specify one, matching the claude /
+            # codex paths' identical semantics.
+            try:
+                result = await asyncio.wait_for(
+                    self._drive_exchange(
+                        proc=proc,
+                        rendered_prompt=rendered_prompt,
+                        purpose=purpose,
+                        model=model,
+                        json_schema=json_schema,
+                    ),
+                    timeout=timeout,
+                )
+            except TimeoutError:
+                duration_ms = int((time.monotonic() - start) * 1000)
+                log.info(
+                    "oneshot_reasoner purpose=%s backend=opencode model=%s duration_ms=%d outcome=timeout error_category=timeout os_user=%s",
+                    purpose,
+                    model,
+                    duration_ms,
+                    os_user_field,
+                )
+                raise OneShotTimeout() from None
+
+            accumulated, completion_error = result
+            duration_ms = int((time.monotonic() - start) * 1000)
+
+            if completion_error is not None:
+                # JSON-RPC error response on the session/prompt id, OR
+                # the subprocess exited mid-stream. Maps to
+                # OneShotSubprocessError when we have a returncode
+                # (process died) and OneShotOutputError when we have
+                # only an error message (opencode itself reported it).
+                if proc.returncode is not None:
+                    log.info(
+                        "oneshot_reasoner purpose=%s backend=opencode model=%s duration_ms=%d outcome=subprocess_error error_category=non_zero_exit returncode=%d os_user=%s",
+                        purpose,
+                        model,
+                        duration_ms,
+                        proc.returncode,
+                        os_user_field,
+                    )
+                    raise OneShotSubprocessError(returncode=proc.returncode, stderr=b"")
+                log.info(
+                    "oneshot_reasoner purpose=%s backend=opencode model=%s duration_ms=%d outcome=output_error error_category=jsonrpc_error returncode=0 os_user=%s",
+                    purpose,
+                    model,
+                    duration_ms,
+                    os_user_field,
+                )
+                raise OneShotOutputError(f"opencode session/prompt error: {completion_error}")
+
+            # Free-form path: hand the accumulated text back unchanged.
+            # Memory extraction / review / triage all supply a schema,
+            # so this branch exists only for any future free-form
+            # caller. Claude and codex both keep the symmetric
+            # branch; the one-shot family stays uniform on this.
+            if json_schema is None:
+                log.info(
+                    "oneshot_reasoner purpose=%s backend=opencode model=%s duration_ms=%d outcome=success returncode=0 os_user=%s",
+                    purpose,
+                    model,
+                    duration_ms,
+                    os_user_field,
+                )
+                return OneShotResult(
+                    text=accumulated,
+                    backend="opencode",
+                    model=model,
+                    raw_metadata={
+                        "returncode": 0,
+                        "stderr": b"",
+                        "cwd": str(self._cwd),
+                        # cmd is post-wrap (includes the sudo prefix
+                        # on cross-user routing); resolved_binary is
+                        # the pre-wrap agent path. Smoke prints
+                        # resolved_binary so the operator-visible
+                        # "which binary ran" answer survives the sudo
+                        # wrap, where cmd[0] is "sudo" rather than
+                        # the agent.
+                        "cmd": list(cmd),
+                        "resolved_binary": resolved_binary,
+                    },
+                    duration_ms=duration_ms,
+                )
+
+            # Schema-backed path. Mirrors the codex reasoner exactly:
+            # the accumulated text must parse as a JSON object;
+            # anything else is OneShotOutputError so memory
+            # extraction's caller-side mapping collapses it to the
+            # zero-state extraction result instead of letting a
+            # malformed payload reach the fact validator.
+            if not accumulated:
+                log.info(
+                    "oneshot_reasoner purpose=%s backend=opencode model=%s duration_ms=%d outcome=output_error error_category=empty_response returncode=0 os_user=%s",
+                    purpose,
+                    model,
+                    duration_ms,
+                    os_user_field,
+                )
+                raise OneShotOutputError("opencode produced no accumulated text")
+            try:
+                payload = json.loads(accumulated)
+            except json.JSONDecodeError as exc:
+                log.info(
+                    "oneshot_reasoner purpose=%s backend=opencode model=%s duration_ms=%d outcome=output_error error_category=invalid_json returncode=0 os_user=%s",
+                    purpose,
+                    model,
+                    duration_ms,
+                    os_user_field,
+                )
+                raise OneShotOutputError(f"opencode accumulated text was not valid JSON: {exc}") from None
+
+            if not isinstance(payload, dict):
+                log.info(
+                    "oneshot_reasoner purpose=%s backend=opencode model=%s duration_ms=%d outcome=output_error error_category=non_object_json returncode=0 os_user=%s",
+                    purpose,
+                    model,
+                    duration_ms,
+                    os_user_field,
+                )
+                raise OneShotOutputError("opencode accumulated JSON was not an object")
+
+            required_fields = json_schema.get("required")
+            if isinstance(required_fields, list):
+                missing = [field for field in required_fields if field not in payload]
+                if missing:
+                    log.info(
+                        "oneshot_reasoner purpose=%s backend=opencode model=%s duration_ms=%d outcome=output_error error_category=missing_required_fields returncode=0 os_user=%s",
+                        purpose,
+                        model,
+                        duration_ms,
+                        os_user_field,
+                    )
+                    raise OneShotOutputError(f"opencode accumulated JSON missing required fields: {missing}")
+
+            # Wrap opencode's schema-shaped payload in the same
+            # envelope claude emits natively (and codex now mirrors).
+            # memory_extraction.py already walks the
+            # `structured_output` field on a parsed dict; rewrapping
+            # keeps the parser path provider-neutral.
+            envelope = json.dumps({"is_error": False, "structured_output": payload})
+            log.info(
+                "oneshot_reasoner purpose=%s backend=opencode model=%s duration_ms=%d outcome=success returncode=0 os_user=%s",
+                purpose,
+                model,
+                duration_ms,
+                os_user_field,
+            )
+            return OneShotResult(
+                text=envelope,
+                backend="opencode",
+                model=model,
+                raw_metadata={
+                    "returncode": 0,
+                    "stderr": b"",
+                    "cwd": str(self._cwd),
+                    "cmd": list(cmd),
+                    "resolved_binary": resolved_binary,
+                },
+                duration_ms=duration_ms,
+            )
+        finally:
+            # Subprocess cleanup runs on every exit path: success,
+            # timeout, subprocess error, output error, and any
+            # unexpected exception propagating from the spawn itself.
+            # The shutdown sequence sends SIGKILL on the wrap path
+            # (after escalating through the target user's permission
+            # to signal its own process group) and on the direct
+            # path; the bounded `wait(timeout=5)` then reaps the
+            # process. A second timeout means the OS has lost the
+            # process; the function returns without raising because
+            # the typed error path already populated the caller's
+            # exception context.
+            if proc is not None:
+                await _shutdown_opencode_proc(proc, effective_user=effective_user, purpose=purpose)
+                if "stderr_task" in locals():
+                    stderr_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await stderr_task
+
+    async def _drive_exchange(
+        self,
+        *,
+        proc: asyncio.subprocess.Process,
+        rendered_prompt: str,
+        purpose: str,
+        model: str | None,
+        json_schema: dict[str, Any] | None,
+    ) -> tuple[str, str | None]:
+        """
+        Run the ACP handshake + session/prompt + read loop on `proc`.
+
+        Returns `(accumulated_text, completion_error)` where
+        `completion_error` is None on success or the JSON-RPC error
+        message string when opencode returned a matching-id error
+        for the prompt. The caller maps `completion_error is not
+        None` to the right typed exception (`OneShotOutputError`
+        vs `OneShotSubprocessError` depending on whether the
+        subprocess itself died).
+
+        Handshake errors propagate as RuntimeError / TimeoutError
+        from the shared `read_result` free function; the caller's
+        try/finally wraps cleanup and the outer wait_for translates
+        TimeoutError to `OneShotTimeout`.
+
+        Kept as a separate method so the outer `run()` can wrap the
+        whole exchange in a single `asyncio.wait_for(timeout=...)`
+        and still hit the cleanup path uniformly.
+
+        `purpose`, `model`, `json_schema` are accepted for symmetry
+        with the broader call shape; they are not read here because
+        the contract is "drive the bytes," not "decide success vs
+        failure semantics." The caller owns those decisions after
+        the exchange returns.
+        """
+        # Local request-id counter scoped to this short-lived
+        # subprocess. Distinct from the conversational backend's
+        # `self._next_id` because the one-shot has no persistent
+        # state to keep across calls.
+        next_id = 1
+
+        # Step 1: initialize. Send request, await response. The
+        # response shape is not consumed here; what matters is that
+        # opencode acknowledges the protocol version before we issue
+        # `session/new`.
+        from kai import __version__
+
+        next_id = await write_rpc(
+            proc=proc,
+            next_id=next_id,
+            method="initialize",
+            params={
+                "protocolVersion": 1,
+                "clientInfo": {"name": "kai", "version": __version__},
+            },
+        )
+        await read_result(
+            proc=proc,
+            expected_id=1,
+            timeout_seconds=_OPENCODE_HANDSHAKE_TIMEOUT_S,
+            backend_label="OpenCode",
+        )
+
+        # Step 2: session/new. The cwd matches the subprocess working
+        # directory so opencode's session model and Kai's view of the
+        # working tree agree. mcpServers is empty: one-shot calls do
+        # not need MCP integration, and excluding the field would
+        # leave opencode reading whatever its config files specify
+        # (potentially injecting tools we deny later anyway).
+        next_id = await write_rpc(
+            proc=proc,
+            next_id=next_id,
+            method="session/new",
+            params={
+                "cwd": str(self._cwd),
+                "mcpServers": [],
+            },
+        )
+        session_result = await read_result(
+            proc=proc,
+            expected_id=2,
+            timeout_seconds=_OPENCODE_HANDSHAKE_TIMEOUT_S,
+            backend_label="OpenCode",
+        )
+        session_id = session_result.get("sessionId")
+        if not isinstance(session_id, str):
+            # Defensive: opencode's session/new response should always
+            # carry a string sessionId; missing it means the handshake
+            # is corrupt and we cannot continue. Surface as a
+            # RuntimeError so the outer try/finally cleans up the
+            # subprocess; the caller maps unexpected exceptions to a
+            # logged-and-collapsed extraction miss.
+            raise RuntimeError(f"OpenCode session/new returned no sessionId: {session_result!r}")
+
+        # Step 3: session/prompt. ACP wraps content in a list of
+        # blocks; the one-shot only sends text content. The prompt id
+        # is captured BEFORE write_rpc bumps the counter so the read
+        # loop below can match against it.
+        prompt_id = next_id
+        next_id = await write_rpc(
+            proc=proc,
+            next_id=next_id,
+            method="session/prompt",
+            params={
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": rendered_prompt}],
+            },
+        )
+
+        # Step 4: read loop. Accumulate `agent_message_chunk` text;
+        # reject any `session/request_permission` requests with the
+        # `reject_once` policy; stop when the prompt response arrives
+        # (success or error). The loop has no timeout of its own
+        # because the outer `asyncio.wait_for` is the per-call cap.
+        accumulated = ""
+        assert proc.stdout is not None
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                # EOF: subprocess died mid-stream. Surface as a
+                # completion_error so the caller maps to
+                # OneShotSubprocessError (proc.returncode will be set
+                # by the await above) or OneShotOutputError. The
+                # accumulated text so far still goes back to the
+                # caller in case a partial response is useful for
+                # debugging (the typed-error path discards it, but
+                # the contract is "what we got").
+                return accumulated, "OpenCode process ended unexpectedly"
+
+            try:
+                msg = json.loads(line.decode())
+            except json.JSONDecodeError:
+                # Non-JSON lines from a misbehaving opencode build
+                # (progress bars, debug prints) are skipped; the
+                # shared `read_result` does the same for handshake
+                # parsing.
+                continue
+
+            # Streaming notification (no `id` field). Accumulate text
+            # via the shared free function; skip every other
+            # notification shape.
+            if "method" in msg and "id" not in msg:
+                text = extract_opencode_text_delta(msg)
+                if text:
+                    accumulated += text
+                continue
+
+            # Server-initiated request (both `method` and `id`). The
+            # one-shot reasoner denies every permission request with
+            # the `reject_once` policy; the response goes back on the
+            # server's id so opencode unblocks and either re-prompts
+            # or moves past the tool call.
+            if "method" in msg and "id" in msg:
+                server_id = msg["id"]
+                response_body = handle_opencode_permission_request(msg, policy="reject_once")
+                if response_body is not None:
+                    payload = {"jsonrpc": "2.0", "id": server_id, "result": response_body}
+                    line_out = (json.dumps(payload) + "\n").encode()
+                    assert proc.stdin is not None
+                    proc.stdin.write(line_out)
+                    try:
+                        await proc.stdin.drain()
+                    except OSError:
+                        # Stdin write failed; subprocess is gone.
+                        # Surface as completion_error with the partial
+                        # accumulated text so the caller can map to
+                        # OneShotSubprocessError.
+                        return accumulated, "OpenCode stdin closed mid-stream"
+                continue
+
+            # Final response for our session/prompt request.
+            if msg.get("id") == prompt_id:
+                if "error" in msg:
+                    err = msg["error"].get("message", "unknown ACP error")
+                    return accumulated, str(err)
+                # Success. The result body is not consumed; the
+                # accumulated text from session/update notifications
+                # IS the answer.
+                return accumulated, None
+
+            # Some other shape (a response to a request we did not
+            # send, or a notification we already filtered). Skip and
+            # keep reading.
+
+
+async def _drain_proc_stderr(proc: asyncio.subprocess.Process) -> None:
+    """
+    Continuously read and discard stderr from a one-shot opencode
+    subprocess.
+
+    Without this, the stderr pipe buffer fills and the process can
+    deadlock. Discarded (not logged at INFO) because the one-shot
+    reasoner's operator-readable failure surface is the typed
+    OneShotError family, not stderr scrape. A DEBUG line per drained
+    string keeps the bytes traceable when an operator turns up
+    logging without needing a code change.
+    """
+    if proc.stderr is None:
+        return
+    while True:
+        try:
+            line = await proc.stderr.readline()
+        except Exception:
+            return
+        if not line:
+            return
+        text = line.decode(errors="replace").strip()
+        if text:
+            log.debug("OpenCode (one-shot) stderr: %s", text[:200])
+
+
+async def _shutdown_opencode_proc(
+    proc: asyncio.subprocess.Process,
+    *,
+    effective_user: str | None,
+    purpose: str,
+) -> None:
+    """
+    Bounded shutdown of an opencode one-shot subprocess on every
+    exit path.
+
+    Wrap path: escalate via the target user's `/bin/kill` permission
+    to send SIGKILL to the spawn's process group first, then reap
+    the sudo wrapper. The conversational claude / codex reasoners
+    use the same pattern (`_kill_target_user_tree`); reusing that
+    helper keeps the cross-user kill semantics uniform.
+
+    Direct path: SIGKILL on `proc` directly. The 5-second
+    `proc.wait(timeout=5)` matches the conversational
+    AcpBackend.shutdown contract; a second timeout means the OS
+    has lost the process and the caller's typed-error path has
+    already populated the exception context, so the function
+    returns silently rather than raising into the cleanup chain.
+    """
+    if proc.returncode is not None:
+        # Already exited (typical happy path: the JSON-RPC response
+        # arrived, the read loop returned, and opencode is in the
+        # process of shutting itself down). Reap to avoid a zombie
+        # and return.
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        return
+
+    if effective_user is not None:
+        # Cross-user spawn: bot user does not have permission to
+        # signal the target user's descendants directly. Use the
+        # shared helper that hands the kill through `sudo /bin/kill`.
+        with contextlib.suppress(BaseException):
+            await _kill_target_user_tree(
+                target_user=effective_user,
+                pgid=proc.pid,
+                purpose=purpose,
+                backend="opencode",
+            )
+
+    # SIGKILL on the wrapper (or on the agent directly when no wrap).
+    # OSError covers the race where the subprocess died between the
+    # returncode check above and this kill.
+    with contextlib.suppress(OSError):
+        proc.kill()
+    with contextlib.suppress(BaseException):
+        await asyncio.wait_for(proc.wait(), timeout=5)

@@ -1128,35 +1128,74 @@ class TestRunReviewGoose:
             await run_review("prompt", agent_backend="goose", provider="")
 
 
-class TestRunReviewRejectsOpenCode:
+class TestRunReviewOpenCodeDispatch:
     """
-    OpenCode has no one-shot reasoner; run_review must surface this
-    as a clean ValueError rather than silently dispatching the
-    Claude branch (which would spawn `claude --print` and bill the
-    operator's Claude auth for what should have been an opencode
-    operation). Pin both the rejection AND the absence of any
-    subprocess spawn for `agent_backend="opencode"`.
+    `run_review` with `agent_backend="opencode"` dispatches to
+    `OpenCodeOneShotReasoner` (NOT a direct `opencode` subprocess
+    spawn, and NOT a fall-through to the claude branch). The
+    reasoner's `OneShotResult.text` becomes the function's return
+    value; typed reasoner errors collapse to RuntimeError so the
+    webhook handler's existing failure surface is unchanged.
     """
 
     @pytest.mark.asyncio
-    async def test_run_review_rejects_opencode_backend(self):
-        """`agent_backend="opencode"` raises ValueError before any subprocess spawn."""
+    async def test_run_review_dispatches_to_opencode_reasoner(self):
+        """The opencode branch builds a OpenCodeOneShotReasoner and
+        awaits its run; the reasoner's text becomes run_review's
+        return value."""
+        from kai.oneshot import OneShotResult
+
+        fake = MagicMock()
+        fake.run = AsyncMock(
+            return_value=OneShotResult(
+                text="review body from opencode",
+                backend="opencode",
+                model="anthropic/claude-sonnet-4-5",
+            )
+        )
+
         with (
+            patch("kai.review.OpenCodeOneShotReasoner", return_value=fake) as ctor,
             patch("kai.review.asyncio.create_subprocess_exec") as mock_exec,
-            pytest.raises(ValueError, match=r"opencode.*not supported"),
         ):
-            await run_review("prompt", agent_backend="opencode")
+            result = await run_review("prompt body", agent_backend="opencode", claude_user="someone")
+
+        assert result == "review body from opencode"
+        # OpenCodeOneShotReasoner was constructed with the claude_user
+        # threaded through as os_user.
+        ctor.assert_called_once()
+        assert ctor.call_args.kwargs == {"os_user": "someone"}
+        # The reasoner's run was awaited.
+        fake.run.assert_awaited_once()
+        # No direct claude / codex / opencode subprocess spawn from
+        # run_review itself - the reasoner owns that.
         mock_exec.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_run_review_does_not_spawn_claude_for_opencode(self):
-        """No fall-through to the claude branch for opencode users."""
-        with patch("kai.review.asyncio.create_subprocess_exec") as mock_exec, pytest.raises(ValueError):
-            await run_review("prompt", agent_backend="opencode", provider="anthropic")
-        # Confirm no `claude --print` was even attempted.
-        for call in mock_exec.call_args_list:
-            argv = call[0]
-            assert "claude" not in argv, f"Unexpected claude spawn: {argv}"
+    async def test_run_review_collapses_oneshot_timeout_to_runtime_error(self):
+        from kai.oneshot import OneShotTimeout
+
+        fake = MagicMock()
+        fake.run = AsyncMock(side_effect=OneShotTimeout())
+
+        with (
+            patch("kai.review.OpenCodeOneShotReasoner", return_value=fake),
+            pytest.raises(RuntimeError, match=r"Review subprocess timed out"),
+        ):
+            await run_review("prompt", agent_backend="opencode")
+
+    @pytest.mark.asyncio
+    async def test_run_review_collapses_oneshot_error_to_runtime_error(self):
+        from kai.oneshot import OneShotOutputError
+
+        fake = MagicMock()
+        fake.run = AsyncMock(side_effect=OneShotOutputError("model refused"))
+
+        with (
+            patch("kai.review.OpenCodeOneShotReasoner", return_value=fake),
+            pytest.raises(RuntimeError, match=r"OpenCode review failed.*model refused"),
+        ):
+            await run_review("prompt", agent_backend="opencode")
 
 
 class TestResolveGooseModelReview:

@@ -651,34 +651,65 @@ class TestRunTriageGoose:
             await run_triage("prompt", agent_backend="goose", provider="")
 
 
-class TestRunTriageRejectsOpenCode:
+class TestRunTriageOpenCodeDispatch:
     """
-    OpenCode has no one-shot reasoner; run_triage must surface this
-    as a clean ValueError rather than silently dispatching the Claude
-    branch (which would spawn `claude --print` and bill the operator's
-    Claude auth for what should have been an opencode operation). Pin
-    both the rejection AND the absence of any subprocess spawn for
-    `agent_backend="opencode"`.
+    `run_triage` with `agent_backend="opencode"` dispatches to
+    `OpenCodeOneShotReasoner`. The reasoner's `OneShotResult.text`
+    becomes the return value; typed reasoner errors collapse to
+    RuntimeError to keep the webhook handler's failure surface
+    unchanged.
     """
 
     @pytest.mark.asyncio
-    async def test_run_triage_rejects_opencode_backend(self):
-        """`agent_backend="opencode"` raises ValueError before any subprocess spawn."""
+    async def test_run_triage_dispatches_to_opencode_reasoner(self):
+        from kai.oneshot import OneShotResult
+
+        fake = MagicMock()
+        fake.run = AsyncMock(
+            return_value=OneShotResult(
+                text='{"labels": []}',
+                backend="opencode",
+                model="anthropic/claude-sonnet-4-5",
+            )
+        )
+
         with (
+            patch("kai.triage.OpenCodeOneShotReasoner", return_value=fake) as ctor,
             patch("kai.triage.asyncio.create_subprocess_exec") as mock_exec,
-            pytest.raises(ValueError, match=r"opencode.*not supported"),
         ):
-            await run_triage("prompt", agent_backend="opencode")
+            result = await run_triage("prompt body", agent_backend="opencode", claude_user="someone")
+
+        assert result == '{"labels": []}'
+        ctor.assert_called_once()
+        assert ctor.call_args.kwargs == {"os_user": "someone"}
+        fake.run.assert_awaited_once()
         mock_exec.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_run_triage_does_not_spawn_claude_for_opencode(self):
-        """No fall-through to the claude branch for opencode users."""
-        with patch("kai.triage.asyncio.create_subprocess_exec") as mock_exec, pytest.raises(ValueError):
-            await run_triage("prompt", agent_backend="opencode", provider="anthropic")
-        for call in mock_exec.call_args_list:
-            argv = call[0]
-            assert "claude" not in argv, f"Unexpected claude spawn: {argv}"
+    async def test_run_triage_collapses_oneshot_timeout_to_runtime_error(self):
+        from kai.oneshot import OneShotTimeout
+
+        fake = MagicMock()
+        fake.run = AsyncMock(side_effect=OneShotTimeout())
+
+        with (
+            patch("kai.triage.OpenCodeOneShotReasoner", return_value=fake),
+            pytest.raises(RuntimeError, match=r"Triage subprocess timed out"),
+        ):
+            await run_triage("prompt", agent_backend="opencode")
+
+    @pytest.mark.asyncio
+    async def test_run_triage_collapses_oneshot_error_to_runtime_error(self):
+        from kai.oneshot import OneShotOutputError
+
+        fake = MagicMock()
+        fake.run = AsyncMock(side_effect=OneShotOutputError("schema bad"))
+
+        with (
+            patch("kai.triage.OpenCodeOneShotReasoner", return_value=fake),
+            pytest.raises(RuntimeError, match=r"OpenCode triage failed.*schema bad"),
+        ):
+            await run_triage("prompt", agent_backend="opencode")
 
 
 class TestRunTriageCodex:

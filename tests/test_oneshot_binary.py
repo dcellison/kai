@@ -126,6 +126,75 @@ class TestCodexResolution:
         assert called == [], f"shutil.which should not be called when CODEX_BIN is set; got {called}"
 
 
+class TestOpenCodeResolution:
+    """OpenCode arm mirrors the codex pattern: OPENCODE_BIN override
+    validates as is-file plus executable with no PATH fallback; no
+    override falls back to shutil.which("opencode")."""
+
+    def test_no_override_resolves_via_path(self, monkeypatch):
+        monkeypatch.delenv("OPENCODE_BIN", raising=False)
+        monkeypatch.setattr(
+            "kai.oneshot_binary.shutil.which",
+            lambda name: "/fake/path/opencode" if name == "opencode" else None,
+        )
+        assert resolve_oneshot_binary("opencode") == "/fake/path/opencode"
+
+    def test_no_override_unreachable_raises_naming_both_candidates(self, monkeypatch):
+        monkeypatch.delenv("OPENCODE_BIN", raising=False)
+        monkeypatch.setattr("kai.oneshot_binary.shutil.which", lambda name: None)
+        with pytest.raises(BinaryResolutionError) as exc:
+            resolve_oneshot_binary("opencode")
+        message = str(exc.value)
+        assert "OPENCODE_BIN" in message
+        assert "PATH" in message
+
+    def test_explicit_override_resolves_to_exact_path(self, tmp_path, monkeypatch):
+        fake = tmp_path / "opencode-binary"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("OPENCODE_BIN", str(fake))
+        monkeypatch.setattr("kai.oneshot_binary.shutil.which", lambda name: "/other/opencode")
+        assert resolve_oneshot_binary("opencode") == str(fake)
+
+    def test_explicit_override_not_a_file_raises_not_a_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("OPENCODE_BIN", str(tmp_path / "does-not-exist"))
+        monkeypatch.setattr("kai.oneshot_binary.shutil.which", lambda name: "/should/not/be/returned")
+        with pytest.raises(BinaryResolutionError) as exc:
+            resolve_oneshot_binary("opencode")
+        message = str(exc.value)
+        assert "not-a-file" in message
+        assert "does-not-exist" in message
+
+    def test_explicit_override_not_executable_raises_not_executable(self, tmp_path, monkeypatch):
+        fake = tmp_path / "opencode-not-x"
+        fake.write_text("not-a-script")
+        fake.chmod(0o644)
+        monkeypatch.setenv("OPENCODE_BIN", str(fake))
+        monkeypatch.setattr("kai.oneshot_binary.shutil.which", lambda name: "/should/not/be/returned")
+        with pytest.raises(BinaryResolutionError) as exc:
+            resolve_oneshot_binary("opencode")
+        message = str(exc.value)
+        assert "not-executable" in message
+        assert str(fake) in message
+
+    def test_explicit_override_no_fallback_to_path(self, tmp_path, monkeypatch):
+        """OPENCODE_BIN set to a bad path must NOT silently fall back to
+        shutil.which('opencode'). Same regression guard as the codex
+        arm; a fallback would hide stale-config bugs from the operator."""
+        monkeypatch.setenv("OPENCODE_BIN", str(tmp_path / "missing"))
+
+        called: list[str] = []
+
+        def fake_which(name):
+            called.append(name)
+            return "/some/opencode"
+
+        monkeypatch.setattr("kai.oneshot_binary.shutil.which", fake_which)
+        with pytest.raises(BinaryResolutionError):
+            resolve_oneshot_binary("opencode")
+        assert called == [], f"shutil.which should not be called when OPENCODE_BIN is set; got {called}"
+
+
 class TestUnknownBackend:
     def test_unknown_backend_raises_value_error(self):
         """An unknown backend string is a CALLER bug (config validation
@@ -134,4 +203,4 @@ class TestUnknownBackend:
         split lets call sites distinguish 'fix the operator's PATH'
         from 'fix the code that asked for the wrong backend'."""
         with pytest.raises(ValueError, match="unknown backend"):
-            resolve_oneshot_binary("opencode")
+            resolve_oneshot_binary("not-a-real-backend")

@@ -223,6 +223,24 @@ MODEL_REGISTRY: dict[tuple[str, ModelRole], str] = {
     ("claude", ModelRole.MEMORY_EPISODE): "claude-haiku-4-5-20251001",
     ("codex", ModelRole.MEMORY_EXTRACTION): "gpt-5.4-mini",
     ("codex", ModelRole.MEMORY_EPISODE): "gpt-5.4-mini",
+    # OpenCode rows use the full `provider/model` shape opencode
+    # expects (validated structurally by is_opencode_model_shape).
+    # Defaults pick anthropic/* because the anthropic provider is the
+    # most-tested opencode auth path; Sonnet for reasoning-heavy roles
+    # (review, triage, behavioral gen), Haiku for cheaper memory work
+    # and the behavioral judge. Operators who authenticated a
+    # different provider via `opencode auth login` (deepseek, openai,
+    # openrouter, google) override these in-tree the same way codex
+    # operators override the codex registry. The shape gate in
+    # _check_model_registry_complete enforces the contract; the
+    # canonical model set is install-local and operator-managed so no
+    # CLI allow-list check applies here.
+    ("opencode", ModelRole.PR_REVIEW): "anthropic/claude-sonnet-4-5",
+    ("opencode", ModelRole.ISSUE_TRIAGE): "anthropic/claude-sonnet-4-5",
+    ("opencode", ModelRole.BEHAVIORAL_JUDGE): "anthropic/claude-haiku-4-5",
+    ("opencode", ModelRole.BEHAVIORAL_GEN): "anthropic/claude-sonnet-4-5",
+    ("opencode", ModelRole.MEMORY_EXTRACTION): "anthropic/claude-haiku-4-5",
+    ("opencode", ModelRole.MEMORY_EPISODE): "anthropic/claude-haiku-4-5",
 }
 
 
@@ -260,18 +278,18 @@ def get_model_for(role: ModelRole, backend: str, override: str = "") -> str:
 def _check_model_registry_complete(backend: str) -> None:
     """
     Verify MODEL_REGISTRY has a row for every role the active backend uses,
-    AND that each codex row names a model the codex CLI actually exposes.
+    AND that each codex / opencode row passes its backend's shape check.
 
     Runs once at load_config() time. Raises SystemExit on a missing or
     invalid row so the bug surfaces at startup rather than at a per-
     request LookupError (which would otherwise crash a single agent
     invocation silently if a future role were added without its
-    registry rows, or with a codex-incompatible model).
+    registry rows, or with a backend-incompatible model).
 
     Goose is exempt: goose-side model resolution lives in module-level
     _GOOSE_AGENT_MODELS dicts that this registry does not subsume.
     """
-    if backend not in ("claude", "codex"):
+    if backend not in ("claude", "codex", "opencode"):
         return
     missing = [role for role in ModelRole if (backend, role) not in MODEL_REGISTRY]
     if missing:
@@ -295,6 +313,26 @@ def _check_model_registry_complete(backend: str) -> None:
             raise SystemExit(
                 f"MODEL_REGISTRY has codex rows naming models the codex CLI does not expose: {details}. "
                 f"Valid codex models: {valid_list}. Update MODEL_REGISTRY in config.py."
+            )
+    # Validate opencode rows against the structural shape check.
+    # OpenCode has no canonical model allow-list (75+ providers via
+    # AI SDK / Models.dev resolved at runtime against the operator's
+    # `opencode auth login` state), so what is checkable upfront is
+    # the `provider/model` shape contract. A bare value like "sonnet"
+    # in the registry would persist through model resolution and fail
+    # at the opencode handshake with no Kai-side pointer; the shape
+    # check pins the contract at startup instead.
+    if backend == "opencode":
+        invalid = [
+            (role, MODEL_REGISTRY[(backend, role)])
+            for role in ModelRole
+            if not is_opencode_model_shape(MODEL_REGISTRY[(backend, role)])
+        ]
+        if invalid:
+            details = ", ".join(f"{role.value}={model}" for role, model in invalid)
+            raise SystemExit(
+                f"MODEL_REGISTRY has opencode rows that are not in `provider/model` shape: {details}. "
+                "Update MODEL_REGISTRY in config.py."
             )
 
 
@@ -1598,20 +1636,22 @@ def _compute_extraction_eligible_backends(
     Return the set of distinct effective backends across extraction-eligible users.
 
     Mirrors `_ingest_memory`'s extraction gate (effective backend in
-    {"claude", "codex"}; goose users are filtered out because they
-    have no `OneShotReasoner` implementation). Each user contributes
-    its effective backend (per-user override or global default).
+    {"claude", "codex", "opencode"}; goose users are filtered out
+    because they have no `OneShotReasoner` implementation). Each user
+    contributes its effective backend (per-user override or global
+    default).
 
     Returns an empty set when `memory_extraction_enabled` is False;
-    callers that gate codex plumbing or registry validation off the
-    set should not fire on retrieval-only or memory-disabled installs.
+    callers that gate codex / opencode plumbing or registry validation
+    off the set should not fire on retrieval-only or memory-disabled
+    installs.
     """
     if not memory_extraction_enabled:
         return set()
     eligible: set[str] = set()
     for uc in user_configs.values():
         effective = uc.agent_backend or agent_backend
-        if effective in ("claude", "codex"):
+        if effective in ("claude", "codex", "opencode"):
             eligible.add(effective)
     return eligible
 

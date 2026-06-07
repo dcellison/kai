@@ -1,13 +1,13 @@
 """
 Shared agent-binary resolver for the one-shot reasoner family.
 
-Single source of truth for "where is the claude/codex binary."
+Single source of truth for "where is the claude/codex/opencode binary."
 `kai.config.load_config()` uses this to fail-fast at startup when the
 memory reasoner backend points at an unreachable binary;
-`kai.oneshot.{Claude,Codex}OneShotReasoner` uses it to build argv with
-the resolved absolute path; `kai.smoke.memory` reads the resolved
-binary from `OneShotResult.raw_metadata["resolved_binary"]` to show
-the operator which binary actually ran.
+`kai.oneshot.{Claude,Codex,OpenCode}OneShotReasoner` uses it to build
+argv with the resolved absolute path; `kai.smoke.memory` reads the
+resolved binary from `OneShotResult.raw_metadata["resolved_binary"]`
+to show the operator which binary actually ran.
 
 Module is a leaf by design: imports `os`, `shutil`, `pathlib` only.
 Neither `kai.config` nor `kai.oneshot` is imported here. The
@@ -70,6 +70,14 @@ def resolve_oneshot_binary(backend: str) -> str:
         raise `BinaryResolutionError` naming both candidates
         (CODEX_BIN unset, codex not on PATH).
 
+    `backend == "opencode"`: branch on `OPENCODE_BIN` with the same
+    is-file plus executable validation pattern as the codex arm. The
+    one-shot adapter spawns `opencode acp` as a short-lived
+    JSON-RPC server per call (distinct from the persistent
+    OpenCodeBackend's conversational session); both paths resolve
+    through this function so any future PATH or override semantics
+    change applies uniformly.
+
     Raises `BinaryResolutionError` with a single-line message
     describing the resolution sequence that was tried and the
     specific failure mode that fired. Callers should surface the
@@ -111,6 +119,31 @@ def resolve_oneshot_binary(backend: str) -> str:
         resolved = shutil.which("codex")
         if resolved is None:
             raise BinaryResolutionError("could not resolve codex binary: CODEX_BIN unset, `codex` not on PATH")
+        return resolved
+
+    if backend == "opencode":
+        # Structural mirror of the codex arm. OPENCODE_BIN, when set,
+        # carries an absolute path the operator validated out of band;
+        # the same is-file + executable pair fires so a typo or stale
+        # path surfaces as a configuration error rather than a silent
+        # PATH-fallback recovery. OpenCode binaries are commonly
+        # installed under ~/.local/bin via the upstream installer
+        # script, which is already on the bot user's PATH for the
+        # conversational backend, so the no-override branch covers the
+        # standard install.
+        override = os.environ.get("OPENCODE_BIN")
+        if override:
+            override_path = Path(override)
+            if not override_path.is_file():
+                raise BinaryResolutionError(f"could not resolve opencode binary: OPENCODE_BIN={override!r} not-a-file")
+            if not os.access(str(override_path), os.X_OK):
+                raise BinaryResolutionError(
+                    f"could not resolve opencode binary: OPENCODE_BIN={override!r} not-executable"
+                )
+            return str(override_path)
+        resolved = shutil.which("opencode")
+        if resolved is None:
+            raise BinaryResolutionError("could not resolve opencode binary: OPENCODE_BIN unset, `opencode` not on PATH")
         return resolved
 
     # Unknown backend. Unlike a resolution miss this is a caller bug

@@ -490,3 +490,120 @@ class TestStartupFailureSurface:
         # so the chat reply tells the operator which backend failed.
         assert final.response.error is not None
         assert "OpenCode startup failed:" in final.response.error
+
+
+# ── Shared free-function tests (used by one-shot reasoner) ───────
+
+
+class TestExtractOpencodeTextDeltaFreeFunction:
+    """`extract_opencode_text_delta` is the module-level free function
+    the conversational backend and the one-shot reasoner both call.
+    The discriminator-filter rules must stay consistent across both."""
+
+    def test_returns_agent_message_chunk_text(self):
+        from kai.opencode import extract_opencode_text_delta
+
+        msg = {
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "hello"},
+                }
+            },
+        }
+        assert extract_opencode_text_delta(msg) == "hello"
+
+    @pytest.mark.parametrize(
+        "kind",
+        [
+            "agent_thought_chunk",
+            "tool_call",
+            "tool_call_update",
+            "usage_update",
+            "available_commands_update",
+        ],
+    )
+    def test_returns_none_for_non_text_shapes(self, kind):
+        from kai.opencode import extract_opencode_text_delta
+
+        msg = {
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": kind,
+                    "content": {"type": "text", "text": "MUST-NOT-APPEAR"},
+                }
+            },
+        }
+        assert extract_opencode_text_delta(msg) is None
+
+    def test_returns_none_for_non_session_update_method(self):
+        from kai.opencode import extract_opencode_text_delta
+
+        msg = {"method": "something/else", "params": {}}
+        assert extract_opencode_text_delta(msg) is None
+
+
+class TestHandleOpencodePermissionRequestFreeFunction:
+    """`handle_opencode_permission_request(msg, policy=...)` picks the
+    first option matching the policy's priority list and wraps it in
+    the ACP v1 nested-outcome shape. The conversational backend uses
+    `allow_always`; the one-shot reasoner uses `reject_once`."""
+
+    def test_allow_always_policy_selects_allow_always(self):
+        from kai.opencode import handle_opencode_permission_request
+
+        msg = {
+            "method": "session/request_permission",
+            "params": {
+                "options": [
+                    {"optionId": "ok-id", "kind": "allow_always"},
+                    {"optionId": "no-id", "kind": "reject_once"},
+                ]
+            },
+        }
+        result = handle_opencode_permission_request(msg, policy="allow_always")
+        assert result == {"outcome": {"outcome": "selected", "optionId": "ok-id"}}
+
+    def test_reject_once_policy_selects_reject_once(self):
+        from kai.opencode import handle_opencode_permission_request
+
+        msg = {
+            "method": "session/request_permission",
+            "params": {
+                "options": [
+                    {"optionId": "ok-id", "kind": "allow_always"},
+                    {"optionId": "no-id", "kind": "reject_once"},
+                ]
+            },
+        }
+        result = handle_opencode_permission_request(msg, policy="reject_once")
+        assert result == {"outcome": {"outcome": "selected", "optionId": "no-id"}}
+
+    def test_returns_none_for_wrong_method(self):
+        from kai.opencode import handle_opencode_permission_request
+
+        msg = {"method": "something/else", "params": {}}
+        assert handle_opencode_permission_request(msg, policy="allow_always") is None
+
+    def test_empty_options_returns_none(self):
+        from kai.opencode import handle_opencode_permission_request
+
+        msg = {"method": "session/request_permission", "params": {"options": []}}
+        assert handle_opencode_permission_request(msg, policy="reject_once") is None
+
+    def test_falls_back_to_first_option_when_no_kind_matches(self):
+        """Defensive fallback: if neither the primary nor secondary
+        policy kind is present, take the first option regardless. The
+        rationale tag (in the INFO log) names this case as
+        `fallback_first_option`. Tests do not assert log shape here;
+        the behavioral contract is "do not crash, pick something."""
+        from kai.opencode import handle_opencode_permission_request
+
+        msg = {
+            "method": "session/request_permission",
+            "params": {"options": [{"optionId": "x-id", "kind": "unknown_kind"}]},
+        }
+        result = handle_opencode_permission_request(msg, policy="allow_always")
+        assert result == {"outcome": {"outcome": "selected", "optionId": "x-id"}}

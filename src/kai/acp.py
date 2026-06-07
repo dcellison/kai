@@ -68,6 +68,121 @@ log = logging.getLogger(__name__)
 _STDERR_WARNING_TOKENS: tuple[str, ...] = ("permission", "rejected", "invalid", "schema")
 
 
+# ── Shared JSON-RPC wire primitives ───────────────────────────────
+
+
+async def write_rpc(
+    *,
+    proc: asyncio.subprocess.Process | None,
+    next_id: int,
+    method: str,
+    params: dict,
+) -> int:
+    """
+    Write a JSON-RPC 2.0 request to the subprocess stdin and return the
+    next request id.
+
+    Pure wire primitive shared between the persistent `AcpBackend`
+    (its `_write_rpc` instance method wraps this with `self._next_id`
+    bookkeeping) and the one-shot reasoner in `kai.oneshot`
+    (which holds its own private counter so its short-lived
+    `opencode acp` session is independent from any conversational
+    session). Both callers must thread the returned id back into their
+    counter so the next request increments correctly.
+
+    `proc` is typed Optional to accept the conversational backend's
+    `self._proc` attribute directly (it is `None` between subprocess
+    incarnations); the assert below makes the live-process invariant
+    explicit and prevents a None-stdin crash with a typed message
+    instead of an AttributeError.
+    """
+    # Both invariants here are caller-controlled; the assert is the
+    # boundary that turns a programming error (calling without a live
+    # process) into a clear typed failure rather than an opaque
+    # AttributeError on `proc.stdin`.
+    assert proc is not None and proc.stdin is not None
+    request_id = next_id
+    msg = (
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": method,
+                "id": request_id,
+                "params": params,
+            }
+        )
+        + "\n"
+    )
+    proc.stdin.write(msg.encode())
+    await proc.stdin.drain()
+    return next_id + 1
+
+
+async def read_result(
+    *,
+    proc: asyncio.subprocess.Process | None,
+    expected_id: int,
+    timeout_seconds: int,
+    backend_label: str,
+) -> dict:
+    """
+    Read stdout lines until a JSON-RPC result with `expected_id` appears.
+
+    Discards session/update notifications (and any other lines that do
+    not carry the expected id) that the harness may emit during
+    startup. Raises `RuntimeError` on JSON-RPC error responses or
+    process exit; raises `TimeoutError` when no line lands within
+    `timeout_seconds`. Error messages are prefixed with
+    `backend_label` so a startup failure log line identifies which
+    adapter raised even when this free function is shared across
+    backends.
+
+    Shared between `AcpBackend._read_result` (conversational backends)
+    and `OpenCodeOneShotReasoner.run` (one-shot reasoner) so the
+    handshake parsing rules - notification discard, error surfacing,
+    timeout bound - cannot drift between the two callers.
+
+    Note: a "result" here is a JSON-RPC response with a matching id.
+    This function explicitly does NOT dispatch to any text-delta or
+    server-request hook; the conversational backend re-adds hook
+    dispatch on top inside `_send_locked`, and the one-shot reasoner
+    drives its own message-pump loop using this function and the
+    `write_rpc` primitive for the handshake then switches to a
+    per-message dispatch loop for `session/prompt`.
+    """
+    assert proc is not None and proc.stdout is not None
+    while True:
+        try:
+            line = await asyncio.wait_for(
+                proc.stdout.readline(),
+                timeout=timeout_seconds,
+            )
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"{backend_label} ACP handshake timed out waiting for response id={expected_id}"
+            ) from exc
+
+        if not line:
+            raise RuntimeError(f"{backend_label} process exited during handshake")
+
+        try:
+            msg = json.loads(line.decode())
+        except json.JSONDecodeError:
+            # Non-JSON output during startup (e.g., progress bars).
+            continue
+
+        # Check for matching response.
+        if msg.get("id") == expected_id:
+            if "error" in msg:
+                err = msg["error"]
+                raise RuntimeError(
+                    f"{backend_label} ACP error (id={expected_id}): {err.get('message', 'unknown error')}"
+                )
+            return msg.get("result", {})
+
+        # Discard notifications (session/update during startup).
+
+
 # ── ACP base backend ──────────────────────────────────────────────
 
 
@@ -412,67 +527,36 @@ class AcpBackend(AgentBackend):
         """
         Write a JSON-RPC 2.0 request to the subprocess stdin.
 
-        Increments the monotonic request ID, serializes the message
-        with a trailing newline, and flushes. Raises RuntimeError if
-        the process or its stdin pipe is gone.
+        Thin wrapper over the module-level `write_rpc` free function so
+        the one-shot reasoner (`kai.oneshot.OpenCodeOneShotReasoner`)
+        and this persistent backend share the same wire-shape
+        primitive. Mutating `self._next_id` and forwarding the rest of
+        the instance state preserves the conversational backend's
+        existing semantics; the read loop's id-matching depends on the
+        counter being incremented exactly once per request.
         """
-        assert self._proc is not None and self._proc.stdin is not None
-        request_id = self._next_id
-        self._next_id += 1
-        msg = (
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "method": method,
-                    "id": request_id,
-                    "params": params,
-                }
-            )
-            + "\n"
+        self._next_id = await write_rpc(
+            proc=self._proc,
+            next_id=self._next_id,
+            method=method,
+            params=params,
         )
-        self._proc.stdin.write(msg.encode())
-        await self._proc.stdin.drain()
 
     async def _read_result(self, expected_id: int) -> dict:
         """
         Read stdout lines until a JSON-RPC result with the expected id appears.
 
-        Discards session/update notifications that the harness may emit
-        during startup. Raises on JSON-RPC error responses or timeout.
-        Error message is prefixed with backend_label so a startup failure
-        log line identifies which adapter raised.
+        Thin wrapper over the module-level `read_result` free function.
+        Shared with the one-shot reasoner so handshake parsing rules
+        (discard notifications, surface JSON-RPC errors, time-bound on
+        `timeout_seconds`) do not drift between the two callers.
         """
-        assert self._proc is not None and self._proc.stdout is not None
-        while True:
-            try:
-                line = await asyncio.wait_for(
-                    self._proc.stdout.readline(),
-                    timeout=self.timeout_seconds,
-                )
-            except TimeoutError as exc:
-                raise TimeoutError(
-                    f"{self.backend_label} ACP handshake timed out waiting for response id={expected_id}"
-                ) from exc
-
-            if not line:
-                raise RuntimeError(f"{self.backend_label} process exited during handshake")
-
-            try:
-                msg = json.loads(line.decode())
-            except json.JSONDecodeError:
-                # Non-JSON output during startup (e.g., progress bars).
-                continue
-
-            # Check for matching response.
-            if msg.get("id") == expected_id:
-                if "error" in msg:
-                    err = msg["error"]
-                    raise RuntimeError(
-                        f"{self.backend_label} ACP error (id={expected_id}): {err.get('message', 'unknown error')}"
-                    )
-                return msg.get("result", {})
-
-            # Discard notifications (session/update during startup).
+        return await read_result(
+            proc=self._proc,
+            expected_id=expected_id,
+            timeout_seconds=self.timeout_seconds,
+            backend_label=self.backend_label,
+        )
 
     # ── Sending prompts ────────────────────────────────────────────
 

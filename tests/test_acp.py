@@ -1148,3 +1148,180 @@ class TestEnvLayering:
             await b._ensure_started()
 
         assert captured["env"]["FOO"] == "inline_value"
+
+
+# ── Shared JSON-RPC free-function tests ──────────────────────────
+
+
+class TestWriteRpcFreeFunction:
+    """`write_rpc` is the wire primitive shared between AcpBackend
+    (its _write_rpc wraps it with self._next_id bookkeeping) and the
+    one-shot OpenCode reasoner (which holds its own counter). The
+    returned value MUST be the incremented id so both callers can
+    thread it back into their state."""
+
+    @pytest.mark.asyncio
+    async def test_writes_jsonrpc_request_with_supplied_id(self):
+        from kai.acp import write_rpc
+
+        proc = MagicMock()
+        proc.stdin = MagicMock()
+        writes: list[bytes] = []
+        proc.stdin.write = writes.append
+
+        async def _drain() -> None:
+            return None
+
+        proc.stdin.drain = _drain
+
+        next_id = await write_rpc(
+            proc=proc,
+            next_id=7,
+            method="session/prompt",
+            params={"sessionId": "s1", "prompt": []},
+        )
+
+        assert next_id == 8
+        sent = json.loads(writes[0].decode().rstrip("\n"))
+        assert sent == {
+            "jsonrpc": "2.0",
+            "method": "session/prompt",
+            "id": 7,
+            "params": {"sessionId": "s1", "prompt": []},
+        }
+
+
+class TestReadResultFreeFunction:
+    """`read_result` reads stdout until a matching-id response lands;
+    discards notifications, surfaces JSON-RPC errors and process exit
+    as RuntimeError, times out via TimeoutError on the supplied bound.
+    Shared between AcpBackend and the one-shot reasoner so handshake
+    parsing rules cannot drift between callers."""
+
+    @pytest.mark.asyncio
+    async def test_returns_result_for_matching_id(self):
+        from kai.acp import read_result
+
+        proc = MagicMock()
+        proc.stdout = MagicMock()
+        lines = [
+            (json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "abc"}}) + "\n").encode(),
+        ]
+
+        async def _readline() -> bytes:
+            return lines.pop(0) if lines else b""
+
+        proc.stdout.readline = _readline
+
+        result = await read_result(
+            proc=proc,
+            expected_id=1,
+            timeout_seconds=5,
+            backend_label="OpenCode",
+        )
+
+        assert result == {"sessionId": "abc"}
+
+    @pytest.mark.asyncio
+    async def test_skips_notifications_until_matching_id(self):
+        from kai.acp import read_result
+
+        proc = MagicMock()
+        proc.stdout = MagicMock()
+        lines = [
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {"update": {"sessionUpdate": "agent_thought_chunk"}},
+                    }
+                )
+                + "\n"
+            ).encode(),
+            (json.dumps({"jsonrpc": "2.0", "id": 99, "result": {}}) + "\n").encode(),
+            (json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"final": True}}) + "\n").encode(),
+        ]
+
+        async def _readline() -> bytes:
+            return lines.pop(0) if lines else b""
+
+        proc.stdout.readline = _readline
+
+        result = await read_result(
+            proc=proc,
+            expected_id=1,
+            timeout_seconds=5,
+            backend_label="OpenCode",
+        )
+        assert result == {"final": True}
+
+    @pytest.mark.asyncio
+    async def test_jsonrpc_error_raises_runtime_error_with_label(self):
+        from kai.acp import read_result
+
+        proc = MagicMock()
+        proc.stdout = MagicMock()
+        lines = [
+            (json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -1, "message": "rejected"}}) + "\n").encode(),
+        ]
+
+        async def _readline() -> bytes:
+            return lines.pop(0) if lines else b""
+
+        proc.stdout.readline = _readline
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await read_result(
+                proc=proc,
+                expected_id=1,
+                timeout_seconds=5,
+                backend_label="TestLabel",
+            )
+        assert "TestLabel" in str(excinfo.value)
+        assert "rejected" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_eof_raises_runtime_error(self):
+        from kai.acp import read_result
+
+        proc = MagicMock()
+        proc.stdout = MagicMock()
+
+        async def _readline() -> bytes:
+            return b""
+
+        proc.stdout.readline = _readline
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await read_result(
+                proc=proc,
+                expected_id=1,
+                timeout_seconds=5,
+                backend_label="TestLabel",
+            )
+        assert "exited during handshake" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_skips_non_json_lines(self):
+        from kai.acp import read_result
+
+        proc = MagicMock()
+        proc.stdout = MagicMock()
+        lines = [
+            b"not-json progress bar\n",
+            (json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}) + "\n").encode(),
+        ]
+
+        async def _readline() -> bytes:
+            return lines.pop(0) if lines else b""
+
+        proc.stdout.readline = _readline
+
+        result = await read_result(
+            proc=proc,
+            expected_id=1,
+            timeout_seconds=5,
+            backend_label="OpenCode",
+        )
+        assert result == {"ok": True}
