@@ -18,6 +18,7 @@ AcpBackend layer:
 """
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
@@ -245,6 +246,14 @@ class TestHandleServerRequest:
     options[*].kind in {allow_once, allow_always, reject_once}. The
     adapter auto-approves (returns the allow_always optionId) so tool
     calls do not hang waiting for an interactive answer.
+
+    Response payload follows the ACP v1 `RequestPermissionResult`
+    contract: result body is `{"outcome": {"outcome": "selected",
+    "optionId": <id>}}`. The shared `_send_server_response` wraps
+    that under the JSON-RPC `result` key. A bare `{"optionId": ...}`
+    payload (the pre-fix shape) is structurally invalid by ACP v1
+    and produces silent stalls or `OpenCode process EOF` on the live
+    install.
     """
 
     def _permission_request(self, options: list[dict]) -> dict:
@@ -255,8 +264,13 @@ class TestHandleServerRequest:
             "params": {"sessionId": "sess-1", "options": options},
         }
 
+    @staticmethod
+    def _selected(option_id: str) -> dict:
+        """Build the ACP v1 selected-outcome result body for an option."""
+        return {"outcome": {"outcome": "selected", "optionId": option_id}}
+
     def test_auto_approve_always_when_available(self):
-        """Returns the allow_always optionId."""
+        """Returns the ACP v1 selected-outcome for allow_always."""
         b = _make_opencode()
         msg = self._permission_request(
             [
@@ -265,7 +279,7 @@ class TestHandleServerRequest:
                 {"optionId": "reject", "kind": "reject_once"},
             ]
         )
-        assert b.handle_server_request(msg) == {"optionId": "always"}
+        assert b.handle_server_request(msg) == self._selected("always")
 
     def test_falls_back_to_allow_once_when_no_allow_always(self):
         """If allow_always is missing, return the allow_once option."""
@@ -276,7 +290,7 @@ class TestHandleServerRequest:
                 {"optionId": "reject", "kind": "reject_once"},
             ]
         )
-        assert b.handle_server_request(msg) == {"optionId": "once"}
+        assert b.handle_server_request(msg) == self._selected("once")
 
     def test_falls_back_to_first_option_when_no_allow_kinds(self):
         """If neither allow_always nor allow_once exist, take the first option as a last resort."""
@@ -287,7 +301,7 @@ class TestHandleServerRequest:
                 {"optionId": "reject", "kind": "reject_once"},
             ]
         )
-        assert b.handle_server_request(msg) == {"optionId": "weird"}
+        assert b.handle_server_request(msg) == self._selected("weird")
 
     def test_empty_options_returns_none(self):
         """No options at all = nothing to pick; return None so the loop logs and skips."""
@@ -307,6 +321,112 @@ class TestHandleServerRequest:
         b = _make_opencode()
         msg = {"jsonrpc": "2.0", "id": 7, "method": "session/something_new", "params": {}}
         assert b.handle_server_request(msg) is None
+
+
+class TestHandleServerRequestLoggingAndDiagnostics:
+    """
+    Pin the per-request INFO diagnostic.
+
+    Every handled session/request_permission emits one INFO line
+    naming the chosen optionId and a rationale tag so production
+    logs surface what the auto-approver decided. The rationale tag
+    is the load-bearing signal for the next time the ACP protocol
+    drifts; without it, an option-discrimination break would only
+    manifest as silent stalls.
+    """
+
+    @staticmethod
+    def _msg(options: list[dict]) -> dict:
+        return {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "session/request_permission",
+            "params": {"sessionId": "sess-1", "options": options},
+        }
+
+    def test_logs_allow_always_rationale(self, caplog):
+        b = _make_opencode()
+        with caplog.at_level(logging.INFO, logger="kai.opencode"):
+            b.handle_server_request(
+                self._msg(
+                    [
+                        {"optionId": "once", "kind": "allow_once"},
+                        {"optionId": "always", "kind": "allow_always"},
+                    ]
+                )
+            )
+        assert any("optionId=always" in r.message and "rationale=allow_always" in r.message for r in caplog.records)
+
+    def test_logs_allow_once_rationale(self, caplog):
+        b = _make_opencode()
+        with caplog.at_level(logging.INFO, logger="kai.opencode"):
+            b.handle_server_request(self._msg([{"optionId": "once", "kind": "allow_once"}]))
+        assert any("optionId=once" in r.message and "rationale=allow_once" in r.message for r in caplog.records)
+
+    def test_logs_fallback_first_option_rationale(self, caplog):
+        b = _make_opencode()
+        with caplog.at_level(logging.INFO, logger="kai.opencode"):
+            b.handle_server_request(self._msg([{"optionId": "weird", "kind": "ask_user"}]))
+        assert any(
+            "optionId=weird" in r.message and "rationale=fallback_first_option" in r.message for r in caplog.records
+        )
+
+    def test_logs_no_usable_option_rationale_as_warning(self, caplog):
+        """Empty options array emits the no_usable_option rationale at WARNING."""
+        b = _make_opencode()
+        with caplog.at_level(logging.WARNING, logger="kai.opencode"):
+            b.handle_server_request(self._msg([]))
+        assert any("rationale=no_usable_option" in r.message for r in caplog.records)
+
+
+class TestHandleServerRequestRejectedShapes:
+    """
+    Regression guard against silent reverts to broken response shapes.
+
+    The pre-fix payload was `{"optionId": <id>}` (bare optionId under
+    result). Other plausible-but-wrong shapes from the round-2 smoke
+    candidate list include the discriminator-at-top-level variant
+    `{"outcome": "selected", "optionId": <id>}`. Both produced silent
+    stalls or `OpenCode process EOF` on the live install. These
+    tests pin that the current implementation does NOT regress to
+    either shape.
+    """
+
+    @staticmethod
+    def _selected(option_id: str) -> dict:
+        return {"outcome": {"outcome": "selected", "optionId": option_id}}
+
+    def test_response_is_not_bare_optionId(self):
+        """Pre-fix payload shape MUST NOT come back."""
+        b = _make_opencode()
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess-1",
+                "options": [{"optionId": "always", "kind": "allow_always"}],
+            },
+        }
+        result = b.handle_server_request(msg)
+        assert result != {"optionId": "always"}
+        assert result == self._selected("always")
+
+    def test_response_is_not_flat_discriminator(self):
+        """Discriminator-at-top-level variant MUST NOT come back either."""
+        b = _make_opencode()
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess-1",
+                "options": [{"optionId": "once", "kind": "allow_once"}],
+            },
+        }
+        result = b.handle_server_request(msg)
+        assert result != {"outcome": "selected", "optionId": "once"}
+        assert result == self._selected("once")
 
 
 # ── Constructor (smoke) ─────────────────────────────────────────────

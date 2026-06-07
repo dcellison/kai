@@ -60,6 +60,14 @@ from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file
 log = logging.getLogger(__name__)
 
 
+# Tokens that indicate an upstream-side rejection or schema failure
+# in an ACP-server stderr line. When any of these substrings (case-
+# insensitive) appears in a drained stderr line, the line is surfaced
+# at WARNING instead of DEBUG. Set at module scope so concrete
+# adapters cannot drift from the shared classifier.
+_STDERR_WARNING_TOKENS: tuple[str, ...] = ("permission", "rejected", "invalid", "schema")
+
+
 # ── ACP base backend ──────────────────────────────────────────────
 
 
@@ -364,9 +372,17 @@ class AcpBackend(AgentBackend):
         Continuously read and discard stderr from the ACP process.
 
         Without this, the stderr pipe buffer fills up and the process
-        deadlocks. Lines are logged at DEBUG level for diagnostics; the
-        backend label prefixes the log line so a multi-backend deployment
-        can tell streams apart.
+        deadlocks. Lines are logged at DEBUG level for routine
+        diagnostics; lines that match an upstream-error indicator
+        (`permission`, `rejected`, `invalid`, `schema`) are surfaced
+        at WARNING so operators see ACP-server-side rejections without
+        having to enable DEBUG. The backend label prefixes the log
+        line so a multi-backend deployment can tell streams apart.
+
+        Without the selective bump, an ACP server like OpenCode can
+        reject a client response as schema-invalid and the diagnostic
+        is silently swallowed at DEBUG level, leaving an operator
+        without any signal that the upstream complained.
         """
         while self._proc and self._proc.stderr:
             try:
@@ -374,7 +390,17 @@ class AcpBackend(AgentBackend):
                 if not line:
                     break
                 text = line.decode().strip()
-                if text:
+                if not text:
+                    continue
+                # Case-insensitive substring check is enough; the
+                # tokens are distinctive within ACP-server diagnostic
+                # output, and a quoted-string false positive would only
+                # mean one extra WARNING line per occurrence, which is
+                # an acceptable cost for the load-bearing real signal.
+                lowered = text.lower()
+                if any(token in lowered for token in _STDERR_WARNING_TOKENS):
+                    log.warning("%s stderr: %s", self.backend_label, text[:200])
+                else:
                     log.debug("%s stderr: %s", self.backend_label, text[:200])
             except Exception:
                 log.warning("Unexpected error in %s stderr drain", self.backend_label, exc_info=True)

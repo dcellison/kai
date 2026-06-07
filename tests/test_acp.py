@@ -33,6 +33,7 @@ Covers:
 """
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -928,12 +929,19 @@ class TestServerInitiatedRequest:
 
     @pytest.mark.asyncio
     async def test_hook_returning_dict_writes_response_with_matching_id(self):
-        """A hook that returns a dict triggers a JSON-RPC response with the server's id."""
+        """A hook that returns a dict triggers a JSON-RPC response with the server's id.
+
+        The shared envelope is JSON-RPC framing only: `jsonrpc`, the
+        server's `id`, and `result` containing whatever the hook
+        returned. A representative ACP v1 selected-outcome payload
+        exercises the result body without coupling this shared-layer
+        test to OpenCode's specific shape.
+        """
 
         class _AutoApprove(_FakeAcp):
             def handle_server_request(self, msg):
                 if msg.get("method") == "session/request_permission":
-                    return {"optionId": "always"}
+                    return {"outcome": {"outcome": "selected", "optionId": "always"}}
                 return None
 
         b = _AutoApprove(model="x", workspace=Path("/tmp/ws"))
@@ -965,7 +973,10 @@ class TestServerInitiatedRequest:
         assert response["jsonrpc"] == "2.0"
         # Response carries the SERVER's id, not the next client id.
         assert response["id"] == 42
-        assert response["result"] == {"optionId": "always"}
+        # The shared envelope passes the hook's return value through
+        # under `result` unchanged; specific shape contracts belong to
+        # the concrete adapter's tests, not here.
+        assert response["result"] == {"outcome": {"outcome": "selected", "optionId": "always"}}
 
     @pytest.mark.asyncio
     async def test_notifications_still_skip_hook(self):
@@ -1017,6 +1028,72 @@ class TestServerInitiatedRequest:
         await _collect_events(b, prompt="hi")
         response = json.loads(b._proc.stdin.write.call_args_list[1][0][0].decode())
         assert set(response.keys()) == {"jsonrpc", "id", "result"}
+
+
+# ── Selective stderr WARNING ───────────────────────────────────────
+
+
+class TestDrainStderrSelectiveWarning:
+    """
+    The stderr drain surfaces upstream-error-shaped lines at WARNING
+    instead of swallowing them at DEBUG.
+
+    Without the selective bump, an ACP server like OpenCode can
+    reject a client response as schema-invalid and the diagnostic
+    is silently swallowed at DEBUG level, leaving operators without
+    any signal that the upstream complained. Token list lives at
+    module scope in `kai.acp._STDERR_WARNING_TOKENS`; this test
+    pins every token in that list separately so dropping one is a
+    visible regression.
+    """
+
+    @staticmethod
+    def _make_stderr_proc(lines: list[bytes]):
+        """Build a fake subprocess with stderr.readline yielding the given lines + EOF."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        proc = MagicMock()
+        proc.stderr = MagicMock()
+        proc.stderr.readline = AsyncMock(side_effect=[*lines, b""])
+        # _drain_stderr's outer loop checks `self._proc.stderr`; both must
+        # stay truthy across iterations until readline returns empty.
+        return proc
+
+    @pytest.mark.asyncio
+    async def test_normal_line_logs_at_debug(self, caplog):
+        """A routine stderr line stays at DEBUG; the selective bump is conservative."""
+        b = _make_fake()
+        b._proc = self._make_stderr_proc([b"starting acp server on port 12345\n"])
+        with caplog.at_level(logging.DEBUG, logger="kai.acp"):
+            await b._drain_stderr()
+        debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any("starting acp server" in r.message for r in debug_records)
+        # And no WARNING fired for that routine line.
+        warning_records = [
+            r for r in caplog.records if r.levelno >= logging.WARNING and "starting acp server" in r.message
+        ]
+        assert warning_records == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("token", ["permission", "rejected", "invalid", "schema"])
+    async def test_matching_line_logs_at_warning(self, caplog, token):
+        """Every documented token bumps the line to WARNING."""
+        b = _make_fake()
+        b._proc = self._make_stderr_proc([f"some {token} error: bad payload\n".encode()])
+        with caplog.at_level(logging.DEBUG, logger="kai.acp"):
+            await b._drain_stderr()
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING and token in r.message]
+        assert warning_records, f"expected WARNING for token={token!r}, got: {[r.message for r in caplog.records]}"
+
+    @pytest.mark.asyncio
+    async def test_case_insensitive_match(self, caplog):
+        """Uppercase / mixed-case tokens still bump to WARNING."""
+        b = _make_fake()
+        b._proc = self._make_stderr_proc([b"PERMISSION denied\n", b"Schema validation failed\n"])
+        with caplog.at_level(logging.DEBUG, logger="kai.acp"):
+            await b._drain_stderr()
+        warning_count = sum(1 for r in caplog.records if r.levelno == logging.WARNING)
+        assert warning_count == 2
 
 
 # ── Env layering ────────────────────────────────────────────────────

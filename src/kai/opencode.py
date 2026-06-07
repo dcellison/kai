@@ -160,28 +160,75 @@ class OpenCodeBackend(AcpBackend):
         agent tasks can actually execute tools), without baking the
         decision into OpenCode's persistent config.
 
+        Response shape follows the ACP v1 protocol's
+        `RequestPermissionResult`: the result body carries an `outcome`
+        object with a discriminator (`selected` or `cancelled`) and an
+        `optionId` field when `selected`. The shared `_send_server_response`
+        wraps this dict under the JSON-RPC `result` key, producing
+        `result.outcome.optionId` on the wire. Sending a bare
+        `result.optionId` (the previous shape) is structurally invalid
+        against the ACP schema; OpenCode either stalls the prompt
+        indefinitely or closes the ACP session with an EOF on stdin.
+        See https://agentclientprotocol.com/protocol/v1/tool-calls for
+        the schema.
+
         Defensive fallback: if the request shape changes and we cannot
         find an allow_always option, look for any allow-shaped option,
         then for any optionId at all, and only then bail with None
         (which logs and skips at the shared-layer call site, letting
         OpenCode time out the request gracefully instead of crashing
         the read loop).
+
+        Every handled request emits one INFO line naming method, the
+        chosen optionId, and a rationale tag (`allow_always`,
+        `allow_once`, `fallback_first_option`, or `no_usable_option`)
+        so production logs surface what the auto-approver decided.
+        That diagnostic is load-bearing for the next time the ACP
+        protocol drifts: without it, a future change that breaks
+        option discrimination would only show up as silent stalls.
         """
         if msg.get("method") != "session/request_permission":
             return None
         options = msg.get("params", {}).get("options", []) or []
-        choice = (
-            _pick_option(options, "allow_always")
-            or _pick_option(options, "allow_once")
-            or (options[0] if options else None)
-        )
+        # Track the rationale alongside the choice so the INFO log
+        # below tells the operator WHY a given option was picked.
+        # `_pick_option` is the fast path; the project's two known
+        # auto-approve kinds (`allow_always`, `allow_once`) are tried
+        # in priority order. The first-element fallback fires only
+        # when neither kind matches; that is a real protocol drift
+        # signal and the rationale tag makes it loud.
+        rationale: str
+        if (choice := _pick_option(options, "allow_always")) is not None:
+            rationale = "allow_always"
+        elif (choice := _pick_option(options, "allow_once")) is not None:
+            rationale = "allow_once"
+        elif options:
+            choice = options[0]
+            rationale = "fallback_first_option"
+        else:
+            choice = None
+            rationale = "no_usable_option"
+
         if not choice or "optionId" not in choice:
             log.warning(
-                "OpenCode session/request_permission missing a usable option; params=%s",
+                "OpenCode session/request_permission missing a usable option; rationale=%s params=%s",
+                rationale,
                 msg.get("params"),
             )
             return None
-        return {"optionId": choice["optionId"]}
+
+        option_id = choice["optionId"]
+        log.info(
+            "OpenCode session/request_permission handled: optionId=%s rationale=%s",
+            option_id,
+            rationale,
+        )
+        return {
+            "outcome": {
+                "outcome": "selected",
+                "optionId": option_id,
+            }
+        }
 
 
 def _pick_option(options: list[dict], kind: str) -> dict | None:
