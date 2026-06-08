@@ -1237,11 +1237,14 @@ def _cmd_config() -> None:
     memory_duplicate_threshold = "0.9"
     if memory_enabled:
         # Memory extraction is supported on agent backends that have a
-        # OneShotReasoner implementation. Today that is claude and
-        # codex; goose retrieval-only installs accept memory_enabled
-        # but skip the extraction prompt because no reasoner exists
-        # for goose. Add to the tuple when a new reasoner ships.
-        if agent_backend in ("claude", "codex"):
+        # OneShotReasoner implementation: claude, codex, and (since
+        # PR #577) opencode. Goose retrieval-only installs accept
+        # memory_enabled but skip the extraction prompt because no
+        # reasoner exists for goose. Add to the tuple when a new
+        # reasoner ships. The runtime eligibility gate at
+        # `bot._ingest_memory` and `config._compute_extraction_eligible_backends`
+        # widened to the same set; both stay in lockstep.
+        if agent_backend in ("claude", "codex", "opencode"):
             memory_extraction_enabled = _prompt_bool(
                 "Enable memory extraction (proactive memory writes)",
                 existing_env.get("MEMORY_EXTRACTION_ENABLED", "false").lower() in ("1", "true", "yes"),

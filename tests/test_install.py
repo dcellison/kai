@@ -7652,6 +7652,98 @@ class TestOpenCodeBinWizardPrompt:
         assert default == sentinel_which_value
         assert required is True
 
+    def test_memory_extraction_defense_in_depth_block_collects_opencode_bin(self, tmp_path, monkeypatch):
+        """Defense-in-depth: when `agent_backend == "opencode"` and the
+        memory-extraction block is reached without `opencode_bin`
+        having been collected (e.g., a future refactor moved the
+        memory-extraction prompt before the global-backend block),
+        the wizard re-prompts with a memory-reasoner-flavored label
+        rather than silently leaving install.conf without
+        `OPENCODE_BIN`.
+
+        The current wizard ordering makes this combination
+        unreachable in practice; the test simulates it by forcing
+        the global-opencode block's validator to accept an empty
+        string (which the operator types when the first prompt
+        appears), so the wizard exits that block with
+        `opencode_bin == ""`. The memory-extraction block's
+        `if agent_backend == "opencode" and not opencode_bin:` gate
+        fires, re-prompts, and the second value is what persists.
+        Pinned so a future refactor that exposes this code path is
+        covered by an existing test rather than discovered at
+        runtime.
+        """
+        valid_path = tmp_path / "fake_opencode"
+        valid_path.write_text("#!/bin/sh\necho hi\n")
+        valid_path.chmod(0o755)
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "kai.install._prompt_default_model",
+            MagicMock(return_value="anthropic/claude-sonnet-4-5"),
+        )
+
+        # Force the validator to accept the empty string the
+        # global-opencode block sees so the loop exits with
+        # opencode_bin == "" and the memory-extraction defense-in-
+        # depth gate fires. The real validator still rejects empty
+        # in production; this monkeypatch is what simulates the
+        # future-refactor failure mode the defense-in-depth block
+        # guards against.
+        monkeypatch.setattr("kai.install._validate_opencode_bin", lambda p: True)
+
+        # Stub `_prompt` so the global-opencode label returns empty
+        # (bypassing `_prompt`'s required-field re-prompt loop) and
+        # the defense-in-depth label returns the valid path. Every
+        # other prompt label passes through to the real `_prompt`
+        # so the rest of the wizard flow consumes the input
+        # iterator normally. This is the precision the test needs:
+        # forcing opencode_bin to "" after the global block without
+        # changing the wizard's other prompts.
+        captured: list[tuple] = []
+        from kai.install import _prompt as _real_prompt
+
+        def _stub_prompt(label, default="", required=False, **kwargs):
+            captured.append((label, default, required))
+            if label == "OpenCode binary path":
+                return ""
+            if label == "OpenCode binary path (required by opencode memory reasoner)":
+                return str(valid_path)
+            return _real_prompt(label, default=default, required=required, **kwargs)
+
+        monkeypatch.setattr("kai.install._prompt", _stub_prompt)
+
+        # The stubbed _prompt for "OpenCode binary path" does not
+        # call input(), so the slot in _opencode_inputs for that
+        # prompt is unused. Drop it so the subsequent timeout
+        # prompt does not consume the placeholder path as its
+        # integer input.
+        inputs_list = self._opencode_inputs(str(valid_path))
+        inputs_list.remove(str(valid_path))
+        inputs = iter(inputs_list)
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        # Both labels appear in the captured prompts: the global-
+        # opencode one (no memory-reasoner suffix) and the defense-
+        # in-depth one (with the suffix).
+        labels = [c[0] for c in captured]
+        assert "OpenCode binary path" in labels
+        assert "OpenCode binary path (required by opencode memory reasoner)" in labels
+
+        # install.conf carries the value from the second prompt
+        # (the defense-in-depth block's collection), which is the
+        # valid path. The empty value from the first prompt is
+        # overwritten when the defense-in-depth block re-assigns
+        # opencode_bin.
+        env = json.loads((tmp_path / "install.conf").read_text())["env"]
+        assert env["OPENCODE_BIN"] == str(valid_path)
+
     def test_wizard_re_run_preserves_existing_opencode_bin(self, tmp_path, monkeypatch):
         """A re-run of `make config` with an existing OPENCODE_BIN
         in install.conf uses the existing value as the default
