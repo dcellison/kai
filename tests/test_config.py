@@ -2523,10 +2523,10 @@ class TestValidateModelForBackend:
         assert validate_model_for_backend("sonnet", "opencode", "anthropic") is False
         assert validate_model_for_backend("haiku", "opencode", "anthropic") is False
 
-    def test_opencode_rejects_malformed_shapes(self):
+    def test_opencode_accepts_multi_slash_and_rejects_empty_segments(self):
         """Empty segments and missing separators fail; multi-slash
         nesting (openrouter-style `openrouter/anthropic/claude-...`)
-        is now accepted because opencode's provider layer parses any
+        is accepted because opencode's provider layer parses any
         non-empty path-prefix shape."""
         from kai.config import validate_model_for_backend
 

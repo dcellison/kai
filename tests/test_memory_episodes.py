@@ -919,6 +919,7 @@ class TestStage2SubprocessAssembly:
         await _run_episode_extractor(
             "payload",
             _cfg(memory_episode_budget_usd=0.15),
+            user_id="test-episode-user",
             effective_backend="claude",
             effective_provider="anthropic",
         )
@@ -950,7 +951,9 @@ class TestStage2SubprocessAssembly:
             return _make_proc(stdout=_stage2_envelope(_valid_episode()))
 
         monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
-        await _run_episode_extractor("payload", _cfg(), effective_backend="claude", effective_provider="anthropic")
+        await _run_episode_extractor(
+            "payload", _cfg(), user_id="test-episode-user", effective_backend="claude", effective_provider="anthropic"
+        )
 
         args = captured["args"]
         assert args[args.index("--tools") + 1] == ""
@@ -1179,7 +1182,11 @@ class TestRunEpisodeExtractorViaReasoner:
 
         with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FakeReasoner()):
             episode, cost_usd, reason = await _run_episode_extractor(
-                "payload", _cfg(), effective_backend="claude", effective_provider="anthropic"
+                "payload",
+                _cfg(),
+                user_id="test-episode-user",
+                effective_backend="claude",
+                effective_provider="anthropic",
             )
 
         assert episode == _valid_episode()
@@ -1199,7 +1206,11 @@ class TestRunEpisodeExtractorViaReasoner:
 
         with patch("kai.memory_extraction._build_memory_reasoner", return_value=_TimingOutReasoner()):
             episode, cost_usd, reason = await _run_episode_extractor(
-                "payload", _cfg(), effective_backend="claude", effective_provider="anthropic"
+                "payload",
+                _cfg(),
+                user_id="test-episode-user",
+                effective_backend="claude",
+                effective_provider="anthropic",
             )
 
         assert episode is None
@@ -1220,7 +1231,11 @@ class TestRunEpisodeExtractorViaReasoner:
 
         with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FailingReasoner()):
             episode, cost_usd, reason = await _run_episode_extractor(
-                "payload", _cfg(), effective_backend="claude", effective_provider="anthropic"
+                "payload",
+                _cfg(),
+                user_id="test-episode-user",
+                effective_backend="claude",
+                effective_provider="anthropic",
             )
 
         assert episode is None
@@ -1261,7 +1276,7 @@ class TestRunEpisodeExtractorWithCodexEnvelope:
         config = _cfg()
         with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FakeCodexReasoner()):
             ep, cost_usd, reason = await _run_episode_extractor(
-                "payload", config, effective_backend="codex", effective_provider="openai"
+                "payload", config, user_id="test-episode-user", effective_backend="codex", effective_provider="openai"
             )
 
         assert ep == episode

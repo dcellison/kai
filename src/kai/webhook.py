@@ -57,7 +57,7 @@ from aiohttp import web
 from telegram import Bot, Update
 
 from kai import cron, memory, review, services, sessions, triage
-from kai.config import DATA_DIR, IMAGE_EXTENSIONS, Config, UserConfig
+from kai.config import DATA_DIR, IMAGE_EXTENSIONS, Config, ModelRole, UserConfig, resolve_user_model
 from kai.telegram_utils import chunk_text
 
 log = logging.getLogger(__name__)
@@ -715,14 +715,17 @@ async def _process_github_event_for_user(
     else:
         provider = config.llm_provider
 
-    # Per-role model overrides for review and triage. Resolved here so
-    # the user's `models:` map (and any load-time legacy env-var seed)
-    # wins over the MODEL_REGISTRY default; review.py / triage.py treat
-    # the empty string as "fall through to the registry default" via
-    # the model_override parameter on run_review / run_triage.
-    user_models = user_config.models if user_config and user_config.models else {}
-    pr_review_model_override = user_models.get("pr_review", "")
-    issue_triage_model_override = user_models.get("issue_triage", "")
+    # Per-role model overrides for review and triage. `resolve_user_model`
+    # implements the full precedence chain: per-user `models:` from
+    # users.yaml > Config.default_models from DEFAULT_MODELS_JSON >
+    # MODEL_REGISTRY's (backend, provider, role) default. review.py /
+    # triage.py treat the empty string as "fall through to the registry
+    # default" via the model_override parameter; the resolver always
+    # returns a concrete model string, so the override path here is
+    # load-bearing only when the resolved value differs from the
+    # registry default (which is exactly when it should fire).
+    pr_review_model_override = resolve_user_model(ModelRole.PR_REVIEW, user_config, config)
+    issue_triage_model_override = resolve_user_model(ModelRole.ISSUE_TRIAGE, user_config, config)
 
     # ── PR review routing ────────────────────────────────────────
     # When PR review is enabled for this user, reviewable PR events

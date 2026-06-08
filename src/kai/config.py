@@ -365,19 +365,35 @@ def get_model_for(role: ModelRole, backend: str, provider: str, override: str = 
 
 def _check_model_registry_complete() -> None:
     """
-    Verify MODEL_REGISTRY has a row for every (backend, provider, role)
-    triple in BACKEND_PROVIDERS, AND that each codex / opencode row
-    passes its backend's shape check.
+    Validate MODEL_REGISTRY against per-backend invariants at startup.
 
     Self-driving: walks every (backend, provider) pair in
-    BACKEND_PROVIDERS rather than taking a single-backend argument.
-    Runs once at load_config() time. Raises SystemExit on a missing or
-    invalid row so the bug surfaces at startup rather than at a
-    per-request LookupError.
+    BACKEND_PROVIDERS. Runs once at load_config() time. Raises
+    SystemExit on any invariant violation so the bug surfaces at
+    startup rather than as a per-request LookupError or a per-request
+    OneShot handshake failure.
 
-    Every backend with a registry row gets validated, including
-    goose: goose folds into the unified triple-key registry, so a
-    missing goose row fails the same way a missing opencode row does.
+    Two layers of validation, only one of which is load-bearing for
+    production code:
+
+    1. Triple-key completeness (defense-in-depth). `_build_registry`
+       already guarantees every (backend, provider, role) triple in
+       BACKEND_PROVIDERS has a row, raising KeyError at module import
+       time if a `(backend, provider)` pair lacks a tier map or if
+       any `_TIER_BY_ROLE` tier is missing. The completeness loop
+       below catches post-construction mutation (test fixtures that
+       monkeypatch `delitem` on MODEL_REGISTRY) and the
+       theoretical case where a future refactor decouples
+       `_build_registry` from `BACKEND_PROVIDERS`. In production this
+       branch is unreachable.
+
+    2. Per-backend value shape (the real production guarantee):
+       - codex rows must name models the codex CLI exposes (validated
+         against CODEX_MODELS); a drift between CODEX_MODELS and the
+         tier map fails here, not at first behavioral run.
+       - opencode rows must pass `is_opencode_model_shape`; bare names
+         like "sonnet" that would survive registry construction but
+         fail at the opencode handshake are caught here.
     """
     for backend, providers in BACKEND_PROVIDERS.items():
         for provider in providers:
@@ -608,7 +624,14 @@ def get_user_backend_and_provider(user_config: "UserConfig | None", config: "Con
     return backend, provider
 
 
-def resolve_user_model(role: ModelRole, user_config: "UserConfig | None", config: "Config") -> str:
+def resolve_user_model(
+    role: ModelRole,
+    user_config: "UserConfig | None",
+    config: "Config",
+    *,
+    backend: str | None = None,
+    provider: str | None = None,
+) -> str:
     """Per-role model resolution with the per-user `models:` override.
 
     Precedence (highest first):
@@ -627,8 +650,14 @@ def resolve_user_model(role: ModelRole, user_config: "UserConfig | None", config
     Single canonical resolver used by every per-user dispatch site;
     callers that need a raw registry lookup (no user context) call
     `get_model_for` directly.
+
+    `backend` and `provider` are optional pre-resolved values. Callers
+    that already computed the effective backend / provider (memory
+    extraction threads them through both stages of the dispatch
+    pipeline) pass them as kwargs to skip the re-resolution. Either
+    both are passed or neither; the helper falls through to
+    `get_user_backend_and_provider` when they are absent.
     """
-    backend, provider = get_user_backend_and_provider(user_config, config)
     if user_config is not None and user_config.models:
         override = user_config.models.get(role.value, "")
         if override:
@@ -637,6 +666,8 @@ def resolve_user_model(role: ModelRole, user_config: "UserConfig | None", config
         global_override = config.default_models.get(role.value, "")
         if global_override:
             return global_override
+    if backend is None or provider is None:
+        backend, provider = get_user_backend_and_provider(user_config, config)
     return get_model_for(role, backend, provider)
 
 

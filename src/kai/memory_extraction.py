@@ -28,7 +28,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 from kai import memory
-from kai.config import Config, ModelRole, get_model_for
+from kai.config import Config, ModelRole, resolve_user_model
 from kai.memory import MemoryResult
 from kai.oneshot import _EXTRACTOR_CWD as _EXTRACTOR_CWD
 from kai.oneshot import _SUBPROCESS_ENV_ALLOWLIST as _SUBPROCESS_ENV_ALLOWLIST
@@ -1848,6 +1848,21 @@ def _resolve_effective_backend(user_id: str, config: Config) -> str:
     return user_cfg.agent_backend or config.agent_backend
 
 
+def _resolve_user_config(user_id: str, config: Config):
+    """Look up the per-user `UserConfig` for an extraction caller.
+
+    Sandbox / unknown user IDs return None; the per-role resolver
+    treats that as "no per-user override, fall through to global
+    default_models then to MODEL_REGISTRY." Same int-coerce + lookup
+    pattern as `_resolve_effective_backend`.
+    """
+    try:
+        tid = int(user_id)
+    except ValueError:
+        return None
+    return config.user_configs.get(tid)
+
+
 def _resolve_effective_provider(user_id: str, config: Config) -> str:
     """
     Resolve the user being extracted to its effective `llm_provider`.
@@ -1997,11 +2012,24 @@ async def _run_extractor(
     # function so memory-domain concerns (is_error, structured_output,
     # facts, has_episode) do not leak into the reasoner.
     reasoner = _build_memory_reasoner(effective_backend, os_user=os_user)
+    # Per-role resolution consults the full precedence chain
+    # (per-user `models.memory_extraction` > Config.default_models >
+    # MODEL_REGISTRY). Pre-resolved backend / provider are passed as
+    # kwargs so the helper skips its own re-resolution; `user_config`
+    # is None for sandbox / eval user_ids and the resolver falls
+    # through to the global default + registry cascade.
+    user_cfg = _resolve_user_config(user_id, config)
     try:
         result = await reasoner.run(
             prompt=payload_text,
             system_prompt=system_prompt,
-            model=get_model_for(ModelRole.MEMORY_EXTRACTION, effective_backend, effective_provider),
+            model=resolve_user_model(
+                ModelRole.MEMORY_EXTRACTION,
+                user_cfg,
+                config,
+                backend=effective_backend,
+                provider=effective_provider,
+            ),
             timeout=config.memory_extraction_timeout_s,
             purpose="fact_extraction",
             json_schema=_FACT_SCHEMA,
@@ -2159,6 +2187,7 @@ async def _run_episode_extractor(
     payload_text: str,
     config: Config,
     *,
+    user_id: str,
     effective_backend: str,
     effective_provider: str,
     os_user: str | None = None,
@@ -2198,7 +2227,13 @@ async def _run_episode_extractor(
         result = await reasoner.run(
             prompt=payload_text,
             system_prompt=_EPISODE_SYSTEM_PROMPT,
-            model=get_model_for(ModelRole.MEMORY_EPISODE, effective_backend, effective_provider),
+            model=resolve_user_model(
+                ModelRole.MEMORY_EPISODE,
+                _resolve_user_config(user_id, config),
+                config,
+                backend=effective_backend,
+                provider=effective_provider,
+            ),
             timeout=config.memory_episode_timeout_s,
             purpose="episode_generation",
             json_schema=_EPISODE_SCHEMA,
@@ -2299,6 +2334,7 @@ async def _generate_episode(
             episode, cost_usd, run_reason = await _run_episode_extractor(
                 payload,
                 config,
+                user_id=user_id,
                 effective_backend=effective_backend,
                 effective_provider=effective_provider,
                 os_user=os_user,
