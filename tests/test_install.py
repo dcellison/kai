@@ -7401,6 +7401,317 @@ class TestValidateCodexBin:
         assert _validate_codex_bin(str(f)) is True
 
 
+class TestValidateOpenCodeBin:
+    """opencode binary path existence validator. Mirrors
+    `TestValidateCodexBin` exactly: same five edge cases (empty,
+    nonexistent, directory, non-executable file, executable file).
+    The shared validator shape (`is_file()` AND `os.access(_, X_OK)`)
+    is the same one codex uses; pinning both halves protects against
+    a future refactor that drops one and silently weakens the
+    binary-path check for one backend but not the other."""
+
+    def test_empty_value_rejected(self):
+        from kai.install import _validate_opencode_bin
+
+        assert _validate_opencode_bin("") is False
+
+    def test_nonexistent_path_rejected(self, tmp_path):
+        from kai.install import _validate_opencode_bin
+
+        assert _validate_opencode_bin(str(tmp_path / "does_not_exist")) is False
+
+    def test_directory_rejected(self, tmp_path):
+        from kai.install import _validate_opencode_bin
+
+        assert _validate_opencode_bin(str(tmp_path)) is False
+
+    def test_non_executable_file_rejected(self, tmp_path):
+        from kai.install import _validate_opencode_bin
+
+        f = tmp_path / "fake_opencode"
+        f.write_text("#!/bin/sh\necho hi\n")
+        assert _validate_opencode_bin(str(f)) is False
+
+    def test_executable_file_accepted(self, tmp_path):
+        from kai.install import _validate_opencode_bin
+
+        f = tmp_path / "fake_opencode"
+        f.write_text("#!/bin/sh\necho hi\n")
+        f.chmod(0o755)
+        assert _validate_opencode_bin(str(f)) is True
+
+
+class TestOpenCodeBinWizardPrompt:
+    """Wizard collects OPENCODE_BIN when the operator picks opencode
+    as the global backend. Mirrors the codex wizard's collection
+    pattern: prompt with `shutil.which("opencode")` as the default
+    suggestion, validate the chosen path, persist to install.conf
+    so `make install` reads from the same source of truth as the
+    sudoers SETENV rule emitter (PR #577). The escape hatch
+    `sudo OPENCODE_BIN=... make install` is preserved by the
+    `_cmd_apply` env passthrough also added in PR #577.
+
+    These tests focus on the wizard surface; the sudoers-rule
+    threading is already covered under TestGenerateSudoersCodexBinArg
+    and the matching opencode regression tests in test_install.py.
+    """
+
+    def _block_etc_kai(self, monkeypatch):
+        """Prevent the wizard from detecting /etc/kai/users.yaml on the host."""
+        _real_exists = Path.exists
+
+        def _exists_no_etc(self):
+            if str(self) == "/etc/kai/users.yaml":
+                return False
+            return _real_exists(self)
+
+        monkeypatch.setattr(Path, "exists", _exists_no_etc)
+
+    def _redirect_staging(self, monkeypatch, tmp_path):
+        """Redirect the staging-path helper so the wizard writes under tmp_path."""
+        monkeypatch.setattr(
+            "kai.install._install_staging_path",
+            lambda filename: tmp_path / filename,
+        )
+
+    def _opencode_inputs(self, opencode_bin_path: str) -> list[str]:
+        """Build the input sequence for an opencode-backend wizard run.
+
+        Mirrors the codex-install test's input sequence at line ~2440
+        of test_install.py except for the agent backend and the
+        binary-path prompt: codex has `codex_auth_mode` plus the
+        codex binary path; opencode has only the opencode binary
+        path (no auth mode prompt because opencode auth lives outside
+        the wizard surface, in `~/.local/share/opencode/auth.json`).
+        """
+        return [
+            "protected",  # deployment mode
+            "/opt/kai",  # install dir
+            "/var/lib/kai",  # data dir
+            "kai",  # service user
+            "darwin",  # platform
+            "fake-token",  # bot token
+            "12345",  # admin telegram ID
+            "admin",  # admin display name
+            "false",  # advanced user options (no per-user os_user)
+            "polling",  # transport
+            "opencode",  # agent backend
+            opencode_bin_path,  # OPENCODE_BIN (NEW prompt this spec adds)
+            # model: handled by _prompt_default_model mock
+            "120",  # agent timeout
+            "10.0",  # budget (non-claude branch)
+            "200000",  # max context window
+            "8080",  # webhook port
+            "test-secret",  # webhook secret
+            "",  # workspace base
+            "",  # allowed workspaces
+            "300",  # pr review cooldown (global resource control)
+            "900",  # pr review timeout
+            "1.0",  # pr review budget (non-claude branch)
+            "false",  # voice
+            "false",  # tts
+            "true",  # memory enabled
+            "true",  # memory extraction enabled
+            "10",  # extraction timeout
+            "8",  # consolidation candidates
+            "3",  # episode classifier context turns
+            "120",  # episode timeout
+            "0.9",  # paraphrase-dedup threshold
+            "2000",  # token budget
+            "10",  # search limit
+            "",  # perplexity key
+        ]
+
+    def test_wizard_persists_opencode_bin_to_install_conf(self, tmp_path, monkeypatch):
+        """The wizard's opencode block collects OPENCODE_BIN and
+        persists it under `env` in install.conf. The persisted value
+        is then threaded into /etc/kai/env and the sudoers rule by
+        `_cmd_apply` and `_generate_sudoers` (covered separately)."""
+        opencode_path = tmp_path / "fake_opencode"
+        opencode_path.write_text("#!/bin/sh\necho hi\n")
+        opencode_path.chmod(0o755)
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
+        # Mock the model prompt so the test doesn't drive the
+        # provider/model free-text branch directly.
+        monkeypatch.setattr(
+            "kai.install._prompt_default_model",
+            MagicMock(return_value="anthropic/claude-sonnet-4-5"),
+        )
+
+        inputs = iter(self._opencode_inputs(str(opencode_path)))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        env = json.loads((tmp_path / "install.conf").read_text())["env"]
+        assert env["OPENCODE_BIN"] == str(opencode_path)
+        assert env["AGENT_BACKEND"] == "opencode"
+
+    def test_wizard_loops_on_invalid_opencode_bin(self, tmp_path, monkeypatch):
+        """An invalid path (does not exist, or not executable) must
+        re-prompt until the operator types a valid one. Symmetric
+        with the codex validator loop at install.py:810-819."""
+        valid_path = tmp_path / "fake_opencode"
+        valid_path.write_text("#!/bin/sh\necho hi\n")
+        valid_path.chmod(0o755)
+        invalid_path = tmp_path / "does_not_exist"
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "kai.install._prompt_default_model",
+            MagicMock(return_value="anthropic/claude-sonnet-4-5"),
+        )
+
+        # Build inputs: first opencode_bin is invalid; loop pulls the
+        # next input from the iterator, which is the valid path. The
+        # rest of the wizard inputs follow.
+        inputs_list = self._opencode_inputs(str(valid_path))
+        # Find the position of opencode_bin in the input list and
+        # inject the invalid path before it.
+        opencode_idx = inputs_list.index(str(valid_path))
+        inputs_list.insert(opencode_idx, str(invalid_path))
+        inputs = iter(inputs_list)
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        env = json.loads((tmp_path / "install.conf").read_text())["env"]
+        # The persisted value is the valid path, NOT the invalid one
+        # the operator typed first. Confirms the validator loop did
+        # not accept the bad input.
+        assert env["OPENCODE_BIN"] == str(valid_path)
+
+    def test_wizard_uses_shutil_which_as_default_suggestion(self, tmp_path, monkeypatch):
+        """When no existing OPENCODE_BIN is in install.conf, the
+        wizard's prompt uses `shutil.which("opencode")` as the
+        default suggestion. Pinned via a capture-and-assert on the
+        `_prompt` call's `default` argument."""
+        opencode_path = tmp_path / "fake_opencode"
+        opencode_path.write_text("#!/bin/sh\necho hi\n")
+        opencode_path.chmod(0o755)
+        # Sentinel which `shutil.which` returns; the wizard should
+        # pass this value as the prompt default.
+        sentinel_which_value = "/sentinel/which/opencode"
+        # Make `shutil.which("opencode")` return the sentinel; leave
+        # other lookups untouched so the wizard's other PATH-based
+        # checks still work.
+        original_which = shutil.which
+
+        def _which(name):
+            if name == "opencode":
+                return sentinel_which_value
+            return original_which(name)
+
+        monkeypatch.setattr("kai.install.shutil.which", _which)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "kai.install._prompt_default_model",
+            MagicMock(return_value="anthropic/claude-sonnet-4-5"),
+        )
+
+        # Capture every `_prompt` call so the test can verify the
+        # OpenCode binary prompt was offered the sentinel value as
+        # the default. The captured tuples are (label, default, ...).
+        captured: list[tuple] = []
+        from kai.install import _prompt as _real_prompt
+
+        def _capturing_prompt(label, default="", required=False, **kwargs):
+            captured.append((label, default, required))
+            # Return the typed value via the input iterator path so
+            # the rest of the wizard flow proceeds normally. Re-route
+            # by calling the real prompt, which uses input().
+            return _real_prompt(label, default=default, required=required, **kwargs)
+
+        monkeypatch.setattr("kai.install._prompt", _capturing_prompt)
+
+        inputs = iter(self._opencode_inputs(str(opencode_path)))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        # Find the OpenCode binary path prompt in the captured list
+        # and assert its default value was the sentinel from
+        # `shutil.which("opencode")`. The exact label text matches
+        # what the spec specifies.
+        opencode_prompts = [c for c in captured if c[0] == "OpenCode binary path"]
+        assert opencode_prompts, "wizard did not prompt for OpenCode binary path"
+        _label, default, required = opencode_prompts[0]
+        assert default == sentinel_which_value
+        assert required is True
+
+    def test_wizard_re_run_preserves_existing_opencode_bin(self, tmp_path, monkeypatch):
+        """A re-run of `make config` with an existing OPENCODE_BIN
+        in install.conf uses the existing value as the default
+        suggestion, NOT the PATH-derived value. Mirrors the codex
+        re-run preservation pattern: `existing_env.get("OPENCODE_BIN",
+        which_opencode)` reads from the already-persisted value
+        first."""
+        opencode_path = tmp_path / "fake_opencode"
+        opencode_path.write_text("#!/bin/sh\necho hi\n")
+        opencode_path.chmod(0o755)
+        prior_path = tmp_path / "prior_opencode"
+        prior_path.write_text("#!/bin/sh\necho prior\n")
+        prior_path.chmod(0o755)
+
+        # Pre-populate install.conf with an existing OPENCODE_BIN
+        # value so the wizard's re-run branch fires.
+        prior_conf = {
+            "install_dir": "/opt/kai",
+            "data_dir": "/var/lib/kai",
+            "service_user": "kai",
+            "platform": "darwin",
+            "env": {
+                "OPENCODE_BIN": str(prior_path),
+                "TELEGRAM_BOT_TOKEN": "fake-token",
+            },
+        }
+        (tmp_path / "install.conf").write_text(json.dumps(prior_conf))
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "kai.install._prompt_default_model",
+            MagicMock(return_value="anthropic/claude-sonnet-4-5"),
+        )
+
+        captured: list[tuple] = []
+        from kai.install import _prompt as _real_prompt
+
+        def _capturing_prompt(label, default="", required=False, **kwargs):
+            captured.append((label, default, required))
+            return _real_prompt(label, default=default, required=required, **kwargs)
+
+        monkeypatch.setattr("kai.install._prompt", _capturing_prompt)
+
+        inputs = iter(self._opencode_inputs(str(opencode_path)))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        # The OpenCode binary prompt's default came from the
+        # pre-populated env, not from shutil.which.
+        opencode_prompts = [c for c in captured if c[0] == "OpenCode binary path"]
+        assert opencode_prompts, "wizard did not prompt for OpenCode binary path"
+        _, default, _ = opencode_prompts[0]
+        assert default == str(prior_path)
+
+
 class TestGenerateSudoersCodexBinArg:
     """_generate_sudoers takes codex_bin as an argument."""
 

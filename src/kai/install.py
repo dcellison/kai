@@ -350,6 +350,25 @@ def _validate_codex_bin(value: str) -> bool:
     return p.is_file() and os.access(p, os.X_OK)
 
 
+def _validate_opencode_bin(value: str) -> bool:
+    """Return True when the path exists and is executable.
+
+    Required by the opencode wizard prompt; the path is baked into
+    both the runtime OPENCODE_BIN env var and the sudoers rule that
+    allows cross-os_user opencode spawns, so a non-existent path
+    here would surface as a confusing 'a password is required' or
+    'command not found' at the first one-shot call. Paired with
+    `_validate_codex_bin` above so the two binary validators stay
+    together; the body shape matches codex byte-for-byte (is-file
+    plus executable) because the underlying requirement is the
+    same.
+    """
+    if not value:
+        return False
+    p = Path(value)
+    return p.is_file() and os.access(p, os.X_OK)
+
+
 def _install_staging_path(filename: str) -> Path:
     """Return the per-operator staging path for a first-time install file.
 
@@ -790,6 +809,13 @@ def _cmd_config() -> None:
     codex_auth_mode = ""
     codex_api_key = ""
     codex_bin = ""
+    # OpenCode binary path collected by the global-opencode block
+    # below (and re-prompted by the memory-extraction defense-in-depth
+    # gate if a future refactor exposes a path where the global block
+    # did not run). Empty when opencode is not in play so the
+    # persistence gate at the tail of this function skips emitting
+    # OPENCODE_BIN to install.conf.
+    opencode_bin = ""
     if agent_backend == "codex":
         codex_auth_mode = _prompt_choice(
             "Codex auth mode",
@@ -824,23 +850,43 @@ def _cmd_config() -> None:
             print("  If users.yaml has per-user `agent_backend: codex` entries with")
             print("  different os_users, log in as each of those too.")
 
-    # OpenCode setup: PATH check + post-install auth reminder. OpenCode
-    # is intentionally absent from VALID_PROVIDERS (its auth lives in
-    # ~/.local/share/opencode/auth.json, operator-managed via
-    # `opencode auth login`), so the provider/API-key block below is
-    # skipped naturally. Model selection routes through
-    # _prompt_default_model later in this function; since
-    # models_for_backend("opencode", _) returns None, the operator gets
-    # a free-text prompt for a full `provider/model` ID.
+    # OpenCode setup: binary-path wizard prompt + post-install auth
+    # reminder. OpenCode is intentionally absent from VALID_PROVIDERS
+    # (its auth lives in ~/.local/share/opencode/auth.json,
+    # operator-managed via `opencode auth login`), so the
+    # provider/API-key block below is skipped naturally. Model
+    # selection routes through _prompt_default_model later in this
+    # function; since models_for_backend("opencode", _) returns None,
+    # the operator gets a free-text prompt for a full `provider/model`
+    # ID.
     #
     # Gate on the global `agent_backend` selection only. Per-user
     # `agent_backend: opencode` overrides in users.yaml do NOT trigger
     # opencode setup here; the operator handles those installs and
     # auth out-of-band.
     if agent_backend == "opencode":
-        if not shutil.which("opencode"):
-            print("  WARNING: 'opencode' binary not found on PATH.")
-            print("  Install it from https://opencode.ai/docs/install/ before starting Kai.")
+        # OpenCode binary path: wizard-prompted and persisted in
+        # install.conf so `make install` writes both /etc/kai/env's
+        # OPENCODE_BIN and the sudoers SETENV rule from the same
+        # source of truth. Default suggestion uses `which opencode`
+        # from the operator's PATH; falls back to the empty string
+        # when which finds nothing (opencode has no single canonical
+        # install location across operator platforms, so an empty
+        # default forces the operator to type the path explicitly
+        # rather than accept a wrong default). The _cmd_apply env
+        # passthrough (`sudo OPENCODE_BIN=... make install`) still
+        # works as the ad-hoc deploy escape hatch; the wizard path is
+        # the canonical source of truth.
+        while True:
+            which_opencode = shutil.which("opencode") or ""
+            opencode_bin = _prompt(
+                "OpenCode binary path",
+                existing_env.get("OPENCODE_BIN", which_opencode),
+                required=True,
+            )
+            if _validate_opencode_bin(opencode_bin):
+                break
+            print(f"  Path '{opencode_bin}' does not exist or is not executable.")
         print("  After install, authenticate OpenCode for at least one provider:")
         print("    <service_user> ~$ opencode auth login")
         print("  Kai writes the active model into OPENCODE_CONFIG_CONTENT at process spawn;")
@@ -1230,6 +1276,30 @@ def _cmd_config() -> None:
                         if _validate_codex_bin(codex_bin):
                             break
                         print(f"  Path '{codex_bin}' does not exist or is not executable.")
+                # Symmetric defense-in-depth for the opencode global
+                # backend. The global-opencode block above already
+                # collected opencode_bin on the normal flow; the gate
+                # here exists for the same future-refactor reason
+                # codex documents above: a refactor that moved the
+                # memory-extraction prompt before the global-backend
+                # block could reach this point with opencode_bin
+                # still empty. Default-suggestion value differs from
+                # codex (empty fallback instead of Homebrew) because
+                # opencode has no canonical install location across
+                # platforms; an empty default forces the operator to
+                # type the path explicitly rather than accept a wrong
+                # default.
+                if agent_backend == "opencode" and not opencode_bin:
+                    while True:
+                        which_opencode = shutil.which("opencode") or ""
+                        opencode_bin = _prompt(
+                            "OpenCode binary path (required by opencode memory reasoner)",
+                            existing_env.get("OPENCODE_BIN", which_opencode),
+                            required=True,
+                        )
+                        if _validate_opencode_bin(opencode_bin):
+                            break
+                        print(f"  Path '{opencode_bin}' does not exist or is not executable.")
                 # No MEMORY_EXTRACTION_BUDGET_USD prompt on this branch:
                 # --max-budget-usd is omitted from the stage-1 claude
                 # --print argv (memory_extraction.py:_run_extractor),
@@ -1430,6 +1500,14 @@ def _cmd_config() -> None:
     # the canonical source of truth.
     if codex_bin:
         env["CODEX_BIN"] = codex_bin
+    # Same gating shape as codex above: the value persists only when
+    # the wizard collected one (truthy opencode_bin), so a claude or
+    # goose install does not pollute install.conf with an empty
+    # OPENCODE_BIN= line. The single env emission drives both
+    # /etc/kai/env's OPENCODE_BIN and the sudoers SETENV rule so the
+    # two cannot drift.
+    if opencode_bin:
+        env["OPENCODE_BIN"] = opencode_bin
 
     # Remove stale renamed keys if present - leaving both the old and
     # new key causes silent confusion (the deprecation warning is
