@@ -7803,6 +7803,73 @@ class TestOpenCodeBinWizardPrompt:
         _, default, _ = opencode_prompts[0]
         assert default == str(prior_path)
 
+    def test_memory_extraction_enabled_persists_for_opencode_install(self, tmp_path, monkeypatch):
+        """An opencode operator who answers `true` to the memory
+        extraction prompt must see the value persist all the way to
+        install.conf's env dict (and from there to /etc/kai/env and
+        the runtime Config). The install-time cleanup gate that drops
+        stale MEMORY_EXTRACTION_* keys for backends without a
+        OneShotReasoner must NOT strip them for opencode (which DOES
+        have an OpenCodeOneShotReasoner).
+
+        This is the operator-visible regression test for the
+        install.py cleanup gate that previously read
+        `("claude", "codex")` and silently dropped the operator's
+        `MEMORY_EXTRACTION_ENABLED=true` answer on opencode installs.
+        Once the gate reads ONESHOT_REASONER_BACKENDS, opencode is
+        admitted and the value persists.
+
+        The base `_opencode_inputs` helper drives the wizard through
+        the memory-extraction prompt with answer `true`; this test
+        also overrides two tunable values to non-defaults so the
+        wizard's delta-from-defaults emission rule writes those keys
+        into install.conf, giving the cleanup gate's matching `.pop`
+        sites real keys to (not) strip.
+        """
+        opencode_path = tmp_path / "fake_opencode"
+        opencode_path.write_text("#!/bin/sh\necho hi\n")
+        opencode_path.chmod(0o755)
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "kai.install._prompt_default_model",
+            MagicMock(return_value="anthropic/claude-sonnet-4-5"),
+        )
+
+        # Build the input sequence; override two extraction tunables
+        # to non-default values so the wizard's delta-from-defaults
+        # emission rule writes them into install.conf and the
+        # cleanup gate has matching keys to (not) strip. The "120"
+        # value appears twice (agent timeout, then episode timeout);
+        # take the second occurrence for the episode-timeout slot.
+        inputs_list = self._opencode_inputs(str(opencode_path))
+        inputs_list[inputs_list.index("10")] = "20"  # MEMORY_EXTRACTION_TIMEOUT_S
+        first_120 = inputs_list.index("120")
+        inputs_list[inputs_list.index("120", first_120 + 1)] = "180"  # MEMORY_EPISODE_TIMEOUT_S
+        inputs = iter(inputs_list)
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        env = json.loads((tmp_path / "install.conf").read_text())["env"]
+        # AGENT_BACKEND pins which gate branch fired; opencode here
+        # exercises the previously-broken cleanup path.
+        assert env["AGENT_BACKEND"] == "opencode"
+        # MEMORY_EXTRACTION_ENABLED was always emitted by the wizard,
+        # then silently stripped by the cleanup gate before the gate
+        # read from ONESHOT_REASONER_BACKENDS. Load-bearing assertion
+        # for the operator-visible bug.
+        assert env["MEMORY_EXTRACTION_ENABLED"] == "true"
+        # The two non-default extraction tunables must also survive
+        # the cleanup. Wizard's emission rule wrote them because the
+        # operator chose values different from the dataclass defaults.
+        assert env["MEMORY_EXTRACTION_TIMEOUT_S"] == "20"
+        assert env["MEMORY_EPISODE_TIMEOUT_S"] == "180"
+
 
 class TestGenerateSudoersCodexBinArg:
     """_generate_sudoers takes codex_bin as an argument."""

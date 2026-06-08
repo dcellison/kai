@@ -40,11 +40,12 @@ import re
 import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
 from kai import memory, memory_extraction
-from kai.config import Config, ModelRole, get_model_for, load_config
+from kai.config import ONESHOT_REASONER_BACKENDS, Config, ModelRole, get_model_for, load_config
 from kai.eval.extraction import _window_to_extractor_args
 from kai.eval.replay import _SANDBOX_USER_ID_PREFIX
 
@@ -102,8 +103,34 @@ ALLOWED_CONSOLIDATION_OUTCOMES = (
     "add_failed_after_delete",
 )
 
-# Default backends evaluated when --backends is not supplied.
-DEFAULT_BACKENDS = ("claude", "codex")
+# Default backends evaluated when --backends is not supplied. Cast
+# to a tuple so argparse's positional-sequence consumers (`default`
+# and `choices`) get the shape they expect; sort first so the help
+# output and downstream loops produce a deterministic order across
+# runs (frozenset iteration is hash-seed-randomized).
+DEFAULT_BACKENDS: tuple[str, ...] = tuple(sorted(ONESHOT_REASONER_BACKENDS))
+
+# Comma-joined sample of per-backend sandbox IDs for the
+# `--user-prefix` help text. Built from ONESHOT_REASONER_BACKENDS so
+# a new reasoner addition extends the help string automatically.
+_BACKEND_SANDBOX_EXAMPLES = ", ".join(f"<prefix>-{b}" for b in sorted(ONESHOT_REASONER_BACKENDS))
+
+# Back-compat lookup key for the legacy single-pair `threshold_report`
+# consumer surface. The pairwise compare loop now builds a dict keyed
+# by every two-backend combination; legacy consumers (gate_result JSON
+# layout, `--fail-on-threshold` exit code) read this one entry. Built
+# via `tuple(sorted(...)[:2])` so the value derives from the constant
+# rather than hardcoding a literal that the grep regression test
+# in `tests/test_config.py` would reject. Today's value is the
+# first two alphabetic entries (`claude` then `codex`); a future
+# backend that sorts before `claude` shifts which
+# pair the legacy consumer surfaces, and `.get()`'s graceful-None
+# return keeps the call site degradation-safe (matched by the
+# `single_backend` sentinel fallback at the call site). A multi-pair
+# consumer surface lands in a separate change; this is the data-path
+# bridge only.
+_sorted_oneshot_backends = sorted(ONESHOT_REASONER_BACKENDS)
+_LEGACY_THRESHOLD_PAIR: tuple[str, str] = (_sorted_oneshot_backends[0], _sorted_oneshot_backends[1])
 
 # Default qualitative sample budget. The 5/3/2 split below is the
 # canonical allocation when budget == 10. Smaller budgets fall back
@@ -1887,9 +1914,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m kai.eval.memory_backend_gate",
         description=(
-            "Claude-vs-Codex memory eval gate. Drives extract_and_store + "
-            "format_context for each backend against the same probe fixture "
-            "and emits gate-result.json + per-backend logs + qualitative-sample.md."
+            "Cross-backend memory eval gate. Drives extract_and_store + "
+            "format_context for each backend with a OneShotReasoner against "
+            "the same probe fixture and emits gate-result.json + per-backend "
+            "logs + qualitative-sample.md."
         ),
     )
     parser.add_argument("--probes", type=Path, required=True, help="Path to the JSONL probe fixture.")
@@ -1907,7 +1935,7 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             f"Sandbox user-ID prefix; must start with {_SANDBOX_USER_ID_PREFIX!r}. "
-            "Per-backend sandbox IDs are <prefix>-claude and <prefix>-codex."
+            f"Per-backend sandbox IDs are {_BACKEND_SANDBOX_EXAMPLES}."
         ),
     )
     parser.add_argument(
@@ -1915,7 +1943,7 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=list(DEFAULT_BACKENDS),
         choices=list(DEFAULT_BACKENDS),
-        help="Backends to run; default is both.",
+        help="Backends to run; default is every backend with a OneShotReasoner.",
     )
     parser.add_argument(
         "--os-user",
@@ -2031,9 +2059,24 @@ async def _run_cli(args: argparse.Namespace) -> int:
         metrics.episode_recall = tp / max(1, tp + fn)
         metrics_by_backend[backend] = metrics
 
-    if "claude" in metrics_by_backend and "codex" in metrics_by_backend:
-        threshold_report = compare_thresholds(metrics_by_backend["claude"], metrics_by_backend["codex"])
-    else:
+    # Compute every pairwise threshold comparison across the backends
+    # that actually produced metrics this run. The legacy consumer
+    # surface (the gate-result JSON layout and the `--fail-on-threshold`
+    # exit code) reads only the `_LEGACY_THRESHOLD_PAIR` entry; the
+    # remaining pairs are computed for downstream multi-pair rendering
+    # that lands separately. `.get(...)` returns None when the legacy
+    # pair did not produce comparable metrics (single-backend run or
+    # a partial-skip), which the `single_backend` sentinel below
+    # converts to the same shape `compare_thresholds` returns.
+    threshold_reports: dict[tuple[str, str], ThresholdReport] = {}
+    for backend_a, backend_b in combinations(sorted(ONESHOT_REASONER_BACKENDS), 2):
+        if backend_a in metrics_by_backend and backend_b in metrics_by_backend:
+            threshold_reports[(backend_a, backend_b)] = compare_thresholds(
+                metrics_by_backend[backend_a],
+                metrics_by_backend[backend_b],
+            )
+    threshold_report = threshold_reports.get(_LEGACY_THRESHOLD_PAIR)
+    if threshold_report is None:
         threshold_report = ThresholdReport(checks=[], overall="single_backend")
 
     gate_result = build_gate_result(

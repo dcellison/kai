@@ -44,6 +44,7 @@ from kai.config import (
     CODEX_MODELS,
     EFFORT_LEVELS,
     MAX_CONTEXT_CEILING,
+    ONESHOT_REASONER_BACKENDS,
     PROJECT_ROOT,
     PROVIDER_DEFAULTS,
     PROVIDER_KEY_VARS,
@@ -1237,14 +1238,13 @@ def _cmd_config() -> None:
     memory_duplicate_threshold = "0.9"
     if memory_enabled:
         # Memory extraction is supported on agent backends that have a
-        # OneShotReasoner implementation: claude, codex, and (since
-        # PR #577) opencode. Goose retrieval-only installs accept
-        # memory_enabled but skip the extraction prompt because no
-        # reasoner exists for goose. Add to the tuple when a new
-        # reasoner ships. The runtime eligibility gate at
-        # `bot._ingest_memory` and `config._compute_extraction_eligible_backends`
-        # widened to the same set; both stay in lockstep.
-        if agent_backend in ("claude", "codex", "opencode"):
+        # Membership tracks backends with a OneShotReasoner. Goose
+        # retrieval-only installs accept memory_enabled but skip the
+        # extraction prompt because no GooseOneShotReasoner exists.
+        # The runtime eligibility gate at `bot._ingest_memory` and
+        # `config._compute_extraction_eligible_backends` read from
+        # the same constant; all sites stay in lockstep through it.
+        if agent_backend in ONESHOT_REASONER_BACKENDS:
             memory_extraction_enabled = _prompt_bool(
                 "Enable memory extraction (proactive memory writes)",
                 existing_env.get("MEMORY_EXTRACTION_ENABLED", "false").lower() in ("1", "true", "yes"),
@@ -1694,11 +1694,14 @@ def _cmd_config() -> None:
     env.pop("MEMORY_EPISODE_MODEL", None)
 
     # Drop stale extraction keys when the agent backend has no memory
-    # reasoner. Today that is goose; claude and codex both support
-    # extraction. A user who flips backend from claude/codex to goose
-    # should not see lingering extraction config that would be
-    # silently ignored at runtime.
-    if agent_backend not in ("claude", "codex"):
+    # reasoner (i.e. is not in ONESHOT_REASONER_BACKENDS). A user who
+    # flips backend from a reasoner-capable backend to one without a
+    # reasoner should not see lingering extraction config that would
+    # be silently ignored at runtime. Mirrors the wizard-side
+    # extraction-prompt gate above so a value prompted-and-accepted on
+    # an eligible backend persists end to end; a value prompted on a
+    # then-ineligible backend gets dropped here.
+    if agent_backend not in ONESHOT_REASONER_BACKENDS:
         env.pop("MEMORY_EXTRACTION_ENABLED", None)
         env.pop("MEMORY_EXTRACTION_BUDGET_USD", None)
         env.pop("MEMORY_EXTRACTION_TIMEOUT_S", None)

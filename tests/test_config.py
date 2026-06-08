@@ -12,6 +12,7 @@ import pytest
 
 from kai.config import (
     MODEL_REGISTRY,
+    ONESHOT_REASONER_BACKENDS,
     Config,
     ModelRole,
     UserConfig,
@@ -3192,3 +3193,115 @@ class TestMemoryRecallShadowConfig:
         cfg = load_config()
         assert cfg.memory_enabled is False
         assert cfg.memory_recall_shadow_enabled is False
+
+
+class TestOneShotReasonerBackendsConstant:
+    """Pin the contract of `ONESHOT_REASONER_BACKENDS`. This constant
+    drives every site that gates on "does this backend support
+    one-shot agent dispatch" (memory extraction, PR review, triage,
+    smoke, behavioral eval, install-time MEMORY_* persistence). The
+    tests below pin both its membership (the set of backends with a
+    OneShotReasoner in `src/kai/oneshot.py`) and its type
+    (`frozenset`, communicating immutability and membership-only
+    intent). A type or membership drift would silently break the
+    one-shot-eligible call sites; pin both invariants here so any
+    future change is intentional.
+    """
+
+    def test_membership(self):
+        """Exactly claude, codex, and opencode have OneShotReasoner
+        implementations in `src/kai/oneshot.py` today. Goose is a
+        valid agent backend (retrieval-only memory installs work) but
+        has no `GooseOneShotReasoner`, so it must NOT be in the
+        constant.
+        """
+        assert "claude" in ONESHOT_REASONER_BACKENDS
+        assert "codex" in ONESHOT_REASONER_BACKENDS
+        assert "opencode" in ONESHOT_REASONER_BACKENDS
+        # Goose-exclusion is load-bearing: collapsing the goose
+        # backend into the one-shot-eligible set would force a goose
+        # operator into memory-extraction / review / triage paths
+        # that the goose backend cannot satisfy.
+        assert "goose" not in ONESHOT_REASONER_BACKENDS
+        # Pin the exact contents so an accidental addition is caught
+        # at test time; intentional additions update this assertion
+        # in lockstep with the constant's definition.
+        assert frozenset({"claude", "codex", "opencode"}) == ONESHOT_REASONER_BACKENDS
+
+    def test_is_frozenset(self):
+        """The constant must be a `frozenset` so callers only do
+        membership checks; a mutable container would invite per-site
+        mutation (`.add(...)`) that breaks the single-source-of-
+        truth invariant the constant is designed to enforce.
+        """
+        assert isinstance(ONESHOT_REASONER_BACKENDS, frozenset)
+
+
+class TestNoAdHocOneShotBackendTuples:
+    """Regression guard for the "no ad-hoc literal tuples" invariant.
+
+    Every site that gates on "is this backend one of the backends
+    with a OneShotReasoner" must read from `ONESHOT_REASONER_BACKENDS`
+    rather than typing a fresh literal tuple. Without this guard, a
+    future contributor who adds a new gate can silently re-introduce
+    the ad-hoc-tuple pattern that this constant was created to
+    eliminate (and that cost the opencode rollout two follow-up
+    fix-up PRs to correct).
+    """
+
+    def test_no_ad_hoc_oneshot_backend_tuples_in_source(self):
+        """Production source files must use ONESHOT_REASONER_BACKENDS
+        instead of literal claude/codex tuples for the one-shot-
+        eligibility check. This pins the invariant the constant is
+        meant to enforce: a future contributor who adds a new gate
+        must read from the constant, not type a new literal.
+
+        Allowed sites for the literal patterns:
+        - The constant's own definition in `config.py`.
+        - Module / function docstrings naming the set (informational).
+        - String literals in error messages naming the set explicitly.
+
+        Disallowed: a bare tuple `("claude", "codex")` or
+        `("claude", "codex", "opencode")` used as a membership-check
+        source.
+
+        KNOWN BLIND SPOTS the pattern does NOT catch (acceptable
+        best-effort scope; the constant's existence and the wider
+        code-review discipline catch what regex cannot):
+
+        - Reversed-order tuples (`("codex", "claude")`). No site uses
+          this shape today; if a contributor introduces one, the next
+          maintainer's grep catches it during review.
+        - Multi-line tuples (`("claude",\\n    "codex",\\n    ...)`).
+          The pattern is single-line. A contributor splitting the
+          tuple across lines bypasses the test; black/ruff formatting
+          keeps short tuples on one line in practice.
+        - Tuples with extra elements (`("claude", "codex", "opencode",
+          "goose")` or any other 4+ form). The pattern matches exactly
+          the 2-element and 3-element forms that were the historical
+          ad-hoc shape; a future widening to a literal 4-tuple would
+          not trip the test.
+        - Set / list / dict-keys forms of the same membership
+          (`{"claude", "codex"}` or `["claude", "codex"]`). The
+          operator-visible bug class this test guards against (the
+          install.py extraction-keys cleanup gate) used tuples; sets
+          and lists are rarer in this codebase but a future use
+          would slip past.
+        """
+        import re
+        from pathlib import Path
+
+        pattern = re.compile(r'\(\s*"claude"\s*,\s*"codex"(\s*,\s*"opencode")?\s*\)')
+        repo_root = Path(__file__).resolve().parent.parent
+        src = repo_root / "src" / "kai"
+        offenders: list[tuple[str, int, str]] = []
+        for path in src.rglob("*.py"):
+            # Allowed: the constant's own definition file.
+            if path.name == "config.py":
+                continue
+            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if pattern.search(line):
+                    offenders.append((str(path.relative_to(repo_root)), lineno, line.strip()))
+        assert not offenders, (
+            f"Found ad-hoc claude/codex tuples; use ONESHOT_REASONER_BACKENDS instead. Offending sites: {offenders}"
+        )

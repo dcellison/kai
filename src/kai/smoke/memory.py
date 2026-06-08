@@ -33,7 +33,7 @@ import logging
 import sys
 import time
 
-from kai.config import ModelRole, get_model_for, load_config
+from kai.config import ONESHOT_REASONER_BACKENDS, ModelRole, get_model_for, load_config
 from kai.memory_extraction import (
     _EXTRACTION_SYSTEM_PROMPT,
     _FACT_SCHEMA,
@@ -108,11 +108,12 @@ async def _run(user_id: str | None, os_user: str | None) -> int:
     # the same way), so reuse it directly.
     resolved_user_id = user_id if user_id is not None else "smoke"
     effective_backend = _resolve_effective_backend(resolved_user_id, config)
-    if effective_backend not in ("claude", "codex"):
+    if effective_backend not in ONESHOT_REASONER_BACKENDS:
+        eligible = ", ".join(sorted(ONESHOT_REASONER_BACKENDS))
         sys.stderr.write(
             f"smoke: effective backend {effective_backend!r} has no memory reasoner. "
-            "Pass --user-id matching a claude- or codex-effective entry in users.yaml, "
-            "or run with a global AGENT_BACKEND of claude or codex.\n"
+            f"Pass --user-id matching an entry in users.yaml whose effective backend "
+            f"is one of: {eligible}, or run with a matching global AGENT_BACKEND.\n"
         )
         return 1
 

@@ -47,6 +47,32 @@ DATA_DIR = Path(os.environ.get("KAI_DATA_DIR") or str(PROJECT_ROOT))
 # `opencode auth login`). Shared between load_config() and install.py.
 VALID_BACKENDS = {"claude", "goose", "codex", "opencode"}
 
+# Backends that ship a `OneShotReasoner` implementation in
+# `src/kai/oneshot.py`. Every site that gates on "does this backend
+# support one-shot agent dispatch" - memory extraction eligibility,
+# PR review / triage dispatch, smoke validation, behavioral eval
+# coverage, install-time MEMORY_* persistence - reads from this set
+# rather than an ad-hoc literal tuple. Adding a new backend with a
+# OneShotReasoner is a one-line change here; without the constant,
+# widening costs a grep-and-extend dance across nine sites in
+# `bot`, `install`, `smoke`, and `eval` (which is exactly what
+# the opencode rollout cost across two follow-up PRs).
+#
+# `frozenset` because the only operation any caller needs is
+# membership; the constant is immutable at module scope and the
+# type pins that intent.
+#
+# Strict subset of VALID_BACKENDS: every entry here is also a valid
+# agent backend, but not every valid agent backend has a
+# OneShotReasoner. Concrete exclusion: `"goose"` is in
+# VALID_BACKENDS but not here because `src/kai/oneshot.py` has no
+# `GooseOneShotReasoner` class. Goose retrieval-only memory
+# installs work; goose one-shot dispatch (memory extraction, PR
+# review, triage) does not. The two constants stay distinct on
+# purpose; collapsing them would force a goose operator through
+# one-shot-eligibility gates the goose backend cannot satisfy.
+ONESHOT_REASONER_BACKENDS: frozenset[str] = frozenset({"claude", "codex", "opencode"})
+
 # Valid LLM providers per backend. Claude always uses Anthropic
 # (hardcoded in get_effective_provider), so it has no entry here.
 # Backends that don't appear in this dict accept no provider config.
@@ -289,7 +315,7 @@ def _check_model_registry_complete(backend: str) -> None:
     Goose is exempt: goose-side model resolution lives in module-level
     _GOOSE_AGENT_MODELS dicts that this registry does not subsume.
     """
-    if backend not in ("claude", "codex", "opencode"):
+    if backend not in ONESHOT_REASONER_BACKENDS:
         return
     missing = [role for role in ModelRole if (backend, role) not in MODEL_REGISTRY]
     if missing:
@@ -1651,7 +1677,7 @@ def _compute_extraction_eligible_backends(
     eligible: set[str] = set()
     for uc in user_configs.values():
         effective = uc.agent_backend or agent_backend
-        if effective in ("claude", "codex", "opencode"):
+        if effective in ONESHOT_REASONER_BACKENDS:
             eligible.add(effective)
     return eligible
 

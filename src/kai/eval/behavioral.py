@@ -95,7 +95,7 @@ from typing import Any
 # on probe schema, drift detection, and probe-set-hash semantics. If
 # Layer 1's drift bucketing changes, Layer 2 follows automatically.
 from kai.codex_exec import extract_codex_text
-from kai.config import ModelRole, get_model_for
+from kai.config import ONESHOT_REASONER_BACKENDS, ModelRole, get_model_for
 from kai.eval.retrieval import (
     Probe,
     detect_drift,
@@ -2280,16 +2280,17 @@ async def _run_cli(args: argparse.Namespace) -> int:
     # _build_parser) means an unset flag yields override="" so the
     # branch below picks the right backend-appropriate default.
     #
-    # The registry only covers claude and codex; goose's model
-    # resolution lives in _GOOSE_AGENT_MODELS dicts inside triage.py
-    # and review.py, not in MODEL_REGISTRY. For goose (and any future
-    # non-registry backend) we preserve the pre-Phase-1 behavior:
-    # explicit --judge-model / --gen-model wins, otherwise the legacy
-    # _DEFAULT_JUDGE_MODEL / _DEFAULT_GEN_MODEL constants are used.
-    # This keeps the goose path byte-identical to today rather than
-    # crashing with a LookupError on an unset flag.
+    # MODEL_REGISTRY covers every backend in ONESHOT_REASONER_BACKENDS;
+    # goose's model resolution lives in _GOOSE_AGENT_MODELS dicts inside
+    # triage.py and review.py, not in MODEL_REGISTRY. For goose (and any
+    # other backend that ever sits outside ONESHOT_REASONER_BACKENDS),
+    # preserve the pre-registry behavior: explicit --judge-model /
+    # --gen-model wins, otherwise the legacy _DEFAULT_JUDGE_MODEL /
+    # _DEFAULT_GEN_MODEL constants are used. This keeps the goose path
+    # byte-identical rather than crashing with a LookupError on an
+    # unset flag.
     eval_backend = os.environ.get("AGENT_BACKEND", "claude").strip().lower()
-    if eval_backend in ("claude", "codex"):
+    if eval_backend in ONESHOT_REASONER_BACKENDS:
         resolved_judge_model = get_model_for(
             ModelRole.BEHAVIORAL_JUDGE,
             eval_backend,
