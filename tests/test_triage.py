@@ -10,10 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kai.triage import (
-    _GOOSE_AGENT_MODELS,
     IssueMetadata,
     _parse_triage_json,
-    _resolve_goose_model,
     _sanitize_search_query,
     _send_error_notification,
     apply_triage,
@@ -334,17 +332,18 @@ class TestRunTriage:
         assert cmd[i + 1] == "sonnet"
 
     @pytest.mark.asyncio
-    async def test_claude_env_override_honored_at_call_site(self, monkeypatch):
+    async def test_model_override_param_wins_over_registry_default(self):
         """
-        ISSUE_TRIAGE_MODEL_CLAUDE in the environment overrides the
-        registry value at the call site. The override env var is
-        read here rather than in load_config; this test verifies the
-        wiring end-to-end.
+        The `model_override` parameter (resolved by the caller in
+        webhook.py from `user_config.models["issue_triage"]` and the
+        load-time legacy env-var seeding) wins over the registry
+        default. Pins the wiring that lets per-user
+        `models.issue_triage` reach dispatch without the historic
+        ISSUE_TRIAGE_MODEL_CLAUDE env-var read at the call site.
         """
-        monkeypatch.setenv("ISSUE_TRIAGE_MODEL_CLAUDE", "opus")
         mock_proc = _mock_subprocess(returncode=0, stdout='{"labels": []}')
         with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_triage("prompt", agent_backend="claude")
+            await run_triage("prompt", agent_backend="claude", model_override="opus")
         cmd = mock_exec.call_args[0]
         i = cmd.index("--model")
         assert cmd[i + 1] == "opus"
@@ -608,29 +607,36 @@ class TestRunTriageGoose:
         assert cmd[0] == "goose"
 
     @pytest.mark.asyncio
-    async def test_open_ended_provider_reads_env(self):
-        """Open-ended providers (ollama) use GOOSE_MODEL from env."""
+    async def test_open_ended_provider_uses_registry_default(self):
+        """Goose+ollama resolves the ISSUE_TRIAGE row from the unified
+        registry. The historic GOOSE_MODEL env path retired with
+        the `_GOOSE_AGENT_MODELS` fold-in."""
         mock_proc = _mock_subprocess(stdout='{"labels": []}')
 
-        with (
-            patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
-            patch.dict(os.environ, {"GOOSE_MODEL": "llama3.3:70b"}),
-        ):
+        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
             await run_triage("prompt", agent_backend="goose", provider="ollama")
 
         cmd = mock_exec.call_args[0]
         model_idx = cmd.index("--model")
-        assert cmd[model_idx + 1] == "llama3.3:70b"
+        assert cmd[model_idx + 1] == "llama4:70b"
 
     @pytest.mark.asyncio
-    async def test_open_ended_provider_no_model_raises(self):
-        """Open-ended provider with no GOOSE_MODEL raises RuntimeError."""
-        with (
-            patch.dict(os.environ, {}, clear=False),
-            pytest.raises(RuntimeError, match="No model configured"),
-        ):
-            os.environ.pop("GOOSE_MODEL", None)
-            await run_triage("prompt", agent_backend="goose", provider="ollama")
+    async def test_open_ended_provider_with_model_override(self):
+        """Per-user `models.issue_triage` override flows through
+        `model_override` and wins over the registry default."""
+        mock_proc = _mock_subprocess(stdout='{"labels": []}')
+
+        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_triage(
+                "prompt",
+                agent_backend="goose",
+                provider="ollama",
+                model_override="qwen3:32b",
+            )
+
+        cmd = mock_exec.call_args[0]
+        model_idx = cmd.index("--model")
+        assert cmd[model_idx + 1] == "qwen3:32b"
 
     @pytest.mark.asyncio
     async def test_default_backend_is_claude(self):
@@ -677,7 +683,9 @@ class TestRunTriageOpenCodeDispatch:
             patch("kai.triage.OpenCodeOneShotReasoner", return_value=fake) as ctor,
             patch("kai.triage.asyncio.create_subprocess_exec") as mock_exec,
         ):
-            result = await run_triage("prompt body", agent_backend="opencode", claude_user="someone")
+            result = await run_triage(
+                "prompt body", agent_backend="opencode", provider="anthropic", claude_user="someone"
+            )
 
         assert result == '{"labels": []}'
         ctor.assert_called_once()
@@ -696,7 +704,7 @@ class TestRunTriageOpenCodeDispatch:
             patch("kai.triage.OpenCodeOneShotReasoner", return_value=fake),
             pytest.raises(RuntimeError, match=r"Triage subprocess timed out"),
         ):
-            await run_triage("prompt", agent_backend="opencode")
+            await run_triage("prompt", agent_backend="opencode", provider="anthropic")
 
     @pytest.mark.asyncio
     async def test_run_triage_collapses_oneshot_error_to_runtime_error(self):
@@ -709,7 +717,7 @@ class TestRunTriageOpenCodeDispatch:
             patch("kai.triage.OpenCodeOneShotReasoner", return_value=fake),
             pytest.raises(RuntimeError, match=r"OpenCode triage failed.*schema bad"),
         ):
-            await run_triage("prompt", agent_backend="opencode")
+            await run_triage("prompt", agent_backend="opencode", provider="anthropic")
 
 
 class TestRunTriageCodex:
@@ -799,16 +807,16 @@ class TestRunTriageCodex:
         assert cmd[i + 1] == "gpt-5.4-mini"
 
     @pytest.mark.asyncio
-    async def test_codex_env_override_honored_at_call_site(self, monkeypatch):
+    async def test_codex_model_override_param_wins(self):
         """
-        ISSUE_TRIAGE_MODEL_CODEX in the environment overrides the
-        registry value at the call site. Same end-to-end env-override
-        wiring as the claude path.
+        On the codex branch, the `model_override` parameter (resolved
+        by the caller from per-user `models.issue_triage` and the
+        load-time legacy env-var seeding) wins over the registry
+        default the same way it does on the claude branch.
         """
-        monkeypatch.setenv("ISSUE_TRIAGE_MODEL_CODEX", "gpt-5.4")
         mock_proc = _mock_subprocess(stdout=self._codex_ndjson("{}"))
         with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_triage("prompt", agent_backend="codex")
+            await run_triage("prompt", agent_backend="codex", model_override="gpt-5.4")
         cmd = mock_exec.call_args[0]
         i = cmd.index("--model")
         assert cmd[i + 1] == "gpt-5.4"
@@ -930,25 +938,24 @@ class TestRunTriageCodex:
         assert result == expected_json
 
 
-class TestResolveGooseModelTriage:
-    """Tests for _resolve_goose_model in triage.py."""
+class TestGooseTriageModelResolutionViaRegistry:
+    """Goose triage model selection now flows through the unified
+    (backend, provider, role) MODEL_REGISTRY. The legacy
+    _resolve_goose_model helper retired with this spec; per-user
+    overrides live in users.yaml `models.issue_triage`."""
 
-    def test_curated_providers(self):
-        """Each curated provider returns its hardcoded mid-tier model."""
-        for provider, expected_model in _GOOSE_AGENT_MODELS.items():
-            assert _resolve_goose_model(provider) == expected_model
+    def test_curated_provider_registry_lookup(self):
+        """Goose+openai resolves the ISSUE_TRIAGE row from the registry."""
+        from kai.config import MODEL_REGISTRY, ModelRole
 
-    def test_open_ended_provider_with_env(self):
-        """Open-ended provider reads GOOSE_MODEL from environment."""
-        with patch.dict(os.environ, {"GOOSE_MODEL": "custom-model"}):
-            assert _resolve_goose_model("openrouter") == "custom-model"
+        assert MODEL_REGISTRY[("goose", "openai", ModelRole.ISSUE_TRIAGE)] == "gpt-5.4"
 
-    def test_open_ended_provider_no_env_raises(self):
-        """Open-ended provider without GOOSE_MODEL raises RuntimeError."""
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("GOOSE_MODEL", None)
-            with pytest.raises(RuntimeError, match="No model configured"):
-                _resolve_goose_model("ollama")
+    def test_open_ended_provider_registry_lookup(self):
+        """Goose+ollama has a registry-shipped default that operators
+        override per-user via users.yaml `models.issue_triage`."""
+        from kai.config import MODEL_REGISTRY, ModelRole
+
+        assert MODEL_REGISTRY[("goose", "ollama", ModelRole.ISSUE_TRIAGE)] == "llama4:70b"
 
 
 # ── _parse_triage_json ──────────────────────────────────────────────

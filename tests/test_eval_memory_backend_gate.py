@@ -260,16 +260,16 @@ class TestMakeBackendConfig:
         assert config.memory_enabled is True
         assert config.memory_extraction_enabled is True
         # Registry resolution still produces the expected literals.
-        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "claude") == "claude-haiku-4-5-20251001"
-        assert get_model_for(ModelRole.MEMORY_EPISODE, "claude") == "claude-haiku-4-5-20251001"
+        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "claude", "anthropic") == "claude-haiku-4-5-20251001"
+        assert get_model_for(ModelRole.MEMORY_EPISODE, "claude", "anthropic") == "claude-haiku-4-5-20251001"
 
     def test_codex_resolves_codex_models(self):
         from kai.config import ModelRole, get_model_for
 
         config = g.make_backend_config(_BASE_CONFIG, "codex")
         assert config.agent_backend == "codex"
-        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex") == "gpt-5.4-mini"
-        assert get_model_for(ModelRole.MEMORY_EPISODE, "codex") == "gpt-5.4-mini"
+        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex", "openai") == "gpt-5.4-mini"
+        assert get_model_for(ModelRole.MEMORY_EPISODE, "codex", "openai") == "gpt-5.4-mini"
 
 
 # ── Anchor matching ─────────────────────────────────────────────────

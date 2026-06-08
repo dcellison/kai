@@ -2939,6 +2939,7 @@ class TestRunExtractorSystemPromptDefault:
                 candidate_metadata={},
                 user_id="test-user-default-kwarg",
                 effective_backend="claude",
+                effective_provider="anthropic",
             )
 
         asyncio.run(_run())
@@ -3263,6 +3264,7 @@ class TestValidateEpisodeIntegration:
             session_id="s-1",
             config=_cfg(),
             effective_backend="claude",
+            effective_provider="anthropic",
         )
 
         assert captured["outcome"] == "validate_rejected"
@@ -3314,6 +3316,7 @@ class TestValidateEpisodeIntegration:
             session_id="s-1",
             config=_cfg(),
             effective_backend="claude",
+            effective_provider="anthropic",
         )
 
         assert captured["outcome"] == "stored"
@@ -3377,6 +3380,7 @@ class TestValidateEpisodeIntegration:
             session_id="s-1",
             config=_cfg(),
             effective_backend="claude",
+            effective_provider="anthropic",
         )
 
         assert captured_metadata.get("speaker") == "episode_summary"
@@ -3587,6 +3591,7 @@ class TestRunExtractorViaReasoner:
                 candidate_metadata={},
                 user_id="u1",
                 effective_backend="claude",
+                effective_provider="anthropic",
             )
 
         assert result.facts == []
@@ -3611,6 +3616,7 @@ class TestRunExtractorViaReasoner:
                 candidate_metadata={},
                 user_id="u1",
                 effective_backend="claude",
+                effective_provider="anthropic",
             )
 
         assert result.facts == []
@@ -3635,6 +3641,7 @@ class TestRunExtractorViaReasoner:
                 candidate_metadata={},
                 user_id="u1",
                 effective_backend="claude",
+                effective_provider="anthropic",
             )
 
         assert result.facts == []
@@ -3711,6 +3718,7 @@ class TestRunExtractorWithCodexEnvelope:
                 candidate_metadata={},
                 user_id="u1",
                 effective_backend="codex",
+                effective_provider="openai",
             )
 
         assert result.facts == []
@@ -3740,6 +3748,7 @@ class TestRunExtractorWithCodexEnvelope:
                 candidate_metadata={},
                 user_id="u1",
                 effective_backend="codex",
+                effective_provider="openai",
             )
 
         assert result.facts == []

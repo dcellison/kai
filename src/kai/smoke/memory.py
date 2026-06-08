@@ -39,6 +39,7 @@ from kai.memory_extraction import (
     _FACT_SCHEMA,
     _build_memory_reasoner,
     _resolve_effective_backend,
+    _resolve_effective_provider,
 )
 from kai.oneshot import OneShotError
 
@@ -108,6 +109,7 @@ async def _run(user_id: str | None, os_user: str | None) -> int:
     # the same way), so reuse it directly.
     resolved_user_id = user_id if user_id is not None else "smoke"
     effective_backend = _resolve_effective_backend(resolved_user_id, config)
+    effective_provider = _resolve_effective_provider(resolved_user_id, config)
     if effective_backend not in ONESHOT_REASONER_BACKENDS:
         eligible = ", ".join(sorted(ONESHOT_REASONER_BACKENDS))
         sys.stderr.write(
@@ -117,9 +119,10 @@ async def _run(user_id: str | None, os_user: str | None) -> int:
         )
         return 1
 
-    extraction_model = get_model_for(ModelRole.MEMORY_EXTRACTION, effective_backend)
-    episode_model = get_model_for(ModelRole.MEMORY_EPISODE, effective_backend)
+    extraction_model = get_model_for(ModelRole.MEMORY_EXTRACTION, effective_backend, effective_provider)
+    episode_model = get_model_for(ModelRole.MEMORY_EPISODE, effective_backend, effective_provider)
     print(f"backend: {effective_backend}")
+    print(f"provider: {effective_provider}")
     print(f"extraction model: {extraction_model}")
     print(f"episode model: {episode_model}")
     print(f"user_id: {user_id or '(none; using global agent_backend)'}")

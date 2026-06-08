@@ -1684,8 +1684,8 @@ class TestMemoryReasonerModelResolution:
         # call site (memory_extraction.py), so the test reads the
         # registry directly to pin the per-backend default.
         load_config()
-        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "claude") == "claude-haiku-4-5-20251001"
-        assert get_model_for(ModelRole.MEMORY_EPISODE, "claude") == "claude-haiku-4-5-20251001"
+        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "claude", "anthropic") == "claude-haiku-4-5-20251001"
+        assert get_model_for(ModelRole.MEMORY_EPISODE, "claude", "anthropic") == "claude-haiku-4-5-20251001"
 
     def test_codex_default_resolves_to_codex_model(self, monkeypatch):
         """Codex install: registry resolves to a codex-CLI-valid SKU.
@@ -1701,8 +1701,8 @@ class TestMemoryReasonerModelResolution:
         monkeypatch.setenv("AGENT_BACKEND", "codex")
         monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
         load_config()
-        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex") == "gpt-5.4-mini"
-        assert get_model_for(ModelRole.MEMORY_EPISODE, "codex") == "gpt-5.4-mini"
+        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex", "openai") == "gpt-5.4-mini"
+        assert get_model_for(ModelRole.MEMORY_EPISODE, "codex", "openai") == "gpt-5.4-mini"
 
     def test_legacy_extraction_model_env_var_is_ignored(self, monkeypatch, caplog):
         """The retired MEMORY_EXTRACTION_MODEL env var no longer has
@@ -1717,7 +1717,7 @@ class TestMemoryReasonerModelResolution:
         # Field is gone; the value is dropped after the warning.
         assert not hasattr(config, "memory_extraction_model")
         # Registry resolution is untouched.
-        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "claude") == "claude-haiku-4-5-20251001"
+        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "claude", "anthropic") == "claude-haiku-4-5-20251001"
         assert any("MEMORY_EXTRACTION_MODEL is deprecated" in r.message for r in caplog.records)
 
     def test_legacy_episode_model_env_var_is_ignored(self, monkeypatch, caplog):
@@ -1727,7 +1727,7 @@ class TestMemoryReasonerModelResolution:
         with caplog.at_level("WARNING", logger="kai.config"):
             config = load_config()
         assert not hasattr(config, "memory_episode_model")
-        assert get_model_for(ModelRole.MEMORY_EPISODE, "claude") == "claude-haiku-4-5-20251001"
+        assert get_model_for(ModelRole.MEMORY_EPISODE, "claude", "anthropic") == "claude-haiku-4-5-20251001"
         assert any("MEMORY_EPISODE_MODEL is deprecated" in r.message for r in caplog.records)
 
 
@@ -1846,7 +1846,7 @@ class TestRegistryValidationPerEligibleBackend:
         monkeypatch.setenv("MEMORY_EXTRACTION_ENABLED", "true")
         # Patch the registry to drop the codex MEMORY_EXTRACTION row.
         patched_registry = dict(config_mod.MODEL_REGISTRY)
-        patched_registry.pop(("codex", ModelRole.MEMORY_EXTRACTION), None)
+        patched_registry.pop(("codex", "openai", ModelRole.MEMORY_EXTRACTION), None)
         monkeypatch.setattr("kai.config.MODEL_REGISTRY", patched_registry)
         with pytest.raises(SystemExit):
             load_config()
@@ -2255,12 +2255,12 @@ class TestModelRegistry:
 
     def test_lookup_returns_registry_value_when_no_override(self):
         """Default path: empty override returns the registry value."""
-        result = get_model_for(ModelRole.PR_REVIEW, "claude")
+        result = get_model_for(ModelRole.PR_REVIEW, "claude", "anthropic")
         assert result == "sonnet"
 
     def test_override_wins_over_registry(self):
         """A truthy override short-circuits the registry lookup."""
-        result = get_model_for(ModelRole.PR_REVIEW, "claude", override="opus")
+        result = get_model_for(ModelRole.PR_REVIEW, "claude", "anthropic", override="opus")
         assert result == "opus"
 
     def test_empty_override_falls_through(self):
@@ -2272,7 +2272,7 @@ class TestModelRegistry:
         the registry takes over. If empty short-circuited the registry,
         the codex behavioral path would never reach the gpt-5.4-nano row.
         """
-        result = get_model_for(ModelRole.PR_REVIEW, "claude", override="")
+        result = get_model_for(ModelRole.PR_REVIEW, "claude", "anthropic", override="")
         assert result == "sonnet"
 
     def test_missing_row_raises_lookup_error(self):
@@ -2285,15 +2285,15 @@ class TestModelRegistry:
         failure if it does.
         """
         with pytest.raises(LookupError, match="No registry entry"):
-            get_model_for(ModelRole.PR_REVIEW, "no-such-backend")
+            get_model_for(ModelRole.PR_REVIEW, "no-such-backend", "anthropic")
 
     def test_completeness_check_passes_for_claude(self):
         """Claude has rows for every role; no exception."""
-        _check_model_registry_complete("claude")  # no raise
+        _check_model_registry_complete()  # no raise
 
     def test_completeness_check_passes_for_codex(self):
         """Codex has rows for every role; no exception."""
-        _check_model_registry_complete("codex")  # no raise
+        _check_model_registry_complete()  # no raise
 
     def test_completeness_check_skips_goose(self):
         """
@@ -2302,7 +2302,7 @@ class TestModelRegistry:
         check skips goose explicitly so a goose-backed install does
         not fail at startup just because the registry has no goose rows.
         """
-        _check_model_registry_complete("goose")  # no raise
+        _check_model_registry_complete()  # no raise
 
     def test_completeness_check_raises_on_missing_row(self, monkeypatch):
         """
@@ -2311,9 +2311,9 @@ class TestModelRegistry:
         with a clear message. Uses monkeypatch.delitem so the change
         is reverted between tests.
         """
-        monkeypatch.delitem(MODEL_REGISTRY, ("claude", ModelRole.PR_REVIEW))
+        monkeypatch.delitem(MODEL_REGISTRY, ("claude", "anthropic", ModelRole.PR_REVIEW))
         with pytest.raises(SystemExit) as excinfo:
-            _check_model_registry_complete("claude")
+            _check_model_registry_complete()
         assert "pr_review" in str(excinfo.value)
         assert "claude" in str(excinfo.value)
 
@@ -2327,9 +2327,9 @@ class TestModelRegistry:
         accepts it for goose, and the codex behavioral path would fall
         over at first invocation.
         """
-        monkeypatch.setitem(MODEL_REGISTRY, ("codex", ModelRole.BEHAVIORAL_JUDGE), "gpt-5.4-nano")
+        monkeypatch.setitem(MODEL_REGISTRY, ("codex", "openai", ModelRole.BEHAVIORAL_JUDGE), "gpt-5.4-nano")
         with pytest.raises(SystemExit) as excinfo:
-            _check_model_registry_complete("codex")
+            _check_model_registry_complete()
         msg = str(excinfo.value)
         assert "gpt-5.4-nano" in msg
         assert "behavioral_judge" in msg
@@ -2345,13 +2345,13 @@ class TestModelRegistry:
         """
         from kai.config import CODEX_MODELS
 
-        assert MODEL_REGISTRY[("codex", ModelRole.BEHAVIORAL_JUDGE)] in CODEX_MODELS
+        assert MODEL_REGISTRY[("codex", "openai", ModelRole.BEHAVIORAL_JUDGE)] in CODEX_MODELS
 
     def test_completeness_check_passes_for_opencode(self):
         """OpenCode has rows for every role; no exception. Mirrors
         the claude and codex completeness gates so a future role
         addition without an opencode row fails fast at startup."""
-        _check_model_registry_complete("opencode")  # no raise
+        _check_model_registry_complete()  # no raise
 
     def test_opencode_row_must_be_provider_slash_model_shape(self, monkeypatch):
         """
@@ -2363,9 +2363,9 @@ class TestModelRegistry:
         opencode handshake rejects it as an unknown provider/model,
         with no Kai-side pointer back to the registry typo.
         """
-        monkeypatch.setitem(MODEL_REGISTRY, ("opencode", ModelRole.BEHAVIORAL_JUDGE), "sonnet")
+        monkeypatch.setitem(MODEL_REGISTRY, ("opencode", "anthropic", ModelRole.BEHAVIORAL_JUDGE), "sonnet")
         with pytest.raises(SystemExit) as excinfo:
-            _check_model_registry_complete("opencode")
+            _check_model_registry_complete()
         msg = str(excinfo.value)
         assert "provider/model" in msg
         assert "behavioral_judge" in msg
@@ -2378,11 +2378,14 @@ class TestModelRegistry:
         are what operators edit when calibrating, and a regression
         here is the failure the synthetic test simulates.
         """
-        from kai.config import is_opencode_model_shape
+        from kai.config import BACKEND_PROVIDERS, is_opencode_model_shape
 
-        for role in ModelRole:
-            value = MODEL_REGISTRY[("opencode", role)]
-            assert is_opencode_model_shape(value), f"opencode {role.value}={value!r} is not provider/model"
+        for provider in BACKEND_PROVIDERS["opencode"]:
+            for role in ModelRole:
+                value = MODEL_REGISTRY[("opencode", provider, role)]
+                assert is_opencode_model_shape(value), (
+                    f"opencode/{provider} {role.value}={value!r} is not provider/model"
+                )
 
     def test_completeness_check_raises_on_missing_opencode_row(self, monkeypatch):
         """
@@ -2391,9 +2394,9 @@ class TestModelRegistry:
         the claude test above so the completeness gate's per-backend
         symmetry stays pinned.
         """
-        monkeypatch.delitem(MODEL_REGISTRY, ("opencode", ModelRole.PR_REVIEW))
+        monkeypatch.delitem(MODEL_REGISTRY, ("opencode", "anthropic", ModelRole.PR_REVIEW))
         with pytest.raises(SystemExit) as excinfo:
-            _check_model_registry_complete("opencode")
+            _check_model_registry_complete()
         assert "pr_review" in str(excinfo.value)
         assert "opencode" in str(excinfo.value)
 
@@ -2401,11 +2404,11 @@ class TestModelRegistry:
 
     def test_claude_pr_review_row_matches_prior_constant(self):
         """review.py used _REVIEW_MODEL = "sonnet" pre-Phase-1."""
-        assert get_model_for(ModelRole.PR_REVIEW, "claude") == "sonnet"
+        assert get_model_for(ModelRole.PR_REVIEW, "claude", "anthropic") == "sonnet"
 
     def test_claude_issue_triage_row_matches_prior_constant(self):
         """triage.py used _TRIAGE_MODEL = "sonnet" pre-Phase-1."""
-        assert get_model_for(ModelRole.ISSUE_TRIAGE, "claude") == "sonnet"
+        assert get_model_for(ModelRole.ISSUE_TRIAGE, "claude", "anthropic") == "sonnet"
 
     def test_claude_behavioral_judge_row_matches_prior_constant(self):
         """
@@ -2418,13 +2421,13 @@ class TestModelRegistry:
         """
         from kai.eval.behavioral import _DEFAULT_JUDGE_MODEL
 
-        assert get_model_for(ModelRole.BEHAVIORAL_JUDGE, "claude") == _DEFAULT_JUDGE_MODEL
+        assert get_model_for(ModelRole.BEHAVIORAL_JUDGE, "claude", "anthropic") == _DEFAULT_JUDGE_MODEL
 
     def test_claude_behavioral_gen_row_matches_prior_constant(self):
         """eval/behavioral.py used _DEFAULT_GEN_MODEL = "sonnet" pre-Phase-1."""
         from kai.eval.behavioral import _DEFAULT_GEN_MODEL
 
-        assert get_model_for(ModelRole.BEHAVIORAL_GEN, "claude") == _DEFAULT_GEN_MODEL
+        assert get_model_for(ModelRole.BEHAVIORAL_GEN, "claude", "anthropic") == _DEFAULT_GEN_MODEL
 
 
 # ── Codex wizard hardening: backend-aware model validation ───────────
@@ -2521,14 +2524,20 @@ class TestValidateModelForBackend:
         assert validate_model_for_backend("haiku", "opencode", "anthropic") is False
 
     def test_opencode_rejects_malformed_shapes(self):
-        """Empty segments, missing separator, and extra separators all fail."""
+        """Empty segments and missing separators fail; multi-slash
+        nesting (openrouter-style `openrouter/anthropic/claude-...`)
+        is now accepted because opencode's provider layer parses any
+        non-empty path-prefix shape."""
         from kai.config import validate_model_for_backend
 
         assert validate_model_for_backend("", "opencode", "") is False
         assert validate_model_for_backend("/foo", "opencode", "") is False
         assert validate_model_for_backend("foo/", "opencode", "") is False
         assert validate_model_for_backend("foo//bar", "opencode", "") is False
-        assert validate_model_for_backend("foo/bar/baz", "opencode", "") is False
+        # Multi-segment shape with all non-empty segments is valid;
+        # opencode parses provider/<rest>.
+        assert validate_model_for_backend("foo/bar/baz", "opencode", "") is True
+        assert validate_model_for_backend("openrouter/anthropic/claude-sonnet-4-5", "opencode", "") is True
         assert validate_model_for_backend("/", "opencode", "") is False
 
 
@@ -2572,11 +2581,21 @@ class TestValidBackends:
 
         assert sorted(VALID_BACKENDS) == ["claude", "codex", "goose", "opencode"]
 
-    def test_opencode_not_in_valid_providers(self):
-        """OpenCode auth lives in opencode-cli config; no provider/API-key wizard prompt fires."""
-        from kai.config import VALID_PROVIDERS
+    def test_opencode_provider_prompt_gate(self):
+        """OpenCode joins BACKENDS_NEEDING_PROVIDER_PROMPT (it talks
+        to multiple providers and needs the operator to name one for
+        the (backend, provider, role) registry lookup). The API-key
+        sub-prompt is suppressed for opencode in install.py because
+        opencode auth is managed by `opencode auth login`, not by
+        Kai."""
+        from kai.config import BACKEND_PROVIDERS, BACKENDS_NEEDING_PROVIDER_PROMPT
 
-        assert "opencode" not in VALID_PROVIDERS
+        assert "opencode" in BACKEND_PROVIDERS
+        assert "opencode" in BACKENDS_NEEDING_PROVIDER_PROMPT
+        # Single-provider backends are absent from the prompt gate so
+        # their provider stays implicit.
+        assert "claude" not in BACKENDS_NEEDING_PROVIDER_PROMPT
+        assert "codex" not in BACKENDS_NEEDING_PROVIDER_PROMPT
 
 
 class TestGetUserBackendAndProvider:
@@ -3305,3 +3324,199 @@ class TestNoAdHocOneShotBackendTuples:
         assert not offenders, (
             f"Found ad-hoc claude/codex tuples; use ONESHOT_REASONER_BACKENDS instead. Offending sites: {offenders}"
         )
+
+
+class TestBackendProviders:
+    """`BACKEND_PROVIDERS` is the single authoritative (backend, provider)
+    allowlist. `BACKENDS_NEEDING_PROVIDER_PROMPT` is derived from it
+    via the multiplicity filter so single-provider backends (claude,
+    codex) bypass the "requires provider" gates while multi-provider
+    backends (opencode, goose) exercise them.
+    """
+
+    def test_membership_contents(self):
+        from kai.config import BACKEND_PROVIDERS
+
+        assert set(BACKEND_PROVIDERS.keys()) == {"claude", "codex", "opencode", "goose"}
+        assert BACKEND_PROVIDERS["claude"] == ("anthropic",)
+        assert BACKEND_PROVIDERS["codex"] == ("openai",)
+        # Multi-provider backends include deepseek (new); openrouter and ollama
+        # are open-ended providers and live here too.
+        assert "deepseek" in BACKEND_PROVIDERS["opencode"]
+        assert "deepseek" in BACKEND_PROVIDERS["goose"]
+        assert "openrouter" in BACKEND_PROVIDERS["opencode"]
+
+    def test_strict_subset_of_valid_backends(self):
+        """Every backend listed in BACKEND_PROVIDERS must also be in
+        VALID_BACKENDS so the wizard's backend prompt accepts it."""
+        from kai.config import BACKEND_PROVIDERS, VALID_BACKENDS
+
+        assert set(BACKEND_PROVIDERS.keys()).issubset(VALID_BACKENDS)
+
+    def test_backends_needing_provider_prompt_is_derived(self):
+        """Derived set: single-provider backends absent; multi-provider
+        backends present. Pins the multiplicity-driven shape."""
+        from kai.config import BACKEND_PROVIDERS, BACKENDS_NEEDING_PROVIDER_PROMPT
+
+        for backend, providers in BACKEND_PROVIDERS.items():
+            if len(providers) > 1:
+                assert backend in BACKENDS_NEEDING_PROVIDER_PROMPT
+            else:
+                assert backend not in BACKENDS_NEEDING_PROVIDER_PROMPT
+
+
+class TestModelRegistryTripleKey:
+    """The (backend, provider, role) triple-key registry is built
+    mechanically from `_TIER_BY_ROLE` and `_BACKEND_PROVIDER_TIER_MODELS`.
+    Every (backend, provider) pair in BACKEND_PROVIDERS has a row for
+    every ModelRole; the completeness check runs at load_config time.
+    """
+
+    def test_keys_are_three_tuples(self):
+        """Every key is a 3-tuple (backend, provider, ModelRole)."""
+        for key in MODEL_REGISTRY:
+            assert isinstance(key, tuple)
+            assert len(key) == 3
+            backend, provider, role = key
+            assert isinstance(backend, str)
+            assert isinstance(provider, str)
+            assert isinstance(role, ModelRole)
+
+    def test_every_backend_provider_pair_has_every_role(self):
+        """Completeness invariant: BACKEND_PROVIDERS x ModelRole all
+        present in MODEL_REGISTRY. A missing triple at runtime would
+        surface as a per-request LookupError; the startup check ahead
+        of dispatch is what makes the runtime invariant safe."""
+        from kai.config import BACKEND_PROVIDERS
+
+        for backend, providers in BACKEND_PROVIDERS.items():
+            for provider in providers:
+                for role in ModelRole:
+                    assert (backend, provider, role) in MODEL_REGISTRY, (
+                        f"Missing registry row for ({backend}, {provider}, {role.value})"
+                    )
+
+    def test_canonical_rows_per_backend(self):
+        """Pin one representative row per backend so a future
+        _BACKEND_PROVIDER_TIER_MODELS tweak surfaces here in addition
+        to the larger acceptance loop above."""
+        assert MODEL_REGISTRY[("claude", "anthropic", ModelRole.PR_REVIEW)] == "sonnet"
+        assert MODEL_REGISTRY[("codex", "openai", ModelRole.PR_REVIEW)] == "gpt-5.4-mini"
+        assert MODEL_REGISTRY[("opencode", "deepseek", ModelRole.PR_REVIEW)] == "deepseek/deepseek-chat"
+        assert MODEL_REGISTRY[("goose", "anthropic", ModelRole.PR_REVIEW)] == "claude-sonnet-4-6"
+
+    def test_codex_rows_are_in_codex_models(self):
+        """The completeness check enforces this at startup; pinning
+        it independently catches drift between CODEX_MODELS and the
+        tier map without needing to trigger load_config."""
+        from kai.config import CODEX_MODELS
+
+        for role in ModelRole:
+            value = MODEL_REGISTRY[("codex", "openai", role)]
+            assert value in CODEX_MODELS, f"codex {role.value}={value} is not in CODEX_MODELS"
+
+
+class TestUserConfigModelsField:
+    """`UserConfig.models` is the per-user per-role override map; back-
+    compat synthesizes `models["agent"]` from the legacy `model:` field
+    so existing users.yaml files load unchanged."""
+
+    def test_field_default_is_none(self):
+        from kai.config import UserConfig
+
+        uc = UserConfig(telegram_id=1, name="test")
+        assert uc.models is None
+
+    def test_models_field_accepts_per_role_dict(self):
+        from kai.config import UserConfig
+
+        uc = UserConfig(
+            telegram_id=1,
+            name="test",
+            models={"pr_review": "deepseek/deepseek-coder", "agent": "sonnet"},
+        )
+        assert uc.models == {"pr_review": "deepseek/deepseek-coder", "agent": "sonnet"}
+
+
+class TestResolveUserModel:
+    """`resolve_user_model` enforces the per-role precedence chain:
+    user_config.models > config.default_models > MODEL_REGISTRY."""
+
+    def _config(self, default_models=None):
+        cfg = MagicMock()
+        cfg.agent_backend = "claude"
+        cfg.llm_provider = ""
+        cfg.default_models = default_models or {}
+        return cfg
+
+    def test_falls_back_to_registry_when_no_overrides(self):
+        from kai.config import resolve_user_model
+
+        result = resolve_user_model(ModelRole.PR_REVIEW, None, self._config())
+        assert result == "sonnet"
+
+    def test_user_override_wins(self):
+        from kai.config import UserConfig, resolve_user_model
+
+        uc = UserConfig(telegram_id=1, name="test", models={"pr_review": "opus"})
+        result = resolve_user_model(ModelRole.PR_REVIEW, uc, self._config())
+        assert result == "opus"
+
+    def test_global_default_models_wins_over_registry(self):
+        from kai.config import resolve_user_model
+
+        cfg = self._config(default_models={"pr_review": "claude-haiku-4-5-20251001"})
+        result = resolve_user_model(ModelRole.PR_REVIEW, None, cfg)
+        assert result == "claude-haiku-4-5-20251001"
+
+    def test_user_override_wins_over_global_default(self):
+        from kai.config import UserConfig, resolve_user_model
+
+        uc = UserConfig(telegram_id=1, name="test", models={"pr_review": "opus"})
+        cfg = self._config(default_models={"pr_review": "claude-haiku-4-5-20251001"})
+        result = resolve_user_model(ModelRole.PR_REVIEW, uc, cfg)
+        assert result == "opus"
+
+
+class TestLegacyEnvOverrideSeeding:
+    """`_apply_legacy_model_env_overrides` reads
+    PR_REVIEW_MODEL_<BACKEND> / ISSUE_TRIAGE_MODEL_<BACKEND> from the
+    process env at load_config time and seeds UserConfig.models. The
+    user's own `models:` map wins over the env-var seed."""
+
+    def test_seeds_pr_review_from_env(self, monkeypatch):
+        from kai.config import UserConfig, _apply_legacy_model_env_overrides
+
+        monkeypatch.setenv("PR_REVIEW_MODEL_CLAUDE", "opus")
+        uc = UserConfig(telegram_id=1, name="test")
+        out = _apply_legacy_model_env_overrides({1: uc}, "claude")
+        assert out[1].models == {"pr_review": "opus"}
+
+    def test_user_own_map_wins_over_env(self, monkeypatch):
+        from kai.config import UserConfig, _apply_legacy_model_env_overrides
+
+        monkeypatch.setenv("PR_REVIEW_MODEL_CLAUDE", "opus")
+        uc = UserConfig(telegram_id=1, name="test", models={"pr_review": "haiku"})
+        out = _apply_legacy_model_env_overrides({1: uc}, "claude")
+        # User's explicit value untouched.
+        assert out[1].models == {"pr_review": "haiku"}
+
+    def test_seeds_only_matching_backend_suffix(self, monkeypatch):
+        """A user on the codex backend should NOT pick up
+        PR_REVIEW_MODEL_CLAUDE; the suffix gates per-user scope."""
+        from kai.config import UserConfig, _apply_legacy_model_env_overrides
+
+        monkeypatch.setenv("PR_REVIEW_MODEL_CLAUDE", "opus")
+        uc = UserConfig(telegram_id=1, name="test", agent_backend="codex")
+        out = _apply_legacy_model_env_overrides({1: uc}, "claude")
+        assert out[1].models is None
+
+    def test_no_env_no_change(self, monkeypatch):
+        """When no env override applies, the dict shape is preserved."""
+        from kai.config import UserConfig, _apply_legacy_model_env_overrides
+
+        monkeypatch.delenv("PR_REVIEW_MODEL_CLAUDE", raising=False)
+        monkeypatch.delenv("ISSUE_TRIAGE_MODEL_CLAUDE", raising=False)
+        uc = UserConfig(telegram_id=1, name="test")
+        out = _apply_legacy_model_env_overrides({1: uc}, "claude")
+        assert out[1].models is None

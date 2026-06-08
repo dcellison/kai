@@ -1133,6 +1133,7 @@ class TestCmdConfig:
                 "polling",  # transport
                 "claude",  # agent backend
                 "sonnet",  # model
+                "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
                 "10.0",  # budget
                 "200000",  # max context window
@@ -1210,6 +1211,7 @@ class TestCmdConfig:
                 "polling",  # transport
                 "claude",  # agent backend
                 "sonnet",  # model
+                "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
                 "10.0",  # budget
                 "200000",  # max context window
@@ -1292,6 +1294,7 @@ class TestCmdConfig:
                 "polling",  # transport
                 "claude",  # agent backend
                 "sonnet",  # model
+                "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
                 "10.0",  # budget
                 "200000",  # max context window
@@ -1361,6 +1364,7 @@ class TestCmdConfig:
                 "polling",
                 "claude",
                 "sonnet",
+                "false",  # customize per-role models (decline; use registry defaults)
                 "120",
                 "10.0",
                 "200000",
@@ -1422,6 +1426,7 @@ class TestCmdConfig:
                 "anthropic",  # goose provider
                 "sk-ant-test-key",  # ANTHROPIC_API_KEY
                 "sonnet",  # model
+                "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
                 "10.0",  # budget
                 "200000",  # max context window
@@ -1478,6 +1483,7 @@ class TestCmdConfig:
                 "goose",  # agent backend
                 "ollama",  # goose provider (no key needed)
                 "sonnet",  # model
+                "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
                 "10.0",  # budget
                 "200000",  # max context window
@@ -1655,6 +1661,7 @@ class TestCmdConfig:
             agent_backend,  # agent backend
             *backend_block,  # llm_provider + api_key (non-claude only)
             "sonnet",  # model
+            "false",  # customize per-role models (decline; use registry defaults)
             "120",  # timeout
             *budget_entry,  # BUDGET_CEILING (non-claude only)
             "200000",  # max context window
@@ -2102,6 +2109,7 @@ class TestCmdConfig:
                 "anthropic",  # goose provider
                 "sk-ant-test-key",  # API key
                 "sonnet",  # model
+                "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
                 "10.0",  # budget
                 "200000",  # max context window
@@ -2398,8 +2406,8 @@ class TestCmdConfig:
         # have a codex-valid row.
         from kai.config import CODEX_MODELS, ModelRole, get_model_for
 
-        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex") in CODEX_MODELS
-        assert get_model_for(ModelRole.MEMORY_EPISODE, "codex") in CODEX_MODELS
+        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex", "openai") in CODEX_MODELS
+        assert get_model_for(ModelRole.MEMORY_EPISODE, "codex", "openai") in CODEX_MODELS
 
     def test_codex_fresh_install_with_memory_extraction_yields_valid_users_yaml(self, tmp_path, monkeypatch):
         """Fresh-install integration contract for codex memory.
@@ -2453,6 +2461,7 @@ class TestCmdConfig:
                 "subscription",  # codex auth mode
                 "/usr/local/bin/codex",  # codex binary path
                 # model: handled by _prompt_default_model mock
+                "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # agent timeout
                 "10.0",  # budget (codex != claude branch)
                 "200000",  # max context window
@@ -2817,6 +2826,7 @@ class TestCmdConfigDefaultModelDispatch:
             "polling",  # transport
             "claude",  # agent backend
             # model prompt is handled by the _prompt_default_model mock
+            "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout (global default)
             "200000",  # max context window (global default)
             "80",  # autocompact pct
@@ -2855,8 +2865,9 @@ class TestCmdConfigDefaultModelDispatch:
             "subscription",  # codex auth mode
             # No OPENAI_API_KEY prompt in subscription mode
             "/usr/local/bin/codex",  # codex binary path
-            # No llm_provider prompt (VALID_PROVIDERS["codex"] is None)
+            # No llm_provider prompt (codex is single-provider; absent from BACKENDS_NEEDING_PROVIDER_PROMPT)
             # Model prompt handled by the _prompt_default_model mock
+            "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout (global default)
             "10.0",  # BUDGET_CEILING (non-claude only)
             "200000",  # max context window (global default)
@@ -2889,6 +2900,7 @@ class TestCmdConfigDefaultModelDispatch:
             "openai",  # llm provider
             "openai-key",  # OPENAI_API_KEY
             # model prompt is handled by the _prompt_default_model mock
+            "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout (global default)
             "10.0",  # BUDGET_CEILING (non-claude only)
             "200000",  # max context window (global default)
@@ -6364,6 +6376,7 @@ class TestCmdConfigCanonicalUsersYaml:
             "polling",
             "claude",
             "sonnet",
+            "false",  # customize per-role models (decline)
             "120",
             "10.0",
             "200000",
@@ -6714,6 +6727,7 @@ class TestCmdConfigSingleUserMode:
             "polling",  # transport
             "claude",  # backend
             "sonnet",  # model
+            "false",  # customize per-role models (decline; use registry defaults)
             "120",  # timeout
             "200000",  # max_context_window
             "80",  # autocompact
@@ -7496,8 +7510,11 @@ class TestOpenCodeBinWizardPrompt:
             "false",  # advanced user options (no per-user os_user)
             "polling",  # transport
             "opencode",  # agent backend
-            opencode_bin_path,  # OPENCODE_BIN (NEW prompt this spec adds)
+            opencode_bin_path,  # OPENCODE_BIN
+            "anthropic",  # llm_provider (opencode joined BACKENDS_NEEDING_PROVIDER_PROMPT)
+            # API key prompt skipped for opencode (auth managed by `opencode auth login`).
             # model: handled by _prompt_default_model mock
+            "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout
             "10.0",  # budget (non-claude branch)
             "200000",  # max context window

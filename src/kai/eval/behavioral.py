@@ -2290,15 +2290,23 @@ async def _run_cli(args: argparse.Namespace) -> int:
     # byte-identical rather than crashing with a LookupError on an
     # unset flag.
     eval_backend = os.environ.get("AGENT_BACKEND", "claude").strip().lower()
+    # Provider is read from the eval-time LLM_PROVIDER env (the eval
+    # gate runs as a developer tool against the operator's configured
+    # backend / provider, not against a sandboxed user). Single-provider
+    # backends (claude, codex) ignore this value because their provider
+    # is implicit at runtime.
+    eval_provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
     if eval_backend in ONESHOT_REASONER_BACKENDS:
         resolved_judge_model = get_model_for(
             ModelRole.BEHAVIORAL_JUDGE,
             eval_backend,
+            eval_provider,
             override=args.judge_model or "",
         )
         resolved_gen_model = get_model_for(
             ModelRole.BEHAVIORAL_GEN,
             eval_backend,
+            eval_provider,
             override=args.gen_model or "",
         )
     else:

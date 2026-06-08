@@ -2,7 +2,7 @@
 # where tools are installed globally (no .venv).
 BIN = .venv/bin/
 
-.PHONY: run lint format check test setup config install install-status tts-model
+.PHONY: run lint format check test setup config install install-status tts-model refresh-models
 
 run:
 	$(BIN)python -m kai
@@ -32,6 +32,13 @@ install:
 
 install-status:
 	$(BIN)python -m kai install status
+
+# Refresh helper for PROVIDER_MODELS. Queries each curated provider's
+# /v1/models endpoint and prints a diff against the in-tree list;
+# operator hand-edits src/kai/config.py after review. Pass
+# `ARGS=--write-snippet` to emit a paste-able Python fragment.
+refresh-models:
+	$(BIN)python -m kai.refresh_models $(ARGS)
 
 models/ggml-base.en.bin:
 	mkdir -p models

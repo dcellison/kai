@@ -1192,11 +1192,19 @@ def init_memory(config: Config) -> None:
     # (MEMORY_ENABLED=true with extraction disabled) produce an empty
     # eligible set, so the resolver loop is a no-op and the map is
     # empty.
-    from kai.config import ModelRole, _compute_extraction_eligible_backends, get_model_for
-
-    eligible_backends: set[str] = _compute_extraction_eligible_backends(
-        config.agent_backend, config.user_configs, config.memory_extraction_enabled
+    from kai.config import (
+        ModelRole,
+        _compute_extraction_eligible_backend_provider_pairs,
+        get_model_for,
     )
+
+    eligible_pairs: set[tuple[str, str]] = _compute_extraction_eligible_backend_provider_pairs(
+        config.agent_backend,
+        config.llm_provider,
+        config.user_configs,
+        config.memory_extraction_enabled,
+    )
+    eligible_backends: set[str] = {backend for backend, _ in eligible_pairs}
     extraction_binaries: dict[str, str | None] = {}
     if eligible_backends:
         from kai.oneshot_binary import BinaryResolutionError, resolve_oneshot_binary
@@ -1237,12 +1245,32 @@ def init_memory(config: Config) -> None:
     # the actual model each backend will run, not an env var. Empty
     # eligible set (retrieval-only memory) leaves both maps empty
     # and the uniform/per-user mode keys unset.
-    extraction_models: dict[str, str] = {
-        backend: get_model_for(ModelRole.MEMORY_EXTRACTION, backend) for backend in sorted(eligible_backends)
+    # Per-backend resolution: when multiple providers are eligible for
+    # the same backend (rare; possible when multi-user installs route
+    # different users through different providers on opencode/goose),
+    # pick the alphabetically first provider's model for the legacy
+    # log-shape's backend-keyed entry. The per-pair detail is preserved
+    # via `extraction_pairs` / `episode_pairs` keyed by "backend/provider"
+    # so operators can still see every distinct registry hit.
+    def _pair_key(backend: str, provider: str) -> str:
+        return f"{backend}/{provider}" if provider else backend
+
+    extraction_pairs: dict[str, str] = {
+        _pair_key(backend, provider): get_model_for(ModelRole.MEMORY_EXTRACTION, backend, provider)
+        for backend, provider in sorted(eligible_pairs)
     }
-    episode_models: dict[str, str] = {
-        backend: get_model_for(ModelRole.MEMORY_EPISODE, backend) for backend in sorted(eligible_backends)
+    episode_pairs: dict[str, str] = {
+        _pair_key(backend, provider): get_model_for(ModelRole.MEMORY_EPISODE, backend, provider)
+        for backend, provider in sorted(eligible_pairs)
     }
+    extraction_models: dict[str, str] = {}
+    episode_models: dict[str, str] = {}
+    for backend, provider in sorted(eligible_pairs):
+        # First (alphabetically sorted) provider per backend wins for
+        # the legacy backend-keyed entry; downstream consumers reading
+        # extraction_models[backend] keep working.
+        extraction_models.setdefault(backend, get_model_for(ModelRole.MEMORY_EXTRACTION, backend, provider))
+        episode_models.setdefault(backend, get_model_for(ModelRole.MEMORY_EPISODE, backend, provider))
 
     # Uniform vs per-user log shape. Single-eligible-backend installs
     # keep the legacy `reasoner_backend` + `extraction_model` flat keys
@@ -1278,6 +1306,8 @@ def init_memory(config: Config) -> None:
                 "extraction_model": flat_model,
                 "extraction_models": extraction_models,
                 "episode_models": episode_models,
+                "extraction_pairs": extraction_pairs,
+                "episode_pairs": episode_pairs,
                 "extraction_binaries": extraction_binaries,
             }
         ),

@@ -715,6 +715,15 @@ async def _process_github_event_for_user(
     else:
         provider = config.llm_provider
 
+    # Per-role model overrides for review and triage. Resolved here so
+    # the user's `models:` map (and any load-time legacy env-var seed)
+    # wins over the MODEL_REGISTRY default; review.py / triage.py treat
+    # the empty string as "fall through to the registry default" via
+    # the model_override parameter on run_review / run_triage.
+    user_models = user_config.models if user_config and user_config.models else {}
+    pr_review_model_override = user_models.get("pr_review", "")
+    issue_triage_model_override = user_models.get("issue_triage", "")
+
     # ── PR review routing ────────────────────────────────────────
     # When PR review is enabled for this user, reviewable PR events
     # (opened, reopened, synchronize) are routed to the review pipeline
@@ -764,6 +773,7 @@ async def _process_github_event_for_user(
                     provider=provider,
                     timeout_s=request.app["pr_review_timeout_s"],
                     budget_usd=request.app["pr_review_budget_usd"],
+                    model_override=pr_review_model_override,
                 )
             )
             _background_tasks.add(task)
@@ -810,6 +820,7 @@ async def _process_github_event_for_user(
                     notify_chat_id=target_chat_id,
                     agent_backend=agent_backend,
                     provider=provider,
+                    model_override=issue_triage_model_override,
                 )
             )
             _background_tasks.add(task)

@@ -73,19 +73,40 @@ VALID_BACKENDS = {"claude", "goose", "codex", "opencode"}
 # one-shot-eligibility gates the goose backend cannot satisfy.
 ONESHOT_REASONER_BACKENDS: frozenset[str] = frozenset({"claude", "codex", "opencode"})
 
-# Valid LLM providers per backend. Claude always uses Anthropic
-# (hardcoded in get_effective_provider), so it has no entry here.
-# Backends that don't appear in this dict accept no provider config.
-# OpenCode is also absent: its model string is a full `provider/model`
-# ID (e.g. `anthropic/claude-sonnet-4-6`) that encodes the provider
-# inline, and auth is managed by the OpenCode CLI itself rather than
-# by Kai's wizard. The wizard therefore skips provider/API-key
-# prompts for opencode and asks for a free-text model instead.
-# NOTE: Backends in VALID_BACKENDS that should have a provider prompt
-# need a matching key here; missing entries silently skip the prompt.
-VALID_PROVIDERS: dict[str, frozenset[str]] = {
-    "goose": frozenset({"anthropic", "openai", "google", "openrouter", "ollama"}),
+# The single authoritative (backend, provider) allowlist. Every site
+# that needs to know "what providers can this backend talk to" reads
+# from this map. Claude and codex are 1:1 with one provider each;
+# opencode and goose are 1:N. load_config validates that every user's
+# (agent_backend, llm_provider) pair is a member. Adding a new
+# backend is one row here; adding a new provider to an existing
+# backend is one tuple element. Tuple values (not frozensets) so the
+# wizard offers providers in a stable, documented order; sorted
+# alphabetically to match how operator-facing error messages render
+# them.
+BACKEND_PROVIDERS: dict[str, tuple[str, ...]] = {
+    "claude": ("anthropic",),
+    "codex": ("openai",),
+    "opencode": ("anthropic", "deepseek", "google", "ollama", "openai", "openrouter"),
+    "goose": ("anthropic", "deepseek", "google", "ollama", "openai", "openrouter"),
 }
+
+# Backends whose runtime configuration requires the operator (or
+# users.yaml) to name a provider explicitly. Derived from the
+# multiplicity of BACKEND_PROVIDERS: a single-provider backend
+# (claude, codex) does not need a provider prompt because the choice
+# is unambiguous and the per-backend code path hardcodes the provider
+# (claude through get_effective_provider, codex always openai). A
+# multi-provider backend (opencode, goose) does need an explicit
+# provider so the (backend, provider, role) registry triple-key
+# lookup can find a row.
+#
+# Kept distinct from BACKEND_PROVIDERS so claude / codex stay out of
+# the "requires provider" gates that drive the wizard provider-prompt,
+# the per-user `llm_provider` validation in _load_user_configs, and
+# the global LLM_PROVIDER env-var validation in load_config. Membership
+# in BACKEND_PROVIDERS describes what is allowed; membership here
+# describes what is required.
+BACKENDS_NEEDING_PROVIDER_PROMPT: frozenset[str] = frozenset(b for b, ps in BACKEND_PROVIDERS.items() if len(ps) > 1)
 
 # Maps LLM provider to its API key environment variable name.
 # Backend-agnostic - the API key for Anthropic is the same env var
@@ -208,86 +229,124 @@ class ModelRole(StrEnum):
     MEMORY_EPISODE = "memory_episode"
 
 
-# Values are exactly what each backend's CLI accepts as --model.
-# Claude rows match today's inline constants verbatim so the registry
-# migration is no-behavior-change:
-# - triage.py _TRIAGE_MODEL = "sonnet"
-# - review.py _REVIEW_MODEL = "sonnet"
-# - eval/behavioral.py _DEFAULT_JUDGE_MODEL = "claude-haiku-4-5-20251001"
-# - eval/behavioral.py _DEFAULT_GEN_MODEL = "sonnet"
-# Codex rows reflect editorial tier mapping: nano for cheap high-volume
-# work (judge), mini for balanced default generation (gen, triage, review).
-# Goose entries are intentionally absent: goose's model identifier
-# depends on llm_provider (the _GOOSE_AGENT_MODELS dicts in triage.py /
-# review.py already encode that per-provider resolution), which would
-# need a third axis the registry does not carry today.
-MODEL_REGISTRY: dict[tuple[str, ModelRole], str] = {
-    ("claude", ModelRole.PR_REVIEW): "sonnet",
-    ("claude", ModelRole.ISSUE_TRIAGE): "sonnet",
-    ("claude", ModelRole.BEHAVIORAL_JUDGE): "claude-haiku-4-5-20251001",
-    ("claude", ModelRole.BEHAVIORAL_GEN): "sonnet",
-    ("codex", ModelRole.PR_REVIEW): "gpt-5.4-mini",
-    ("codex", ModelRole.ISSUE_TRIAGE): "gpt-5.4-mini",
-    # gpt-5.4-mini for the judge role: the closest analog to the
-    # claude haiku tier (small, fast, cheap). gpt-5.4-nano would have
-    # matched the editorial "cheaper than mini" intent but the codex
-    # CLI does not expose it, so it would fail at first behavioral
-    # eval. _check_model_registry_complete validates registry rows
-    # against CODEX_MODELS so future drift gets caught at startup.
-    ("codex", ModelRole.BEHAVIORAL_JUDGE): "gpt-5.4-mini",
-    ("codex", ModelRole.BEHAVIORAL_GEN): "gpt-5.4-mini",
-    # Memory extraction rows. Claude entries match the historical
-    # extraction default (claude-haiku-4-5-20251001), so any install
-    # that ran under the old MEMORY_EXTRACTION_MODEL=<empty> path
-    # sees identical model resolution post-migration. Codex entries
-    # pick the smallest currently-exposed codex model (gpt-5.4-mini)
-    # on the same editorial tier as Claude's haiku selection;
-    # _check_model_registry_complete validates codex rows against
-    # CODEX_MODELS at startup so a future SKU rename surfaces the
-    # bad row before runtime.
-    ("claude", ModelRole.MEMORY_EXTRACTION): "claude-haiku-4-5-20251001",
-    ("claude", ModelRole.MEMORY_EPISODE): "claude-haiku-4-5-20251001",
-    ("codex", ModelRole.MEMORY_EXTRACTION): "gpt-5.4-mini",
-    ("codex", ModelRole.MEMORY_EPISODE): "gpt-5.4-mini",
-    # OpenCode rows use the full `provider/model` shape opencode
-    # expects (validated structurally by is_opencode_model_shape).
-    # Defaults pick anthropic/* because the anthropic provider is the
-    # most-tested opencode auth path; Sonnet for reasoning-heavy roles
-    # (review, triage, behavioral gen), Haiku for cheaper memory work
-    # and the behavioral judge. Operators who authenticated a
-    # different provider via `opencode auth login` (deepseek, openai,
-    # openrouter, google) override these in-tree the same way codex
-    # operators override the codex registry. The shape gate in
-    # _check_model_registry_complete enforces the contract; the
-    # canonical model set is install-local and operator-managed so no
-    # CLI allow-list check applies here.
-    ("opencode", ModelRole.PR_REVIEW): "anthropic/claude-sonnet-4-5",
-    ("opencode", ModelRole.ISSUE_TRIAGE): "anthropic/claude-sonnet-4-5",
-    ("opencode", ModelRole.BEHAVIORAL_JUDGE): "anthropic/claude-haiku-4-5",
-    ("opencode", ModelRole.BEHAVIORAL_GEN): "anthropic/claude-sonnet-4-5",
-    ("opencode", ModelRole.MEMORY_EXTRACTION): "anthropic/claude-haiku-4-5",
-    ("opencode", ModelRole.MEMORY_EPISODE): "anthropic/claude-haiku-4-5",
+# Per-role tier assignment. Roles that need reasoning depth (PR
+# review, issue triage, behavioral gen) pick the "balanced" tier;
+# roles that need cheap high-volume throughput (memory extraction,
+# memory episode, behavioral judge) pick "cheap". Two tiers cover
+# every current role; adding a third (e.g. "strong" for deeper
+# reasoning) means one line here plus a per-(backend, provider)
+# tier-map entry in lockstep.
+_TIER_BY_ROLE: dict[ModelRole, str] = {
+    ModelRole.PR_REVIEW: "balanced",
+    ModelRole.ISSUE_TRIAGE: "balanced",
+    ModelRole.MEMORY_EXTRACTION: "cheap",
+    ModelRole.MEMORY_EPISODE: "cheap",
+    ModelRole.BEHAVIORAL_JUDGE: "cheap",
+    ModelRole.BEHAVIORAL_GEN: "balanced",
+}
+
+# Per-(backend, provider) tier-to-model map. Names are exactly what
+# each backend's CLI accepts as --model. The backend axis matters
+# because the same underlying model is named differently across
+# backends:
+#  - claude CLI takes anthropic aliases ("sonnet", "haiku")
+#  - codex CLI takes its own model identifiers ("gpt-5.4-mini")
+#  - opencode takes full "provider/model" strings, structurally
+#    validated by is_opencode_model_shape
+#  - goose takes the provider's native model name verbatim
+# Codex collapses "balanced" and "cheap" onto gpt-5.4-mini: the next
+# step down (gpt-5.4-nano) is not in CODEX_MODELS so a "cheap" =
+# "gpt-5.4-nano" entry would fail _check_model_registry_complete at
+# startup. Every (backend, provider) pair in BACKEND_PROVIDERS must
+# have a row here; _build_registry raises KeyError at module import
+# time on any missing pair.
+_BACKEND_PROVIDER_TIER_MODELS: dict[tuple[str, str], dict[str, str]] = {
+    ("claude", "anthropic"): {"balanced": "sonnet", "cheap": "claude-haiku-4-5-20251001"},
+    ("codex", "openai"): {"balanced": "gpt-5.4-mini", "cheap": "gpt-5.4-mini"},
+    ("opencode", "anthropic"): {"balanced": "anthropic/claude-sonnet-4-5", "cheap": "anthropic/claude-haiku-4-5"},
+    ("opencode", "openai"): {"balanced": "openai/gpt-5.4-mini", "cheap": "openai/gpt-5.4-mini"},
+    ("opencode", "deepseek"): {"balanced": "deepseek/deepseek-chat", "cheap": "deepseek/deepseek-chat"},
+    ("opencode", "google"): {"balanced": "google/gemini-3.1-pro", "cheap": "google/gemini-3-flash"},
+    # OpenRouter's "provider/model" shape nests under opencode's own
+    # "provider/model" prefix; the structural check accepts this
+    # because the outer slash is what matters to opencode.
+    ("opencode", "openrouter"): {
+        "balanced": "openrouter/anthropic/claude-sonnet-4-5",
+        "cheap": "openrouter/anthropic/claude-haiku-4-5",
+    },
+    ("opencode", "ollama"): {"balanced": "ollama/llama4:70b", "cheap": "ollama/llama4:8b"},
+    ("goose", "anthropic"): {"balanced": "claude-sonnet-4-6", "cheap": "claude-haiku-4-5"},
+    ("goose", "openai"): {"balanced": "gpt-5.4", "cheap": "gpt-5.4-mini"},
+    ("goose", "deepseek"): {"balanced": "deepseek-chat", "cheap": "deepseek-chat"},
+    ("goose", "google"): {"balanced": "gemini-3.1-pro", "cheap": "gemini-3-flash"},
+    ("goose", "openrouter"): {
+        "balanced": "openrouter/anthropic/claude-sonnet-4-5",
+        "cheap": "openrouter/anthropic/claude-haiku-4-5",
+    },
+    ("goose", "ollama"): {"balanced": "llama4:70b", "cheap": "llama4:8b"},
 }
 
 
-def get_model_for(role: ModelRole, backend: str, override: str = "") -> str:
+def _build_registry() -> dict[tuple[str, str, ModelRole], str]:
+    """Fan out the (backend, provider) tier maps over every ModelRole.
+
+    Raises KeyError at module import time if any (backend, provider)
+    pair in BACKEND_PROVIDERS lacks a tier map; the precise pair name
+    appears in the exception message so the maintainer can fix the
+    omission without grepping. This intentionally fails fast rather
+    than silently skipping, because a partial registry would
+    surface as a confusing per-request LookupError much later.
     """
-    Resolve the model identifier for a (role, backend) pair.
+    rows: dict[tuple[str, str, ModelRole], str] = {}
+    for backend, providers in BACKEND_PROVIDERS.items():
+        for provider in providers:
+            try:
+                tier_map = _BACKEND_PROVIDER_TIER_MODELS[(backend, provider)]
+            except KeyError:
+                raise KeyError(
+                    f"_BACKEND_PROVIDER_TIER_MODELS missing entry for "
+                    f"(backend={backend!r}, provider={provider!r}); update "
+                    f"src/kai/config.py to include this pair."
+                ) from None
+            for role, tier in _TIER_BY_ROLE.items():
+                rows[(backend, provider, role)] = tier_map[tier]
+    return rows
+
+
+# (backend, provider, role) -> model identifier passed to the
+# backend's CLI as --model. Built mechanically from the tier scheme
+# above so a new (backend, provider) pair extends the registry via
+# one row in _BACKEND_PROVIDER_TIER_MODELS plus one tuple element in
+# BACKEND_PROVIDERS.
+MODEL_REGISTRY: dict[tuple[str, str, ModelRole], str] = _build_registry()
+
+
+def get_model_for(role: ModelRole, backend: str, provider: str, override: str = "") -> str:
+    """
+    Resolve the model identifier for a (role, backend, provider) triple.
 
     Override precedence: if `override` is truthy, it wins (used by
-    per-role env vars like ISSUE_TRIAGE_MODEL_CODEX or by CLI flags
-    like --judge-model). Otherwise the registry value is returned.
+    CLI flags like --judge-model in the behavioral eval). Otherwise
+    the registry value for the exact triple is returned.
 
-    Raises LookupError on a missing (backend, role) row. Total in the
-    steady state because _check_model_registry_complete() runs at
-    startup and fails fast (SystemExit) if any role is missing for
-    the active backend. The runtime LookupError exists for defensive
-    parsing: a request-path bug should surface as a 5xx, not a
-    process-wide SystemExit.
+    For single-provider backends (claude, codex), an empty `provider`
+    string is resolved to the implicit provider (anthropic / openai)
+    via `get_effective_provider`. This lets callers that do not have
+    a provider in scope (e.g. eval-time globals) still hit the
+    registry without an explicit lookup; multi-provider backends
+    (opencode, goose) require an explicit non-empty provider because
+    the implicit value is undefined.
+
+    Raises LookupError on a missing (backend, provider, role) row.
+    Total in the steady state because _check_model_registry_complete()
+    runs at startup and fails fast (SystemExit) if any (backend,
+    provider) pair in BACKEND_PROVIDERS is missing a role.
 
     Args:
         role: The ModelRole the caller wants a model for.
-        backend: The active backend string ("claude" or "codex").
+        backend: The active backend string (one of VALID_BACKENDS).
+        provider: The effective provider string; empty falls back to
+            the backend's implicit provider on single-provider backends.
         override: Caller-supplied override string. Empty disables.
 
     Returns:
@@ -295,71 +354,75 @@ def get_model_for(role: ModelRole, backend: str, override: str = "") -> str:
     """
     if override:
         return override
+    effective_provider = provider or get_effective_provider(backend, provider)
     try:
-        return MODEL_REGISTRY[(backend, role)]
+        return MODEL_REGISTRY[(backend, effective_provider, role)]
     except KeyError:
-        raise LookupError(f"No registry entry for (backend={backend}, role={role.value})") from None
+        raise LookupError(
+            f"No registry entry for (backend={backend}, provider={effective_provider}, role={role.value})"
+        ) from None
 
 
-def _check_model_registry_complete(backend: str) -> None:
+def _check_model_registry_complete() -> None:
     """
-    Verify MODEL_REGISTRY has a row for every role the active backend uses,
-    AND that each codex / opencode row passes its backend's shape check.
+    Verify MODEL_REGISTRY has a row for every (backend, provider, role)
+    triple in BACKEND_PROVIDERS, AND that each codex / opencode row
+    passes its backend's shape check.
 
+    Self-driving: walks every (backend, provider) pair in
+    BACKEND_PROVIDERS rather than taking a single-backend argument.
     Runs once at load_config() time. Raises SystemExit on a missing or
-    invalid row so the bug surfaces at startup rather than at a per-
-    request LookupError (which would otherwise crash a single agent
-    invocation silently if a future role were added without its
-    registry rows, or with a backend-incompatible model).
+    invalid row so the bug surfaces at startup rather than at a
+    per-request LookupError.
 
-    Goose is exempt: goose-side model resolution lives in module-level
-    _GOOSE_AGENT_MODELS dicts that this registry does not subsume.
+    Every backend with a registry row gets validated, including
+    goose: goose folds into the unified triple-key registry, so a
+    missing goose row fails the same way a missing opencode row does.
     """
-    if backend not in ONESHOT_REASONER_BACKENDS:
-        return
-    missing = [role for role in ModelRole if (backend, role) not in MODEL_REGISTRY]
-    if missing:
-        names = ", ".join(role.value for role in missing)
-        raise SystemExit(
-            f"MODEL_REGISTRY is missing rows for backend '{backend}': {names}. Update MODEL_REGISTRY in config.py."
-        )
-    # Validate codex rows against the CLI's actual model surface so a
-    # future drift (operator updates CODEX_MODELS without touching
-    # MODEL_REGISTRY, or vice versa) fails fast at startup rather
-    # than at the first behavioral / triage / review run.
-    if backend == "codex":
-        invalid = [
-            (role, MODEL_REGISTRY[(backend, role)])
-            for role in ModelRole
-            if MODEL_REGISTRY[(backend, role)] not in CODEX_MODELS
-        ]
-        if invalid:
-            valid_list = ", ".join(sorted(CODEX_MODELS.keys()))
-            details = ", ".join(f"{role.value}={model}" for role, model in invalid)
-            raise SystemExit(
-                f"MODEL_REGISTRY has codex rows naming models the codex CLI does not expose: {details}. "
-                f"Valid codex models: {valid_list}. Update MODEL_REGISTRY in config.py."
-            )
-    # Validate opencode rows against the structural shape check.
-    # OpenCode has no canonical model allow-list (75+ providers via
-    # AI SDK / Models.dev resolved at runtime against the operator's
-    # `opencode auth login` state), so what is checkable upfront is
-    # the `provider/model` shape contract. A bare value like "sonnet"
-    # in the registry would persist through model resolution and fail
-    # at the opencode handshake with no Kai-side pointer; the shape
-    # check pins the contract at startup instead.
-    if backend == "opencode":
-        invalid = [
-            (role, MODEL_REGISTRY[(backend, role)])
-            for role in ModelRole
-            if not is_opencode_model_shape(MODEL_REGISTRY[(backend, role)])
-        ]
-        if invalid:
-            details = ", ".join(f"{role.value}={model}" for role, model in invalid)
-            raise SystemExit(
-                f"MODEL_REGISTRY has opencode rows that are not in `provider/model` shape: {details}. "
-                "Update MODEL_REGISTRY in config.py."
-            )
+    for backend, providers in BACKEND_PROVIDERS.items():
+        for provider in providers:
+            missing = [role for role in ModelRole if (backend, provider, role) not in MODEL_REGISTRY]
+            if missing:
+                names = ", ".join(role.value for role in missing)
+                raise SystemExit(
+                    f"MODEL_REGISTRY is missing rows for "
+                    f"(backend='{backend}', provider='{provider}'): {names}. "
+                    f"Update _BACKEND_PROVIDER_TIER_MODELS in config.py."
+                )
+            # Codex CLI model surface check. A future drift (operator
+            # updates CODEX_MODELS without touching the tier map, or
+            # vice versa) fails fast at startup.
+            if backend == "codex":
+                invalid_codex = [
+                    (role, MODEL_REGISTRY[(backend, provider, role)])
+                    for role in ModelRole
+                    if MODEL_REGISTRY[(backend, provider, role)] not in CODEX_MODELS
+                ]
+                if invalid_codex:
+                    valid_list = ", ".join(sorted(CODEX_MODELS.keys()))
+                    details = ", ".join(f"{role.value}={model}" for role, model in invalid_codex)
+                    raise SystemExit(
+                        f"MODEL_REGISTRY has codex rows naming models the codex CLI does not expose: "
+                        f"{details}. Valid codex models: {valid_list}. "
+                        f"Update _BACKEND_PROVIDER_TIER_MODELS in config.py."
+                    )
+            # OpenCode "provider/model" shape check. OpenCode has no
+            # canonical model allow-list (75+ providers via AI SDK /
+            # Models.dev resolved at runtime against the operator's
+            # `opencode auth login` state); what is checkable upfront
+            # is the shape contract.
+            if backend == "opencode":
+                invalid_opencode = [
+                    (role, MODEL_REGISTRY[(backend, provider, role)])
+                    for role in ModelRole
+                    if not is_opencode_model_shape(MODEL_REGISTRY[(backend, provider, role)])
+                ]
+                if invalid_opencode:
+                    details = ", ".join(f"{role.value}={model}" for role, model in invalid_opencode)
+                    raise SystemExit(
+                        f"MODEL_REGISTRY has opencode rows that are not in `provider/model` "
+                        f"shape: {details}. Update _BACKEND_PROVIDER_TIER_MODELS in config.py."
+                    )
 
 
 def get_effective_provider(backend: str, llm_provider: str) -> str:
@@ -412,8 +475,8 @@ def validate_model_for_provider(model: str, provider: str) -> bool:
     Returns True if the provider is open-ended (accepts any model)
     or if the model is in the provider's curated list. Unknown providers
     (not in PROVIDER_MODELS or OPEN_ENDED_PROVIDERS) are accepted with
-    a warning - this catches the case where VALID_PROVIDERS gains
-    a new entry but PROVIDER_MODELS was not updated to match.
+    a warning; this catches the case where BACKEND_PROVIDERS gains a
+    new entry but PROVIDER_MODELS was not updated to match.
 
     Backend-aware callers should use `validate_model_for_backend`. This
     function stays as the implementation goose / claude delegate to.
@@ -422,9 +485,9 @@ def validate_model_for_provider(model: str, provider: str) -> bool:
         return True
     models = PROVIDER_MODELS.get(provider)
     if models is None:
-        # Provider is valid (passed VALID_PROVIDERS check) but has
-        # no curated model list and is not explicitly open-ended. This
-        # is a programming oversight - log it so it's visible.
+        # Provider is in BACKEND_PROVIDERS but has no curated model
+        # list and is not explicitly open-ended. This is a programming
+        # oversight; log it so the gap is visible at runtime.
         if provider:
             log.warning(
                 "Provider '%s' has no entry in PROVIDER_MODELS or OPEN_ENDED_PROVIDERS; accepting model '%s' unchecked",
@@ -458,8 +521,16 @@ def is_opencode_model_shape(model: str) -> bool:
     """
     if not model:
         return False
+    # Split on every "/" and require at least two non-empty segments.
+    # The first segment is opencode's provider prefix; remaining
+    # segments form the model_id, which itself may contain slashes
+    # for openrouter-style nesting like
+    # "openrouter/anthropic/claude-sonnet-4-5". Empty segments
+    # (leading slash, trailing slash, or "foo//bar" double-slash)
+    # all fail because the opencode provider resolver expects every
+    # path segment to be non-empty.
     parts = model.split("/")
-    if len(parts) != 2:
+    if len(parts) < 2:
         return False
     return all(parts)
 
@@ -535,6 +606,38 @@ def get_user_backend_and_provider(user_config: "UserConfig | None", config: "Con
     else:
         provider = user_config.llm_provider if user_config and user_config.llm_provider else config.llm_provider
     return backend, provider
+
+
+def resolve_user_model(role: ModelRole, user_config: "UserConfig | None", config: "Config") -> str:
+    """Per-role model resolution with the per-user `models:` override.
+
+    Precedence (highest first):
+        1. user_config.models[role.value] when present (per-user from
+           users.yaml; also seeded from legacy PR_REVIEW_MODEL_* /
+           ISSUE_TRIAGE_MODEL_* env vars at load time)
+        2. config.default_models[role.value] when present (global from
+           DEFAULT_MODELS_JSON in /etc/kai/env; captured by the wizard)
+        3. MODEL_REGISTRY[(backend, provider, role)] (curated default)
+
+    The user's per-role override wins so an operator who sets
+    `models.pr_review: deepseek/deepseek-coder` for one user does not
+    inherit the install-wide value. The global default sits between
+    per-user and the registry so the wizard's per-role customization
+    applies across users who have not set their own override.
+    Single canonical resolver used by every per-user dispatch site;
+    callers that need a raw registry lookup (no user context) call
+    `get_model_for` directly.
+    """
+    backend, provider = get_user_backend_and_provider(user_config, config)
+    if user_config is not None and user_config.models:
+        override = user_config.models.get(role.value, "")
+        if override:
+            return override
+    if config.default_models:
+        global_override = config.default_models.get(role.value, "")
+        if global_override:
+            return global_override
+    return get_model_for(role, backend, provider)
 
 
 # Maximum context window size in tokens. Claude's hard ceiling.
@@ -720,6 +823,19 @@ class UserConfig:
     github_notify_chat_id: int | None = None
     pr_review: bool | None = None
     issue_triage: bool | None = None
+    # Per-role per-user model overrides loaded from users.yaml `models:`.
+    # Keys are role identifiers: "agent" for the conversational role
+    # plus every ModelRole.value ("pr_review", "issue_triage",
+    # "memory_extraction", "memory_episode", "behavioral_judge",
+    # "behavioral_gen"). Values are the model strings the user's
+    # backend's CLI accepts; same shape rules as the global
+    # MODEL_REGISTRY's (backend, provider, role) rows. Missing keys
+    # fall through to the registry default.
+    #
+    # Back-compat: a user with legacy `model:` set and no `models:`
+    # gets `models["agent"] = model_value` synthesized at load time
+    # so existing users.yaml files keep working unchanged.
+    models: dict[str, str] | None = None
 
 
 # ── Config dataclass ─────────────────────────────────────────────────
@@ -780,6 +896,13 @@ class Config:
 
     # Claude Code process configuration
     default_model: str = "sonnet"
+    # Global per-role model defaults. Parsed from DEFAULT_MODELS_JSON
+    # env var at load time as a JSON object: keys are role identifiers
+    # ("agent" plus every ModelRole.value), values are model strings.
+    # Sits between per-user UserConfig.models (highest precedence) and
+    # MODEL_REGISTRY[(backend, provider, role)] (lowest) in the
+    # resolution chain that `resolve_user_model` implements.
+    default_models: dict[str, str] = field(default_factory=dict)
     claude_timeout_seconds: int = 120
     budget_ceiling: float = 10.0
     claude_max_session_hours: float = 0  # 0 = no limit
@@ -1682,6 +1805,98 @@ def _compute_extraction_eligible_backends(
     return eligible
 
 
+def _apply_legacy_model_env_overrides(
+    user_configs: dict[int, "UserConfig"],
+    default_backend: str,
+) -> dict[int, "UserConfig"]:
+    """Seed UserConfig.models from the deprecated per-role env vars.
+
+    Reads PR_REVIEW_MODEL_<EFFECTIVE_BACKEND> and
+    ISSUE_TRIAGE_MODEL_<EFFECTIVE_BACKEND> from the process env for
+    each user. EFFECTIVE_BACKEND is the user's per-user override
+    (`uc.agent_backend`) or `default_backend` when the user has no
+    override. The resolution is inlined as a single fallback
+    expression rather than calling `get_user_backend_and_provider`,
+    because the full Config object is not yet built at this point in
+    `load_config` (this pass runs immediately after `_load_user_configs`,
+    before the Config constructor runs). Provider is not needed by
+    this function; only `backend` drives the env-var suffix.
+
+    Per-user `models:` entries always win over the env-var seed; only
+    roles absent from the user's own map get seeded.
+
+    Logs a one-shot deprecation warning the first time ANY user gets
+    a seed value applied; one log line per `load_config` call, not
+    per user. The warning names the env var, the role it seeds, and
+    points the operator at the users.yaml `models:` migration path.
+
+    Returns a new user_configs dict (UserConfig is a frozen dataclass;
+    `dataclasses.replace` is required to update the models field).
+    """
+    import dataclasses
+
+    warned = False
+    out: dict[int, UserConfig] = {}
+    for uid, uc in user_configs.items():
+        backend = uc.agent_backend or default_backend
+        existing_models = dict(uc.models or {})
+        for role_str, env_prefix in [
+            ("pr_review", "PR_REVIEW_MODEL"),
+            ("issue_triage", "ISSUE_TRIAGE_MODEL"),
+        ]:
+            if role_str in existing_models:
+                continue  # user's own map wins
+            env_value = os.environ.get(f"{env_prefix}_{backend.upper()}", "").strip()
+            if not env_value:
+                continue
+            existing_models[role_str] = env_value
+            if not warned:
+                log.warning(
+                    "%s_%s is deprecated; migrate the value into the "
+                    "user's `models.%s` field in users.yaml. The env "
+                    "var continues to work as a fallback for the "
+                    "current major version.",
+                    env_prefix,
+                    backend.upper(),
+                    role_str,
+                )
+                warned = True
+        out[uid] = dataclasses.replace(uc, models=existing_models or None)
+    return out
+
+
+def _compute_extraction_eligible_backend_provider_pairs(
+    agent_backend: str,
+    agent_provider: str,
+    user_configs: dict[int, UserConfig],
+    memory_extraction_enabled: bool,
+) -> set[tuple[str, str]]:
+    """
+    Return the set of distinct (effective_backend, effective_provider)
+    pairs across extraction-eligible users.
+
+    Same shape as `_compute_extraction_eligible_backends` but paired
+    with the user's effective provider so callers can look up per-role
+    models in the (backend, provider, role) MODEL_REGISTRY. Used by
+    `memory.config` startup logging to render each eligible pair's
+    extraction and episode model selection.
+    """
+    if not memory_extraction_enabled:
+        return set()
+    eligible: set[tuple[str, str]] = set()
+    for uc in user_configs.values():
+        eff_backend = uc.agent_backend or agent_backend
+        if eff_backend not in ONESHOT_REASONER_BACKENDS:
+            continue
+        eff_provider = uc.llm_provider or agent_provider
+        if eff_backend == "claude":
+            eff_provider = "anthropic"
+        elif eff_backend == "codex":
+            eff_provider = "openai"
+        eligible.add((eff_backend, eff_provider))
+    return eligible
+
+
 def _load_user_configs(
     global_backend: str,
     global_llm_provider: str,
@@ -1882,7 +2097,17 @@ def _load_user_configs(
             # Validate against the user's effective backend. If the user
             # has no explicit backend, validate against the global one.
             eff_backend_for_val = user_backend or global_backend
-            valid = VALID_PROVIDERS.get(eff_backend_for_val)
+            # Validate against BACKEND_PROVIDERS only when the backend
+            # requires a provider prompt. Single-provider backends
+            # (claude, codex) are absent from BACKENDS_NEEDING_PROVIDER_PROMPT,
+            # so a per-user llm_provider override on those backends is
+            # accepted without a curated-list check (the provider is
+            # implicit at runtime regardless of what users.yaml says).
+            valid: tuple[str, ...] | None = (
+                BACKEND_PROVIDERS.get(eff_backend_for_val)
+                if eff_backend_for_val in BACKENDS_NEEDING_PROVIDER_PROMPT
+                else None
+            )
             if valid is not None and provider_str not in valid:
                 raise SystemExit(
                     f"users.yaml: user '{name}' has invalid llm_provider "
@@ -1899,7 +2124,7 @@ def _load_user_configs(
 
         # If user's effective backend requires a provider but none can be
         # resolved (neither user-level nor global), that's a fatal config error.
-        if eff_backend in VALID_PROVIDERS and not eff_provider_str:
+        if eff_backend in BACKENDS_NEEDING_PROVIDER_PROMPT and not eff_provider_str:
             raise SystemExit(
                 f"users.yaml: user '{name}' has agent_backend='{eff_backend}' but no "
                 f"llm_provider is configured (set it in users.yaml or as "
@@ -2100,6 +2325,52 @@ def _load_user_configs(
                     raw_triage,
                 )
 
+        # Per-role per-user model overrides (`models:` sub-map). Keys
+        # are "agent" plus any ModelRole.value; values are model strings
+        # the user's backend's CLI accepts. Validation mirrors the
+        # legacy `model:` field's check via validate_model_for_backend.
+        # An invalid key or value raises SystemExit so the operator
+        # sees the precise failure at startup rather than at first
+        # dispatch.
+        user_models: dict[str, str] | None = None
+        raw_models = entry.get("models")
+        if raw_models is not None:
+            if not isinstance(raw_models, dict):
+                raise SystemExit(
+                    f"users.yaml: user '{name}' has `models` that is not a mapping; "
+                    f"expected a sub-map of role -> model string."
+                )
+            valid_role_keys = {"agent", *(r.value for r in ModelRole)}
+            checked: dict[str, str] = {}
+            for raw_key, raw_value in raw_models.items():
+                role_key = str(raw_key).strip().lower()
+                if role_key not in valid_role_keys:
+                    raise SystemExit(
+                        f"users.yaml: user '{name}' has models.{role_key!r} which is not "
+                        f"a recognized role; valid roles: {', '.join(sorted(valid_role_keys))}."
+                    )
+                value_str = str(raw_value).strip()
+                if not value_str:
+                    raise SystemExit(
+                        f"users.yaml: user '{name}' has models.{role_key} with an empty value; "
+                        f"remove the key or set a non-empty model string."
+                    )
+                if not validate_model_for_backend(value_str, eff_backend, eff_provider):
+                    raise SystemExit(
+                        f"users.yaml: user '{name}' has models.{role_key}={value_str!r} which is "
+                        f"not valid for (backend={eff_backend}, provider={eff_provider})."
+                    )
+                checked[role_key] = value_str
+            user_models = checked if checked else None
+
+        # Back-compat: if the operator only set the legacy `model:`
+        # field, synthesize `models["agent"] = model_value` so the
+        # in-memory shape matches users.yaml entries that use the
+        # `models:` map. The on-disk file is untouched; the next
+        # `make config` re-run writes the canonical shape.
+        if user_models is None and model is not None:
+            user_models = {"agent": model}
+
         configs[telegram_id] = UserConfig(
             telegram_id=telegram_id,
             name=name,
@@ -2119,6 +2390,7 @@ def _load_user_configs(
             github_notify_chat_id=github_notify_chat_id,
             pr_review=pr_review,
             issue_triage=issue_triage,
+            models=user_models,
         )
 
     if not configs:
@@ -2366,12 +2638,17 @@ def load_config() -> Config:
     # uses _GOOSE_AGENT_MODELS dicts, not the registry). Raises
     # SystemExit on a missing row so the bug surfaces at startup rather
     # than as a per-request LookupError.
-    _check_model_registry_complete(agent_backend)
+    _check_model_registry_complete()
 
     # LLM provider - validated against the backend's supported set.
-    # Only required for non-Claude backends.
+    # Single-provider backends (claude, codex) skip the prompt because
+    # their provider is implicit; multi-provider backends (opencode,
+    # goose) must name one so the (backend, provider, role) registry
+    # lookup can find a row.
     llm_provider = ""
-    valid_providers = VALID_PROVIDERS.get(agent_backend)
+    valid_providers: tuple[str, ...] | None = (
+        BACKEND_PROVIDERS.get(agent_backend) if agent_backend in BACKENDS_NEEDING_PROVIDER_PROMPT else None
+    )
     if valid_providers is not None:
         llm_provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
         if llm_provider not in valid_providers:
@@ -2437,6 +2714,11 @@ def load_config() -> Config:
         ("MEMORY_REASONER_BACKEND", "memory reasoner is now derived per-user from agent_backend"),
         ("MEMORY_EXTRACTION_MODEL", "memory extraction model is now resolved per-user from the MODEL_REGISTRY"),
         ("MEMORY_EPISODE_MODEL", "memory episode model is now resolved per-user from the MODEL_REGISTRY"),
+        (
+            "GOOSE_MODEL",
+            "goose model selection now flows through the (backend, provider, role) "
+            "MODEL_REGISTRY and per-user `models.agent` in users.yaml",
+        ),
     )
     for _legacy_key, _reason in _deprecated_memory_env:
         if os.environ.get(_legacy_key):
@@ -2576,6 +2858,14 @@ def load_config() -> Config:
     # path is always one of the two resolved defaults.
     users_yaml_path = _resolve_users_yaml_path(bool(protected_env))
     user_configs = _load_user_configs(agent_backend, llm_provider, users_yaml_path)
+    # Seed UserConfig.models from the deprecated per-role env vars
+    # (PR_REVIEW_MODEL_<BACKEND> / ISSUE_TRIAGE_MODEL_<BACKEND>). The
+    # values reach dispatch through UserConfig.models rather than via
+    # the historic dispatch-time env reads in review.py / triage.py
+    # so the per-user `models:` map remains the single source of
+    # truth for per-role selection. One-shot deprecation warning
+    # fires inside the helper when any seed value applies.
+    user_configs = _apply_legacy_model_env_overrides(user_configs, agent_backend)
     allowed_ids = set(user_configs.keys())
     if os.environ.get("ALLOWED_USER_IDS", "").strip():
         log.warning(
@@ -2596,25 +2886,18 @@ def load_config() -> Config:
         agent_backend, user_configs, memory_extraction_enabled
     )
 
-    # Registry completeness and binary resolution per
-    # eligible backend. With model env vars retired, get_model_for()
-    # is the only check that a (role, backend) registry row exists;
-    # the existing early _check_model_registry_complete(agent_backend)
-    # call covers conversational + triage + review + behavioral-eval
-    # rows for the global backend, but a per-user override to a
-    # different backend would reach runtime without its memory-role
-    # rows being validated. Loop over the eligible set after
-    # _load_user_configs runs so per-user overrides are visible.
-    # `_check_model_registry_complete` is idempotent so re-running
-    # it for the global backend if it appears in the set is harmless.
-    # `resolve_oneshot_binary` is gated on the same set so a missing
-    # CODEX_BIN on a deployment where any user routes to codex fails
-    # fast at startup instead of at the first extraction.
+    # Per-eligible-backend binary resolution. The earlier
+    # _check_model_registry_complete() call is self-driving over every
+    # (backend, provider) pair in BACKEND_PROVIDERS, so registry rows
+    # are already validated for every backend including per-user
+    # overrides. `resolve_oneshot_binary` is per-backend (CODEX_BIN
+    # location, opencode binary path) so it stays in the loop;
+    # a missing CODEX_BIN on a deployment where any user routes to
+    # codex fails fast at startup instead of at the first extraction.
     if memory_extraction_enabled and extraction_eligible_backends:
         from kai.oneshot_binary import BinaryResolutionError, resolve_oneshot_binary
 
         for _backend in sorted(extraction_eligible_backends):
-            _check_model_registry_complete(_backend)
             try:
                 resolve_oneshot_binary(_backend)
             except BinaryResolutionError as e:
@@ -2670,6 +2953,39 @@ def load_config() -> Config:
 
     default_model = os.environ.get("DEFAULT_MODEL", "sonnet")
 
+    # Parse DEFAULT_MODELS_JSON: global per-role defaults captured by
+    # the wizard's per-role customization step. Empty / unset / invalid
+    # JSON collapses to an empty dict, which leaves resolve_user_model
+    # falling through to MODEL_REGISTRY for every role; the wizard
+    # writes the key only when at least one captured value differed
+    # from the registry default (delta-from-defaults), so the absence
+    # of the key in env reflects "operator accepted every default".
+    default_models_raw = os.environ.get("DEFAULT_MODELS_JSON", "").strip()
+    default_models: dict[str, str] = {}
+    if default_models_raw:
+        import json
+
+        try:
+            parsed = json.loads(default_models_raw)
+        except ValueError as e:
+            raise SystemExit(
+                f"DEFAULT_MODELS_JSON is not valid JSON: {e}. Re-run `make config` or remove the env var."
+            ) from None
+        if not isinstance(parsed, dict):
+            raise SystemExit(f"DEFAULT_MODELS_JSON must be a JSON object; got {type(parsed).__name__}.")
+        valid_role_keys = {"agent", *(r.value for r in ModelRole)}
+        for raw_key, raw_value in parsed.items():
+            role_key = str(raw_key).strip().lower()
+            if role_key not in valid_role_keys:
+                raise SystemExit(
+                    f"DEFAULT_MODELS_JSON: unrecognized role '{role_key}'; "
+                    f"valid roles: {', '.join(sorted(valid_role_keys))}."
+                )
+            value_str = str(raw_value).strip()
+            if not value_str:
+                raise SystemExit(f"DEFAULT_MODELS_JSON: empty value for role '{role_key}'.")
+            default_models[role_key] = value_str
+
     # Validate DEFAULT_MODEL against the effective global backend.
     # Codex installs validate against CODEX_MODELS only - no fallback
     # to PROVIDER_MODELS["openai"]. Other backends still use the
@@ -2694,6 +3010,7 @@ def load_config() -> Config:
         telegram_webhook_secret=telegram_webhook_secret,
         allowed_user_ids=allowed_ids,
         default_model=default_model,
+        default_models=default_models,
         claude_timeout_seconds=claude_timeout_seconds,
         budget_ceiling=budget_ceiling,
         claude_max_session_hours=claude_max_session_hours,

@@ -40,17 +40,20 @@ from pathlib import Path
 import yaml
 
 from kai.config import (
+    BACKEND_PROVIDERS,
+    BACKENDS_NEEDING_PROVIDER_PROMPT,
     CODEX_DEFAULT_MODEL,
     CODEX_MODELS,
     EFFORT_LEVELS,
     MAX_CONTEXT_CEILING,
+    MODEL_REGISTRY,
     ONESHOT_REASONER_BACKENDS,
     PROJECT_ROOT,
     PROVIDER_DEFAULTS,
     PROVIDER_KEY_VARS,
     PROVIDER_MODELS,
     VALID_BACKENDS,
-    VALID_PROVIDERS,
+    ModelRole,
     _read_protected_file,
     models_for_backend,
     validate_model_for_backend,
@@ -215,9 +218,9 @@ def _prompt_default_model(agent_backend: str, eff_provider: str, default_val: st
       anthropic, openai, google) ship a fixed model list; the operator
       picks from the list via _prompt_choice.
     - Open-ended providers (those in OPEN_ENDED_PROVIDERS, currently
-      openrouter and ollama; also any provider in VALID_PROVIDERS without
-      a PROVIDER_MODELS entry) accept arbitrary model identifiers; the
-      operator types one via _prompt(required=True).
+      openrouter and ollama; also any provider in BACKEND_PROVIDERS
+      without a PROVIDER_MODELS entry) accept arbitrary model
+      identifiers; the operator types one via _prompt(required=True).
 
     The required=True on the open-ended branch forces the operator to
     commit to a concrete model string. load_config falls back to "sonnet"
@@ -796,10 +799,10 @@ def _cmd_config() -> None:
 
     # Codex auth handling runs BEFORE the legacy provider/key block so
     # subscription mode is not gated on an OPENAI_API_KEY the operator
-    # does not need. VALID_PROVIDERS["codex"] is intentionally unset
-    # (codex is openai-only and has its own auth model), so the
-    # legacy block below skips codex entirely - same path claude
-    # follows today.
+    # does not need. Codex sits outside BACKENDS_NEEDING_PROVIDER_PROMPT
+    # (it is single-provider: always openai), so the provider/API-key
+    # block below skips codex entirely; codex follows the same path
+    # claude does for the provider prompt.
     #
     # Gate on the global `agent_backend` selection only. Per-user
     # `agent_backend: codex` overrides in users.yaml do NOT trigger
@@ -852,14 +855,14 @@ def _cmd_config() -> None:
             print("  different os_users, log in as each of those too.")
 
     # OpenCode setup: binary-path wizard prompt + post-install auth
-    # reminder. OpenCode is intentionally absent from VALID_PROVIDERS
-    # (its auth lives in ~/.local/share/opencode/auth.json,
-    # operator-managed via `opencode auth login`), so the
-    # provider/API-key block below is skipped naturally. Model
-    # selection routes through _prompt_default_model later in this
-    # function; since models_for_backend("opencode", _) returns None,
-    # the operator gets a free-text prompt for a full `provider/model`
-    # ID.
+    # reminder. OpenCode joins BACKENDS_NEEDING_PROVIDER_PROMPT so the
+    # operator names the provider used by the (backend, provider, role)
+    # registry; the API-key sub-prompt skips for opencode because
+    # opencode auth lives in `~/.local/share/opencode/auth.json` and
+    # is managed via `opencode auth login`, not by Kai. Model selection
+    # routes through _prompt_default_model later in this function; since
+    # models_for_backend("opencode", _) returns None, the operator gets
+    # a free-text prompt for a full `provider/model` ID.
     #
     # Gate on the global `agent_backend` selection only. Per-user
     # `agent_backend: opencode` overrides in users.yaml do NOT trigger
@@ -893,32 +896,40 @@ def _cmd_config() -> None:
         print("  Kai writes the active model into OPENCODE_CONFIG_CONTENT at process spawn;")
         print("  OpenCode resolves it against the credentials in ~/.local/share/opencode/auth.json.")
 
-    # Non-Claude backends: provider and API key. The provider choice
-    # determines which env var to prompt for (or none for ollama).
-    # Codex and OpenCode are intentionally absent from VALID_PROVIDERS,
-    # so this block only fires for goose; codex is handled in the
-    # dedicated branch above and opencode in the block immediately
-    # above (no API key needed; auth is opencode-cli-managed).
+    # Multi-provider backends (opencode, goose): operator picks the
+    # provider that drives the (backend, provider, role) registry
+    # lookup at runtime. Single-provider backends (claude, codex)
+    # bypass this block via BACKENDS_NEEDING_PROVIDER_PROMPT
+    # membership; their provider is implicit (claude through
+    # get_effective_provider, codex always openai). OpenCode also
+    # skips the API-key sub-prompt because opencode's auth is
+    # managed by `opencode auth login`, not by Kai; the wizard
+    # captures only the provider name so the registry triple-key
+    # can find a row.
     llm_provider = ""
     llm_api_key_var = ""
     llm_api_key = ""
-    valid_providers = VALID_PROVIDERS.get(agent_backend)
+    valid_providers: tuple[str, ...] | None = (
+        BACKEND_PROVIDERS.get(agent_backend) if agent_backend in BACKENDS_NEEDING_PROVIDER_PROMPT else None
+    )
     if valid_providers is not None:
         llm_provider = _prompt_choice(
             "LLM provider",
             sorted(valid_providers),
             existing_env.get("LLM_PROVIDER", ""),
         )
-        llm_api_key_var = PROVIDER_KEY_VARS.get(llm_provider, "")
-        if llm_api_key_var:
-            llm_api_key = _prompt(
-                llm_api_key_var,
-                existing_env.get(llm_api_key_var, ""),
-                required=True,
-            )
-        else:
-            # Ollama, Copilot, etc.: no API key needed
-            print(f"  {llm_provider} does not require an API key.")
+        if agent_backend != "opencode":
+            llm_api_key_var = PROVIDER_KEY_VARS.get(llm_provider, "")
+            if llm_api_key_var:
+                llm_api_key = _prompt(
+                    llm_api_key_var,
+                    existing_env.get(llm_api_key_var, ""),
+                    required=True,
+                )
+            else:
+                # Ollama and any other auth-less provider on the
+                # goose path.
+                print(f"  {llm_provider} does not require an API key.")
     print()
 
     # -- Claude --
@@ -979,6 +990,81 @@ def _cmd_config() -> None:
             print(f"  DEFAULT_MODEL '{raw_existing_model}' is not valid for {surface}. Please choose a new default.")
         default_model_prefill_value = _default_model_prefill()
     model = _prompt_default_model(agent_backend, eff_provider, default_model_prefill_value)
+
+    # Per-role model customization. The conversational role (`agent`)
+    # was just captured via `_prompt_default_model` above; this block
+    # offers the six non-conversational roles (PR review, issue triage,
+    # memory extraction, memory episode, behavioral judge, behavioral
+    # gen) as an optional follow-up. Default-accept is one keystroke
+    # ("no, use registry defaults"); operators who want per-role
+    # control answer yes and walk the role list.
+    #
+    # The captured dict drops entries equal to the registry default
+    # (delta-from-defaults discipline). The result writes to
+    # DEFAULT_MODELS_JSON in /etc/kai/env so load_config sees it as
+    # a global fallback below per-user `models:` and above the
+    # MODEL_REGISTRY default.
+    default_models_override: dict[str, str] = {}
+    existing_default_models_raw = existing_env.get("DEFAULT_MODELS_JSON", "").strip()
+    existing_default_models: dict[str, str] = {}
+    if existing_default_models_raw:
+        try:
+            parsed_existing = json.loads(existing_default_models_raw)
+            if isinstance(parsed_existing, dict):
+                existing_default_models = {str(k): str(v) for k, v in parsed_existing.items()}
+        except ValueError:
+            # Invalid JSON in env: ignore; the wizard re-captures.
+            pass
+
+    customize_models = _prompt_bool(
+        "Customize per-role models (PR review, triage, memory, eval)",
+        default=bool(existing_default_models),
+    )
+    if customize_models:
+        # `models_for_backend` returns a curated dict for the
+        # claude / codex / goose-on-curated path, or None for opencode
+        # and OPEN_ENDED_PROVIDERS (openrouter, ollama). Branch on
+        # the return: curated path uses _prompt_choice, None path
+        # uses free-text _prompt with the registry default as
+        # suggestion.
+        model_surface = models_for_backend(agent_backend, eff_provider)
+        # Only prompt for roles the active backend can actually serve;
+        # _build_registry guarantees a row exists for every (backend,
+        # provider, role) triple in BACKEND_PROVIDERS, but the
+        # behavioral roles are eval-only and rarely set per-user.
+        # Walk every ModelRole regardless so the wizard surfaces the
+        # full set; operators accept defaults to skip individual roles.
+        for role in ModelRole:
+            role_key = role.value
+            try:
+                role_default = MODEL_REGISTRY[(agent_backend, eff_provider, role)]
+            except KeyError:
+                # Registry has no row for this triple; skip the role
+                # rather than offering an empty suggestion. Will not
+                # happen in steady state because _check_model_registry_complete
+                # asserts completeness at load_config time.
+                continue
+            existing_value = existing_default_models.get(role_key, role_default)
+            if model_surface is None:
+                # opencode + OPEN_ENDED_PROVIDERS: free-text prompt.
+                # The operator's auth state determines validity; a
+                # curated keyboard would mislead.
+                value = _prompt(
+                    f"  {role_key}",
+                    default=existing_value,
+                )
+            else:
+                # claude / codex / goose-on-curated: numbered-choice
+                # list from the curated dict. The operator's last
+                # selected value (or registry default) pre-fills as
+                # the highlighted default.
+                value = _prompt_choice(
+                    f"  {role_key}",
+                    sorted(model_surface.keys()),
+                    existing_value,
+                )
+            if value and value != role_default:
+                default_models_override[role_key] = value
 
     while True:
         # AGENT_TIMEOUT_SECONDS is canonical; legacy
@@ -1544,6 +1630,16 @@ def _cmd_config() -> None:
     # makes the env file self-describing and forces the wizard layer
     # to own the validation responsibility.
     env["DEFAULT_MODEL"] = model
+
+    # DEFAULT_MODELS_JSON carries the per-role customization overrides
+    # captured above (delta-from-defaults: only roles the operator
+    # changed appear). load_config parses it as global fallback below
+    # per-user `models:` and above the MODEL_REGISTRY default.
+    # Suppress the key entirely when the operator accepted every
+    # default so /etc/kai/env stays as a delta from the in-tree
+    # canonical surface.
+    if default_models_override:
+        env["DEFAULT_MODELS_JSON"] = json.dumps(default_models_override, sort_keys=True)
 
     # AGENT_TIMEOUT_SECONDS is an inheritable installation default;
     # per-user timeouts in users.yaml override at runtime. Always

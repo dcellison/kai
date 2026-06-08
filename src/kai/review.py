@@ -70,47 +70,6 @@ _REVIEW_BUDGET_USD = 1.0
 # thinking-heavy reviews while still terminating genuinely stuck processes.
 _REVIEW_TIMEOUT = 900
 
-# Mid-tier model per provider for Goose background agent tasks. Matches
-# the "sonnet" design decision for Claude - background tasks should not
-# burn frontier-tier tokens. Full provider-native model IDs are required
-# because `goose run --model` uses provider naming, not Claude aliases.
-#
-# NOTE: Kai stores Google's provider as "google" in VALID_PROVIDERS,
-# but Goose's --help lists it as "gemini-cli". This dict keys on Kai's
-# stored value ("google"). If Goose requires "gemini-cli", that is a
-# pre-existing config.py naming issue, not introduced by this change.
-_GOOSE_AGENT_MODELS: dict[str, str] = {
-    "anthropic": "claude-sonnet-4-6",
-    "openai": "gpt-5.4",
-    "google": "gemini-3-flash",
-}
-
-
-def _resolve_goose_model(provider: str) -> str:
-    """Pick the review model for a Goose provider.
-
-    Curated providers get a hardcoded mid-tier model (cost-effective
-    for background tasks). Open-ended providers (openrouter, ollama)
-    fall back to the GOOSE_MODEL env var, which is the user's
-    configured model. There is no safe default for those providers.
-
-    Raises RuntimeError if no model can be resolved (open-ended
-    provider with no GOOSE_MODEL set).
-    """
-    model = _GOOSE_AGENT_MODELS.get(provider)
-    if model:
-        return model
-    # Open-ended provider: use whatever the user configured.
-    # GOOSE_MODEL is set in the process environment by the launcher.
-    model = os.environ.get("GOOSE_MODEL", "")
-    if not model:
-        raise RuntimeError(
-            f"No model configured for Goose provider '{provider}'. "
-            f"Set GOOSE_MODEL in the environment or DEFAULT_MODEL in .env."
-        )
-    return model
-
-
 # Header prepended to every review comment on GitHub. Distinguishes
 # automated reviews from human comments. Per design decision #11.
 _REVIEW_HEADER = "## Review by Kai\n\n"
@@ -673,6 +632,12 @@ async def run_review(
     # this fix; cleanup deferred to a separate refactor that updates
     # webhook.py and the test suite together.
     budget_usd: float = _REVIEW_BUDGET_USD,
+    # Per-role model override. Caller in webhook.py resolves
+    # `user_config.models.get("pr_review", "")` and passes it; empty
+    # falls through to MODEL_REGISTRY's (backend, provider, PR_REVIEW)
+    # default. Caller-resolved so the per-user models map (and its
+    # load-time legacy env-var seeding) wins over the registry default.
+    model_override: str = "",
 ) -> str:
     """
     Spawn a one-shot LLM subprocess to perform the review.
@@ -725,18 +690,19 @@ async def run_review(
     """
     if agent_backend == "opencode":
         # Dispatch to the OpenCode one-shot reasoner. The model
-        # identifier comes from the per-role MODEL_REGISTRY; an
-        # operator-side override via PR_REVIEW_MODEL_OPENCODE is
-        # accepted on the same shape the other backends use. The
-        # reasoner returns OneShotResult.text (raw review text) when
-        # json_schema is None, which is what this function's
-        # contract returns. Typed reasoner errors collapse to
-        # RuntimeError so the webhook handler's existing catch
-        # surface does not need to widen.
+        # identifier comes from the per-role MODEL_REGISTRY indexed
+        # by (backend, provider, role); the caller's per-user
+        # `models.pr_review` override (when set in users.yaml) wins
+        # via the `model_override` parameter. The reasoner returns
+        # OneShotResult.text (raw review text) when json_schema is
+        # None, which is what this function's contract returns. Typed
+        # reasoner errors collapse to RuntimeError so the webhook
+        # handler's existing catch surface does not need to widen.
         review_model = get_model_for(
             ModelRole.PR_REVIEW,
             agent_backend,
-            override=os.environ.get("PR_REVIEW_MODEL_OPENCODE", ""),
+            provider,
+            override=model_override,
         )
         reasoner = OpenCodeOneShotReasoner(os_user=claude_user)
         try:
@@ -771,7 +737,8 @@ async def run_review(
         review_model = get_model_for(
             ModelRole.PR_REVIEW,
             agent_backend,
-            override=os.environ.get("PR_REVIEW_MODEL_CODEX", ""),
+            provider,
+            override=model_override,
         )
         # Pin the absolute codex path when CODEX_BIN is set; same
         # rationale as codex.py and triage.py - sudo cannot resolve
@@ -864,8 +831,17 @@ async def run_review(
         # Goose one-shot mode: read prompt from stdin, write response
         # to stdout. -q suppresses non-response output, --no-session
         # avoids creating session files, --no-profile skips user
-        # config, --max-turns 1 prevents runaway tool loops.
-        model = _resolve_goose_model(provider)
+        # config, --max-turns 1 prevents runaway tool loops. Model
+        # comes from the unified (backend, provider, role) registry
+        # so a goose-on-deepseek install inherits deepseek-chat the
+        # same way claude inherits sonnet; openrouter / ollama users
+        # set their per-user `models.pr_review` in users.yaml.
+        model = get_model_for(
+            ModelRole.PR_REVIEW,
+            agent_backend,
+            provider,
+            override=model_override,
+        )
         cmd = [
             "goose",
             "run",
@@ -911,18 +887,19 @@ async def run_review(
         # signature is unused on every currently-exercised path - see the
         # comment on the parameter declaration above for the full rationale
         # and why cleanup is deferred to a separate refactor.
-        # Model identifier comes from the per-role registry so the
-        # codex backend (and any future backend) can override the
-        # mid-tier "sonnet" default without modifying this branch.
-        # The override env var PR_REVIEW_MODEL_<BACKEND> is read here
-        # rather than in load_config because the override surface
-        # grows with ModelRole; threading every entry through Config
-        # would inflate the dataclass for a passthrough to a typed
-        # lookup.
+        # Model identifier comes from the per-role registry indexed
+        # by (backend, provider, role) so the codex backend (and any
+        # future backend) can override the mid-tier "sonnet" default
+        # without modifying this branch. The caller's per-user
+        # `models.pr_review` override (when set in users.yaml) wins
+        # via the `model_override` parameter; the load-time env-var
+        # seeding pass also routes deprecated PR_REVIEW_MODEL_*
+        # values through that same parameter.
         review_model = get_model_for(
             ModelRole.PR_REVIEW,
             agent_backend,
-            override=os.environ.get(f"PR_REVIEW_MODEL_{agent_backend.upper()}", ""),
+            provider,
+            override=model_override,
         )
         cmd = [
             "claude",
@@ -1087,6 +1064,7 @@ async def review_pr(
     # See `run_review` above for why `budget_usd` is currently unused
     # on every exercised path; cleanup deferred to a separate refactor.
     budget_usd: float = _REVIEW_BUDGET_USD,
+    model_override: str = "",
 ) -> None:
     """
     Full review pipeline: fetch diff, build prompt, run review, post results.
@@ -1154,6 +1132,7 @@ async def review_pr(
             provider=provider,
             timeout_s=timeout_s,
             budget_usd=budget_usd,
+            model_override=model_override,
         )
 
         if not review_text.strip():

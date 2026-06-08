@@ -10,12 +10,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kai.review import (
-    _GOOSE_AGENT_MODELS,
     _MAX_DIFF_CHARS,
     _MAX_PRIOR_COMMENTS_CHARS,
     _REVIEW_HEADER,
     PRMetadata,
-    _resolve_goose_model,
     build_review_prompt,
     extract_pr_metadata,
     fetch_pr_diff,
@@ -518,16 +516,17 @@ class TestRunReview:
         assert "sonnet" in cmd
 
     @pytest.mark.asyncio
-    async def test_claude_env_override_honored_at_call_site(self, monkeypatch):
+    async def test_model_override_param_wins_over_registry_default(self):
         """
-        PR_REVIEW_MODEL_CLAUDE in the environment overrides the registry
-        value at the call site. The override env var is read here rather
-        than in load_config; this test verifies the wiring end-to-end.
+        The `model_override` parameter (resolved by the caller in
+        webhook.py from `user_config.models[role.value]` and the
+        load-time legacy env-var seeding) wins over the registry
+        default. Pins the wiring that lets per-user `models.pr_review`
+        reach dispatch without the historic env-var read at the call site.
         """
-        monkeypatch.setenv("PR_REVIEW_MODEL_CLAUDE", "opus")
         mock_proc = _mock_process(stdout=b"ok")
         with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_review("prompt")
+            await run_review("prompt", model_override="opus")
         cmd = mock_exec.call_args[0]
         i = cmd.index("--model")
         assert cmd[i + 1] == "opus"
@@ -809,16 +808,16 @@ class TestRunReviewCodex:
         assert cmd[i + 1] == "gpt-5.4-mini"
 
     @pytest.mark.asyncio
-    async def test_codex_env_override_honored_at_call_site(self, monkeypatch):
+    async def test_codex_model_override_param_wins(self):
         """
-        PR_REVIEW_MODEL_CODEX in the environment overrides the
-        registry value at the call site. Same end-to-end env-override
-        wiring as the claude path.
+        On the codex branch, the `model_override` parameter (resolved
+        by the caller from per-user `models.pr_review` and the
+        load-time legacy env-var seeding) wins over the registry
+        default the same way it does on the claude branch.
         """
-        monkeypatch.setenv("PR_REVIEW_MODEL_CODEX", "gpt-5.4")
         mock_proc = _mock_process(stdout=self._codex_ndjson(""))
         with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_review("prompt", agent_backend="codex")
+            await run_review("prompt", agent_backend="codex", model_override="gpt-5.4")
         cmd = mock_exec.call_args[0]
         i = cmd.index("--model")
         assert cmd[i + 1] == "gpt-5.4"
@@ -1084,30 +1083,39 @@ class TestRunReviewGoose:
         assert cmd[0] == "goose"
 
     @pytest.mark.asyncio
-    async def test_open_ended_provider_reads_env(self):
-        """Open-ended providers (ollama) use GOOSE_MODEL from env."""
+    async def test_open_ended_provider_uses_registry_default(self):
+        """Goose+ollama resolves the PR_REVIEW row from the unified
+        registry. Operators override per-user via users.yaml
+        `models.pr_review`; the historic GOOSE_MODEL env path retired
+        with the `_GOOSE_AGENT_MODELS` fold-in."""
         mock_proc = _mock_process(stdout=b"output")
 
-        with (
-            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
-            patch.dict(os.environ, {"GOOSE_MODEL": "llama3.3:70b"}),
-        ):
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
             await run_review("prompt", agent_backend="goose", provider="ollama")
 
         cmd = mock_exec.call_args[0]
         model_idx = cmd.index("--model")
-        assert cmd[model_idx + 1] == "llama3.3:70b"
+        # Registry value for ("goose", "ollama", PR_REVIEW); see
+        # _BACKEND_PROVIDER_TIER_MODELS in config.py.
+        assert cmd[model_idx + 1] == "llama4:70b"
 
     @pytest.mark.asyncio
-    async def test_open_ended_provider_no_model_raises(self):
-        """Open-ended provider with no GOOSE_MODEL raises RuntimeError."""
-        with (
-            patch.dict(os.environ, {}, clear=False),
-            pytest.raises(RuntimeError, match="No model configured"),
-        ):
-            # Remove GOOSE_MODEL if it happens to be set in the test env
-            os.environ.pop("GOOSE_MODEL", None)
-            await run_review("prompt", agent_backend="goose", provider="ollama")
+    async def test_open_ended_provider_with_model_override(self):
+        """Per-user `models.pr_review` override flows through
+        `model_override` and wins over the registry default."""
+        mock_proc = _mock_process(stdout=b"output")
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review(
+                "prompt",
+                agent_backend="goose",
+                provider="ollama",
+                model_override="qwen3:32b",
+            )
+
+        cmd = mock_exec.call_args[0]
+        model_idx = cmd.index("--model")
+        assert cmd[model_idx + 1] == "qwen3:32b"
 
     @pytest.mark.asyncio
     async def test_default_backend_is_claude(self):
@@ -1158,7 +1166,9 @@ class TestRunReviewOpenCodeDispatch:
             patch("kai.review.OpenCodeOneShotReasoner", return_value=fake) as ctor,
             patch("kai.review.asyncio.create_subprocess_exec") as mock_exec,
         ):
-            result = await run_review("prompt body", agent_backend="opencode", claude_user="someone")
+            result = await run_review(
+                "prompt body", agent_backend="opencode", provider="anthropic", claude_user="someone"
+            )
 
         assert result == "review body from opencode"
         # OpenCodeOneShotReasoner was constructed with the claude_user
@@ -1182,7 +1192,7 @@ class TestRunReviewOpenCodeDispatch:
             patch("kai.review.OpenCodeOneShotReasoner", return_value=fake),
             pytest.raises(RuntimeError, match=r"Review subprocess timed out"),
         ):
-            await run_review("prompt", agent_backend="opencode")
+            await run_review("prompt", agent_backend="opencode", provider="anthropic")
 
     @pytest.mark.asyncio
     async def test_run_review_collapses_oneshot_error_to_runtime_error(self):
@@ -1195,28 +1205,28 @@ class TestRunReviewOpenCodeDispatch:
             patch("kai.review.OpenCodeOneShotReasoner", return_value=fake),
             pytest.raises(RuntimeError, match=r"OpenCode review failed.*model refused"),
         ):
-            await run_review("prompt", agent_backend="opencode")
+            await run_review("prompt", agent_backend="opencode", provider="anthropic")
 
 
-class TestResolveGooseModelReview:
-    """Tests for _resolve_goose_model in review.py."""
+class TestGooseModelResolutionViaRegistry:
+    """Goose model selection now flows through the unified
+    (backend, provider, role) MODEL_REGISTRY. Curated providers
+    inherit the registry default; open-ended providers (openrouter,
+    ollama) need a per-user `models.pr_review` in users.yaml or
+    accept the registry-shipped fallback."""
 
-    def test_curated_providers(self):
-        """Each curated provider returns its hardcoded mid-tier model."""
-        for provider, expected_model in _GOOSE_AGENT_MODELS.items():
-            assert _resolve_goose_model(provider) == expected_model
+    def test_curated_provider_registry_lookup(self):
+        """Goose+openai resolves the PR_REVIEW row from the registry."""
+        from kai.config import MODEL_REGISTRY, ModelRole
 
-    def test_open_ended_provider_with_env(self):
-        """Open-ended provider reads GOOSE_MODEL from environment."""
-        with patch.dict(os.environ, {"GOOSE_MODEL": "custom-model"}):
-            assert _resolve_goose_model("openrouter") == "custom-model"
+        assert MODEL_REGISTRY[("goose", "openai", ModelRole.PR_REVIEW)] == "gpt-5.4"
 
-    def test_open_ended_provider_no_env_raises(self):
-        """Open-ended provider without GOOSE_MODEL raises RuntimeError."""
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("GOOSE_MODEL", None)
-            with pytest.raises(RuntimeError, match="No model configured"):
-                _resolve_goose_model("ollama")
+    def test_open_ended_provider_registry_lookup(self):
+        """Goose+ollama has a registry-shipped default; operators
+        override per-user via users.yaml `models.pr_review`."""
+        from kai.config import MODEL_REGISTRY, ModelRole
+
+        assert MODEL_REGISTRY[("goose", "ollama", ModelRole.PR_REVIEW)] == "llama4:70b"
 
 
 # ── post_review_comment ─────────────────────────────────────────────

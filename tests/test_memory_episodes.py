@@ -206,6 +206,7 @@ class TestExtractionResultClassifier:
             candidate_metadata={},
             user_id="u1",
             effective_backend="claude",
+            effective_provider="anthropic",
         )
         assert isinstance(result, ExtractionResult)
         assert result.has_episode is True
@@ -228,6 +229,7 @@ class TestExtractionResultClassifier:
             candidate_metadata={},
             user_id="u1",
             effective_backend="claude",
+            effective_provider="anthropic",
         )
         assert result.has_episode is False
 
@@ -261,6 +263,7 @@ class TestExtractionResultClassifier:
             candidate_metadata={},
             user_id="u1",
             effective_backend="claude",
+            effective_provider="anthropic",
         )
         assert result.has_episode is False
         assert result.facts == []
@@ -516,6 +519,7 @@ class TestStage2Isolation:
                 session_id=None,
                 config=_cfg(memory_episode_timeout_s=10),
                 effective_backend="claude",
+                effective_provider="anthropic",
             )
 
         episode_records = [r for r in caplog.records if r.message.startswith("memory.episode ")]
@@ -566,6 +570,7 @@ class TestStage2Isolation:
                 session_id=None,
                 config=_cfg(),
                 effective_backend="claude",
+                effective_provider="anthropic",
             )
         await release_task
 
@@ -614,6 +619,7 @@ class TestStage2Isolation:
                 session_id=None,
                 config=_cfg(),
                 effective_backend="claude",
+                effective_provider="anthropic",
             )
 
         records = [r for r in caplog.records if r.message.startswith("memory.episode ")]
@@ -651,6 +657,7 @@ class TestStage2Isolation:
                 session_id=None,
                 config=_cfg(),
                 effective_backend="claude",
+                effective_provider="anthropic",
             )
 
         episode_records = [r for r in caplog.records if r.message.startswith("memory.episode ")]
@@ -698,6 +705,7 @@ class TestStage2Storage:
             session_id="sess-42",
             config=_cfg(),
             effective_backend="claude",
+            effective_provider="anthropic",
         )
 
         assert captured["memory_type"] == "episode"
@@ -738,6 +746,7 @@ class TestStage2Storage:
             session_id=None,
             config=_cfg(),
             effective_backend="claude",
+            effective_provider="anthropic",
         )
 
         assert "lessons" not in captured["metadata"]
@@ -770,6 +779,7 @@ class TestStage2Storage:
             session_id=None,
             config=_cfg(),
             effective_backend="claude",
+            effective_provider="anthropic",
         )
 
         assert captured["metadata"]["lessons"] == episode_with_lessons["lessons"]
@@ -800,6 +810,7 @@ class TestStage2Storage:
             session_id=None,
             config=_cfg(),
             effective_backend="claude",
+            effective_provider="anthropic",
         )
 
         assert captured["content"] == f"{ep['goal']}\n\n{ep['context']}"
@@ -826,6 +837,7 @@ class TestStage2Storage:
                 session_id=None,
                 config=_cfg(),
                 effective_backend="claude",
+                effective_provider="anthropic",
             )
 
         records = [r for r in caplog.records if r.message.startswith("memory.episode ")]
@@ -863,6 +875,7 @@ class TestStage2Storage:
                 session_id=None,
                 config=_cfg(),
                 effective_backend="claude",
+                effective_provider="anthropic",
             )
 
         records = [r for r in caplog.records if r.message.startswith("memory.episode ")]
@@ -907,6 +920,7 @@ class TestStage2SubprocessAssembly:
             "payload",
             _cfg(memory_episode_budget_usd=0.15),
             effective_backend="claude",
+            effective_provider="anthropic",
         )
 
         args = captured["args"]
@@ -936,7 +950,7 @@ class TestStage2SubprocessAssembly:
             return _make_proc(stdout=_stage2_envelope(_valid_episode()))
 
         monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
-        await _run_episode_extractor("payload", _cfg(), effective_backend="claude")
+        await _run_episode_extractor("payload", _cfg(), effective_backend="claude", effective_provider="anthropic")
 
         args = captured["args"]
         assert args[args.index("--tools") + 1] == ""
@@ -1164,7 +1178,9 @@ class TestRunEpisodeExtractorViaReasoner:
                 )
 
         with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FakeReasoner()):
-            episode, cost_usd, reason = await _run_episode_extractor("payload", _cfg(), effective_backend="claude")
+            episode, cost_usd, reason = await _run_episode_extractor(
+                "payload", _cfg(), effective_backend="claude", effective_provider="anthropic"
+            )
 
         assert episode == _valid_episode()
         assert cost_usd == pytest.approx(0.04)
@@ -1182,7 +1198,9 @@ class TestRunEpisodeExtractorViaReasoner:
                 raise OneShotTimeout()
 
         with patch("kai.memory_extraction._build_memory_reasoner", return_value=_TimingOutReasoner()):
-            episode, cost_usd, reason = await _run_episode_extractor("payload", _cfg(), effective_backend="claude")
+            episode, cost_usd, reason = await _run_episode_extractor(
+                "payload", _cfg(), effective_backend="claude", effective_provider="anthropic"
+            )
 
         assert episode is None
         assert cost_usd == 0.0
@@ -1201,7 +1219,9 @@ class TestRunEpisodeExtractorViaReasoner:
                 raise OneShotSubprocessError(returncode=2, stderr=b"oauth refused: please login")
 
         with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FailingReasoner()):
-            episode, cost_usd, reason = await _run_episode_extractor("payload", _cfg(), effective_backend="claude")
+            episode, cost_usd, reason = await _run_episode_extractor(
+                "payload", _cfg(), effective_backend="claude", effective_provider="anthropic"
+            )
 
         assert episode is None
         assert cost_usd == 0.0
@@ -1240,7 +1260,9 @@ class TestRunEpisodeExtractorWithCodexEnvelope:
 
         config = _cfg()
         with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FakeCodexReasoner()):
-            ep, cost_usd, reason = await _run_episode_extractor("payload", config, effective_backend="codex")
+            ep, cost_usd, reason = await _run_episode_extractor(
+                "payload", config, effective_backend="codex", effective_provider="openai"
+            )
 
         assert ep == episode
         # No total_cost_usd in the envelope -> 0.0. Codex runs

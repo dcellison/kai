@@ -36,6 +36,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -729,16 +730,19 @@ async def run_backend(
     elif memory.get_all(user_id=sandbox_user_id, limit=1):
         raise SystemExit(f"sandbox user {sandbox_user_id!r} has existing rows; pass --reset to clear them")
 
-    # Memory models for this run come from the per-backend registry,
-    # matching what `_resolve_effective_backend` -> `get_model_for`
+    # Memory models for this run come from the per-(backend, provider)
+    # registry, matching what `get_model_for(role, backend, provider)`
     # produces in production per-extraction. Pinned here so the
     # BackendRun summary reports the same SKUs the reasoner actually
-    # spawned.
+    # spawned. Eval-time provider comes from the LLM_PROVIDER env var
+    # (the gate runs as a developer tool against the operator's
+    # configured backend / provider, not against a sandboxed user).
+    eval_provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
     run = BackendRun(
         backend=backend,
         sandbox_user_id=sandbox_user_id,
-        model_fact=get_model_for(ModelRole.MEMORY_EXTRACTION, backend),
-        model_episode=get_model_for(ModelRole.MEMORY_EPISODE, backend),
+        model_fact=get_model_for(ModelRole.MEMORY_EXTRACTION, backend, eval_provider),
+        model_episode=get_model_for(ModelRole.MEMORY_EPISODE, backend, eval_provider),
         log_path=log_path,
     )
 
