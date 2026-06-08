@@ -1237,13 +1237,13 @@ def _cmd_config() -> None:
     # suppressed by the delta-from-default check below.
     memory_duplicate_threshold = "0.9"
     if memory_enabled:
-        # Memory extraction is supported on agent backends that have a
-        # Membership tracks backends with a OneShotReasoner. Goose
-        # retrieval-only installs accept memory_enabled but skip the
-        # extraction prompt because no GooseOneShotReasoner exists.
-        # The runtime eligibility gate at `bot._ingest_memory` and
-        # `config._compute_extraction_eligible_backends` read from
-        # the same constant; all sites stay in lockstep through it.
+        # Memory extraction is supported on agent backends that ship a
+        # OneShotReasoner. Goose retrieval-only installs accept
+        # memory_enabled but skip the extraction prompt because no
+        # GooseOneShotReasoner exists. The runtime eligibility gate at
+        # `bot._ingest_memory` and `config._compute_extraction_eligible_backends`
+        # read from the same constant; all sites stay in lockstep
+        # through it.
         if agent_backend in ONESHOT_REASONER_BACKENDS:
             memory_extraction_enabled = _prompt_bool(
                 "Enable memory extraction (proactive memory writes)",
