@@ -3669,11 +3669,23 @@ class TestMemoryReasonerSelection:
         reasoner = memory_extraction._build_memory_reasoner("opencode")
         assert isinstance(reasoner, OpenCodeOneShotReasoner)
 
+    def test_goose_backend_builds_goose_reasoner(self):
+        """Goose dispatches to GooseOneShotReasoner with the provider
+        threaded through (goose's one-shot argv carries an explicit
+        --provider flag, unlike the other backends)."""
+        from kai.oneshot import GooseOneShotReasoner
+
+        reasoner = memory_extraction._build_memory_reasoner("goose", os_user=None, provider="deepseek")
+        assert isinstance(reasoner, GooseOneShotReasoner)
+        assert reasoner._provider == "deepseek"
+
     def test_unknown_backend_still_raises_defensive_runtime_error(self):
         """The defensive RuntimeError remains the safety net for any
-        backend the eligibility gate does not allow through."""
-        with pytest.raises(RuntimeError, match=r"non-extraction backend.*goose"):
-            memory_extraction._build_memory_reasoner("goose")
+        backend the eligibility gate does not allow through. Every
+        real backend dispatches now, so the guard is exercised with a
+        string no backend will ever use."""
+        with pytest.raises(RuntimeError, match=r"non-extraction backend.*nonexistent"):
+            memory_extraction._build_memory_reasoner("nonexistent")
 
 
 class TestRunExtractorWithCodexEnvelope:
@@ -3932,7 +3944,7 @@ class TestExtractAndStorePerUserDispatch:
                     duration_ms=1,
                 )
 
-        def _spy_build(effective_backend, os_user=None):
+        def _spy_build(effective_backend, os_user=None, provider=""):
             captured_backends.append(effective_backend)
             return _StubReasoner()
 
@@ -3984,7 +3996,7 @@ class TestExtractAndStorePerUserDispatch:
                     duration_ms=1,
                 )
 
-        def _build(effective_backend, os_user=None):
+        def _build(effective_backend, os_user=None, provider=""):
             return _ModelCapturingReasoner()
 
         monkeypatch.setattr(memory_extraction, "_build_memory_reasoner", _build)
@@ -4022,7 +4034,7 @@ class TestExtractAndStorePerUserDispatch:
 
         captured: list[str] = []
 
-        def _build(effective_backend, os_user=None):
+        def _build(effective_backend, os_user=None, provider=""):
             captured.append(effective_backend)
 
             class _R:
@@ -4069,7 +4081,7 @@ class TestExtractAndStorePerUserDispatch:
 
         captured: list[str] = []
 
-        def _build(effective_backend, os_user=None):
+        def _build(effective_backend, os_user=None, provider=""):
             captured.append(effective_backend)
 
             class _R:

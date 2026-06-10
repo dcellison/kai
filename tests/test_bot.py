@@ -3298,15 +3298,17 @@ class TestHandleResponse:
         extract_mock.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_extraction_skipped_for_goose_users(self, monkeypatch):
-        """Symmetric guard: goose users must NOT reach the extractor.
-        The gate widening for opencode must not have widened to goose
-        too; goose has no OneShotReasoner implementation, so an
-        extraction attempt would crash."""
+    async def test_extraction_skipped_for_non_reasoner_backend_users(self, monkeypatch):
+        """Symmetric guard: users whose effective backend has no
+        OneShotReasoner must NOT reach the extractor; an extraction
+        attempt would crash. Every real backend is a member today, so
+        the gate's negative branch is exercised by patching the
+        constant down rather than naming a real backend."""
         from kai.bot import _handle_response
         from kai.config import UserConfig
 
         monkeypatch.setattr("kai.memory.is_enabled", lambda: True)
+        monkeypatch.setattr("kai.bot.ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
         extract_mock = AsyncMock()
         monkeypatch.setattr("kai.memory_extraction.extract_and_store", extract_mock)
 

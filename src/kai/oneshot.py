@@ -42,6 +42,7 @@ from typing import Any, Protocol
 from kai.acp import drain_late_text, read_result, write_rpc
 from kai.codex_exec import extract_codex_text
 from kai.config import DATA_DIR, resolve_claude_user
+from kai.goose import goose_provider_id
 from kai.oneshot_binary import BinaryResolutionError, resolve_oneshot_binary
 from kai.opencode import (
     concat_opencode_text,
@@ -284,6 +285,13 @@ _OPENCODE_PRESERVED_AUTH_VARS: tuple[str, ...] = (
     "OPENROUTER_API_KEY",
     "DEEPSEEK_API_KEY",
 )
+# Goose authenticates per provider via env keys (or the target user's
+# keychain, which `sudo -H` reaches through the rewritten HOME), so
+# the preserve list is the same five provider keys opencode carries.
+# GOOSE_MODEL / GOOSE_PROVIDER are deliberately absent: the one-shot
+# passes model and provider as argv flags, so nothing model-related
+# rides the environment on this path.
+_GOOSE_PRESERVED_AUTH_VARS: tuple[str, ...] = _OPENCODE_PRESERVED_AUTH_VARS
 
 
 def _preserved_auth_vars_for(backend: str) -> tuple[str, ...]:
@@ -303,6 +311,8 @@ def _preserved_auth_vars_for(backend: str) -> tuple[str, ...]:
         return _CODEX_PRESERVED_AUTH_VARS
     if backend == "opencode":
         return _OPENCODE_PRESERVED_AUTH_VARS
+    if backend == "goose":
+        return _GOOSE_PRESERVED_AUTH_VARS
     raise ValueError(f"unknown backend for preserve-env: {backend!r}")
 
 
@@ -2111,3 +2121,316 @@ async def _shutdown_opencode_proc(
         proc.kill()
     with contextlib.suppress(BaseException):
         await asyncio.wait_for(proc.wait(), timeout=5)
+
+
+# ── Goose implementation ────────────────────────────────────────────
+
+
+# Env vars forwarded to the goose one-shot subprocess. Identical in
+# content to the opencode list: PATH for binary resolution, HOME for
+# the keychain / config state goose reads per user, and the five
+# provider API keys for env-key auth flows. GOOSE_MODEL and
+# GOOSE_PROVIDER are deliberately absent: the one-shot passes model
+# and provider as argv flags (unlike the conversational GooseBackend,
+# which delivers both via env), so the env surface stays minimal.
+# KAI_WEBHOOK_SECRET is likewise absent; one-shots never serve the
+# webhook API.
+_GOOSE_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "DEEPSEEK_API_KEY",
+)
+
+
+def _render_goose_stdin(system_prompt: str | None, prompt: str) -> str:
+    """
+    Build the stdin payload for a goose one-shot call.
+
+    `goose run -i -` reads the whole instruction text from stdin and
+    has no dedicated system-prompt slot this reasoner trusts: the
+    `--system` flag exists but its semantics relative to the
+    recipe/profile system prompt are unverified, so the system text
+    rides inside the stdin payload behind a randomized boundary
+    block, exactly the shape `_render_codex_stdin` and
+    `_render_opencode_session_prompt` use. The boundary entropy is
+    collision-avoidance, not a security barrier; matching the
+    sibling renderers keeps the three non-claude one-shot prompt
+    shapes symmetric.
+
+    A None or empty `system_prompt` returns the user prompt
+    unchanged, matching the no-system-prompt semantics callers get
+    from claude's `--system-prompt` flag being omitted.
+    """
+    if not system_prompt:
+        return prompt
+    begin, end = make_boundary("SYSTEM")
+    return f"{begin}\n{system_prompt}\n{end}\n\n{prompt}"
+
+
+class GooseOneShotReasoner:
+    """
+    Spawns `goose run -i -` once per call and returns either the raw
+    response text or, when a JSON schema is supplied, the normalized
+    `{"is_error": false, "structured_output": ...}` envelope string
+    that matches the shape memory_extraction.py already parses.
+
+    Goose differs from the siblings in three load-bearing ways:
+
+    - The provider is an explicit argv flag: goose is multi-provider
+      and the registry's goose model names are bare (no provider
+      prefix), so the constructor takes the Kai provider key and the
+      argv carries `--provider <goose_provider_id(provider)>`. The
+      wire-name translation matters: goose ships DeepSeek as
+      `custom_deepseek` and rejects the bare Kai key.
+    - No structured-output channel at all: like opencode, the JSON
+      instruction rides the caller's prompt and compliance is model
+      discipline, so the schema-backed path parses through
+      `_parse_schema_payload` (fence / prose tolerant) rather than a
+      bare `json.loads`.
+    - Plain stdout: `-q` prints only the model response, so the
+      response text is the stripped stdout with no event-stream
+      walking (unlike codex's NDJSON).
+
+    Flag rationale (all verified against `goose run --help` on
+    1.29.1): `-i -` reads the prompt from stdin; `-q` suppresses
+    non-response output; `--no-session` writes no session files;
+    `--no-profile` keeps the operator's default extensions out of a
+    bounded structured-output call; `--max-turns 1` prevents tool
+    loops (the one-shot asks for text, not actions).
+    """
+
+    def __init__(self, *, cwd: Path | None = None, os_user: str | None = None, provider: str = "") -> None:
+        """
+        Args:
+            cwd: Override for the subprocess working directory. Tests
+                pass a temp path so the run does not touch the real
+                DATA_DIR; production callers leave this unset and the
+                reasoner uses `_EXTRACTOR_CWD`.
+            os_user: Optional target OS user, symmetric with the
+                other reasoners: None (or a value resolve_claude_user
+                collapses to the current process user) spawns goose
+                in-process; a non-bot username wraps the argv in
+                `sudo -H -u <user>`.
+            provider: Kai provider key for the `--provider` flag
+                (translated to goose's wire name at argv build).
+                Empty omits the flag so goose falls back to its own
+                GOOSE_PROVIDER / config default; production callers
+                always pass the user's effective provider.
+        """
+        self._cwd = cwd if cwd is not None else _EXTRACTOR_CWD
+        self._os_user = os_user
+        self._provider = provider
+
+    async def run(
+        self,
+        *,
+        prompt: str,
+        system_prompt: str | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+        purpose: str,
+        json_schema: dict[str, Any] | None = None,
+    ) -> OneShotResult:
+        # Lazy mkdir + chmod: deferred from import time so a
+        # permission failure surfaces as a logged miss rather than
+        # crashing the bot at startup. The unconditional chmod
+        # self-heals a pre-existing tighter mode on the next call.
+        self._cwd.mkdir(parents=True, exist_ok=True)
+        self._cwd.chmod(0o755)
+
+        # Shared resolver so config validation, this argv, and the
+        # smoke output all see the same resolution result.
+        # BinaryResolutionError becomes OneShotRoutingError here so
+        # the existing memory_extraction `except OneShotError` catch
+        # surface is unchanged.
+        try:
+            resolved_binary = resolve_oneshot_binary("goose")
+        except BinaryResolutionError as e:
+            raise OneShotRoutingError(str(e)) from e
+        cmd: list[str] = [resolved_binary, "run", "-i", "-"]
+        if self._provider:
+            cmd.extend(["--provider", goose_provider_id(self._provider)])
+        if model is not None:
+            cmd.extend(["--model", model])
+        cmd.extend(["-q", "--no-session", "--no-profile", "--max-turns", "1"])
+
+        # Per-user OS routing. Same shape the sibling reasoners use:
+        # resolve_claude_user returns None when the target is unset
+        # OR matches the bot user (self-sudo-skip), and the direct
+        # spawn path is byte-identical to a no-os_user call. A
+        # non-None target wraps the argv in sudo with the goose
+        # preserve list.
+        effective_user = resolve_claude_user(self._os_user)
+        if effective_user is not None:
+            cmd = _wrap_cmd_for_user(cmd, effective_user, "goose")
+
+        # Allow-listed env: only forward keys present in the parent
+        # env. PATH is allow-listed so sudo can resolve the bare
+        # `goose` invocation against the bot user's PATH when
+        # GOOSE_BIN is unset; an explicit GOOSE_BIN puts the absolute
+        # path straight into argv.
+        subprocess_env: dict[str, str] = {key: os.environ[key] for key in _GOOSE_ENV_ALLOWLIST if key in os.environ}
+
+        stdin_payload = _render_goose_stdin(system_prompt, prompt)
+        os_user_field = _os_user_log_field(effective_user)
+
+        start = time.monotonic()
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(self._cwd),
+            env=subprocess_env,
+            start_new_session=bool(effective_user),
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=stdin_payload.encode("utf-8")),
+                timeout=timeout,
+            )
+        except TimeoutError:
+            # Wrap path: escalate via the target user's permission to
+            # signal its own process group so the whole descendant
+            # tree terminates before the wrapper is reaped. Direct
+            # path keeps the plain kill+await.
+            if effective_user is not None:
+                await _kill_target_user_tree(
+                    target_user=effective_user,
+                    pgid=proc.pid,
+                    purpose=purpose,
+                    backend="goose",
+                )
+            proc.kill()
+            await proc.wait()
+            duration_ms = int((time.monotonic() - start) * 1000)
+            log.info(
+                "oneshot_reasoner purpose=%s backend=goose model=%s duration_ms=%d outcome=timeout error_category=timeout os_user=%s",
+                purpose,
+                model,
+                duration_ms,
+                os_user_field,
+            )
+            raise OneShotTimeout() from None
+
+        duration_ms = int((time.monotonic() - start) * 1000)
+        returncode = proc.returncode if proc.returncode is not None else -1
+        if returncode != 0:
+            log.info(
+                "oneshot_reasoner purpose=%s backend=goose model=%s duration_ms=%d outcome=subprocess_error error_category=non_zero_exit returncode=%d os_user=%s",
+                purpose,
+                model,
+                duration_ms,
+                returncode,
+                os_user_field,
+            )
+            raise OneShotSubprocessError(returncode=returncode, stderr=stderr)
+
+        response_text = stdout.decode("utf-8", errors="replace").strip()
+        raw_metadata = {
+            "returncode": returncode,
+            "stderr": stderr,
+            "cwd": str(self._cwd),
+            # cmd is post-wrap (includes the sudo prefix on
+            # cross-user routing); resolved_binary is the pre-wrap
+            # agent path so the smoke output's "which binary ran"
+            # answer survives the wrap, where cmd[0] is "sudo".
+            "cmd": list(cmd),
+            "resolved_binary": resolved_binary,
+        }
+
+        # Free-form path: hand the response text back unchanged.
+        # Memory extraction always supplies a schema, so this branch
+        # exists only for future free-form callers; claude, codex,
+        # and opencode keep the symmetric branch.
+        if json_schema is None:
+            log.info(
+                "oneshot_reasoner purpose=%s backend=goose model=%s duration_ms=%d outcome=success returncode=0 os_user=%s",
+                purpose,
+                model,
+                duration_ms,
+                os_user_field,
+            )
+            return OneShotResult(
+                text=response_text,
+                backend="goose",
+                model=model,
+                raw_metadata=raw_metadata,
+                duration_ms=duration_ms,
+            )
+
+        # Schema-backed path. Mirrors the codex and opencode
+        # reasoners: the response text must carry a JSON object, with
+        # `_parse_schema_payload` tolerating fence / prose wrapping
+        # around it; anything it cannot recover is OneShotOutputError
+        # so memory extraction's caller-side mapping collapses it to
+        # the zero-state extraction result instead of letting a
+        # malformed payload reach the fact validator.
+        if not response_text:
+            log.info(
+                "oneshot_reasoner purpose=%s backend=goose model=%s duration_ms=%d outcome=output_error error_category=empty_response returncode=0 os_user=%s",
+                purpose,
+                model,
+                duration_ms,
+                os_user_field,
+            )
+            raise OneShotOutputError("goose produced no response text")
+        try:
+            payload = _parse_schema_payload(response_text)
+        except json.JSONDecodeError as exc:
+            log.info(
+                "oneshot_reasoner purpose=%s backend=goose model=%s duration_ms=%d outcome=output_error error_category=invalid_json returncode=0 os_user=%s",
+                purpose,
+                model,
+                duration_ms,
+                os_user_field,
+            )
+            raise OneShotOutputError(f"goose response text did not contain a JSON object: {exc}") from None
+
+        if not isinstance(payload, dict):
+            log.info(
+                "oneshot_reasoner purpose=%s backend=goose model=%s duration_ms=%d outcome=output_error error_category=non_object_json returncode=0 os_user=%s",
+                purpose,
+                model,
+                duration_ms,
+                os_user_field,
+            )
+            raise OneShotOutputError("goose response JSON was not an object")
+
+        required_fields = json_schema.get("required")
+        if isinstance(required_fields, list):
+            missing = [field for field in required_fields if field not in payload]
+            if missing:
+                log.info(
+                    "oneshot_reasoner purpose=%s backend=goose model=%s duration_ms=%d outcome=output_error error_category=missing_required_fields returncode=0 os_user=%s",
+                    purpose,
+                    model,
+                    duration_ms,
+                    os_user_field,
+                )
+                raise OneShotOutputError(f"goose response JSON missing required fields: {missing}")
+
+        # Wrap goose's schema-shaped payload in the same envelope
+        # claude emits natively (codex and opencode mirror it).
+        # memory_extraction.py already walks the `structured_output`
+        # field on a parsed dict; rewrapping keeps the parser path
+        # provider-neutral.
+        envelope = json.dumps({"is_error": False, "structured_output": payload})
+        log.info(
+            "oneshot_reasoner purpose=%s backend=goose model=%s duration_ms=%d outcome=success returncode=0 os_user=%s",
+            purpose,
+            model,
+            duration_ms,
+            os_user_field,
+        )
+        return OneShotResult(
+            text=envelope,
+            backend="goose",
+            model=model,
+            raw_metadata=raw_metadata,
+            duration_ms=duration_ms,
+        )

@@ -1722,14 +1722,29 @@ class TestExtractionEligibleBackendsHelper:
         eligible = _compute_extraction_eligible_backends("claude", configs, True)
         assert eligible == {"claude", "codex"}
 
-    def test_goose_users_filtered_out(self):
-        """A users.yaml entry with `agent_backend: goose` does NOT
-        contribute to the eligible set, mirroring the runtime gate
-        at bot.py that skips extraction for goose users. The
-        precondition/binary checks must not fire on a goose-only
-        user even when extraction is enabled globally."""
+    def test_goose_users_contribute_to_eligible_set(self):
+        """A users.yaml entry with `agent_backend: goose` contributes
+        to the eligible set now that goose ships a OneShotReasoner;
+        the config-load precondition / binary checks must fire for a
+        goose user the same way they do for the other backends."""
         from kai.config import UserConfig, _compute_extraction_eligible_backends
 
+        configs = {
+            1: UserConfig(telegram_id=1, name="alice", os_user="a"),
+            2: UserConfig(telegram_id=2, name="bob", os_user="b", agent_backend="goose", llm_provider="openai"),
+        }
+        eligible = _compute_extraction_eligible_backends("claude", configs, True)
+        assert eligible == {"claude", "goose"}
+
+    def test_non_reasoner_backends_filtered_out(self, monkeypatch):
+        """The membership gate itself: a backend outside the patched
+        constant does not contribute, even when extraction is enabled
+        globally. Patched rather than exemplified by a real backend
+        because every real backend is currently a member."""
+        import kai.config as config_module
+        from kai.config import UserConfig, _compute_extraction_eligible_backends
+
+        monkeypatch.setattr(config_module, "ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
         configs = {
             1: UserConfig(telegram_id=1, name="alice", os_user="a"),
             2: UserConfig(telegram_id=2, name="bob", os_user="b", agent_backend="goose", llm_provider="openai"),
@@ -3221,24 +3236,18 @@ class TestOneShotReasonerBackendsConstant:
     """
 
     def test_membership(self):
-        """Exactly claude, codex, and opencode have OneShotReasoner
-        implementations in `src/kai/oneshot.py` today. Goose is a
-        valid agent backend (retrieval-only memory installs work) but
-        has no `GooseOneShotReasoner`, so it must NOT be in the
-        constant.
+        """Every backend with a OneShotReasoner implementation in
+        `src/kai/oneshot.py` is a member: claude, codex, opencode,
+        and goose all ship one today.
         """
         assert "claude" in ONESHOT_REASONER_BACKENDS
         assert "codex" in ONESHOT_REASONER_BACKENDS
         assert "opencode" in ONESHOT_REASONER_BACKENDS
-        # Goose-exclusion is load-bearing: collapsing the goose
-        # backend into the one-shot-eligible set would force a goose
-        # operator into memory-extraction / review / triage paths
-        # that the goose backend cannot satisfy.
-        assert "goose" not in ONESHOT_REASONER_BACKENDS
+        assert "goose" in ONESHOT_REASONER_BACKENDS
         # Pin the exact contents so an accidental addition is caught
         # at test time; intentional additions update this assertion
         # in lockstep with the constant's definition.
-        assert frozenset({"claude", "codex", "opencode"}) == ONESHOT_REASONER_BACKENDS
+        assert frozenset({"claude", "codex", "goose", "opencode"}) == ONESHOT_REASONER_BACKENDS
 
     def test_is_frozenset(self):
         """The constant must be a `frozenset` so callers only do

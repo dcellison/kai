@@ -2341,13 +2341,18 @@ class TestCommandDispatch:
 class TestDashboardBackendNote:
     """Users on a backend without a OneShotReasoner never get
     extraction; the dashboard must say so instead of letting the
-    user discover it through facts never accumulating."""
+    user discover it through facts never accumulating. Every real
+    backend is a member of ONESHOT_REASONER_BACKENDS today, so these
+    tests patch the module's constant down to exercise the
+    non-member branch without coupling to any specific excluded
+    backend name."""
 
     @pytest.mark.asyncio
     async def test_note_appended_for_non_reasoner_backend(
         self, monkeypatch, update_factory, context_factory, auth_config
     ):
         auth_config.agent_backend = "goose"
+        monkeypatch.setattr(memory_command, "ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
         monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
         monkeypatch.setattr(
             memory_command.memory,
@@ -2367,6 +2372,7 @@ class TestDashboardBackendNote:
         the note must appear there too, not only on populated
         dashboards."""
         auth_config.agent_backend = "goose"
+        monkeypatch.setattr(memory_command, "ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
         monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
         monkeypatch.setattr(
             memory_command.memory,
@@ -2404,6 +2410,7 @@ class TestDashboardBackendNote:
         user_cfg = MagicMock()
         user_cfg.agent_backend = "goose"
         auth_config.get_user_config.return_value = user_cfg
+        monkeypatch.setattr(memory_command, "ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
         monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
         monkeypatch.setattr(
             memory_command.memory,

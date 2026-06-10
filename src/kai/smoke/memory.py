@@ -47,10 +47,10 @@ log = logging.getLogger("kai.smoke.memory")
 
 
 # Fixed two-turn conversation. The user-asserted preference is stable
-# enough that both claude and codex extractors reliably produce a
-# single fact referencing the anchor substring; the assistant turn
-# carries the conventional acknowledgement shape so the prompt's
-# extraction rules fire on familiar ground.
+# enough that every backend's extractor reliably produces a single
+# fact referencing the anchor substring; the assistant turn carries
+# the conventional acknowledgement shape so the prompt's extraction
+# rules fire on familiar ground.
 _SMOKE_USER_TEXT = "Quick note: I take my coffee with oat milk, no sugar."
 _SMOKE_ASSISTANT_TEXT = "Noted, coffee with oat milk and no sugar."
 _SMOKE_ANCHOR_SUBSTRING = "oat milk"

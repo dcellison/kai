@@ -62,16 +62,17 @@ VALID_BACKENDS = {"claude", "goose", "codex", "opencode"}
 # membership; the constant is immutable at module scope and the
 # type pins that intent.
 #
-# Strict subset of VALID_BACKENDS: every entry here is also a valid
-# agent backend, but not every valid agent backend has a
-# OneShotReasoner. Concrete exclusion: `"goose"` is in
-# VALID_BACKENDS but not here because `src/kai/oneshot.py` has no
-# `GooseOneShotReasoner` class. Goose retrieval-only memory
-# installs work; goose one-shot dispatch (memory extraction, PR
-# review, triage) does not. The two constants stay distinct on
-# purpose; collapsing them would force a goose operator through
-# one-shot-eligibility gates the goose backend cannot satisfy.
-ONESHOT_REASONER_BACKENDS: frozenset[str] = frozenset({"claude", "codex", "opencode"})
+# Subset of VALID_BACKENDS by contract: every entry here is also a
+# valid agent backend, and membership asserts that
+# `src/kai/oneshot.py` ships a OneShotReasoner for it. Today every
+# valid backend qualifies, so the two sets happen to be equal, but
+# they stay distinct constants on purpose: a future backend lands in
+# VALID_BACKENDS first and joins this set only when its reasoner
+# exists, and every extraction-eligibility gate (bot dispatch, config
+# validation, wizard prompts, smoke, the /memory retrieval-only
+# note) keys off this set rather than VALID_BACKENDS so that gap
+# stays representable.
+ONESHOT_REASONER_BACKENDS: frozenset[str] = frozenset({"claude", "codex", "goose", "opencode"})
 
 # The single authoritative (backend, provider) allowlist. Every site
 # that needs to know "what providers can this backend talk to" reads
@@ -1832,10 +1833,9 @@ def _compute_extraction_eligible_backends(
     Return the set of distinct effective backends across extraction-eligible users.
 
     Mirrors `_ingest_memory`'s extraction gate (effective backend in
-    {"claude", "codex", "opencode"}; goose users are filtered out
-    because they have no `OneShotReasoner` implementation). Each user
-    contributes its effective backend (per-user override or global
-    default).
+    ONESHOT_REASONER_BACKENDS; a backend without a OneShotReasoner is
+    filtered out). Each user contributes its effective backend
+    (per-user override or global default).
 
     Returns an empty set when `memory_extraction_enabled` is False;
     callers that gate codex / opencode plumbing or registry validation
@@ -2884,8 +2884,8 @@ def load_config() -> Config:
     # time, so the "is this install in a valid state for memory
     # extraction" question must read the full eligible set rather than
     # a single global backend value. The helper mirrors
-    # `_ingest_memory`'s extraction gate in bot.py (goose users are
-    # filtered out because they have no `OneShotReasoner` implementation).
+    # `_ingest_memory`'s extraction gate in bot.py (membership in
+    # ONESHOT_REASONER_BACKENDS).
     extraction_eligible_backends = _compute_extraction_eligible_backends(
         agent_backend, user_configs, memory_extraction_enabled
     )

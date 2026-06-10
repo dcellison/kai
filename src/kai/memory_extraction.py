@@ -35,6 +35,7 @@ from kai.oneshot import _SUBPROCESS_ENV_ALLOWLIST as _SUBPROCESS_ENV_ALLOWLIST
 from kai.oneshot import (
     ClaudeOneShotReasoner,
     CodexOneShotReasoner,
+    GooseOneShotReasoner,
     OneShotError,
     OneShotReasoner,
     OneShotSubprocessError,
@@ -1888,24 +1889,34 @@ def _resolve_effective_provider(user_id: str, config: Config) -> str:
     return user_cfg.llm_provider or config.llm_provider
 
 
-def _build_memory_reasoner(effective_backend: str, os_user: str | None = None) -> OneShotReasoner:
+def _build_memory_reasoner(
+    effective_backend: str,
+    os_user: str | None = None,
+    provider: str = "",
+) -> OneShotReasoner:
     """
     Build the one-shot reasoner matching the user's effective backend.
 
     Dispatches on the per-user `effective_backend` resolved by
-    `_resolve_effective_backend`. The valid set is "claude" / "codex" /
-    "opencode"; goose users do not reach this site (gated upstream in
-    `bot.py`). The RuntimeError branch is a defensive safety net for
-    a future regression where the upstream gate widens or changes -
-    surfacing as a runtime error rather than silently selecting
-    Claude keeps the failure visible.
+    `_resolve_effective_backend`. The valid set is
+    ONESHOT_REASONER_BACKENDS; the RuntimeError branch is a defensive
+    safety net for a future regression where the upstream gate widens
+    or changes - surfacing as a runtime error rather than silently
+    selecting Claude keeps the failure visible.
 
     `os_user` is resolved once at the top of `extract_and_store` and
-    threaded in. All three reasoners accept `os_user=None` and spawn
+    threaded in. Every reasoner accepts `os_user=None` and spawns
     in-process via the self-sudo-skip path; a non-bot value wraps
     the argv in `sudo -H -u <user>`. Tests monkeypatch this helper
     to inject fake reasoners; the parameters are accepted but not
     inspected on the test side because patches use `return_value=`.
+
+    `provider` is consumed by the goose reasoner only: goose's
+    one-shot argv carries an explicit `--provider` flag, while the
+    other backends encode the provider implicitly (claude/codex are
+    single-provider; opencode embeds it in the model string). The
+    other branches accept and ignore it so the call sites stay
+    uniform.
 
     Returning a fresh instance per call (rather than a module-level
     singleton) keeps the memory path stateless and mirrors the
@@ -1917,6 +1928,8 @@ def _build_memory_reasoner(effective_backend: str, os_user: str | None = None) -
         return CodexOneShotReasoner(os_user=os_user)
     if effective_backend == "opencode":
         return OpenCodeOneShotReasoner(os_user=os_user)
+    if effective_backend == "goose":
+        return GooseOneShotReasoner(os_user=os_user, provider=provider)
     raise RuntimeError(f"extraction reached _build_memory_reasoner for non-extraction backend: {effective_backend!r}")
 
 
@@ -2003,7 +2016,7 @@ async def _run_extractor(
     # returned on failure. JSON envelope parsing stays in this
     # function so memory-domain concerns (is_error, structured_output,
     # facts, has_episode) do not leak into the reasoner.
-    reasoner = _build_memory_reasoner(effective_backend, os_user=os_user)
+    reasoner = _build_memory_reasoner(effective_backend, os_user=os_user, provider=effective_provider)
     # Per-role resolution consults the full precedence chain
     # (per-user `models.memory_extraction` > Config.default_models >
     # MODEL_REGISTRY). Pre-resolved backend / provider are passed as
@@ -2208,7 +2221,7 @@ async def _run_episode_extractor(
     # `os_user` is the routing target resolved once at the top of
     # `extract_and_store` (per-user OS routing); stage 2 inherits the
     # same target so the policy boundary is enforced consistently.
-    reasoner = _build_memory_reasoner(effective_backend, os_user=os_user)
+    reasoner = _build_memory_reasoner(effective_backend, os_user=os_user, provider=effective_provider)
     try:
         result = await reasoner.run(
             prompt=payload_text,

@@ -2202,15 +2202,13 @@ async def _run_cli(args: argparse.Namespace) -> int:
     # _build_parser) means an unset flag yields override="" so the
     # branch below picks the right backend-appropriate default.
     #
-    # MODEL_REGISTRY covers every backend in ONESHOT_REASONER_BACKENDS;
-    # goose's model resolution lives in _GOOSE_AGENT_MODELS dicts inside
-    # triage.py and review.py, not in MODEL_REGISTRY. For goose (and any
-    # other backend that ever sits outside ONESHOT_REASONER_BACKENDS),
-    # preserve the pre-registry behavior: explicit --judge-model /
-    # --gen-model wins, otherwise the legacy _DEFAULT_JUDGE_MODEL /
-    # _DEFAULT_GEN_MODEL constants are used. This keeps the goose path
-    # byte-identical rather than crashing with a LookupError on an
-    # unset flag.
+    # MODEL_REGISTRY covers every backend in ONESHOT_REASONER_BACKENDS,
+    # which is every real backend today. The else arm below survives as
+    # the defensive path for an AGENT_BACKEND env value the registry
+    # does not know (a typo, or a future backend mid-introduction):
+    # explicit --judge-model / --gen-model wins, otherwise the legacy
+    # _DEFAULT_JUDGE_MODEL / _DEFAULT_GEN_MODEL constants are used
+    # rather than crashing with a LookupError on an unset flag.
     eval_backend = os.environ.get("AGENT_BACKEND", "claude").strip().lower()
     # Provider is read from the eval-time LLM_PROVIDER env (the eval
     # gate runs as a developer tool against the operator's configured
@@ -2232,10 +2230,8 @@ async def _run_cli(args: argparse.Namespace) -> int:
             override=args.gen_model or "",
         )
     else:
-        # Non-registry backend (goose). Preserve pre-Phase-1 behavior:
-        # explicit flag wins, otherwise the legacy _DEFAULT_* constant
-        # is used. Codex-aware behavioral wiring on non-registry
-        # backends is Phase 5 scope.
+        # Unrecognized AGENT_BACKEND env value: explicit flag wins,
+        # otherwise the legacy _DEFAULT_* constant is used.
         resolved_judge_model = args.judge_model or _DEFAULT_JUDGE_MODEL
         resolved_gen_model = args.gen_model or _DEFAULT_GEN_MODEL
     config = BehavioralConfig(

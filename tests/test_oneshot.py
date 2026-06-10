@@ -19,10 +19,12 @@ import pytest
 
 from kai.oneshot import (
     _CODEX_ENV_ALLOWLIST,
+    _GOOSE_ENV_ALLOWLIST,
     _OPENCODE_PRESERVED_AUTH_VARS,
     _SUBPROCESS_ENV_ALLOWLIST,
     ClaudeOneShotReasoner,
     CodexOneShotReasoner,
+    GooseOneShotReasoner,
     OneShotOutputError,
     OneShotResult,
     OneShotRoutingError,
@@ -31,6 +33,7 @@ from kai.oneshot import (
     OpenCodeOneShotReasoner,
     _parse_schema_payload,
     _preserved_auth_vars_for,
+    _render_goose_stdin,
     _render_opencode_session_prompt,
 )
 
@@ -63,6 +66,8 @@ def _mock_binary_resolver():
             return "codex"
         if backend == "opencode":
             return "opencode"
+        if backend == "goose":
+            return "goose"
         raise ValueError(f"unknown backend: {backend!r}")
 
     with patch("kai.oneshot.resolve_oneshot_binary", side_effect=fake_resolve):
@@ -2827,3 +2832,294 @@ class TestOpenCodeOneShotReasonerSudoWrap:
 
         spawn_kwargs = mock_exec.call_args_list[0].kwargs
         assert spawn_kwargs["start_new_session"] is True
+
+
+# ── Goose reasoner tests ─────────────────────────────────────────────
+
+
+class TestGooseOneShotReasonerArgvAndEnv:
+    """Argv shape, provider wire-name translation, stdin payload, and
+    the env allow-list of the goose one-shot."""
+
+    @pytest.mark.asyncio
+    async def test_argv_shape_with_provider_translation(self, tmp_path):
+        """The full `goose run` argv, with the Kai provider key
+        translated to goose's wire name (deepseek is custom_deepseek
+        on the goose side) and the registry model untranslated."""
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="deepseek")
+        proc = _make_proc(stdout=b'{"facts": [], "has_episode": false}')
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                model="deepseek-v4-flash",
+                json_schema={"type": "object"},
+            )
+        cmd = list(mock_exec.call_args[0])
+        assert cmd == [
+            "goose",
+            "run",
+            "-i",
+            "-",
+            "--provider",
+            "custom_deepseek",
+            "--model",
+            "deepseek-v4-flash",
+            "-q",
+            "--no-session",
+            "--no-profile",
+            "--max-turns",
+            "1",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_argv_omits_provider_when_empty(self, tmp_path):
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_proc(stdout=b"{}")
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await reasoner.run(prompt="p", purpose="fact_extraction", model="m", json_schema={"type": "object"})
+        cmd = list(mock_exec.call_args[0])
+        assert "--provider" not in cmd
+
+    @pytest.mark.asyncio
+    async def test_argv_omits_model_when_none(self, tmp_path):
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="anthropic")
+        proc = _make_proc(stdout=b"{}")
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
+        cmd = list(mock_exec.call_args[0])
+        assert "--model" not in cmd
+        assert cmd[4] == "--provider"
+        assert cmd[5] == "anthropic"
+
+    @pytest.mark.asyncio
+    async def test_stdin_wraps_system_prompt_in_boundary(self, tmp_path):
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="anthropic")
+        proc = _make_proc(stdout=b"{}")
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            await reasoner.run(
+                prompt="USER TEXT",
+                system_prompt="SYSTEM TEXT",
+                purpose="fact_extraction",
+                json_schema={"type": "object"},
+            )
+        payload = proc.communicate.call_args.kwargs["input"].decode("utf-8")
+        assert "--- BEGIN SYSTEM " in payload
+        assert "SYSTEM TEXT" in payload
+        assert payload.endswith("USER TEXT")
+
+    @pytest.mark.asyncio
+    async def test_stdin_omits_boundary_when_no_system_prompt(self, tmp_path):
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="anthropic")
+        proc = _make_proc(stdout=b"{}")
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            await reasoner.run(prompt="USER TEXT", purpose="fact_extraction", json_schema={"type": "object"})
+        payload = proc.communicate.call_args.kwargs["input"].decode("utf-8")
+        assert payload == "USER TEXT"
+
+    @pytest.mark.asyncio
+    async def test_env_contains_only_allowlisted_keys(self, tmp_path, monkeypatch):
+        """Secrets outside the allow-list must not reach the goose
+        subprocess; GOOSE_MODEL / GOOSE_PROVIDER stay out too because
+        the one-shot passes both as argv flags."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "key")
+        monkeypatch.setenv("GOOSE_MODEL", "leak-model")
+        monkeypatch.setenv("GOOSE_PROVIDER", "leak-provider")
+        monkeypatch.setenv("KAI_WEBHOOK_SECRET", "leak-secret")
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "leak-token")
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="anthropic")
+        proc = _make_proc(stdout=b"{}")
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
+        env = mock_exec.call_args.kwargs["env"]
+        assert env["ANTHROPIC_API_KEY"] == "key"
+        assert set(env) <= set(_GOOSE_ENV_ALLOWLIST)
+        assert "GOOSE_MODEL" not in env
+        assert "GOOSE_PROVIDER" not in env
+        assert "KAI_WEBHOOK_SECRET" not in env
+        assert "TELEGRAM_BOT_TOKEN" not in env
+
+
+class TestGooseOneShotReasonerOutput:
+    """Free-form and schema-backed output contracts, mirroring the
+    codex / opencode reasoner suites."""
+
+    @pytest.mark.asyncio
+    async def test_non_schema_returns_stripped_text(self, tmp_path):
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="anthropic")
+        proc = _make_proc(stdout=b"  free-form review text  \n")
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(prompt="p", purpose="pr_review", json_schema=None)
+        assert isinstance(result, OneShotResult)
+        assert result.backend == "goose"
+        assert result.text == "free-form review text"
+
+    @pytest.mark.asyncio
+    async def test_schema_backed_success_returns_normalized_envelope(self, tmp_path):
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="deepseek")
+        payload = {"facts": [{"content": "x"}], "has_episode": False}
+        proc = _make_proc(stdout=json.dumps(payload).encode())
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                model="deepseek-v4-flash",
+                json_schema={"type": "object"},
+            )
+        envelope = json.loads(result.text)
+        assert envelope == {"is_error": False, "structured_output": payload}
+        assert result.raw_metadata["resolved_binary"] == "goose"
+
+    @pytest.mark.asyncio
+    async def test_schema_backed_recovers_fenced_payload_with_preamble(self, tmp_path):
+        """Goose has no structured-output channel, so models that
+        narrate and fence (deepseek-v4-flash does both) must still
+        reach the envelope via the tolerant parser."""
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="deepseek")
+        body = 'Let me analyze the exchange.\n\n```json\n{"facts": [], "has_episode": false}\n```'
+        proc = _make_proc(stdout=body.encode())
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema={"type": "object", "required": ["facts", "has_episode"]},
+            )
+        envelope = json.loads(result.text)
+        assert envelope == {
+            "is_error": False,
+            "structured_output": {"facts": [], "has_episode": False},
+        }
+
+    @pytest.mark.asyncio
+    async def test_empty_response_raises_output_error(self, tmp_path):
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="anthropic")
+        proc = _make_proc(stdout=b"   \n")
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(OneShotOutputError),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_raises_output_error(self, tmp_path):
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="anthropic")
+        proc = _make_proc(stdout=b"not json at all")
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(OneShotOutputError),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("non_object_payload", ['"a plain string"', "[]", "42", "true", "null"])
+    async def test_non_object_json_raises_output_error(self, tmp_path, non_object_payload):
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="anthropic")
+        proc = _make_proc(stdout=non_object_payload.encode())
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(OneShotOutputError),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
+
+    @pytest.mark.asyncio
+    async def test_missing_required_fields_raises_output_error(self, tmp_path):
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="anthropic")
+        proc = _make_proc(stdout=b'{"facts": []}')
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(OneShotOutputError) as excinfo,
+        ):
+            await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema={"type": "object", "required": ["facts", "has_episode"]},
+            )
+        assert "has_episode" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_non_zero_exit_raises_subprocess_error(self, tmp_path):
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="anthropic")
+        proc = _make_proc(stdout=b"", stderr=b"boom", returncode=3)
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(OneShotSubprocessError) as excinfo,
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
+        assert excinfo.value.returncode == 3
+        assert excinfo.value.stderr == b"boom"
+
+    @pytest.mark.asyncio
+    async def test_timeout_kills_and_raises(self, tmp_path):
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="anthropic")
+        proc = _make_proc(raise_timeout=True)
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(OneShotTimeout),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", timeout=0.01, json_schema={"type": "object"})
+        proc.kill.assert_called_once()
+        proc.wait.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_binary_resolution_failure_raises_routing_error(self, tmp_path):
+        from kai.oneshot_binary import BinaryResolutionError
+
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="anthropic")
+        with (
+            patch(
+                "kai.oneshot.resolve_oneshot_binary",
+                side_effect=BinaryResolutionError("could not resolve goose binary"),
+            ),
+            pytest.raises(OneShotRoutingError),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
+
+
+class TestGooseStdinRender:
+    """`_render_goose_stdin` boundary contract."""
+
+    def test_none_system_prompt_returns_prompt_unchanged(self):
+        assert _render_goose_stdin(None, "hello") == "hello"
+
+    def test_empty_system_prompt_returns_prompt_unchanged(self):
+        assert _render_goose_stdin("", "hello") == "hello"
+
+    def test_system_prompt_rides_boundary_block(self):
+        rendered = _render_goose_stdin("SYS", "USER")
+        assert rendered.index("SYS") < rendered.index("USER")
+        assert "--- BEGIN SYSTEM " in rendered
+        assert "--- END SYSTEM " in rendered
+
+
+@pytest.mark.routing_test
+class TestGooseRouting:
+    """Sudo wrap and preserve-env contract for the goose one-shot,
+    mirroring the codex / opencode routing classes."""
+
+    @pytest.mark.asyncio
+    async def test_goose_runs_in_process_when_os_user_matches_bot(self, tmp_path):
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="anthropic")
+        proc = _make_proc(stdout=b"{}")
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
+        cmd = mock_exec.call_args[0]
+        assert cmd[0] != "sudo"
+        assert mock_exec.call_args.kwargs["start_new_session"] is False
+
+    @pytest.mark.asyncio
+    async def test_goose_wraps_with_preserve_env(self, tmp_path):
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user="other-user", provider="deepseek")
+        proc = _make_proc(stdout=b"{}")
+        with (
+            patch("kai.oneshot.resolve_claude_user", return_value="other-user"),
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec,
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
+        cmd = list(mock_exec.call_args[0])
+        assert cmd[:4] == ["sudo", "-H", "-u", "other-user"]
+        assert cmd[4] == (
+            "--preserve-env=ANTHROPIC_API_KEY,OPENAI_API_KEY,GOOGLE_API_KEY,OPENROUTER_API_KEY,DEEPSEEK_API_KEY"
+        )
+        assert cmd[5] == "--"
+        assert cmd[6] == "goose"
+        assert mock_exec.call_args.kwargs["start_new_session"] is True

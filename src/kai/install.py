@@ -377,6 +377,20 @@ def _validate_opencode_bin(value: str) -> bool:
     return p.is_file() and os.access(p, os.X_OK)
 
 
+def _validate_goose_bin(value: str) -> bool:
+    """Return True when the path exists and is executable.
+
+    Required by the goose wizard prompt; same dual consumer as the
+    codex and opencode validators above (runtime GOOSE_BIN env var
+    plus the per-user sudoers rule), and the same is-file plus
+    executable body because the underlying requirement is the same.
+    """
+    if not value:
+        return False
+    p = Path(value)
+    return p.is_file() and os.access(p, os.X_OK)
+
+
 def _install_staging_path(filename: str) -> Path:
     """Return the per-operator staging path for a first-time install file.
 
@@ -824,6 +838,10 @@ def _cmd_config() -> None:
     # persistence gate at the tail of this function skips emitting
     # OPENCODE_BIN to install.conf.
     opencode_bin = ""
+    # Goose binary path: same collection and persistence shape as
+    # opencode above (global-goose block, extraction defense-in-depth
+    # re-prompt, empty-skip persistence gate for GOOSE_BIN).
+    goose_bin = ""
     if agent_backend == "codex":
         codex_auth_mode = _prompt_choice(
             "Codex auth mode",
@@ -899,6 +917,30 @@ def _cmd_config() -> None:
         print("    <service_user> ~$ opencode auth login")
         print("  Kai writes the active model into OPENCODE_CONFIG_CONTENT at process spawn;")
         print("  OpenCode resolves it against the credentials in ~/.local/share/opencode/auth.json.")
+
+    # Goose setup: binary-path wizard prompt. Mirrors the opencode
+    # block above: the wizard-persisted path drives /etc/kai/env's
+    # GOOSE_BIN and the per-user sudoers SETENV rule from one source
+    # of truth, and resolve_oneshot_binary("goose") prefers it over
+    # PATH discovery at run time. Default suggestion uses `which
+    # goose` from the operator's PATH (Homebrew installs land there);
+    # falls back to the empty string when which finds nothing so the
+    # operator types the path explicitly rather than accepting a
+    # wrong default. Provider auth needs no extra reminder here: the
+    # provider prompt below collects the API key for key-based
+    # providers, and keychain auth via `goose configure` is per-user
+    # and out of band.
+    if agent_backend == "goose":
+        while True:
+            which_goose = shutil.which("goose") or ""
+            goose_bin = _prompt(
+                "Goose binary path",
+                existing_env.get("GOOSE_BIN", which_goose),
+                required=True,
+            )
+            if _validate_goose_bin(goose_bin):
+                break
+            print(f"  Path '{goose_bin}' does not exist or is not executable.")
 
     # Multi-provider backends (opencode, goose): operator picks the
     # provider that drives the (backend, provider, role) registry
@@ -1258,12 +1300,12 @@ def _cmd_config() -> None:
         "Enable semantic memory (Mem0 + Qdrant)",
         existing_env.get("MEMORY_ENABLED", "false").lower() in ("1", "true", "yes"),
     )
-    # Codex memory is supported. Both claude and codex agent backends
-    # can run semantic memory with a backend-matched reasoner; the
-    # reasoner_backend prompt below resolves which subprocess runs
-    # the extraction. The historical "codex disables memory" guard
-    # was removed once OneShotReasoner abstracted away the claude-
-    # only assumption in memory_extraction.
+    # Every backend in ONESHOT_REASONER_BACKENDS can run semantic
+    # memory with a backend-matched reasoner; extraction dispatches
+    # per user at runtime via memory_extraction._build_memory_reasoner.
+    # The historical "codex disables memory" guard was removed once
+    # OneShotReasoner abstracted away the claude-only assumption in
+    # memory_extraction.
     # Defaults match the dataclass values in config.py. Only non-defaults
     # (or memory_enabled=true itself) are written to the env dict below.
     memory_extraction_enabled = False
@@ -1360,6 +1402,24 @@ def _cmd_config() -> None:
                         if _validate_opencode_bin(opencode_bin):
                             break
                         print(f"  Path '{opencode_bin}' does not exist or is not executable.")
+                # Same defense-in-depth shape for the goose global
+                # backend: the global-goose block above collects
+                # goose_bin on the normal flow; this gate covers a
+                # future refactor that reaches the extraction prompts
+                # with goose_bin still empty. Defaults mirror the
+                # global block (`which goose`, else empty so the
+                # operator types the path explicitly).
+                if agent_backend == "goose" and not goose_bin:
+                    while True:
+                        which_goose = shutil.which("goose") or ""
+                        goose_bin = _prompt(
+                            "Goose binary path (required by goose memory reasoner)",
+                            existing_env.get("GOOSE_BIN", which_goose),
+                            required=True,
+                        )
+                        if _validate_goose_bin(goose_bin):
+                            break
+                        print(f"  Path '{goose_bin}' does not exist or is not executable.")
                 # Extraction timeout is the LLM-call hard cap inside
                 # memory_extraction.py:541. Default 10s is too aggressive
                 # for production - real extractions routinely take 20-30s
@@ -1563,6 +1623,12 @@ def _cmd_config() -> None:
     # two cannot drift.
     if opencode_bin:
         env["OPENCODE_BIN"] = opencode_bin
+    # Same gating shape again for goose: persist only when the wizard
+    # collected a value, so non-goose installs do not carry an empty
+    # GOOSE_BIN= line. The single emission drives both /etc/kai/env's
+    # GOOSE_BIN and the sudoers SETENV rule so the two cannot drift.
+    if goose_bin:
+        env["GOOSE_BIN"] = goose_bin
 
     # Remove stale renamed keys if present - leaving both the old and
     # new key causes silent confusion (the deprecation warning is
@@ -2319,6 +2385,7 @@ def _generate_sudoers(
     os_users: Iterable[str] = (),
     codex_bin: str | None = None,
     opencode_bin: str | None = None,
+    goose_bin: str | None = None,
 ) -> str:
     """
     Generate sudoers rules for the service user to read protected config files.
@@ -2332,7 +2399,7 @@ def _generate_sudoers(
     in the current PATH (e.g., when running in a minimal environment).
 
     Per-user `(target_user) SETENV: NOPASSWD:` rules for the claude, codex,
-    and opencode binaries (plus a `NOPASSWD: /bin/kill` rule for the
+    opencode, and goose binaries (plus a `NOPASSWD: /bin/kill` rule for the
     cross-user kill escalation) are emitted for every distinct `os_user`
     value in users.yaml. Users matching `service_user` are skipped (the
     runtime detects self-sudo via resolve_claude_user() and spawns the
@@ -2341,7 +2408,9 @@ def _generate_sudoers(
     env var at install time. The opencode rule uses the service user's
     `~/.local/bin/opencode` path (where the upstream installer drops the
     binary by default); operators with a custom install location can
-    override via OPENCODE_BIN.
+    override via OPENCODE_BIN. The goose rule defaults to
+    /opt/homebrew/bin/goose (the Homebrew cask location) with the same
+    GOOSE_BIN override shape.
 
     Args:
         service_user: The OS username that runs the Kai service.
@@ -2419,6 +2488,12 @@ def _generate_sudoers(
         # override via OPENCODE_BIN (the wizard prompts for and
         # persists the value the same way CODEX_BIN is handled).
         opencode_bin_resolved = opencode_bin or f"{svc_home}/.local/bin/opencode"
+        # Goose binary path. Homebrew's block-goose-cli cask drops the
+        # binary under /opt/homebrew/bin/goose on macOS; the wizard
+        # prompts for and persists GOOSE_BIN the same way CODEX_BIN
+        # and OPENCODE_BIN are handled, so the fallback fires only on
+        # a first-time install where the wizard has not run yet.
+        goose_bin_resolved = goose_bin or "/opt/homebrew/bin/goose"
         # kill(1) for the cross-user kill escalation (#456). The bot
         # runs `sudo -n -u <target> /bin/kill -<sig> <pid>` against
         # the inner claude grandchild because POSIX signal permissions
@@ -2434,9 +2509,9 @@ def _generate_sudoers(
         # rationale as the claude_bin fix in PR #455.
         kill_bin = "/bin/kill"
         # SETENV: allows the service user to pass env vars (e.g.,
-        # KAI_WEBHOOK_SECRET) through sudo to claude and codex.
-        # Scoped to the claude and codex rules; the kill rule does
-        # not need SETENV (kill ignores env entirely), and the
+        # KAI_WEBHOOK_SECRET, provider API keys) through sudo to the
+        # agent binaries. Scoped to the agent rules; the kill rule
+        # does not need SETENV (kill ignores env entirely), and the
         # cat/tee config-read rules above remain locked down.
         #
         # Scope note for the generated rules below (also surfaced
@@ -2457,10 +2532,10 @@ def _generate_sudoers(
         rules += textwrap.dedent("""\
 
             # Per-target sudoers rules for the cross-os-user inner agent spawn.
-            # The claude, codex, and opencode rules grant arbitrary code execution
-            # as <target> (all three agents have Bash/Read/Write tools); the kill
-            # rule grants signal delivery to any <target>-owned process. The kill
-            # rule's scope is broader than a PID-locked rule because sudoers
+            # The claude, codex, opencode, and goose rules grant arbitrary code
+            # execution as <target> (all four agents have shell/file tools); the
+            # kill rule grants signal delivery to any <target>-owned process. The
+            # kill rule's scope is broader than a PID-locked rule because sudoers
             # argument matching is not safe per sudo(8). The kill rule is a strict
             # subset of capabilities the agent rules already provide; the practical
             # delta is zero.
@@ -2469,6 +2544,7 @@ def _generate_sudoers(
             rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {claude_bin}\n"
             rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {codex_bin_resolved}\n"
             rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {opencode_bin_resolved}\n"
+            rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {goose_bin_resolved}\n"
             rules += f"{service_user} ALL=({target}) NOPASSWD: {kill_bin}\n"
 
     return rules
@@ -3658,6 +3734,11 @@ def _cmd_apply() -> None:
         env_opencode_bin = os.environ.get("OPENCODE_BIN")
         if env_opencode_bin and env.get("AGENT_BACKEND") == "opencode":
             env["OPENCODE_BIN"] = env_opencode_bin
+        # And for GOOSE_BIN, completing the per-backend trio. Same
+        # global-AGENT_BACKEND gating posture as the two above.
+        env_goose_bin = os.environ.get("GOOSE_BIN")
+        if env_goose_bin and env.get("AGENT_BACKEND") == "goose":
+            env["GOOSE_BIN"] = env_goose_bin
         # AGENT_TIMEOUT_SECONDS migration. Operators upgrading without
         # re-running the wizard carry the legacy CLAUDE_TIMEOUT_SECONDS
         # key in install.conf; rewrite to the canonical name at apply
@@ -3696,6 +3777,7 @@ def _cmd_apply() -> None:
             dry_run,
             codex_bin=env.get("CODEX_BIN"),
             opencode_bin=env.get("OPENCODE_BIN"),
+            goose_bin=env.get("GOOSE_BIN"),
             agent_backend=env.get("AGENT_BACKEND", "claude"),
         )
 
@@ -4807,6 +4889,7 @@ def _apply_sudoers(
     users_yaml_path: str | Path = "/etc/kai/users.yaml",
     codex_bin: str | None = None,
     opencode_bin: str | None = None,
+    goose_bin: str | None = None,
     agent_backend: str = "claude",
 ) -> None:
     """
@@ -4817,13 +4900,14 @@ def _apply_sudoers(
     matching SETENV: NOPASSWD: rule. Without this, hand-added per-user rules
     were silently wiped on every `sudo make install`.
 
-    `codex_bin` and `opencode_bin` are threaded from `_cmd_apply`'s env
-    dict (which sources them from install.conf, after the apply-time
-    env-var override block) so the SETENV rules pin the same absolute
-    paths the running bot will invoke. `codex_bin` falls back to
-    /opt/homebrew/bin/codex; `opencode_bin` falls back to the service
-    user's `~/.local/bin/opencode`. Both fallbacks fire only on first-
-    time installs where the wizard has not run yet.
+    `codex_bin`, `opencode_bin`, and `goose_bin` are threaded from
+    `_cmd_apply`'s env dict (which sources them from install.conf,
+    after the apply-time env-var override block) so the SETENV rules
+    pin the same absolute paths the running bot will invoke.
+    `codex_bin` falls back to /opt/homebrew/bin/codex; `opencode_bin`
+    falls back to the service user's `~/.local/bin/opencode`;
+    `goose_bin` falls back to /opt/homebrew/bin/goose. The fallbacks
+    fire only on first-time installs where the wizard has not run yet.
 
     `agent_backend` is the install's global backend (the env dict's
     AGENT_BACKEND, defaulting to claude when the key is absent, which
@@ -4842,6 +4926,7 @@ def _apply_sudoers(
         os_users,
         codex_bin=codex_bin,
         opencode_bin=opencode_bin,
+        goose_bin=goose_bin,
     )
 
     # Backstop check: each per-user rule pins a backend binary to a
@@ -4855,12 +4940,10 @@ def _apply_sudoers(
     # global agent_backend plus any per-user agent_backend overrides
     # in users.yaml): telling an opencode-only operator to install
     # claude would manufacture a requirement that does not exist and
-    # train operators to ignore the warning. Goose has no entry in the
-    # map because it has no per-user sudoers rule (it always runs as
-    # the service user). The rules themselves are still emitted for
-    # all three binaries: a rule pointing at an absent path is inert,
-    # and unconditional emission means a later backend switch cannot
-    # strand a user without a rule.
+    # train operators to ignore the warning. The rules themselves are
+    # still emitted for all four binaries: a rule pointing at an
+    # absent path is inert, and unconditional emission means a later
+    # backend switch cannot strand a user without a rule.
     if os_users:
         backends_in_use = {agent_backend} | _collect_backends_from_yaml(users_yaml_path)
         svc_home = _user_home(service_user)
@@ -4884,6 +4967,11 @@ def _apply_sudoers(
                 Path(opencode_bin or f"{svc_home}/.local/bin/opencode"),
                 "Re-run 'make config' and point OPENCODE_BIN at the actual "
                 "opencode install location to keep the rule and runtime in sync.",
+            ),
+            "goose": (
+                Path(goose_bin or "/opt/homebrew/bin/goose"),
+                "Re-run 'make config' and point GOOSE_BIN at the actual goose "
+                "install location to keep the rule and runtime in sync.",
             ),
         }
         for backend in sorted(backends_in_use & expected_bins.keys()):

@@ -957,14 +957,29 @@ class TestBackendAwareModelResolution:
             asyncio.run(behavioral._run_cli(args))
         return captured["config"]
 
-    def test_goose_unset_flag_falls_back_to_legacy_constant(self, tmp_path, monkeypatch):
+    def test_goose_unset_flag_uses_registry(self, tmp_path, monkeypatch):
         """
-        On a goose-backed install, an unset --judge-model must NOT trigger
-        get_model_for("goose", BEHAVIORAL_JUDGE) (no registry row, would
-        raise LookupError). The fallback path uses _DEFAULT_JUDGE_MODEL,
-        matching pre-Phase-1 behavior.
+        Goose is a registry-resolved backend: an unset flag resolves
+        through the (goose, provider, role) rows the same way claude
+        does. LLM_PROVIDER is required env on goose installs, so the
+        eval reads it the same way the runtime does.
         """
+        from kai.config import ModelRole, get_model_for
+
         monkeypatch.setenv("AGENT_BACKEND", "goose")
+        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        args = self._make_args(tmp_path)  # judge_model=None, gen_model=None
+        config = self._run_with_captured_config(args)
+        assert config.judge_model == get_model_for(ModelRole.BEHAVIORAL_JUDGE, "goose", "anthropic")
+        assert config.gen_model == get_model_for(ModelRole.BEHAVIORAL_GEN, "goose", "anthropic")
+
+    def test_unrecognized_backend_falls_back_to_legacy_constant(self, tmp_path, monkeypatch):
+        """
+        An AGENT_BACKEND env value the registry does not know must NOT
+        trigger get_model_for (no registry row, would raise
+        LookupError). The fallback path uses _DEFAULT_JUDGE_MODEL.
+        """
+        monkeypatch.setenv("AGENT_BACKEND", "nonexistent")
         args = self._make_args(tmp_path)  # judge_model=None, gen_model=None
         config = self._run_with_captured_config(args)
         assert config.judge_model == behavioral._DEFAULT_JUDGE_MODEL

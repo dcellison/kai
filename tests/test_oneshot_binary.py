@@ -195,6 +195,76 @@ class TestOpenCodeResolution:
         assert called == [], f"shutil.which should not be called when OPENCODE_BIN is set; got {called}"
 
 
+class TestGooseResolution:
+    """Goose arm mirrors the codex / opencode pattern: GOOSE_BIN
+    override validates as is-file plus executable with no PATH
+    fallback; no override falls back to shutil.which("goose")."""
+
+    def test_no_override_resolves_via_path(self, monkeypatch):
+        monkeypatch.delenv("GOOSE_BIN", raising=False)
+        monkeypatch.setattr(
+            "kai.oneshot_binary.shutil.which",
+            lambda name: "/fake/path/goose" if name == "goose" else None,
+        )
+        assert resolve_oneshot_binary("goose") == "/fake/path/goose"
+
+    def test_no_override_unreachable_raises_naming_both_candidates(self, monkeypatch):
+        monkeypatch.delenv("GOOSE_BIN", raising=False)
+        monkeypatch.setattr("kai.oneshot_binary.shutil.which", lambda name: None)
+        with pytest.raises(BinaryResolutionError) as exc:
+            resolve_oneshot_binary("goose")
+        message = str(exc.value)
+        assert "GOOSE_BIN" in message
+        assert "PATH" in message
+
+    def test_explicit_override_resolves_to_exact_path(self, tmp_path, monkeypatch):
+        fake = tmp_path / "goose-binary"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("GOOSE_BIN", str(fake))
+        monkeypatch.setattr("kai.oneshot_binary.shutil.which", lambda name: "/other/goose")
+        assert resolve_oneshot_binary("goose") == str(fake)
+
+    def test_explicit_override_not_a_file_raises_not_a_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GOOSE_BIN", str(tmp_path / "does-not-exist"))
+        monkeypatch.setattr("kai.oneshot_binary.shutil.which", lambda name: "/should/not/be/returned")
+        with pytest.raises(BinaryResolutionError) as exc:
+            resolve_oneshot_binary("goose")
+        message = str(exc.value)
+        assert "not-a-file" in message
+        assert "does-not-exist" in message
+
+    def test_explicit_override_not_executable_raises_not_executable(self, tmp_path, monkeypatch):
+        fake = tmp_path / "goose-not-x"
+        fake.write_text("not-a-script")
+        fake.chmod(0o644)
+        monkeypatch.setenv("GOOSE_BIN", str(fake))
+        monkeypatch.setattr("kai.oneshot_binary.shutil.which", lambda name: "/should/not/be/returned")
+        with pytest.raises(BinaryResolutionError) as exc:
+            resolve_oneshot_binary("goose")
+        message = str(exc.value)
+        assert "not-executable" in message
+        assert str(fake) in message
+
+    def test_explicit_override_no_fallback_to_path(self, tmp_path, monkeypatch):
+        """GOOSE_BIN set to a bad path must NOT silently fall back to
+        shutil.which('goose'). Same regression guard as the codex and
+        opencode arms; a fallback would hide stale-config bugs from
+        the operator."""
+        monkeypatch.setenv("GOOSE_BIN", str(tmp_path / "missing"))
+
+        called: list[str] = []
+
+        def fake_which(name):
+            called.append(name)
+            return "/some/goose"
+
+        monkeypatch.setattr("kai.oneshot_binary.shutil.which", fake_which)
+        with pytest.raises(BinaryResolutionError):
+            resolve_oneshot_binary("goose")
+        assert called == [], f"shutil.which should not be called when GOOSE_BIN is set; got {called}"
+
+
 class TestUnknownBackend:
     def test_unknown_backend_raises_value_error(self):
         """An unknown backend string is a CALLER bug (config validation

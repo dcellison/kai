@@ -1,13 +1,14 @@
 """
 Shared agent-binary resolver for the one-shot reasoner family.
 
-Single source of truth for "where is the claude/codex/opencode binary."
+Single source of truth for "where is the agent binary" across the
+one-shot backends (claude, codex, opencode, goose).
 `kai.config.load_config()` uses this to fail-fast at startup when the
-memory reasoner backend points at an unreachable binary;
-`kai.oneshot.{Claude,Codex,OpenCode}OneShotReasoner` uses it to build
-argv with the resolved absolute path; `kai.smoke.memory` reads the
-resolved binary from `OneShotResult.raw_metadata["resolved_binary"]`
-to show the operator which binary actually ran.
+memory reasoner backend points at an unreachable binary; the
+`kai.oneshot` reasoner classes use it to build argv with the resolved
+absolute path; `kai.smoke.memory` reads the resolved binary from
+`OneShotResult.raw_metadata["resolved_binary"]` to show the operator
+which binary actually ran.
 
 Module is a leaf by design: imports `os`, `shutil`, `pathlib` only.
 Neither `kai.config` nor `kai.oneshot` is imported here. The
@@ -144,6 +145,25 @@ def resolve_oneshot_binary(backend: str) -> str:
         resolved = shutil.which("opencode")
         if resolved is None:
             raise BinaryResolutionError("could not resolve opencode binary: OPENCODE_BIN unset, `opencode` not on PATH")
+        return resolved
+
+    if backend == "goose":
+        # Structural mirror of the codex / opencode arms. GOOSE_BIN,
+        # when set, is validated as a configuration error with no
+        # PATH fallback; unset falls through to PATH discovery, which
+        # covers the common Homebrew install where `goose` is already
+        # resolvable from the service user's shell.
+        override = os.environ.get("GOOSE_BIN")
+        if override:
+            override_path = Path(override)
+            if not override_path.is_file():
+                raise BinaryResolutionError(f"could not resolve goose binary: GOOSE_BIN={override!r} not-a-file")
+            if not os.access(str(override_path), os.X_OK):
+                raise BinaryResolutionError(f"could not resolve goose binary: GOOSE_BIN={override!r} not-executable")
+            return str(override_path)
+        resolved = shutil.which("goose")
+        if resolved is None:
+            raise BinaryResolutionError("could not resolve goose binary: GOOSE_BIN unset, `goose` not on PATH")
         return resolved
 
     # Unknown backend. Unlike a resolution miss this is a caller bug

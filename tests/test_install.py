@@ -1409,6 +1409,7 @@ class TestCmdConfig:
                 "false",  # advanced user options
                 "polling",  # transport
                 "goose",  # agent backend (prompt shown because existing config has goose)
+                "/bin/sh",  # goose binary path (any existing executable)
                 "anthropic",  # goose provider
                 "sk-ant-test-key",  # ANTHROPIC_API_KEY
                 "sonnet",  # model
@@ -1439,16 +1440,17 @@ class TestCmdConfig:
         assert conf["env"]["AGENT_BACKEND"] == "goose"
         assert conf["env"]["LLM_PROVIDER"] == "anthropic"
         assert conf["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
+        assert conf["env"]["GOOSE_BIN"] == "/bin/sh"
         # Memory was declined, so the retrieval-only note must not
         # print; it belongs only to the memory-enabled flow.
         out = capsys.readouterr().out
         assert "retrieval-only" not in out
 
-    def test_goose_memory_enabled_prints_retrieval_only_note(self, tmp_path, monkeypatch, capsys):
-        """Goose plus memory: the extraction prompts are skipped (no
-        OneShotReasoner), and the operator must be told the result is
-        retrieval-only rather than discovering it through facts never
-        accumulating."""
+    def test_goose_memory_enabled_walks_extraction_prompts(self, tmp_path, monkeypatch, capsys):
+        """Goose plus memory now walks the extraction prompts: goose
+        ships a OneShotReasoner, so the wizard treats it like the
+        other reasoner backends and the retrieval-only note does not
+        print."""
         monkeypatch.chdir(tmp_path)
         conf_path = tmp_path / "install.conf"
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
@@ -1459,40 +1461,50 @@ class TestCmdConfig:
         existing = {"version": 1, "env": {"AGENT_BACKEND": "goose"}}
         conf_path.write_text(json.dumps(existing))
 
-        inputs = iter(
-            [
-                "protected",  # deployment mode
-                "/opt/kai",  # install dir
-                "/var/lib/kai",  # data dir
-                "kai",  # service user
-                "darwin",  # platform
-                "fake-token",  # bot token
-                "12345",  # admin telegram ID
-                "admin",  # admin display name
-                "false",  # advanced user options
-                "polling",  # transport
-                "goose",  # agent backend
-                "anthropic",  # goose provider
-                "sk-ant-test-key",  # ANTHROPIC_API_KEY
-                "sonnet",  # model
-                "false",  # customize per-role models
-                "120",  # timeout
-                "0",  # max session age hours
-                "1800",  # idle eviction timeout seconds
-                "8080",  # port
-                "test-secret",  # webhook secret
-                "~/Projects",  # workspace base
-                "",  # allowed workspaces (empty)
-                "300",  # pr review cooldown (global resource control)
-                "900",  # pr review timeout
-                "false",  # voice
-                "false",  # tts
-                "true",  # memory enabled
-                "2000",  # memory token budget (extraction prompts skipped)
-                "10",  # memory search limit
-                "",  # perplexity key (empty)
-            ]
-        )
+        memory_block = [
+            "true",  # memory enabled
+            "true",  # memory extraction enabled (now prompted on goose)
+            "60",  # per-extraction timeout (non-default so it persists)
+            "8",  # consolidation candidates
+            "3",  # episode classifier context turns
+            "120",  # per-episode timeout
+            "0.9",  # paraphrase-dedup threshold
+            "2000",  # memory token budget
+            "10",  # memory search limit
+        ]
+        inputs = iter(self._base_inputs(memory_block, agent_backend="goose"))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        out = capsys.readouterr().out
+        assert "retrieval-only" not in out
+        conf = json.loads((tmp_path / "install.conf").read_text())
+        assert conf["env"]["MEMORY_ENABLED"] == "true"
+        assert conf["env"]["MEMORY_EXTRACTION_ENABLED"] == "true"
+        assert conf["env"]["MEMORY_EXTRACTION_TIMEOUT_S"] == "60"
+
+    def test_non_reasoner_backend_memory_prints_retrieval_only_note(self, tmp_path, monkeypatch, capsys):
+        """The retrieval-only note still prints for a backend outside
+        ONESHOT_REASONER_BACKENDS. Every real backend is a member
+        today, so the else branch is exercised by patching the
+        constant down; goose stands in as the excluded backend the
+        same way it did before it grew a reasoner."""
+        import kai.install as install_module
+
+        monkeypatch.chdir(tmp_path)
+        conf_path = tmp_path / "install.conf"
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(install_module, "ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
+        self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
+
+        existing = {"version": 1, "env": {"AGENT_BACKEND": "goose"}}
+        conf_path.write_text(json.dumps(existing))
+
+        memory_block = ["true", "2000", "10"]  # memory enabled; extraction prompts gated out
+        inputs = iter(self._base_inputs(memory_block, agent_backend="goose"))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
 
         _cmd_config()
@@ -1529,6 +1541,7 @@ class TestCmdConfig:
                 "false",  # advanced user options
                 "polling",  # transport
                 "goose",  # agent backend
+                "/bin/sh",  # goose binary path (any existing executable)
                 "ollama",  # goose provider (no key needed)
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
@@ -1663,8 +1676,14 @@ class TestCmdConfig:
             )
         # Wizard prompts for provider + API key only for non-claude
         # backends. The API key prompt itself is skipped when provider
-        # is "ollama" (local model, no auth).
+        # is "ollama" (local model, no auth). The goose backend block
+        # additionally prompts for the binary path before the provider
+        # prompt; /bin/sh is just an existing executable that passes
+        # the is-file + executable validation without depending on
+        # goose being installed on the test host.
         backend_block: list[str] = []
+        if agent_backend == "goose":
+            backend_block.append("/bin/sh")
         if agent_backend != "claude":
             backend_block.append(llm_provider)
             if llm_provider != "ollama":
@@ -2093,12 +2112,19 @@ class TestCmdConfig:
         for key in env:
             assert not key.startswith("MEMORY_"), f"stale memory key: {key}"
 
-    def test_non_claude_backend_drops_stale_extraction_keys(self, tmp_path, monkeypatch):
-        """Switching from claude to goose strips MEMORY_EXTRACTION_* keys."""
+    def test_non_reasoner_backend_drops_stale_extraction_keys(self, tmp_path, monkeypatch):
+        """Switching to a backend outside ONESHOT_REASONER_BACKENDS
+        strips MEMORY_EXTRACTION_* keys. Every real backend is a
+        member today, so the cleanup branch is exercised by patching
+        the constant down with goose standing in as the excluded
+        backend."""
+        import kai.install as install_module
+
         monkeypatch.chdir(tmp_path)
         conf_path = tmp_path / "install.conf"
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(install_module, "ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
         self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
@@ -2129,6 +2155,7 @@ class TestCmdConfig:
                 "false",  # advanced user options
                 "polling",  # transport
                 "goose",  # agent backend (was claude)
+                "/bin/sh",  # goose binary path (any existing executable)
                 "anthropic",  # goose provider
                 "sk-ant-test-key",  # API key
                 "sonnet",  # model
@@ -2276,54 +2303,44 @@ class TestCmdConfig:
         # All defaults → key is absent.
         assert "EPISODE_CLASSIFIER_CONTEXT_TURNS" not in env
 
-    def test_episode_classifier_context_turns_skipped_on_goose_backend(self, tmp_path, monkeypatch):
-        """On agent_backend="goose", the entire memory-extraction
-        branch is gated out (the classifier only runs under claude
-        per bot.py's effective_backend == "claude" check). The wizard
-        does not prompt for the new key, the dataclass default
-        applies at startup, and the env file does not carry the key."""
+    def test_episode_classifier_context_turns_skipped_on_goose_extraction_declined(self, tmp_path, monkeypatch):
+        """On a goose install that declines extraction, the
+        extraction-enabled branch (including the classifier-window
+        prompt) does not fire: the dataclass default applies at
+        startup and the env file does not carry the key."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
-        # On goose, the extraction-enabled prompt itself is skipped, so
-        # memory_block is shaped like a no-extraction run. The entire
-        # extraction-enabled branch (including the new classifier-window
-        # prompt) does not fire.
-        memory_block = ["true", "2000", "10"]  # memory_enabled, token_budget, search_limit
+        # Goose now reaches the extraction-enabled prompt; declining it
+        # keeps the rest of the extraction branch (including the new
+        # classifier-window prompt) gated out.
+        memory_block = ["true", "false", "2000", "10"]  # memory on, extraction declined, budget, limit
         inputs = iter(self._base_inputs(memory_block, agent_backend="goose"))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
 
         _cmd_config()
 
         env = json.loads((tmp_path / "install.conf").read_text())["env"]
-        # Backend-cleanup pop in install.py drops the key under non-
-        # claude backends; pin the absence so a future regression
-        # that leaves a stale value in /etc/kai/env after a
-        # claude→goose flip surfaces here.
         assert "EPISODE_CLASSIFIER_CONTEXT_TURNS" not in env
 
     def test_goose_retrieval_only_does_not_persist_invalid_reasoner_backend(self, tmp_path, monkeypatch):
-        """v5 regression: a goose install accepting memory_enabled=true
-        with extraction disabled must NOT write MEMORY_REASONER_BACKEND
-        to the generated env. The wizard gates the prompt on
-        memory_extraction_enabled (the composed value), so on a
-        goose-backed install the prompt never fires and the key never
-        lands. Prevents the prior failure mode where the prompt fired
-        and `agent_backend=goose` as the default would have produced
-        MEMORY_REASONER_BACKEND=goose, failing load_config validation."""
+        """A goose install accepting memory_enabled=true and declining
+        extraction must NOT write MEMORY_REASONER_BACKEND or any
+        extraction config to the generated env: the retired reasoner
+        prompt never fires and extraction-off is the dataclass
+        default, so the delta-from-default emission suppresses both."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
-        # Goose install: extraction is gated out, so no reasoner prompt.
-        # Inputs match the existing goose-skip test shape (memory_enabled,
-        # token_budget, search_limit).
-        memory_block = ["true", "2000", "10"]
+        # Goose now reaches the extraction prompt; declining keeps the
+        # run retrieval-only.
+        memory_block = ["true", "false", "2000", "10"]
         inputs = iter(self._base_inputs(memory_block, agent_backend="goose"))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
 
@@ -2331,8 +2348,7 @@ class TestCmdConfig:
 
         env = json.loads((tmp_path / "install.conf").read_text())["env"]
         # The critical assertion: no invalid reasoner-backend value
-        # in the env. The cleanup block also drops it on non-supported
-        # backends as defense-in-depth.
+        # in the env.
         assert "MEMORY_REASONER_BACKEND" not in env
         # Extraction config is also absent on goose retrieval-only.
         assert "MEMORY_EXTRACTION_ENABLED" not in env
@@ -2916,6 +2932,7 @@ class TestCmdConfigDefaultModelDispatch:
             "fake-token",  # bot token
             "polling",  # transport
             "goose",  # agent backend
+            "/bin/sh",  # goose binary path (any existing executable)
             "openai",  # llm provider
             "openai-key",  # OPENAI_API_KEY
             # model prompt is handled by the _prompt_default_model mock
