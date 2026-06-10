@@ -32,6 +32,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -425,6 +426,98 @@ def _os_user_log_field(effective_user: str | None) -> str:
     site uses the same vocabulary.
     """
     return effective_user if effective_user else "self"
+
+
+# ── Shared schema-payload parsing ────────────────────────────────────
+
+
+# Matches one fenced code block and captures its body. The info
+# string after the opening fence (`json`, `JSON`, or anything else)
+# is consumed but not constrained: models label payload fences
+# inconsistently and the json.loads attempt on the body is the real
+# filter. DOTALL lets the body span newlines; the non-greedy body
+# keeps back-to-back fences in one response as separate matches
+# instead of one block swallowing everything between the first
+# opener and the last closer.
+_FENCED_BLOCK_RE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
+
+
+def _parse_schema_payload(text: str) -> Any:
+    """
+    Parse a schema-backed one-shot response out of a model's chat text.
+
+    Claude one-shots never need this leniency (`--json-schema` makes
+    the CLI emit validated JSON) and codex rarely does
+    (`--output-schema` shapes the final message CLI-side), but
+    opencode has no structured-output channel at all: the JSON-only
+    instruction rides inside the prompt, so compliance is pure model
+    discipline. Models that narrate before answering wrap the payload
+    in chat noise (observed with deepseek-v4-flash: a reasoning
+    preamble followed by a ```json fence), and a bare json.loads on
+    that text rejects an otherwise valid payload. Both the opencode
+    and codex schema paths parse through this helper so the two
+    reasoners keep mirroring each other.
+
+    Three tiers, cheapest first:
+
+    1. Bare parse of the stripped text. Preserves the strict-path
+       behavior exactly, including non-dict results (a bare scalar or
+       list still reaches the caller's non_object_json check rather
+       than being rejected here).
+    2. Fenced blocks: each block body that parses as a JSON object is
+       a candidate.
+    3. Brace scan: `raw_decode` at each `{` pulls an object out of
+       unfenced prose.
+
+    Within tiers 2 and 3 the LAST candidate wins: models think first
+    and answer last, so when a preamble quotes an example object the
+    payload that follows it is the real answer.
+
+    Raises the tier-1 `json.JSONDecodeError` when no tier produces an
+    object, so call sites keep their existing except shape and the
+    logged error carries the position of the original parse failure.
+    """
+    stripped = text.strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        bare_error = exc
+
+    payload: Any = None
+    for match in _FENCED_BLOCK_RE.finditer(text):
+        try:
+            candidate = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            payload = candidate
+    if payload is not None:
+        return payload
+
+    # Tier 3 walks every `{` because a failed raw_decode reports
+    # nothing about where a viable object might start. On success the
+    # scan resumes AFTER the parsed object: nested objects are part
+    # of the outer candidate, and re-parsing them would let an inner
+    # fragment shadow the complete payload. Quadratic on brace-dense
+    # garbage in the worst case, but one-shot responses are a few KB
+    # and this tier only runs after both cheaper tiers missed.
+    decoder = json.JSONDecoder()
+    search_from = 0
+    while True:
+        brace = text.find("{", search_from)
+        if brace == -1:
+            break
+        try:
+            candidate, end = decoder.raw_decode(text, brace)
+        except json.JSONDecodeError:
+            search_from = brace + 1
+            continue
+        payload = candidate
+        search_from = end
+    if payload is not None:
+        return payload
+
+    raise bare_error
 
 
 # ── Claude implementation ───────────────────────────────────────────
@@ -1189,11 +1282,13 @@ class CodexOneShotReasoner:
                     duration_ms=duration_ms,
                 )
 
-            # Schema-backed path. The final agent_message must parse
-            # as a JSON object; anything else is OneShotOutputError so
-            # memory_extraction's caller-side mapping collapses it to
-            # the zero-state extraction result instead of letting a
-            # malformed payload reach the fact validator.
+            # Schema-backed path. The final agent_message must carry
+            # a JSON object; `_parse_schema_payload` tolerates fence /
+            # prose wrapping around it, and anything it cannot recover
+            # is OneShotOutputError so memory_extraction's caller-side
+            # mapping collapses it to the zero-state extraction result
+            # instead of letting a malformed payload reach the fact
+            # validator.
             if not final_text:
                 log.info(
                     "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=%d outcome=output_error error_category=empty_agent_message returncode=0 os_user=%s",
@@ -1204,7 +1299,7 @@ class CodexOneShotReasoner:
                 )
                 raise OneShotOutputError("codex produced no final agent_message")
             try:
-                payload = json.loads(final_text)
+                payload = _parse_schema_payload(final_text)
             except json.JSONDecodeError as exc:
                 log.info(
                     "oneshot_reasoner purpose=%s backend=codex model=%s duration_ms=%d outcome=output_error error_category=invalid_json returncode=0 os_user=%s",
@@ -1213,7 +1308,7 @@ class CodexOneShotReasoner:
                     duration_ms,
                     os_user_field,
                 )
-                raise OneShotOutputError(f"codex final text was not valid JSON: {exc}") from None
+                raise OneShotOutputError(f"codex final text did not contain a JSON object: {exc}") from None
 
             # Codex's `--output-schema` enforcement is best-effort:
             # the CLI does not hard-reject a final message that
@@ -1639,11 +1734,13 @@ class OpenCodeOneShotReasoner:
                 )
 
             # Schema-backed path. Mirrors the codex reasoner exactly:
-            # the accumulated text must parse as a JSON object;
-            # anything else is OneShotOutputError so memory
-            # extraction's caller-side mapping collapses it to the
-            # zero-state extraction result instead of letting a
-            # malformed payload reach the fact validator.
+            # the accumulated text must carry a JSON object, with
+            # `_parse_schema_payload` tolerating fence / prose wrapping
+            # around it; anything it cannot recover is
+            # OneShotOutputError so memory extraction's caller-side
+            # mapping collapses it to the zero-state extraction result
+            # instead of letting a malformed payload reach the fact
+            # validator.
             if not accumulated:
                 log.info(
                     "oneshot_reasoner purpose=%s backend=opencode model=%s duration_ms=%d outcome=output_error error_category=empty_response returncode=0 os_user=%s",
@@ -1654,7 +1751,7 @@ class OpenCodeOneShotReasoner:
                 )
                 raise OneShotOutputError("opencode produced no accumulated text")
             try:
-                payload = json.loads(accumulated)
+                payload = _parse_schema_payload(accumulated)
             except json.JSONDecodeError as exc:
                 log.info(
                     "oneshot_reasoner purpose=%s backend=opencode model=%s duration_ms=%d outcome=output_error error_category=invalid_json returncode=0 os_user=%s",
@@ -1663,7 +1760,7 @@ class OpenCodeOneShotReasoner:
                     duration_ms,
                     os_user_field,
                 )
-                raise OneShotOutputError(f"opencode accumulated text was not valid JSON: {exc}") from None
+                raise OneShotOutputError(f"opencode accumulated text did not contain a JSON object: {exc}") from None
 
             if not isinstance(payload, dict):
                 log.info(

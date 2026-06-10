@@ -29,6 +29,7 @@ from kai.oneshot import (
     OneShotSubprocessError,
     OneShotTimeout,
     OpenCodeOneShotReasoner,
+    _parse_schema_payload,
     _preserved_auth_vars_for,
     _render_opencode_session_prompt,
 )
@@ -1129,6 +1130,28 @@ class TestCodexOneShotReasonerSuccess:
         assert envelope == {"is_error": False, "structured_output": payload}
 
     @pytest.mark.asyncio
+    async def test_schema_backed_recovers_fenced_final_message(self, tmp_path):
+        """`--output-schema` shaping is best-effort, so a model that
+        fences its final JSON must still reach the envelope; the
+        codex parse runs through the same tolerant helper as
+        opencode."""
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        payload = {"facts": [], "has_episode": False}
+        fenced = "```json\n" + json.dumps(payload) + "\n```"
+        stdout = (_codex_event("agent_message", fenced) + "\n").encode("utf-8")
+        proc = _make_proc(stdout=stdout, returncode=0)
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema={"type": "object"},
+            )
+
+        envelope = json.loads(result.text)
+        assert envelope == {"is_error": False, "structured_output": payload}
+
+    @pytest.mark.asyncio
     async def test_non_schema_success_returns_raw_text(self, tmp_path):
         """A None schema means the caller wants the free-form
         agent_message text back unchanged; no envelope wrapping
@@ -2021,6 +2044,71 @@ class TestCodexReasonerWritesSanitizedSchema:
         assert "maxItems" not in disk["properties"]["facts"]
 
 
+# ── Schema-payload parsing tests ─────────────────────────────────
+
+
+class TestParseSchemaPayload:
+    """Contract for `_parse_schema_payload`: bare JSON passes through
+    unchanged (including non-dict values, which must reach the
+    caller's non_object_json check), fenced or prose-wrapped objects
+    are recovered, the last candidate wins within a tier, and text
+    with no recoverable object re-raises the bare-parse
+    JSONDecodeError."""
+
+    def test_bare_object_passes_through(self):
+        assert _parse_schema_payload('{"facts": []}') == {"facts": []}
+
+    @pytest.mark.parametrize("bare_non_dict", ["[1, 2]", "42", "true", "null", '"text"'])
+    def test_bare_non_dict_passes_through(self, bare_non_dict):
+        assert _parse_schema_payload(bare_non_dict) == json.loads(bare_non_dict)
+
+    def test_fenced_json_block(self):
+        assert _parse_schema_payload('```json\n{"a": 1}\n```') == {"a": 1}
+
+    def test_fence_without_info_string(self):
+        assert _parse_schema_payload('```\n{"a": 1}\n```') == {"a": 1}
+
+    def test_preamble_then_fenced_payload(self):
+        # The exact production failure shape: reasoning prose
+        # followed by a fenced payload.
+        text = (
+            'Let me analyze the current exchange to extract facts.\n\n```json\n{"facts": [], "has_episode": false}\n```'
+        )
+        assert _parse_schema_payload(text) == {"facts": [], "has_episode": False}
+
+    def test_last_fenced_object_wins(self):
+        text = '```json\n{"example": true}\n```\nThe real answer:\n```json\n{"a": 1}\n```'
+        assert _parse_schema_payload(text) == {"a": 1}
+
+    def test_unfenced_object_in_prose(self):
+        text = 'Here is the result: {"a": 1} hope that helps.'
+        assert _parse_schema_payload(text) == {"a": 1}
+
+    def test_last_unfenced_object_wins(self):
+        text = 'I will use {"draft": true} as a template. Final: {"a": 1}'
+        assert _parse_schema_payload(text) == {"a": 1}
+
+    def test_nested_object_returns_outer(self):
+        # The brace scan resumes after a parsed object so an inner
+        # fragment cannot shadow the complete payload.
+        text = 'payload {"outer": {"inner": 1}} end'
+        assert _parse_schema_payload(text) == {"outer": {"inner": 1}}
+
+    def test_fenced_payload_beats_unfenced_prose_example(self):
+        text = 'The shape is {"facts": []} with values.\n```json\n{"facts": ["x"], "has_episode": true}\n```'
+        assert _parse_schema_payload(text) == {"facts": ["x"], "has_episode": True}
+
+    def test_no_json_raises_decode_error(self):
+        with pytest.raises(json.JSONDecodeError):
+            _parse_schema_payload("not json at all")
+
+    def test_fenced_non_object_raises_decode_error(self):
+        # A fenced list is not a candidate (the schema demands an
+        # object) and the body has no `{` for the brace scan.
+        with pytest.raises(json.JSONDecodeError):
+            _parse_schema_payload("```json\n[1, 2]\n```")
+
+
 # ── OpenCode reasoner tests ──────────────────────────────────────
 
 
@@ -2514,16 +2602,49 @@ class TestOpenCodeOneShotReasonerFailures:
 
 
 class TestOpenCodeOneShotReasonerSchema:
-    """When `json_schema` is supplied, the accumulated text must parse
-    as a JSON object containing the schema's `required` fields. The
-    reasoner wraps the parsed payload in the same envelope claude /
-    codex emit, so the memory extraction caller does not need an
-    opencode branch."""
+    """When `json_schema` is supplied, the accumulated text must carry
+    a JSON object containing the schema's `required` fields; fence /
+    prose wrapping around the object is tolerated. The reasoner wraps
+    the parsed payload in the same envelope claude / codex emit, so
+    the memory extraction caller does not need an opencode branch."""
 
     @pytest.mark.asyncio
     async def test_schema_backed_returns_envelope(self, tmp_path):
         reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         body = json.dumps({"facts": [], "has_episode": False})
+        proc = _make_acp_proc(
+            _opencode_handshake_lines()
+            + [
+                _session_update_line(body),
+                _rpc_response_line(request_id=3, result={"stopReason": "end_turn"}),
+            ]
+        )
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema={
+                    "type": "object",
+                    "required": ["facts", "has_episode"],
+                },
+            )
+
+        envelope = json.loads(result.text)
+        assert envelope == {
+            "is_error": False,
+            "structured_output": {"facts": [], "has_episode": False},
+        }
+
+    @pytest.mark.asyncio
+    async def test_schema_backed_recovers_fenced_payload_with_preamble(self, tmp_path):
+        """Some models narrate before answering and fence the JSON
+        (deepseek-v4-flash does both); the payload must still reach
+        the envelope instead of collapsing to invalid_json."""
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        body = (
+            'Let me analyze the current exchange to extract facts.\n\n```json\n{"facts": [], "has_episode": false}\n```'
+        )
         proc = _make_acp_proc(
             _opencode_handshake_lines()
             + [
