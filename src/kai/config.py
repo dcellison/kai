@@ -142,15 +142,38 @@ PROVIDER_MODELS: dict[str, dict[str, str]] = {
         "gemini-3-flash": "\u264a Gemini 3 Flash",
         "gemini-3-deep-think": "\u264a Gemini 3 Deep Think",
     },
+    # DeepSeek's first-class OpenCode / Models.dev surface is exactly
+    # these two V4 SKUs. The legacy `deepseek-chat` and
+    # `deepseek-reasoner` aliases (which mapped to V4 Flash's
+    # non-thinking and thinking modes respectively) are deprecated by
+    # DeepSeek and scheduled to retire 2026-07-24; do not list them
+    # here. Thinking-vs-non-thinking is a runtime mode flag handled
+    # by opencode's `options.reasoning.enabled`, not a model-name
+    # distinction at this layer.
+    "deepseek": {
+        "deepseek-v4-pro": "DeepSeek V4 Pro",
+        "deepseek-v4-flash": "DeepSeek V4 Flash",
+    },
 }
 
-# Default model for each provider, used when no model is explicitly
-# configured. Open-ended providers (openrouter, ollama) have no
-# default - users on those providers MUST have a model set.
+# Default model for each provider, used as the wizard prompt
+# suggestion for the conversational role (DEFAULT_MODEL / per-user
+# `models.agent`). The conversational role does the most work and
+# the heaviest work in the Kai system; defaulting to a balanced or
+# speed-tier model on this surface underspends on the highest-value
+# path. Each entry below is the strongest curated model the provider
+# offers. Open-ended providers (openrouter, ollama) have no entry;
+# users on those providers MUST set a model explicitly.
+#
+# Non-agent roles (PR review, issue triage, memory extraction,
+# memory episode, behavioral judge, behavioral gen) use the tier
+# scheme in `_BACKEND_PROVIDER_TIER_MODELS` instead, where balanced
+# and cheap tiers split per-role per-(backend, provider).
 PROVIDER_DEFAULTS: dict[str, str] = {
-    "anthropic": "sonnet",
+    "anthropic": "opus",
     "openai": "gpt-5.4",
-    "google": "gemini-3-flash",
+    "google": "gemini-3.1-pro",
+    "deepseek": "deepseek-v4-pro",
 }
 
 # Codex CLI model surface. Independent of PROVIDER_MODELS["openai"]:
@@ -265,7 +288,15 @@ _BACKEND_PROVIDER_TIER_MODELS: dict[tuple[str, str], dict[str, str]] = {
     ("codex", "openai"): {"balanced": "gpt-5.4-mini", "cheap": "gpt-5.4-mini"},
     ("opencode", "anthropic"): {"balanced": "anthropic/claude-sonnet-4-5", "cheap": "anthropic/claude-haiku-4-5"},
     ("opencode", "openai"): {"balanced": "openai/gpt-5.4-mini", "cheap": "openai/gpt-5.4-mini"},
-    ("opencode", "deepseek"): {"balanced": "deepseek/deepseek-chat", "cheap": "deepseek/deepseek-chat"},
+    # DeepSeek V4 first-class OpenCode surface (V4 Pro and V4 Flash).
+    # The legacy `deepseek-chat` / `deepseek-reasoner` aliases (mode
+    # flags on V4 Flash) retire 2026-07-24, so do not use them in
+    # registry defaults. Pro for reasoning-heavy roles (the
+    # balanced tier covers review / triage / behavioral_gen); Flash
+    # for high-volume / latency-sensitive roles (the cheap tier
+    # covers memory extraction / memory episode / behavioral_judge).
+    # Same 1M context on both; the split is capability-vs-cost.
+    ("opencode", "deepseek"): {"balanced": "deepseek/deepseek-v4-pro", "cheap": "deepseek/deepseek-v4-flash"},
     ("opencode", "google"): {"balanced": "google/gemini-3.1-pro", "cheap": "google/gemini-3-flash"},
     # OpenRouter's "provider/model" shape nests under opencode's own
     # "provider/model" prefix; the structural check accepts this
@@ -277,7 +308,12 @@ _BACKEND_PROVIDER_TIER_MODELS: dict[tuple[str, str], dict[str, str]] = {
     ("opencode", "ollama"): {"balanced": "ollama/llama4:70b", "cheap": "ollama/llama4:8b"},
     ("goose", "anthropic"): {"balanced": "claude-sonnet-4-6", "cheap": "claude-haiku-4-5"},
     ("goose", "openai"): {"balanced": "gpt-5.4", "cheap": "gpt-5.4-mini"},
-    ("goose", "deepseek"): {"balanced": "deepseek-chat", "cheap": "deepseek-chat"},
+    # goose-on-deepseek: bare model names; goose passes them through
+    # to the provider API directly (no opencode-style "provider/"
+    # prefix). Same Pro / Flash split as opencode-on-deepseek above;
+    # same 2026-07-24 deprecation reason for skipping the legacy
+    # `deepseek-chat` alias.
+    ("goose", "deepseek"): {"balanced": "deepseek-v4-pro", "cheap": "deepseek-v4-flash"},
     ("goose", "google"): {"balanced": "gemini-3.1-pro", "cheap": "gemini-3-flash"},
     ("goose", "openrouter"): {
         "balanced": "openrouter/anthropic/claude-sonnet-4-5",
