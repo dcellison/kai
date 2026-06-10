@@ -662,13 +662,13 @@ async def run_triage(
 
 def _parse_triage_json(raw: str) -> dict:
     """
-    Parse Claude's triage response, stripping markdown fencing if present.
+    Parse the agent's triage response, stripping markdown fencing if present.
 
-    Claude sometimes wraps JSON in ```json ... ``` blocks despite being
+    Models sometimes wrap JSON in ```json ... ``` blocks despite being
     instructed not to. This handles that gracefully.
 
     Args:
-        raw: The raw response string from Claude.
+        raw: The raw response string from the triage agent.
 
     Returns:
         The parsed JSON as a dict.
@@ -691,7 +691,7 @@ def _parse_triage_json(raw: str) -> dict:
         text = text[:-3]
     text = text.strip()
 
-    # If Claude added preamble text before the JSON (e.g., "Here's the
+    # If the model added preamble text before the JSON (e.g., "Here's the
     # analysis:\n{...}"), try to extract a valid JSON object. The naive
     # first-{-to-last-} approach can grab the wrong span when the preamble
     # contains braces, so we validate each candidate by trying json.loads
@@ -716,7 +716,7 @@ def _parse_triage_json(raw: str) -> dict:
     try:
         result = json.loads(text)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Claude returned non-JSON triage response: {e}") from e
+        raise ValueError(f"Agent returned non-JSON triage response: {e}") from e
     if not isinstance(result, dict):
         raise ValueError(f"Expected JSON object, got {type(result).__name__}")
     return result
@@ -1052,7 +1052,7 @@ async def triage_issue(
         # Step 3: Build the triage prompt
         prompt = build_triage_prompt(metadata, related_issues, projects)
 
-        # Step 4: Run the triage subprocess (Claude or Goose)
+        # Step 4: Run the triage subprocess (matching the active backend)
         raw_response = await run_triage(
             prompt,
             claude_user=claude_user,
@@ -1064,7 +1064,7 @@ async def triage_issue(
         if not raw_response.strip():
             log.warning("Empty triage output for %s#%d", metadata.repo, metadata.number)
             await _send_error_notification(
-                metadata, "Empty response from Claude", webhook_port, webhook_secret, notify_chat_id
+                metadata, "Empty response from agent", webhook_port, webhook_secret, notify_chat_id
             )
             return
 

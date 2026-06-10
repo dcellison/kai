@@ -277,7 +277,7 @@ async def _acquire_lock_or_kill(
         return lock
     except TimeoutError:
         log.error(
-            "Lock acquisition timed out for chat %d after %ds; force-killing Claude",
+            "Lock acquisition timed out for chat %d after %ds; force-killing agent subprocess",
             chat_id,
             _LOCK_ACQUIRE_TIMEOUT,
         )
@@ -3661,14 +3661,14 @@ async def _handle_response(
     # the user already saw the "(stopped)" edit and doesn't need a false alarm.
     # Failed responses are logged to history so that after a session restart,
     # the injected history shows the message was attempted (not unanswered).
-    # Without this, Claude sees an unanswered user message in history and may
-    # try to address it instead of the current message.
+    # Without this, the agent sees an unanswered user message in history and
+    # may try to address it instead of the current message.
     if final_response is None:
         if stopped_by_user:
             log_message(direction="assistant", chat_id=chat_id, text="[stopped by user]")
         else:
             log_message(direction="assistant", chat_id=chat_id, text="[no response]")
-            await update.message.reply_text("Error: No response from Claude")
+            await update.message.reply_text("Error: No response from agent")
         return
 
     if not final_response.success:

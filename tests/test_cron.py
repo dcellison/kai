@@ -438,7 +438,7 @@ class TestJobCallbackClaude:
 
     @pytest.mark.asyncio()
     async def test_claude_stream_exception_returns_early(self, caplog):
-        """Exceptions during Claude interaction are caught and logged."""
+        """Exceptions during agent interaction are caught and logged."""
         mock_claude = MagicMock()
 
         async def exploding_send(prompt):

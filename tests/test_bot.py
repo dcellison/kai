@@ -2871,7 +2871,7 @@ class TestHandleResponse:
 
     @pytest.mark.asyncio
     async def test_no_done_event_error(self):
-        """No done event: sends 'No response from Claude' error."""
+        """No done event: sends 'No response from agent' error."""
         from kai.bot import _handle_response
 
         update = _make_update()
@@ -2884,7 +2884,7 @@ class TestHandleResponse:
             await _handle_response(update, ctx, 12345, "test", claude, "sonnet")
 
         replies = [c[0][0] for c in update.message.reply_text.call_args_list]
-        assert any("No response from Claude" in r for r in replies)
+        assert any("No response from agent" in r for r in replies)
 
     @pytest.mark.asyncio
     async def test_error_response_with_live_msg(self):

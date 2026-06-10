@@ -272,7 +272,7 @@ def build_session_context(
         except OSError:
             pass
 
-    # Memory subsystem state marker. Tells the inner Claude where to
+    # Memory subsystem state marker. Tells the inner agent where to
     # route new fact saves: enabled = POST /api/memory/add (Qdrant),
     # disabled = Edit MEMORY.md. Reflects operator INTENT (Config.
     # memory_enabled), not runtime success; if Qdrant init failed at
@@ -290,7 +290,7 @@ def build_session_context(
     # need to fire on every turn (writing style, formatting, behavioral
     # rules), while MEMORY.md holds project state and notes that surface
     # via similarity retrieval once the Qdrant-backed semantic memory
-    # is enabled. Injected above MEMORY.md so the inner Claude reads
+    # is enabled. Injected above MEMORY.md so the inner agent reads
     # rules before facts on a top-to-bottom scan. When chat_id is None
     # (one-shot CLI invocations) the block is omitted entirely; there
     # is no global-fallback PREFERENCES.md.
@@ -323,7 +323,7 @@ def build_session_context(
     #
     # Per-user scoping (#347): when chat_id is set, the file lives under
     # memory/<chat_id>/MEMORY.md so each user has their own writable
-    # copy. The inner Claude subprocess runs as that user's os_user
+    # copy. The inner agent subprocess runs as that user's os_user
     # (via sudo -H -u), so ownership of the subdirectory is set to
     # match. A non-service user cannot write the legacy single-global
     # file, which was the bug this scoping fixes. Falls back to the
@@ -352,7 +352,7 @@ def build_session_context(
         parts.append(f"## Workspace Instructions\n\n{ws_prompt}")
 
     # Always inject the per-user history directory path so the inner
-    # Claude's grep/jq searches are naturally scoped to this user.
+    # agent's grep/jq searches are naturally scoped to this user.
     history_dir = str(data_dir / "history" / str(chat_id)) if chat_id is not None else str(data_dir / "history")
 
     # Inject recent conversation history for continuity.
@@ -386,7 +386,7 @@ def build_session_context(
             )
         parts.append(api_note)
 
-    # Inject messaging and file exchange API info so Claude can
+    # Inject messaging and file exchange API info so the inner agent can
     # proactively send text or files to the user (e.g., when a
     # background task completes or a scheduled job has results).
     if api.webhook_secret:
@@ -440,7 +440,7 @@ def build_session_context(
         )
         parts.append("\n".join(svc_lines))
 
-    # Include chat_id so inner Claude can pass it back in API
+    # Include chat_id so the inner agent can pass it back in API
     # calls for correct multi-user routing. Without this, all
     # API calls route to the default admin user.
     if chat_id is not None:
@@ -464,7 +464,7 @@ def ensure_user_memory(chat_id: int | None, data_dir: Path) -> None:
     Idempotent and cheap: a stat, a possible mkdir, a possible copy2.
     Called on every send() path before build_session_context() so that
     a user without a pre-created `memory/<chat_id>/` (single-user dev,
-    test runs, or any deployment where the inner Claude runs as the
+    test runs, or any deployment where the inner agent runs as the
     same identity as the bot) still gets a writable memory surface on
     their first message.
 
@@ -502,7 +502,7 @@ def ensure_user_memory(chat_id: int | None, data_dir: Path) -> None:
     # data_dir/memory/MEMORY.md. This mirrors the behavior of the
     # removed main._bootstrap_memory() function so a fresh
     # `python -m kai` (no users.yaml, no prior install, memory disabled)
-    # still has a writable memory_root for the inner Claude to update.
+    # still has a writable memory_root for the inner agent to update.
     # Without this branch a write attempt from the subprocess would
     # FileNotFoundError on the missing parent directory.
     if chat_id is None:
@@ -716,7 +716,7 @@ def ensure_user_home(chat_id: int | None, data_dir: Path) -> Path:
                 # No template on this host (incomplete install tree).
                 # Match ensure_user_memory's `# Memory\n` /
                 # ensure_user_preferences' `# Preferences\n` last-resort
-                # placeholder so the inner Claude has a writable file.
+                # placeholder so the inner agent has a writable file.
                 claude_dst.write_text("# Identity\n")
     except OSError:
         log.warning(

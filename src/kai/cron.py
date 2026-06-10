@@ -297,16 +297,16 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                     final_response = event.response
                     break
         except Exception:
-            log.exception("Job %d crashed during Claude interaction", job_id)
+            log.exception("Job %d crashed during agent interaction", job_id)
             return
 
         if final_response is None or not final_response.success:
             if final_response is None:
                 # Stream ended without a done event; helps distinguish from
                 # a done event with an error (which sets final_response.success=False)
-                log.warning("Job %d '%s': Claude stream ended without a done event", job_id, data["name"])
+                log.warning("Job %d '%s': agent stream ended without a done event", job_id, data["name"])
             error = final_response.error if final_response else "No response"
-            log.error("Job %d Claude error: %s", job_id, error)
+            log.error("Job %d agent error: %s", job_id, error)
             return
 
         response_text = final_response.text
