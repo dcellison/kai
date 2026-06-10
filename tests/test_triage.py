@@ -528,7 +528,7 @@ class TestRunTriageGoose:
             "--provider",
             "openai",
             "--model",
-            "gpt-5.4",
+            "gpt-5.5",
             "-q",
             "--no-session",
             "--no-profile",
@@ -794,17 +794,17 @@ class TestRunTriageCodex:
     @pytest.mark.asyncio
     async def test_codex_argv_uses_registry_model(self):
         """
-        With agent_backend=codex and no env override, the --model argv
-        slot matches the registry's (codex, ISSUE_TRIAGE) row
-        ("gpt-5.4-mini"). Locks the registry as the source of truth
-        for the codex side.
+        With agent_backend=codex and no override, the --model argv
+        slot matches the registry's (codex, openai, ISSUE_TRIAGE) row
+        (gpt-5.5, the current frontier). Locks the registry as the
+        source of truth for the codex side.
         """
         mock_proc = _mock_subprocess(stdout=self._codex_ndjson("{}"))
         with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
             await run_triage("prompt", agent_backend="codex")
         cmd = mock_exec.call_args[0]
         i = cmd.index("--model")
-        assert cmd[i + 1] == "gpt-5.4-mini"
+        assert cmd[i + 1] == "gpt-5.5"
 
     @pytest.mark.asyncio
     async def test_codex_model_override_param_wins(self):
@@ -948,7 +948,7 @@ class TestGooseTriageModelResolutionViaRegistry:
         """Goose+openai resolves the ISSUE_TRIAGE row from the registry."""
         from kai.config import MODEL_REGISTRY, ModelRole
 
-        assert MODEL_REGISTRY[("goose", "openai", ModelRole.ISSUE_TRIAGE)] == "gpt-5.4"
+        assert MODEL_REGISTRY[("goose", "openai", ModelRole.ISSUE_TRIAGE)] == "gpt-5.5"
 
     def test_open_ended_provider_registry_lookup(self):
         """Goose+ollama has a registry-shipped default that operators

@@ -3043,8 +3043,9 @@ class TestCmdConfigDefaultModelDispatch:
         helper.assert_called_once()
         # New signature: (agent_backend, eff_provider, default_val).
         # Third positional arg is the prefill. Must be
-        # PROVIDER_DEFAULTS["openai"] = "gpt-5.4", NOT "opus".
-        assert helper.call_args.args[2] == "gpt-5.4"
+        # PROVIDER_DEFAULTS["openai"] = "gpt-5.5-pro" (the strongest
+        # OpenAI text model), NOT the rejected "opus".
+        assert helper.call_args.args[2] == "gpt-5.5-pro"
         assert helper.call_args.args[2] != "opus"
         assert env["DEFAULT_MODEL"] == "gpt-5.4-mini"
 

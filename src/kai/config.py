@@ -127,20 +127,41 @@ PROVIDER_KEY_VARS: dict[str, str] = {
 # Goose passes model IDs through verbatim to the provider API - no
 # aliasing layer - so these must be the exact strings the APIs accept.
 PROVIDER_MODELS: dict[str, dict[str, str]] = {
+    # Claude CLI accepts short aliases that auto-resolve to the
+    # current SKU (`opus` -> claude-opus-4-8 as of 2026-06-09).
+    # Listing the aliases here keeps the registry stable across
+    # Anthropic version bumps; the CLI handles the resolution.
+    # Claude Fable 5 is Anthropic's strongest widely-released model
+    # today but is not yet wired as a Claude CLI short alias, so
+    # the keyboard surface stays at opus/sonnet/haiku.
     "anthropic": {
         "opus": "\U0001f9e0 Opus",
         "sonnet": "\u26a1 Sonnet",
         "haiku": "\U0001fab6 Haiku",
     },
+    # OpenAI current API surface (verified 2026-06-09 against
+    # developers.openai.com/api/docs/models). gpt-5.5-pro is the
+    # single strongest text model; gpt-5.5 is the standard frontier;
+    # the 5.4 family covers cheaper / cost-tier workloads. 5.3 and
+    # earlier are retired from this surface.
     "openai": {
-        "gpt-5.4": "\U0001f7e2 GPT-5.4",
-        "gpt-5.4-mini": "\U0001f7e1 GPT-5.4 Mini",
+        "gpt-5.5-pro": "\U0001f7e3 GPT-5.5 Pro",
+        "gpt-5.5": "\U0001f7e2 GPT-5.5",
+        "gpt-5.4-pro": "\U0001f7e1 GPT-5.4 Pro",
+        "gpt-5.4": "\U0001f7e1 GPT-5.4",
+        "gpt-5.4-mini": "\U0001f7e0 GPT-5.4 Mini",
         "gpt-5.4-nano": "\U0001f535 GPT-5.4 Nano",
     },
+    # Google Gemini current API surface (verified 2026-06-09 against
+    # ai.google.dev/gemini-api/docs/models). gemini-2.5-pro is the
+    # most advanced for complex tasks per the docs; the 2.5 Flash
+    # family covers speed and cost. The 3.x family exists but is
+    # mostly Preview variants and specialized SKUs (image / live /
+    # TTS); the curated keyboard stays on the stable 2.5 trio.
     "google": {
-        "gemini-3.1-pro": "\u264a Gemini 3.1 Pro",
-        "gemini-3-flash": "\u264a Gemini 3 Flash",
-        "gemini-3-deep-think": "\u264a Gemini 3 Deep Think",
+        "gemini-2.5-pro": "\u264a Gemini 2.5 Pro",
+        "gemini-2.5-flash": "\u264a Gemini 2.5 Flash",
+        "gemini-2.5-flash-lite": "\u264a Gemini 2.5 Flash Lite",
     },
     # DeepSeek's first-class OpenCode / Models.dev surface is exactly
     # these two V4 SKUs. The legacy `deepseek-chat` and
@@ -171,8 +192,8 @@ PROVIDER_MODELS: dict[str, dict[str, str]] = {
 # and cheap tiers split per-role per-(backend, provider).
 PROVIDER_DEFAULTS: dict[str, str] = {
     "anthropic": "opus",
-    "openai": "gpt-5.4",
-    "google": "gemini-3.1-pro",
+    "openai": "gpt-5.5-pro",
+    "google": "gemini-2.5-pro",
     "deepseek": "deepseek-v4-pro",
 }
 
@@ -277,17 +298,32 @@ _TIER_BY_ROLE: dict[ModelRole, str] = {
 #  - opencode takes full "provider/model" strings, structurally
 #    validated by is_opencode_model_shape
 #  - goose takes the provider's native model name verbatim
-# Codex collapses "balanced" and "cheap" onto gpt-5.4-mini: the next
-# step down (gpt-5.4-nano) is not in CODEX_MODELS so a "cheap" =
-# "gpt-5.4-nano" entry would fail _check_model_registry_complete at
-# startup. Every (backend, provider) pair in BACKEND_PROVIDERS must
-# have a row here; _build_registry raises KeyError at module import
-# time on any missing pair.
+# Cheap-tier picks must be in CODEX_MODELS for the codex backend
+# (the startup completeness check validates this); the balanced
+# tier picks the current frontier where the CLI surface allows.
+# Every (backend, provider) pair in BACKEND_PROVIDERS must have a
+# row here; _build_registry raises KeyError at module import time
+# on any missing pair.
 _BACKEND_PROVIDER_TIER_MODELS: dict[tuple[str, str], dict[str, str]] = {
+    # Claude CLI accepts short aliases that auto-resolve to the
+    # current SKU; `sonnet` -> claude-sonnet-4-6 and `haiku` ->
+    # claude-haiku-4-5 as of 2026-06-09. Keep the dated haiku ID for
+    # cheap-tier roles where a fully-pinned model version is
+    # preferable so an automated stage-2 episode generation stays
+    # reproducible across CLI version bumps.
     ("claude", "anthropic"): {"balanced": "sonnet", "cheap": "claude-haiku-4-5-20251001"},
-    ("codex", "openai"): {"balanced": "gpt-5.4-mini", "cheap": "gpt-5.4-mini"},
-    ("opencode", "anthropic"): {"balanced": "anthropic/claude-sonnet-4-5", "cheap": "anthropic/claude-haiku-4-5"},
-    ("opencode", "openai"): {"balanced": "openai/gpt-5.4-mini", "cheap": "openai/gpt-5.4-mini"},
+    # Codex CLI accepts the OpenAI model surface. gpt-5.5 is the
+    # current frontier reasoning model; gpt-5.4-mini stays as the
+    # cheap tier for high-volume roles (memory extraction, episode
+    # generation, behavioral judge).
+    ("codex", "openai"): {"balanced": "gpt-5.5", "cheap": "gpt-5.4-mini"},
+    # OpenCode/Anthropic surface uses the `anthropic/<model>`
+    # provider-prefixed shape; the model halves match the current
+    # Claude SKUs (Sonnet 4.6 and Haiku 4.5 as of 2026-06-09).
+    ("opencode", "anthropic"): {"balanced": "anthropic/claude-sonnet-4-6", "cheap": "anthropic/claude-haiku-4-5"},
+    # OpenCode/OpenAI: same tier split as codex/openai but in the
+    # opencode provider-prefixed shape.
+    ("opencode", "openai"): {"balanced": "openai/gpt-5.5", "cheap": "openai/gpt-5.4-mini"},
     # DeepSeek V4 first-class OpenCode surface (V4 Pro and V4 Flash).
     # The legacy `deepseek-chat` / `deepseek-reasoner` aliases (mode
     # flags on V4 Flash) retire 2026-07-24, so do not use them in
@@ -297,26 +333,29 @@ _BACKEND_PROVIDER_TIER_MODELS: dict[tuple[str, str], dict[str, str]] = {
     # covers memory extraction / memory episode / behavioral_judge).
     # Same 1M context on both; the split is capability-vs-cost.
     ("opencode", "deepseek"): {"balanced": "deepseek/deepseek-v4-pro", "cheap": "deepseek/deepseek-v4-flash"},
-    ("opencode", "google"): {"balanced": "google/gemini-3.1-pro", "cheap": "google/gemini-3-flash"},
+    # Google's most advanced for complex tasks per the Gemini API
+    # docs (2026-06-09) is gemini-2.5-pro; gemini-2.5-flash is the
+    # speed/cost tier. The 3.x family is mostly Preview / specialized.
+    ("opencode", "google"): {"balanced": "google/gemini-2.5-pro", "cheap": "google/gemini-2.5-flash"},
     # OpenRouter's "provider/model" shape nests under opencode's own
     # "provider/model" prefix; the structural check accepts this
     # because the outer slash is what matters to opencode.
     ("opencode", "openrouter"): {
-        "balanced": "openrouter/anthropic/claude-sonnet-4-5",
+        "balanced": "openrouter/anthropic/claude-sonnet-4-6",
         "cheap": "openrouter/anthropic/claude-haiku-4-5",
     },
     ("opencode", "ollama"): {"balanced": "ollama/llama4:70b", "cheap": "ollama/llama4:8b"},
     ("goose", "anthropic"): {"balanced": "claude-sonnet-4-6", "cheap": "claude-haiku-4-5"},
-    ("goose", "openai"): {"balanced": "gpt-5.4", "cheap": "gpt-5.4-mini"},
+    ("goose", "openai"): {"balanced": "gpt-5.5", "cheap": "gpt-5.4-mini"},
     # goose-on-deepseek: bare model names; goose passes them through
     # to the provider API directly (no opencode-style "provider/"
     # prefix). Same Pro / Flash split as opencode-on-deepseek above;
     # same 2026-07-24 deprecation reason for skipping the legacy
     # `deepseek-chat` alias.
     ("goose", "deepseek"): {"balanced": "deepseek-v4-pro", "cheap": "deepseek-v4-flash"},
-    ("goose", "google"): {"balanced": "gemini-3.1-pro", "cheap": "gemini-3-flash"},
+    ("goose", "google"): {"balanced": "gemini-2.5-pro", "cheap": "gemini-2.5-flash"},
     ("goose", "openrouter"): {
-        "balanced": "openrouter/anthropic/claude-sonnet-4-5",
+        "balanced": "openrouter/anthropic/claude-sonnet-4-6",
         "cheap": "openrouter/anthropic/claude-haiku-4-5",
     },
     ("goose", "ollama"): {"balanced": "llama4:70b", "cheap": "llama4:8b"},

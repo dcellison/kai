@@ -2464,10 +2464,13 @@ class TestCodexModelsSurface:
 
         assert CODEX_DEFAULT_MODEL == "gpt-5.5"
 
-    def test_provider_defaults_openai_unchanged(self):
+    def test_provider_defaults_openai_is_strongest_available(self):
+        """PROVIDER_DEFAULTS["openai"] points at the OpenAI API's
+        single strongest text model (per the agent-role-strongest
+        rule). Verified 2026-06-09 against developers.openai.com."""
         from kai.config import PROVIDER_DEFAULTS
 
-        assert PROVIDER_DEFAULTS["openai"] == "gpt-5.4"
+        assert PROVIDER_DEFAULTS["openai"] == "gpt-5.5-pro"
 
 
 class TestValidateModelForBackend:
@@ -3341,17 +3344,21 @@ class TestProviderDefaultsStrongestModel:
         assert PROVIDER_DEFAULTS["anthropic"] == "opus"
 
     def test_openai_default_is_strongest(self):
+        """gpt-5.5-pro is the single strongest text model on the
+        OpenAI API per developers.openai.com (verified 2026-06-09).
+        Above the gpt-5.5 / 5.4-pro / 5.4 / 5.4-mini / 5.4-nano line."""
         from kai.config import PROVIDER_DEFAULTS, PROVIDER_MODELS
 
         assert PROVIDER_DEFAULTS["openai"] in PROVIDER_MODELS["openai"]
-        # gpt-5.4 (non-mini, non-nano) is the strongest current entry.
-        assert PROVIDER_DEFAULTS["openai"] == "gpt-5.4"
+        assert PROVIDER_DEFAULTS["openai"] == "gpt-5.5-pro"
 
     def test_google_default_is_pro(self):
-        """Pro is the strongest current entry; Flash is the speed tier."""
+        """gemini-2.5-pro is the most advanced Gemini for complex
+        tasks per ai.google.dev/gemini-api/docs/models (verified
+        2026-06-09). The 3.x family is mostly Preview / specialized."""
         from kai.config import PROVIDER_DEFAULTS
 
-        assert PROVIDER_DEFAULTS["google"] == "gemini-3.1-pro"
+        assert PROVIDER_DEFAULTS["google"] == "gemini-2.5-pro"
 
     def test_deepseek_default_is_v4_pro(self):
         """V4 Pro is the strongest first-class OpenCode-on-DeepSeek
@@ -3491,7 +3498,10 @@ class TestModelRegistryTripleKey:
         _BACKEND_PROVIDER_TIER_MODELS tweak surfaces here in addition
         to the larger acceptance loop above."""
         assert MODEL_REGISTRY[("claude", "anthropic", ModelRole.PR_REVIEW)] == "sonnet"
-        assert MODEL_REGISTRY[("codex", "openai", ModelRole.PR_REVIEW)] == "gpt-5.4-mini"
+        # codex balanced tier picks the current frontier (gpt-5.5);
+        # cheap tier stays at gpt-5.4-mini for high-volume roles.
+        assert MODEL_REGISTRY[("codex", "openai", ModelRole.PR_REVIEW)] == "gpt-5.5"
+        assert MODEL_REGISTRY[("codex", "openai", ModelRole.MEMORY_EXTRACTION)] == "gpt-5.4-mini"
         # opencode-on-deepseek balanced tier resolves to V4 Pro for
         # the reasoning-heavy PR review role; V4 Flash covers the
         # cheap tier elsewhere. The legacy `deepseek-chat` alias is

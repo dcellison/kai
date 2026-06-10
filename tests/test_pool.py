@@ -212,8 +212,9 @@ class TestPerUserBackendRouting:
         config = _make_config(user_configs={111: user})
         pool = SubprocessPool(config=config, services_info=[])
         instance = pool.get(111)
-        # PROVIDER_DEFAULTS["openai"] = "gpt-5.4"
-        assert instance.model == "gpt-5.4"
+        # PROVIDER_DEFAULTS["openai"] = "gpt-5.5-pro" (the strongest
+        # current OpenAI text model; per the agent-role-strongest rule).
+        assert instance.model == "gpt-5.5-pro"
 
     @pytest.mark.asyncio
     async def test_invalid_stored_model_on_provider_mismatch(self):
