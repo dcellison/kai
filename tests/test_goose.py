@@ -21,7 +21,7 @@ import pytest
 
 from kai.backend import USER_MESSAGE_MARKER, StreamEvent
 from kai.config import WorkspaceConfig
-from kai.goose import _ANTHROPIC_MODEL_MAP, GooseBackend
+from kai.goose import _ANTHROPIC_MODEL_MAP, GooseBackend, goose_provider_id
 
 # ── Shared helpers ───────────────────────────────────────────────────
 
@@ -212,6 +212,18 @@ class TestModelMapping:
         assert _ANTHROPIC_MODEL_MAP.get(model_id, model_id) == model_id
 
 
+class TestProviderTranslation:
+    """`goose_provider_id` maps Kai provider keys to goose's wire-level
+    provider names; everything without a mapping passes through."""
+
+    def test_deepseek_maps_to_custom_deepseek(self):
+        assert goose_provider_id("deepseek") == "custom_deepseek"
+
+    @pytest.mark.parametrize("provider", ["anthropic", "openai", "google", "openrouter", "ollama"])
+    def test_other_providers_pass_through(self, provider):
+        assert goose_provider_id(provider) == provider
+
+
 # ── Constructor ────────────────────────────────────────────────────
 
 
@@ -397,6 +409,25 @@ class TestHandshake:
 
         call_kwargs = mock_exec.call_args[1]
         assert call_kwargs["env"]["GOOSE_PROVIDER"] == "openai"
+
+    @pytest.mark.asyncio
+    async def test_deepseek_provider_translated_to_wire_name(self):
+        """
+        Kai's "deepseek" key becomes goose's "custom_deepseek" wire
+        name in GOOSE_PROVIDER. Goose ships DeepSeek as a declarative
+        provider under that name and rejects the bare key with
+        "Unknown provider: deepseek" before any API call.
+        """
+        g = _make_goose(model="deepseek-v4-pro", provider="deepseek")
+        proc = _make_mock_proc(_handshake_lines())
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await g._ensure_started()
+
+        call_kwargs = mock_exec.call_args[1]
+        assert call_kwargs["env"]["GOOSE_PROVIDER"] == "custom_deepseek"
+        # Model names are NOT translated; only the provider name is.
+        assert call_kwargs["env"]["GOOSE_MODEL"] == "deepseek-v4-pro"
 
     @pytest.mark.asyncio
     async def test_provider_env_var_omitted_when_empty(self):

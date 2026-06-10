@@ -39,6 +39,7 @@ import aiohttp
 
 from kai.codex_exec import extract_codex_text
 from kai.config import ModelRole, get_model_for, resolve_claude_user
+from kai.goose import goose_provider_id
 from kai.oneshot import OneShotError, OneShotTimeout, OpenCodeOneShotReasoner
 from kai.prompt_utils import make_boundary
 
@@ -814,9 +815,12 @@ async def run_review(
         # avoids creating session files, --no-profile skips user
         # config, --max-turns 1 prevents runaway tool loops. Model
         # comes from the unified (backend, provider, role) registry
-        # so a goose-on-deepseek install inherits deepseek-chat the
-        # same way claude inherits sonnet; openrouter / ollama users
-        # set their per-user `models.pr_review` in users.yaml.
+        # so a goose-on-deepseek install picks up the deepseek-shaped
+        # default; openrouter / ollama users set their per-user
+        # `models.pr_review` in users.yaml. The --provider value runs
+        # through `goose_provider_id` because goose's wire-level
+        # provider names can differ from Kai's keys (deepseek is
+        # custom_deepseek on the goose side).
         model = get_model_for(
             ModelRole.PR_REVIEW,
             agent_backend,
@@ -829,7 +833,7 @@ async def run_review(
             "-i",
             "-",
             "--provider",
-            provider,
+            goose_provider_id(provider),
             "--model",
             model,
             "-q",

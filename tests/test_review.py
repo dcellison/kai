@@ -991,6 +991,23 @@ class TestRunReviewGoose:
         assert cmd[model_idx + 1] == "claude-sonnet-4-6"
 
     @pytest.mark.asyncio
+    async def test_deepseek_provider_translated_to_wire_name(self):
+        """Kai's "deepseek" key rides the argv as goose's
+        "custom_deepseek" wire name; goose rejects the bare key with
+        "Unknown provider: deepseek". The model name stays Kai's
+        registry value untranslated."""
+        mock_proc = _mock_process(stdout=b"output")
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review("prompt", agent_backend="goose", provider="deepseek")
+
+        cmd = mock_exec.call_args[0]
+        provider_idx = cmd.index("--provider")
+        assert cmd[provider_idx + 1] == "custom_deepseek"
+        model_idx = cmd.index("--model")
+        assert cmd[model_idx + 1] == "deepseek-v4-pro"
+
+    @pytest.mark.asyncio
     async def test_successful_response_stripped(self):
         """Goose output is returned with whitespace stripped."""
         mock_proc = _mock_process(stdout=b"  review text with whitespace  \n")

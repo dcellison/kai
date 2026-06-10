@@ -35,6 +35,32 @@ _ANTHROPIC_MODEL_MAP: dict[str, str] = {
 }
 
 
+# Map Kai provider keys to goose's wire-level provider names. Kai uses
+# "deepseek" as its provider key everywhere (BACKEND_PROVIDERS, the
+# model registry, per-user config; shared with the opencode backend),
+# but goose ships DeepSeek as a declarative provider named
+# "custom_deepseek"; passing the bare name fails with "Unknown
+# provider: deepseek" before any API call. The .get(key, key) fallback
+# passes every other provider through unchanged, so the map only grows
+# when goose names a provider differently than Kai does.
+_GOOSE_PROVIDER_MAP: dict[str, str] = {
+    "deepseek": "custom_deepseek",
+}
+
+
+def goose_provider_id(provider: str) -> str:
+    """
+    Translate a Kai provider key to goose's wire-level provider name.
+
+    Used by every site that hands a provider name to the goose binary:
+    `GooseBackend.build_env` (GOOSE_PROVIDER) and the `goose run`
+    one-shot argv in review and triage (`--provider`). Kai-level
+    surfaces (wizard, /settings, users.yaml, the model registry) keep
+    the Kai key; only the goose wire name differs.
+    """
+    return _GOOSE_PROVIDER_MAP.get(provider, provider)
+
+
 # ── Goose ACP backend ─────────────────────────────────────────────
 
 
@@ -85,7 +111,10 @@ class GooseBackend(AcpBackend):
         has no default provider configured. Kai's wizard writes
         LLM_PROVIDER to /etc/kai/env for its own bookkeeping, but the
         goose binary reads the GOOSE_-prefixed name; the translation
-        happens here so the two layers stay decoupled.
+        happens here so the two layers stay decoupled. The value runs
+        through `goose_provider_id` because goose's wire-level provider
+        names can differ from Kai's keys (deepseek is custom_deepseek
+        on the goose side).
 
         Guarded on `self.provider` truthiness because it can be the
         empty-string default for the claude backend pre-wiring path,
@@ -99,7 +128,7 @@ class GooseBackend(AcpBackend):
         if mapped:
             base_env["GOOSE_MODEL"] = mapped
         if self.provider:
-            base_env["GOOSE_PROVIDER"] = self.provider
+            base_env["GOOSE_PROVIDER"] = goose_provider_id(self.provider)
         return base_env
 
     def build_session_new_params(self) -> dict:
