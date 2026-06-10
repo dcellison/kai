@@ -332,6 +332,19 @@ def _validate_non_negative_int(value: str) -> bool:
         return False
 
 
+def _validate_non_negative_float(value: str) -> bool:
+    """Check that a string is a non-negative float (zero allowed).
+
+    Sibling of `_validate_non_negative_int` for float-typed fields
+    where 0 is a meaningful disable value (AGENT_MAX_SESSION_HOURS
+    uses 0 for "no session-age limit").
+    """
+    try:
+        return float(value) >= 0
+    except ValueError:
+        return False
+
+
 def _validate_chat_id(value: str) -> bool:
     """Check that a string is a valid Telegram chat ID (any non-zero integer)."""
     try:
@@ -1078,6 +1091,28 @@ def _cmd_config() -> None:
             break
         print("  Must be a positive integer.")
 
+    # Session lifecycle tunables. Both govern the subprocess pool for
+    # every backend (recycle-by-age and idle eviction), hence the
+    # AGENT_ prefix; the CLAUDE_-prefixed forms are legacy aliases
+    # honored as prefill fallbacks here and popped from the env dict
+    # below so a regenerated config carries only the canonical keys.
+    while True:
+        max_session_hours = _prompt(
+            "Max session age in hours (0 = no limit)",
+            existing_env.get("AGENT_MAX_SESSION_HOURS", existing_env.get("CLAUDE_MAX_SESSION_HOURS", "0")),
+        )
+        if _validate_non_negative_float(max_session_hours):
+            break
+        print("  Must be a non-negative number.")
+    while True:
+        idle_timeout = _prompt(
+            "Idle eviction timeout in seconds (0 disables)",
+            existing_env.get("AGENT_IDLE_TIMEOUT", existing_env.get("CLAUDE_IDLE_TIMEOUT", "1800")),
+        )
+        if _validate_non_negative_int(idle_timeout):
+            break
+        print("  Must be a non-negative integer.")
+
     # Skip the budget prompt on the claude backend: --max-budget-usd
     # is no longer emitted to claude --print argv (Max-plan OAuth
     # makes the CLI's computed-cost ceiling a phantom signal), so
@@ -1600,13 +1635,16 @@ def _cmd_config() -> None:
 
     # Remove stale renamed keys if present - leaving both the old and
     # new key causes silent confusion (the deprecation warning is
-    # suppressed when the new key exists). CLAUDE_TIMEOUT_SECONDS is
-    # renamed to AGENT_TIMEOUT_SECONDS; pop the legacy key on every
+    # suppressed when the new key exists). CLAUDE_TIMEOUT_SECONDS,
+    # CLAUDE_MAX_SESSION_HOURS, and CLAUDE_IDLE_TIMEOUT are renamed
+    # to their AGENT_-prefixed forms; pop the legacy keys on every
     # regenerate so the next /etc/kai/env carries only the canonical
-    # form.
+    # forms.
     env.pop("CLAUDE_MODEL", None)
     env.pop("CLAUDE_MAX_BUDGET_USD", None)
     env.pop("CLAUDE_TIMEOUT_SECONDS", None)
+    env.pop("CLAUDE_MAX_SESSION_HOURS", None)
+    env.pop("CLAUDE_IDLE_TIMEOUT", None)
 
     # BUDGET_CEILING is global (not per-user). Skipped entirely on the
     # claude backend (--max-budget-usd is omitted from claude --print
@@ -1647,6 +1685,16 @@ def _cmd_config() -> None:
     # CLAUDE_TIMEOUT_SECONDS; the legacy key is migrated to the new
     # name at apply time.)
     env["AGENT_TIMEOUT_SECONDS"] = timeout
+
+    # Session lifecycle keys are written delta-from-default (matching
+    # the autocompact / effort treatment below) so a default-accepting
+    # run keeps /etc/kai/env minimal; load_config supplies the same
+    # defaults at runtime. Compare as parsed numbers so inputs like
+    # "0.0" or "01800" that pass validation still count as defaults.
+    if float(max_session_hours) != 0:
+        env["AGENT_MAX_SESSION_HOURS"] = max_session_hours
+    if int(idle_timeout) != 1800:
+        env["AGENT_IDLE_TIMEOUT"] = idle_timeout
 
     # Context window tuning - only include if non-default.
     # Compare as int to handle inputs like "000" that pass validation.
@@ -3673,6 +3721,14 @@ def _cmd_apply() -> None:
         if "AGENT_TIMEOUT_SECONDS" not in env and "CLAUDE_TIMEOUT_SECONDS" in env:
             env["AGENT_TIMEOUT_SECONDS"] = env["CLAUDE_TIMEOUT_SECONDS"]
         env.pop("CLAUDE_TIMEOUT_SECONDS", None)
+        # Same migration for the session lifecycle keys (renamed from
+        # the CLAUDE_-prefixed forms; they govern every backend's pool).
+        if "AGENT_MAX_SESSION_HOURS" not in env and "CLAUDE_MAX_SESSION_HOURS" in env:
+            env["AGENT_MAX_SESSION_HOURS"] = env["CLAUDE_MAX_SESSION_HOURS"]
+        env.pop("CLAUDE_MAX_SESSION_HOURS", None)
+        if "AGENT_IDLE_TIMEOUT" not in env and "CLAUDE_IDLE_TIMEOUT" in env:
+            env["AGENT_IDLE_TIMEOUT"] = env["CLAUDE_IDLE_TIMEOUT"]
+        env.pop("CLAUDE_IDLE_TIMEOUT", None)
         _apply_secrets(env, dry_run, users_yaml_staging_path=users_yaml_staging_path)
 
         # -- Step 6: Deploy Goose config (if backend=goose) --

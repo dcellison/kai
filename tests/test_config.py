@@ -35,8 +35,10 @@ _CONFIG_ENV_VARS = [
     "CLAUDE_TIMEOUT_SECONDS",
     "BUDGET_CEILING",
     "CLAUDE_MAX_BUDGET_USD",  # backward compat (renamed to BUDGET_CEILING)
-    "CLAUDE_MAX_SESSION_HOURS",
-    "CLAUDE_IDLE_TIMEOUT",
+    "AGENT_MAX_SESSION_HOURS",
+    "CLAUDE_MAX_SESSION_HOURS",  # backward compat (renamed to AGENT_MAX_SESSION_HOURS)
+    "AGENT_IDLE_TIMEOUT",
+    "CLAUDE_IDLE_TIMEOUT",  # backward compat (renamed to AGENT_IDLE_TIMEOUT)
     "WEBHOOK_PORT",
     "WEBHOOK_SECRET",
     "VOICE_ENABLED",
@@ -249,13 +251,13 @@ class TestLoadConfigErrors:
 
     def test_invalid_session_hours(self, monkeypatch):
         _set_required(monkeypatch)
-        monkeypatch.setenv("CLAUDE_MAX_SESSION_HOURS", "not-a-number")
-        with pytest.raises(SystemExit, match="CLAUDE_MAX_SESSION_HOURS"):
+        monkeypatch.setenv("AGENT_MAX_SESSION_HOURS", "not-a-number")
+        with pytest.raises(SystemExit, match="AGENT_MAX_SESSION_HOURS"):
             load_config()
 
     def test_session_hours_from_env(self, monkeypatch):
         _set_required(monkeypatch)
-        monkeypatch.setenv("CLAUDE_MAX_SESSION_HOURS", "4.5")
+        monkeypatch.setenv("AGENT_MAX_SESSION_HOURS", "4.5")
         config = load_config()
         assert config.claude_max_session_hours == 4.5
 
@@ -2696,6 +2698,71 @@ class TestAgentTimeoutSecondsRename:
         self._required_env(monkeypatch)
         cfg = load_config()
         assert cfg.claude_timeout_seconds == 120
+
+
+class TestAgentSessionLifecycleRename:
+    """CLAUDE_MAX_SESSION_HOURS / CLAUDE_IDLE_TIMEOUT renamed to the
+    AGENT_-prefixed forms with legacy aliases. The deprecation warning
+    comes from the _renamed_env_vars map, which fires whenever a legacy
+    key is present in the environment."""
+
+    def _required_env(self, monkeypatch, **overrides):
+        for var in _CONFIG_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        base = {
+            "TELEGRAM_BOT_TOKEN": "test-token",
+            "ALLOWED_USER_IDS": "12345",
+            "DEFAULT_MODEL": "sonnet",
+            "BUDGET_CEILING": "10.0",
+            "WEBHOOK_PORT": "8080",
+            "WEBHOOK_SECRET": "test-secret",
+        }
+        base.update(overrides)
+        for k, v in base.items():
+            monkeypatch.setenv(k, v)
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n",
+        )
+
+    def test_agent_keys_preferred_over_legacy(self, monkeypatch):
+        self._required_env(
+            monkeypatch,
+            AGENT_MAX_SESSION_HOURS="6",
+            CLAUDE_MAX_SESSION_HOURS="2",
+            AGENT_IDLE_TIMEOUT="900",
+            CLAUDE_IDLE_TIMEOUT="300",
+        )
+        cfg = load_config()
+        assert cfg.claude_max_session_hours == 6
+        assert cfg.claude_idle_timeout == 900
+
+    def test_legacy_only_falls_back_with_warning(self, monkeypatch, caplog):
+        self._required_env(
+            monkeypatch,
+            CLAUDE_MAX_SESSION_HOURS="4.5",
+            CLAUDE_IDLE_TIMEOUT="600",
+        )
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            cfg = load_config()
+        assert cfg.claude_max_session_hours == 4.5
+        assert cfg.claude_idle_timeout == 600
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("CLAUDE_MAX_SESSION_HOURS in env is deprecated" in m for m in messages)
+        assert any("CLAUDE_IDLE_TIMEOUT in env is deprecated" in m for m in messages)
+
+    def test_neither_set_uses_defaults(self, monkeypatch):
+        self._required_env(monkeypatch)
+        cfg = load_config()
+        assert cfg.claude_max_session_hours == 0
+        assert cfg.claude_idle_timeout == 1800
+
+    def test_invalid_idle_timeout_names_canonical_key(self, monkeypatch):
+        """A bad value fails fast naming the canonical key, including
+        when the bad value arrives through the legacy alias."""
+        self._required_env(monkeypatch, CLAUDE_IDLE_TIMEOUT="soon")
+        with pytest.raises(SystemExit, match="AGENT_IDLE_TIMEOUT"):
+            load_config()
 
 
 class TestLoadConfigBackendAwareModelValidation:

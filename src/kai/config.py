@@ -975,7 +975,7 @@ class Config:
             --max-budget-usd flag is omitted from claude --print argv).
             Enforced on non-claude backends, which run on pay-per-token
             billing where the ceiling is a real cost gate.
-        claude_max_session_hours: Hours before the inner Claude process is recycled. Prevents
+        claude_max_session_hours: Hours before the inner agent subprocess is recycled. Prevents
             unbounded V8 memory growth that can trigger macOS Jetsam kernel panics. 0 = no limit.
         session_db_path: Path to the SQLite database for sessions, jobs, and settings
         webhook_port: Port for the local aiohttp server (webhooks + scheduling API)
@@ -2639,14 +2639,28 @@ def load_config() -> Config:
         budget_ceiling = float(raw_ceiling)
     except ValueError:
         raise SystemExit("BUDGET_CEILING must be a number") from None
+    # AGENT_MAX_SESSION_HOURS / AGENT_IDLE_TIMEOUT are the canonical
+    # keys; the CLAUDE_-prefixed forms are legacy aliases kept for
+    # installs upgrading without re-running the wizard. Apply-time
+    # migration in install.py rewrites /etc/kai/env to the new keys,
+    # so the fallback only fires on the first start after an upgrade
+    # (the _renamed_env_vars warning below tells the operator to
+    # migrate). Both govern the subprocess pool's session lifecycle
+    # for every backend, which is why the claude prefix was retired.
+    raw_session_hours = os.environ.get("AGENT_MAX_SESSION_HOURS", "").strip()
+    if not raw_session_hours:
+        raw_session_hours = os.environ.get("CLAUDE_MAX_SESSION_HOURS", "").strip() or "0"
     try:
-        claude_max_session_hours = float(os.environ.get("CLAUDE_MAX_SESSION_HOURS", "0"))
+        claude_max_session_hours = float(raw_session_hours)
     except ValueError:
-        raise SystemExit("CLAUDE_MAX_SESSION_HOURS must be a number") from None
+        raise SystemExit("AGENT_MAX_SESSION_HOURS must be a number") from None
+    raw_idle_timeout = os.environ.get("AGENT_IDLE_TIMEOUT", "").strip()
+    if not raw_idle_timeout:
+        raw_idle_timeout = os.environ.get("CLAUDE_IDLE_TIMEOUT", "").strip() or "1800"
     try:
-        claude_idle_timeout = int(os.environ.get("CLAUDE_IDLE_TIMEOUT", "1800"))
+        claude_idle_timeout = int(raw_idle_timeout)
     except ValueError:
-        raise SystemExit("CLAUDE_IDLE_TIMEOUT must be an integer") from None
+        raise SystemExit("AGENT_IDLE_TIMEOUT must be an integer") from None
     try:
         webhook_port = int(os.environ.get("WEBHOOK_PORT", "8080"))
     except ValueError:
@@ -3022,6 +3036,8 @@ def load_config() -> Config:
     _renamed_env_vars = {
         "CLAUDE_MAX_BUDGET_USD": "BUDGET_CEILING (global ceiling). Per-user defaults go in users.yaml 'max_budget'.",
         "CLAUDE_TIMEOUT_SECONDS": "AGENT_TIMEOUT_SECONDS.",
+        "CLAUDE_MAX_SESSION_HOURS": "AGENT_MAX_SESSION_HOURS.",
+        "CLAUDE_IDLE_TIMEOUT": "AGENT_IDLE_TIMEOUT.",
     }
     for var, replacement in _renamed_env_vars.items():
         if os.environ.get(var, "").strip():

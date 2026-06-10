@@ -70,7 +70,7 @@ users:
 
 Each user gets:
 
-- **Own agent subprocess** - created lazily on first message, evicted after idle timeout (`CLAUDE_IDLE_TIMEOUT`, default 30 minutes). No shared conversation state.
+- **Own agent subprocess** - created lazily on first message, evicted after idle timeout (`AGENT_IDLE_TIMEOUT`, default 30 minutes). No shared conversation state.
 - **Isolated data** - conversation history, workspace settings, scheduled jobs, and file uploads are all namespaced by user. One user cannot see or affect another's state.
 - **Optional OS-level separation** - set `os_user` to run that user's agent process as a dedicated system account via `sudo -u`. Requires a sudoers rule (the install script generates one automatically).
 - **Per-user home workspace** - each user can have their own default workspace directory.
@@ -223,7 +223,7 @@ Authorization, per-user model selection, per-user OS isolation, per-user GitHub 
 | `BUDGET_CEILING` | No | `10.0` | Global budget ceiling in USD. Users cannot exceed this via `/settings budget`. Per-user defaults in `users.yaml` `max_budget`. |
 | `CLAUDE_MAX_CONTEXT_WINDOW` | No | `0` | Installation-wide default context window in tokens (0 = backend default). Per-user override in `users.yaml` `context_window`, or `/settings context`. |
 | `CLAUDE_AUTOCOMPACT_PCT` | No | `80` | Context compression threshold %, Claude Code only. When usage hits this, Claude compresses history. Can only lower the default (~83%), not raise it. |
-| `CLAUDE_MAX_SESSION_HOURS` | No | `0` | Maximum session age in hours before recycling the subprocess (0 = no limit). Recommended: 4-8 on memory-constrained machines. |
+| `AGENT_MAX_SESSION_HOURS` | No | `0` | Maximum session age in hours before recycling the subprocess (0 = no limit). Applies to every backend. Recommended: 4-8 on memory-constrained machines. |
 | `WORKSPACE_BASE` | No | | Installation-wide default workspace base directory. Per-user override in `users.yaml` `workspace_base`. |
 | `ALLOWED_WORKSPACES` | No | | Comma-separated extra workspace paths accessible by name. Users also manage their own via `/workspace allow`. |
 | `WEBHOOK_PORT` | No | `8080` | HTTP server port for webhooks and scheduling API |
@@ -234,7 +234,7 @@ Authorization, per-user model selection, per-user OS isolation, per-user GitHub 
 | `PR_REVIEW_TIMEOUT_S` | No | `900` | Subprocess timeout for a single PR review, in seconds. |
 | `PR_REVIEW_BUDGET_USD` | No | `1.0` | Hard USD ceiling for one PR review subprocess. Informational on the claude backend; enforced on non-claude backends. |
 | `SPEC_DIR` | No | `specs` | Spec directory relative to repo root, for branch-name matching in PR reviews |
-| `CLAUDE_IDLE_TIMEOUT` | No | `1800` | Seconds before idle subprocesses are evicted (0 to disable) |
+| `AGENT_IDLE_TIMEOUT` | No | `1800` | Seconds before idle subprocesses are evicted (0 to disable). Applies to every backend. |
 | `CLAUDE_EFFORT_LEVEL` | No | `high` | Reasoning effort for inner Claude: `low`, `medium`, `high`, `xhigh`, `max`. |
 | `VOICE_ENABLED` | No | `false` | Enable voice message transcription |
 | `TTS_ENABLED` | No | `false` | Enable text-to-speech voice responses |

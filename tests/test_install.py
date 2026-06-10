@@ -1135,6 +1135,8 @@ class TestCmdConfig:
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
+                "0",  # max session age hours (0 = no limit)
+                "1800",  # idle eviction timeout seconds
                 "10.0",  # budget
                 "200000",  # max context window
                 "80",  # autocompact pct
@@ -1213,6 +1215,8 @@ class TestCmdConfig:
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
+                "0",  # max session age hours (0 = no limit)
+                "1800",  # idle eviction timeout seconds
                 "10.0",  # budget
                 "200000",  # max context window
                 "80",  # autocompact pct
@@ -1296,6 +1300,8 @@ class TestCmdConfig:
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
+                "0",  # max session age hours (0 = no limit)
+                "1800",  # idle eviction timeout seconds
                 "10.0",  # budget
                 "200000",  # max context window
                 "80",  # autocompact pct
@@ -1366,6 +1372,8 @@ class TestCmdConfig:
                 "sonnet",
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",
+                "0",  # max session age hours (0 = no limit)
+                "1800",  # idle eviction timeout seconds
                 "10.0",
                 "200000",
                 "80",
@@ -1428,6 +1436,8 @@ class TestCmdConfig:
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
+                "0",  # max session age hours (0 = no limit)
+                "1800",  # idle eviction timeout seconds
                 "10.0",  # budget
                 "200000",  # max context window
                 "8080",  # port
@@ -1485,6 +1495,8 @@ class TestCmdConfig:
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
+                "0",  # max session age hours (0 = no limit)
+                "1800",  # idle eviction timeout seconds
                 "10.0",  # budget
                 "200000",  # max context window
                 "8080",  # port
@@ -1663,6 +1675,8 @@ class TestCmdConfig:
             "sonnet",  # model
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # timeout
+            "0",  # max session age hours (0 = no limit)
+            "1800",  # idle eviction timeout seconds
             *budget_entry,  # BUDGET_CEILING (non-claude only)
             "200000",  # max context window
             *claude_only_pre_webhook,  # autocompact + effort (claude only)
@@ -2111,6 +2125,8 @@ class TestCmdConfig:
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
+                "0",  # max session age hours (0 = no limit)
+                "1800",  # idle eviction timeout seconds
                 "10.0",  # budget
                 "200000",  # max context window
                 "8080",  # port
@@ -2463,6 +2479,8 @@ class TestCmdConfig:
                 # model: handled by _prompt_default_model mock
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # agent timeout
+                "0",  # max session age hours (0 = no limit)
+                "1800",  # idle eviction timeout seconds
                 "10.0",  # budget (codex != claude branch)
                 "200000",  # max context window
                 # autocompact + effort skipped on non-claude backend
@@ -2828,6 +2846,8 @@ class TestCmdConfigDefaultModelDispatch:
             # model prompt is handled by the _prompt_default_model mock
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout (global default)
+            "0",  # max session age hours (0 = no limit)
+            "1800",  # idle eviction timeout seconds
             "200000",  # max context window (global default)
             "80",  # autocompact pct
             "",  # effort level (default)
@@ -2869,6 +2889,8 @@ class TestCmdConfigDefaultModelDispatch:
             # Model prompt handled by the _prompt_default_model mock
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout (global default)
+            "0",  # max session age hours (0 = no limit)
+            "1800",  # idle eviction timeout seconds
             "10.0",  # BUDGET_CEILING (non-claude only)
             "200000",  # max context window (global default)
             # No autocompact_pct / effort_level prompts (claude-only)
@@ -2902,6 +2924,8 @@ class TestCmdConfigDefaultModelDispatch:
             # model prompt is handled by the _prompt_default_model mock
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout (global default)
+            "0",  # max session age hours (0 = no limit)
+            "1800",  # idle eviction timeout seconds
             "10.0",  # BUDGET_CEILING (non-claude only)
             "200000",  # max context window (global default)
             # autocompact_pct / effort_level prompts are claude-only (gated)
@@ -6379,6 +6403,8 @@ class TestCmdConfigCanonicalUsersYaml:
             "sonnet",
             "false",  # customize per-role models (decline)
             "120",
+            "0",  # max session age hours (0 = no limit)
+            "1800",  # idle eviction timeout seconds
             "10.0",
             "200000",
             "80",
@@ -6730,6 +6756,8 @@ class TestCmdConfigSingleUserMode:
             "sonnet",  # model
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # timeout
+            "0",  # max session age hours (0 = no limit)
+            "1800",  # idle eviction timeout seconds
             "200000",  # max_context_window
             "80",  # autocompact
             "",  # effort level
@@ -7517,6 +7545,8 @@ class TestOpenCodeBinWizardPrompt:
             # model: handled by _prompt_default_model mock
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout
+            "0",  # max session age hours (0 = no limit)
+            "1800",  # idle eviction timeout seconds
             "10.0",  # budget (non-claude branch)
             "200000",  # max context window
             "8080",  # webhook port
@@ -7967,6 +7997,82 @@ class TestApplyBackendAwareModelValidation:
         )
         with pytest.raises(SystemExit, match="not valid for codex"):
             _cmd_apply()
+
+
+class TestCmdConfigSessionLifecycleKeys:
+    """Wizard emission and migration for AGENT_MAX_SESSION_HOURS /
+    AGENT_IDLE_TIMEOUT. Both are delta-from-default keys: a
+    default-accepting run writes neither, a non-default answer writes
+    the canonical AGENT_-prefixed key, and legacy CLAUDE_-prefixed
+    keys carried in an existing install.conf prefill the prompts and
+    are popped from the regenerated env."""
+
+    def _run_claude_chain(self, tmp_path, monkeypatch, mutate=None):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        TestCmdConfig._simulate_existing_etc_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 1\n    name: alice\n    role: admin\n",
+        )
+        base = list(TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend())
+        if mutate:
+            mutate(base)
+        inputs = iter(base)
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        monkeypatch.setattr(
+            "kai.install._prompt_default_model",
+            lambda backend, prov, default: "sonnet",
+        )
+        _cmd_config()
+        return json.loads((tmp_path / "install.conf").read_text())["env"]
+
+    def test_defaults_suppress_both_keys(self, tmp_path, monkeypatch):
+        env = self._run_claude_chain(tmp_path, monkeypatch)
+        assert "AGENT_MAX_SESSION_HOURS" not in env
+        assert "AGENT_IDLE_TIMEOUT" not in env
+
+    def test_non_default_values_land_with_canonical_names(self, tmp_path, monkeypatch):
+        def mutate(base):
+            # First "0" in the chain is the session-hours slot; "1800"
+            # appears only as the idle-timeout slot.
+            base[base.index("0")] = "6"
+            base[base.index("1800")] = "900"
+
+        env = self._run_claude_chain(tmp_path, monkeypatch, mutate)
+        assert env["AGENT_MAX_SESSION_HOURS"] == "6"
+        assert env["AGENT_IDLE_TIMEOUT"] == "900"
+
+    def test_legacy_keys_prefill_then_migrate_to_canonical(self, tmp_path, monkeypatch):
+        """A regenerate over an install.conf carrying the legacy
+        CLAUDE_-prefixed keys prefills the prompts with the legacy
+        values; accepting the prefills (empty input) lands the values
+        under the canonical names and the legacy keys do not survive
+        into the regenerated env."""
+        prior_conf = {
+            "install_dir": "/opt/kai",
+            "data_dir": "/var/lib/kai",
+            "service_user": "kai",
+            "platform": "darwin",
+            "env": {
+                "TELEGRAM_BOT_TOKEN": "fake-token",
+                "CLAUDE_MAX_SESSION_HOURS": "4",
+                "CLAUDE_IDLE_TIMEOUT": "600",
+            },
+        }
+        (tmp_path / "install.conf").write_text(json.dumps(prior_conf))
+
+        def mutate(base):
+            # Empty input accepts the prompt prefill, which reads the
+            # legacy keys as fallback defaults.
+            base[base.index("0")] = ""
+            base[base.index("1800")] = ""
+
+        env = self._run_claude_chain(tmp_path, monkeypatch, mutate)
+        assert env["AGENT_MAX_SESSION_HOURS"] == "4"
+        assert env["AGENT_IDLE_TIMEOUT"] == "600"
+        assert "CLAUDE_MAX_SESSION_HOURS" not in env
+        assert "CLAUDE_IDLE_TIMEOUT" not in env
 
 
 class TestApplyAgentTimeoutMigration:
