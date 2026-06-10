@@ -156,8 +156,8 @@ If interrupted mid-response, Kai notifies you on restart and asks you to resend 
 | `/stop` | Interrupt a response mid-stream |
 | `/models` | Interactive model picker |
 | `/model <name>` | Switch model (available models depend on backend) |
-| `/settings` | Show per-user settings (model, budget, timeout, context window) |
-| `/settings <field> <value>` | Change a setting (`model`, `budget`, `timeout`, `context`) |
+| `/settings` | Show per-user settings (model, budget, timeout) |
+| `/settings <field> <value>` | Change a setting (`model`, `budget`, `timeout`) |
 | `/settings reset [field]` | Clear all overrides, or one field |
 | `/workspace` (or `/ws`) | Show current workspace |
 | `/workspace <name>` | Switch by name (resolved under `WORKSPACE_BASE`) |
@@ -221,7 +221,6 @@ Authorization, per-user model selection, per-user OS isolation, per-user GitHub 
 | `DEFAULT_MODEL` | No | `sonnet` | Installation-wide default model. Per-user override in `users.yaml` `model`, or `/settings model`. |
 | `AGENT_TIMEOUT_SECONDS` | No | `120` | Installation-wide default per-message timeout. Per-user override in `users.yaml` `timeout`, or `/settings timeout`. |
 | `BUDGET_CEILING` | No | `10.0` | Global budget ceiling in USD. Users cannot exceed this via `/settings budget`. Per-user defaults in `users.yaml` `max_budget`. |
-| `CLAUDE_MAX_CONTEXT_WINDOW` | No | `0` | Installation-wide default context window in tokens (0 = backend default). Per-user override in `users.yaml` `context_window`, or `/settings context`. |
 | `CLAUDE_AUTOCOMPACT_PCT` | No | `80` | Context compression threshold %, Claude Code only. When usage hits this, Claude compresses history. Can only lower the default (~83%), not raise it. |
 | `AGENT_MAX_SESSION_HOURS` | No | `0` | Maximum session age in hours before recycling the subprocess (0 = no limit). Applies to every backend. Recommended: 4-8 on memory-constrained machines. |
 | `WORKSPACE_BASE` | No | | Installation-wide default workspace base directory. Per-user override in `users.yaml` `workspace_base`. |

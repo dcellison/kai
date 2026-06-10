@@ -517,7 +517,6 @@ class TestUserSettings:
         await sessions.set_user_setting(111, "model", "opus")
         await sessions.set_user_setting(111, "budget", "15.0")
         await sessions.set_user_setting(111, "timeout", "300")
-        await sessions.set_user_setting(111, "context_window", "200000")
         await sessions.delete_all_user_settings(111)
         result = await sessions.get_user_settings(111)
         assert result == {}
@@ -559,7 +558,6 @@ class TestResolveUserDefaults:
             "default_model": "sonnet",
             "budget_ceiling": 10.0,
             "claude_timeout_seconds": 120,
-            "claude_max_context_window": 0,
         }
         defaults.update(kwargs)
         if user_configs is not None:
@@ -573,7 +571,6 @@ class TestResolveUserDefaults:
         assert result["model"] == "sonnet"
         assert result["budget"] == 10.0
         assert result["timeout"] == 120
-        assert result["context_window"] == 0
 
     async def test_db_overrides_globals(self, db):
         """DB settings override global defaults."""
@@ -585,7 +582,6 @@ class TestResolveUserDefaults:
         assert result["budget"] == 25.0
         # Unset fields still come from globals
         assert result["timeout"] == 120
-        assert result["context_window"] == 0
 
     async def test_yaml_overrides_globals(self, db):
         """users.yaml settings override global defaults."""
@@ -597,14 +593,12 @@ class TestResolveUserDefaults:
             model="opus",
             max_budget=20.0,
             timeout=300,
-            context_window=200_000,
         )
         config = self._make_config(user_configs={111: uc})
         result = await sessions.resolve_user_defaults(111, config)
         assert result["model"] == "opus"
         assert result["budget"] == 20.0
         assert result["timeout"] == 300
-        assert result["context_window"] == 200_000
 
     async def test_db_overrides_yaml(self, db):
         """DB settings take precedence over users.yaml."""
@@ -641,7 +635,6 @@ class TestResolveUserDefaults:
         assert result["model"] == "opus"  # from DB
         assert result["timeout"] == 300  # from YAML
         assert result["budget"] == 10.0  # from global
-        assert result["context_window"] == 0  # from global
 
     # ── Empty/blank model fallthrough (finding 1) ────────────────
 

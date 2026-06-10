@@ -58,7 +58,6 @@ from kai import github_api, memory_command, services, sessions, webhook
 from kai.backend import resolve_home_workspace
 from kai.config import (
     DATA_DIR,
-    MAX_CONTEXT_CEILING,
     ONESHOT_REASONER_BACKENDS,
     OPEN_ENDED_PROVIDERS,
     PROVIDER_DEFAULTS,
@@ -665,11 +664,6 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # ── Per-user settings ──────────────────────────────────────────────
 
-# Map user-facing field names to DB storage keys. "context" is the
-# user-facing name; "context_window" is the DB key. Defined once so
-# the mapping isn't scattered across set/reset/display handlers.
-_FIELD_ALIASES: dict[str, str] = {"context": "context_window"}
-
 
 @_require_auth
 async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -783,41 +777,7 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(f"Default timeout set to {timeout}s.")
         return
 
-    # /settings context <n>
-    if field == "context":
-        if not value:
-            await update.message.reply_text("Usage: /settings context <tokens>")
-            return
-        try:
-            ctx = int(value)
-            if ctx < 0:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("Context window must be a non-negative integer.")
-            return
-        if ctx != 0 and ctx < 50000:
-            await update.message.reply_text("Context window must be at least 50000 tokens (or 0 for default).")
-            return
-        if ctx > MAX_CONTEXT_CEILING:
-            await update.message.reply_text(f"Context window cannot exceed {MAX_CONTEXT_CEILING} tokens.")
-            return
-        await sessions.set_user_setting(chat_id, "context_window", str(ctx))
-        # Context window is a CLI flag baked in at process startup
-        # (passed via --settings). Must restart to take effect.
-        pool = _get_pool(context)
-        instance = pool.get_if_exists(chat_id)
-        restarted = False
-        if instance:
-            instance.max_context_window = ctx
-            await pool.restart(chat_id)
-            await _end_session(chat_id)
-            restarted = True
-        label = f"{ctx:,} tokens" if ctx > 0 else "default"
-        suffix = " Session restarted." if restarted else ""
-        await update.message.reply_text(f"Context window set to {label}.{suffix}")
-        return
-
-    await update.message.reply_text(f"Unknown setting: {field}\nSettings: model, budget, timeout, context, reset")
+    await update.message.reply_text(f"Unknown setting: {field}\nSettings: model, budget, timeout, reset")
 
 
 async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, config: Config) -> None:
@@ -858,35 +818,6 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     yaml_timeout = user_config.timeout if user_config else None
     timeout, timeout_src = _resolve("timeout", yaml_timeout, config.claude_timeout_seconds, lambda v: f"{int(v)}s")
 
-    # Context window - handled separately from _resolve() because 0 has
-    # special display semantics ("default" instead of "0 tokens") and
-    # resolve_user_defaults() doesn't expose source attribution strings.
-    yaml_ctx = user_config.context_window if user_config else None
-    ctx_from_db = False
-    try:
-        if "context_window" in db_settings:
-            ctx_val = int(db_settings["context_window"])
-            ctx_from_db = True
-        elif yaml_ctx is not None:
-            ctx_val = yaml_ctx
-        else:
-            ctx_val = config.claude_max_context_window
-    except (ValueError, TypeError):
-        # Corrupt DB value - fall through to yaml/global
-        ctx_val = yaml_ctx if yaml_ctx is not None else config.claude_max_context_window
-    # Source attribution. When the user explicitly sets context to 0
-    # (meaning "use the Claude Code default"), show "global default"
-    # instead of "user override" - the intent was to revert, not override.
-    # ctx_from_db is False after a corrupt DB parse, so attribution stays
-    # correct on fallback (unlike checking "context_window" in db_settings).
-    if ctx_from_db and ctx_val > 0:
-        ctx_src = "user override"
-    elif not ctx_from_db and yaml_ctx is not None:
-        ctx_src = "users.yaml"
-    else:
-        ctx_src = "global default"
-    ctx_label = f"{ctx_val:,} tokens" if ctx_val > 0 else "not set (model default)"
-
     # Provider info - always show so users know their configuration.
     # Uses the shared helper that checks the running instance first,
     # falling back to config cascade so new users see their provider
@@ -900,8 +831,7 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
         f"  Model: {model} ({model_src})"
         f"{provider_line}\n"
         f"  Budget: {budget} ({budget_src})\n"
-        f"  Timeout: {timeout} ({timeout_src})\n"
-        f"  Context: {ctx_label} ({ctx_src})"
+        f"  Timeout: {timeout} ({timeout_src})"
     )
 
 
@@ -946,10 +876,6 @@ def _revert_instance_field(pool: SubprocessPool, chat_id: int, field: str, confi
         instance.max_budget_usd = user.max_budget if user and user.max_budget is not None else config.budget_ceiling
     elif field == "timeout":
         instance.timeout_seconds = user.timeout if user and user.timeout is not None else config.claude_timeout_seconds
-    elif field == "context_window":
-        instance.max_context_window = (
-            user.context_window if user and user.context_window is not None else config.claude_max_context_window
-        )
 
 
 async def _handle_settings_reset(
@@ -968,30 +894,28 @@ async def _handle_settings_reset(
     extra process restart during an infrequent operation.
     """
     assert update.message is not None
-    valid_fields = {"model", "budget", "timeout", "context"}
+    valid_fields = {"model", "budget", "timeout"}
 
     if field:
         field = field.lower()
         if field not in valid_fields:
             await update.message.reply_text(f"Unknown field: {field}\nFields: {', '.join(sorted(valid_fields))}")
             return
-        # Resolve alias (e.g., "context" -> "context_window")
-        db_field = _FIELD_ALIASES.get(field, field)
-        await sessions.delete_user_setting(chat_id, db_field)
+        await sessions.delete_user_setting(chat_id, field)
         pool = _get_pool(context)
         # Write the resolved default back onto the live instance before
         # restarting. restart() preserves the Python object, so stale
         # in-memory attributes would persist without this step.
-        _revert_instance_field(pool, chat_id, db_field, config)
+        _revert_instance_field(pool, chat_id, field, config)
         await pool.restart(chat_id)
         await _end_session(chat_id)
         await update.message.reply_text(f"Cleared {field} override. Using default. Session restarted.")
     else:
         await sessions.delete_all_user_settings(chat_id)
         pool = _get_pool(context)
-        # Revert all four fields to their resolved defaults before
+        # Revert all three fields to their resolved defaults before
         # restarting (same rationale as single-field reset above).
-        for f in ("model", "budget", "timeout", "context_window"):
+        for f in ("model", "budget", "timeout"):
             _revert_instance_field(pool, chat_id, f, config)
         await pool.restart(chat_id)
         await _end_session(chat_id)
@@ -2952,7 +2876,6 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/settings model <name> - Default model\n"
         "/settings budget <n> - Spending cap (USD)\n"
         "/settings timeout <n> - Response timeout (seconds)\n"
-        "/settings context <n> - Context window (tokens)\n"
         "/settings reset [field] - Clear overrides\n"
         "\n"
         "/workspace (or /ws) - Show current workspace\n"

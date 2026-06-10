@@ -11,9 +11,8 @@
 #
 # Required fields per user: telegram_id, name.
 # All other fields are optional. Omitted fields inherit installation
-# defaults from .env / /etc/kai/env (model, timeout, context_window,
-# workspace_base) or the hardcoded defaults documented in the
-# templates/.env header.
+# defaults from .env / /etc/kai/env (model, timeout, workspace_base)
+# or the hardcoded defaults documented in the templates/.env header.
 
 users:
   # Example: admin user with full settings
@@ -38,10 +37,9 @@ users:
 
     # Optional per-user defaults. Users can override these at runtime
     # via /settings. Omitted fields inherit installation defaults
-    # (DEFAULT_MODEL, AGENT_TIMEOUT_SECONDS, CLAUDE_MAX_CONTEXT_WINDOW).
+    # (DEFAULT_MODEL, AGENT_TIMEOUT_SECONDS).
     # model: opus             # haiku/sonnet/opus for claude; provider/model for opencode
     # timeout: 300            # response timeout in seconds (max 600)
-    # context_window: 200000  # context window in tokens (0 = default)
 
     # Agent backend. Overrides the global AGENT_BACKEND from .env for
     # this user only. Default is "claude" (Claude Code CLI). Other

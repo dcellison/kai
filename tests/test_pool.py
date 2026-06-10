@@ -110,7 +110,7 @@ class TestInstanceCreation:
         assert (tmp_path / "home" / "999").is_dir()
 
     def test_create_uses_user_config_settings(self, tmp_path):
-        """User with model/timeout/budget/context_window in users.yaml gets those values."""
+        """User with model/timeout/budget in users.yaml gets those values."""
         ws = tmp_path / "ws"
         ws.mkdir()
         user = UserConfig(
@@ -120,7 +120,6 @@ class TestInstanceCreation:
             model="opus",
             max_budget=25.0,
             timeout=300,
-            context_window=200_000,
         )
         config = _make_config(user_configs={111: user})
         pool = SubprocessPool(config=config, services_info=[])
@@ -128,24 +127,21 @@ class TestInstanceCreation:
         assert instance.model == "opus"
         assert instance.max_budget_usd == 25.0
         assert instance.timeout_seconds == 300
-        assert instance.max_context_window == 200_000
 
     def test_create_falls_back_to_global_for_missing_user_fields(self):
-        """User with no model/timeout/context_window gets global defaults."""
+        """User with no model/timeout gets global defaults."""
         user = UserConfig(telegram_id=111, name="alice")
         config = _make_config(
             user_configs={111: user},
             default_model="haiku",
             budget_ceiling=5.0,
             claude_timeout_seconds=60,
-            claude_max_context_window=100_000,
         )
         pool = SubprocessPool(config=config, services_info=[])
         instance = pool.get(111)
         assert instance.model == "haiku"
         assert instance.max_budget_usd == 5.0
         assert instance.timeout_seconds == 60
-        assert instance.max_context_window == 100_000
 
 
 # ── Per-user backend/provider routing ──────────────────────────────
@@ -418,7 +414,6 @@ class TestPropertyAccessors:
                 "model": "opus",
                 "budget": 10.0,
                 "timeout": 120,
-                "context_window": 0,
             },
         ):
             assert await pool.get_effective_model(999) == "opus"

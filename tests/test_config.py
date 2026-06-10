@@ -195,19 +195,27 @@ class TestLoadConfigDefaults:
         assert config.voice_enabled is False
         assert config.tts_enabled is False
         assert config.workspace_base is None
-        # Context window tuning defaults to 0 (use Claude Code defaults)
-        assert config.claude_max_context_window == 0
+        # Autocompact tuning defaults to 0 (use Claude Code default)
         assert config.claude_autocompact_pct == 0
         # Agent backend default
         assert config.agent_backend == "claude"
 
-    def test_context_window_from_env(self, monkeypatch):
+    def test_autocompact_from_env(self, monkeypatch):
         _set_required(monkeypatch)
-        monkeypatch.setenv("CLAUDE_MAX_CONTEXT_WINDOW", "200000")
         monkeypatch.setenv("CLAUDE_AUTOCOMPACT_PCT", "80")
         config = load_config()
-        assert config.claude_max_context_window == 200000
         assert config.claude_autocompact_pct == 80
+
+    def test_retired_context_window_env_warns_but_loads(self, monkeypatch, caplog):
+        """A lingering CLAUDE_MAX_CONTEXT_WINDOW (the setting was
+        removed) does not block startup; load_config warns that the
+        key has no effect."""
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CLAUDE_MAX_CONTEXT_WINDOW", "200000")
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            config = load_config()
+        assert config is not None
+        assert any("CLAUDE_MAX_CONTEXT_WINDOW is no longer supported" in r.getMessage() for r in caplog.records)
 
 
 # ── Error cases ──────────────────────────────────────────────────────
@@ -260,24 +268,6 @@ class TestLoadConfigErrors:
         monkeypatch.setenv("AGENT_MAX_SESSION_HOURS", "4.5")
         config = load_config()
         assert config.claude_max_session_hours == 4.5
-
-    def test_invalid_context_window(self, monkeypatch):
-        _set_required(monkeypatch)
-        monkeypatch.setenv("CLAUDE_MAX_CONTEXT_WINDOW", "not-a-number")
-        with pytest.raises(SystemExit, match="CLAUDE_MAX_CONTEXT_WINDOW"):
-            load_config()
-
-    def test_negative_context_window(self, monkeypatch):
-        _set_required(monkeypatch)
-        monkeypatch.setenv("CLAUDE_MAX_CONTEXT_WINDOW", "-1")
-        with pytest.raises(SystemExit, match="CLAUDE_MAX_CONTEXT_WINDOW"):
-            load_config()
-
-    def test_context_window_exceeds_ceiling(self, monkeypatch):
-        _set_required(monkeypatch)
-        monkeypatch.setenv("CLAUDE_MAX_CONTEXT_WINDOW", "99999999999")
-        with pytest.raises(SystemExit, match="CLAUDE_MAX_CONTEXT_WINDOW"):
-            load_config()
 
     def test_invalid_autocompact_pct(self, monkeypatch):
         _set_required(monkeypatch)
@@ -966,7 +956,6 @@ class TestMinimalEnvWithUsersYaml:
         assert config.default_model == "sonnet"
         assert config.claude_timeout_seconds == 120
         assert config.budget_ceiling == 10.0
-        assert config.claude_max_context_window == 0
         assert config.workspace_base is None
         assert config.allowed_workspaces == []
         # users.yaml IDs are the authorization surface

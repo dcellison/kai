@@ -18,7 +18,6 @@ from telegram.error import BadRequest
 
 from kai.backend import AgentResponse, StreamEvent
 from kai.bot import (
-    _FIELD_ALIASES,
     _QUEUED_MESSAGE_MARKER,
     _acquire_lock_or_kill,
     _backend_name_for_instance,
@@ -4255,35 +4254,15 @@ class TestHandleSettings:
         reply = update.message.reply_text.call_args[0][0]
         assert "600" in reply
 
-    # ── 9. Set context window ──────────────────────────────────────
+    # ── 9. Context is not a setting ────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_set_context_window(self):
-        """/settings context 200000 sets the context window."""
+    async def test_context_is_unknown_setting(self):
+        """/settings context <n> is rejected: the context window
+        setting was removed, so the field falls through to the
+        unknown-setting reply and nothing is persisted."""
         update = _make_update(text="/settings context 200000")
-        config = _make_config()
-        pool = _make_mock_claude()
-        instance = MagicMock()
-        pool.get_if_exists = MagicMock(return_value=instance)
-        ctx = _make_context(config=config, pool=pool, args=["context", "200000"])
-        mock_sessions = self._mock_sessions()
-
-        with self._patches(mock_sessions):
-            await handle_settings(update, ctx)
-
-        mock_sessions.set_user_setting.assert_called_once_with(12345, "context_window", "200000")
-        # Context window change triggers restart
-        pool.restart.assert_called_once()
-        reply = update.message.reply_text.call_args[0][0]
-        assert "200,000" in reply
-
-    # ── 10. Reject context below minimum ───────────────────────────
-
-    @pytest.mark.asyncio
-    async def test_reject_context_below_minimum(self):
-        """/settings context 10000 is rejected (below 50000 minimum)."""
-        update = _make_update(text="/settings context 10000")
-        ctx = _make_context(args=["context", "10000"])
+        ctx = _make_context(args=["context", "200000"])
         mock_sessions = self._mock_sessions()
 
         with self._patches(mock_sessions):
@@ -4291,26 +4270,8 @@ class TestHandleSettings:
 
         mock_sessions.set_user_setting.assert_not_called()
         reply = update.message.reply_text.call_args[0][0]
-        assert "50000" in reply
-
-    # ── 11. Context zero accepted (means default) ──────────────────
-
-    @pytest.mark.asyncio
-    async def test_context_zero_accepted(self):
-        """/settings context 0 is accepted (means 'use default')."""
-        update = _make_update(text="/settings context 0")
-        config = _make_config()
-        pool = _make_mock_claude()
-        pool.get_if_exists = MagicMock(return_value=MagicMock())
-        ctx = _make_context(config=config, pool=pool, args=["context", "0"])
-        mock_sessions = self._mock_sessions()
-
-        with self._patches(mock_sessions):
-            await handle_settings(update, ctx)
-
-        mock_sessions.set_user_setting.assert_called_once_with(12345, "context_window", "0")
-        reply = update.message.reply_text.call_args[0][0]
-        assert "default" in reply.lower()
+        assert "Unknown setting" in reply
+        assert "context" not in reply.split("Settings:")[1]
 
     # ── 12. Reset all ──────────────────────────────────────────────
 
@@ -4381,11 +4342,13 @@ class TestHandleSettings:
         reply = update.message.reply_text.call_args[0][0]
         assert "unknown model" in reply.lower()
 
-    # ── 16. Reset context maps to context_window ───────────────────
+    # ── 16. Reset context is an unknown field ──────────────────────
 
     @pytest.mark.asyncio
-    async def test_reset_context_alias(self):
-        """/settings reset context maps to context_window in DB."""
+    async def test_reset_context_unknown_field(self):
+        """/settings reset context is rejected: the context window
+        setting was removed, so the field is not in the resettable
+        set and nothing is deleted from the DB."""
         update = _make_update(text="/settings reset context")
         config = _make_config()
         pool = _make_mock_claude()
@@ -4395,8 +4358,9 @@ class TestHandleSettings:
         with self._patches(mock_sessions):
             await handle_settings(update, ctx)
 
-        # Should use the DB field name, not the user-facing alias
-        mock_sessions.delete_user_setting.assert_called_once_with(12345, "context_window")
+        mock_sessions.delete_user_setting.assert_not_called()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Unknown field" in reply
 
     # ── 17. Reset reverts instance to defaults ────────────────────
 
@@ -4456,7 +4420,7 @@ class TestHandleSettings:
 
     @pytest.mark.asyncio
     async def test_reset_all_reverts_instance(self):
-        """/settings reset reverts all four fields on the live instance."""
+        """/settings reset reverts all three fields on the live instance."""
         update = _make_update(text="/settings reset")
         config = _make_config()
         pool = _make_mock_claude()
@@ -4464,7 +4428,6 @@ class TestHandleSettings:
         instance.model = "opus"
         instance.max_budget_usd = 99.0
         instance.timeout_seconds = 500
-        instance.max_context_window = 500000
         pool.get_if_exists = MagicMock(return_value=instance)
         ctx = _make_context(config=config, pool=pool, args=["reset"])
         mock_sessions = self._mock_sessions()
@@ -4475,7 +4438,6 @@ class TestHandleSettings:
         assert instance.model == config.default_model
         assert instance.max_budget_usd == config.budget_ceiling
         assert instance.timeout_seconds == config.claude_timeout_seconds
-        assert instance.max_context_window == config.claude_max_context_window
 
     # ── 19. Budget displays "unlimited" when zero ─────────────────
 
@@ -5047,23 +5009,6 @@ class TestModelPersistence:
             await _handle_settings_reset(update, ctx, 12345, config, "model")
 
         mock_sessions.delete_user_setting.assert_called_once_with(12345, "model")
-
-
-# ── Field alias mapping ───────────────────────────────────────────
-
-
-class TestFieldAliases:
-    """Tests for the _FIELD_ALIASES mapping."""
-
-    def test_context_maps_to_context_window(self):
-        """The 'context' alias maps to 'context_window' DB key."""
-        assert _FIELD_ALIASES["context"] == "context_window"
-
-    def test_no_alias_returns_field_name(self):
-        """Fields without aliases return the field name itself via .get()."""
-        assert _FIELD_ALIASES.get("model", "model") == "model"
-        assert _FIELD_ALIASES.get("budget", "budget") == "budget"
-        assert _FIELD_ALIASES.get("timeout", "timeout") == "timeout"
 
 
 # ── Command menu completeness ────────────────────────────────────────

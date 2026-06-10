@@ -110,7 +110,6 @@ class CodexBackend(AgentBackend):
         timeout_seconds: int = 120,
         services_info: list[dict] | None = None,
         workspace_config: WorkspaceConfig | None = None,
-        max_context_window: int = 0,
         provider: str = "openai",
         # Optional OS user to run codex as via `sudo -H -u <user>`. When
         # set, the codex subprocess runs as <codex_user> and reads its
@@ -140,7 +139,6 @@ class CodexBackend(AgentBackend):
         self.max_budget_usd = max_budget_usd
         self.timeout_seconds = timeout_seconds
         self.workspace_config = workspace_config
-        self.max_context_window = max_context_window
         self.provider = provider  # ABC-mandated; bot.py reads this
         self.codex_user = codex_user
         self.memory_enabled = memory_enabled

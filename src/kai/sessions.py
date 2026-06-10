@@ -636,10 +636,8 @@ async def build_workspace_config(
 #   workspace DB > workspace YAML > user DB > users.yaml > env > hardcoded
 
 # Canonical field names for per-user settings. Must match the storage
-# keys used by set_user_setting / get_user_settings. The user-facing
-# command name "context" is mapped to "context_window" in bot.py
-# via _FIELD_ALIASES.
-_USER_SETTING_FIELDS = {"model", "budget", "timeout", "context_window"}
+# keys used by set_user_setting / get_user_settings.
+_USER_SETTING_FIELDS = {"model", "budget", "timeout"}
 
 
 async def get_user_settings(chat_id: int) -> dict[str, str]:
@@ -688,7 +686,6 @@ class UserDefaults(TypedDict):
     model: str
     budget: float
     timeout: int
-    context_window: int
 
 
 async def resolve_user_defaults(
@@ -699,8 +696,8 @@ async def resolve_user_defaults(
     Resolve per-user settings by layering DB overrides on top of
     users.yaml and env var defaults.
 
-    Returns a UserDefaults dict with keys: model, budget, timeout,
-    context_window. All values are resolved - never None.
+    Returns a UserDefaults dict with keys: model, budget, timeout.
+    All values are resolved - never None.
 
     Precedence (highest to lowest):
     1. Database (user-set via /settings or /model)
@@ -751,20 +748,10 @@ async def resolve_user_defaults(
     if timeout is None:
         timeout = yaml_timeout if yaml_timeout is not None else config.claude_timeout_seconds
 
-    # Context window: DB > users.yaml > env > 0
-    yaml_ctx = user_config.context_window if user_config and user_config.context_window is not None else None
-    try:
-        context_window = int(db_settings["context_window"]) if "context_window" in db_settings else None
-    except (ValueError, TypeError):
-        context_window = None
-    if context_window is None:
-        context_window = yaml_ctx if yaml_ctx is not None else config.claude_max_context_window
-
     return {
         "model": model,
         "budget": budget,
         "timeout": timeout,
-        "context_window": context_window,
     }
 
 
@@ -1096,7 +1083,7 @@ async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSetting
     repos = await get_effective_repos(chat_id, yaml_repos)
 
     # Notification destination: DB > yaml > telegram_id.
-    # Defensive try/except matches budget/timeout/context_window above.
+    # Defensive try/except matches budget/timeout above.
     # A corrupt DB value falls through to yaml/default rather than
     # aborting the entire resolution.
     notify: int | None = None

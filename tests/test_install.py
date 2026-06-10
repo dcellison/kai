@@ -1138,7 +1138,6 @@ class TestCmdConfig:
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "10.0",  # budget
-                "200000",  # max context window
                 "80",  # autocompact pct
                 "",  # claude effort level (take default "high")
                 "8080",  # port
@@ -1168,7 +1167,9 @@ class TestCmdConfig:
         assert conf["version"] == 1
         assert conf["install_dir"] == "/opt/kai"
         assert conf["env"]["TELEGRAM_BOT_TOKEN"] == "fake-token"
-        assert conf["env"]["CLAUDE_MAX_CONTEXT_WINDOW"] == "200000"
+        # The context window setting was removed; the wizard never
+        # emits the retired key.
+        assert "CLAUDE_MAX_CONTEXT_WINDOW" not in conf["env"]
         assert conf["env"]["CLAUDE_AUTOCOMPACT_PCT"] == "80"
         # ALLOWED_USER_IDS should not be in the env dict
         assert "ALLOWED_USER_IDS" not in conf["env"]
@@ -1218,7 +1219,6 @@ class TestCmdConfig:
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "10.0",  # budget
-                "200000",  # max context window
                 "80",  # autocompact pct
                 "",  # claude effort level (take default "high")
                 "8080",  # port
@@ -1303,7 +1303,6 @@ class TestCmdConfig:
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "10.0",  # budget
-                "200000",  # max context window
                 "80",  # autocompact pct
                 "",  # claude effort level (take default "high")
                 "8080",  # port
@@ -1375,7 +1374,6 @@ class TestCmdConfig:
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "10.0",
-                "200000",
                 "80",
                 "",  # claude effort level (take default "high")
                 "8080",
@@ -1439,7 +1437,6 @@ class TestCmdConfig:
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "10.0",  # budget
-                "200000",  # max context window
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
@@ -1498,7 +1495,6 @@ class TestCmdConfig:
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "10.0",  # budget
-                "200000",  # max context window
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
@@ -1678,7 +1674,6 @@ class TestCmdConfig:
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
             *budget_entry,  # BUDGET_CEILING (non-claude only)
-            "200000",  # max context window
             *claude_only_pre_webhook,  # autocompact + effort (claude only)
             "8080",  # port
             "test-secret",  # webhook secret
@@ -2128,7 +2123,6 @@ class TestCmdConfig:
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "10.0",  # budget
-                "200000",  # max context window
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
@@ -2482,7 +2476,6 @@ class TestCmdConfig:
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
                 "10.0",  # budget (codex != claude branch)
-                "200000",  # max context window
                 # autocompact + effort skipped on non-claude backend
                 "8080",  # webhook port
                 "test-secret",  # webhook secret
@@ -2830,7 +2823,7 @@ class TestCmdConfigDefaultModelDispatch:
 
         Post-tranche-B, the global-default prompts fire unconditionally
         even when users.yaml exists, so the chain feeds timeout,
-        max_context_window, workspace_base, and pr_review_cooldown
+        workspace_base, and pr_review_cooldown
         values that the pre-tranche-B users-yaml-exists branch had
         skipped silently.
         """
@@ -2848,7 +2841,6 @@ class TestCmdConfigDefaultModelDispatch:
             "120",  # agent timeout (global default)
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
-            "200000",  # max context window (global default)
             "80",  # autocompact pct
             "",  # effort level (default)
             "8080",  # webhook port
@@ -2892,7 +2884,6 @@ class TestCmdConfigDefaultModelDispatch:
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
             "10.0",  # BUDGET_CEILING (non-claude only)
-            "200000",  # max context window (global default)
             # No autocompact_pct / effort_level prompts (claude-only)
             "8080",  # webhook port
             "test-secret",  # webhook secret
@@ -2927,7 +2918,6 @@ class TestCmdConfigDefaultModelDispatch:
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
             "10.0",  # BUDGET_CEILING (non-claude only)
-            "200000",  # max context window (global default)
             # autocompact_pct / effort_level prompts are claude-only (gated)
             "8080",  # webhook port
             "test-secret",  # webhook secret
@@ -6210,7 +6200,7 @@ class TestStripInstallConfKeys:
 
 class TestCmdConfigGlobalDefaultsRegardlessOfUsersYaml:
     """Pins the contract that installation-wide defaults (DEFAULT_MODEL,
-    AGENT_TIMEOUT_SECONDS, BUDGET_CEILING on non-claude, CLAUDE_MAX_CONTEXT_WINDOW,
+    AGENT_TIMEOUT_SECONDS, BUDGET_CEILING on non-claude,
     WORKSPACE_BASE, PR_REVIEW_COOLDOWN) prompt on every wizard run and
     land in install.conf's env regardless of users.yaml presence.
 
@@ -6247,12 +6237,22 @@ class TestCmdConfigGlobalDefaultsRegardlessOfUsersYaml:
         env = json.loads((tmp_path / "install.conf").read_text())["env"]
         assert env["AGENT_TIMEOUT_SECONDS"] == "120"
 
-    def test_max_context_window_lands_with_users_yaml(self, tmp_path, monkeypatch):
-        """CLAUDE_MAX_CONTEXT_WINDOW reaches env when users.yaml is present.
-
-        Pre-fix: the env emission was gated on `not users_yaml_exists`,
-        so the prompt fired but the value never made it to install.conf.
-        """
+    def test_retired_context_window_key_dropped_on_regenerate(self, tmp_path, monkeypatch):
+        """A regenerate over an install.conf carrying the retired
+        CLAUDE_MAX_CONTEXT_WINDOW key drops it: the setting was
+        removed, so the wizard neither prompts for it nor carries the
+        stale key into the regenerated env."""
+        prior_conf = {
+            "install_dir": "/opt/kai",
+            "data_dir": "/var/lib/kai",
+            "service_user": "kai",
+            "platform": "darwin",
+            "env": {
+                "TELEGRAM_BOT_TOKEN": "fake-token",
+                "CLAUDE_MAX_CONTEXT_WINDOW": "200000",
+            },
+        }
+        (tmp_path / "install.conf").write_text(json.dumps(prior_conf))
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
@@ -6267,7 +6267,7 @@ class TestCmdConfigGlobalDefaultsRegardlessOfUsersYaml:
         _cmd_config()
 
         env = json.loads((tmp_path / "install.conf").read_text())["env"]
-        assert env["CLAUDE_MAX_CONTEXT_WINDOW"] == "200000"
+        assert "CLAUDE_MAX_CONTEXT_WINDOW" not in env
 
     def test_workspace_base_lands_with_users_yaml(self, tmp_path, monkeypatch):
         """WORKSPACE_BASE reaches env when users.yaml is present."""
@@ -6406,7 +6406,6 @@ class TestCmdConfigCanonicalUsersYaml:
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
             "10.0",
-            "200000",
             "80",
             "",  # effort level (default)
             "8080",
@@ -6758,7 +6757,6 @@ class TestCmdConfigSingleUserMode:
             "120",  # timeout
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
-            "200000",  # max_context_window
             "80",  # autocompact
             "",  # effort level
             "8080",  # webhook port
@@ -7548,7 +7546,6 @@ class TestOpenCodeBinWizardPrompt:
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
             "10.0",  # budget (non-claude branch)
-            "200000",  # max context window
             "8080",  # webhook port
             "test-secret",  # webhook secret
             "",  # workspace base

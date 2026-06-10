@@ -147,7 +147,7 @@ class AgentBackend(ABC):
     restore, /settings, and /model commands). These are generic to any
     backend:
         model, workspace, home_workspace, max_budget_usd,
-        timeout_seconds, max_context_window, workspace_config, provider
+        timeout_seconds, workspace_config, provider
 
     Backend-specific attributes (NOT on the ABC) stay on the concrete
     class. For ClaudeCodeBackend these include: claude_user,
@@ -165,7 +165,6 @@ class AgentBackend(ABC):
     home_workspace: Path
     max_budget_usd: float
     timeout_seconds: int
-    max_context_window: int
     workspace_config: WorkspaceConfig | None
     provider: str
 

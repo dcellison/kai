@@ -40,7 +40,6 @@ class TestUserConfig:
         assert uc.max_budget is None
         assert uc.model is None
         assert uc.timeout is None
-        assert uc.context_window is None
         assert uc.workspace_base is None
         assert uc.github_repos == []
         assert uc.github_notify_chat_id is None
@@ -61,7 +60,6 @@ class TestUserConfig:
             max_budget=15.0,
             model="opus",
             timeout=300,
-            context_window=200_000,
             workspace_base=Path("/home/alice/projects"),
             github_repos=["alice/repo-a", "alice/repo-b"],
             github_notify_chat_id=-100123456789,
@@ -76,7 +74,6 @@ class TestUserConfig:
         assert uc.max_budget == 15.0
         assert uc.model == "opus"
         assert uc.timeout == 300
-        assert uc.context_window == 200_000
         assert uc.workspace_base == Path("/home/alice/projects")
         assert uc.github_repos == ["alice/repo-a", "alice/repo-b"]
         assert uc.github_notify_chat_id == -100123456789
@@ -443,7 +440,7 @@ class TestLoadUserConfigs:
         assert configs is not None
         assert configs[111].os_user == "alice_os"
 
-    # ── New per-user setting fields (model, timeout, context_window) ──
+    # ── New per-user setting fields (model, timeout) ──────────────────
 
     def test_model_parsed(self, tmp_path):
         """Valid model name is stored, lowercased."""
@@ -515,8 +512,10 @@ class TestLoadUserConfigs:
         assert configs[111].timeout is None
         assert "invalid timeout" in caplog.text.lower()
 
-    def test_context_window_parsed(self, tmp_path):
-        """Valid context_window is stored as int."""
+    def test_context_window_key_tolerated_with_warning(self, tmp_path, caplog):
+        """A users.yaml still carrying context_window (the setting was
+        removed) loads cleanly; the key is ignored with a warning so
+        the operator knows it has no effect."""
         data = self._yaml_dict(
             """\
             users:
@@ -530,42 +529,8 @@ class TestLoadUserConfigs:
         ):
             configs = _load_user_configs("claude", "")
         assert configs is not None
-        assert configs[111].context_window == 200_000
-
-    def test_context_window_zero_allowed(self, tmp_path):
-        """context_window of 0 means 'use default' and is valid."""
-        data = self._yaml_dict(
-            """\
-            users:
-              - telegram_id: 111
-                name: alice
-                context_window: 0
-            """,
-        )
-        with (
-            patch("kai.config._read_protected_yaml", return_value=data),
-        ):
-            configs = _load_user_configs("claude", "")
-        assert configs is not None
-        assert configs[111].context_window == 0
-
-    def test_context_window_below_minimum_ignored(self, tmp_path, caplog):
-        """context_window below 50000 (and not 0) is ignored."""
-        data = self._yaml_dict(
-            """\
-            users:
-              - telegram_id: 111
-                name: alice
-                context_window: 10000
-            """,
-        )
-        with (
-            patch("kai.config._read_protected_yaml", return_value=data),
-        ):
-            configs = _load_user_configs("claude", "")
-        assert configs is not None
-        assert configs[111].context_window is None
-        assert "invalid context_window" in caplog.text.lower()
+        assert 111 in configs
+        assert "'context_window' is no longer supported" in caplog.text
 
     def test_new_fields_default_none(self, tmp_path):
         """New optional fields default to None when omitted."""
@@ -583,7 +548,6 @@ class TestLoadUserConfigs:
         assert configs is not None
         assert configs[111].model is None
         assert configs[111].timeout is None
-        assert configs[111].context_window is None
         assert configs[111].workspace_base is None
         assert configs[111].github_repos == []
         assert configs[111].github_notify_chat_id is None

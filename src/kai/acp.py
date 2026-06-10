@@ -293,7 +293,6 @@ class AcpBackend(AgentBackend):
         timeout_seconds: int = 120,
         services_info: list[dict] | None = None,
         workspace_config: WorkspaceConfig | None = None,
-        max_context_window: int = 0,
         provider: str = "",
         # Operator-intent flag for the memory subsystem (Config.
         # memory_enabled). Drives the [Memory subsystem: ...] marker
@@ -310,7 +309,6 @@ class AcpBackend(AgentBackend):
         self.max_budget_usd = max_budget_usd
         self.timeout_seconds = timeout_seconds
         self.workspace_config = workspace_config
-        self.max_context_window = max_context_window
         self.provider = provider
         self.memory_enabled = memory_enabled
 

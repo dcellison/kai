@@ -102,7 +102,7 @@ class SubprocessPool:
 
         Resolution order for each setting:
         1. UserConfig from users.yaml (os_user, home_workspace, model,
-           budget, timeout, context_window, agent_backend, llm_provider)
+           budget, timeout, agent_backend, llm_provider)
         2. Global config defaults (from .env)
 
         Per-user DB overrides (set via /settings or /model) are applied
@@ -191,9 +191,6 @@ class SubprocessPool:
         # budget_ceiling doubles as the fallback default for unconfigured users
         budget = user.max_budget if user and user.max_budget is not None else self._config.budget_ceiling
         timeout = user.timeout if user and user.timeout is not None else self._config.claude_timeout_seconds
-        context_window = (
-            user.context_window if user and user.context_window is not None else self._config.claude_max_context_window
-        )
         # home_ws is what the backend treats as "home" for the foreign-
         # workspace reminder. Same resolution as the workspace above so
         # the two cannot drift; pre-#353 this took a different path that
@@ -227,7 +224,6 @@ class SubprocessPool:
                 timeout_seconds=timeout,
                 services_info=self._services_info,
                 workspace_config=ws_config,
-                max_context_window=context_window,
                 provider=effective_provider,
                 memory_enabled=self._config.memory_enabled,
             )
@@ -248,7 +244,6 @@ class SubprocessPool:
                 timeout_seconds=timeout,
                 services_info=self._services_info,
                 workspace_config=ws_config,
-                max_context_window=context_window,
                 provider=effective_provider,
                 memory_enabled=self._config.memory_enabled,
             )
@@ -280,7 +275,6 @@ class SubprocessPool:
                 timeout_seconds=timeout,
                 services_info=self._services_info,
                 workspace_config=ws_config,
-                max_context_window=context_window,
                 provider="openai",
                 codex_user=os_user,
                 memory_enabled=self._config.memory_enabled,
@@ -298,7 +292,6 @@ class SubprocessPool:
             claude_user=os_user,
             max_session_hours=self._config.claude_max_session_hours,
             workspace_config=ws_config,
-            max_context_window=context_window,
             autocompact_pct=self._config.claude_autocompact_pct,
             claude_effort_level=self._config.claude_effort_level,
             memory_enabled=self._config.memory_enabled,
@@ -441,22 +434,9 @@ class SubprocessPool:
                 except (ValueError, TypeError):
                     log.warning("Corrupt timeout in DB for user %d", chat_id)
 
-            # Context window: CLI flag (--settings), requires restart if changed.
-            # No workspace-config guard here because WorkspaceConfig doesn't
-            # have a context_window field. If one is added, guard this block
-            # the same way model/budget/timeout are guarded above.
-            if "context_window" in db_settings:
-                try:
-                    new_ctx = int(db_settings["context_window"])
-                    if new_ctx != instance.max_context_window:
-                        instance.max_context_window = new_ctx
-                        needs_restart = True
-                except (ValueError, TypeError):
-                    log.warning("Corrupt context_window in DB for user %d", chat_id)
-
             # restart() kills the subprocess and spawns a new one, but
             # the backend *object* is preserved. Mutations made
-            # above (budget, timeout, model, context_window) survive the
+            # above (budget, timeout, model) survive the
             # restart because the new subprocess reads from self.* attrs.
             if needs_restart:
                 log.info("Restarting process for user %d: per-user DB overrides differ", chat_id)

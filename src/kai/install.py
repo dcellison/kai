@@ -45,7 +45,6 @@ from kai.config import (
     CODEX_DEFAULT_MODEL,
     CODEX_MODELS,
     EFFORT_LEVELS,
-    MAX_CONTEXT_CEILING,
     MODEL_REGISTRY,
     ONESHOT_REASONER_BACKENDS,
     PROJECT_ROOT,
@@ -946,8 +945,8 @@ def _cmd_config() -> None:
     print()
 
     # -- Agent --
-    # DEFAULT_MODEL, AGENT_TIMEOUT_SECONDS, BUDGET_CEILING, and
-    # CLAUDE_MAX_CONTEXT_WINDOW are inheritable installation defaults:
+    # DEFAULT_MODEL, AGENT_TIMEOUT_SECONDS, and BUDGET_CEILING are
+    # inheritable installation defaults:
     # users.yaml entries that omit a per-user override fall back to
     # these values at runtime. The prompts therefore fire on every
     # wizard run regardless of users.yaml presence. The previous
@@ -1133,21 +1132,6 @@ def _cmd_config() -> None:
             print("  Must be a positive number.")
     else:
         budget = ""
-
-    # Context window tuning - smaller windows reduce token usage and
-    # cache invalidation pressure on the inner Claude process.
-    while True:
-        max_context_window = _prompt(
-            "Max context window (tokens, 0 = default 1M)",
-            existing_env.get("CLAUDE_MAX_CONTEXT_WINDOW", "200000"),
-        )
-        try:
-            val = int(max_context_window)
-            if 0 <= val <= MAX_CONTEXT_CEILING:
-                break
-        except ValueError:
-            pass
-        print(f"  Must be 0-{MAX_CONTEXT_CEILING} (0 = use default).")
 
     # Autocompact threshold controls when Claude automatically compresses
     # conversation history. Lower values compact sooner, reducing token
@@ -1469,10 +1453,9 @@ def _cmd_config() -> None:
                 # exists so an operator typo (3000 instead of 3) cannot
                 # produce a single payload with ~3001 pairs in the
                 # PRIOR CONTEXT block that exceeds Haiku's per-call
-                # token limit. Pattern mirrors the
-                # `max_context_window` prompt above, which handles the
-                # same lower-bound-plus-ceiling shape inline rather
-                # than introducing a single-use validator helper. The
+                # token limit. The lower-bound-plus-ceiling shape is
+                # handled inline rather than through a single-use
+                # validator helper. The
                 # cap is enforced again at load_config (config.py); the
                 # wizard inline check exists only to give the operator
                 # immediate feedback rather than a delayed SystemExit
@@ -1645,6 +1628,10 @@ def _cmd_config() -> None:
     env.pop("CLAUDE_TIMEOUT_SECONDS", None)
     env.pop("CLAUDE_MAX_SESSION_HOURS", None)
     env.pop("CLAUDE_IDLE_TIMEOUT", None)
+    # CLAUDE_MAX_CONTEXT_WINDOW is retired outright (no canonical
+    # replacement); drop a lingering key so the regenerated env does
+    # not carry a setting the runtime no longer reads.
+    env.pop("CLAUDE_MAX_CONTEXT_WINDOW", None)
 
     # BUDGET_CEILING is global (not per-user). Skipped entirely on the
     # claude backend (--max-budget-usd is omitted from claude --print
@@ -1696,14 +1683,6 @@ def _cmd_config() -> None:
     if int(idle_timeout) != 1800:
         env["AGENT_IDLE_TIMEOUT"] = idle_timeout
 
-    # Context window tuning - only include if non-default.
-    # Compare as int to handle inputs like "000" that pass validation.
-    # CLAUDE_MAX_CONTEXT_WINDOW is an inheritable installation default
-    # (per-user override in users.yaml `context_window`). Emitted
-    # whenever non-default regardless of users.yaml presence so the
-    # global value the wizard just collected actually reaches runtime.
-    if max_context_window and int(max_context_window) != 0:
-        env["CLAUDE_MAX_CONTEXT_WINDOW"] = max_context_window
     if int(autocompact_pct) != 0:
         env["CLAUDE_AUTOCOMPACT_PCT"] = autocompact_pct
 
@@ -3729,6 +3708,10 @@ def _cmd_apply() -> None:
         if "AGENT_IDLE_TIMEOUT" not in env and "CLAUDE_IDLE_TIMEOUT" in env:
             env["AGENT_IDLE_TIMEOUT"] = env["CLAUDE_IDLE_TIMEOUT"]
         env.pop("CLAUDE_IDLE_TIMEOUT", None)
+        # CLAUDE_MAX_CONTEXT_WINDOW is retired outright (no canonical
+        # replacement); drop it at apply time so /etc/kai/env does not
+        # carry a setting the runtime no longer reads.
+        env.pop("CLAUDE_MAX_CONTEXT_WINDOW", None)
         _apply_secrets(env, dry_run, users_yaml_staging_path=users_yaml_staging_path)
 
         # -- Step 6: Deploy Goose config (if backend=goose) --

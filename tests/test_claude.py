@@ -357,28 +357,11 @@ class TestCommandConstruction:
             assert "TMPDIR" not in env
 
     @pytest.mark.asyncio
-    async def test_max_context_window_in_cmd(self):
-        """--settings with maxContextWindow is added when max_context_window > 0."""
-        claude = _make_claude(max_context_window=200000)
-
-        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
-            mock_proc = MagicMock()
-            mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
-            mock_exec.return_value = mock_proc
-
-            await claude._ensure_started()
-
-            cmd = mock_exec.call_args[0]
-            assert "--settings" in cmd
-            idx = cmd.index("--settings")
-            settings = json.loads(cmd[idx + 1])
-            assert settings["preferences"]["maxContextWindow"] == 200000
-
-    @pytest.mark.asyncio
-    async def test_no_context_window_flag_when_zero(self):
-        """--settings for context window is omitted when max_context_window is 0."""
-        claude = _make_claude(max_context_window=0)
+    async def test_no_settings_flag_in_cmd(self):
+        """The argv carries no --settings flag: the context window
+        setting was removed, and no other knob routes through the
+        settings JSON path."""
+        claude = _make_claude()
 
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
             mock_proc = MagicMock()

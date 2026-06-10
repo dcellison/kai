@@ -746,11 +746,6 @@ def resolve_user_model(
     return get_model_for(role, backend, provider)
 
 
-# Maximum context window size in tokens. Claude's hard ceiling.
-# Shared between load_config() (env var validation) and
-# _load_user_configs() (users.yaml validation).
-MAX_CONTEXT_CEILING = 1_000_000
-
 # Image file extensions that Telegram renders inline as photos.
 # Shared between bot.py (inbound document handling) and webhook.py (send-file API).
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -892,7 +887,6 @@ class UserConfig:
             BUDGET_CEILING (global env var).
         model: Default model name (e.g., "opus", "sonnet", "haiku").
         timeout: Default timeout in seconds for Claude responses.
-        context_window: Default context window size in tokens (0 = default).
         workspace_base: Base directory for /workspace new and name resolution.
             Falls back to global WORKSPACE_BASE env var if not set.
     """
@@ -906,7 +900,6 @@ class UserConfig:
     max_budget: float | None = None
     model: str | None = None
     timeout: int | None = None
-    context_window: int | None = None
     workspace_base: Path | None = None
     # Per-user allowed workspaces from users.yaml. Distinct from the
     # global `Config.allowed_workspaces` (env var / workspaces.yaml)
@@ -1014,10 +1007,8 @@ class Config:
     claude_max_session_hours: float = 0  # 0 = no limit
     claude_idle_timeout: int = 1800  # seconds before idle subprocess eviction; 0 = no eviction
 
-    # Context window tuning. Both settings help control token usage and
-    # reduce cache invalidation pressure on the inner Claude process.
-    # 0 = use Claude Code defaults (1M window, ~83% autocompact threshold).
-    claude_max_context_window: int = 0  # tokens; passed as --max-context-window CLI flag
+    # Autocompact tuning helps control token usage on the claude
+    # backend. 0 = use the Claude Code default (~83% threshold).
     claude_autocompact_pct: int = 0  # 1-100; passed as CLAUDE_AUTOCOMPACT_PCT_OVERRIDE env var
 
     # Effort level passed to inner Claude as `--effort <value>`. Higher
@@ -2285,22 +2276,12 @@ def _load_user_configs(
                 log.warning("users.yaml: invalid timeout for %s: %s; ignoring", name, e)
                 user_timeout = None
 
-        # Validate optional context_window (0 or 50000-1000000)
-        user_context_window = entry.get("context_window")
-        if user_context_window is not None:
-            try:
-                if isinstance(user_context_window, bool):
-                    raise ValueError("must be an integer, not a boolean")
-                user_context_window = int(user_context_window)
-                if user_context_window < 0:
-                    raise ValueError("must be non-negative")
-                if user_context_window != 0 and user_context_window < 50_000:
-                    raise ValueError("must be at least 50000 (or 0 for default)")
-                if user_context_window > MAX_CONTEXT_CEILING:
-                    raise ValueError(f"must not exceed {MAX_CONTEXT_CEILING}")
-            except (TypeError, ValueError) as e:
-                log.warning("users.yaml: invalid context_window for %s: %s; ignoring", name, e)
-                user_context_window = None
+        # The context_window setting was removed (the agent CLI default
+        # applies). Tolerate the key in existing users.yaml files so
+        # installs keep loading; warn so the operator knows the value
+        # has no effect.
+        if entry.get("context_window") is not None:
+            log.warning("users.yaml: 'context_window' is no longer supported; ignoring (user %s)", name)
 
         # Validate optional workspace_base (absolute path to a directory).
         # Warn but don't skip the user if the directory doesn't exist.
@@ -2487,7 +2468,6 @@ def _load_user_configs(
             max_budget=max_budget,
             model=model,
             timeout=user_timeout,
-            context_window=user_context_window,
             workspace_base=user_workspace_base,
             allowed_workspaces=user_allowed_workspaces,
             agent_backend=user_backend,
@@ -2670,13 +2650,6 @@ def load_config() -> Config:
     except ValueError:
         raise SystemExit("FILE_RETENTION_DAYS must be an integer") from None
 
-    # Context window tuning - 0 means "use Claude Code defaults"
-    try:
-        claude_max_context_window = int(os.environ.get("CLAUDE_MAX_CONTEXT_WINDOW", "0"))
-        if claude_max_context_window < 0 or claude_max_context_window > MAX_CONTEXT_CEILING:
-            raise SystemExit(f"CLAUDE_MAX_CONTEXT_WINDOW must be 0-{MAX_CONTEXT_CEILING} (0 = use default)")
-    except ValueError:
-        raise SystemExit("CLAUDE_MAX_CONTEXT_WINDOW must be an integer") from None
     try:
         claude_autocompact_pct = int(os.environ.get("CLAUDE_AUTOCOMPACT_PCT", "0"))
         if claude_autocompact_pct < 0 or claude_autocompact_pct > 100:
@@ -3047,6 +3020,16 @@ def load_config() -> Config:
                 replacement,
             )
 
+    # Retired env vars: the setting no longer exists, so unlike the
+    # renames above there is no replacement key to point at. Warn so
+    # the operator knows the lingering value has no effect; the wizard
+    # drops the key on the next regenerate.
+    if os.environ.get("CLAUDE_MAX_CONTEXT_WINDOW", "").strip():
+        log.warning(
+            "CLAUDE_MAX_CONTEXT_WINDOW is no longer supported; the agent CLI's default "
+            "context window applies. Re-run 'make config' to clean /etc/kai/env."
+        )
+
     # Warn when GitHub features are configured but no user has a
     # repo list. Events will never reach the agents because
     # `_get_subscribed_users()` returns empty for every incoming
@@ -3137,7 +3120,6 @@ def load_config() -> Config:
         budget_ceiling=budget_ceiling,
         claude_max_session_hours=claude_max_session_hours,
         claude_idle_timeout=claude_idle_timeout,
-        claude_max_context_window=claude_max_context_window,
         claude_autocompact_pct=claude_autocompact_pct,
         claude_effort_level=claude_effort_level,
         codex_auth_mode=codex_auth_mode,
