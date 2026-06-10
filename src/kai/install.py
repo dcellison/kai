@@ -4937,6 +4937,9 @@ def _apply_sudoers(
     if os_users:
         backends_in_use = {agent_backend} | _collect_backends_from_yaml(users_yaml_path)
         svc_home = _user_home(service_user)
+        # Each entry's path must resolve to exactly what _generate_sudoers
+        # pins for that backend's rule (including the fallbacks); a new
+        # backend with a sudoers rule needs an entry in both places.
         expected_bins: dict[str, tuple[Path, str]] = {
             "claude": (
                 Path(f"{svc_home}/.local/bin/claude"),

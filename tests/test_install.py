@@ -7150,12 +7150,18 @@ class TestApplySudoersDryRun:
         )
 
         captured = capsys.readouterr()
-        assert "claude sudoers" in captured.err
-        assert "opencode" not in captured.err.replace("opencode sudoers", "")
+        # The per-user override adds claude to the check, so its
+        # warning fires; the opencode binary exists, so no opencode
+        # warning appears.
+        assert "the claude sudoers rule" in captured.err
+        assert "the opencode sudoers rule" not in captured.err
 
     def test_goose_only_install_warns_about_nothing(self, tmp_path, capsys, monkeypatch):
-        """Goose has no per-user sudoers rule, so a goose-only install
-        with os_users gets no missing-binary warning at all."""
+        """A goose-only install with os_users gets no missing-binary
+        warning at all: the backstop's binary map deliberately omits
+        goose because goose has no per-user sudoers rule (it always
+        runs as the service user), so there is no pinned binary path
+        that can drift out of sync with a rule."""
         svc_home = tmp_path / "home" / "kai"
         svc_home.mkdir(parents=True)
         monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
