@@ -153,7 +153,10 @@ def _make_mock_proc(stdout_lines: list[bytes]) -> MagicMock:
     Build a mock subprocess that yields predefined stdout lines.
 
     stdout_lines should be a list of bytes, each ending with b"\\n".
-    The final entry should be b"" to signal EOF.
+    Once the list is exhausted, every further readline call returns
+    b"" (EOF), so tests do not need to count exactly how many reads
+    the send loop performs; the post-completion drain in particular
+    issues reads past the completion result.
     """
     proc = MagicMock()
     proc.returncode = None
@@ -162,7 +165,14 @@ def _make_mock_proc(stdout_lines: list[bytes]) -> MagicMock:
     proc.stdin.write = MagicMock()
     proc.stdin.drain = AsyncMock()
     proc.stdout = MagicMock()
-    proc.stdout.readline = AsyncMock(side_effect=stdout_lines)
+    queue = list(stdout_lines)
+
+    async def _readline() -> bytes:
+        if not queue:
+            return b""
+        return queue.pop(0)
+
+    proc.stdout.readline = _readline
     proc.stderr = MagicMock()
     proc.stderr.readline = AsyncMock(return_value=b"")
     proc.wait = AsyncMock()

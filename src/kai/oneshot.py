@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from kai.acp import read_result, write_rpc
+from kai.acp import drain_late_text, read_result, write_rpc
 from kai.codex_exec import extract_codex_text
 from kai.config import DATA_DIR, resolve_claude_user
 from kai.oneshot_binary import BinaryResolutionError, resolve_oneshot_binary
@@ -1845,8 +1845,10 @@ class OpenCodeOneShotReasoner:
         # Step 4: read loop. Accumulate `agent_message_chunk` text;
         # reject any `session/request_permission` requests with the
         # `reject_once` policy; stop when the prompt response arrives
-        # (success or error). The loop has no timeout of its own
-        # because the outer `asyncio.wait_for` is the per-call cap.
+        # (success or error), draining any text chunks that flush
+        # after the success response before returning. The loop has
+        # no timeout of its own because the outer `asyncio.wait_for`
+        # is the per-call cap (it also bounds the drain).
         accumulated = ""
         assert proc.stdout is not None
         while True:
@@ -1915,7 +1917,19 @@ class OpenCodeOneShotReasoner:
                     return accumulated, str(err)
                 # Success. The result body is not consumed; the
                 # accumulated text from session/update notifications
-                # IS the answer.
+                # IS the answer. The response can beat the turn's
+                # final text chunk(s) onto stdout, and the caller
+                # kills the subprocess after this returns, so any
+                # undrained tail would be silently lost; for the
+                # JSON-consuming purposes (triage, extraction) a
+                # missing tail makes the entire response unparseable.
+                # See drain_late_text for the mechanism.
+                accumulated = await drain_late_text(
+                    proc=proc,
+                    accumulated=accumulated,
+                    extract_delta=extract_opencode_text_delta,
+                    combine=concat_opencode_text,
+                )
                 return accumulated, None
 
             # Some other shape (a response to a request we did not

@@ -32,6 +32,7 @@ Covers:
     literal in the shared layer)
 """
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -39,7 +40,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kai.acp import AcpBackend
+from kai.acp import AcpBackend, drain_late_text
 from kai.backend import USER_MESSAGE_MARKER, StreamEvent
 from kai.config import WorkspaceConfig
 
@@ -170,7 +171,10 @@ def _make_mock_proc(stdout_lines: list[bytes]) -> MagicMock:
     Build a mock subprocess that yields predefined stdout lines.
 
     stdout_lines should be a list of bytes, each ending with b"\\n".
-    A final entry of b"" signals EOF on the next readline call.
+    Once the list is exhausted, every further readline call returns
+    b"" (EOF), so tests do not need to count exactly how many reads
+    the send loop performs; the post-completion drain in particular
+    issues reads past the completion result.
     """
     proc = MagicMock()
     proc.returncode = None
@@ -179,7 +183,14 @@ def _make_mock_proc(stdout_lines: list[bytes]) -> MagicMock:
     proc.stdin.write = MagicMock()
     proc.stdin.drain = AsyncMock()
     proc.stdout = MagicMock()
-    proc.stdout.readline = AsyncMock(side_effect=stdout_lines)
+    queue = list(stdout_lines)
+
+    async def _readline() -> bytes:
+        if not queue:
+            return b""
+        return queue.pop(0)
+
+    proc.stdout.readline = _readline
     proc.stderr = MagicMock()
     proc.stderr.readline = AsyncMock(return_value=b"")
     proc.wait = AsyncMock()
@@ -606,6 +617,141 @@ class TestSendStream:
         assert events[-1].response is not None
         assert events[-1].response.success is True
         assert events[-1].response.text == "ok"
+
+
+# ── Post-completion drain ──────────────────────────────────────────
+
+
+class TestCompletionDrain:
+    """Text chunks can land on stdout AFTER the session/prompt
+    response: the server resolves the prompt when the session goes
+    idle while its event forwarding still has chunks in flight. The
+    send loop drains those trailing chunks before yielding the done
+    event, so the final text is complete and nothing stays buffered
+    in the pipe to surface at the start of the next turn."""
+
+    @pytest.mark.asyncio
+    async def test_late_chunk_after_completion_included_in_final_text(self):
+        b = _make_fake()
+        b._proc = _make_mock_proc(
+            [
+                _text_chunk("hello wor"),
+                _completion_result(prompt_id=3),
+                _text_chunk("ld"),
+            ]
+        )
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+        events = await _collect_events(b, prompt="hi")
+        assert events[-1].done is True
+        assert events[-1].response is not None
+        assert events[-1].response.success is True
+        assert events[-1].response.text == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_drain_skips_non_text_and_id_bearing_messages(self):
+        """During the drain, non-JSON garbage, non-text notifications,
+        and id-bearing messages (server requests, stray responses) are
+        ignored; only text chunks accumulate."""
+        b = _make_fake()
+        b._proc = _make_mock_proc(
+            [
+                _text_chunk("body"),
+                _completion_result(prompt_id=3),
+                b"not json\n",
+                _other_notification(),
+                _json_line({"jsonrpc": "2.0", "id": 99, "method": "session/request_permission", "params": {}}),
+                _json_line({"jsonrpc": "2.0", "id": 98, "result": {}}),
+                _text_chunk(" tail"),
+            ]
+        )
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+        events = await _collect_events(b, prompt="hi")
+        assert events[-1].response is not None
+        assert events[-1].response.success is True
+        assert events[-1].response.text == "body tail"
+
+    @pytest.mark.asyncio
+    async def test_drain_quiet_window_closes_with_pipe_open(self, monkeypatch):
+        """When the pipe stays open but nothing arrives within the
+        drain window, the drain stops and the done event carries the
+        text accumulated so far. The window constant lives in kai.acp
+        and is resolved at call time, so patching it there covers
+        every drain call site."""
+        monkeypatch.setattr("kai.acp.COMPLETION_DRAIN_WINDOW_S", 0.05)
+        b = _make_fake()
+        b._proc = _make_mock_proc([])
+        queue = [_text_chunk("done body"), _completion_result(prompt_id=3)]
+
+        async def _readline() -> bytes:
+            if queue:
+                return queue.pop(0)
+            # Pipe open, no data: block until the drain window
+            # cancels the read.
+            await asyncio.Event().wait()
+            return b""
+
+        b._proc.stdout.readline = _readline
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+        events = await _collect_events(b, prompt="hi")
+        assert events[-1].done is True
+        assert events[-1].response is not None
+        assert events[-1].response.success is True
+        assert events[-1].response.text == "done body"
+
+
+class TestDrainLateTextFreeFunction:
+    """drain_late_text contract: accumulate text deltas through the
+    caller's hooks until the quiet window passes or the pipe reaches
+    EOF; everything that is not a text notification is ignored."""
+
+    @pytest.mark.asyncio
+    async def test_eof_ends_drain_and_returns_accumulated(self):
+        proc = _make_mock_proc([_text_chunk("Hello"), _text_chunk(" world")])
+        out = await drain_late_text(
+            proc=proc,
+            accumulated="say: ",
+            extract_delta=_make_fake().extract_text_delta,
+            combine=lambda prev, new: prev + new,
+        )
+        assert out == "say: Hello world"
+
+    @pytest.mark.asyncio
+    async def test_quiet_window_returns_accumulated_unchanged(self):
+        proc = _make_mock_proc([])
+
+        async def _readline() -> bytes:
+            await asyncio.Event().wait()
+            return b""
+
+        proc.stdout.readline = _readline
+        out = await drain_late_text(
+            proc=proc,
+            accumulated="full answer",
+            extract_delta=_make_fake().extract_text_delta,
+            combine=lambda prev, new: prev + new,
+            window_s=0.05,
+        )
+        assert out == "full answer"
+
+    @pytest.mark.asyncio
+    async def test_combine_hook_applies_to_drained_chunks(self):
+        """The caller's combine hook runs on drained chunks exactly as
+        it does on in-turn chunks (opencode's sentence-boundary space
+        injection must not be bypassed for the tail)."""
+        proc = _make_mock_proc([_text_chunk("Tail starts here")])
+        out = await drain_late_text(
+            proc=proc,
+            accumulated="Sentence ends.",
+            extract_delta=_make_fake().extract_text_delta,
+            combine=lambda prev, new: prev + " " + new,
+        )
+        assert out == "Sentence ends. Tail starts here"
 
 
 # ── Timeouts ───────────────────────────────────────────────────────

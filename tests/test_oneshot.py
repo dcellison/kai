@@ -7,6 +7,7 @@ memory-specific contracts (envelope parsing, schema validation, fact
 storage) live in `tests/test_memory_extraction.py` and stay there.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -2346,6 +2347,62 @@ class TestOpenCodeOneShotReasonerFlow:
             result = await reasoner.run(prompt="hi", purpose="fact_extraction")
 
         assert result.text == "REAL"
+        assert "FILTERED" not in result.text
+
+    @pytest.mark.asyncio
+    async def test_drains_text_chunk_arriving_after_prompt_response(self, tmp_path):
+        """A text chunk that flushes to stdout after the session/prompt
+        response still accumulates. OpenCode resolves the prompt when
+        the session goes idle while its event forwarding can still
+        have the final agent_message_chunk in flight; without the
+        post-response drain the tail is lost, and for JSON consumers
+        (triage, extraction) a missing tail makes the entire response
+        unparseable."""
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_acp_proc(
+            _opencode_handshake_lines()
+            + [
+                _session_update_line('{\n  "priority": "'),
+                _rpc_response_line(request_id=3, result={"stopReason": "end_turn"}),
+                _session_update_line('low"\n}'),
+            ]
+        )
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(prompt="hi", purpose="fact_extraction")
+
+        assert json.loads(result.text) == {"priority": "low"}
+
+    @pytest.mark.asyncio
+    async def test_drain_filters_non_text_shapes_and_quiet_window_closes(self, tmp_path, monkeypatch):
+        """The drain applies the same notification filter as the main
+        loop (thought chunks do not accumulate), and when the pipe
+        stays open with nothing arriving inside the drain window the
+        accumulated text is returned as-is."""
+        monkeypatch.setattr("kai.acp.COMPLETION_DRAIN_WINDOW_S", 0.05)
+        reasoner = OpenCodeOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        proc = _make_acp_proc([])
+        queue = _opencode_handshake_lines() + [
+            _session_update_line("REAL"),
+            _rpc_response_line(request_id=3, result={"stopReason": "end_turn"}),
+            _filtered_session_update_line("agent_thought_chunk"),
+            _session_update_line("-TAIL"),
+        ]
+
+        async def _readline() -> bytes:
+            if queue:
+                return queue.pop(0)
+            # Pipe open, no data: block until the drain window
+            # cancels the read.
+            await asyncio.Event().wait()
+            return b""
+
+        proc.stdout.readline = _readline
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(prompt="hi", purpose="fact_extraction")
+
+        assert result.text == "REAL-TAIL"
         assert "FILTERED" not in result.text
 
     @pytest.mark.asyncio

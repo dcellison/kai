@@ -39,7 +39,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 import kai
@@ -181,6 +181,79 @@ async def read_result(
             return msg.get("result", {})
 
         # Discard notifications (session/update during startup).
+
+
+# Quiet window for draining text chunks that land on stdout AFTER the
+# session/prompt response. OpenCode resolves the prompt request when
+# the session goes idle, but its event forwarding is asynchronous: the
+# final agent_message_chunk notification(s) can flush milliseconds
+# after the response (observed lag ~100ms on opencode 1.15.11). The
+# window restarts on every received line, so it bounds the wait for
+# the NEXT line, not the total drain time; 0.5s gives roughly 5x
+# margin over the observed lag while capping the added per-call
+# latency when nothing trails the response.
+COMPLETION_DRAIN_WINDOW_S: float = 0.5
+
+
+async def drain_late_text(
+    *,
+    proc: asyncio.subprocess.Process | None,
+    accumulated: str,
+    extract_delta: Callable[[dict], str | None],
+    combine: Callable[[str, str], str],
+    window_s: float | None = None,
+) -> str:
+    """
+    Drain trailing text-chunk notifications after a prompt response
+    and return the updated accumulated text.
+
+    The ACP read loops treat the matching-id response to
+    session/prompt as end-of-turn, but the response can beat the
+    turn's final text chunk(s) onto stdout (see
+    COMPLETION_DRAIN_WINDOW_S above for the mechanism). Stopping at
+    the response therefore truncates the tail of the answer: fatal
+    for one-shot JSON consumers, whose whole response becomes
+    unparseable, and wrong for the conversational loop, where the
+    unread chunk stays buffered in the pipe and surfaces at the START
+    of the next turn's reply.
+
+    Reads lines until the quiet window passes with no output or the
+    pipe reaches EOF, feeding each notification through the caller's
+    `extract_delta` / `combine` hooks so opencode's sentence-boundary
+    whitespace join applies to drained chunks exactly as it does to
+    in-turn chunks. Non-text notifications and non-JSON lines are
+    skipped. Server-initiated requests are not answered here: the
+    turn is already complete, so no permission request can be
+    pending, and anything else with an id is a response to a request
+    this client never sent.
+
+    EOF ends the drain rather than raising: by this point the turn
+    succeeded and the accumulated text is the answer. The one-shot
+    caller kills the subprocess right after this returns anyway, and
+    the conversational caller's next send() handles respawn.
+
+    `window_s=None` resolves COMPLETION_DRAIN_WINDOW_S at call time
+    so tests can patch the module constant and cover both call sites
+    with one knob.
+    """
+    if window_s is None:
+        window_s = COMPLETION_DRAIN_WINDOW_S
+    assert proc is not None and proc.stdout is not None
+    while True:
+        try:
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=window_s)
+        except TimeoutError:
+            return accumulated
+        if not line:
+            return accumulated
+        try:
+            msg = json.loads(line.decode())
+        except json.JSONDecodeError:
+            continue
+        if "method" in msg and "id" not in msg:
+            text = extract_delta(msg)
+            if text:
+                accumulated = combine(accumulated, text)
 
 
 # ── ACP base backend ──────────────────────────────────────────────
@@ -844,6 +917,18 @@ class AcpBackend(AgentBackend):
 
                 # Final result for our prompt (has matching id).
                 if self.is_completion(msg, prompt_id):
+                    # The response can beat the turn's final text
+                    # chunk(s) onto stdout; without the drain those
+                    # chunks stay buffered in the pipe and surface at
+                    # the start of the NEXT turn's reply (the
+                    # subprocess persists across turns). See
+                    # drain_late_text for the mechanism.
+                    accumulated = await drain_late_text(
+                        proc=self._proc,
+                        accumulated=accumulated,
+                        extract_delta=self.extract_text_delta,
+                        combine=self.combine_text_chunks,
+                    )
                     response = AgentResponse(
                         success=True,
                         text=accumulated,
