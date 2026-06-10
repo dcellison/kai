@@ -2175,6 +2175,51 @@ def _collect_os_users_from_yaml(users_yaml_path: str | Path) -> list[str]:
     return result
 
 
+def _collect_backends_from_yaml(users_yaml_path: str | Path) -> set[str]:
+    """
+    Read users.yaml and return the distinct per-user agent_backend values.
+
+    Sibling of `_collect_os_users_from_yaml` with the same lightweight
+    posture: the installer only needs the backend names to scope the
+    missing-binary backstop in `_apply_sudoers` to backends the install
+    actually uses; full validation of backend values happens at runtime
+    in config's users.yaml loader. Unknown or misspelled values pass
+    through as-is and are ignored by the caller's intersection with the
+    known-binary map, so a typo in users.yaml cannot break the install
+    (the runtime surfaces it on the user's first message instead).
+
+    Behavior mirrors the os_user reader: missing file, empty file,
+    non-dict document, or missing `users:` list all yield an empty set;
+    malformed YAML raises so the install fails loudly.
+    """
+    path = Path(users_yaml_path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return set()
+    if not text.strip():
+        return set()
+    data = yaml.safe_load(text)
+    if not isinstance(data, dict):
+        return set()
+    users = data.get("users")
+    if not isinstance(users, list):
+        return set()
+    backends: set[str] = set()
+    for entry in users:
+        if not isinstance(entry, dict):
+            continue
+        backend = entry.get("agent_backend")
+        # PyYAML may parse unquoted scalars as non-strings; only string
+        # values can name a backend.
+        if not isinstance(backend, str):
+            continue
+        normalized = backend.strip()
+        if normalized:
+            backends.add(normalized)
+    return backends
+
+
 def _build_codex_login_reminder(
     env: dict[str, str],
     service_user: str,
@@ -3724,6 +3769,7 @@ def _cmd_apply() -> None:
             dry_run,
             codex_bin=env.get("CODEX_BIN"),
             opencode_bin=env.get("OPENCODE_BIN"),
+            agent_backend=env.get("AGENT_BACKEND", "claude"),
         )
 
         # -- Step 8: Migrate runtime data --
@@ -4834,6 +4880,7 @@ def _apply_sudoers(
     users_yaml_path: str | Path = "/etc/kai/users.yaml",
     codex_bin: str | None = None,
     opencode_bin: str | None = None,
+    agent_backend: str = "claude",
 ) -> None:
     """
     Write sudoers rules for the service user to read protected config.
@@ -4850,6 +4897,12 @@ def _apply_sudoers(
     /opt/homebrew/bin/codex; `opencode_bin` falls back to the service
     user's `~/.local/bin/opencode`. Both fallbacks fire only on first-
     time installs where the wizard has not run yet.
+
+    `agent_backend` is the install's global backend (the env dict's
+    AGENT_BACKEND, defaulting to claude when the key is absent, which
+    matches the runtime default). Together with the per-user
+    agent_backend overrides in users.yaml it scopes the missing-binary
+    backstop below to backends the install actually uses.
     """
     sudoers_path = Path("/etc/sudoers.d/kai")
     # Load and validate users.yaml *before* the dry_run gate. Intentional:
@@ -4864,26 +4917,53 @@ def _apply_sudoers(
         opencode_bin=opencode_bin,
     )
 
-    # Backstop check: the per-user rules pin the claude binary to
-    # {service_user_home}/.local/bin/claude (the native-installer
-    # location and where the bot's runtime PATH resolves `claude`).
-    # If the service user installed claude somewhere else (Homebrew,
-    # npm global, pipx), the rule will point at a nonexistent or
-    # mismatched binary and the bot's sudo dispatch will fail at
-    # runtime with no obvious cause. Warn loudly but do not abort -
-    # the warning catches the simple "wrong path" case; the operator
-    # still owns the symlink or reinstall to make the paths agree.
+    # Backstop check: each per-user rule pins a backend binary to a
+    # fixed absolute path; a rule that points at a nonexistent binary
+    # makes the bot's sudo dispatch fail at runtime with no obvious
+    # cause. Warn loudly but do not abort - the warning catches the
+    # simple "wrong path" case; the operator still owns the symlink,
+    # reinstall, or wizard re-run that makes the paths agree.
+    #
+    # The check is scoped to backends the install actually uses (the
+    # global agent_backend plus any per-user agent_backend overrides
+    # in users.yaml): telling an opencode-only operator to install
+    # claude would manufacture a requirement that does not exist and
+    # train operators to ignore the warning. Goose has no entry in the
+    # map because it has no per-user sudoers rule (it always runs as
+    # the service user). The rules themselves are still emitted for
+    # all three binaries: a rule pointing at an absent path is inert,
+    # and unconditional emission means a later backend switch cannot
+    # strand a user without a rule.
     if os_users:
-        expected_bin = Path(f"{_user_home(service_user)}/.local/bin/claude")
-        if not expected_bin.exists():
-            print(
-                f"Warning: {expected_bin} not found; sudoers rule may point at "
-                "a nonexistent binary. The bot's runtime spawn resolves bare "
-                "`claude` against the service user's PATH - install claude via "
-                "the native installer (`~/.local/bin/claude`) or symlink your "
-                "existing install there to keep the rule and runtime in sync.",
-                file=sys.stderr,
-            )
+        backends_in_use = {agent_backend} | _collect_backends_from_yaml(users_yaml_path)
+        svc_home = _user_home(service_user)
+        expected_bins: dict[str, tuple[Path, str]] = {
+            "claude": (
+                Path(f"{svc_home}/.local/bin/claude"),
+                "The bot's runtime spawn resolves bare `claude` against the "
+                "service user's PATH - install claude via the native installer "
+                "(`~/.local/bin/claude`) or symlink your existing install there "
+                "to keep the rule and runtime in sync.",
+            ),
+            "codex": (
+                Path(codex_bin or "/opt/homebrew/bin/codex"),
+                "Re-run 'make config' and point CODEX_BIN at the actual codex "
+                "install location to keep the rule and runtime in sync.",
+            ),
+            "opencode": (
+                Path(opencode_bin or f"{svc_home}/.local/bin/opencode"),
+                "Re-run 'make config' and point OPENCODE_BIN at the actual "
+                "opencode install location to keep the rule and runtime in sync.",
+            ),
+        }
+        for backend in sorted(backends_in_use & expected_bins.keys()):
+            expected_bin, remedy = expected_bins[backend]
+            if not expected_bin.exists():
+                print(
+                    f"Warning: {expected_bin} not found; the {backend} sudoers "
+                    f"rule may point at a nonexistent binary. {remedy}",
+                    file=sys.stderr,
+                )
 
     if dry_run:
         print(f"[DRY RUN] Would write: {sudoers_path} (mode 0440)")

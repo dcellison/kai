@@ -29,6 +29,7 @@ from kai.install import (
     _cmd_apply,
     _cmd_config,
     _cmd_status,
+    _collect_backends_from_yaml,
     _collect_os_users_from_yaml,
     _collect_user_memory_owners,
     _copy_tree,
@@ -7052,6 +7053,153 @@ class TestApplySudoersDryRun:
 
         captured = capsys.readouterr()
         assert "Warning" not in captured.err
+
+    def test_opencode_only_install_gets_no_claude_warning(self, tmp_path, capsys, monkeypatch):
+        """An install whose only backend is opencode is never told to
+        install claude; the backstop checks the opencode binary instead."""
+        svc_home = tmp_path / "home" / "kai"
+        svc_home.mkdir(parents=True)
+        # Neither the claude binary nor the opencode binary exists.
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
+
+        _apply_sudoers(
+            "kai",
+            dry_run=True,
+            users_yaml_path=users_yaml,
+            opencode_bin=str(tmp_path / "nope" / "opencode"),
+            agent_backend="opencode",
+        )
+
+        captured = capsys.readouterr()
+        assert "claude" not in captured.err
+        assert "opencode sudoers" in captured.err
+        assert "OPENCODE_BIN" in captured.err
+
+    def test_opencode_only_install_silent_when_binary_exists(self, tmp_path, capsys, monkeypatch):
+        """An opencode-only install with its binary in place warns about
+        nothing, even though the claude binary is absent."""
+        svc_home = tmp_path / "home" / "kai"
+        svc_home.mkdir(parents=True)
+        opencode = tmp_path / "opencode"
+        opencode.write_text("#!/bin/sh\n")
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
+
+        _apply_sudoers(
+            "kai",
+            dry_run=True,
+            users_yaml_path=users_yaml,
+            opencode_bin=str(opencode),
+            agent_backend="opencode",
+        )
+
+        captured = capsys.readouterr()
+        assert "Warning" not in captured.err
+
+    def test_codex_backend_missing_binary_names_codex_bin(self, tmp_path, capsys, monkeypatch):
+        """A codex install with a missing binary gets the codex warning
+        pointing at the CODEX_BIN wizard setting."""
+        svc_home = tmp_path / "home" / "kai"
+        svc_home.mkdir(parents=True)
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
+
+        _apply_sudoers(
+            "kai",
+            dry_run=True,
+            users_yaml_path=users_yaml,
+            codex_bin=str(tmp_path / "nope" / "codex"),
+            agent_backend="codex",
+        )
+
+        captured = capsys.readouterr()
+        assert "codex sudoers" in captured.err
+        assert "CODEX_BIN" in captured.err
+        assert "claude" not in captured.err
+
+    def test_per_user_backend_override_widens_the_check(self, tmp_path, capsys, monkeypatch):
+        """A mixed install (global opencode, one per-user claude
+        override) checks both binaries: the claude warning fires for
+        the per-user claude even though the global backend is not
+        claude."""
+        svc_home = tmp_path / "home" / "kai"
+        svc_home.mkdir(parents=True)
+        opencode = tmp_path / "opencode"
+        opencode.write_text("#!/bin/sh\n")
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            "users:\n"
+            "  - telegram_id: 1\n"
+            "    os_user: alice\n"
+            "  - telegram_id: 2\n"
+            "    os_user: bob\n"
+            "    agent_backend: claude\n"
+        )
+
+        _apply_sudoers(
+            "kai",
+            dry_run=True,
+            users_yaml_path=users_yaml,
+            opencode_bin=str(opencode),
+            agent_backend="opencode",
+        )
+
+        captured = capsys.readouterr()
+        assert "claude sudoers" in captured.err
+        assert "opencode" not in captured.err.replace("opencode sudoers", "")
+
+    def test_goose_only_install_warns_about_nothing(self, tmp_path, capsys, monkeypatch):
+        """Goose has no per-user sudoers rule, so a goose-only install
+        with os_users gets no missing-binary warning at all."""
+        svc_home = tmp_path / "home" / "kai"
+        svc_home.mkdir(parents=True)
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
+
+        _apply_sudoers(
+            "kai",
+            dry_run=True,
+            users_yaml_path=users_yaml,
+            agent_backend="goose",
+        )
+
+        captured = capsys.readouterr()
+        assert "Warning" not in captured.err
+
+
+class TestCollectBackendsFromYaml:
+    """The lightweight per-user agent_backend reader that scopes the
+    sudoers missing-binary backstop."""
+
+    def test_missing_file_returns_empty_set(self, tmp_path):
+        assert _collect_backends_from_yaml(tmp_path / "nope.yaml") == set()
+
+    def test_collects_distinct_backends(self, tmp_path):
+        path = tmp_path / "users.yaml"
+        path.write_text(
+            "users:\n"
+            "  - telegram_id: 1\n"
+            "    agent_backend: codex\n"
+            "  - telegram_id: 2\n"
+            "    agent_backend: opencode\n"
+            "  - telegram_id: 3\n"
+            "    agent_backend: codex\n"
+            "  - telegram_id: 4\n"
+        )
+        assert _collect_backends_from_yaml(path) == {"codex", "opencode"}
+
+    def test_non_string_and_blank_values_skipped(self, tmp_path):
+        path = tmp_path / "users.yaml"
+        path.write_text(
+            "users:\n  - telegram_id: 1\n    agent_backend: 42\n  - telegram_id: 2\n    agent_backend: '  '\n"
+        )
+        assert _collect_backends_from_yaml(path) == set()
 
 
 # ── _apply_service dry run ───────────────────────────────────────────
