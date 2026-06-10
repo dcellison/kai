@@ -217,7 +217,7 @@ async def save_session(chat_id: int, session_id: str, model: str, cost_usd: floa
 
     Args:
         chat_id: Telegram chat ID.
-        session_id: Claude session identifier from the stream-json response.
+        session_id: Agent session identifier reported by the backend.
         model: Model name used for this session (e.g., "sonnet").
         cost_usd: Cost of this particular interaction (added to running total).
     """
@@ -273,8 +273,8 @@ async def create_job(
     Args:
         chat_id: Telegram chat ID that owns this job.
         name: Human-readable job name (shown in /jobs).
-        job_type: "reminder" (sends prompt as-is) or "claude" (processed by Claude).
-        prompt: Message text for reminders, or Claude prompt for Claude jobs.
+        job_type: "reminder" (sends prompt as-is) or "claude" (processed by the agent backend).
+        prompt: Message text for reminders, or the agent prompt for agent-type jobs.
         schedule_type: "once", "daily", or "interval".
         schedule_data: JSON string with schedule details.
             once: {"run_at": "ISO-datetime"}
