@@ -38,11 +38,13 @@ decoupled from a vendor SDK's versioning.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import signal
 import subprocess
+import tempfile
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -73,6 +75,88 @@ log = logging.getLogger(__name__)
 # "opus" / "haiku" to claude-sonnet-4-6 etc for the Anthropic case.
 # If a future codex version accepts a Kai-internal alias, add a map
 # here and apply it before setting CODEX_MODEL on the subprocess env.
+
+
+# Where per-turn image files for codex live. The app-server's
+# LocalImageUserInput takes a file path, not an inline payload, so the
+# base64 image data the bot layer sends in content blocks must be
+# materialized on disk for the duration of the turn. The directory
+# sits under DATA_DIR/files because that tree is the established
+# agent-readable upload area (the bot already tells agents to read
+# saved uploads there by absolute path); the workspace would also be
+# readable but project workspaces can be git repositories, and a
+# transient binary appearing inside one invites accidental commits.
+_TURN_IMAGE_DIR = DATA_DIR / "files" / "codex_turn_images"
+
+
+def write_turn_image_file(block: dict) -> Path | None:
+    """
+    Materialize an Anthropic-style base64 image block as a file for
+    codex's `localImage` input item.
+
+    The bot layer builds image content in the Anthropic form
+    (`{"type": "image", "source": {"type": "base64", "media_type":
+    ..., "data": ...}}`) because the claude backend forwards content
+    blocks verbatim. The codex app-server has no inline-payload image
+    input; its `LocalImageUserInput` is `{"type": "localImage",
+    "path": ...}`, so the payload is written to a temp file and the
+    path rides the turn. The caller owns the file's lifetime and
+    unlinks it when the turn ends.
+
+    The file is chmod 0o644 after writing (NamedTemporaryFile
+    defaults to 0o600, which the target-user subprocess cannot open
+    on the sudo-wrapped path) and the directory 0o755, the same
+    posture as the codex one-shot's `--output-schema` temp file.
+
+    Returns None when the block is not the expected Anthropic base64
+    shape, the payload is not valid base64, or the write fails; the
+    caller drops such blocks with a user-visible notice.
+    """
+    source = block.get("source")
+    if not isinstance(source, dict) or source.get("type") != "base64":
+        return None
+    media_type = source.get("media_type")
+    data = source.get("data")
+    if not isinstance(media_type, str) or not isinstance(data, str):
+        return None
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except ValueError:
+        return None
+
+    # Suffix from the media subtype so the file extension matches the
+    # content (codex and the model both key on extensions for type
+    # hints). A subtype that is not a plain token falls back to a
+    # neutral suffix rather than letting caller-controlled text into
+    # the filename.
+    subtype = media_type.split("/", 1)[-1]
+    suffix = f".{subtype}" if subtype.isalnum() else ".img"
+    try:
+        _TURN_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        _TURN_IMAGE_DIR.chmod(0o755)
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            suffix=suffix,
+            prefix="turn-image-",
+            dir=str(_TURN_IMAGE_DIR),
+            delete=False,
+        ) as fh:
+            fh.write(raw)
+            path = Path(fh.name)
+        path.chmod(0o644)
+    except OSError as e:
+        log.warning("CodexBackend: could not write turn image file: %s", e)
+        return None
+    return path
+
+
+def _unlink_turn_images(paths: list[Path]) -> None:
+    """Remove this turn's image files; missing files are fine."""
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            log.warning("CodexBackend: could not remove turn image %s: %s", path, e)
 
 
 # ── Codex CLI backend ─────────────────────────────────────────────
@@ -593,28 +677,46 @@ class CodexBackend(AgentBackend):
         # through the helper signature.
         reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace) or ""
 
-        # Strip non-text user blocks before per-turn assembly. The
-        # codex CLI accepts text blocks only; the drop must run BEFORE
+        # Normalize user blocks to the app-server `UserInput` shape
+        # before per-turn assembly. Text blocks pass through; image
+        # blocks are materialized to disk and forwarded as
+        # `localImage` items (the protocol schema's image carrier; no
+        # capability gate exists or is needed, the schema is fixed by
+        # the installed CLI). A block that cannot be materialized
+        # (wrong shape, bad base64, write failure) is dropped and
+        # counted so the reply carries a user-visible notice; a
+        # log-only drop leaves the user believing the model saw an
+        # image it never received. Normalization must run BEFORE
         # assemble_turn_context so the marker it prepends labels a
-        # real user-text region. Stripping after the helper would
-        # leave injected text layers (session_context, reminder,
-        # memory) above the marker and nothing below it.
+        # real user region. Running it after the helper would leave
+        # injected text layers (session_context, reminder, memory)
+        # above the marker and nothing below it.
         had_user_text = isinstance(prompt, str)
+        dropped_images = 0
+        turn_image_paths: list[Path] = []
         if isinstance(prompt, list):
-            text_blocks: list[dict] = []
+            input_blocks: list[dict] = []
             for block in prompt:
-                if block.get("type") == "text":
-                    text_blocks.append({"type": "text", "text": block["text"]})
-                else:
-                    log.warning(
-                        "CodexBackend: dropping non-text content block type=%s",
-                        block.get("type"),
-                    )
-            had_user_text = bool(text_blocks)
-            # Codex requires a non-empty `input` array. An all-non-text
-            # input becomes a single placeholder so the marker has a
-            # user region to label.
-            prompt = text_blocks or [{"type": "text", "text": "(empty prompt)"}]
+                block_type = block.get("type")
+                if block_type == "text":
+                    input_blocks.append({"type": "text", "text": block["text"]})
+                    continue
+                if block_type == "image":
+                    image_path = write_turn_image_file(block)
+                    if image_path is not None:
+                        turn_image_paths.append(image_path)
+                        input_blocks.append({"type": "localImage", "path": str(image_path)})
+                        continue
+                    dropped_images += 1
+                log.warning(
+                    "CodexBackend: dropping content block type=%s",
+                    block_type,
+                )
+            had_user_text = any(b.get("type") == "text" for b in input_blocks)
+            # Codex requires a non-empty `input` array. Input whose
+            # every block was dropped becomes a single placeholder so
+            # the marker has a user region to label.
+            prompt = input_blocks or [{"type": "text", "text": "(empty prompt)"}]
 
         # `chat_id=None` to the helper suppresses semantic recall for
         # this turn. The placeholder text "(empty prompt)" is backend-
@@ -634,8 +736,8 @@ class CodexBackend(AgentBackend):
 
         # Coerce to the JSON-RPC content-block shape. `prompt` is
         # either a str (from a str input; the helper preserves the
-        # input type family) or a list of text blocks (every non-
-        # text block was stripped above).
+        # input type family) or a list already normalized to
+        # `UserInput` items above (text plus any localImage entries).
         rpc_prompt: list[dict]
         if isinstance(prompt, str):
             rpc_prompt = [{"type": "text", "text": prompt}]
@@ -665,6 +767,10 @@ class CodexBackend(AgentBackend):
         except OSError as e:
             log.error("Failed to write to Codex process: %s", e)
             await self._kill()
+            # The turn never dispatched, so this turn's image files
+            # have no reader; the streaming loop's cleanup is not
+            # reached on this path.
+            _unlink_turn_images(turn_image_paths)
             yield StreamEvent(
                 text_so_far="",
                 done=True,
@@ -692,7 +798,26 @@ class CodexBackend(AgentBackend):
         # override the CURRENT item's text - never the prior
         # committed content. The visible text streamed to telegram
         # is `committed + ("\n\n" + current if current)`.
+        # When images were dropped above, the committed prefix is
+        # seeded with a notice so the user learns the model never saw
+        # them; the drop is otherwise invisible (the reply reads as a
+        # normal answer to the caption text). The seed carries no
+        # trailing separator because every commit join below inserts
+        # "\n\n" after a non-empty committed prefix. `got_model_text`
+        # exists because the seed makes the visible text non-empty
+        # before the model says anything; the EOF branch below must
+        # judge "did the model produce output" from this flag, not
+        # from visible-text truthiness, or a process that dies
+        # silently after an image drop would surface as a successful
+        # notice-only reply.
         committed_text = ""
+        got_model_text = False
+        if dropped_images:
+            noun = "image" if dropped_images == 1 else "images"
+            committed_text = (
+                f"[Note: {dropped_images} attached {noun} could not be passed to "
+                f"Codex; this reply is based on the message text only.]"
+            )
         current_item_id: str | None = None
         current_item_text = ""
 
@@ -753,7 +878,9 @@ class CodexBackend(AgentBackend):
                 if line:
                     last_activity = time.monotonic()
                 else:
-                    # EOF - process died
+                    # EOF - process died. Success iff the model said
+                    # anything; the notice seed alone does not count
+                    # (see `got_model_text` above).
                     log.error("Codex process EOF")
                     await self._kill()
                     visible = _visible_text()
@@ -761,9 +888,9 @@ class CodexBackend(AgentBackend):
                         text_so_far=visible,
                         done=True,
                         response=AgentResponse(
-                            success=bool(visible),
+                            success=got_model_text,
                             text=visible,
-                            error=None if visible else "Codex process ended unexpectedly",
+                            error=None if got_model_text else "Codex process ended unexpectedly",
                         ),
                     )
                     return
@@ -825,6 +952,7 @@ class CodexBackend(AgentBackend):
                     delta_text = params.get("delta", "")
                     delta_item_id = params.get("itemId")
                     if delta_text:
+                        got_model_text = True
                         # Defensive: if a delta arrives without a
                         # prior item/started (out-of-order or schema
                         # drift), treat it as opening a new item.
@@ -851,8 +979,11 @@ class CodexBackend(AgentBackend):
                         # Commit the in-flight item to the prefix and
                         # reset. Subsequent items append after a blank
                         # line; subsequent deltas can never overwrite
-                        # this text.
+                        # this text. `got_model_text` is set here as
+                        # well as on deltas because an item/completed
+                        # can carry text that never streamed as deltas.
                         if current_item_text:
+                            got_model_text = True
                             committed_text = (
                                 committed_text + "\n\n" + current_item_text if committed_text else current_item_text
                             )
@@ -966,6 +1097,13 @@ class CodexBackend(AgentBackend):
                     error=str(e),
                 ),
             )
+        finally:
+            # Every exit from the loop above is terminal for the turn
+            # (completion, turn failure, timeout, EOF, mid-turn error,
+            # or the consumer closing the generator), and codex
+            # consumes image input when the turn is processed, so the
+            # files have no reader past this point.
+            _unlink_turn_images(turn_image_paths)
 
     # ── Kill / restart / shutdown ──────────────────────────────────
 

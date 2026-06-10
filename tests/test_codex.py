@@ -17,9 +17,14 @@ Covers:
 7. Send serialization via the internal lock (concurrent sends queue).
 8. Prompt coercion: string -> single text block, list-of-blocks dropping
    non-text content.
+9. Image input: Anthropic base64 blocks materialized via
+   write_turn_image_file and forwarded as localImage items, per-turn
+   file cleanup on every exit path, drop notice in the reply text for
+   unconvertible blocks, and the EOF-after-drop path staying an error.
 """
 
 import asyncio
+import base64
 import inspect
 import json
 import os
@@ -30,7 +35,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kai.backend import USER_MESSAGE_MARKER, StreamEvent
-from kai.codex import CodexBackend
+from kai.codex import CodexBackend, write_turn_image_file
 from kai.config import WorkspaceConfig
 
 # ── Shared helpers ──────────────────────────────────────────────────
@@ -192,6 +197,21 @@ def _handshake_lines(thread_id: str = "codex-thread-1") -> list[bytes]:
       3. client `thread/start` -> server response (id=2)
     """
     return [_initialize_result(), _thread_start_result(thread_id)]
+
+
+_IMAGE_BYTES = b"fake-image-bytes"
+
+
+def _anthropic_image_block(media_type: str = "image/jpeg") -> dict:
+    """Anthropic-style base64 image block, the shape the bot layer builds."""
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": base64.b64encode(_IMAGE_BYTES).decode(),
+        },
+    }
 
 
 async def _collect_events(c: CodexBackend, prompt: str | list = "test") -> list[StreamEvent]:
@@ -1144,6 +1164,196 @@ class TestPromptCoercion:
         # real user text, not the codex-synthetic placeholder.
         call = recall_spy.call_args
         assert call.args[0] == "real user text" or call.kwargs.get("query") == "real user text"
+
+
+# ── Image input ────────────────────────────────────────────────────
+
+
+class TestWriteTurnImageFile:
+    """`write_turn_image_file` materializes the Anthropic base64 image
+    shape as a world-readable file for codex's localImage input, and
+    returns None on any other shape so the caller drops the block."""
+
+    def test_writes_decoded_bytes_with_subtype_suffix(self):
+        path = write_turn_image_file(_anthropic_image_block())
+        assert path is not None
+        try:
+            assert path.read_bytes() == _IMAGE_BYTES
+            assert path.name.startswith("turn-image-")
+            assert path.suffix == ".jpeg"
+            assert path.parent.name == "codex_turn_images"
+            # World-readable so a sudo-routed codex user can open it.
+            assert path.stat().st_mode & 0o777 == 0o644
+        finally:
+            path.unlink()
+
+    def test_non_alnum_subtype_falls_back_to_neutral_suffix(self):
+        path = write_turn_image_file(_anthropic_image_block(media_type="image/svg+xml"))
+        assert path is not None
+        try:
+            assert path.suffix == ".img"
+        finally:
+            path.unlink()
+
+    def test_non_dict_source_returns_none(self):
+        assert write_turn_image_file({"type": "image", "source": "fake"}) is None
+
+    def test_non_base64_source_type_returns_none(self):
+        block = {"type": "image", "source": {"type": "url", "url": "https://x.test/i.png"}}
+        assert write_turn_image_file(block) is None
+
+    def test_missing_fields_return_none(self):
+        block = {"type": "image", "source": {"type": "base64", "media_type": "image/png"}}
+        assert write_turn_image_file(block) is None
+
+    def test_invalid_base64_returns_none(self):
+        block = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "not!valid!b64"},
+        }
+        assert write_turn_image_file(block) is None
+
+
+class TestImageForwarding:
+    """Image blocks ride turn/start as localImage items; unconvertible
+    blocks are dropped with a user-visible notice; this turn's files
+    are removed on every exit path."""
+
+    @pytest.mark.asyncio
+    async def test_image_forwarded_as_local_image_and_cleaned_up(self):
+        c = _make_codex()
+        c._proc = _make_mock_proc([_agent_message_delta("ok"), _turn_completed("completed")])
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        prompt: list = [
+            {"type": "text", "text": "what is in this image"},
+            _anthropic_image_block(),
+        ]
+        events = await _collect_events(c, prompt=prompt)
+
+        write_calls = c._proc.stdin.write.call_args_list
+        sent_input = json.loads(write_calls[-1][0][0].decode())["params"]["input"]
+        local_images = [b for b in sent_input if b.get("type") == "localImage"]
+        assert len(local_images) == 1
+        sent_path = Path(local_images[0]["path"])
+        assert sent_path.name.startswith("turn-image-")
+        # The turn is over once events complete; the file is gone.
+        assert not sent_path.exists()
+        final = events[-1].response
+        assert final is not None and final.success
+        assert "[Note:" not in final.text
+
+    @pytest.mark.asyncio
+    async def test_dropped_image_seeds_user_notice(self):
+        """An unconvertible image block drops AND the reply text says
+        so; a log-only drop leaves the user believing the model saw
+        the image."""
+        c = _make_codex()
+        c._proc = _make_mock_proc([_agent_message_delta("ok"), _turn_completed("completed")])
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        prompt: list = [
+            {"type": "text", "text": "what is in this image"},
+            {"type": "image", "source": "fake"},
+        ]
+        events = await _collect_events(c, prompt=prompt)
+
+        write_calls = c._proc.stdin.write.call_args_list
+        sent_input = json.loads(write_calls[-1][0][0].decode())["params"]["input"]
+        assert all(b["type"] == "text" for b in sent_input)
+        final = events[-1].response
+        assert final is not None and final.success
+        # The notice is the committed prefix; the model text joins
+        # after the standard blank-line separator.
+        assert final.text == (
+            "[Note: 1 attached image could not be passed to Codex; this reply is based on the message text only.]\n\nok"
+        )
+
+    @pytest.mark.asyncio
+    async def test_two_dropped_images_pluralize_notice(self):
+        c = _make_codex()
+        c._proc = _make_mock_proc([_agent_message_delta("ok"), _turn_completed("completed")])
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        prompt: list = [
+            {"type": "text", "text": "compare these"},
+            {"type": "image", "source": "fake"},
+            {"type": "image", "source": "also-fake"},
+        ]
+        events = await _collect_events(c, prompt=prompt)
+
+        final = events[-1].response
+        assert final is not None
+        assert final.text.startswith("[Note: 2 attached images could not be passed to Codex")
+
+    @pytest.mark.asyncio
+    async def test_eof_after_drop_is_error_not_notice_success(self):
+        """A process that dies without output after an image drop must
+        surface as an error; the notice seed alone is not a reply."""
+        c = _make_codex()
+        c._proc = _make_mock_proc([b""])  # immediate EOF
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        prompt: list = [
+            {"type": "text", "text": "what is in this image"},
+            {"type": "image", "source": "fake"},
+        ]
+        events = await _collect_events(c, prompt=prompt)
+
+        final = events[-1].response
+        assert final is not None
+        assert not final.success
+        assert final.error is not None and "ended unexpectedly" in final.error
+
+    @pytest.mark.asyncio
+    async def test_eof_after_completed_item_is_success(self):
+        """Text that arrived only via item/completed (no deltas) still
+        counts as model output when the process then dies."""
+        c = _make_codex()
+        c._proc = _make_mock_proc([_item_started_agent(), _item_completed_agent("done"), b""])
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        events = await _collect_events(c, prompt="hello")
+
+        final = events[-1].response
+        assert final is not None
+        assert final.success
+        assert "done" in final.text
+
+    @pytest.mark.asyncio
+    async def test_image_file_cleaned_up_on_eof(self):
+        """The finally-side cleanup runs on the error exits too, not
+        just on turn completion."""
+        c = _make_codex()
+        # Hold a direct reference: the EOF path kills the subprocess,
+        # which nulls c._proc before the assertions run.
+        proc = _make_mock_proc([b""])  # immediate EOF
+        c._proc = proc
+        c._session_id = "test-session"
+        c._fresh_session = False
+        c._next_id = 3
+
+        prompt: list = [
+            {"type": "text", "text": "what is in this image"},
+            _anthropic_image_block(),
+        ]
+        await _collect_events(c, prompt=prompt)
+
+        write_calls = proc.stdin.write.call_args_list
+        sent_input = json.loads(write_calls[-1][0][0].decode())["params"]["input"]
+        local_images = [b for b in sent_input if b.get("type") == "localImage"]
+        assert len(local_images) == 1
+        assert not Path(local_images[0]["path"]).exists()
 
 
 # ── Restart / force_kill / shutdown / change_workspace ────────────
