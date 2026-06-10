@@ -932,7 +932,7 @@ def _cmd_config() -> None:
                 print(f"  {llm_provider} does not require an API key.")
     print()
 
-    # -- Claude --
+    # -- Agent --
     # DEFAULT_MODEL, AGENT_TIMEOUT_SECONDS, BUDGET_CEILING, and
     # CLAUDE_MAX_CONTEXT_WINDOW are inheritable installation defaults:
     # users.yaml entries that omit a per-user override fall back to
@@ -959,7 +959,7 @@ def _cmd_config() -> None:
             return CODEX_DEFAULT_MODEL
         return PROVIDER_DEFAULTS.get(eff_provider, "")
 
-    print("-- Claude --")
+    print("-- Agent --")
     # DEFAULT_MODEL is an inheritable installation default; the prompt
     # fires on every wizard run with the existing env value prefilled
     # when it validates for the (possibly newly chosen) backend.
@@ -1090,7 +1090,7 @@ def _cmd_config() -> None:
     if agent_backend != "claude":
         while True:
             budget = _prompt(
-                "Claude budget (USD)",
+                "Agent budget (USD)",
                 existing_env.get("BUDGET_CEILING", existing_env.get("CLAUDE_MAX_BUDGET_USD", "10.0")),
             )
             if _validate_positive_float(budget):
