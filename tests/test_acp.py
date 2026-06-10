@@ -30,6 +30,10 @@ Covers:
 16. backend_label flows into error messages and log lines
 17. Workspace model validation uses self.backend_name (no "goose"
     literal in the shared layer)
+18. Image content blocks: promptCapabilities.image capture from the
+    initialize result, Anthropic-to-ACP block conversion, forwarding
+    when supported, drop notice in the reply text when not, and the
+    EOF-after-drop path staying an error
 """
 
 import asyncio
@@ -40,7 +44,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kai.acp import AcpBackend, drain_late_text
+from kai.acp import AcpBackend, convert_image_block, drain_late_text
 from kai.backend import USER_MESSAGE_MARKER, StreamEvent
 from kai.config import WorkspaceConfig
 
@@ -100,13 +104,22 @@ def _json_line(obj: dict) -> bytes:
     return json.dumps(obj).encode() + b"\n"
 
 
-def _initialize_result() -> bytes:
-    """Build the server's response to an initialize request."""
+def _initialize_result(prompt_capabilities: dict | None = None) -> bytes:
+    """Build the server's response to an initialize request.
+
+    `prompt_capabilities` lands under `agentCapabilities.
+    promptCapabilities` (the ACP location AcpBackend reads the image
+    capability from); None omits the key entirely, matching an agent
+    that does not advertise prompt capabilities.
+    """
+    caps: dict = {}
+    if prompt_capabilities is not None:
+        caps["promptCapabilities"] = prompt_capabilities
     return _json_line(
         {
             "jsonrpc": "2.0",
             "id": 1,
-            "result": {"protocolVersion": 0, "agentCapabilities": {}},
+            "result": {"protocolVersion": 0, "agentCapabilities": caps},
         }
     )
 
@@ -199,9 +212,9 @@ def _make_mock_proc(stdout_lines: list[bytes]) -> MagicMock:
     return proc
 
 
-def _handshake_lines(session_id: str = "sess-1") -> list[bytes]:
+def _handshake_lines(session_id: str = "sess-1", prompt_capabilities: dict | None = None) -> list[bytes]:
     """Return the two stdout lines for a successful handshake."""
-    return [_initialize_result(), _session_new_result(session_id)]
+    return [_initialize_result(prompt_capabilities), _session_new_result(session_id)]
 
 
 async def _collect_events(backend: _FakeAcp, prompt: str | list = "test") -> list[StreamEvent]:
@@ -210,6 +223,11 @@ async def _collect_events(backend: _FakeAcp, prompt: str | list = "test") -> lis
     async for event in backend._send_locked(prompt):
         events.append(event)
     return events
+
+
+def _anthropic_image_block(data: str = "QkFTRTY0", media_type: str = "image/jpeg") -> dict:
+    """Anthropic-style base64 image block, the shape the bot layer builds."""
+    return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
 
 
 # ── Hook surface contract ───────────────────────────────────────────
@@ -1026,6 +1044,204 @@ class TestContentStripping:
         prompt_texts = [block["text"] for block in prompt_msg["params"]["prompt"]]
         joined = " ".join(prompt_texts)
         assert "(empty prompt)" in joined
+
+    @pytest.mark.asyncio
+    async def test_image_forwarded_when_agent_supports_it(self):
+        """With `promptCapabilities.image` captured as True, an
+        Anthropic-style image block is converted to the ACP shape and
+        written on session/prompt; no drop notice appears."""
+        b = _make_fake(workspace=Path("/tmp/ws"), home_workspace=Path("/tmp/ws"))
+        b._proc = _make_mock_proc(
+            [
+                _text_chunk("ok"),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+        b._supports_image_input = True
+
+        prompt: list = [
+            {"type": "text", "text": "what is in this image"},
+            _anthropic_image_block(),
+        ]
+        events = await _collect_events(b, prompt=prompt)
+
+        write_calls = b._proc.stdin.write.call_args_list
+        prompt_msg = json.loads(write_calls[-1][0][0].decode())
+        sent_blocks = prompt_msg["params"]["prompt"]
+        assert {"type": "image", "mimeType": "image/jpeg", "data": "QkFTRTY0"} in sent_blocks
+        final = events[-1].response
+        assert final is not None and final.success
+        assert "[Note:" not in final.text
+
+    @pytest.mark.asyncio
+    async def test_dropped_image_seeds_user_notice(self):
+        """Without image capability the block is dropped AND the reply
+        text carries a notice; a log-only drop leaves the user
+        believing the model saw the image."""
+        b = _make_fake(workspace=Path("/tmp/ws"), home_workspace=Path("/tmp/ws"))
+        b._proc = _make_mock_proc(
+            [
+                _text_chunk("ok"),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+
+        prompt: list = [
+            {"type": "text", "text": "what is in this image"},
+            _anthropic_image_block(),
+        ]
+        events = await _collect_events(b, prompt=prompt)
+
+        write_calls = b._proc.stdin.write.call_args_list
+        prompt_msg = json.loads(write_calls[-1][0][0].decode())
+        assert all(block["type"] == "text" for block in prompt_msg["params"]["prompt"])
+        final = events[-1].response
+        assert final is not None and final.success
+        assert final.text.startswith("[Note: 1 attached image could not be passed to FakeAcp")
+        assert "ok" in final.text
+
+    @pytest.mark.asyncio
+    async def test_two_dropped_images_pluralize_notice(self):
+        """The notice counts every dropped image in the turn."""
+        b = _make_fake(workspace=Path("/tmp/ws"), home_workspace=Path("/tmp/ws"))
+        b._proc = _make_mock_proc(
+            [
+                _text_chunk("ok"),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+
+        prompt: list = [
+            {"type": "text", "text": "compare these"},
+            _anthropic_image_block(),
+            _anthropic_image_block(data="QUJD"),
+        ]
+        events = await _collect_events(b, prompt=prompt)
+
+        final = events[-1].response
+        assert final is not None
+        assert final.text.startswith("[Note: 2 attached images could not be passed to FakeAcp")
+
+    @pytest.mark.asyncio
+    async def test_malformed_image_dropped_despite_capability(self):
+        """A block that is not the Anthropic base64 shape is dropped
+        (with the notice) even when the agent supports images, rather
+        than sending a malformed ACP block."""
+        b = _make_fake(workspace=Path("/tmp/ws"), home_workspace=Path("/tmp/ws"))
+        b._proc = _make_mock_proc(
+            [
+                _text_chunk("ok"),
+                _completion_result(prompt_id=3),
+            ]
+        )
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+        b._supports_image_input = True
+
+        prompt: list = [
+            {"type": "text", "text": "what is in this image"},
+            {"type": "image", "source": "fake"},
+        ]
+        events = await _collect_events(b, prompt=prompt)
+
+        write_calls = b._proc.stdin.write.call_args_list
+        prompt_msg = json.loads(write_calls[-1][0][0].decode())
+        assert all(block["type"] == "text" for block in prompt_msg["params"]["prompt"])
+        final = events[-1].response
+        assert final is not None
+        assert final.text.startswith("[Note: 1 attached image")
+
+    @pytest.mark.asyncio
+    async def test_eof_after_drop_is_error_not_notice_success(self):
+        """A process that dies without output after an image drop must
+        surface as an error; the notice seed alone is not a reply."""
+        b = _make_fake(workspace=Path("/tmp/ws"), home_workspace=Path("/tmp/ws"))
+        b._proc = _make_mock_proc([])  # immediate EOF
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+
+        prompt: list = [
+            {"type": "text", "text": "what is in this image"},
+            _anthropic_image_block(),
+        ]
+        events = await _collect_events(b, prompt=prompt)
+
+        final = events[-1].response
+        assert final is not None
+        assert not final.success
+        assert final.error is not None and "ended unexpectedly" in final.error
+
+
+# ── Image block conversion ───────────────────────────────────────────
+
+
+class TestConvertImageBlock:
+    """`convert_image_block` translates the Anthropic base64 image
+    shape (built by the bot layer) into ACP's image content block, and
+    returns None on any other shape so the caller drops it."""
+
+    def test_converts_anthropic_base64_block(self):
+        assert convert_image_block(_anthropic_image_block()) == {
+            "type": "image",
+            "mimeType": "image/jpeg",
+            "data": "QkFTRTY0",
+        }
+
+    def test_non_dict_source_returns_none(self):
+        assert convert_image_block({"type": "image", "source": "fake"}) is None
+
+    def test_non_base64_source_type_returns_none(self):
+        block = {"type": "image", "source": {"type": "url", "url": "https://x.test/i.png"}}
+        assert convert_image_block(block) is None
+
+    def test_missing_data_returns_none(self):
+        block = {"type": "image", "source": {"type": "base64", "media_type": "image/png"}}
+        assert convert_image_block(block) is None
+
+    def test_missing_media_type_returns_none(self):
+        block = {"type": "image", "source": {"type": "base64", "data": "QkFTRTY0"}}
+        assert convert_image_block(block) is None
+
+
+# ── Image capability capture ─────────────────────────────────────────
+
+
+class TestImageCapabilityCapture:
+    """The handshake reads `agentCapabilities.promptCapabilities.image`
+    from the initialize result; missing or malformed structures mean
+    no image support."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("prompt_capabilities", "expected"),
+        [
+            ({"image": True}, True),
+            ({"image": False}, False),
+            ({"embeddedContext": True}, False),
+            (None, False),
+        ],
+    )
+    async def test_capability_captured_from_initialize(self, prompt_capabilities, expected):
+        b = _make_fake()
+
+        async def _fake_spawn(*args, **kwargs):
+            return _make_mock_proc(_handshake_lines(prompt_capabilities=prompt_capabilities))
+
+        with patch("kai.acp.asyncio.create_subprocess_exec", side_effect=_fake_spawn):
+            await b._ensure_started()
+
+        assert b._supports_image_input is expected
 
 
 # ── Server-initiated request handling ───────────────────────────────

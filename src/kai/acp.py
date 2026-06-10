@@ -256,6 +256,33 @@ async def drain_late_text(
                 accumulated = combine(accumulated, text)
 
 
+def convert_image_block(block: dict) -> dict | None:
+    """
+    Convert an Anthropic-style base64 image block to the ACP shape.
+
+    The bot layer builds image content in the Anthropic form
+    (`{"type": "image", "source": {"type": "base64", "media_type":
+    ..., "data": ...}}`) because the claude backend forwards content
+    blocks verbatim. ACP defines its own image content block
+    (`{"type": "image", "mimeType": ..., "data": ...}` with base64
+    data), so the ACP path translates rather than asking the bot
+    layer to grow per-backend block shapes.
+
+    Returns None when the block is not the expected Anthropic base64
+    shape (non-dict source, a non-base64 source type, or missing
+    fields); the caller drops such blocks the same way it drops
+    unsupported block types.
+    """
+    source = block.get("source")
+    if not isinstance(source, dict) or source.get("type") != "base64":
+        return None
+    media_type = source.get("media_type")
+    data = source.get("data")
+    if not isinstance(media_type, str) or not isinstance(data, str):
+        return None
+    return {"type": "image", "mimeType": media_type, "data": data}
+
+
 # ── ACP base backend ──────────────────────────────────────────────
 
 
@@ -336,6 +363,13 @@ class AcpBackend(AgentBackend):
         # Subprocess and session state.
         self._proc: asyncio.subprocess.Process | None = None
         self._session_id: str | None = None
+        # Whether the agent accepts image content blocks on
+        # session/prompt, read from `promptCapabilities.image` in the
+        # initialize result. False until a handshake completes so a
+        # prompt can never race ahead of the capability answer; each
+        # handshake overwrites it, so a restart re-reads the agent's
+        # current answer.
+        self._supports_image_input: bool = False
         # Monotonically increasing JSON-RPC request ID. Reset to 1 on
         # each subprocess start; the request IDs are scoped to one
         # subprocess incarnation so the read loop's id-matching is
@@ -559,10 +593,21 @@ class AcpBackend(AgentBackend):
         )
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
-        # Step 1: initialize - establish protocol version.
+        # Step 1: initialize - establish protocol version and read the
+        # agent's capability answer. `promptCapabilities.image` gates
+        # whether image content blocks are forwarded on session/prompt
+        # or dropped with a user-visible notice. The chained
+        # isinstance guards treat any missing or malformed capability
+        # structure as "no image support": dropping an image a capable
+        # agent could have read is a degraded reply, but sending an
+        # image to an agent that never advertised support is a
+        # protocol violation with harness-defined behavior.
         self._next_id = 1
         await self._write_rpc("initialize", self.build_initialize_params())
-        await self._read_result(expected_id=1)
+        init_result = await self._read_result(expected_id=1)
+        agent_caps = init_result.get("agentCapabilities")
+        prompt_caps = agent_caps.get("promptCapabilities") if isinstance(agent_caps, dict) else None
+        self._supports_image_input = bool(prompt_caps.get("image")) if isinstance(prompt_caps, dict) else False
 
         # Step 2: session/new - create a session.
         await self._write_rpc("session/new", self.build_session_new_params())
@@ -720,29 +765,47 @@ class AcpBackend(AgentBackend):
 
         reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace) or ""
 
-        # Strip non-text user blocks before per-turn assembly. ACP
-        # accepts text content blocks only in the current contract;
-        # stripping must run BEFORE assemble_turn_context so the marker
-        # it prepends labels a real user-text region. Stripping after
-        # the helper would leave injected text layers (session_context,
-        # reminder, memory) above the marker and nothing below it.
+        # Normalize user blocks to the ACP content shape before
+        # per-turn assembly. Text blocks pass through; image blocks
+        # are converted to ACP's image shape when the agent advertised
+        # `promptCapabilities.image` on this handshake, and dropped
+        # otherwise (capability absent, or a block that is not the
+        # Anthropic base64 shape `convert_image_block` expects). Every
+        # dropped image is counted so the reply can carry a
+        # user-visible notice; a log-only warning leaves the user
+        # believing the model saw an image it never received.
+        # Normalization must run BEFORE assemble_turn_context so the
+        # marker it prepends labels a real user region. Running it
+        # after the helper would leave injected text layers
+        # (session_context, reminder, memory) above the marker and
+        # nothing below it.
         had_user_text = isinstance(prompt, str)
+        dropped_images = 0
         if isinstance(prompt, list):
-            text_blocks: list[dict] = []
+            acp_blocks: list[dict] = []
             for block in prompt:
-                if block.get("type") == "text":
-                    text_blocks.append({"type": "text", "text": block["text"]})
-                else:
-                    log.warning(
-                        "%s: dropping non-text content block type=%s",
-                        self.backend_label,
-                        block.get("type"),
-                    )
-            had_user_text = bool(text_blocks)
-            # ACP requires a non-empty prompt array. An all-non-text
-            # input becomes a single placeholder so the marker has a
-            # user region to label.
-            prompt = text_blocks or [{"type": "text", "text": "(empty prompt)"}]
+                block_type = block.get("type")
+                if block_type == "text":
+                    acp_blocks.append({"type": "text", "text": block["text"]})
+                    continue
+                if block_type == "image" and self._supports_image_input:
+                    converted = convert_image_block(block)
+                    if converted is not None:
+                        acp_blocks.append(converted)
+                        continue
+                if block_type == "image":
+                    dropped_images += 1
+                log.warning(
+                    "%s: dropping content block type=%s (supports_image_input=%s)",
+                    self.backend_label,
+                    block_type,
+                    self._supports_image_input,
+                )
+            had_user_text = any(b.get("type") == "text" for b in acp_blocks)
+            # ACP requires a non-empty prompt array. Input whose every
+            # block was dropped becomes a single placeholder so the
+            # marker has a user region to label.
+            prompt = acp_blocks or [{"type": "text", "text": "(empty prompt)"}]
 
         # `chat_id=None` to the helper suppresses semantic recall for
         # this turn. The placeholder "(empty prompt)" is backend-
@@ -762,8 +825,8 @@ class AcpBackend(AgentBackend):
 
         # Coerce to the ACP content-block shape. `prompt` is either a
         # str (from a str input; the helper preserves the input type
-        # family) or a list of text blocks (every non-text block was
-        # stripped above).
+        # family) or a list already normalized to ACP blocks above
+        # (text plus any forwarded images).
         acp_prompt: list[dict]
         if isinstance(prompt, str):
             acp_prompt = [{"type": "text", "text": prompt}]
@@ -800,7 +863,29 @@ class AcpBackend(AgentBackend):
 
         # Stream response: read stdout lines, accumulate text via the
         # extract_text_delta hook, and yield StreamEvents.
+        #
+        # When images were dropped above, the display text is seeded
+        # with a notice so the user learns the model never saw them;
+        # the drop is otherwise invisible (the reply reads as a normal
+        # answer to the caption text). Seeding `accumulated` puts the
+        # notice in every StreamEvent and in the final AgentResponse
+        # without touching the response protocol. The trailing
+        # newlines end the seed at a line break, so chunk-join
+        # heuristics (see combine_text_chunks) never fire against it.
+        # `got_model_text` exists because the seed makes `accumulated`
+        # non-empty before the agent says anything; the EOF branch
+        # below must judge "did the model produce output" from this
+        # flag, not from `accumulated` truthiness, or a process that
+        # dies silently after an image drop would surface as a
+        # successful notice-only reply.
         accumulated = ""
+        got_model_text = False
+        if dropped_images:
+            noun = "image" if dropped_images == 1 else "images"
+            accumulated = (
+                f"[Note: {dropped_images} attached {noun} could not be passed to "
+                f"{self.backend_label}; this reply is based on the message text only.]\n\n"
+            )
         last_activity = time.monotonic()
         max_idle_seconds = self.timeout_seconds * 5
 
@@ -850,16 +935,18 @@ class AcpBackend(AgentBackend):
                 if line:
                     last_activity = time.monotonic()
                 else:
-                    # EOF - process died.
+                    # EOF - process died. Success iff the model said
+                    # anything; the notice seed alone does not count
+                    # (see `got_model_text` above).
                     log.error("%s process EOF", self.backend_label)
                     await self._kill()
                     yield StreamEvent(
                         text_so_far=accumulated,
                         done=True,
                         response=AgentResponse(
-                            success=bool(accumulated),
+                            success=got_model_text,
                             text=accumulated,
-                            error=None if accumulated else f"{self.backend_label} process ended unexpectedly",
+                            error=None if got_model_text else f"{self.backend_label} process ended unexpectedly",
                         ),
                     )
                     return
@@ -880,6 +967,7 @@ class AcpBackend(AgentBackend):
                     text = self.extract_text_delta(msg)
                     if text:
                         accumulated = self.combine_text_chunks(accumulated, text)
+                        got_model_text = True
                         yield StreamEvent(text_so_far=accumulated)
                     continue
 
