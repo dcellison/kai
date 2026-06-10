@@ -2093,10 +2093,19 @@ class TestForgetConfirmMultiSource:
 
 @pytest.fixture
 def auth_config():
-    """A Config-shaped object that authorizes user_id 999."""
+    """A Config-shaped object that authorizes user_id 999.
+
+    Backend attributes are pinned to a reasoner-capable default
+    (claude, no per-user override) so the dashboard's retrieval-only
+    note stays out of tests that are not about it; a bare MagicMock
+    here would read as a non-reasoner backend and append the note
+    (with a mock repr in it) to every dashboard render.
+    """
     cfg = MagicMock()
     cfg.allowed_user_ids = {999}
     cfg.memory_search_floor = 0.3
+    cfg.agent_backend = "claude"
+    cfg.get_user_config.return_value = None
     return cfg
 
 
@@ -2324,6 +2333,88 @@ class TestCommandDispatch:
         # unauthorized users get silence, matching the rest of the bot.
         upd.message.reply_text.assert_not_called()
         upd.effective_chat.send_message.assert_not_called()
+
+
+# ── Dashboard retrieval-only note ──────────────────────────────────
+
+
+class TestDashboardBackendNote:
+    """Users on a backend without a OneShotReasoner never get
+    extraction; the dashboard must say so instead of letting the
+    user discover it through facts never accumulating."""
+
+    @pytest.mark.asyncio
+    async def test_note_appended_for_non_reasoner_backend(
+        self, monkeypatch, update_factory, context_factory, auth_config
+    ):
+        auth_config.agent_backend = "goose"
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        monkeypatch.setattr(
+            memory_command.memory,
+            "get_stats",
+            lambda *, user_id: _stats(extracted_count=3),
+        )
+        upd = update_factory()
+        ctx = context_factory(args=[])
+        await memory_command.handle_memory_command(upd, ctx)
+        sent_text = upd.effective_chat.send_message.call_args.kwargs["text"]
+        assert "memory extraction is not available on the goose backend" in sent_text
+        assert "retrieval-only" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_note_rides_empty_state(self, monkeypatch, update_factory, context_factory, auth_config):
+        """The empty state is where "why is this empty?" is sharpest;
+        the note must appear there too, not only on populated
+        dashboards."""
+        auth_config.agent_backend = "goose"
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        monkeypatch.setattr(
+            memory_command.memory,
+            "get_stats",
+            lambda *, user_id: _stats(extracted_count=0),
+        )
+        upd = update_factory()
+        ctx = context_factory(args=[])
+        await memory_command.handle_memory_command(upd, ctx)
+        sent_text = upd.effective_chat.send_message.call_args.kwargs["text"]
+        assert "No memories yet" in sent_text
+        assert "retrieval-only" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_no_note_for_reasoner_backend(self, monkeypatch, update_factory, context_factory):
+        """The auth_config fixture default (claude, no override) is a
+        reasoner backend; the note must not appear."""
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        monkeypatch.setattr(
+            memory_command.memory,
+            "get_stats",
+            lambda *, user_id: _stats(extracted_count=3),
+        )
+        upd = update_factory()
+        ctx = context_factory(args=[])
+        await memory_command.handle_memory_command(upd, ctx)
+        sent_text = upd.effective_chat.send_message.call_args.kwargs["text"]
+        assert "retrieval-only" not in sent_text
+
+    @pytest.mark.asyncio
+    async def test_per_user_override_drives_note(self, monkeypatch, update_factory, context_factory, auth_config):
+        """A per-user goose override on a claude-global install gets
+        the note; the fall-through matches the extraction gate's
+        backend resolution."""
+        user_cfg = MagicMock()
+        user_cfg.agent_backend = "goose"
+        auth_config.get_user_config.return_value = user_cfg
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        monkeypatch.setattr(
+            memory_command.memory,
+            "get_stats",
+            lambda *, user_id: _stats(extracted_count=3),
+        )
+        upd = update_factory()
+        ctx = context_factory(args=[])
+        await memory_command.handle_memory_command(upd, ctx)
+        sent_text = upd.effective_chat.send_message.call_args.kwargs["text"]
+        assert "memory extraction is not available on the goose backend" in sent_text
 
 
 # ── Cache TTL ──────────────────────────────────────────────────────

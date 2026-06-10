@@ -1382,7 +1382,7 @@ class TestCmdConfig:
             "in spec #353; an admin who needs a custom path must hand-edit users.yaml."
         )
 
-    def test_goose_backend_writes_env(self, tmp_path, monkeypatch):
+    def test_goose_backend_writes_env(self, tmp_path, monkeypatch, capsys):
         """Selecting goose backend writes AGENT_BACKEND to env."""
         monkeypatch.chdir(tmp_path)
         conf_path = tmp_path / "install.conf"
@@ -1439,6 +1439,69 @@ class TestCmdConfig:
         assert conf["env"]["AGENT_BACKEND"] == "goose"
         assert conf["env"]["LLM_PROVIDER"] == "anthropic"
         assert conf["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
+        # Memory was declined, so the retrieval-only note must not
+        # print; it belongs only to the memory-enabled flow.
+        out = capsys.readouterr().out
+        assert "retrieval-only" not in out
+
+    def test_goose_memory_enabled_prints_retrieval_only_note(self, tmp_path, monkeypatch, capsys):
+        """Goose plus memory: the extraction prompts are skipped (no
+        OneShotReasoner), and the operator must be told the result is
+        retrieval-only rather than discovering it through facts never
+        accumulating."""
+        monkeypatch.chdir(tmp_path)
+        conf_path = tmp_path / "install.conf"
+        monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._block_etc_kai(monkeypatch)
+        self._redirect_staging(monkeypatch, tmp_path)
+
+        existing = {"version": 1, "env": {"AGENT_BACKEND": "goose"}}
+        conf_path.write_text(json.dumps(existing))
+
+        inputs = iter(
+            [
+                "protected",  # deployment mode
+                "/opt/kai",  # install dir
+                "/var/lib/kai",  # data dir
+                "kai",  # service user
+                "darwin",  # platform
+                "fake-token",  # bot token
+                "12345",  # admin telegram ID
+                "admin",  # admin display name
+                "false",  # advanced user options
+                "polling",  # transport
+                "goose",  # agent backend
+                "anthropic",  # goose provider
+                "sk-ant-test-key",  # ANTHROPIC_API_KEY
+                "sonnet",  # model
+                "false",  # customize per-role models
+                "120",  # timeout
+                "0",  # max session age hours
+                "1800",  # idle eviction timeout seconds
+                "8080",  # port
+                "test-secret",  # webhook secret
+                "~/Projects",  # workspace base
+                "",  # allowed workspaces (empty)
+                "300",  # pr review cooldown (global resource control)
+                "900",  # pr review timeout
+                "false",  # voice
+                "false",  # tts
+                "true",  # memory enabled
+                "2000",  # memory token budget (extraction prompts skipped)
+                "10",  # memory search limit
+                "",  # perplexity key (empty)
+            ]
+        )
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        out = capsys.readouterr().out
+        assert "memory extraction is not available on the goose backend" in out
+        assert "retrieval-only" in out
+        conf = json.loads((tmp_path / "install.conf").read_text())
+        assert conf["env"]["MEMORY_ENABLED"] == "true"
 
     def test_goose_ollama_no_api_key(self, tmp_path, monkeypatch):
         """Selecting ollama provider skips the API key prompt."""

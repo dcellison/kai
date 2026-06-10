@@ -1465,6 +1465,18 @@ def _cmd_config() -> None:
                     except ValueError:
                         pass
                     print("  Must be a number between 0.3 and 1.01.")
+        else:
+            # Backends without a OneShotReasoner never see the
+            # extraction prompts above, and without this line the
+            # operator's only signal is silence: retrieval works but
+            # facts never accumulate, and nothing says why. One
+            # sentence at configure time names the limitation the
+            # moment the operator opts into memory.
+            print(
+                f"  Note: memory extraction is not available on the {agent_backend} "
+                "backend; memory will be retrieval-only (no facts are written from "
+                "conversations)."
+            )
         while True:
             memory_token_budget = _prompt(
                 "Memory context token budget per turn",

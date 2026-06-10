@@ -62,7 +62,7 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from kai import memory
-from kai.config import Config
+from kai.config import ONESHOT_REASONER_BACKENDS, Config
 from kai.memory import MemoryResult, MemoryStats
 
 if TYPE_CHECKING:
@@ -1306,6 +1306,24 @@ async def _send_dashboard(
         await _send_or_edit(update, _MSG_QUERY_FAILED, None, edit=edit)
         return
     text, kb = _build_dashboard(stats)
+    # Backends without a OneShotReasoner never run extraction, so for
+    # those users this dashboard only ever shrinks toward (or stays
+    # at) empty. Without an explicit line the user's only signal is
+    # silence: nothing accumulates and nothing says why. Appended
+    # here rather than in _build_dashboard so the builder stays a
+    # pure view over MemoryStats and the note also rides the
+    # empty-state text, where the question "why is this empty?" is
+    # sharpest. The per-user fall-through matches the extraction
+    # gate's backend resolution in bot.py.
+    config: Config = context.bot_data["config"]
+    user_config = config.get_user_config(chat_id)
+    effective_backend = user_config.agent_backend if user_config and user_config.agent_backend else config.agent_backend
+    if effective_backend not in ONESHOT_REASONER_BACKENDS:
+        text += (
+            f"\n\nNote: memory extraction is not available on the {effective_backend} "
+            "backend; this memory is retrieval-only (no facts are written from "
+            "conversations)."
+        )
     # Reset the cache: dashboard is the root. memory_ids cleared so
     # any stale fact button taps (from a previous search or episode
     # list) trip the session-expired branch instead of resolving to
