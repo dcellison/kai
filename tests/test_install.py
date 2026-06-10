@@ -1396,6 +1396,7 @@ class TestCmdConfig:
         existing = {"version": 1, "env": {"AGENT_BACKEND": "goose"}}
         conf_path.write_text(json.dumps(existing))
 
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = iter(
             [
                 "protected",  # deployment mode
@@ -1409,7 +1410,7 @@ class TestCmdConfig:
                 "false",  # advanced user options
                 "polling",  # transport
                 "goose",  # agent backend (prompt shown because existing config has goose)
-                "/bin/sh",  # goose binary path (any existing executable)
+                "/opt/homebrew/bin/goose",  # goose binary path (validator stubbed)
                 "anthropic",  # goose provider
                 "sk-ant-test-key",  # ANTHROPIC_API_KEY
                 "sonnet",  # model
@@ -1440,7 +1441,7 @@ class TestCmdConfig:
         assert conf["env"]["AGENT_BACKEND"] == "goose"
         assert conf["env"]["LLM_PROVIDER"] == "anthropic"
         assert conf["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
-        assert conf["env"]["GOOSE_BIN"] == "/bin/sh"
+        assert conf["env"]["GOOSE_BIN"] == "/opt/homebrew/bin/goose"
         # Memory was declined, so the retrieval-only note must not
         # print; it belongs only to the memory-enabled flow.
         out = capsys.readouterr().out
@@ -1472,6 +1473,7 @@ class TestCmdConfig:
             "2000",  # memory token budget
             "10",  # memory search limit
         ]
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = iter(self._base_inputs(memory_block, agent_backend="goose"))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
 
@@ -1504,6 +1506,7 @@ class TestCmdConfig:
         conf_path.write_text(json.dumps(existing))
 
         memory_block = ["true", "2000", "10"]  # memory enabled; extraction prompts gated out
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = iter(self._base_inputs(memory_block, agent_backend="goose"))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
 
@@ -1528,6 +1531,7 @@ class TestCmdConfig:
         conf_path.write_text(json.dumps(existing))
 
         # No API key input after "ollama" - the prompt is skipped.
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = iter(
             [
                 "protected",  # deployment mode
@@ -1541,7 +1545,7 @@ class TestCmdConfig:
                 "false",  # advanced user options
                 "polling",  # transport
                 "goose",  # agent backend
-                "/bin/sh",  # goose binary path (any existing executable)
+                "/opt/homebrew/bin/goose",  # goose binary path (validator stubbed)
                 "ollama",  # goose provider (no key needed)
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
@@ -1678,12 +1682,12 @@ class TestCmdConfig:
         # backends. The API key prompt itself is skipped when provider
         # is "ollama" (local model, no auth). The goose backend block
         # additionally prompts for the binary path before the provider
-        # prompt; /bin/sh is just an existing executable that passes
-        # the is-file + executable validation without depending on
-        # goose being installed on the test host.
+        # prompt; goose callers stub `_validate_goose_bin` (the codex
+        # wizard-test precedent), so the literal path here never
+        # touches the host filesystem.
         backend_block: list[str] = []
         if agent_backend == "goose":
-            backend_block.append("/bin/sh")
+            backend_block.append("/opt/homebrew/bin/goose")
         if agent_backend != "claude":
             backend_block.append(llm_provider)
             if llm_provider != "ollama":
@@ -1811,6 +1815,7 @@ class TestCmdConfig:
         self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = iter(self._base_inputs(["false"], agent_backend="goose"))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
 
@@ -1863,6 +1868,7 @@ class TestCmdConfig:
         conf_path.write_text(json.dumps(pre_existing))
 
         # Re-run wizard, switch to goose this time.
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = iter(self._base_inputs(["false"], agent_backend="goose"))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
 
@@ -2142,6 +2148,7 @@ class TestCmdConfig:
         }
         conf_path.write_text(json.dumps(existing))
 
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = iter(
             [
                 "protected",  # deployment mode
@@ -2155,7 +2162,7 @@ class TestCmdConfig:
                 "false",  # advanced user options
                 "polling",  # transport
                 "goose",  # agent backend (was claude)
-                "/bin/sh",  # goose binary path (any existing executable)
+                "/opt/homebrew/bin/goose",  # goose binary path (validator stubbed)
                 "anthropic",  # goose provider
                 "sk-ant-test-key",  # API key
                 "sonnet",  # model
@@ -2318,6 +2325,7 @@ class TestCmdConfig:
         # keeps the rest of the extraction branch (including the new
         # classifier-window prompt) gated out.
         memory_block = ["true", "false", "2000", "10"]  # memory on, extraction declined, budget, limit
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = iter(self._base_inputs(memory_block, agent_backend="goose"))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
 
@@ -2341,6 +2349,7 @@ class TestCmdConfig:
         # Goose now reaches the extraction prompt; declining keeps the
         # run retrieval-only.
         memory_block = ["true", "false", "2000", "10"]
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = iter(self._base_inputs(memory_block, agent_backend="goose"))
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
 
@@ -2932,7 +2941,7 @@ class TestCmdConfigDefaultModelDispatch:
             "fake-token",  # bot token
             "polling",  # transport
             "goose",  # agent backend
-            "/bin/sh",  # goose binary path (any existing executable)
+            "/opt/homebrew/bin/goose",  # goose binary path (validator stubbed)
             "openai",  # llm provider
             "openai-key",  # OPENAI_API_KEY
             # model prompt is handled by the _prompt_default_model mock
@@ -2984,6 +2993,7 @@ class TestCmdConfigDefaultModelDispatch:
         in install.conf.
         """
         self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_MODEL": "sonnet"})
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         helper, env = self._run(
             monkeypatch,
             tmp_path,
@@ -3046,6 +3056,7 @@ class TestCmdConfigDefaultModelDispatch:
         re-prompts, helper fires with eff_provider equal to "openai".
         """
         self._setup(monkeypatch, tmp_path, existing_env={})
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         helper, env = self._run(
             monkeypatch,
             tmp_path,
@@ -3069,6 +3080,7 @@ class TestCmdConfigDefaultModelDispatch:
         the prefill, the operator pressing Enter would re-accept it.
         """
         self._setup(monkeypatch, tmp_path, existing_env={"DEFAULT_MODEL": "opus"})
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         helper, env = self._run(
             monkeypatch,
             tmp_path,
@@ -7634,6 +7646,44 @@ class TestValidateOpenCodeBin:
         f.write_text("#!/bin/sh\necho hi\n")
         f.chmod(0o755)
         assert _validate_opencode_bin(str(f)) is True
+
+
+class TestValidateGooseBin:
+    """goose binary path existence validator. Mirrors
+    `TestValidateCodexBin` and `TestValidateOpenCodeBin` exactly: same
+    five edge cases (empty, nonexistent, directory, non-executable
+    file, executable file), pinning the shared validator shape for
+    the third backend the same way it is pinned for the other two."""
+
+    def test_empty_value_rejected(self):
+        from kai.install import _validate_goose_bin
+
+        assert _validate_goose_bin("") is False
+
+    def test_nonexistent_path_rejected(self, tmp_path):
+        from kai.install import _validate_goose_bin
+
+        assert _validate_goose_bin(str(tmp_path / "does_not_exist")) is False
+
+    def test_directory_rejected(self, tmp_path):
+        from kai.install import _validate_goose_bin
+
+        assert _validate_goose_bin(str(tmp_path)) is False
+
+    def test_non_executable_file_rejected(self, tmp_path):
+        from kai.install import _validate_goose_bin
+
+        f = tmp_path / "fake_goose"
+        f.write_text("#!/bin/sh\necho hi\n")
+        assert _validate_goose_bin(str(f)) is False
+
+    def test_executable_file_accepted(self, tmp_path):
+        from kai.install import _validate_goose_bin
+
+        f = tmp_path / "fake_goose"
+        f.write_text("#!/bin/sh\necho hi\n")
+        f.chmod(0o755)
+        assert _validate_goose_bin(str(f)) is True
 
 
 class TestOpenCodeBinWizardPrompt:
