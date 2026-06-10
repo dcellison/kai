@@ -1028,8 +1028,10 @@ class TestPromptCoercion:
 
     @pytest.mark.asyncio
     async def test_list_prompt_drops_non_text_blocks(self):
-        """Non-text blocks are dropped with a warning; the marker and
-        text blocks are preserved."""
+        """Unconvertible non-text blocks are dropped from the `input`
+        array; the marker and text blocks are preserved. The
+        user-visible drop notice for images is pinned separately in
+        TestImageForwarding."""
         c = _make_codex()
         c._proc = _make_mock_proc([_agent_message_delta("ok"), _turn_completed("completed")])
         c._session_id = "test-session"
