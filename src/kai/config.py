@@ -965,7 +965,7 @@ class Config:
             Sent by Telegram as X-Telegram-Bot-Api-Secret-Token header on each update.
             Only required in webhook mode. Defaults to WEBHOOK_SECRET if not explicitly set.
         allowed_user_ids: Set of Telegram user IDs permitted to interact with the bot (required)
-        default_model: Default model name, provider-dependent (e.g. sonnet, gpt-5.4, gemini-3-flash)
+        default_model: Default model name, provider-dependent (e.g. sonnet, gpt-5.5-pro, gemini-2.5-pro)
         claude_timeout_seconds: Seconds before a Claude response is considered timed out
         budget_ceiling: Global budget ceiling in USD. Users cannot exceed
             this via /settings budget. Also serves as the fallback default
