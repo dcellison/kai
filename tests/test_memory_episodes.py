@@ -62,10 +62,8 @@ def _cfg(**overrides) -> Config:
     defaults = {
         "memory_enabled": True,
         "memory_extraction_enabled": True,
-        "memory_extraction_budget_usd": 0.05,
         "memory_extraction_timeout_s": 60,
         "memory_consolidation_candidates_n": 0,
-        "memory_episode_budget_usd": 0.15,
         "memory_episode_timeout_s": 120,
     }
     defaults.update(overrides)
@@ -119,15 +117,12 @@ def _valid_episode() -> dict:
     }
 
 
-def _stage2_envelope(episode: dict | None = None, *, cost_usd: float = 0.04) -> bytes:
+def _stage2_envelope(episode: dict | None = None) -> bytes:
     """Build a stage-2 CLI envelope JSON. Same nesting convention as
-    stage 1: `episode` field under `structured_output`. `cost_usd` is
-    surfaced because the stage-2 telemetry path captures it from the
-    envelope; tests that assert log payload depend on it."""
+    stage 1: `episode` field under `structured_output`."""
     return json.dumps(
         {
             "is_error": False,
-            "total_cost_usd": cost_usd,
             "structured_output": {
                 "episode": episode or _valid_episode(),
             },
@@ -283,13 +278,13 @@ def _timeout_proc() -> MagicMock:
 
 def _is_error_envelope() -> bytes:
     """Stage-1 envelope with envelope-level is_error=true. The CLI
-    emits this when a retry loop burned the budget but the JSON still
-    parsed cleanly; stage 1 must treat it as failure even though the
+    can emit this on a mid-retry failure where the JSON still parsed
+    cleanly; stage 1 must treat it as failure even though the
     structured payload is technically present."""
     return json.dumps(
         {
             "is_error": True,
-            "subtype": "error_max_budget_usd",
+            "subtype": "error_during_execution",
             "structured_output": {"facts": [], "has_episode": True},
         }
     ).encode("utf-8")
@@ -527,10 +522,7 @@ class TestStage2Isolation:
         payload = json.loads(episode_records[0].message[len("memory.episode ") :])
         assert payload["outcome"] == "timeout"
         assert payload["reason"] == "timeout"
-        # cost_usd is 0.0 on timeout (the envelope never returned).
-        assert payload["cost_usd"] == 0.0
-        # duration_ms always present for budget-tracking parity with
-        # stage 1's _emit_intent_log.
+        # duration_ms is always present, even on the timeout path.
         assert payload["duration_ms"] >= 0
 
     @pytest.mark.asyncio
@@ -556,7 +548,7 @@ class TestStage2Isolation:
 
         # Stub the subprocess so the in-acquire body runs near-instantly.
         async def _fake_exec(*args, **kwargs):
-            return _make_proc(stdout=_stage2_envelope(_valid_episode(), cost_usd=0.01))
+            return _make_proc(stdout=_stage2_envelope(_valid_episode()))
 
         monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
         monkeypatch.setattr(memory_extraction.memory, "add_structured", lambda *a, **kw: "fake-id")
@@ -590,18 +582,18 @@ class TestStage2Isolation:
 
     @pytest.mark.asyncio
     async def test_stage2_is_error_envelope_maps_to_subprocess_error(self, monkeypatch, caplog):
-        """Budget exhaustion (and any other CLI is_error condition) must
-        map to outcome=subprocess_error, NOT parse_error. Pre-fix this
-        was silently mislabeled because the only branches checking
+        """Any CLI is_error condition must map to
+        outcome=subprocess_error, NOT parse_error. Pre-fix this was
+        silently mislabeled because the only branches checking
         run_reason were `timeout`, `exit_*`, and `invalid_json`; an
         is_error envelope fell through to the else and got tagged as a
-        content fault. Operators triaging by outcome would otherwise see
-        budget burns mixed with genuine JSON-parse failures."""
+        content fault. Operators triaging by outcome would otherwise
+        see CLI-signaled failures mixed with genuine JSON-parse
+        failures."""
         is_error_envelope = json.dumps(
             {
                 "is_error": True,
-                "subtype": "error_max_budget_usd",
-                "total_cost_usd": 0.15,
+                "subtype": "error_during_execution",
                 "structured_output": {"episode": _valid_episode()},
             }
         ).encode("utf-8")
@@ -627,14 +619,9 @@ class TestStage2Isolation:
         payload = json.loads(records[0].message[len("memory.episode ") :])
         assert payload["outcome"] == "subprocess_error"
         # The subtype detail survives in the reason field so operators
-        # can distinguish budget burns from auth failures.
+        # can distinguish failure classes.
         assert payload["reason"] is not None
-        assert "error_max_budget_usd" in payload["reason"]
-        # Cost_usd is captured from the envelope even on the error path
-        # so budget tracking still sees the burn. Value matches the
-        # Sonnet-sized 0.15 dataclass default to make the budget-burn
-        # scenario read as realistic for the recommended model.
-        assert payload["cost_usd"] == 0.15
+        assert "error_during_execution" in payload["reason"]
 
     @pytest.mark.asyncio
     async def test_stage2_unexpected_exception_caught(self, monkeypatch, caplog):
@@ -674,7 +661,7 @@ class TestStage2Storage:
     """Stage-2 success path: a valid episode JSON lands in Mem0 with
     the full Sophia field set in metadata, the embedded content is
     goal+context, lessons is omitted when not produced, and the
-    success log carries cost+duration for budget tracking."""
+    success log carries the call duration."""
 
     @pytest.mark.asyncio
     async def test_episode_stored_with_full_sophia_fields(self, monkeypatch):
@@ -694,7 +681,7 @@ class TestStage2Storage:
         monkeypatch.setattr(memory_extraction.memory, "add_structured", _fake_add)
 
         async def _fake_exec(*args, **kwargs):
-            return _make_proc(stdout=_stage2_envelope(_valid_episode(), cost_usd=0.04))
+            return _make_proc(stdout=_stage2_envelope(_valid_episode()))
 
         monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
 
@@ -816,16 +803,14 @@ class TestStage2Storage:
         assert captured["content"] == f"{ep['goal']}\n\n{ep['context']}"
 
     @pytest.mark.asyncio
-    async def test_episode_log_includes_cost_and_duration(self, monkeypatch, caplog):
-        """The success log carries cost_usd (from the CLI envelope) and
-        duration_ms (end-to-end). Without these, operators cannot do
-        budget tracking on stage-2 calls. Asserted at the JSON-payload
-        level so a future log-format change still surfaces a missing
-        field as a test failure."""
+    async def test_episode_log_includes_duration(self, monkeypatch, caplog):
+        """The success log carries duration_ms (end-to-end). Asserted
+        at the JSON-payload level so a future log-format change still
+        surfaces a missing field as a test failure."""
         monkeypatch.setattr(memory_extraction.memory, "add_structured", lambda *a, **kw: "fake-id")
 
         async def _fake_exec(*args, **kwargs):
-            return _make_proc(stdout=_stage2_envelope(_valid_episode(), cost_usd=0.039))
+            return _make_proc(stdout=_stage2_envelope(_valid_episode()))
 
         monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
 
@@ -845,7 +830,6 @@ class TestStage2Storage:
         payload = json.loads(records[0].message[len("memory.episode ") :])
         assert payload["outcome"] == "stored"
         assert payload["memory_id"] == "fake-id"
-        assert payload["cost_usd"] == 0.039
         assert payload["duration_ms"] >= 0
         # `memory_id` and `reason` are presence-symmetric: each is
         # included only when it carries information. Success has a
@@ -894,7 +878,7 @@ class TestStage2Storage:
 
 class TestStage2SubprocessAssembly:
     """The stage-2 subprocess flag set is identical to stage 1 except
-    for model, budget, timeout, schema, and system prompt. Asserted
+    for model, timeout, schema, and system prompt. Asserted
     here so a future change that diverges the security-sensitive flags
     (--tools, --permission-mode, --no-session-persistence) shows up as
     a test failure - those flags are the security review of the
@@ -902,9 +886,9 @@ class TestStage2SubprocessAssembly:
 
     @pytest.mark.asyncio
     async def test_stage2_command_uses_episode_config(self, monkeypatch):
-        """Budget, timeout, system prompt, and JSON schema all come
-        from the episode-specific config fields, not the stage-1 ones.
-        The model now resolves through `get_model_for(MEMORY_EPISODE,
+        """Timeout, system prompt, and JSON schema all come from the
+        episode-specific config fields, not the stage-1 ones. The
+        model resolves through `get_model_for(MEMORY_EPISODE,
         effective_backend)` (issue #515 retired the per-stage env vars),
         so the assertion pins the registry-resolved value rather than a
         config-field override."""
@@ -918,7 +902,7 @@ class TestStage2SubprocessAssembly:
         monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
         await _run_episode_extractor(
             "payload",
-            _cfg(memory_episode_budget_usd=0.15),
+            _cfg(),
             user_id="test-episode-user",
             effective_backend="claude",
             effective_provider="anthropic",
@@ -928,11 +912,6 @@ class TestStage2SubprocessAssembly:
         # Registry MEMORY_EPISODE row for claude is the Haiku SKU; same
         # value the retired `memory_episode_model` default pointed at.
         assert args[args.index("--model") + 1] == "claude-haiku-4-5-20251001"
-        # --max-budget-usd is NOT emitted on the claude backend (issue
-        # #390): Max-plan OAuth makes the CLI's computed-cost ceiling a
-        # phantom signal. Runaway protection comes from
-        # memory_episode_timeout_s instead.
-        assert "--max-budget-usd" not in args
         assert args[args.index("--system-prompt") + 1] == _EPISODE_SYSTEM_PROMPT
         # Schema arg is the episode schema, not the fact schema.
         schema_str = args[args.index("--json-schema") + 1]
@@ -1156,19 +1135,18 @@ def test_module_exposes_extraction_result():
 
 
 class TestRunEpisodeExtractorViaReasoner:
-    """`_run_episode_extractor` now routes through the OneShotReasoner
+    """`_run_episode_extractor` routes through the OneShotReasoner
     boundary. These tests monkeypatch the reasoner helper so the
     caller-side mapping from typed reasoner exceptions to the stage-2
-    `(episode, cost_usd, reason)` triple is exercised directly."""
+    `(episode, reason)` pair is exercised directly."""
 
     @pytest.mark.asyncio
-    async def test_valid_envelope_returns_episode_triple(self):
+    async def test_valid_envelope_returns_episode_pair(self):
         """A reasoner returning a well-formed Claude envelope produces
-        the same `(episode, cost_usd, None)` triple the subprocess
-        path produces today."""
+        the `(episode, None)` success pair."""
         from kai.oneshot import OneShotResult
 
-        envelope_text = _stage2_envelope(_valid_episode(), cost_usd=0.04).decode("utf-8")
+        envelope_text = _stage2_envelope(_valid_episode()).decode("utf-8")
 
         class _FakeReasoner:
             async def run(self, **kwargs):
@@ -1181,7 +1159,7 @@ class TestRunEpisodeExtractorViaReasoner:
                 )
 
         with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FakeReasoner()):
-            episode, cost_usd, reason = await _run_episode_extractor(
+            episode, reason = await _run_episode_extractor(
                 "payload",
                 _cfg(),
                 user_id="test-episode-user",
@@ -1190,14 +1168,12 @@ class TestRunEpisodeExtractorViaReasoner:
             )
 
         assert episode == _valid_episode()
-        assert cost_usd == pytest.approx(0.04)
         assert reason is None
 
     @pytest.mark.asyncio
     async def test_timeout_maps_to_literal_timeout_reason(self):
-        """OneShotTimeout maps to the literal `"timeout"` reason string
-        with `cost_usd=0.0` (no envelope ever returned). Downstream
-        telemetry pins this exact string."""
+        """OneShotTimeout maps to the literal `"timeout"` reason
+        string. Downstream telemetry pins this exact string."""
         from kai.oneshot import OneShotTimeout
 
         class _TimingOutReasoner:
@@ -1205,7 +1181,7 @@ class TestRunEpisodeExtractorViaReasoner:
                 raise OneShotTimeout()
 
         with patch("kai.memory_extraction._build_memory_reasoner", return_value=_TimingOutReasoner()):
-            episode, cost_usd, reason = await _run_episode_extractor(
+            episode, reason = await _run_episode_extractor(
                 "payload",
                 _cfg(),
                 user_id="test-episode-user",
@@ -1214,7 +1190,6 @@ class TestRunEpisodeExtractorViaReasoner:
             )
 
         assert episode is None
-        assert cost_usd == 0.0
         assert reason == "timeout"
 
     @pytest.mark.asyncio
@@ -1230,7 +1205,7 @@ class TestRunEpisodeExtractorViaReasoner:
                 raise OneShotSubprocessError(returncode=2, stderr=b"oauth refused: please login")
 
         with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FailingReasoner()):
-            episode, cost_usd, reason = await _run_episode_extractor(
+            episode, reason = await _run_episode_extractor(
                 "payload",
                 _cfg(),
                 user_id="test-episode-user",
@@ -1239,7 +1214,6 @@ class TestRunEpisodeExtractorViaReasoner:
             )
 
         assert episode is None
-        assert cost_usd == 0.0
         assert reason is not None
         assert reason.startswith("exit_2: ")
         assert "oauth refused" in reason
@@ -1253,14 +1227,11 @@ class TestRunEpisodeExtractorWithCodexEnvelope:
     re-introduce a backend branch in the episode extractor."""
 
     @pytest.mark.asyncio
-    async def test_codex_envelope_produces_episode_triple(self):
+    async def test_codex_envelope_produces_episode_pair(self):
         from kai.oneshot import OneShotResult
 
         episode = _valid_episode()
-        # CodexOneShotReasoner emits exactly this envelope shape (no
-        # total_cost_usd field; codex subscription auth has no
-        # per-call billing surface). The stage-2 cost coercion to 0.0
-        # is the documented behavior for non-claude backends.
+        # CodexOneShotReasoner emits exactly this envelope shape.
         envelope_text = '{"is_error": false, "structured_output": {"episode": ' + json.dumps(episode) + "}}"
 
         class _FakeCodexReasoner:
@@ -1275,13 +1246,9 @@ class TestRunEpisodeExtractorWithCodexEnvelope:
 
         config = _cfg()
         with patch("kai.memory_extraction._build_memory_reasoner", return_value=_FakeCodexReasoner()):
-            ep, cost_usd, reason = await _run_episode_extractor(
+            ep, reason = await _run_episode_extractor(
                 "payload", config, user_id="test-episode-user", effective_backend="codex", effective_provider="openai"
             )
 
         assert ep == episode
-        # No total_cost_usd in the envelope -> 0.0. Codex runs
-        # subscription-backed in the supported deployment model, so
-        # the cost field is informational and reads as zero.
-        assert cost_usd == 0.0
         assert reason is None

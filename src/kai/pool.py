@@ -102,7 +102,7 @@ class SubprocessPool:
 
         Resolution order for each setting:
         1. UserConfig from users.yaml (os_user, home_workspace, model,
-           budget, timeout, agent_backend, llm_provider)
+           timeout, agent_backend, llm_provider)
         2. Global config defaults (from .env)
 
         Per-user DB overrides (set via /settings or /model) are applied
@@ -188,8 +188,6 @@ class SubprocessPool:
                 )
                 model = self._config.default_model
 
-        # budget_ceiling doubles as the fallback default for unconfigured users
-        budget = user.max_budget if user and user.max_budget is not None else self._config.budget_ceiling
         timeout = user.timeout if user and user.timeout is not None else self._config.claude_timeout_seconds
         # home_ws is what the backend treats as "home" for the foreign-
         # workspace reminder. Same resolution as the workspace above so
@@ -220,7 +218,6 @@ class SubprocessPool:
                 home_workspace=home_ws,
                 webhook_port=self._config.webhook_port,
                 webhook_secret=self._config.webhook_secret,
-                max_budget_usd=budget,
                 timeout_seconds=timeout,
                 services_info=self._services_info,
                 workspace_config=ws_config,
@@ -240,7 +237,6 @@ class SubprocessPool:
                 home_workspace=home_ws,
                 webhook_port=self._config.webhook_port,
                 webhook_secret=self._config.webhook_secret,
-                max_budget_usd=budget,
                 timeout_seconds=timeout,
                 services_info=self._services_info,
                 workspace_config=ws_config,
@@ -271,7 +267,6 @@ class SubprocessPool:
                 home_workspace=home_ws,
                 webhook_port=self._config.webhook_port,
                 webhook_secret=self._config.webhook_secret,
-                max_budget_usd=budget,
                 timeout_seconds=timeout,
                 services_info=self._services_info,
                 workspace_config=ws_config,
@@ -286,7 +281,6 @@ class SubprocessPool:
             home_workspace=home_ws,
             webhook_port=self._config.webhook_port,
             webhook_secret=self._config.webhook_secret,
-            max_budget_usd=budget,
             timeout_seconds=timeout,
             services_info=self._services_info,
             claude_user=os_user,
@@ -418,14 +412,6 @@ class SubprocessPool:
                         instance.provider,
                     )
 
-            # Budget: workspace config budget overrides user default
-            ws_budget = instance.workspace_config.budget if instance.workspace_config else None
-            if ws_budget is None and "budget" in db_settings:
-                try:
-                    instance.max_budget_usd = float(db_settings["budget"])
-                except (ValueError, TypeError):
-                    log.warning("Corrupt budget in DB for user %d", chat_id)
-
             # Timeout: workspace config timeout overrides user default
             ws_timeout = instance.workspace_config.timeout if instance.workspace_config else None
             if ws_timeout is None and "timeout" in db_settings:
@@ -436,7 +422,7 @@ class SubprocessPool:
 
             # restart() kills the subprocess and spawns a new one, but
             # the backend *object* is preserved. Mutations made
-            # above (budget, timeout, model) survive the
+            # above (timeout, model) survive the
             # restart because the new subprocess reads from self.* attrs.
             if needs_restart:
                 log.info("Restarting process for user %d: per-user DB overrides differ", chat_id)

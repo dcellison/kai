@@ -625,7 +625,7 @@ def _text_event(text: str) -> StreamEvent:
     return StreamEvent(text_so_far=text, done=False, response=None)
 
 
-def _done_event(text="Final response", cost=0.01, session_id="sess-1", success=True, error=None) -> StreamEvent:
+def _done_event(text="Final response", session_id="sess-1", success=True, error=None) -> StreamEvent:
     """Final streaming event with an AgentResponse."""
     return StreamEvent(
         text_so_far=text,
@@ -634,7 +634,6 @@ def _done_event(text="Final response", cost=0.01, session_id="sess-1", success=T
             text=text,
             success=success,
             error=error,
-            cost_usd=cost,
             duration_ms=1000,
             session_id=session_id,
         ),
@@ -947,14 +946,12 @@ class TestHandleStats:
             "model": "sonnet",
             "created_at": "2026-01-01",
             "last_used_at": "2026-01-02",
-            "total_cost_usd": 0.1234,
         }
         with patch("kai.bot.sessions.get_stats", new_callable=AsyncMock, return_value=stats):
             await handle_stats(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "abcd1234" in reply
         assert "sonnet" in reply
-        assert "0.1234" in reply
 
 
 # ── handle_jobs ──────────────────────────────────────────────────────
@@ -2324,15 +2321,8 @@ class TestWorkspaceSubcommandRouting:
 
 
 class TestWorkspaceConfigSuffix:
-    def test_with_model_and_budget(self):
-        """Shows model and budget when both are configured."""
-        from kai.config import WorkspaceConfig
-
-        ws = WorkspaceConfig(path=Path("/tmp/ws"), model="opus", budget=15.0)
-        assert _workspace_config_suffix(ws) == " (model: opus, budget: $15.00)"
-
-    def test_model_only(self):
-        """Shows model only when budget is not set."""
+    def test_with_model(self):
+        """Shows model when configured."""
         from kai.config import WorkspaceConfig
 
         ws = WorkspaceConfig(path=Path("/tmp/ws"), model="haiku")
@@ -2343,7 +2333,7 @@ class TestWorkspaceConfigSuffix:
         assert _workspace_config_suffix(None) == ""
 
     def test_config_with_no_overrides(self):
-        """Returns empty string when config has no model or budget."""
+        """Returns empty string when config has no model."""
         from kai.config import WorkspaceConfig
 
         ws = WorkspaceConfig(path=Path("/tmp/ws"))
@@ -2407,7 +2397,7 @@ class TestSwitchWorkspaceConfig:
 
         ws_path = tmp_path / "ws"
         ws_path.mkdir()
-        ws_config = WorkspaceConfig(path=ws_path.resolve(), model="opus", budget=20.0)
+        ws_config = WorkspaceConfig(path=ws_path.resolve(), model="opus")
         config = _make_config(
             claude_workspace=Path("/home/workspace"),
             workspace_configs={ws_path.resolve(): ws_config},
@@ -2426,7 +2416,6 @@ class TestSwitchWorkspaceConfig:
 
         reply_text = update.message.reply_text.call_args[0][0]
         assert "model: opus" in reply_text
-        assert "budget: $20.00" in reply_text
 
     @pytest.mark.asyncio
     async def test_switch_deleted_directory(self, tmp_path):
@@ -3731,7 +3720,7 @@ class TestHandleWorkspaceConfig:
             await _handle_workspace_config(update, ctx, "config")
 
         reply = update.message.reply_text.call_args[0][0]
-        # Should show model, budget, timeout with "global default" source
+        # Should show model and timeout with "global default" source
         assert "sonnet" in reply
         assert "global default" in reply
 
@@ -3776,45 +3765,6 @@ class TestHandleWorkspaceConfig:
         # Should confirm to the user
         reply = update.message.reply_text.call_args[0][0]
         assert "opus" in reply.lower()
-
-    # ── 3. Set budget with validation ───────────────────────────────
-
-    @pytest.mark.asyncio
-    async def test_set_budget(self):
-        """/workspace config budget 5 sets the budget."""
-        update = _make_update(text="/workspace config budget 5")
-        config = _make_config()
-        pool = _make_mock_claude()
-        ctx = _make_context(config=config, pool=pool)
-        mock_sessions = self._mock_sessions()
-
-        with self._patches(mock_sessions):
-            await _handle_workspace_config(update, ctx, "config budget 5")
-
-        mock_sessions.set_workspace_config_setting.assert_called_once_with(
-            12345, str(pool.get_workspace(12345)), "budget", "5.0"
-        )
-        reply = update.message.reply_text.call_args[0][0]
-        assert "$5.00" in reply
-
-    # ── 4. Reject negative budget ───────────────────────────────────
-
-    @pytest.mark.asyncio
-    async def test_reject_negative_budget(self):
-        """/workspace config budget -5 is rejected."""
-        update = _make_update(text="/workspace config budget -5")
-        config = _make_config()
-        pool = _make_mock_claude()
-        ctx = _make_context(config=config, pool=pool)
-        mock_sessions = self._mock_sessions()
-
-        with self._patches(mock_sessions):
-            await _handle_workspace_config(update, ctx, "config budget -5")
-
-        # Should not persist anything
-        mock_sessions.set_workspace_config_setting.assert_not_called()
-        reply = update.message.reply_text.call_args[0][0]
-        assert "positive" in reply.lower()
 
     # ── 5. Set timeout ──────────────────────────────────────────────
 
@@ -3995,50 +3945,8 @@ class TestHandleWorkspaceConfig:
         reply = update.message.reply_text.call_args[0][0]
         assert "bogus" in reply
         assert "model" in reply
-        assert "budget" in reply
         # Should NOT apply any config change
         pool.change_workspace.assert_not_called()
-
-    # ── Budget ceiling enforcement ──────────────────────────────────
-
-    @pytest.mark.asyncio
-    async def test_budget_ceiling_from_global_config(self):
-        """Budget exceeding global budget_ceiling is rejected."""
-        # Ceiling comes from config.budget_ceiling, not per-user max_budget.
-        # User has max_budget=5 but global ceiling is 8; requesting 10
-        # should be rejected because 10 > 8 (global ceiling).
-        user = UserConfig(telegram_id=12345, name="test", max_budget=5.0)
-        config = _make_config(budget_ceiling=8.0, user_configs={12345: user})
-        update = _make_update(text="/workspace config budget 10")
-        pool = _make_mock_claude()
-        ctx = _make_context(config=config, pool=pool)
-        mock_sessions = self._mock_sessions()
-
-        with self._patches(mock_sessions):
-            await _handle_workspace_config(update, ctx, "config budget 10")
-
-        # Should reject - 10 exceeds global ceiling of 8
-        mock_sessions.set_workspace_config_setting.assert_not_called()
-        reply = update.message.reply_text.call_args[0][0]
-        assert "$8.00" in reply
-        assert "admin limit" in reply.lower()
-
-    @pytest.mark.asyncio
-    async def test_budget_above_yaml_default_but_under_ceiling_allowed(self):
-        """Budget above per-user max_budget but under global ceiling succeeds."""
-        # User has max_budget=5 in users.yaml, but global ceiling is 20.
-        # Setting budget to 10 should succeed (above yaml default, under ceiling).
-        user = UserConfig(telegram_id=12345, name="test", max_budget=5.0)
-        config = _make_config(budget_ceiling=20.0, user_configs={12345: user})
-        update = _make_update(text="/workspace config budget 10")
-        pool = _make_mock_claude()
-        ctx = _make_context(config=config, pool=pool)
-        mock_sessions = self._mock_sessions()
-
-        with self._patches(mock_sessions):
-            await _handle_workspace_config(update, ctx, "config budget 10")
-
-        mock_sessions.set_workspace_config_setting.assert_called_once()
 
     # ── Invalid model rejected ──────────────────────────────────────
 
@@ -4127,33 +4035,15 @@ class TestHandleSettings:
         reply = update.message.reply_text.call_args[0][0]
         assert "opus" in reply.lower()
 
-    # ── 3. Set budget ──────────────────────────────────────────────
+    # ── 3. Unknown setting rejected ────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_set_budget(self):
-        """/settings budget 5 sets the budget (within default $10 ceiling)."""
+    async def test_budget_is_unknown_setting(self):
+        """/settings budget 5 answers with the unknown-setting message
+        listing the supported fields."""
         update = _make_update(text="/settings budget 5")
         config = _make_config()
-        pool = _make_mock_claude()
-        pool.get_if_exists = MagicMock(return_value=MagicMock())
-        ctx = _make_context(config=config, pool=pool, args=["budget", "5"])
-        mock_sessions = self._mock_sessions()
-
-        with self._patches(mock_sessions):
-            await handle_settings(update, ctx)
-
-        mock_sessions.set_user_setting.assert_called_once_with(12345, "budget", "5.0")
-        reply = update.message.reply_text.call_args[0][0]
-        assert "$5.00" in reply
-
-    # ── 4. Reject negative budget ──────────────────────────────────
-
-    @pytest.mark.asyncio
-    async def test_reject_negative_budget(self):
-        """/settings budget -5 is rejected."""
-        update = _make_update(text="/settings budget -5")
-        config = _make_config()
-        ctx = _make_context(config=config, args=["budget", "-5"])
+        ctx = _make_context(config=config, args=["budget", "5"])
         mock_sessions = self._mock_sessions()
 
         with self._patches(mock_sessions):
@@ -4161,47 +4051,9 @@ class TestHandleSettings:
 
         mock_sessions.set_user_setting.assert_not_called()
         reply = update.message.reply_text.call_args[0][0]
-        assert "positive" in reply.lower()
-
-    # ── 5. Budget exceeds ceiling ──────────────────────────────────
-
-    @pytest.mark.asyncio
-    async def test_budget_exceeds_ceiling(self):
-        """/settings budget 999 is rejected when global ceiling is lower."""
-        # Ceiling comes from config.budget_ceiling (global), not per-user
-        config = _make_config(budget_ceiling=25.0)
-        update = _make_update(text="/settings budget 999")
-        ctx = _make_context(config=config, args=["budget", "999"])
-        mock_sessions = self._mock_sessions()
-
-        with self._patches(mock_sessions):
-            await handle_settings(update, ctx)
-
-        mock_sessions.set_user_setting.assert_not_called()
-        reply = update.message.reply_text.call_args[0][0]
-        assert "$25.00" in reply
-        assert "admin limit" in reply.lower()
-
-    # ── 5b. Budget allowed when ceiling is zero (no limit) ──────────
-
-    @pytest.mark.asyncio
-    async def test_budget_allowed_when_ceiling_zero(self):
-        """/settings budget 50 succeeds when global ceiling is 0 (no limit)."""
-        # If BUDGET_CEILING=0 and no users.yaml entry, 0 means
-        # "no admin ceiling" - budget should be allowed, not rejected.
-        config = _make_config(budget_ceiling=0.0)
-        update = _make_update(text="/settings budget 50")
-        pool = _make_mock_claude()
-        pool.get_if_exists = MagicMock(return_value=MagicMock())
-        ctx = _make_context(config=config, pool=pool, args=["budget", "50"])
-        mock_sessions = self._mock_sessions()
-
-        with self._patches(mock_sessions):
-            await handle_settings(update, ctx)
-
-        mock_sessions.set_user_setting.assert_called_once_with(12345, "budget", "50.0")
-        reply = update.message.reply_text.call_args[0][0]
-        assert "$50.00" in reply
+        assert "Unknown setting" in reply
+        assert "model" in reply
+        assert "timeout" in reply
 
     # ── 6. Set timeout ─────────────────────────────────────────────
 
@@ -4420,13 +4272,12 @@ class TestHandleSettings:
 
     @pytest.mark.asyncio
     async def test_reset_all_reverts_instance(self):
-        """/settings reset reverts all three fields on the live instance."""
+        """/settings reset reverts all fields on the live instance."""
         update = _make_update(text="/settings reset")
         config = _make_config()
         pool = _make_mock_claude()
         instance = MagicMock()
         instance.model = "opus"
-        instance.max_budget_usd = 99.0
         instance.timeout_seconds = 500
         pool.get_if_exists = MagicMock(return_value=instance)
         ctx = _make_context(config=config, pool=pool, args=["reset"])
@@ -4436,46 +4287,7 @@ class TestHandleSettings:
             await handle_settings(update, ctx)
 
         assert instance.model == config.default_model
-        assert instance.max_budget_usd == config.budget_ceiling
         assert instance.timeout_seconds == config.claude_timeout_seconds
-
-    # ── 19. Budget displays "unlimited" when zero ─────────────────
-
-    @pytest.mark.asyncio
-    async def test_show_settings_budget_zero_displays_unlimited(self):
-        """Budget of $0.00 displays as 'unlimited', not '$0.00'."""
-        update = _make_update(text="/settings")
-        config = _make_config(budget_ceiling=0.0)
-        ctx = _make_context(config=config)
-        mock_sessions = self._mock_sessions()
-
-        with self._patches(mock_sessions):
-            await _show_settings(update, ctx, 12345, config)
-
-        reply = update.message.reply_text.call_args[0][0]
-        assert "unlimited" in reply.lower()
-        assert "$0.00" not in reply
-
-    # ── 20. Ceiling enforced from global config, not per-user ────
-
-    @pytest.mark.asyncio
-    async def test_ceiling_enforced_from_global_config(self):
-        """Ceiling comes from config.budget_ceiling, not per-user max_budget."""
-        # User has max_budget=15 in users.yaml, but global ceiling is 50.
-        # User should be able to set budget up to $50, not just $15.
-        user = UserConfig(telegram_id=12345, name="testuser", max_budget=15.0)
-        config = _make_config(budget_ceiling=50.0, user_configs={12345: user})
-        update = _make_update(text="/settings budget 40")
-        pool = _make_mock_claude()
-        pool.get_if_exists = MagicMock(return_value=MagicMock())
-        ctx = _make_context(config=config, pool=pool, args=["budget", "40"])
-        mock_sessions = self._mock_sessions()
-
-        with self._patches(mock_sessions):
-            await handle_settings(update, ctx)
-
-        # Budget of $40 should succeed (under $50 ceiling, above $15 yaml default)
-        mock_sessions.set_user_setting.assert_called_once_with(12345, "budget", "40.0")
 
 
 # ── /github command ─────────────────────────────────────────────────

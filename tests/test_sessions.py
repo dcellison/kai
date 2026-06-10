@@ -24,27 +24,27 @@ class TestSessions:
         assert await sessions.get_session(999) is None
 
     async def test_save_then_get(self, db):
-        await sessions.save_session(1, "sess-abc", "sonnet", 0.5)
+        await sessions.save_session(1, "sess-abc", "sonnet")
         result = await sessions.get_session(1)
         assert result == "sess-abc"
 
-    async def test_save_twice_accumulates_cost(self, db):
-        await sessions.save_session(1, "sess-1", "sonnet", 0.5)
-        await sessions.save_session(1, "sess-1", "sonnet", 0.3)
+    async def test_save_twice_updates_in_place(self, db):
+        await sessions.save_session(1, "sess-1", "sonnet")
+        await sessions.save_session(1, "sess-2", "opus")
         stats = await sessions.get_stats(1)
-        assert stats["total_cost_usd"] == pytest.approx(0.8)
+        assert stats["session_id"] == "sess-2"
+        assert stats["model"] == "opus"
 
     async def test_clear_session(self, db):
-        await sessions.save_session(1, "sess-1", "sonnet", 0.0)
+        await sessions.save_session(1, "sess-1", "sonnet")
         await sessions.clear_session(1)
         assert await sessions.get_session(1) is None
 
     async def test_get_stats(self, db):
-        await sessions.save_session(1, "sess-1", "opus", 1.23)
+        await sessions.save_session(1, "sess-1", "opus")
         stats = await sessions.get_stats(1)
         assert stats["session_id"] == "sess-1"
         assert stats["model"] == "opus"
-        assert stats["total_cost_usd"] == pytest.approx(1.23)
         assert "created_at" in stats
         assert "last_used_at" in stats
 
@@ -318,23 +318,21 @@ class TestWorkspaceConfigSettings:
     async def test_set_multiple_fields(self, db):
         """Multiple fields for the same workspace are returned together."""
         await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "opus")
-        await sessions.set_workspace_config_setting(111, "/projects/kai", "budget", "20.0")
         await sessions.set_workspace_config_setting(111, "/projects/kai", "timeout", "300")
         result = await sessions.get_workspace_config_settings(111, "/projects/kai")
-        assert result == {"model": "opus", "budget": "20.0", "timeout": "300"}
+        assert result == {"model": "opus", "timeout": "300"}
 
     async def test_delete_single_field(self, db):
         """Deleting one field leaves others intact."""
         await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "opus")
-        await sessions.set_workspace_config_setting(111, "/projects/kai", "budget", "20.0")
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "timeout", "300")
         await sessions.delete_workspace_config_setting(111, "/projects/kai", "model")
         result = await sessions.get_workspace_config_settings(111, "/projects/kai")
-        assert result == {"budget": "20.0"}
+        assert result == {"timeout": "300"}
 
     async def test_delete_all(self, db):
         """Bulk delete removes all overrides for a workspace."""
         await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "opus")
-        await sessions.set_workspace_config_setting(111, "/projects/kai", "budget", "20.0")
         await sessions.set_workspace_config_setting(111, "/projects/kai", "timeout", "300")
         await sessions.delete_all_workspace_config(111, "/projects/kai")
         result = await sessions.get_workspace_config_settings(111, "/projects/kai")
@@ -389,44 +387,43 @@ class TestBuildWorkspaceConfig:
         """YAML config present, no DB overrides, returns YAML values."""
         from kai.config import WorkspaceConfig
 
-        yaml = WorkspaceConfig(path=Path("/projects/kai"), model="opus", budget=15.0)
+        yaml = WorkspaceConfig(path=Path("/projects/kai"), model="opus", timeout=150)
         result = await sessions.build_workspace_config(yaml, Path("/projects/kai"), 111)
         assert result is not None
         assert result.model == "opus"
-        assert result.budget == 15.0
+        assert result.timeout == 150
 
     async def test_db_only(self, db):
         """No YAML config, DB overrides present, returns DB values."""
         await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "haiku")
-        await sessions.set_workspace_config_setting(111, "/projects/kai", "budget", "5.0")
+        await sessions.set_workspace_config_setting(111, "/projects/kai", "timeout", "150")
         result = await sessions.build_workspace_config(None, Path("/projects/kai"), 111)
         assert result is not None
         assert result.model == "haiku"
-        assert result.budget == 5.0
+        assert result.timeout == 150
         assert result.path == Path("/projects/kai")
 
     async def test_db_overrides_yaml(self, db):
         """DB values take precedence over YAML values."""
         from kai.config import WorkspaceConfig
 
-        yaml = WorkspaceConfig(path=Path("/projects/kai"), model="opus", budget=15.0)
+        yaml = WorkspaceConfig(path=Path("/projects/kai"), model="opus", timeout=150)
         await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "sonnet")
         result = await sessions.build_workspace_config(yaml, Path("/projects/kai"), 111)
         assert result is not None
         assert result.model == "sonnet"
-        # Budget from YAML is preserved (not overridden)
-        assert result.budget == 15.0
+        # Timeout from YAML is preserved (not overridden)
+        assert result.timeout == 150
 
     async def test_partial_override(self, db):
-        """YAML has model+budget, DB overrides only model. Budget from YAML."""
+        """YAML has model+timeout, DB overrides only model. Timeout from YAML."""
         from kai.config import WorkspaceConfig
 
-        yaml = WorkspaceConfig(path=Path("/projects/kai"), model="opus", budget=20.0, timeout=300)
+        yaml = WorkspaceConfig(path=Path("/projects/kai"), model="opus", timeout=300)
         await sessions.set_workspace_config_setting(111, "/projects/kai", "model", "haiku")
         result = await sessions.build_workspace_config(yaml, Path("/projects/kai"), 111)
         assert result is not None
         assert result.model == "haiku"
-        assert result.budget == 20.0
         assert result.timeout == 300
 
     async def test_env_merge(self, db):
@@ -499,23 +496,21 @@ class TestUserSettings:
     async def test_set_multiple_fields(self, db):
         """Multiple fields are returned together."""
         await sessions.set_user_setting(111, "model", "opus")
-        await sessions.set_user_setting(111, "budget", "15.0")
         await sessions.set_user_setting(111, "timeout", "300")
         result = await sessions.get_user_settings(111)
-        assert result == {"model": "opus", "budget": "15.0", "timeout": "300"}
+        assert result == {"model": "opus", "timeout": "300"}
 
     async def test_delete_single(self, db):
         """Deleting one field leaves others intact."""
         await sessions.set_user_setting(111, "model", "opus")
-        await sessions.set_user_setting(111, "budget", "15.0")
+        await sessions.set_user_setting(111, "timeout", "300")
         await sessions.delete_user_setting(111, "model")
         result = await sessions.get_user_settings(111)
-        assert result == {"budget": "15.0"}
+        assert result == {"timeout": "300"}
 
     async def test_delete_all(self, db):
         """Bulk delete removes all per-user settings."""
         await sessions.set_user_setting(111, "model", "opus")
-        await sessions.set_user_setting(111, "budget", "15.0")
         await sessions.set_user_setting(111, "timeout", "300")
         await sessions.delete_all_user_settings(111)
         result = await sessions.get_user_settings(111)
@@ -556,7 +551,6 @@ class TestResolveUserDefaults:
             "telegram_bot_token": "test",
             "allowed_user_ids": {111},
             "default_model": "sonnet",
-            "budget_ceiling": 10.0,
             "claude_timeout_seconds": 120,
         }
         defaults.update(kwargs)
@@ -569,17 +563,14 @@ class TestResolveUserDefaults:
         config = self._make_config()
         result = await sessions.resolve_user_defaults(111, config)
         assert result["model"] == "sonnet"
-        assert result["budget"] == 10.0
         assert result["timeout"] == 120
 
     async def test_db_overrides_globals(self, db):
         """DB settings override global defaults."""
         config = self._make_config()
         await sessions.set_user_setting(111, "model", "opus")
-        await sessions.set_user_setting(111, "budget", "25.0")
         result = await sessions.resolve_user_defaults(111, config)
         assert result["model"] == "opus"
-        assert result["budget"] == 25.0
         # Unset fields still come from globals
         assert result["timeout"] == 120
 
@@ -591,13 +582,11 @@ class TestResolveUserDefaults:
             telegram_id=111,
             name="alice",
             model="opus",
-            max_budget=20.0,
             timeout=300,
         )
         config = self._make_config(user_configs={111: uc})
         result = await sessions.resolve_user_defaults(111, config)
         assert result["model"] == "opus"
-        assert result["budget"] == 20.0
         assert result["timeout"] == 300
 
     async def test_db_overrides_yaml(self, db):
@@ -608,15 +597,12 @@ class TestResolveUserDefaults:
             telegram_id=111,
             name="alice",
             model="opus",
-            max_budget=20.0,
             timeout=300,
         )
         config = self._make_config(user_configs={111: uc})
         await sessions.set_user_setting(111, "model", "haiku")
-        await sessions.set_user_setting(111, "budget", "5.0")
         result = await sessions.resolve_user_defaults(111, config)
         assert result["model"] == "haiku"
-        assert result["budget"] == 5.0
         # Timeout not overridden in DB, comes from YAML
         assert result["timeout"] == 300
 
@@ -634,7 +620,6 @@ class TestResolveUserDefaults:
         result = await sessions.resolve_user_defaults(111, config)
         assert result["model"] == "opus"  # from DB
         assert result["timeout"] == 300  # from YAML
-        assert result["budget"] == 10.0  # from global
 
     # ── Empty/blank model fallthrough (finding 1) ────────────────
 
@@ -1337,8 +1322,7 @@ class TestWorkspaceHistoryMigration:
                 CREATE TABLE sessions (
                     chat_id INTEGER PRIMARY KEY,
                     session_id TEXT NOT NULL,
-                    model TEXT DEFAULT 'sonnet',
-                    total_cost REAL DEFAULT 0.0
+                    model TEXT DEFAULT 'sonnet'
                 )
             """)
             await conn.execute("""

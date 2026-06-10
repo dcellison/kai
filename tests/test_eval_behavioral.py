@@ -99,10 +99,8 @@ def _make_config(**overrides) -> BehavioralConfig:
     """
     base: dict = {
         "judge_model": "claude-haiku-4-5-20251001",
-        "judge_budget_usd": 0.05,
         "judge_timeout_s": 60,
         "gen_model": "sonnet",
-        "gen_budget_usd": 0.10,
         "gen_timeout_s": 120,
         "seed": "0123456789abcdef",
         "max_concurrency": 4,
@@ -140,7 +138,6 @@ def _make_outcome(*, probe: Probe, memory_outcome: str) -> ProbeOutcome:
         judge_reasoning="reason",
         memory_outcome=memory_outcome,
         latency_ms={"A": 1.0, "B": 1.0, "judge": 1.0},
-        cost_usd={"A": None, "B": None, "judge": 0.001},
     )
 
 
@@ -267,12 +264,11 @@ class TestJudgeOutputParsingValid:
     @pytest.mark.parametrize("choice", ["A_wins", "B_wins", "tie", "both_wrong"])
     def test_parse_valid_choices(self, choice: str):
         # Build the envelope shape that `claude --print --output-format
-        # json --json-schema ...` produces: outer dict with structured
-        # output nested, plus the cost field used by _extract_judge_cost.
+        # json --json-schema ...` produces: outer dict with the
+        # structured output nested.
         envelope = {
             "is_error": False,
             "structured_output": {"choice": choice, "reasoning": "test reasoning"},
-            "total_cost_usd": 0.001,
         }
         parsed = _parse_judge_stdout(json.dumps(envelope).encode("utf-8"))
         assert parsed is not None
@@ -316,7 +312,7 @@ class TestJudgeOutputParsingMalformed:
         assert _parse_judge_stdout(b'["a", "b"]') is None
 
     def test_is_error_true(self):
-        # CLI exits 0 with is_error=true on budget-cap mid-retry.
+        # CLI exits 0 with is_error=true on a mid-retry failure.
         # Treat as failure rather than partial-success-with-noise.
         env = {
             "is_error": True,
@@ -326,7 +322,7 @@ class TestJudgeOutputParsingMalformed:
 
     def test_missing_structured_output(self):
         # Top-level envelope present but the nested payload is missing.
-        env = {"total_cost_usd": 0.001}
+        env = {"is_error": False}
         assert _parse_judge_stdout(json.dumps(env).encode("utf-8")) is None
 
     def test_structured_output_not_dict(self):
@@ -471,9 +467,8 @@ class TestRollupOutcome:
 class TestSubprocessTimeout:
     """Generator subprocess timeout -> probe lands in generation_error.
 
-    Verifies the cost-saving short-circuit also fires: when both arms
-    fail, the judge call is skipped (no point spending money to score
-    nothing against nothing).
+    Verifies the short-circuit also fires: when both arms fail, the
+    judge call is skipped (no point scoring nothing against nothing).
     """
 
     def test_subprocess_timeout_buckets_as_generation_error(self):
@@ -515,7 +510,7 @@ class TestSubprocessTimeout:
 
         # Per-arm latencies are still recorded so the operator can see
         # which side timed out. Judge latency is zero because the call
-        # was short-circuited (cost discipline).
+        # was short-circuited.
         assert outcome.latency_ms["A"] == 50.0
         assert outcome.latency_ms["B"] == 50.0
         assert outcome.latency_ms["judge"] == 0.0
@@ -705,8 +700,8 @@ class TestGeneratorEmptySystemPrompt:
 
     def test_generator_uses_text_output_format(self):
         # Generator emits free-form text for the judge to read; locks
-        # the design choice that --output-format=text (no JSON envelope,
-        # which is why generator cost is None in the output JSON).
+        # the design choice that --output-format=text (no JSON
+        # envelope to unwrap).
         cmd = _build_gen_cmd(_make_config())
         assert "--output-format" in cmd
         assert cmd[cmd.index("--output-format") + 1] == "text"
@@ -846,10 +841,8 @@ class TestOutputWriteFailure:
         args.user_id = "user-1"
         args.output = bad_output
         args.judge_model = "claude-haiku-4-5-20251001"
-        args.judge_budget_usd = 0.05
         args.judge_timeout_s = 60
         args.gen_model = "sonnet"
-        args.gen_budget_usd = 0.10
         args.gen_timeout_s = 120
         args.seed = None
         args.max_concurrency = 1
@@ -870,7 +863,6 @@ class TestOutputWriteFailure:
                     judge_reasoning="",
                     memory_outcome="generation_error",
                     latency_ms={"A": 0.0, "B": 0.0, "judge": 0.0},
-                    cost_usd={"A": None, "B": None, "judge": None},
                 ),
             ]
 
@@ -927,10 +919,8 @@ class TestBackendAwareModelResolution:
         args.user_id = "user-1"
         args.output = None
         args.judge_model = judge_model
-        args.judge_budget_usd = 0.05
         args.judge_timeout_s = 60
         args.gen_model = gen_model
-        args.gen_budget_usd = 0.10
         args.gen_timeout_s = 120
         args.seed = None
         args.max_concurrency = 1
@@ -1483,7 +1473,6 @@ class TestBuildJudgeCmdCodex:
         assert "--system-prompt" not in cmd
         assert "--permission-mode" not in cmd
         assert "--tools" not in cmd
-        assert "--max-budget-usd" not in cmd
 
     def test_codex_bin_env_override(self, monkeypatch):
         monkeypatch.setenv("CODEX_BIN", "/tmp/fake-codex")
@@ -1509,7 +1498,6 @@ class TestBuildGenCmdCodex:
         assert cmd[i + 1] == "gpt-5.4-mini"
         assert "--system-prompt" not in cmd
         assert "--tools" not in cmd
-        assert "--max-budget-usd" not in cmd
 
     def test_codex_bin_env_override(self, monkeypatch):
         monkeypatch.setenv("CODEX_BIN", "/tmp/fake-codex")

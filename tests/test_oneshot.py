@@ -124,7 +124,7 @@ def _make_proc(
 class TestClaudeOneShotReasonerArgv:
     """The Claude reasoner's argv must match the pre-refactor memory
     extraction shape: claude --print, schema flag when provided,
-    sandboxing flags, no --bare, no --max-budget-usd."""
+    sandboxing flags, no --bare."""
 
     @pytest.mark.asyncio
     async def test_argv_shape_with_schema_and_system_prompt(self, tmp_path):
@@ -170,20 +170,6 @@ class TestClaudeOneShotReasonerArgv:
 
         cmd = mock_exec.call_args[0]
         assert "--bare" not in cmd
-
-    @pytest.mark.asyncio
-    async def test_argv_omits_max_budget_usd_flag(self, tmp_path):
-        """Max-plan OAuth makes --max-budget-usd a phantom signal; runaway
-        protection is the wait_for timeout. The reasoner must not emit
-        the flag regardless of how a future config knob looks."""
-        reasoner = ClaudeOneShotReasoner(cwd=tmp_path)
-        proc = _make_proc()
-
-        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
-            await reasoner.run(prompt="p", purpose="fact_extraction")
-
-        cmd = mock_exec.call_args[0]
-        assert "--max-budget-usd" not in cmd
 
     @pytest.mark.asyncio
     async def test_payload_sent_on_stdin_not_argv(self, tmp_path):

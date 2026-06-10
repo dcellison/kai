@@ -77,7 +77,6 @@ class AgentResponse:
         success: True if the backend returned a valid response, False on error.
         text: The full response text (accumulated from streaming chunks).
         session_id: Session identifier (used for session continuity).
-        cost_usd: Cost of this interaction in USD.
         duration_ms: Wall-clock duration of the interaction in milliseconds.
         error: Error message if success is False, None otherwise.
     """
@@ -85,7 +84,6 @@ class AgentResponse:
     success: bool
     text: str
     session_id: str | None = None
-    cost_usd: float = 0.0
     duration_ms: int = 0
     error: str | None = None
 
@@ -146,8 +144,8 @@ class AgentBackend(ABC):
     Mutable attributes on the ABC (set by pool.py during workspace
     restore, /settings, and /model commands). These are generic to any
     backend:
-        model, workspace, home_workspace, max_budget_usd,
-        timeout_seconds, workspace_config, provider
+        model, workspace, home_workspace, timeout_seconds,
+        workspace_config, provider
 
     Backend-specific attributes (NOT on the ABC) stay on the concrete
     class. For ClaudeCodeBackend these include: claude_user,
@@ -163,7 +161,6 @@ class AgentBackend(ABC):
     model: str
     workspace: Path
     home_workspace: Path
-    max_budget_usd: float
     timeout_seconds: int
     workspace_config: WorkspaceConfig | None
     provider: str

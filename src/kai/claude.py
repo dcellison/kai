@@ -14,7 +14,7 @@ The stream-json protocol:
     Input:  {"type": "user", "message": {"role": "user", "content": [...]}}
     Output: {"type": "system", ...}      - session metadata
             {"type": "assistant", ...}   - partial text (streaming)
-            {"type": "result", ...}      - final response with cost/session info
+            {"type": "result", ...}      - final response with session info
 """
 
 import asyncio
@@ -57,12 +57,8 @@ class ClaudeCodeBackend(AgentBackend):
     lock to prevent interleaving.
 
     The process runs with --permission-mode bypassPermissions (required
-    for headless operation via Telegram). No --max-budget-usd is emitted:
-    the claude backend is committed to Max-plan OAuth, where the CLI's
-    computed-cost ceiling has no relation to actual billing (the CLI
-    tracks pay-per-token rates whether or not the operator owes any of
-    that money). Terminating the subprocess at a phantom ceiling would
-    just stop work that is not costing anything. Runaway protection
+    for headless operation via Telegram). No cost cap is passed:
+    subscription auth has no real per-token cost. Runaway protection
     comes from the per-message stdout-read timeouts and idle detection
     (both derived from `timeout_seconds`) - a stuck or recursive
     subprocess surfaces via stream-read failure rather than holding
@@ -81,7 +77,6 @@ class ClaudeCodeBackend(AgentBackend):
         home_workspace: Path | None = None,
         webhook_port: int = 8080,
         webhook_secret: str = "",
-        max_budget_usd: float = 1.0,
         timeout_seconds: int = 120,
         services_info: list[dict] | None = None,
         claude_user: str | None = None,
@@ -106,7 +101,6 @@ class ClaudeCodeBackend(AgentBackend):
         self.model = model
         self.workspace = workspace
         self.home_workspace = home_workspace or workspace
-        self.max_budget_usd = max_budget_usd
         self.timeout_seconds = timeout_seconds
         self.workspace_config = workspace_config
         # Effort level for the inner Claude --effort flag. Stored on the
@@ -136,7 +130,6 @@ class ClaudeCodeBackend(AgentBackend):
         # Global defaults, preserved so we can restore them when
         # switching away from a configured workspace.
         self._default_model = model
-        self._default_budget = max_budget_usd
         self._default_timeout = timeout_seconds
 
         # Apply per-workspace overrides (if configured). These become
@@ -146,8 +139,6 @@ class ClaudeCodeBackend(AgentBackend):
         # with a codex-only model is silently rejected here.
         if workspace_config:
             self.model = apply_workspace_model(workspace_config, "claude", "anthropic", self.model)
-            if workspace_config.budget is not None:
-                self.max_budget_usd = workspace_config.budget
             if workspace_config.timeout is not None:
                 self.timeout_seconds = workspace_config.timeout
 
@@ -186,7 +177,7 @@ class ClaudeCodeBackend(AgentBackend):
         Start the Claude Code subprocess if not already running.
 
         Launches claude with stream-json I/O, bypassPermissions mode (required
-        for headless operation), and the configured model and budget. The process
+        for headless operation), and the configured model. The process
         runs in the current workspace directory and persists across messages.
 
         When claude_user is set, the process is spawned via sudo -u to run as
@@ -939,10 +930,8 @@ class ClaudeCodeBackend(AgentBackend):
                     # See issue #326 for the paired UX fix.
                     if event.get("is_error", False) and not result_text:
                         log.warning(
-                            "Result event with is_error=true has no result field; "
-                            "session=%s cost_usd=%s duration_ms=%s keys=%s",
+                            "Result event with is_error=true has no result field; session=%s duration_ms=%s keys=%s",
                             event.get("session_id"),
-                            event.get("total_cost_usd"),
                             event.get("duration_ms"),
                             sorted(event.keys()),
                         )
@@ -952,9 +941,7 @@ class ClaudeCodeBackend(AgentBackend):
                     #   (a) `result` populated with a human-readable
                     #       reason. Use it directly.
                     #   (b) `result` empty BUT `errors` populated with a
-                    #       list of strings (the documented variant for
-                    #       BUDGET_CEILING exhaustion: errors carries
-                    #       ["Reached maximum budget ($N)"]).
+                    #       list of strings.
                     #
                     # Falls back to a non-None sentinel when both fields
                     # are empty so downstream rendering never produces
@@ -983,7 +970,6 @@ class ClaudeCodeBackend(AgentBackend):
                         success=not event.get("is_error", False),
                         text=text,
                         session_id=event.get("session_id", self._session_id),
-                        cost_usd=event.get("total_cost_usd", 0.0),
                         duration_ms=event.get("duration_ms", 0),
                         error=response_error,
                     )
@@ -1149,16 +1135,14 @@ class ClaudeCodeBackend(AgentBackend):
         # Always revert to global defaults first, then apply overrides.
         # This prevents stale values when switching from a fully-configured
         # workspace to a partially-configured one (e.g., workspace A has
-        # budget=15.0 but workspace B only sets model - without the reset,
-        # budget would carry over from A instead of reverting to default).
+        # timeout=300 but workspace B only sets model - without the reset,
+        # the timeout would carry over from A instead of reverting to
+        # default).
         self.model = self._default_model
-        self.max_budget_usd = self._default_budget
         self.timeout_seconds = self._default_timeout
 
         if workspace_config:
             self.model = apply_workspace_model(workspace_config, "claude", "anthropic", self.model)
-            if workspace_config.budget is not None:
-                self.max_budget_usd = workspace_config.budget
             if workspace_config.timeout is not None:
                 self.timeout_seconds = workspace_config.timeout
 

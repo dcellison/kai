@@ -44,7 +44,6 @@ def _make_config(**overrides) -> Config:
         "allowed_user_ids": {111, 222},
         "default_model": "sonnet",
         "claude_timeout_seconds": 30,
-        "budget_ceiling": 1.0,
         "claude_max_session_hours": 0,
         "claude_idle_timeout": 1800,
         "webhook_port": 8080,
@@ -110,7 +109,7 @@ class TestInstanceCreation:
         assert (tmp_path / "home" / "999").is_dir()
 
     def test_create_uses_user_config_settings(self, tmp_path):
-        """User with model/timeout/budget in users.yaml gets those values."""
+        """User with model/timeout in users.yaml gets those values."""
         ws = tmp_path / "ws"
         ws.mkdir()
         user = UserConfig(
@@ -118,14 +117,12 @@ class TestInstanceCreation:
             name="alice",
             home_workspace=ws,
             model="opus",
-            max_budget=25.0,
             timeout=300,
         )
         config = _make_config(user_configs={111: user})
         pool = SubprocessPool(config=config, services_info=[])
         instance = pool.get(111)
         assert instance.model == "opus"
-        assert instance.max_budget_usd == 25.0
         assert instance.timeout_seconds == 300
 
     def test_create_falls_back_to_global_for_missing_user_fields(self):
@@ -134,13 +131,11 @@ class TestInstanceCreation:
         config = _make_config(
             user_configs={111: user},
             default_model="haiku",
-            budget_ceiling=5.0,
             claude_timeout_seconds=60,
         )
         pool = SubprocessPool(config=config, services_info=[])
         instance = pool.get(111)
         assert instance.model == "haiku"
-        assert instance.max_budget_usd == 5.0
         assert instance.timeout_seconds == 60
 
 
@@ -412,7 +407,6 @@ class TestPropertyAccessors:
             new_callable=AsyncMock,
             return_value={
                 "model": "opus",
-                "budget": 10.0,
                 "timeout": 120,
             },
         ):
@@ -542,8 +536,8 @@ class TestWorkspaceRestoration:
         # Instance starts with global model "sonnet"
         assert instance.model == "sonnet"
 
-        # Simulate DB overrides: user set model=opus and budget=20.0
-        db_settings = {"model": "opus", "budget": "20.0"}
+        # Simulate DB overrides: user set model=opus
+        db_settings = {"model": "opus"}
         with (
             patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
             patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value=db_settings),
@@ -552,7 +546,6 @@ class TestWorkspaceRestoration:
             await pool._restore_workspace(111, instance)
             # Model is a CLI flag, so changing it triggers restart
             assert instance.model == "opus"
-            assert instance.max_budget_usd == 20.0
             mock_restart.assert_called_once()
 
     @pytest.mark.asyncio

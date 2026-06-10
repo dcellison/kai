@@ -50,22 +50,10 @@ log = logging.getLogger(__name__)
 # Claude's context window while leaving room for the prompt frame.
 _MAX_DIFF_CHARS = 100_000
 
-# Default per-review budget cap in USD. Vestigial after #390:
-# --max-budget-usd is no longer emitted to claude --print argv on the
-# claude branch (Max-plan OAuth makes the CLI's computed-cost ceiling
-# a phantom signal), and the Goose branch uses --max-turns 1 rather
-# than a dollar ceiling, so the constant's only remaining role is to
-# provide the default for the `budget_usd` parameter on `run_review`
-# / `run_review_session` - a parameter that is itself unused on every
-# currently-exercised path. Retained for symmetry with
-# _TRIAGE_BUDGET_USD and to avoid changing public signatures (see
-# PR_REVIEW_BUDGET_USD env var); cleanup deferred to a separate
-# refactor that can also drop the `budget_usd` parameter.
-_REVIEW_BUDGET_USD = 1.0
-
 # Default subprocess timeout for a single review, in seconds. Overridable
-# via PR_REVIEW_TIMEOUT_S in config; same fallback rationale as the budget
-# default above. Sonnet 4.6+ uses extended thinking, which can take a long
+# via PR_REVIEW_TIMEOUT_S in config; the in-code default keeps direct
+# callers working without config plumbing. Sonnet 4.6+ uses extended
+# thinking, which can take a long
 # time on large diffs with prior review context - 15 minutes accommodates
 # thinking-heavy reviews while still terminating genuinely stuck processes.
 _REVIEW_TIMEOUT = 900
@@ -625,13 +613,6 @@ async def run_review(
     agent_backend: str = "claude",
     provider: str = "",
     timeout_s: int = _REVIEW_TIMEOUT,
-    # `budget_usd` is unused on every currently-exercised path: the
-    # claude branch no longer emits --max-budget-usd to argv (#390),
-    # and the Goose branch uses --max-turns 1 rather than a dollar
-    # ceiling. Kept on the signature to avoid a public API break in
-    # this fix; cleanup deferred to a separate refactor that updates
-    # webhook.py and the test suite together.
-    budget_usd: float = _REVIEW_BUDGET_USD,
     # Per-role model override. Caller in webhook.py resolves
     # `user_config.models.get("pr_review", "")` and passes it; empty
     # falls through to MODEL_REGISTRY's (backend, provider, PR_REVIEW)
@@ -648,8 +629,8 @@ async def run_review(
     of review text; the prompt and output handling are identical
     regardless of backend.
 
-    Claude path: supports sudo -u for OS-level isolation, process
-    group kills for cleanup, and per-run budget caps.
+    Claude path: supports sudo -u for OS-level isolation and process
+    group kills for cleanup.
 
     Codex path: sudo -H -u when claude_user is set (codex needs
     HOME pointing at the user's home so it reads the right
@@ -731,9 +712,9 @@ async def run_review(
         # `sudo -H -u <user>` so codex reads ~<user>/.codex/auth.json
         # instead of the service user's home. The parameter name is
         # claude-historical; rename is out of scope for this fix.
-        # No --max-budget-usd: codex on subscription auth has no
-        # per-call billing; runaway protection comes from
-        # timeout_s at the asyncio.wait_for below.
+        # No cost cap is passed: subscription auth has no per-call
+        # billing; runaway protection comes from timeout_s at the
+        # asyncio.wait_for below.
         review_model = get_model_for(
             ModelRole.PR_REVIEW,
             agent_backend,
@@ -878,15 +859,9 @@ async def run_review(
             raise RuntimeError(f"Review subprocess timed out after {timeout_s}s") from None
     else:
         # Claude one-shot mode: --print reads from stdin, writes to stdout.
-        # No --max-budget-usd on this branch: the claude backend runs under
-        # Max-plan OAuth, where the CLI tracks computed token cost regardless
-        # of whether any money is being charged. Passing the flag would
-        # terminate the subprocess at a ceiling that does not correspond to
-        # real billing. Runaway protection comes from `timeout_s` at the
-        # asyncio.wait_for call below. The `budget_usd` parameter on the
-        # signature is unused on every currently-exercised path - see the
-        # comment on the parameter declaration above for the full rationale
-        # and why cleanup is deferred to a separate refactor.
+        # No cost cap is passed: subscription auth has no real per-token
+        # cost. Runaway protection comes from `timeout_s` at the
+        # asyncio.wait_for call below.
         # Model identifier comes from the per-role registry indexed
         # by (backend, provider, role) so the codex backend (and any
         # future backend) can override the mid-tier "sonnet" default
@@ -1061,9 +1036,6 @@ async def review_pr(
     agent_backend: str = "claude",
     provider: str = "",
     timeout_s: int = _REVIEW_TIMEOUT,
-    # See `run_review` above for why `budget_usd` is currently unused
-    # on every exercised path; cleanup deferred to a separate refactor.
-    budget_usd: float = _REVIEW_BUDGET_USD,
     model_override: str = "",
 ) -> None:
     """
@@ -1131,7 +1103,6 @@ async def review_pr(
             agent_backend=agent_backend,
             provider=provider,
             timeout_s=timeout_s,
-            budget_usd=budget_usd,
             model_override=model_override,
         )
 

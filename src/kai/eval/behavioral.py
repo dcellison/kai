@@ -61,7 +61,7 @@ Design rationale (the parts that are not obvious from the code):
   separate so a noisy run is diagnosable: a 30% generation_error rate
   means the gen subprocess is broken (rate-limited, timed out, model
   unavailable); a 30% judge_error rate means the judge subprocess is
-  broken (bad budget cap, schema regression). Mixing them would hide
+  broken (schema regression, auth failure). Mixing them would hide
   which side needs operator attention.
 
 PII posture: probe questions and gold-fact text remain in the gitignored
@@ -129,14 +129,6 @@ _DEFAULT_JUDGE_MODEL = "claude-haiku-4-5-20251001"
 # the operator typically wants this to match whatever the bot runs in
 # production. Sonnet is the production default; override via `--gen-model`.
 _DEFAULT_GEN_MODEL = "sonnet"
-
-
-# Per-call cost ceilings. The judge call is small (~3-4k input tokens,
-# tens of output tokens), so 0.05 USD is generous. The generator can
-# emit longer responses for multi-fact questions; 0.10 USD covers a
-# 1-2k output-token reply at Sonnet rates.
-_DEFAULT_JUDGE_BUDGET_USD = 0.05
-_DEFAULT_GEN_BUDGET_USD = 0.10
 
 
 # Subprocess timeout ceilings. Match the extractor's 60s default; a
@@ -282,10 +274,8 @@ class BehavioralConfig:
     """
 
     judge_model: str
-    judge_budget_usd: float
     judge_timeout_s: int
     gen_model: str
-    gen_budget_usd: float
     gen_timeout_s: int
     seed: str
     max_concurrency: int
@@ -330,9 +320,9 @@ class ProbeOutcome:
     so a future debugger can see what the judge actually said before
     the de-anonymization step.
 
-    `responses` and `latency_ms`/`cost_usd` are dicts keyed by arm
-    letter ("A", "B") so the per-probe row in the output JSON can
-    surface both arms symmetrically.
+    `responses` and `latency_ms` are dicts keyed by arm letter
+    ("A", "B") so the per-probe row in the output JSON can surface
+    both arms symmetrically.
     """
 
     probe: Probe
@@ -343,7 +333,6 @@ class ProbeOutcome:
     judge_reasoning: str
     memory_outcome: str  # rolled-up bucket name (one of _OUTCOME_BUCKETS or "drift")
     latency_ms: dict[str, float]  # {"A": ..., "B": ..., "judge": ...}
-    cost_usd: dict[str, float | None]  # {"A": None, "B": None, "judge": ...}
 
 
 # ── Probe loading ──────────────────────────────────────────────────
@@ -430,8 +419,6 @@ def _build_judge_cmd(config: BehavioralConfig) -> list[str]:
         "json",
         "--json-schema",
         json.dumps(_JUDGE_SCHEMA),
-        "--max-budget-usd",
-        str(config.judge_budget_usd),
         "--system-prompt",
         _JUDGE_SYSTEM_PROMPT,
         "--permission-mode",
@@ -450,10 +437,7 @@ def _build_gen_cmd(config: BehavioralConfig) -> list[str]:
     - `--output-format text` (not `json`): the generator's output is a
       free-form reply that the judge will read; the JSON envelope would
       need to be unwrapped, and we don't need the structured-output
-      validator path. Side effect: the per-call cost is NOT recoverable
-      from text output (the JSON envelope carries it). The harness
-      records `cost_usd` as None for the generator arms; this is a
-      documented limitation, not a bug.
+      validator path.
 
     - No `--json-schema`: text output, no schema to validate against.
 
@@ -473,8 +457,6 @@ def _build_gen_cmd(config: BehavioralConfig) -> list[str]:
         config.gen_model,
         "--output-format",
         "text",
-        "--max-budget-usd",
-        str(config.gen_budget_usd),
         # Literally empty, not omitted. Omitting would let the CLI's
         # default system prompt confound the measurement; passing ""
         # replaces it with the empty string. Verified accepted by
@@ -497,11 +479,6 @@ def _build_judge_cmd_codex(config: BehavioralConfig) -> list[str]:
     `--tools` flag set; the harness handles schema validation post-hoc
     (see `_validate_judge_envelope`) and injects the system prompt as
     a boundary-delimited prefix to stdin (see `_render_codex_stdin`).
-
-    The `--max-budget-usd` knob is also absent because codex on
-    subscription auth has no per-call billing surface. The CLI flag
-    is silently ignored on codex; the corresponding harness output
-    field records `cost_usd = None`.
 
     `CODEX_BIN` env override is honored same as triage/review and the
     persistent backend: installs where codex lives in a per-os_user
@@ -834,7 +811,7 @@ def _extract_judge_choice(envelope: dict) -> tuple[str, str] | None:
     Caller buckets None as `judge_error`.
 
     1. `is_error: true` -> None. The CLI can exit 0 with is_error set
-       when a budget cap was hit mid-retry; we treat that as failure
+       (e.g. an auth failure mid-retry); we treat that as failure
        rather than partial-success-with-noise.
     2. Schema-validated payload nests under `structured_output` (this
        is what `--json-schema` produces, not at the top level;
@@ -862,31 +839,14 @@ def _extract_judge_choice(envelope: dict) -> tuple[str, str] | None:
 def _parse_judge_stdout(stdout: bytes) -> tuple[str, str] | None:
     """Convenience wrapper: decode envelope + extract (choice, reasoning).
 
-    Used by the test suite (which passes raw bytes) and as a single
-    call point when the caller does not also need the cost field.
-    Production's `_run_one_judge` bypasses this and decodes the
-    envelope once so the cost extractor can reuse it; see that
-    function for the rationale on avoiding the duplicate decode.
+    Used by the test suite (which passes raw bytes) and by
+    production's `_run_one_judge` as the single decode + extract
+    call point.
     """
     envelope = _decode_judge_envelope(stdout)
     if envelope is None:
         return None
     return _extract_judge_choice(envelope)
-
-
-def _extract_judge_cost_usd(envelope: dict) -> float | None:
-    """Pull the judge's per-call cost from an already-decoded envelope.
-
-    Takes a dict (not raw bytes) so callers that already decoded the
-    envelope for the choice extractor do not pay for a second
-    json.loads. Returns None if `total_cost_usd` is missing or not
-    numeric. The extractor uses `total_cost_usd` at the envelope top
-    level (verified via the smoke test referenced in
-    memory_extraction's spec 320 §13.2). Different from the generator
-    case where text-format output has no cost field at all.
-    """
-    cost = envelope.get("total_cost_usd")
-    return float(cost) if isinstance(cost, (int, float)) else None
 
 
 # ── Anonymization + outcome rollup ─────────────────────────────────
@@ -1200,15 +1160,11 @@ async def _run_one_arm(
     arm_prompt: str,
     cwd: Path,
     env: dict[str, str],
-) -> tuple[str | None, float, float | None]:
-    """Run one generator arm; return (response_text, latency_ms, cost_usd).
+) -> tuple[str | None, float]:
+    """Run one generator arm; return (response_text, latency_ms).
 
     Returns response_text=None on any failure (non-zero exit, timeout,
     empty stdout); the caller buckets None as `generation_error`.
-    cost_usd is always None for text-format output (the JSON envelope
-    that carries cost is not produced when --output-format=text), so
-    the field is included for schema symmetry with the judge call but
-    not populated. Documented limitation per spec §3.3.
 
     Backend dispatch: claude builds `claude --print` argv and reads
     the raw stdout text; codex builds `codex exec --json` argv,
@@ -1231,7 +1187,7 @@ async def _run_one_arm(
         env=env,
     )
     if rc != 0:
-        return None, elapsed_ms, None
+        return None, elapsed_ms
     if config.backend == "codex":
         text = _parse_codex_gen_stdout(stdout).strip()
     else:
@@ -1241,8 +1197,8 @@ async def _run_one_arm(
         # the judge cannot score nothing against the gold fact. Bucket
         # as generation_error rather than feeding empty string into
         # the comparison.
-        return None, elapsed_ms, None
-    return text, elapsed_ms, None
+        return None, elapsed_ms
+    return text, elapsed_ms
 
 
 async def _run_one_judge(
@@ -1254,8 +1210,8 @@ async def _run_one_judge(
     response_b: str,
     cwd: Path,
     env: dict[str, str],
-) -> tuple[tuple[str, str] | None, float, float | None]:
-    """Run one judge call; return ((choice, reasoning) or None, latency_ms, cost_usd).
+) -> tuple[tuple[str, str] | None, float]:
+    """Run one judge call; return ((choice, reasoning) or None, latency_ms).
 
     None signals any failure in the parsing chain (timeout, non-zero
     exit, malformed JSON, missing structured_output, invalid choice).
@@ -1285,29 +1241,14 @@ async def _run_one_judge(
         env=env,
     )
     if rc != 0:
-        return None, elapsed_ms, None
+        return None, elapsed_ms
     if config.backend == "codex":
         # Codex has no --json-schema CLI-side; the harness parses NDJSON,
         # extracts the agent_message text, parses as JSON, and validates
-        # against _JUDGE_SCHEMA via _validate_judge_envelope. Cost is
-        # always None on codex (subscription auth has no per-call billing).
+        # against _JUDGE_SCHEMA via _validate_judge_envelope.
         parsed = _parse_codex_judge_stdout(stdout)
-        return parsed, elapsed_ms, None
-    # Decode the envelope once and feed it to BOTH the choice extractor
-    # and the cost extractor; previously each function called
-    # json.loads(stdout) independently, doubling the parse work per
-    # judge call. Cost is still recorded when the envelope is
-    # well-formed JSON but the contents fail validation (e.g.
-    # is_error=True or invalid choice enum) so that operator-side
-    # accounting stays accurate even on bucketed-as-judge_error probes.
-    envelope = _decode_judge_envelope(stdout)
-    if envelope is None:
-        return None, elapsed_ms, None
-    cost = _extract_judge_cost_usd(envelope)
-    parsed = _extract_judge_choice(envelope)
-    if parsed is None:
-        return None, elapsed_ms, cost
-    return parsed, elapsed_ms, cost
+        return parsed, elapsed_ms
+    return _parse_judge_stdout(stdout), elapsed_ms
 
 
 async def _run_one_probe(
@@ -1372,12 +1313,12 @@ async def _run_one_probe(
     # log readability, NOT memory-on then memory-off — the latter
     # would leak the arm assignment via timing patterns visible in
     # the bot's API logs.
-    response_a, lat_a, cost_a = await _run_one_arm(config=config, arm_prompt=arm_prompts["A"], cwd=cwd, env=env)
-    response_b, lat_b, cost_b = await _run_one_arm(config=config, arm_prompt=arm_prompts["B"], cwd=cwd, env=env)
+    response_a, lat_a = await _run_one_arm(config=config, arm_prompt=arm_prompts["A"], cwd=cwd, env=env)
+    response_b, lat_b = await _run_one_arm(config=config, arm_prompt=arm_prompts["B"], cwd=cwd, env=env)
 
     if response_a is None or response_b is None:
-        # One or both arms broken; skip the judge call (cost-saving)
-        # and bucket as generation_error. Per-arm latencies are still
+        # One or both arms broken; skip the pointless judge call and
+        # bucket as generation_error. Per-arm latencies are still
         # recorded so the operator can see which side timed out.
         return ProbeOutcome(
             probe=probe,
@@ -1388,10 +1329,9 @@ async def _run_one_probe(
             judge_reasoning="",
             memory_outcome="generation_error",
             latency_ms={"A": lat_a, "B": lat_b, "judge": 0.0},
-            cost_usd={"A": cost_a, "B": cost_b, "judge": None},
         )
 
-    judged, lat_judge, cost_judge = await _run_one_judge(
+    judged, lat_judge = await _run_one_judge(
         config=config,
         question=probe.question,
         ground_truth_text=ground_truth_text,
@@ -1410,7 +1350,6 @@ async def _run_one_probe(
             judge_reasoning="",
             memory_outcome="judge_error",
             latency_ms={"A": lat_a, "B": lat_b, "judge": lat_judge},
-            cost_usd={"A": cost_a, "B": cost_b, "judge": cost_judge},
         )
 
     choice, reasoning = judged
@@ -1423,7 +1362,6 @@ async def _run_one_probe(
         judge_reasoning=reasoning,
         memory_outcome=_rollup_outcome(judge_choice=choice, memory_arm_letter=memory_arm_letter),
         latency_ms={"A": lat_a, "B": lat_b, "judge": lat_judge},
-        cost_usd={"A": cost_a, "B": cost_b, "judge": cost_judge},
     )
 
 
@@ -1435,8 +1373,8 @@ def _make_drift_outcome(probe: Probe, tags: tuple[str, ...]) -> ProbeOutcome:
     against. Surface them as a separate `drift` row so the per-probe
     output preserves the probe identity and the aggregation logic
     knows to exclude them from rate denominators. All response /
-    latency / cost fields are zero/None — no subprocess call ran for
-    this probe.
+    latency fields are zero/empty; no subprocess call ran for this
+    probe.
     """
     return ProbeOutcome(
         probe=probe,
@@ -1447,7 +1385,6 @@ def _make_drift_outcome(probe: Probe, tags: tuple[str, ...]) -> ProbeOutcome:
         judge_reasoning="",
         memory_outcome="drift",
         latency_ms={"A": 0.0, "B": 0.0, "judge": 0.0},
-        cost_usd={"A": None, "B": None, "judge": None},
     )
 
 
@@ -1470,8 +1407,8 @@ async def _run_all_probes(
     capacity of N translates to up to N concurrent claude subprocesses;
     the second subprocess in a slot cannot start until the first has
     returned. The default cap (4) is a tradeoff between throughput and
-    Anthropic-side rate-limit headroom; operators on a tight budget
-    can drop it to 1 for fully serial execution.
+    Anthropic-side rate-limit headroom; operators can drop it to 1
+    for fully serial execution.
 
     Per-probe RNG note: each probe gets its own seeded `random.Random`
     derived from (run_seed, expected_fact_id). This keeps arm assignment
@@ -1616,7 +1553,6 @@ async def _run_all_probes(
                     judge_reasoning=f"probe execution raised: {type(e).__name__}",
                     memory_outcome="generation_error",
                     latency_ms={"A": 0.0, "B": 0.0, "judge": 0.0},
-                    cost_usd={"A": None, "B": None, "judge": None},
                 )
 
     tasks = [_run_under_semaphore(p) for p in probes]
@@ -1838,10 +1774,8 @@ def _outcome_to_per_probe_dict(outcome: ProbeOutcome, *, probe_id: int) -> dict[
         "memory_outcome": outcome.memory_outcome,
         # Round latencies to 1ms precision to keep the JSON readable;
         # sub-millisecond timing is meaningless for whole-subprocess
-        # calls anyway. cost_usd round to 6 places (sub-cent precision
-        # is what Anthropic's billing API reports).
+        # calls anyway.
         "latency_ms": {k: round(v, 1) for k, v in outcome.latency_ms.items()},
-        "cost_usd": {k: (round(v, 6) if isinstance(v, (int, float)) else None) for k, v in outcome.cost_usd.items()},
     }
 
 
@@ -2078,12 +2012,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Model for the judge call (default for claude: {_DEFAULT_JUDGE_MODEL}; codex uses MODEL_REGISTRY's BEHAVIORAL_JUDGE row).",
     )
     parser.add_argument(
-        "--judge-budget-usd",
-        type=float,
-        default=_DEFAULT_JUDGE_BUDGET_USD,
-        help=f"Max USD per judge call (default: {_DEFAULT_JUDGE_BUDGET_USD}).",
-    )
-    parser.add_argument(
         "--judge-timeout-s",
         type=int,
         default=_DEFAULT_JUDGE_TIMEOUT_S,
@@ -2094,12 +2022,6 @@ def _build_parser() -> argparse.ArgumentParser:
         # See --judge-model above for the rationale on default=None.
         default=None,
         help=f"Model for the generation arms (default for claude: {_DEFAULT_GEN_MODEL}; codex uses MODEL_REGISTRY's BEHAVIORAL_GEN row).",
-    )
-    parser.add_argument(
-        "--gen-budget-usd",
-        type=float,
-        default=_DEFAULT_GEN_BUDGET_USD,
-        help=f"Max USD per generation arm (default: {_DEFAULT_GEN_BUDGET_USD}).",
     )
     parser.add_argument(
         "--gen-timeout-s",
@@ -2318,10 +2240,8 @@ async def _run_cli(args: argparse.Namespace) -> int:
         resolved_gen_model = args.gen_model or _DEFAULT_GEN_MODEL
     config = BehavioralConfig(
         judge_model=resolved_judge_model,
-        judge_budget_usd=args.judge_budget_usd,
         judge_timeout_s=args.judge_timeout_s,
         gen_model=resolved_gen_model,
-        gen_budget_usd=args.gen_budget_usd,
         gen_timeout_s=args.gen_timeout_s,
         seed=_resolve_seed(cli_seed=args.seed, probes=probes, user_id=args.user_id),
         max_concurrency=args.max_concurrency,
@@ -2335,20 +2255,6 @@ async def _run_cli(args: argparse.Namespace) -> int:
     # claude_cli_version / codex_cli_version under the right key
     # without the caller juggling two Optional[str] arguments.
     cli_version_field, cli_version_value = _capture_agent_cli_version(eval_backend)
-
-    # Codex on subscription auth has no per-call billing surface, so
-    # the budget flags are not enforced at the subprocess level. The
-    # output JSON records cost_usd=None per call. Log once at startup
-    # so an operator who set --judge-budget-usd / --gen-budget-usd
-    # explicitly sees that the flags were not enforced; otherwise the
-    # eval would silently consume subscription quota.
-    if eval_backend == "codex":
-        print(
-            "eval: codex on subscription auth has no per-call cost surface; "
-            "--judge-budget-usd / --gen-budget-usd are not enforced and "
-            "cost_usd in the output JSON will be None.",
-            file=sys.stderr,
-        )
 
     print(
         f"Running {len(scored_probes)} probes "

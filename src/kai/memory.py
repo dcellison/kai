@@ -47,9 +47,7 @@ log = logging.getLogger(__name__)
 
 # Maximum length (chars) for the assistant portion of an ingested
 # exchange. Long tool outputs (file dumps, stack traces, large diffs)
-# would otherwise dominate the Haiku extraction payload, pushing
-# per-call token cost above the expected $0.02-$0.03 envelope
-# documented in config.memory_extraction_budget_usd. Used by
+# would otherwise dominate the Haiku extraction payload. Used by
 # memory_extraction._build_extraction_payload. The user-side
 # counterpart lives next to its sole consumer in memory_extraction.py;
 # kept here on the assistant side because moving it would be churn

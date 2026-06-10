@@ -799,7 +799,6 @@ class WorkspaceConfig:
     Attributes:
         path: Canonical resolved workspace directory.
         model: Claude model override (haiku/sonnet/opus).
-        budget: Per-session spending cap in USD.
         timeout: Per-readline timeout in seconds.
         env: Inline environment variables for the Claude subprocess.
         env_file: Path to a KEY=VALUE file to load as environment vars.
@@ -809,7 +808,6 @@ class WorkspaceConfig:
 
     path: Path
     model: str | None = None
-    budget: float | None = None
     timeout: int | None = None
     env: dict[str, str] | None = None
     env_file: Path | None = None
@@ -870,9 +868,9 @@ class UserConfig:
     Per-user configuration loaded from users.yaml.
 
     Defines a user's identity, authorization, and resource limits.
-    Preferences that the user controls (active model, working budget)
-    live in the settings table, not here. The fields below are
-    admin-set baselines that users can override within boundaries.
+    Preferences that the user controls (active model, timeout) live
+    in the settings table, not here. The fields below are admin-set
+    baselines that users can override within boundaries.
 
     Attributes:
         telegram_id: Telegram user ID (authorization key).
@@ -881,10 +879,6 @@ class UserConfig:
         github: GitHub username for webhook actor routing.
         os_user: OS username for subprocess isolation (Phase 3).
         home_workspace: Per-user home workspace directory.
-        max_budget: Default budget in USD for this user. Used as the
-            baseline when the user has not set their own via /settings
-            budget. Does NOT serve as a ceiling - the ceiling is
-            BUDGET_CEILING (global env var).
         model: Default model name (e.g., "opus", "sonnet", "haiku").
         timeout: Default timeout in seconds for Claude responses.
         workspace_base: Base directory for /workspace new and name resolution.
@@ -897,7 +891,6 @@ class UserConfig:
     github: str | None = None
     os_user: str | None = None
     home_workspace: Path | None = None
-    max_budget: float | None = None
     model: str | None = None
     timeout: int | None = None
     workspace_base: Path | None = None
@@ -960,14 +953,6 @@ class Config:
         allowed_user_ids: Set of Telegram user IDs permitted to interact with the bot (required)
         default_model: Default model name, provider-dependent (e.g. sonnet, gpt-5.5-pro, gemini-2.5-pro)
         claude_timeout_seconds: Seconds before a Claude response is considered timed out
-        budget_ceiling: Global budget ceiling in USD. Users cannot exceed
-            this via /settings budget. Also serves as the fallback default
-            for users without a per-user max_budget in users.yaml.
-            Informational only on the claude backend (Max-plan OAuth makes
-            the CLI's computed-cost ceiling a phantom signal; the
-            --max-budget-usd flag is omitted from claude --print argv).
-            Enforced on non-claude backends, which run on pay-per-token
-            billing where the ceiling is a real cost gate.
         claude_max_session_hours: Hours before the inner agent subprocess is recycled. Prevents
             unbounded V8 memory growth that can trigger macOS Jetsam kernel panics. 0 = no limit.
         session_db_path: Path to the SQLite database for sessions, jobs, and settings
@@ -1003,7 +988,6 @@ class Config:
     # resolution chain that `resolve_user_model` implements.
     default_models: dict[str, str] = field(default_factory=dict)
     claude_timeout_seconds: int = 120
-    budget_ceiling: float = 10.0
     claude_max_session_hours: float = 0  # 0 = no limit
     claude_idle_timeout: int = 1800  # seconds before idle subprocess eviction; 0 = no eviction
 
@@ -1013,7 +997,7 @@ class Config:
 
     # Effort level passed to inner Claude as `--effort <value>`. Higher
     # settings spend more reasoning tokens per turn, improving answer
-    # quality at the cost of latency and budget. Default "high" matches
+    # quality at the cost of latency. Default "high" matches
     # the operator's outer-Claude default; switching to "medium" globally
     # would silently downgrade existing reasoning quality. Critical when
     # users.yaml `os_user` is set, because inner Claude then runs as a
@@ -1079,14 +1063,6 @@ class Config:
     # a long time; the default gives thinking-heavy reviews room while
     # still terminating genuinely stuck processes.
     pr_review_timeout_s: int = 900
-    # Hard USD ceiling for one PR review subprocess. Omitted from claude
-    # --print argv on the claude backend (Max-plan OAuth makes the CLI's
-    # computed-cost ceiling a phantom signal); the field is consulted by
-    # non-claude backends, where reviews run on pay-per-token billing
-    # and the ceiling is a real cost gate. Field stays defined so
-    # operators with hand-edited /etc/kai/env from a previous install
-    # are not affected by upgrade.
-    pr_review_budget_usd: float = 1.0
     # Deprecated: review agent now resolves repos via workspace config.
     # Kept for backwards compatibility with existing .env files; the value
     # is parsed but no longer used by webhook.py.
@@ -1151,15 +1127,6 @@ class Config:
     # different model for a (role, backend) pair edits MODEL_REGISTRY
     # in code.
     memory_extraction_enabled: bool = False
-    # Per-call budget ceiling. Retained as inert compatibility config.
-    # Both supported memory reasoners (claude and codex) are
-    # subscription-backed in the operator deployment model and no code
-    # path forwards this value to subprocess argv. Runaway protection
-    # comes from memory_extraction_timeout_s instead. The field stays
-    # in the dataclass so operators upgrading from a deployment with
-    # MEMORY_EXTRACTION_BUDGET_USD already set in /etc/kai/env do not
-    # see a startup error after upgrade.
-    memory_extraction_budget_usd: float = 0.01
     # Timeout (seconds) for a single extraction subprocess. Haiku
     # typically finishes in 2-4s; 10s gives headroom without stranding
     # an executor thread on a hung subprocess.
@@ -1207,15 +1174,6 @@ class Config:
     # resolved per-user from the registry at episode-extraction time
     # via get_model_for(ModelRole.MEMORY_EPISODE, effective_backend);
     # there is no global override field.
-    # Per-call budget ceiling (USD). Retained as inert compatibility
-    # config. Same rationale as memory_extraction_budget_usd above:
-    # both supported reasoners are subscription-backed and no code
-    # path forwards this value to subprocess argv. Runaway protection
-    # comes from memory_episode_timeout_s instead. The field stays in
-    # the dataclass so operators upgrading from a deployment with
-    # MEMORY_EPISODE_BUDGET_USD already set in /etc/kai/env do not see
-    # a startup error after upgrade.
-    memory_episode_budget_usd: float = 0.15
     # Subprocess timeout (seconds). Default 120 - twice the production-
     # tuned stage-1 value (60s) and 12x the stage-1 dataclass default
     # (10s). The asymmetry is intentional: stage 2 is fire-and-forget
@@ -1567,18 +1525,11 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
                 )
                 # Don't skip - could be an open-ended provider model ID
 
-        # Validate budget (same bool guard as timeout - float(True) is 1.0)
-        budget = claude_section.get("budget")
-        if budget is not None:
-            try:
-                if isinstance(budget, bool):
-                    raise ValueError("must be a number, not a boolean")
-                budget = float(budget)
-                if budget <= 0:
-                    raise ValueError("must be positive")
-            except (TypeError, ValueError) as e:
-                log.warning("workspaces.yaml: invalid budget for %s: %s; skipping entry", path, e)
-                continue
+        # Budgets are no longer tracked; tolerate a lingering key from
+        # an older workspaces.yaml rather than failing the entry, so an
+        # un-migrated file keeps loading after upgrade.
+        if claude_section.get("budget") is not None:
+            log.warning("workspaces.yaml: 'budget' for %s is no longer supported; ignoring", path)
 
         # Validate timeout (must be a positive integer, not a float or bool).
         # bool is a subclass of int in Python, so `timeout: true` would
@@ -1638,7 +1589,6 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
         configs[path] = WorkspaceConfig(
             path=path,
             model=model,
-            budget=budget,
             timeout=timeout,
             env=env,
             env_file=env_file,
@@ -2161,18 +2111,11 @@ def _load_user_configs(
                     )
                     home_workspace = None
 
-        # Validate max_budget (same bool guard as workspace budget)
-        max_budget = entry.get("max_budget")
-        if max_budget is not None:
-            try:
-                if isinstance(max_budget, bool):
-                    raise ValueError("must be a number, not a boolean")
-                max_budget = float(max_budget)
-                if max_budget <= 0:
-                    raise ValueError("must be positive")
-            except (TypeError, ValueError) as e:
-                log.warning("users.yaml: invalid max_budget for %s: %s; skipping entry", name, e)
-                continue
+        # Budgets are no longer tracked; tolerate a lingering key from
+        # an older users.yaml rather than failing the entry, so an
+        # un-migrated file keeps loading after upgrade.
+        if entry.get("max_budget") is not None:
+            log.warning("users.yaml: 'max_budget' for %s is no longer supported; ignoring", name)
 
         # Validate optional agent_backend (must be valid if set)
         user_backend: str | None = None
@@ -2465,7 +2408,6 @@ def _load_user_configs(
             github=github,
             os_user=os_user,
             home_workspace=home_workspace,
-            max_budget=max_budget,
             model=model,
             timeout=user_timeout,
             workspace_base=user_workspace_base,
@@ -2608,17 +2550,6 @@ def load_config() -> Config:
         claude_timeout_seconds = int(raw_timeout)
     except ValueError:
         raise SystemExit("AGENT_TIMEOUT_SECONDS must be an integer") from None
-    # Budget ceiling: new var takes precedence, fall back to old var
-    # for backward compat on upgrade (existing .env has old key name).
-    raw_ceiling = os.environ.get("BUDGET_CEILING", "").strip()
-    if not raw_ceiling:
-        raw_ceiling = os.environ.get("CLAUDE_MAX_BUDGET_USD", "").strip()
-    if not raw_ceiling:
-        raw_ceiling = "10.0"
-    try:
-        budget_ceiling = float(raw_ceiling)
-    except ValueError:
-        raise SystemExit("BUDGET_CEILING must be a number") from None
     # AGENT_MAX_SESSION_HOURS / AGENT_IDLE_TIMEOUT are the canonical
     # keys; the CLAUDE_-prefixed forms are legacy aliases kept for
     # installs upgrading without re-running the wizard. Apply-time
@@ -2684,7 +2615,7 @@ def load_config() -> Config:
 
     # PR review agent config. The global `pr_review` toggle now lives
     # per-user in users.yaml; PR_REVIEW_COOLDOWN / PR_REVIEW_TIMEOUT_S
-    # / PR_REVIEW_BUDGET_USD remain as global resource controls.
+    # remain as global resource controls.
     try:
         pr_review_cooldown = int(os.environ.get("PR_REVIEW_COOLDOWN", "300"))
     except ValueError:
@@ -2695,12 +2626,6 @@ def load_config() -> Config:
             raise SystemExit("PR_REVIEW_TIMEOUT_S must be a positive integer")
     except ValueError:
         raise SystemExit("PR_REVIEW_TIMEOUT_S must be an integer") from None
-    try:
-        pr_review_budget_usd = float(os.environ.get("PR_REVIEW_BUDGET_USD", "1.0"))
-        if pr_review_budget_usd <= 0:
-            raise SystemExit("PR_REVIEW_BUDGET_USD must be a positive number")
-    except ValueError:
-        raise SystemExit("PR_REVIEW_BUDGET_USD must be a number") from None
 
     try:
         totp_session_minutes = int(os.environ.get("TOTP_SESSION_MINUTES", "30"))
@@ -2776,9 +2701,9 @@ def load_config() -> Config:
     # dataclass docstring documents this dependency, but without
     # parse-time enforcement the extraction subprocess fires when
     # MEMORY_EXTRACTION_ENABLED=true is set with MEMORY_ENABLED=false,
-    # burning ~$0.01/turn of Haiku budget whose result silently no-ops
-    # in the `_memory is None` guard inside add_structured. Compose
-    # here so the dependency is explicit and the budget-burn hole is
+    # spawning a per-turn Haiku call whose result silently no-ops in
+    # the `_memory is None` guard inside add_structured. Compose here
+    # so the dependency is explicit and the wasted-subprocess hole is
     # closed regardless of operator env-var ordering.
     memory_extraction_enabled = memory_extraction_enabled and memory_enabled
 
@@ -2823,12 +2748,6 @@ def load_config() -> Config:
             )
 
     try:
-        memory_extraction_budget_usd = float(os.environ.get("MEMORY_EXTRACTION_BUDGET_USD", "0.01"))
-        if memory_extraction_budget_usd < 0:
-            raise SystemExit("MEMORY_EXTRACTION_BUDGET_USD must be non-negative")
-    except ValueError:
-        raise SystemExit("MEMORY_EXTRACTION_BUDGET_USD must be a number") from None
-    try:
         memory_extraction_timeout_s = int(os.environ.get("MEMORY_EXTRACTION_TIMEOUT_S", "10"))
         if memory_extraction_timeout_s <= 0:
             raise SystemExit("MEMORY_EXTRACTION_TIMEOUT_S must be a positive integer")
@@ -2865,16 +2784,8 @@ def load_config() -> Config:
     # extraction time (memory_extraction._resolve_episode_model uses
     # get_model_for(ModelRole.MEMORY_EPISODE, effective_backend)); the
     # global MEMORY_EPISODE_MODEL env var is deprecated and warned
-    # about above. Budget is strictly positive (zero would silently
-    # disable a real subprocess; the intentional kill switch is
-    # MEMORY_ENABLED). Timeout floor is 10s to prevent accidentally
+    # about above. Timeout floor is 10s to prevent accidentally
     # tightening it below Haiku's warm-up time.
-    try:
-        memory_episode_budget_usd = float(os.environ.get("MEMORY_EPISODE_BUDGET_USD", "0.15"))
-        if memory_episode_budget_usd <= 0:
-            raise SystemExit("MEMORY_EPISODE_BUDGET_USD must be positive")
-    except ValueError:
-        raise SystemExit("MEMORY_EPISODE_BUDGET_USD must be a number") from None
     try:
         memory_episode_timeout_s = int(os.environ.get("MEMORY_EPISODE_TIMEOUT_S", "120"))
         if memory_episode_timeout_s < 10:
@@ -3007,7 +2918,6 @@ def load_config() -> Config:
     # not legacy renames; the runtime no longer reads them at all and
     # the corresponding wizard prompts have been retired.
     _renamed_env_vars = {
-        "CLAUDE_MAX_BUDGET_USD": "BUDGET_CEILING (global ceiling). Per-user defaults go in users.yaml 'max_budget'.",
         "CLAUDE_TIMEOUT_SECONDS": "AGENT_TIMEOUT_SECONDS.",
         "CLAUDE_MAX_SESSION_HOURS": "AGENT_MAX_SESSION_HOURS.",
         "CLAUDE_IDLE_TIMEOUT": "AGENT_IDLE_TIMEOUT.",
@@ -3023,12 +2933,23 @@ def load_config() -> Config:
     # Retired env vars: the setting no longer exists, so unlike the
     # renames above there is no replacement key to point at. Warn so
     # the operator knows the lingering value has no effect; the wizard
-    # drops the key on the next regenerate.
-    if os.environ.get("CLAUDE_MAX_CONTEXT_WINDOW", "").strip():
-        log.warning(
-            "CLAUDE_MAX_CONTEXT_WINDOW is no longer supported; the agent CLI's default "
-            "context window applies. Re-run 'make config' to clean /etc/kai/env."
-        )
+    # drops the key on the next regenerate. The reason clause finishes
+    # the sentence "<KEY> is no longer supported; ...".
+    _retired_env_vars = {
+        "CLAUDE_MAX_CONTEXT_WINDOW": "the agent CLI's default context window applies",
+        "BUDGET_CEILING": "budgets are no longer tracked",
+        "CLAUDE_MAX_BUDGET_USD": "budgets are no longer tracked",
+        "PR_REVIEW_BUDGET_USD": "budgets are no longer tracked",
+        "MEMORY_EXTRACTION_BUDGET_USD": "budgets are no longer tracked",
+        "MEMORY_EPISODE_BUDGET_USD": "budgets are no longer tracked",
+    }
+    for var, reason in _retired_env_vars.items():
+        if os.environ.get(var, "").strip():
+            log.warning(
+                "%s is no longer supported; %s. Re-run 'make config' to clean /etc/kai/env.",
+                var,
+                reason,
+            )
 
     # Warn when GitHub features are configured but no user has a
     # repo list. Events will never reach the agents because
@@ -3117,7 +3038,6 @@ def load_config() -> Config:
         default_model=default_model,
         default_models=default_models,
         claude_timeout_seconds=claude_timeout_seconds,
-        budget_ceiling=budget_ceiling,
         claude_max_session_hours=claude_max_session_hours,
         claude_idle_timeout=claude_idle_timeout,
         claude_autocompact_pct=claude_autocompact_pct,
@@ -3133,7 +3053,6 @@ def load_config() -> Config:
         memory_projects=memory_projects,
         pr_review_cooldown=pr_review_cooldown,
         pr_review_timeout_s=pr_review_timeout_s,
-        pr_review_budget_usd=pr_review_budget_usd,
         github_repo=os.getenv("GITHUB_REPO", ""),
         spec_dir=os.getenv("SPEC_DIR", "specs"),
         file_retention_days=file_retention_days,
@@ -3150,11 +3069,9 @@ def load_config() -> Config:
         memory_embedding_model=memory_embedding_model,
         memory_extraction_enabled=memory_extraction_enabled,
         memory_recall_shadow_enabled=memory_recall_shadow_enabled,
-        memory_extraction_budget_usd=memory_extraction_budget_usd,
         memory_extraction_timeout_s=memory_extraction_timeout_s,
         episode_classifier_context_turns=episode_classifier_context_turns,
         memory_consolidation_candidates_n=memory_consolidation_candidates_n,
-        memory_episode_budget_usd=memory_episode_budget_usd,
         memory_episode_timeout_s=memory_episode_timeout_s,
         memory_search_floor=memory_search_floor,
         memory_duplicate_threshold=memory_duplicate_threshold,

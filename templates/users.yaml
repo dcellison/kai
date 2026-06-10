@@ -28,13 +28,6 @@ users:
     # Inherits the global WORKSPACE_BASE installation default if unset.
     # workspace_base: ~/projects
 
-    # max_budget serves double duty: it is the user's default budget
-    # AND the ceiling they cannot exceed via /settings budget. The
-    # global BUDGET_CEILING is the hard upper bound; /settings
-    # enforces it. If max_budget is unset, the user falls back to
-    # BUDGET_CEILING as their baseline.
-    max_budget: 20.0
-
     # Optional per-user defaults. Users can override these at runtime
     # via /settings. Omitted fields inherit installation defaults
     # (DEFAULT_MODEL, AGENT_TIMEOUT_SECONDS).

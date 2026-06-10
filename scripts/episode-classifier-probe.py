@@ -5,8 +5,8 @@ Episode-classifier probe (issue #392).
 Spawns `claude --print` with the production stage-1 extractor flags and
 drives a small labeled corpus through the windowed payload builder.
 For each labeled case prints per-case `has_episode`, `facts_count`,
-`cost_usd`, and the input payload size, plus a final pass/fail summary
-against the expected `has_episode` labels.
+and the input payload size, plus a final pass/fail summary against
+the expected `has_episode` labels.
 
 This is the manual-verification gate referenced by issue #392's
 acceptance criterion: a post-merge run reproduces the (true, false)
@@ -29,10 +29,8 @@ from `kai.memory_extraction` so the probe uses the same prompt + schema
 between probe and production should fail loudly here rather than
 silently masking real classifier behavior.
 
-Cost: at the default 2-case corpus and Haiku-rate billing, well under
-$0.01 per run on pay-per-token billing. On Max-plan OAuth (the only
-deployment posture for the claude backend after #390), the run is
-unbilled. Operators can iterate on the corpus and prompt freely.
+The run is unbilled under the subscription-auth deployment posture;
+operators can iterate on the corpus and prompt freely.
 """
 
 from __future__ import annotations
@@ -157,13 +155,12 @@ _LABELED_CORPUS: list[_LabeledCase] = [
 async def _run_one(case: _LabeledCase, model: str, prior_turns: int, timeout_s: int) -> dict:
     """
     Spawn one extraction subprocess for the labeled case and return a
-    per-case result dict. The dict is the merged shape of the CLI
-    envelope's relevant fields (`cost_usd`) and the parsed extractor
-    output (`has_episode`, `facts` list).
+    per-case result dict. The dict carries the parsed extractor
+    output (`has_episode`, `facts` list) plus payload metadata.
 
     Mirrors the production stage-1 invocation in
-    `kai.memory_extraction._run_extractor` (no --max-budget-usd per
-    #390; allow-listed env per the original sandboxing rationale;
+    `kai.memory_extraction._run_extractor` (no cost cap on argv;
+    allow-listed env per the original sandboxing rationale;
     `asyncio.wait_for` around `proc.communicate` so a hung Haiku call
     surfaces as an explicit error rather than freezing the operator's
     terminal). The probe diverges from production only by reading the
@@ -267,7 +264,6 @@ async def _run_one(case: _LabeledCase, model: str, prior_turns: int, timeout_s: 
         "case": case.name,
         "has_episode": parsed.get("has_episode"),
         "facts_count": len(parsed.get("facts", [])),
-        "cost_usd": envelope.get("total_cost_usd") or envelope.get("cost_usd"),
         "payload_size": len(payload_bytes),
         "expected_has_episode": case.expected_has_episode,
     }
@@ -317,7 +313,6 @@ async def _main() -> int:
         status = "PASS" if actual == expected else "FAIL"
         print(f"  has_episode={actual}  expected={expected}  [{status}]")
         print(f"  facts_count={result['facts_count']}")
-        print(f"  cost_usd={result.get('cost_usd')}")
         print(f"  payload_size={result['payload_size']} bytes")
         print()
 

@@ -568,7 +568,6 @@ class TestStreamParsing:
         assert events[2].response is not None
         assert events[2].response.success is True
         assert events[2].response.text == "Hello world"
-        assert events[2].response.cost_usd == 0.0
 
     @pytest.mark.asyncio
     async def test_multi_agent_message_items_join_with_blank_line(self):
@@ -755,7 +754,6 @@ class TestCompletion:
         assert final.response.success is True
         assert final.response.text == "answer"
         assert final.response.session_id == "test-session"
-        assert final.response.cost_usd == 0.0
 
     @pytest.mark.asyncio
     async def test_eof_with_accumulated_text(self):

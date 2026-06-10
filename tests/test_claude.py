@@ -36,7 +36,6 @@ def _make_claude(**kwargs) -> ClaudeCodeBackend:
     defaults = {
         "model": "sonnet",
         "workspace": Path("/tmp/test-workspace"),
-        "max_budget_usd": 1.0,
         "timeout_seconds": 30,
     }
     defaults.update(kwargs)
@@ -96,7 +95,6 @@ def _result_event(
     text: str = "Final",
     is_error: bool = False,
     session_id: str = "sess-123",
-    cost: float = 0.05,
     duration: int = 1500,
 ) -> bytes:
     """Build a result event JSON line."""
@@ -106,7 +104,6 @@ def _result_event(
             "result": text,
             "is_error": is_error,
             "session_id": session_id,
-            "total_cost_usd": cost,
             "duration_ms": duration,
         }
     )
@@ -491,44 +488,6 @@ class TestCommandConstruction:
             assert "--effort" in cmd
             idx = cmd.index("--effort")
             assert cmd[idx + 1] == "xhigh"
-
-    @pytest.mark.asyncio
-    async def test_max_budget_usd_flag_absent_on_claude_backend(self):
-        """--max-budget-usd must NOT be emitted to the inner Claude
-        argv (issue #390). ClaudeCodeBackend is only instantiated for
-        the claude backend (pool.py selects between ClaudeCodeBackend
-        and GooseBackend by agent_backend), so the absence is
-        unconditional at this site. Max-plan OAuth makes the CLI's
-        computed-cost ceiling a phantom signal; runaway protection
-        comes from timeout_seconds at the per-message wait_for() call.
-        The max_budget_usd attribute on the instance stays so
-        /settings budget can read it back, but the value no longer
-        reaches the subprocess argv. Pinned as an absence assertion
-        so a future regression that re-adds the flag fails here.
-        """
-        # Construct with a non-default max_budget_usd so the assertion
-        # would catch a regression that simply forgot to remove the
-        # argv pair (rather than a regression that emits the dataclass
-        # default 1.0). Using an obviously-non-default 7.0 makes the
-        # intent legible at the call site.
-        claude = _make_claude(max_budget_usd=7.0)
-        assert claude.max_budget_usd == 7.0  # constructor wired it through
-
-        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
-            mock_proc = MagicMock()
-            mock_proc.returncode = None
-            mock_proc.stderr = AsyncMock()
-            mock_exec.return_value = mock_proc
-
-            await claude._ensure_started()
-
-            cmd = mock_exec.call_args[0]
-            assert "--max-budget-usd" not in cmd
-            # The numeric value also must not slip into argv as a
-            # bare positional. Belt-and-suspenders: covers a regression
-            # that drops the flag name but accidentally leaves the
-            # value behind in the list.
-            assert "7.0" not in cmd
 
 
 # ── Process signal handling ──────────────────────────────────────────
@@ -1116,7 +1075,7 @@ class TestSendLockedBasic:
             [
                 _system_event(),
                 _assistant_event("Hello"),
-                _result_event("Hello", cost=0.05, duration=1500),
+                _result_event("Hello", duration=1500),
                 b"",
             ]
         )
@@ -1130,7 +1089,6 @@ class TestSendLockedBasic:
         assert done_event.done is True
         assert done_event.response is not None
         assert done_event.response.success is True
-        assert done_event.response.cost_usd == 0.05
         assert done_event.response.duration_ms == 1500
         assert done_event.response.session_id == "sess-123"
 
@@ -3491,57 +3449,52 @@ class TestRestart:
 
 class TestWorkspaceConfig:
     def test_constructor_with_workspace_config(self):
-        """WorkspaceConfig overrides model, budget, and timeout."""
+        """WorkspaceConfig overrides model and timeout."""
         ws_config = WorkspaceConfig(
             path=Path("/tmp/ws"),
             model="opus",
-            budget=15.0,
             timeout=300,
         )
         claude = _make_claude(workspace_config=ws_config)
         assert claude.model == "opus"
-        assert claude.max_budget_usd == 15.0
         assert claude.timeout_seconds == 300
 
     def test_constructor_without_workspace_config(self):
         """Without config, global defaults are used."""
         claude = _make_claude()
         assert claude.model == "sonnet"
-        assert claude.max_budget_usd == 1.0
         assert claude.timeout_seconds == 30
 
     def test_constructor_partial_workspace_config(self):
-        """Config with only model set leaves budget and timeout at defaults."""
+        """Config with only model set leaves timeout at the default."""
         ws_config = WorkspaceConfig(path=Path("/tmp/ws"), model="haiku")
         claude = _make_claude(workspace_config=ws_config)
         assert claude.model == "haiku"
-        assert claude.max_budget_usd == 1.0  # unchanged
         assert claude.timeout_seconds == 30  # unchanged
 
     def test_defaults_preserved(self):
         """Constructor stores the original global defaults."""
-        ws_config = WorkspaceConfig(path=Path("/tmp/ws"), model="opus", budget=20.0)
+        ws_config = WorkspaceConfig(path=Path("/tmp/ws"), model="opus", timeout=300)
         claude = _make_claude(workspace_config=ws_config)
         assert claude._default_model == "sonnet"
-        assert claude._default_budget == 1.0
         assert claude._default_timeout == 30
 
     @pytest.mark.asyncio
     async def test_change_workspace_with_config(self):
         """Switching to a configured workspace applies overrides."""
         claude = _make_claude()
-        ws_config = WorkspaceConfig(path=Path("/tmp/ws2"), model="opus", budget=20.0)
+        ws_config = WorkspaceConfig(path=Path("/tmp/ws2"), model="opus", timeout=300)
 
         with patch.object(claude, "_kill", new_callable=AsyncMock):
             await claude.change_workspace(Path("/tmp/ws2"), workspace_config=ws_config)
 
         assert claude.model == "opus"
-        assert claude.max_budget_usd == 20.0
+        assert claude.timeout_seconds == 300
 
     @pytest.mark.asyncio
     async def test_change_workspace_to_unconfigured(self):
         """Switching from configured to unconfigured reverts to global defaults."""
-        ws_config = WorkspaceConfig(path=Path("/tmp/ws"), model="opus", budget=20.0)
+        ws_config = WorkspaceConfig(path=Path("/tmp/ws"), model="opus", timeout=300)
         claude = _make_claude(workspace_config=ws_config)
         assert claude.model == "opus"
 
@@ -3549,17 +3502,17 @@ class TestWorkspaceConfig:
             await claude.change_workspace(Path("/tmp/other"))
 
         assert claude.model == "sonnet"  # reverted to default
-        assert claude.max_budget_usd == 1.0  # reverted to default
+        assert claude.timeout_seconds == 30  # reverted to default
 
     @pytest.mark.asyncio
     async def test_change_workspace_no_stale_values(self):
         """Partial config doesn't carry over values from previous workspace.
 
-        Scenario: workspace A has budget=20.0. Switch to workspace B
-        which only sets model. Budget must revert to the global default,
-        not carry over workspace A's 20.0.
+        Scenario: workspace A has timeout=300. Switch to workspace B
+        which only sets model. Timeout must revert to the global
+        default, not carry over workspace A's 300.
         """
-        ws_a = WorkspaceConfig(path=Path("/tmp/a"), model="opus", budget=20.0)
+        ws_a = WorkspaceConfig(path=Path("/tmp/a"), model="opus", timeout=300)
         ws_b = WorkspaceConfig(path=Path("/tmp/b"), model="haiku")
         claude = _make_claude(workspace_config=ws_a)
 
@@ -3567,7 +3520,7 @@ class TestWorkspaceConfig:
             await claude.change_workspace(Path("/tmp/b"), workspace_config=ws_b)
 
         assert claude.model == "haiku"
-        assert claude.max_budget_usd == 1.0  # global default, not 20.0
+        assert claude.timeout_seconds == 30  # global default, not 300
 
     @pytest.mark.asyncio
     async def test_change_workspace_model_override_cycle(self):

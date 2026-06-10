@@ -1,24 +1,18 @@
 """
 Tests for error-recovery UX (issue #326).
 
-Three layers of behavior change:
+Two layers of behavior:
 
 1. claude.py: when the CLI emits an `is_error=true` event with an
-   empty `result` field, the actual reason now comes from the
-   `errors` field (where BUDGET_CEILING exhaustion places it). Falls
-   back to a non-None sentinel string when both are empty so the
-   downstream "Error: None" surface can never recur.
+   empty `result` field, the actual reason comes from the `errors`
+   field. Falls back to a non-None sentinel string when both are
+   empty so the downstream "Error: None" surface can never recur.
 
 2. bot.py: error rendering APPENDS a follow-up message instead of
    OVERWRITING the live streamed message. Pre-#326 the error edit
    erased any tool-use, partial reasoning, and intermediate output
    the user was watching - on long sessions, minutes of visible
    work disappearing into a single error line.
-
-3. bot.py: budget-exhaustion errors send a recovery directive as a
-   second follow-up message ("Type /new to start fresh, or ask your
-   operator to raise BUDGET_CEILING"). Other error types fall
-   through with no extra guidance for v1.
 """
 
 from __future__ import annotations
@@ -31,7 +25,6 @@ import pytest
 
 from kai import bot
 from kai.backend import AgentResponse, StreamEvent
-from kai.bot import _budget_recovery_hint, _is_budget_exhaustion
 from kai.claude import ClaudeCodeBackend
 
 # ── claude.py error-event handling ──────────────────────────────────
@@ -44,7 +37,6 @@ def _make_claude(**kwargs) -> ClaudeCodeBackend:
     defaults = {
         "model": "sonnet",
         "workspace": Path("/tmp/test-workspace"),
-        "max_budget_usd": 1.0,
         "timeout_seconds": 30,
     }
     defaults.update(kwargs)
@@ -83,26 +75,25 @@ def _system_event(session_id: str = "sess-326") -> bytes:
 class TestClaudeErrorPopulation:
     """The CLI's `is_error=true` events come in two shapes (per #326):
     (a) `result` populated with a human-readable reason, (b) `result`
-    empty BUT `errors` populated with a list of strings (the
-    BUDGET_CEILING variant). Pre-#326 only shape (a) produced a
-    non-None error string; shape (b) silently fell through to None
-    and rendered as the literal "Error: None" in chat. The fix reads
-    `errors` when `result` is empty, with a sentinel fallback for the
-    pathological case where both fields are absent."""
+    empty BUT `errors` populated with a list of strings. Pre-#326
+    only shape (a) produced a non-None error string; shape (b)
+    silently fell through to None and rendered as the literal
+    "Error: None" in chat. The fix reads `errors` when `result` is
+    empty, with a sentinel fallback for the pathological case where
+    both fields are absent."""
 
     @pytest.mark.asyncio
     async def test_errors_field_populates_response_error_when_result_empty(self):
-        """The BUDGET_CEILING variant: result is empty, errors carries
-        the reason. AgentResponse.error must reflect the errors-field
-        content, not None."""
+        """Shape (b): result is empty, errors carries the reason.
+        AgentResponse.error must reflect the errors-field content,
+        not None."""
         result_event = _json_line(
             {
                 "type": "result",
                 "result": "",
                 "is_error": True,
-                "errors": ["Reached maximum budget ($10)"],
+                "errors": ["API connection lost"],
                 "session_id": "sess-326",
-                "total_cost_usd": 10.103919,
                 "duration_ms": 90000,
             }
         )
@@ -116,7 +107,7 @@ class TestClaudeErrorPopulation:
         response = done[0].response
         assert response is not None
         assert response.success is False
-        assert response.error == "Reached maximum budget ($10)"
+        assert response.error == "API connection lost"
 
     @pytest.mark.asyncio
     async def test_empty_result_and_empty_errors_falls_back_to_sentinel(self):
@@ -130,7 +121,6 @@ class TestClaudeErrorPopulation:
                 "result": "",
                 "is_error": True,
                 "session_id": "sess-326",
-                "total_cost_usd": 0.0,
                 "duration_ms": 100,
             }
         )
@@ -164,7 +154,6 @@ class TestClaudeErrorPopulation:
                 "is_error": True,
                 "errors": ["should-be-ignored"],
                 "session_id": "sess-326",
-                "total_cost_usd": 0.05,
                 "duration_ms": 1500,
             }
         )
@@ -178,76 +167,14 @@ class TestClaudeErrorPopulation:
         assert response.error == "Model self-reported error"
 
 
-# ── budget detection helpers ────────────────────────────────────────
-
-
-class TestBudgetDetection:
-    """`_is_budget_exhaustion` and `_budget_recovery_hint` are pure
-    helpers, easiest to verify directly. The bot.py message-lifecycle
-    integration exercises them through the response handler in the
-    next class."""
-
-    def test_is_budget_exhaustion_matches_canonical_phrasing(self):
-        """The CLI's documented error text includes 'maximum budget'.
-        Substring match is case-insensitive and tolerant of dollar
-        amount variation."""
-        assert _is_budget_exhaustion("Reached maximum budget ($10)") is True
-        assert _is_budget_exhaustion("Reached maximum budget ($25.50)") is True
-        # Case-insensitive: a future CLI capitalization tweak still matches.
-        assert _is_budget_exhaustion("REACHED MAXIMUM BUDGET ($10)") is True
-
-    def test_is_budget_exhaustion_rejects_non_matches(self):
-        """Auth failures, network errors, generic strings, and
-        None/empty all return False - the directive should NOT fire
-        for these."""
-        assert _is_budget_exhaustion("Authentication failed") is False
-        assert _is_budget_exhaustion("Connection refused") is False
-        assert _is_budget_exhaustion("no error detail provided") is False
-        assert _is_budget_exhaustion(None) is False
-        assert _is_budget_exhaustion("") is False
-
-    def test_budget_recovery_hint_includes_dollar_amount_when_extractable(self):
-        """The hint inlines the actual ceiling so the user sees the
-        number they hit, not a generic placeholder."""
-        hint = _budget_recovery_hint("Reached maximum budget ($10)")
-        assert "$10" in hint
-        assert "/new" in hint
-        assert "BUDGET_CEILING" in hint
-
-        hint_2 = _budget_recovery_hint("Reached maximum budget ($25.50)")
-        assert "$25.50" in hint_2
-
-    def test_budget_recovery_hint_falls_back_when_amount_unparseable(self):
-        """If the CLI ever emits the budget phrasing without a dollar
-        amount in parens (or with a different format), the hint
-        gracefully drops the amount rather than failing or rendering
-        a malformed string."""
-        hint = _budget_recovery_hint("Reached maximum budget")
-        # No $ amount in the output, but the directive is still useful
-        assert "/new" in hint
-        assert "BUDGET_CEILING" in hint
-        # No "$N" leakage from the template
-        assert "{amount}" not in hint
-        assert "$" not in hint
-
-    def test_budget_recovery_hint_tolerates_none(self):
-        """Defensive: hint should not crash on None input, since the
-        caller's contract relies on this being safe even on
-        unexpected error-string shapes."""
-        hint = _budget_recovery_hint(None)
-        assert "/new" in hint
-        assert "BUDGET_CEILING" in hint
-
-
 # ── bot.py error message lifecycle ──────────────────────────────────
 
 
 class TestErrorMessageLifecycle:
     """End-to-end behavior of `_handle_response` when the stream ends
-    in an error: append (don't overwrite), no "Error: None", budget
-    errors get the directive, non-budget errors don't.
+    in an error: append (don't overwrite), no "Error: None".
 
-    All five tests stream a text event BEFORE the terminal error so
+    All tests stream a text event BEFORE the terminal error so
     `_handle_response` actually creates a live_msg via the streaming
     loop. Without that, the live_msg branch in the error path is
     never exercised and the overwrite-not-called assertion is
@@ -256,7 +183,7 @@ class TestErrorMessageLifecycle:
     internal `reply_text` call, so a future refactor of `_reply_safe`
     cannot silently void these tests."""
 
-    def _make_pool_text_then_error(self, error_text: str | None = "Reached maximum budget ($10)"):
+    def _make_pool_text_then_error(self, error_text: str | None = "API connection lost"):
         """Mock pool whose .send() yields a text event followed by a
         done StreamEvent with the given error string. The text event
         triggers live_msg creation in the streaming loop, so the
@@ -274,7 +201,6 @@ class TestErrorMessageLifecycle:
                     text="streamed work",
                     success=False,
                     error=error_text,
-                    cost_usd=10.10,
                     duration_ms=90000,
                     session_id="sess-326",
                 ),
@@ -326,7 +252,7 @@ class TestErrorMessageLifecycle:
         rendering AND _reply_safe IS invoked with an error notice."""
         update, live_msg = self._make_update_with_live_msg()
         ctx = self._make_context()
-        pool = self._make_pool_text_then_error("Reached maximum budget ($10)")
+        pool = self._make_pool_text_then_error("API connection lost")
 
         with (
             patch("kai.bot.log_message"),
@@ -364,56 +290,23 @@ class TestErrorMessageLifecycle:
     @staticmethod
     def _error_path_calls(mock_reply_safe) -> list:
         """Filter `_reply_safe` calls to those carrying an error
-        notice or budget directive, separating them from the
-        streaming-loop's live_msg-creation call (which uses the same
-        wrapper to send the initial text chunk). Error-path calls
-        are identified by the "Error: " prefix or the presence of
-        BUDGET_CEILING in the directive - both of which the
-        streaming text would never legitimately contain."""
+        notice, separating them from the streaming-loop's
+        live_msg-creation call (which uses the same wrapper to send
+        the initial text chunk). Error-path calls are identified by
+        the "Error: " prefix, which the streaming text would never
+        legitimately contain."""
         out = []
         for call in mock_reply_safe.await_args_list:
             text = call.args[1] if len(call.args) > 1 else ""
-            if text.startswith("Error: ") or "BUDGET_CEILING" in text:
+            if text.startswith("Error: "):
                 out.append(call)
         return out
 
     @pytest.mark.asyncio
-    async def test_budget_error_sends_two_messages(self):
-        """Budget-exhaustion: error notice + recovery directive,
-        sent as two separate _reply_safe calls (in addition to the
-        streaming loop's live_msg-creation call)."""
-        update, _live_msg = self._make_update_with_live_msg()
-        ctx = self._make_context()
-        pool = self._make_pool_text_then_error("Reached maximum budget ($10)")
-
-        with (
-            patch("kai.bot.log_message"),
-            patch("kai.bot.sessions"),
-            patch("kai.bot._edit_message_safe", new_callable=AsyncMock),
-            patch("kai.bot._reply_safe", new_callable=AsyncMock) as mock_reply_safe,
-        ):
-            await bot._handle_response(update, ctx, chat_id=12345, prompt="hi", pool=pool, model="sonnet")
-
-        # Filter to error-path calls so the streaming-loop's
-        # live_msg-creation call (which also goes through _reply_safe)
-        # does not pollute the count. Patching _reply_safe directly
-        # (rather than asserting on the inner reply_text) keeps this
-        # test stable against future _reply_safe internal changes.
-        error_calls = self._error_path_calls(mock_reply_safe)
-        assert len(error_calls) == 2
-        first_text = error_calls[0].args[1]
-        second_text = error_calls[1].args[1]
-        assert first_text == "Error: Reached maximum budget ($10)"
-        assert "$10" in second_text
-        assert "/new" in second_text
-        assert "BUDGET_CEILING" in second_text
-
-    @pytest.mark.asyncio
-    async def test_non_budget_error_sends_one_message(self):
-        """Generic errors (auth failures, transport errors, etc.)
-        get just the error notice; no directive. Structure leaves
-        room for additional error-class directives if recurring
-        patterns emerge."""
+    async def test_error_sends_exactly_one_message(self):
+        """An error produces exactly one error notice (in addition to
+        the streaming loop's live_msg-creation call); no extra
+        directive messages follow it."""
         update, _live_msg = self._make_update_with_live_msg()
         ctx = self._make_context()
         pool = self._make_pool_text_then_error("Authentication failed")
@@ -478,7 +371,7 @@ class TestErrorMessageLifecycle:
         debuggability."""
         update, _live_msg = self._make_update_with_live_msg()
         ctx = self._make_context()
-        pool = self._make_pool_text_then_error("Reached maximum budget ($10)")
+        pool = self._make_pool_text_then_error("API connection lost")
 
         captured_log: list[str] = []
 
@@ -500,6 +393,6 @@ class TestErrorMessageLifecycle:
         error_calls = self._error_path_calls(mock_reply_safe)
         assert len(error_calls) >= 1
         chat_error = error_calls[0].args[1]
-        assert "Reached maximum budget ($10)" in chat_error
+        assert "API connection lost" in chat_error
         # Synthetic history entry uses the same reason string.
-        assert any("Reached maximum budget ($10)" in t for t in captured_log)
+        assert any("API connection lost" in t for t in captured_log)

@@ -1966,19 +1966,11 @@ async def _run_extractor(
       disable all tools`). The extractor only reads stdin and writes JSON.
     - --no-session-persistence keeps ~/.claude/projects/ from growing a
       directory per extraction.
-    - NO --max-budget-usd on the claude backend. The flag enforces a
-      computed-cost ceiling that has no relation to actual billing under
-      Max-plan OAuth (the CLI tracks token rates whether or not money is
-      charged), so terminating a subprocess at the configured ceiling
-      would just stop work that is not costing anything. Runaway-loop
-      protection comes from `memory_extraction_timeout_s` (passed to
-      `asyncio.wait_for` below), which is sufficient: a stuck or
-      recursive extractor cannot hold the executor longer than the
-      timeout, regardless of how many tokens it has notionally generated.
-      The `memory_extraction_budget_usd` Config field stays defined as
-      inert compatibility config: both supported reasoners (claude and
-      codex) are subscription-backed in the operator deployment model
-      and no code path forwards the value to subprocess argv.
+    - No cost cap is passed: subscription auth has no real per-token
+      cost. Runaway-loop protection comes from
+      `memory_extraction_timeout_s` (passed to `asyncio.wait_for`
+      below), which is sufficient: a stuck or recursive extractor
+      cannot hold the executor longer than the timeout.
     - --permission-mode bypassPermissions is acceptable because
       --tools "" leaves nothing to permit or deny.
 
@@ -2068,9 +2060,9 @@ async def _run_extractor(
     if not isinstance(parsed, dict):
         log.warning("Memory extraction returned non-object JSON: %r", parsed)
         return ExtractionResult(facts=[], has_episode=False)
-    # Defense-in-depth: the CLI can exit 0 with is_error=true when a
-    # retry loop burns the budget but the envelope still parses. Treat
-    # that as extraction failure, not silent success with partial data.
+    # Defense-in-depth: the CLI can exit 0 with is_error=true while the
+    # envelope still parses. Treat that as extraction failure, not
+    # silent success with partial data.
     if parsed.get("is_error") is True:
         log.warning(
             "Memory extraction CLI envelope reports is_error=true (subtype=%s)",
@@ -2117,7 +2109,6 @@ def _emit_episode_log(
     user_id: str,
     outcome: str,
     memory_id: str | None,
-    cost_usd: float,
     duration_ms: int,
     reason: str | None,
 ) -> None:
@@ -2129,10 +2120,8 @@ def _emit_episode_log(
     per-recall `memory.recall` patterns. Compact JSON separators so
     downstream parsers see one wire format across the memory subsystem.
 
-    `cost_usd` and `duration_ms` are always populated for budget tracking
-    parity with stage 1's _emit_intent_log; on the timeout path cost is
-    0.0 because the subprocess was killed before it returned a billed
-    envelope.
+    `duration_ms` is always populated; on the timeout path it reflects
+    the elapsed time up to the kill.
 
     `memory_id` and `reason` are presence-symmetric: each is included
     only when it carries information. `memory_id` appears only on the
@@ -2152,7 +2141,6 @@ def _emit_episode_log(
     payload: dict = {
         "user_id": user_id,
         "outcome": outcome,
-        "cost_usd": cost_usd,
         "duration_ms": duration_ms,
     }
     if memory_id is not None:
@@ -2195,11 +2183,9 @@ async def _run_episode_extractor(
     """
     Spawn `claude --print` with the episode-generator prompt and parse.
 
-    Returns a triple `(episode, cost_usd, reason)` where:
+    Returns a pair `(episode, reason)` where:
     - `episode` is the validated episode dict on success, or None on any
       failure path.
-    - `cost_usd` is the CLI envelope's `total_cost_usd` (0.0 on timeout
-      because the envelope never returned).
     - `reason` is a short failure tag for telemetry on non-success paths
       (`timeout`, `subprocess_error`, `parse_error`); None on success.
 
@@ -2210,9 +2196,9 @@ async def _run_episode_extractor(
     and system prompt - the env allowlist, sandboxing flags, auth
     posture, and stdin-only payload delivery are all reused so the
     security review of stage 1 transfers without re-evaluation.
-    --max-budget-usd is omitted for the same Max-plan reason documented
-    on `_run_extractor`; runaway protection comes from
-    `memory_episode_timeout_s` at the `asyncio.wait_for` call below.
+    No cost cap is passed (subscription auth has no real per-token
+    cost); runaway protection comes from `memory_episode_timeout_s`
+    at the `asyncio.wait_for` call below.
     """
     # Stage 2 routes through the same reasoner as stage 1; the
     # caller-side mapping recovers the exact failure-reason strings
@@ -2239,11 +2225,10 @@ async def _run_episode_extractor(
             json_schema=_EPISODE_SCHEMA,
         )
     except OneShotTimeout:
-        return None, 0.0, "timeout"
+        return None, "timeout"
     except OneShotSubprocessError as e:
         return (
             None,
-            0.0,
             f"exit_{e.returncode}: {e.stderr[:200].decode('utf-8', errors='replace')}",
         )
     except OneShotError:
@@ -2252,21 +2237,15 @@ async def _run_episode_extractor(
         # _generate_episode's broad except handles the truly
         # unexpected case; this branch keeps known reasoner failures
         # in the stage-2 vocabulary.
-        return None, 0.0, "reasoner_error"
+        return None, "reasoner_error"
     try:
         parsed = json.loads(result.text)
     except json.JSONDecodeError:
-        return None, 0.0, f"invalid_json: {result.text[:200]}"
+        return None, f"invalid_json: {result.text[:200]}"
     if not isinstance(parsed, dict):
-        return None, 0.0, "non_object_envelope"
-    # Cost lives in the CLI envelope. Coerce defensively: a future CLI
-    # version that renames or omits the field should produce 0.0, not a
-    # KeyError that would be caught by the broad except in
-    # `_generate_episode` and report `unexpected_exception` for what is
-    # actually just a CLI shape drift.
-    cost_usd = float(parsed.get("total_cost_usd") or 0.0)
+        return None, "non_object_envelope"
     if parsed.get("is_error") is True:
-        return None, cost_usd, f"is_error subtype={parsed.get('subtype')}"
+        return None, f"is_error subtype={parsed.get('subtype')}"
     # Same nested/root resolution as stage 1: `claude --print
     # --output-format json --json-schema ...` puts the schema-validated
     # payload under `structured_output`. Fall back to root for tests
@@ -2278,8 +2257,8 @@ async def _run_episode_extractor(
         episode_root = parsed
     episode = episode_root.get("episode")
     if not isinstance(episode, dict):
-        return None, cost_usd, "missing_episode_field"
-    return episode, cost_usd, None
+        return None, "missing_episode_field"
+    return episode, None
 
 
 async def _generate_episode(
@@ -2317,7 +2296,6 @@ async def _generate_episode(
     start = time.monotonic()
     outcome: str = "store_failed"
     memory_id: str | None = None
-    cost_usd: float = 0.0
     reason: str | None = None
     try:
         async with sem:
@@ -2331,7 +2309,7 @@ async def _generate_episode(
             # quick succession and the second waits on the first.
             start = time.monotonic()
             payload = _build_episode_payload(user_text, assistant_text)
-            episode, cost_usd, run_reason = await _run_episode_extractor(
+            episode, run_reason = await _run_episode_extractor(
                 payload,
                 config,
                 user_id=user_id,
@@ -2345,25 +2323,24 @@ async def _generate_episode(
                 # store_failed, validate_rejected, stored.
                 #
                 # Subprocess-level faults (exit code, is_error envelope
-                # from a budget burn or auth failure) collapse to
+                # from an auth or CLI-internal failure) collapse to
                 # `subprocess_error`. Content faults (malformed JSON,
                 # non-object envelope, missing episode field) collapse
                 # to `parse_error`. The is_error branch is load-bearing:
-                # without it, budget exhaustion would silently mislabel
-                # as a parse error and operators triaging by outcome
-                # would see budget burns mixed with genuine JSON
-                # problems.
+                # without it, a CLI-signaled failure would silently
+                # mislabel as a parse error and operators triaging by
+                # outcome would see subprocess faults mixed with
+                # genuine JSON problems.
                 if run_reason == "timeout":
                     outcome = "timeout"
                 elif run_reason and (run_reason.startswith("exit_") or run_reason.startswith("is_error")):
                     # Subprocess-level faults: nonzero exit (binary
                     # crashed, env wrong, OOM kill) or is_error
-                    # envelope (CLI exited 0 but signaled failure -
-                    # most commonly error_max_budget_usd from a budget
-                    # burn, occasionally an auth error). Both belong
-                    # under the same outcome label so operators
-                    # triaging by outcome see them together rather
-                    # than scanning two buckets for related symptoms.
+                    # envelope (CLI exited 0 but signaled failure,
+                    # e.g. an auth error). Both belong under the same
+                    # outcome label so operators triaging by outcome
+                    # see them together rather than scanning two
+                    # buckets for related symptoms.
                     outcome = "subprocess_error"
                 elif run_reason and run_reason.startswith("invalid_json"):
                     outcome = "parse_error"
@@ -2470,7 +2447,6 @@ async def _generate_episode(
         user_id=user_id,
         outcome=outcome,
         memory_id=memory_id,
-        cost_usd=cost_usd,
         duration_ms=duration_ms,
         reason=reason,
     )

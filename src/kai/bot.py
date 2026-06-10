@@ -21,7 +21,7 @@ The response flow for a text message:
     5. Prompt sent to ClaudeCodeBackend.send() → streaming begins
     6. Live message created and progressively edited (2-second intervals)
     7. Final response delivered (text, voice, or both depending on voice mode)
-    8. Session saved to database (cost tracking)
+    8. Session saved to database
     9. Flag file cleared
 
 Handler registration order in create_bot() matters: python-telegram-bot matches
@@ -190,68 +190,6 @@ _LOCK_ACQUIRE_TIMEOUT = 3600  # 1 hour
 # into a single global set would obscure which subsystem is responsible
 # for a given task's lifetime.
 _pending_memory_tasks: set[asyncio.Task[None]] = set()
-
-
-# Budget-exhaustion recovery directive.
-#
-# When the inner Claude session hits BUDGET_CEILING (default $10), the
-# CLI emits an `is_error=true` event whose `errors` field carries the
-# string "Reached maximum budget ($N)". `claude.py` populates
-# AgentResponse.error from that field; the bot uses the helper below
-# to detect the budget variant and append a recovery hint as a
-# follow-up message.
-#
-# The hint is a SEPARATE message, not appended to the error notice
-# itself, so Telegram clients show it with a notification badge and
-# the user immediately sees "what to do next" alongside "what
-# happened". The bot remains responsive to /new (and every other
-# command) after the error - the per-chat lock is released by the
-# return below, and the dispatch loop continues unaffected.
-_BUDGET_RECOVERY_HINT_WITH_AMOUNT = (
-    "Hit session budget ({amount}). Type /new to start a fresh session, "
-    "or ask your operator to raise BUDGET_CEILING in /etc/kai/env."
-)
-_BUDGET_RECOVERY_HINT_NO_AMOUNT = (
-    "Hit session budget. Type /new to start a fresh session, "
-    "or ask your operator to raise BUDGET_CEILING in /etc/kai/env."
-)
-
-# Matches the CLI's "Reached maximum budget ($N)" wording. The regex
-# is anchored on the documented phrasing; if Anthropic ever changes the
-# wording the budget detection regresses to "no match", the dollar
-# amount can't be extracted, and the no-amount hint is sent. The chat
-# still surfaces the real error string from claude.py either way -
-# only the dollar-amount-aware directive is missed.
-#
-# `\d+(?:\.\d+)?` accepts integer ($10) or one-decimal ($10.50)
-# amounts and rejects malformed compositions like $1.2.3.4. Tighter
-# than `[\d.]+`; signals intent to a future reader that we expect a
-# single decimal point at most.
-_BUDGET_PHRASE_RE = re.compile(r"maximum budget \(\$(\d+(?:\.\d+)?)\)", re.IGNORECASE)
-
-
-def _is_budget_exhaustion(error_text: str | None) -> bool:
-    """True iff the error string indicates BUDGET_CEILING exhaustion.
-
-    Substring match on the CLI's documented phrasing. Wording change
-    in a future Anthropic release would silently regress this to
-    False, in which case the recovery hint stops appearing - the
-    error notice itself still surfaces. A regression test pins the
-    current phrasing.
-    """
-    if not error_text:
-        return False
-    return "maximum budget" in error_text.lower()
-
-
-def _budget_recovery_hint(error_text: str | None) -> str:
-    """Return the budget-exhaustion recovery directive, with the
-    dollar amount inlined when extractable from the error string."""
-    if error_text:
-        match = _BUDGET_PHRASE_RE.search(error_text)
-        if match:
-            return _BUDGET_RECOVERY_HINT_WITH_AMOUNT.format(amount=f"${match.group(1)}")
-    return _BUDGET_RECOVERY_HINT_NO_AMOUNT
 
 
 async def _acquire_lock_or_kill(
@@ -439,8 +377,8 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """
     Handle /new — kill the Claude process and start a fresh session.
 
-    Clears the session from the database so cost tracking resets, and
-    kills the subprocess so the next message launches a new one.
+    Clears the session from the database and kills the subprocess so
+    the next message launches a new one.
     """
     assert update.message is not None
     chat_id = _chat_id(update)
@@ -722,34 +660,6 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(f"Default model set to {display}. Session restarted.")
         return
 
-    # /settings budget <n>
-    if field == "budget":
-        if not value:
-            await update.message.reply_text("Usage: /settings budget <amount>")
-            return
-        try:
-            budget = float(value)
-            if budget <= 0 or not math.isfinite(budget):
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("Budget must be a positive number.")
-            return
-        # Enforce ceiling: always from global config, never per-user.
-        # 0 means "no ceiling" (skip enforcement).
-        ceiling = config.budget_ceiling
-        if ceiling and budget > ceiling:
-            await update.message.reply_text(f"Budget cannot exceed ${ceiling:.2f} (admin limit).")
-            return
-        await sessions.set_user_setting(chat_id, "budget", str(budget))
-        # Apply to running instance if one exists. Don't use pool.get()
-        # here - it would create a new instance just to set an attribute.
-        pool = _get_pool(context)
-        instance = pool.get_if_exists(chat_id)
-        if instance:
-            instance.max_budget_usd = budget
-        await update.message.reply_text(f"Default budget set to ${budget:.2f}.")
-        return
-
     # /settings timeout <n>
     if field == "timeout":
         if not value:
@@ -762,14 +672,15 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except ValueError:
             await update.message.reply_text("Timeout must be a positive integer (seconds).")
             return
-        # Cap at 600s (10 minutes). The real cost guard is the budget
-        # ceiling; this cap prevents a single stuck request from holding
-        # the per-chat lock indefinitely.
+        # Cap at 600s (10 minutes). The timeout is the runaway guard
+        # for a stuck subprocess; this cap prevents a single stuck
+        # request from holding the per-chat lock indefinitely.
         if timeout > 600:
             await update.message.reply_text("Timeout cannot exceed 600 seconds.")
             return
         await sessions.set_user_setting(chat_id, "timeout", str(timeout))
-        # Apply to running instance if one exists (same rationale as budget)
+        # Apply to running instance if one exists. Don't use pool.get()
+        # here - it would create a new instance just to set an attribute.
         pool = _get_pool(context)
         instance = pool.get_if_exists(chat_id)
         if instance:
@@ -777,7 +688,7 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(f"Default timeout set to {timeout}s.")
         return
 
-    await update.message.reply_text(f"Unknown setting: {field}\nSettings: model, budget, timeout, reset")
+    await update.message.reply_text(f"Unknown setting: {field}\nSettings: model, timeout, reset")
 
 
 async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, config: Config) -> None:
@@ -803,17 +714,6 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     yaml_model = user_config.model if user_config else None
     model, model_src = _resolve("model", yaml_model, config.default_model, str)
 
-    # Budget - 0 means "unlimited" (consistent with the ceiling check
-    # in the budget handler, where 0 = no ceiling).
-    # budget_ceiling doubles as the fallback default for unconfigured users
-    yaml_budget = user_config.max_budget if user_config else None
-    budget, budget_src = _resolve(
-        "budget",
-        yaml_budget,
-        config.budget_ceiling,
-        lambda v: "unlimited" if float(v) == 0 else f"${float(v):.2f}",
-    )
-
     # Timeout
     yaml_timeout = user_config.timeout if user_config else None
     timeout, timeout_src = _resolve("timeout", yaml_timeout, config.claude_timeout_seconds, lambda v: f"{int(v)}s")
@@ -827,11 +727,7 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     provider_line = f"\n  Provider: {provider}"
 
     await update.message.reply_text(
-        f"Your settings:\n"
-        f"  Model: {model} ({model_src})"
-        f"{provider_line}\n"
-        f"  Budget: {budget} ({budget_src})\n"
-        f"  Timeout: {timeout} ({timeout_src})"
+        f"Your settings:\n  Model: {model} ({model_src}){provider_line}\n  Timeout: {timeout} ({timeout_src})"
     )
 
 
@@ -871,9 +767,6 @@ def _revert_instance_field(pool: SubprocessPool, chat_id: int, field: str, confi
                     )
                     fallback = config.default_model
                 instance.model = fallback
-    elif field == "budget":
-        # budget_ceiling doubles as the fallback default for unconfigured users
-        instance.max_budget_usd = user.max_budget if user and user.max_budget is not None else config.budget_ceiling
     elif field == "timeout":
         instance.timeout_seconds = user.timeout if user and user.timeout is not None else config.claude_timeout_seconds
 
@@ -888,13 +781,13 @@ async def _handle_settings_reset(
     """
     Handle /settings reset [field].
 
-    Always restarts the process even for non-flag settings (budget,
-    timeout) where a restart isn't strictly necessary. The simplicity
-    of "reset always restarts" outweighs the minor overhead of one
+    Always restarts the process even for non-flag settings (timeout)
+    where a restart isn't strictly necessary. The simplicity of
+    "reset always restarts" outweighs the minor overhead of one
     extra process restart during an infrequent operation.
     """
     assert update.message is not None
-    valid_fields = {"model", "budget", "timeout"}
+    valid_fields = {"model", "timeout"}
 
     if field:
         field = field.lower()
@@ -913,9 +806,9 @@ async def _handle_settings_reset(
     else:
         await sessions.delete_all_user_settings(chat_id)
         pool = _get_pool(context)
-        # Revert all three fields to their resolved defaults before
+        # Revert all fields to their resolved defaults before
         # restarting (same rationale as single-field reset above).
-        for f in ("model", "budget", "timeout"):
+        for f in ("model", "timeout"):
             _revert_instance_field(pool, chat_id, f, config)
         await pool.restart(chat_id)
         await _end_session(chat_id)
@@ -1056,7 +949,7 @@ async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 @_require_auth
 async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /stats — show session info, model, cost, and process status."""
+    """Handle /stats: show session info, model, and process status."""
     assert update.message is not None
     chat_id = _chat_id(update)
     pool = _get_pool(context)
@@ -1070,7 +963,6 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Model: {stats['model']}\n"
         f"Started: {stats['created_at']}\n"
         f"Last used: {stats['last_used_at']}\n"
-        f"Total cost: ${stats['total_cost_usd']:.4f}\n"
         f"Process alive: {alive}"
     )
 
@@ -1268,13 +1160,11 @@ def _short_workspace_name(path: str, base: Path | None) -> str:
 def _workspace_config_suffix(ws_config: WorkspaceConfig | None) -> str:
     """Build a parenthesized suffix showing workspace config details.
 
-    Returns e.g. " (model: opus, budget: $15.00)" or "" if no config.
+    Returns e.g. " (model: opus)" or "" if no config.
     """
     extras = []
     if ws_config and ws_config.model:
         extras.append(f"model: {ws_config.model}")
-    if ws_config and ws_config.budget is not None:
-        extras.append(f"budget: ${ws_config.budget:.2f}")
     return f" ({', '.join(extras)})" if extras else ""
 
 
@@ -1485,29 +1375,6 @@ async def _handle_workspace_config(
         await update.message.reply_text(f"Model set to {value.lower()}.")
         return
 
-    # /workspace config budget <n>
-    if field == "budget":
-        if not value:
-            await update.message.reply_text("Usage: /workspace config budget <amount>")
-            return
-        try:
-            budget = float(value)
-            if budget <= 0 or not math.isfinite(budget):
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("Budget must be a positive number.")
-            return
-        # Enforce ceiling: always from global config, never per-user.
-        # 0 means "no ceiling" (skip enforcement).
-        ceiling = config.budget_ceiling
-        if ceiling and budget > ceiling:
-            await update.message.reply_text(f"Budget cannot exceed ${ceiling:.2f} (admin limit).")
-            return
-        await sessions.set_workspace_config_setting(chat_id, workspace_str, "budget", str(budget))
-        await _apply_config_change(context, chat_id, workspace, config)
-        await update.message.reply_text(f"Budget set to ${budget:.2f}.")
-        return
-
     # /workspace config timeout <n>
     if field == "timeout":
         if not value:
@@ -1539,9 +1406,7 @@ async def _handle_workspace_config(
             await _apply_config_change(context, chat_id, workspace, config)
         return
 
-    await update.message.reply_text(
-        f"Unknown config field: {field}\nFields: model, budget, timeout, env, prompt, reset"
-    )
+    await update.message.reply_text(f"Unknown config field: {field}\nFields: model, timeout, env, prompt, reset")
 
 
 async def _show_workspace_config(
@@ -1577,24 +1442,6 @@ async def _show_workspace_config(
     else:
         model, model_src = config.default_model, "global default"
     lines.append(f"  Model: {model} ({model_src})")
-
-    # Budget: workspace DB > workspaces.yaml > user DB > users.yaml > global.
-    # users.yaml uses max_budget (serves as both ceiling and default).
-    try:
-        if "budget" in db_settings:
-            budget, budget_src = float(db_settings["budget"]), "workspace override"
-        elif yaml_config and yaml_config.budget is not None:
-            budget, budget_src = yaml_config.budget, "workspaces.yaml"
-        elif "budget" in user_settings:
-            budget, budget_src = float(user_settings["budget"]), "user setting"
-        elif user_config and user_config.max_budget is not None:
-            budget, budget_src = user_config.max_budget, "users.yaml"
-        else:
-            # budget_ceiling doubles as the fallback default for unconfigured users
-            budget, budget_src = config.budget_ceiling, "global default"
-        lines.append(f"  Budget: ${budget:.2f} ({budget_src})")
-    except (ValueError, TypeError):
-        lines.append("  Budget: (corrupted - reset with /workspace config reset budget)")
 
     # Timeout: workspace DB > workspaces.yaml > user DB > users.yaml > global
     try:
@@ -2874,7 +2721,6 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "\n"
         "/settings - Show your settings\n"
         "/settings model <name> - Default model\n"
-        "/settings budget <n> - Spending cap (USD)\n"
         "/settings timeout <n> - Response timeout (seconds)\n"
         "/settings reset [field] - Clear overrides\n"
         "\n"
@@ -2912,7 +2758,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/voice <name> - Set voice\n"
         "/voices - Choose a voice (inline buttons)\n"
         "\n"
-        "/stats - Show session info and cost\n"
+        "/stats - Show session info\n"
         "/job - List scheduled jobs\n"
         "/job info <id> - Show job details\n"
         "/job cancel <id> - Cancel a job\n"
@@ -3616,17 +3462,11 @@ async def _handle_response(
         # back to plain text on BadRequest while letting network
         # errors propagate naturally.
         await _reply_safe(update.message, error_text)
-        # Budget-exhaustion gets a recovery directive as a second
-        # follow-up message. Other error types fall through with no
-        # extra guidance; structure leaves room for additional
-        # error-class directives if recurring patterns emerge.
-        if _is_budget_exhaustion(real_error):
-            await _reply_safe(update.message, _budget_recovery_hint(real_error))
         return
 
-    # Persist session info for /stats (cost accumulates across interactions)
+    # Persist session info for /stats
     if final_response.session_id:
-        await sessions.save_session(chat_id, final_response.session_id, model, final_response.cost_usd)
+        await sessions.save_session(chat_id, final_response.session_id, model)
 
     final_text = final_response.text
     log_message(direction="assistant", chat_id=chat_id, text=final_text)

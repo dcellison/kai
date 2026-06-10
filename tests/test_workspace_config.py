@@ -33,7 +33,6 @@ class TestWorkspaceConfig:
         ws = WorkspaceConfig(path=Path("/tmp/ws"))
         assert ws.path == Path("/tmp/ws")
         assert ws.model is None
-        assert ws.budget is None
         assert ws.timeout is None
         assert ws.env is None
         assert ws.env_file is None
@@ -45,14 +44,12 @@ class TestWorkspaceConfig:
         ws = WorkspaceConfig(
             path=Path("/tmp/ws"),
             model="opus",
-            budget=15.0,
             timeout=300,
             env={"FOO": "bar"},
             env_file=Path("/tmp/.env"),
             system_prompt="Be helpful",
         )
         assert ws.model == "opus"
-        assert ws.budget == 15.0
         assert ws.timeout == 300
         assert ws.env == {"FOO": "bar"}
         assert ws.system_prompt == "Be helpful"
@@ -236,7 +233,6 @@ class TestLoadWorkspaceConfigs:
               - path: {ws1}
                 claude:
                   model: opus
-                  budget: 15.0
                   timeout: 300
               - path: {ws2}
                 claude:
@@ -251,7 +247,6 @@ class TestLoadWorkspaceConfigs:
 
         assert len(configs) == 2
         assert configs[ws1.resolve()].model == "opus"
-        assert configs[ws1.resolve()].budget == 15.0
         assert configs[ws1.resolve()].timeout == 300
         assert configs[ws2.resolve()].model == "haiku"
 
@@ -353,8 +348,10 @@ class TestLoadWorkspaceConfigs:
         assert configs[ws.resolve()].model == "some-custom-model"
         assert "unrecognized model" in caplog.text
 
-    def test_bool_budget_rejected(self, tmp_path):
-        """Boolean budget (e.g. true) is rejected, not silently cast to $1.00."""
+    def test_lingering_budget_ignored_with_warning(self, tmp_path, caplog):
+        """A `budget` key from an older workspaces.yaml is ignored with
+        a warning; the entry itself still loads. Tolerance keeps an
+        un-migrated file working after upgrade."""
         ws = tmp_path / "ws"
         ws.mkdir()
         self._write_yaml(
@@ -363,35 +360,20 @@ class TestLoadWorkspaceConfigs:
             workspaces:
               - path: {ws}
                 claude:
-                  budget: true
+                  model: opus
+                  budget: 15.0
             """,
         )
         with (
             patch("kai.config._read_protected_yaml", return_value=None),
             patch("kai.config.PROJECT_ROOT", tmp_path),
+            caplog.at_level("WARNING", logger="kai.config"),
         ):
             configs = _load_workspace_configs()
-        assert configs == {}
-
-    def test_negative_budget(self, tmp_path):
-        """Negative budget causes the entry to be skipped."""
-        ws = tmp_path / "ws"
-        ws.mkdir()
-        self._write_yaml(
-            tmp_path,
-            f"""\
-            workspaces:
-              - path: {ws}
-                claude:
-                  budget: -5.0
-            """,
-        )
-        with (
-            patch("kai.config._read_protected_yaml", return_value=None),
-            patch("kai.config.PROJECT_ROOT", tmp_path),
-        ):
-            configs = _load_workspace_configs()
-        assert configs == {}
+        cfg = configs[ws.resolve()]
+        assert cfg.model == "opus"
+        assert "'budget' for" in caplog.text
+        assert "no longer supported; ignoring" in caplog.text
 
     def test_mutual_exclusion_system_prompt(self, tmp_path):
         """Both system_prompt and system_prompt_file causes skip."""
@@ -603,7 +585,6 @@ class TestLoadWorkspaceConfigs:
             configs = _load_workspace_configs()
         cfg = configs[ws.resolve()]
         assert cfg.model is None
-        assert cfg.budget is None
         assert cfg.timeout is None
 
     def test_env_dict_values_coerced_to_strings(self, tmp_path):

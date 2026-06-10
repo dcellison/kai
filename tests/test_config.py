@@ -33,8 +33,8 @@ _CONFIG_ENV_VARS = [
     "DEFAULT_MODEL",
     "CLAUDE_MODEL",
     "CLAUDE_TIMEOUT_SECONDS",
-    "BUDGET_CEILING",
-    "CLAUDE_MAX_BUDGET_USD",  # backward compat (renamed to BUDGET_CEILING)
+    "BUDGET_CEILING",  # retired (budgets are no longer tracked)
+    "CLAUDE_MAX_BUDGET_USD",  # retired (budgets are no longer tracked)
     "AGENT_MAX_SESSION_HOURS",
     "CLAUDE_MAX_SESSION_HOURS",  # backward compat (renamed to AGENT_MAX_SESSION_HOURS)
     "AGENT_IDLE_TIMEOUT",
@@ -186,7 +186,6 @@ class TestLoadConfigDefaults:
         config = load_config()
         assert config.default_model == "sonnet"
         assert config.claude_timeout_seconds == 120
-        assert config.budget_ceiling == 10.0
         assert config.claude_max_session_hours == 0
         assert config.webhook_port == 8080
         # Without TELEGRAM_WEBHOOK_URL, defaults to polling mode
@@ -698,7 +697,6 @@ class TestPRReviewConfig:
         config = load_config()
         assert config.pr_review_cooldown == 300
         assert config.pr_review_timeout_s == 900
-        assert config.pr_review_budget_usd == 1.0
 
     def test_custom_cooldown(self, monkeypatch):
         """PR_REVIEW_COOLDOWN is picked up from env."""
@@ -732,27 +730,6 @@ class TestPRReviewConfig:
         _set_required(monkeypatch)
         monkeypatch.setenv("PR_REVIEW_TIMEOUT_S", "0")
         with pytest.raises(SystemExit, match="PR_REVIEW_TIMEOUT_S"):
-            load_config()
-
-    def test_budget_override(self, monkeypatch):
-        """PR_REVIEW_BUDGET_USD parses to a float and reaches the Config."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("PR_REVIEW_BUDGET_USD", "2.5")
-        config = load_config()
-        assert config.pr_review_budget_usd == 2.5
-
-    def test_budget_rejects_non_number(self, monkeypatch):
-        """Non-numeric PR_REVIEW_BUDGET_USD raises SystemExit."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("PR_REVIEW_BUDGET_USD", "cheap")
-        with pytest.raises(SystemExit, match="PR_REVIEW_BUDGET_USD"):
-            load_config()
-
-    def test_budget_rejects_non_positive(self, monkeypatch):
-        """Zero or negative PR_REVIEW_BUDGET_USD raises SystemExit."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("PR_REVIEW_BUDGET_USD", "-1.0")
-        with pytest.raises(SystemExit, match="PR_REVIEW_BUDGET_USD"):
             load_config()
 
     def test_github_repo_from_env(self, monkeypatch):
@@ -829,7 +806,6 @@ def _mock_user_configs(monkeypatch):
 # GITHUB_NOTIFY_CHAT_ID) are no longer read at runtime and have no
 # deprecation handling here — the loader silently ignores them.
 _RENAMED_VARS_WITH_VALUES = {
-    "CLAUDE_MAX_BUDGET_USD": "10.0",
     "CLAUDE_TIMEOUT_SECONDS": "120",
 }
 
@@ -849,11 +825,57 @@ class TestRenamedEnvWarnings:
     def test_empty_var_does_not_warn(self, monkeypatch, caplog):
         """Empty string env vars are not treated as 'set'."""
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
-        monkeypatch.setenv("CLAUDE_MAX_BUDGET_USD", "")
+        monkeypatch.setenv("CLAUDE_TIMEOUT_SECONDS", "")
         _mock_user_configs(monkeypatch)
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             load_config()
-        assert "CLAUDE_MAX_BUDGET_USD in env is deprecated" not in caplog.text
+        assert "CLAUDE_TIMEOUT_SECONDS in env is deprecated" not in caplog.text
+
+
+# Retired env vars: the setting no longer exists, so the loader warns
+# that the lingering value has no effect (no replacement key to point
+# at) and continues without error.
+_RETIRED_VARS_WITH_VALUES = {
+    "CLAUDE_MAX_CONTEXT_WINDOW": "100000",
+    "BUDGET_CEILING": "10.0",
+    "CLAUDE_MAX_BUDGET_USD": "10.0",
+    "PR_REVIEW_BUDGET_USD": "1.0",
+    "MEMORY_EXTRACTION_BUDGET_USD": "0.01",
+    "MEMORY_EPISODE_BUDGET_USD": "0.15",
+}
+
+
+class TestRetiredEnvWarnings:
+    """Retired env vars surface a single no-longer-supported warning
+    and never abort startup."""
+
+    @pytest.mark.parametrize("var,value", _RETIRED_VARS_WITH_VALUES.items())
+    def test_warns_on_retired_key(self, monkeypatch, caplog, var, value):
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
+        monkeypatch.setenv(var, value)
+        _mock_user_configs(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
+        assert f"{var} is no longer supported" in caplog.text
+
+    @pytest.mark.parametrize("var,value", _RETIRED_VARS_WITH_VALUES.items())
+    def test_retired_key_does_not_abort(self, monkeypatch, var, value):
+        """A lingering retired key has no effect beyond the warning;
+        load_config still returns a usable Config."""
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
+        monkeypatch.setenv(var, value)
+        _mock_user_configs(monkeypatch)
+        config = load_config()
+        assert config.telegram_bot_token == "fake"
+
+    def test_empty_retired_key_does_not_warn(self, monkeypatch, caplog):
+        """Empty string env vars are not treated as 'set'."""
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
+        monkeypatch.setenv("BUDGET_CEILING", "")
+        _mock_user_configs(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="kai.config"):
+            load_config()
+        assert "BUDGET_CEILING is no longer supported" not in caplog.text
 
 
 # ── GitHub repos empty warning ───────────────────────────────────────
@@ -955,7 +977,6 @@ class TestMinimalEnvWithUsersYaml:
         # Uses dataclass defaults when no env var is set
         assert config.default_model == "sonnet"
         assert config.claude_timeout_seconds == 120
-        assert config.budget_ceiling == 10.0
         assert config.workspace_base is None
         assert config.allowed_workspaces == []
         # users.yaml IDs are the authorization surface
@@ -977,20 +998,6 @@ class TestMinimalEnvWithUsersYaml:
         # Per-user is "opus" from users.yaml
         assert config.user_configs is not None
         assert config.user_configs[123].model == "opus"
-
-    def test_per_user_budget_without_env(self, monkeypatch):
-        """Per-user budget from users.yaml works when BUDGET_CEILING is unset."""
-        for var, val in _MINIMAL_GLOBAL_ENV.items():
-            monkeypatch.setenv(var, val)
-        user = UserConfig(telegram_id=123, name="testuser", max_budget=25.0)
-        monkeypatch.setattr(
-            "kai.config._load_user_configs",
-            lambda *_a: {123: user},
-        )
-        config = load_config()
-        assert config.budget_ceiling == 10.0  # dataclass default
-        assert config.user_configs is not None
-        assert config.user_configs[123].max_budget == 25.0
 
     def test_workspace_base_from_users_yaml_only(self, monkeypatch, tmp_path):
         """Per-user workspace_base works when WORKSPACE_BASE env is unset."""
@@ -1125,24 +1132,8 @@ class TestLegacyEnvBackwardCompat:
     Pre-tranche-A this class covered the "single-user install via
     env vars only" path; that path is gone (the loader raises
     SystemExit on absent users.yaml). What remains is the env-var
-    rename surface (BUDGET_CEILING <- CLAUDE_MAX_BUDGET_USD,
-    AGENT_TIMEOUT_SECONDS <- CLAUDE_TIMEOUT_SECONDS).
+    rename surface (AGENT_TIMEOUT_SECONDS <- CLAUDE_TIMEOUT_SECONDS).
     """
-
-    def test_old_budget_env_var_backward_compat(self, monkeypatch):
-        """CLAUDE_MAX_BUDGET_USD still works as fallback when BUDGET_CEILING is not set."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("CLAUDE_MAX_BUDGET_USD", "42.0")
-        config = load_config()
-        assert config.budget_ceiling == 42.0
-
-    def test_new_budget_env_var_takes_precedence(self, monkeypatch):
-        """BUDGET_CEILING wins over CLAUDE_MAX_BUDGET_USD when both are set."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("BUDGET_CEILING", "50.0")
-        monkeypatch.setenv("CLAUDE_MAX_BUDGET_USD", "25.0")
-        config = load_config()
-        assert config.budget_ceiling == 50.0
 
     def test_no_deprecation_warnings(self, monkeypatch, caplog):
         """No users.yaml deprecation warnings when users.yaml is absent."""
@@ -1250,7 +1241,6 @@ class TestMemoryExtractionConfig:
         _set_required(monkeypatch)
         config = load_config()
         assert config.memory_extraction_enabled is False
-        assert config.memory_extraction_budget_usd == 0.01
         assert config.memory_extraction_timeout_s == 10
 
     def test_enabled_from_env(self, monkeypatch):
@@ -1268,7 +1258,7 @@ class TestMemoryExtractionConfig:
 
         Without enforcement, MEMORY_EXTRACTION_ENABLED=true with
         MEMORY_ENABLED=false would let the Haiku extraction subprocess
-        fire every turn, burning ~$0.01/turn of budget whose result
+        fire every turn, spawning a per-turn call whose result
         silently no-ops in the `_memory is None` guard inside
         add_structured. Pin the dependency so future refactors don't
         accidentally remove it.
@@ -1295,29 +1285,11 @@ class TestMemoryExtractionConfig:
         deprecation_msgs = [r.message for r in caplog.records if "MEMORY_EXTRACTION_MODEL is deprecated" in r.message]
         assert len(deprecation_msgs) == 1, deprecation_msgs
 
-    def test_budget_override(self, monkeypatch):
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_EXTRACTION_BUDGET_USD", "0.25")
-        config = load_config()
-        assert config.memory_extraction_budget_usd == 0.25
-
     def test_timeout_override(self, monkeypatch):
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_EXTRACTION_TIMEOUT_S", "30")
         config = load_config()
         assert config.memory_extraction_timeout_s == 30
-
-    def test_budget_rejects_negative(self, monkeypatch):
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_EXTRACTION_BUDGET_USD", "-0.01")
-        with pytest.raises(SystemExit, match="non-negative"):
-            load_config()
-
-    def test_budget_rejects_non_number(self, monkeypatch):
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_EXTRACTION_BUDGET_USD", "not-a-number")
-        with pytest.raises(SystemExit, match="must be a number"):
-            load_config()
 
     def test_timeout_rejects_zero(self, monkeypatch):
         """Timeout=0 would cancel the subprocess before it started;
@@ -1848,10 +1820,9 @@ class TestRegistryValidationPerEligibleBackend:
 
 class TestMemoryEpisode:
     """The MEMORY_EPISODE_* env vars: stage-2 episode generation, which
-    runs out-of-band on stage-1 positives. Bounds: budget is strictly
-    positive (no zero kill-switch; the master switch is MEMORY_ENABLED)
-    and timeout has a 10s floor (Haiku warm-up time). The model is no
-    longer configurable here (issue #515 retired MEMORY_EPISODE_MODEL);
+    runs out-of-band on stage-1 positives. Timeout has a 10s floor
+    (Haiku warm-up time). The model is not configurable here (issue
+    #515 retired MEMORY_EPISODE_MODEL);
     `get_model_for(ModelRole.MEMORY_EPISODE, effective_backend)` is the
     only source."""
 
@@ -1859,47 +1830,13 @@ class TestMemoryEpisode:
         """Defaults must stay stable so unset = production behavior."""
         _set_required(monkeypatch)
         config = load_config()
-        assert config.memory_episode_budget_usd == 0.15
         assert config.memory_episode_timeout_s == 120
-
-    def test_budget_override(self, monkeypatch):
-        """Override path: arbitrary positive value beats the dataclass
-        default of 0.15. Test value 0.30 chosen specifically to be
-        non-default so a future flip of the dataclass default to 0.30
-        would not silently mask a regression in the override path."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_EPISODE_BUDGET_USD", "0.30")
-        config = load_config()
-        assert config.memory_episode_budget_usd == 0.30
 
     def test_timeout_override(self, monkeypatch):
         _set_required(monkeypatch)
         monkeypatch.setenv("MEMORY_EPISODE_TIMEOUT_S", "60")
         config = load_config()
         assert config.memory_episode_timeout_s == 60
-
-    def test_budget_rejects_zero(self, monkeypatch):
-        """Stage-2 budget of zero would mean every call exits at first
-        token with error_max_budget_usd. Unlike the consolidation
-        candidates field, zero is NOT a kill switch here - the master
-        switch is MEMORY_ENABLED. Reject explicitly so a typo doesn't
-        silently disable the feature."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_EPISODE_BUDGET_USD", "0")
-        with pytest.raises(SystemExit, match="positive"):
-            load_config()
-
-    def test_budget_rejects_negative(self, monkeypatch):
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_EPISODE_BUDGET_USD", "-0.05")
-        with pytest.raises(SystemExit, match="positive"):
-            load_config()
-
-    def test_budget_rejects_non_number(self, monkeypatch):
-        _set_required(monkeypatch)
-        monkeypatch.setenv("MEMORY_EPISODE_BUDGET_USD", "not-a-number")
-        with pytest.raises(SystemExit, match="must be a number"):
-            load_config()
 
     def test_timeout_rejects_below_floor(self, monkeypatch):
         """Floor is 10s because Haiku's warm-up alone can run several
@@ -2653,7 +2590,6 @@ class TestAgentTimeoutSecondsRename:
             "TELEGRAM_BOT_TOKEN": "test-token",
             "ALLOWED_USER_IDS": "12345",
             "DEFAULT_MODEL": "sonnet",
-            "BUDGET_CEILING": "10.0",
             "WEBHOOK_PORT": "8080",
             "WEBHOOK_SECRET": "test-secret",
         }
@@ -2702,7 +2638,6 @@ class TestAgentSessionLifecycleRename:
             "TELEGRAM_BOT_TOKEN": "test-token",
             "ALLOWED_USER_IDS": "12345",
             "DEFAULT_MODEL": "sonnet",
-            "BUDGET_CEILING": "10.0",
             "WEBHOOK_PORT": "8080",
             "WEBHOOK_SECRET": "test-secret",
         }
@@ -2763,7 +2698,6 @@ class TestLoadConfigBackendAwareModelValidation:
         base = {
             "TELEGRAM_BOT_TOKEN": "test-token",
             "ALLOWED_USER_IDS": "12345",
-            "BUDGET_CEILING": "10.0",
             "WEBHOOK_PORT": "8080",
             "WEBHOOK_SECRET": "test-secret",
         }

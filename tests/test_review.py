@@ -532,27 +532,6 @@ class TestRunReview:
         assert cmd[i + 1] == "opus"
 
     @pytest.mark.asyncio
-    async def test_max_budget_usd_flag_absent_on_claude_backend(self):
-        """
-        --max-budget-usd must NOT be emitted to claude --print argv
-        on the claude backend (issue #390): Max-plan OAuth makes the
-        CLI's computed-cost ceiling a phantom signal, so passing the
-        flag would terminate the subprocess at a ceiling that does
-        not correspond to real billing. Runaway protection comes from
-        the per-review timeout instead. Pinned as an absence assertion
-        so a future regression that re-adds the flag fails here.
-        """
-        mock_proc = _mock_process(stdout=b"ok")
-
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            # agent_backend defaults to "claude"; budget_usd is still
-            # accepted on the signature but no longer reaches argv.
-            await run_review("prompt", budget_usd=1.0)
-
-        cmd = mock_exec.call_args[0]
-        assert "--max-budget-usd" not in cmd
-
-    @pytest.mark.asyncio
     async def test_failure_raises(self):
         """Non-zero exit from Claude subprocess raises RuntimeError."""
         mock_proc = _mock_process(stderr=b"model not found", returncode=1)
@@ -860,20 +839,6 @@ class TestRunReviewCodex:
         assert "codex" in cmd
         codex_i = cmd.index("codex")
         assert cmd[codex_i + 1] == "exec"
-
-    @pytest.mark.asyncio
-    async def test_codex_no_max_budget_flag(self):
-        """
-        --max-budget-usd is not emitted on the codex branch. Codex on
-        subscription auth has no per-call billing; runaway protection
-        comes from the asyncio.wait_for timeout. Mirror of the
-        existing claude-side absence assertion.
-        """
-        mock_proc = _mock_process(stdout=self._codex_ndjson(""))
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_review("prompt", agent_backend="codex")
-        cmd = mock_exec.call_args[0]
-        assert "--max-budget-usd" not in cmd
 
     @pytest.mark.asyncio
     async def test_codex_extracts_final_text_from_ndjson(self):

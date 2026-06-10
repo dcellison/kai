@@ -43,15 +43,6 @@ from kai.prompt_utils import make_boundary
 log = logging.getLogger(__name__)
 
 
-# Per-triage budget cap in USD. Vestigial after #390: --max-budget-usd
-# is no longer emitted to claude --print argv on the claude branch
-# (Max-plan OAuth makes the CLI's computed-cost ceiling a phantom
-# signal), and the Goose branch uses --max-turns 1 rather than a
-# dollar ceiling, so this constant has no consumer at present.
-# Retained for symmetry with _REVIEW_BUDGET_USD and for future
-# non-claude triage paths; cleanup deferred to a separate refactor.
-_TRIAGE_BUDGET_USD = 1.0
-
 # Timeout for the triage subprocess in seconds.
 _TRIAGE_TIMEOUT = 300
 
@@ -426,9 +417,9 @@ async def run_triage(
         # `sudo -H -u <user>` so codex reads ~<user>/.codex/auth.json
         # instead of the service user's home. The parameter name is
         # claude-historical; rename is out of scope for this fix.
-        # No --max-budget-usd: codex on subscription auth has no
-        # per-call billing; runaway protection comes from
-        # _TRIAGE_TIMEOUT at the asyncio.wait_for below.
+        # No cost cap is passed: subscription auth has no per-call
+        # billing; runaway protection comes from _TRIAGE_TIMEOUT at
+        # the asyncio.wait_for below.
         triage_model = get_model_for(
             ModelRole.ISSUE_TRIAGE,
             agent_backend,
@@ -582,16 +573,10 @@ async def run_triage(
             raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from None
     else:
         # Claude one-shot mode: --print reads from stdin, writes to stdout.
-        # No --max-budget-usd on this branch: the claude backend runs under
-        # Max-plan OAuth, where the CLI tracks computed token cost regardless
-        # of whether any money is being charged. Passing the flag would
-        # terminate the subprocess at a ceiling that does not correspond to
-        # real billing. Runaway protection comes from _TRIAGE_TIMEOUT at the
+        # No cost cap is passed: subscription auth has no real per-token
+        # cost. Runaway protection comes from _TRIAGE_TIMEOUT at the
         # asyncio.wait_for call below: a stuck subprocess cannot hold the
-        # executor longer than that timeout, regardless of how many tokens
-        # it has notionally produced. _TRIAGE_BUDGET_USD stays defined for
-        # symmetry with the other budget defaults in this codebase; cleanup
-        # is deferred to a separate refactor.
+        # executor longer than that timeout.
         # Model identifier comes from the per-role registry indexed
         # by (backend, provider, role). Caller's per-user
         # `models.issue_triage` override (when set in users.yaml)

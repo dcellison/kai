@@ -91,7 +91,6 @@ def _cfg(**overrides) -> Config:
     defaults = {
         "memory_enabled": True,
         "memory_extraction_enabled": True,
-        "memory_extraction_budget_usd": 0.01,
         "memory_extraction_timeout_s": 10,
         "memory_consolidation_candidates_n": 0,
     }
@@ -773,7 +772,7 @@ class TestSubprocessCommandAssembly:
             "hi",
             "hello",
             user_id="u1",
-            config=_cfg(memory_extraction_budget_usd=0.05, memory_extraction_timeout_s=7),
+            config=_cfg(memory_extraction_timeout_s=7),
         )
 
         args = captured["args"]
@@ -785,14 +784,6 @@ class TestSubprocessCommandAssembly:
         # values immediately following them.
         assert args[args.index("--model") + 1] == "claude-haiku-4-5-20251001"
         assert args[args.index("--output-format") + 1] == "json"
-        # --max-budget-usd is NOT emitted on the claude backend (issue
-        # #390): Max-plan OAuth makes the CLI's computed-cost ceiling a
-        # phantom signal. Runaway protection comes from
-        # memory_extraction_timeout_s instead. Pinned as an absence
-        # assertion so a future regression that re-adds the flag fails
-        # here rather than silently re-introducing phantom-cost
-        # subprocess termination.
-        assert "--max-budget-usd" not in args
         # Schema arg must be a JSON string that round-trips. Both root
         # required fields are present: `facts` (the original extractor
         # output) and `has_episode` (the stage-2 classifier; issue
@@ -1087,13 +1078,13 @@ class TestExtractAndStoreOutcomes:
 
     @pytest.mark.asyncio
     async def test_is_error_envelope_returns_zero(self, monkeypatch):
-        """Exit 0 with is_error=true (e.g. budget ceiling trip mid-retry)
+        """Exit 0 with is_error=true (e.g. an auth failure mid-retry)
         must be treated as extraction failure, not silent success."""
         envelope = {
             "type": "result",
-            "subtype": "error_max_budget_usd",
+            "subtype": "error_during_execution",
             "is_error": True,
-            "errors": ["Reached maximum budget ($0.01)"],
+            "errors": ["Authentication failed"],
             "structured_output": {"facts": [{"content": "x", "tags": ["fact"]}]},
         }
 
@@ -3171,7 +3162,7 @@ class TestValidateEpisodeWorkflowRegex:
             "Run a 10-probe eval to determine whether removing assistant-derived facts helps",
             "Determine which iterate-epic candidate should land first",
             "Correct two design mistakes in the memory feature plan",
-            "Establish that budget framing has no place in the claude backend",
+            "Establish that per-user model routing has no place in the recall path",
         ]
         for goal in negatives:
             payload = {"goal": goal}
@@ -3237,7 +3228,7 @@ class TestValidateEpisodeIntegration:
         }
 
         async def _fake_runner(payload, config, **kwargs):
-            return episode_payload, 0.001, None
+            return episode_payload, None
 
         captured: dict = {}
 
@@ -3293,7 +3284,7 @@ class TestValidateEpisodeIntegration:
         }
 
         async def _fake_runner(payload, config, **kwargs):
-            return episode_payload, 0.001, None
+            return episode_payload, None
 
         captured: dict = {}
 
@@ -3352,7 +3343,7 @@ class TestValidateEpisodeIntegration:
         }
 
         async def _fake_runner(payload, config, **kwargs):
-            return episode_payload, 0.001, None
+            return episode_payload, None
 
         captured_metadata: dict = {}
 

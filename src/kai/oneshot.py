@@ -454,9 +454,9 @@ class ClaudeOneShotReasoner:
     - `--tools ""` disables all built-in tools.
     - `--no-session-persistence` keeps `~/.claude/projects/` from
       growing a directory per call.
-    - NO `--max-budget-usd`. On Max-plan OAuth the CLI's computed-
-      cost ceiling has no relation to actual billing; runaway-loop
-      protection comes from `asyncio.wait_for(timeout)` instead.
+    - No cost cap is passed: subscription auth has no real per-token
+      cost. Runaway-loop protection comes from
+      `asyncio.wait_for(timeout)` instead.
     - `--permission-mode bypassPermissions` is acceptable because
       `--tools ""` leaves nothing to permit or deny.
 

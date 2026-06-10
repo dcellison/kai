@@ -54,7 +54,6 @@ from kai.install import (
     _validate_display_name,
     _validate_os_user,
     _validate_port,
-    _validate_positive_float,
     _validate_positive_int,
     _validate_telegram_id,
     _validate_user_ids,
@@ -169,20 +168,6 @@ class TestValidatePort:
 
     def test_port_non_numeric(self):
         assert _validate_port("abc") is False
-
-
-class TestValidatePositiveFloat:
-    def test_valid(self):
-        assert _validate_positive_float("10.0") is True
-
-    def test_zero(self):
-        assert _validate_positive_float("0") is False
-
-    def test_negative(self):
-        assert _validate_positive_float("-1.5") is False
-
-    def test_non_numeric(self):
-        assert _validate_positive_float("abc") is False
 
 
 class TestValidatePositiveInt:
@@ -1138,7 +1123,6 @@ class TestCmdConfig:
                 "120",  # timeout
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
-                "10.0",  # budget
                 "80",  # autocompact pct
                 "",  # claude effort level (take default "high")
                 "8080",  # port
@@ -1148,7 +1132,6 @@ class TestCmdConfig:
                 "false",  # pr review enabled
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout (seconds)
-                "1.0",  # pr review budget (USD)
                 "false",  # issue triage enabled
                 "",  # github notify chat id (empty)
                 "false",  # voice
@@ -1219,7 +1202,6 @@ class TestCmdConfig:
                 "120",  # timeout
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
-                "10.0",  # budget
                 "80",  # autocompact pct
                 "",  # claude effort level (take default "high")
                 "8080",  # port
@@ -1229,7 +1211,6 @@ class TestCmdConfig:
                 "false",  # pr review enabled
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout (seconds)
-                "1.0",  # pr review budget (USD)
                 "false",  # issue triage enabled
                 "",  # github notify chat id (empty)
                 "false",  # voice
@@ -1303,7 +1284,6 @@ class TestCmdConfig:
                 "120",  # timeout
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
-                "10.0",  # budget
                 "80",  # autocompact pct
                 "",  # claude effort level (take default "high")
                 "8080",  # port
@@ -1313,7 +1293,6 @@ class TestCmdConfig:
                 "false",  # pr review enabled
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout
-                "1.0",  # pr review budget
                 "false",  # issue triage enabled
                 "",  # github notify chat id
                 "false",  # voice
@@ -1437,7 +1416,6 @@ class TestCmdConfig:
                 "120",  # timeout
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
-                "10.0",  # budget
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
@@ -1445,7 +1423,6 @@ class TestCmdConfig:
                 "false",  # pr review enabled
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout (seconds)
-                "1.0",  # pr review budget (USD)
                 "false",  # issue triage enabled
                 "",  # github notify chat id (empty)
                 "false",  # voice
@@ -1495,7 +1472,6 @@ class TestCmdConfig:
                 "120",  # timeout
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
-                "10.0",  # budget
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
@@ -1503,7 +1479,6 @@ class TestCmdConfig:
                 "false",  # pr review enabled
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout (seconds)
-                "1.0",  # pr review budget (USD)
                 "false",  # issue triage enabled
                 "",  # github notify chat id (empty)
                 "false",  # voice
@@ -1642,20 +1617,6 @@ class TestCmdConfig:
                 effort,  # claude effort level ("" = default "high")
             ]
 
-        # BUDGET_CEILING and PR_REVIEW_BUDGET_USD prompts are skipped
-        # on the claude backend (issue #390): --max-budget-usd is no
-        # longer emitted to claude --print argv, so prompting for a
-        # value that is never enforced would be wizard noise. The
-        # fixture entries are conditional to match the wizard's
-        # runtime conditional. Same shape as claude_only_pre_webhook
-        # immediately above; the inverted conditional reflects that
-        # these prompts now fire ONLY on non-claude backends.
-        budget_entry: list[str] = []
-        pr_review_budget_entry: list[str] = []
-        if agent_backend != "claude":
-            budget_entry = ["10.0"]  # BUDGET_CEILING
-            pr_review_budget_entry = ["1.0"]  # PR_REVIEW_BUDGET_USD
-
         return [
             "protected",  # deployment mode
             "/opt/kai",  # install dir
@@ -1674,7 +1635,6 @@ class TestCmdConfig:
             "120",  # timeout
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
-            *budget_entry,  # BUDGET_CEILING (non-claude only)
             *claude_only_pre_webhook,  # autocompact + effort (claude only)
             "8080",  # port
             "test-secret",  # webhook secret
@@ -1682,7 +1642,6 @@ class TestCmdConfig:
             "",  # allowed workspaces
             "300",  # pr review cooldown (global resource control)
             "900",  # pr review timeout
-            *pr_review_budget_entry,  # PR_REVIEW_BUDGET_USD (non-claude only)
             "false",  # voice
             "false",  # tts
             *memory_block,
@@ -1845,12 +1804,8 @@ class TestCmdConfig:
         self._redirect_staging(monkeypatch, tmp_path)
 
         # Memory on, extraction on, custom timeout + consolidation candidates + episode tunables + token budget + search limit.
-        # Budget prompts (extraction, episode) are skipped on the claude
-        # backend per issue #390 - --max-budget-usd is no longer emitted
-        # to claude --print argv at either stage, so the wizard does not
-        # ask for a value that would never be enforced. The memory
-        # reasoner backend and episode model prompts were retired in
-        # issue #515 (per-user dispatch via agent_backend).
+        # The memory reasoner backend and episode model prompts were
+        # retired in issue #515 (per-user dispatch via agent_backend).
         memory_block = [
             "true",  # memory enabled
             "true",  # extraction enabled (claude backend)
@@ -1876,8 +1831,7 @@ class TestCmdConfig:
         assert "MEMORY_REASONER_BACKEND" not in env
         assert "MEMORY_EXTRACTION_MODEL" not in env
         assert "MEMORY_EPISODE_MODEL" not in env
-        # Budget keys absent on claude backend: prompt is skipped, value
-        # stays at dataclass default, double-gated emission suppresses.
+        # Retired budget keys are never written.
         assert "MEMORY_EXTRACTION_BUDGET_USD" not in env
         assert env["MEMORY_EXTRACTION_TIMEOUT_S"] == "60"
         assert env["MEMORY_CONSOLIDATION_CANDIDATES_N"] == "5"
@@ -1928,7 +1882,8 @@ class TestCmdConfig:
         assert "MEMORY_REASONER_BACKEND" not in env
         assert "MEMORY_EXTRACTION_MODEL" not in env
         assert "MEMORY_EPISODE_MODEL" not in env
-        # Budget and timeout match dataclass defaults → no emission.
+        # Retired budget keys are never written; timeout matches the
+        # dataclass default → no emission.
         assert "MEMORY_EPISODE_BUDGET_USD" not in env
         assert "MEMORY_EPISODE_TIMEOUT_S" not in env
         # Stage-1 keys also suppressed because their inputs match
@@ -1948,9 +1903,8 @@ class TestCmdConfig:
         self._redirect_staging(monkeypatch, tmp_path)
 
         # Inputs in wizard order: enabled, ext enabled, timeout, consolidation, classifier-window, episode timeout, dedup threshold, token budget, search limit.
-        # Budget prompts (extraction, episode) are skipped on the claude
-        # backend per issue #390. The memory reasoner backend and
-        # episode model prompts were retired in issue #515.
+        # The memory reasoner backend and episode model prompts were
+        # retired in issue #515.
         memory_block = [
             "true",
             "true",
@@ -1971,9 +1925,9 @@ class TestCmdConfig:
         rendered = _generate_env_file(conf["env"])
         assert 'MEMORY_ENABLED="true"' in rendered
         assert 'MEMORY_EXTRACTION_ENABLED="true"' in rendered
-        # Budget keys never reach the env file on claude (prompt skipped,
-        # double-gated emission suppresses) - asserted absent here as the
-        # round-trip equivalent of test_memory_enabled_writes_tunables.
+        # Retired budget keys never reach the env file - asserted
+        # absent here as the round-trip equivalent of
+        # test_memory_enabled_writes_tunables.
         assert "MEMORY_EXTRACTION_BUDGET_USD" not in rendered
         assert 'MEMORY_EXTRACTION_TIMEOUT_S="45"' in rendered
         assert 'MEMORY_CONSOLIDATION_CANDIDATES_N="4"' in rendered
@@ -1986,8 +1940,8 @@ class TestCmdConfig:
         assert "MEMORY_EXTRACTION_MODEL" not in rendered
         assert "MEMORY_EPISODE_MODEL" not in rendered
         # Episode tunables: non-default timeout survives. Round-trip
-        # parity with the extraction tunables above. Budget is
-        # suppressed on claude for the same reason.
+        # parity with the extraction tunables above; the retired
+        # budget key stays absent.
         assert "MEMORY_EPISODE_BUDGET_USD" not in rendered
         assert 'MEMORY_EPISODE_TIMEOUT_S="90"' in rendered
         assert 'MEMORY_TOKEN_BUDGET="2500"' in rendered
@@ -2036,13 +1990,9 @@ class TestCmdConfig:
         env = conf["env"]
         assert env["MEMORY_ENABLED"] == "true"
         assert env["MEMORY_EXTRACTION_ENABLED"] == "true"
-        # Budget key dropped on claude backend per issue #390: prompt
-        # is skipped, the pre-init "0.01" stays untouched (existing env
-        # is no longer consulted for this key on claude), and the
-        # double-gated emission suppresses. A previously-set value on
-        # an upgrade path is intentionally cleared - the field is
-        # informational only on claude, so a stale operator value does
-        # not need to round-trip.
+        # The retired budget key is dropped on regenerate: a
+        # previously-set value on an upgrade path is intentionally
+        # cleared rather than round-tripped.
         assert "MEMORY_EXTRACTION_BUDGET_USD" not in env
         assert env["MEMORY_EXTRACTION_TIMEOUT_S"] == "75"
         assert env["MEMORY_TOKEN_BUDGET"] == "4000"
@@ -2123,14 +2073,12 @@ class TestCmdConfig:
                 "120",  # timeout
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
-                "10.0",  # budget
                 "8080",  # port
                 "test-secret",  # webhook secret
                 "~/Projects",  # workspace base
                 "",  # allowed workspaces
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout
-                "1.0",  # pr review budget
                 "false",  # voice
                 "false",  # tts
                 "true",  # memory enabled (extraction + timeout prompts skipped: non-claude)
@@ -2153,13 +2101,11 @@ class TestCmdConfig:
         """Extraction off must skip the timeout, consolidation, classifier-window, AND episode prompts; search limit still asked.
 
         Regression guard for the off-by-one trap: timeout, consolidation,
-        the new episode-classifier context window (#392), and the entire
+        the episode-classifier context window (#392), and the entire
         episode block sit inside the extraction-enabled branch, so
         disabling extraction must consume strictly fewer prompts than
-        enabling it. (Issue #390 removed the extraction budget and
-        episode budget prompts; #392 adds the classifier window prompt;
-        the extraction-enabled branch now drives only timeout,
-        consolidation, classifier-window, episode model, and episode
+        enabling it. (The extraction-enabled branch drives only
+        timeout, consolidation, classifier-window, and episode
         timeout.) If the gating drifts on any of these prompts - notably
         if a future edit accidentally hoists the classifier-window
         prompt out of the extraction-enabled branch - the input iterator
@@ -2476,7 +2422,6 @@ class TestCmdConfig:
                 "120",  # agent timeout
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
-                "10.0",  # budget (codex != claude branch)
                 # autocompact + effort skipped on non-claude backend
                 "8080",  # webhook port
                 "test-secret",  # webhook secret
@@ -2484,7 +2429,6 @@ class TestCmdConfig:
                 "",  # allowed workspaces
                 "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout
-                "1.0",  # pr review budget (non-claude branch)
                 "false",  # voice
                 "false",  # tts
                 "true",  # memory enabled
@@ -2884,7 +2828,6 @@ class TestCmdConfigDefaultModelDispatch:
             "120",  # agent timeout (global default)
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
-            "10.0",  # BUDGET_CEILING (non-claude only)
             # No autocompact_pct / effort_level prompts (claude-only)
             "8080",  # webhook port
             "test-secret",  # webhook secret
@@ -2892,7 +2835,6 @@ class TestCmdConfigDefaultModelDispatch:
             "",  # allowed workspaces (global default, empty)
             "300",  # pr review cooldown (global resource control)
             "900",  # pr review subprocess timeout
-            "1.0",  # pr review subprocess budget (non-claude only)
             "false",  # voice
             "false",  # tts
             memory_enabled,  # memory enabled
@@ -2918,7 +2860,6 @@ class TestCmdConfigDefaultModelDispatch:
             "120",  # agent timeout (global default)
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
-            "10.0",  # BUDGET_CEILING (non-claude only)
             # autocompact_pct / effort_level prompts are claude-only (gated)
             "8080",  # webhook port
             "test-secret",  # webhook secret
@@ -2926,7 +2867,6 @@ class TestCmdConfigDefaultModelDispatch:
             "",  # allowed workspaces (global default, empty)
             "300",  # pr review cooldown (global resource control)
             "900",  # pr review subprocess timeout
-            "1.0",  # pr review subprocess budget (non-claude only)
             "false",  # voice
             "false",  # tts
             "false",  # memory enabled
@@ -6201,9 +6141,9 @@ class TestStripInstallConfKeys:
 
 class TestCmdConfigGlobalDefaultsRegardlessOfUsersYaml:
     """Pins the contract that installation-wide defaults (DEFAULT_MODEL,
-    AGENT_TIMEOUT_SECONDS, BUDGET_CEILING on non-claude,
-    WORKSPACE_BASE, PR_REVIEW_COOLDOWN) prompt on every wizard run and
-    land in install.conf's env regardless of users.yaml presence.
+    AGENT_TIMEOUT_SECONDS, WORKSPACE_BASE, PR_REVIEW_COOLDOWN) prompt
+    on every wizard run and land in install.conf's env regardless of
+    users.yaml presence.
 
     The pre-fix wizard gated those prompts on `not users_yaml_exists`
     so a re-run on an existing install silently kept stale globals - the
@@ -6352,26 +6292,6 @@ class TestCmdConfigGlobalDefaultsRegardlessOfUsersYaml:
 
         env = json.loads((tmp_path / "install.conf").read_text())["env"]
         assert env["ALLOWED_WORKSPACES"] == f"{ws_a},{ws_b}"
-
-    def test_budget_ceiling_lands_with_users_yaml_on_non_claude(self, tmp_path, monkeypatch):
-        """BUDGET_CEILING reaches env on non-claude backends when
-        users.yaml exists. Claude-branch budget suppression is unchanged.
-        """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
-        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._existing_etc_users(monkeypatch)
-
-        inputs = iter(TestCmdConfigDefaultModelDispatch._inputs_for_goose_openai())
-        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
-        monkeypatch.setattr(
-            "kai.install._prompt_default_model",
-            lambda backend, prov, default: "gpt-5.4",
-        )
-        _cmd_config()
-
-        env = json.loads((tmp_path / "install.conf").read_text())["env"]
-        assert env["BUDGET_CEILING"] == "10.0"
 
 
 # ── _cmd_config: users.yaml canonicalization ─────────────────────────
@@ -7699,14 +7619,12 @@ class TestOpenCodeBinWizardPrompt:
             "120",  # agent timeout
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
-            "10.0",  # budget (non-claude branch)
             "8080",  # webhook port
             "test-secret",  # webhook secret
             "",  # workspace base
             "",  # allowed workspaces
             "300",  # pr review cooldown (global resource control)
             "900",  # pr review timeout
-            "1.0",  # pr review budget (non-claude branch)
             "false",  # voice
             "false",  # tts
             "true",  # memory enabled

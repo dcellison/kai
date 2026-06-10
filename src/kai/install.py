@@ -302,14 +302,6 @@ def _validate_port(value: str) -> bool:
         return False
 
 
-def _validate_positive_float(value: str) -> bool:
-    """Check that a string is a positive float."""
-    try:
-        return float(value) > 0
-    except ValueError:
-        return False
-
-
 def _validate_positive_int(value: str) -> bool:
     """Check that a string is a positive integer."""
     try:
@@ -945,7 +937,7 @@ def _cmd_config() -> None:
     print()
 
     # -- Agent --
-    # DEFAULT_MODEL, AGENT_TIMEOUT_SECONDS, and BUDGET_CEILING are
+    # DEFAULT_MODEL and AGENT_TIMEOUT_SECONDS are
     # inheritable installation defaults:
     # users.yaml entries that omit a per-user override fall back to
     # these values at runtime. The prompts therefore fire on every
@@ -1112,27 +1104,6 @@ def _cmd_config() -> None:
             break
         print("  Must be a non-negative integer.")
 
-    # Skip the budget prompt on the claude backend: --max-budget-usd
-    # is no longer emitted to claude --print argv (Max-plan OAuth
-    # makes the CLI's computed-cost ceiling a phantom signal), so
-    # asking the operator for a value that is never enforced would
-    # be wizard noise. Pre-init `budget = ""` here; the BUDGET_CEILING
-    # env emission below (in the env-build block) skips writing the
-    # key entirely on the claude branch, leaving Config.budget_ceiling
-    # at its dataclass default for the (informational) /settings
-    # budget readback.
-    if agent_backend != "claude":
-        while True:
-            budget = _prompt(
-                "Agent budget (USD)",
-                existing_env.get("BUDGET_CEILING", existing_env.get("CLAUDE_MAX_BUDGET_USD", "10.0")),
-            )
-            if _validate_positive_float(budget):
-                break
-            print("  Must be a positive number.")
-    else:
-        budget = ""
-
     # Autocompact threshold controls when Claude automatically compresses
     # conversation history. Lower values compact sooner, reducing token
     # usage at the cost of losing raw context earlier. Claude Code caps
@@ -1226,11 +1197,10 @@ def _cmd_config() -> None:
     print()
 
     # -- PR review agent --
-    # PR_REVIEW_COOLDOWN, PR_REVIEW_TIMEOUT_S, and PR_REVIEW_BUDGET_USD
-    # are global resource controls for the review subprocess: any
-    # review by any user counts against the same cooldown, the same
-    # subprocess timeout, and (on non-claude backends) the same USD
-    # budget per run. All three fire on every wizard run. The per-user
+    # PR_REVIEW_COOLDOWN and PR_REVIEW_TIMEOUT_S are global resource
+    # controls for the review subprocess: any review by any user
+    # counts against the same cooldown and the same subprocess
+    # timeout. Both fire on every wizard run. The per-user
     # `pr_review` toggle lives in users.yaml (or /github reviews).
     print("-- PR review agent --")
     print("  Per-user PR review toggle lives in users.yaml ('pr_review')")
@@ -1248,8 +1218,8 @@ def _cmd_config() -> None:
             break
         print("  Must be a positive integer.")
 
-    # Timeout + budget for the review subprocess. Always collectable: they
-    # apply to any review whether or not the global env flag is set.
+    # Timeout for the review subprocess. Always collectable: it
+    # applies to any review whether or not the global env flag is set.
     while True:
         pr_review_timeout_s = _prompt(
             "Review subprocess timeout in seconds",
@@ -1258,22 +1228,6 @@ def _cmd_config() -> None:
         if _validate_positive_int(pr_review_timeout_s):
             break
         print("  Must be a positive integer.")
-    # Skip the PR review budget prompt on the claude backend:
-    # --max-budget-usd is no longer emitted to claude --print argv on
-    # this site either (review.py:738 else branch). Pre-init to the
-    # dataclass default so the env emission below correctly suppresses
-    # writing PR_REVIEW_BUDGET_USD on the claude branch.
-    if agent_backend != "claude":
-        while True:
-            pr_review_budget_usd = _prompt(
-                "Review subprocess USD budget ceiling",
-                existing_env.get("PR_REVIEW_BUDGET_USD", "1.0"),
-            )
-            if _validate_positive_float(pr_review_budget_usd):
-                break
-            print("  Must be a positive number.")
-    else:
-        pr_review_budget_usd = "1.0"
     print()
 
     # -- Optional features --
@@ -1313,7 +1267,6 @@ def _cmd_config() -> None:
     # Defaults match the dataclass values in config.py. Only non-defaults
     # (or memory_enabled=true itself) are written to the env dict below.
     memory_extraction_enabled = False
-    memory_extraction_budget_usd = "0.01"
     memory_extraction_timeout_s = "10"
     memory_consolidation_candidates_n = "8"
     # Issue #392: episode classifier context window. Pre-init matches
@@ -1324,13 +1277,12 @@ def _cmd_config() -> None:
     # when the operator is on the claude backend AND extraction is
     # enabled - same gating pattern as the other extraction tunables.
     episode_classifier_context_turns = "3"
-    # Stage-2 episode budget + timeout pre-inits (issue #385). Each
-    # value matches the corresponding wizard prompt default and the
-    # emission-gate sentinel so the data flow reads consistently
-    # whether the operator runs the episode block or skips it. The
-    # episode model itself is resolved per-user from the registry
-    # at extraction time; no wizard prompt or env var carries it.
-    memory_episode_budget_usd = "0.15"
+    # Stage-2 episode timeout pre-init (issue #385). The value matches
+    # the corresponding wizard prompt default and the emission-gate
+    # sentinel so the data flow reads consistently whether the
+    # operator runs the episode block or skips it. The episode model
+    # itself is resolved per-user from the registry at extraction
+    # time; no wizard prompt or env var carries it.
     memory_episode_timeout_s = "120"
     memory_token_budget = "2000"
     memory_search_limit = "10"
@@ -1408,14 +1360,6 @@ def _cmd_config() -> None:
                         if _validate_opencode_bin(opencode_bin):
                             break
                         print(f"  Path '{opencode_bin}' does not exist or is not executable.")
-                # No MEMORY_EXTRACTION_BUDGET_USD prompt on this branch:
-                # --max-budget-usd is omitted from the stage-1 claude
-                # --print argv (memory_extraction.py:_run_extractor),
-                # so prompting for a value that is never enforced would
-                # be wizard noise. The pre-init `memory_extraction_budget_usd
-                # = "0.01"` from above is left untouched; the env emission
-                # below double-gates on agent_backend != "claude" so the
-                # key is never written on the claude branch.
                 # Extraction timeout is the LLM-call hard cap inside
                 # memory_extraction.py:541. Default 10s is too aggressive
                 # for production - real extractions routinely take 20-30s
@@ -1473,23 +1417,15 @@ def _cmd_config() -> None:
                     except ValueError:
                         pass
                     print("  Must be 0-10.")
-                # Stage-2 episode tunables (issue #385). Budget and
-                # timeout sit inside the extraction-enabled guard
-                # because episodes only fire when stage 1 fires (the
-                # has_episode classifier comes from stage 1's output).
+                # Stage-2 episode timeout (issue #385) sits inside the
+                # extraction-enabled guard because episodes only fire
+                # when stage 1 fires (the has_episode classifier comes
+                # from stage 1's output).
                 # The episode model is resolved per-user from the
                 # registry at extraction time via get_model_for(
                 # ModelRole.MEMORY_EPISODE, effective_backend); the
                 # wizard prompt for the model was retired with the
                 # MEMORY_EPISODE_MODEL env var.
-                # No MEMORY_EPISODE_BUDGET_USD prompt on this branch:
-                # --max-budget-usd is omitted from the stage-2 claude
-                # --print argv (memory_extraction.py:_run_episode_extractor)
-                # for the same Max-plan reason as stage 1. The pre-init
-                # `memory_episode_budget_usd = "0.15"` above is left
-                # untouched; the env emission below double-gates on
-                # agent_backend != "claude" so the key is never written
-                # on the claude branch.
                 # Episode timeout has a 10s floor: Haiku's warm-up alone
                 # routinely runs several seconds, so a sub-floor timeout
                 # would surface as systematic timeouts that mask real
@@ -1624,27 +1560,19 @@ def _cmd_config() -> None:
     # regenerate so the next /etc/kai/env carries only the canonical
     # forms.
     env.pop("CLAUDE_MODEL", None)
-    env.pop("CLAUDE_MAX_BUDGET_USD", None)
     env.pop("CLAUDE_TIMEOUT_SECONDS", None)
     env.pop("CLAUDE_MAX_SESSION_HOURS", None)
     env.pop("CLAUDE_IDLE_TIMEOUT", None)
-    # CLAUDE_MAX_CONTEXT_WINDOW is retired outright (no canonical
-    # replacement); drop a lingering key so the regenerated env does
-    # not carry a setting the runtime no longer reads.
+    # Retired keys (no canonical replacement); drop lingering values
+    # so the regenerated env does not carry settings the runtime no
+    # longer reads. Mirrors the `_retired_env_vars` warning map in
+    # load_config.
     env.pop("CLAUDE_MAX_CONTEXT_WINDOW", None)
-
-    # BUDGET_CEILING is global (not per-user). Skipped entirely on the
-    # claude backend (--max-budget-usd is omitted from claude --print
-    # argv). The `and budget` truthiness check is load-bearing, not
-    # defensive: on the users.yaml branch, `budget` is initialized via
-    # `existing_env.get("BUDGET_CEILING", existing_env.get("CLAUDE_MAX_BUDGET_USD", ""))`
-    # which defaults to "" when neither key is in the existing env, and
-    # writing `BUDGET_CEILING=` (empty value) into /etc/kai/env would
-    # crash load_config()'s float() parsing at startup. The legacy
-    # branch's _validate_positive_float loop guarantees a non-empty
-    # number string there, so the guard is a no-op for that branch.
-    if agent_backend != "claude" and budget:
-        env["BUDGET_CEILING"] = budget
+    env.pop("CLAUDE_MAX_BUDGET_USD", None)
+    env.pop("BUDGET_CEILING", None)
+    env.pop("PR_REVIEW_BUDGET_USD", None)
+    env.pop("MEMORY_EXTRACTION_BUDGET_USD", None)
+    env.pop("MEMORY_EPISODE_BUDGET_USD", None)
 
     # DEFAULT_MODEL is always emitted. The model is global (per-user
     # values in users.yaml are overrides on top of it, not replacements),
@@ -1726,8 +1654,6 @@ def _cmd_config() -> None:
     # review, regardless of which user opted in.
     if pr_review_timeout_s != "900":
         env["PR_REVIEW_TIMEOUT_S"] = pr_review_timeout_s
-    if agent_backend != "claude" and pr_review_budget_usd != "1.0":
-        env["PR_REVIEW_BUDGET_USD"] = pr_review_budget_usd
 
     # Semantic memory: global env vars (per-user partitioning is runtime).
     # Toggling memory_enabled from true back to false correctly drops
@@ -1746,19 +1672,7 @@ def _cmd_config() -> None:
             # as deprecation warnings at load_config time so existing
             # installs survive one reboot before this wizard regenerates
             # /etc/kai/env without those keys.
-            # Double-gate (agent_backend AND non-default value) is
-            # intentionally redundant: the wizard now skips the
-            # extraction-budget prompt on claude, so the value is
-            # always "0.01" on that branch and the float comparison
-            # alone would also exclude it. The explicit
-            # `agent_backend != "claude"` makes the intent legible at
-            # the emission site without forcing the reader to trace
-            # the pre-init default. Same shape as the autocompact
-            # and effort emissions earlier in the function.
-            if agent_backend != "claude" and float(memory_extraction_budget_usd) != 0.01:
-                env["MEMORY_EXTRACTION_BUDGET_USD"] = memory_extraction_budget_usd
-            # Timeout written under the same gate as budget: both are
-            # extraction-only tunables. Numeric compare so "10" vs "10 "
+            # Extraction-only tunable. Numeric compare so "10" vs "10 "
             # or "010" do not produce a spurious env entry equal to
             # the dataclass default.
             if int(memory_extraction_timeout_s) != 10:
@@ -1785,9 +1699,6 @@ def _cmd_config() -> None:
             # is no longer emitted: the episode model resolves per-user
             # from the registry at extraction time via get_model_for
             # (issue #515).
-            # Double-gate matches the stage-1 budget treatment above.
-            if agent_backend != "claude" and float(memory_episode_budget_usd) != 0.15:
-                env["MEMORY_EPISODE_BUDGET_USD"] = memory_episode_budget_usd
             if int(memory_episode_timeout_s) != 120:
                 env["MEMORY_EPISODE_TIMEOUT_S"] = memory_episode_timeout_s
             # Paraphrase-dedup threshold. Same delta-from-default gate
@@ -1826,7 +1737,6 @@ def _cmd_config() -> None:
     # then-ineligible backend gets dropped here.
     if agent_backend not in ONESHOT_REASONER_BACKENDS:
         env.pop("MEMORY_EXTRACTION_ENABLED", None)
-        env.pop("MEMORY_EXTRACTION_BUDGET_USD", None)
         env.pop("MEMORY_EXTRACTION_TIMEOUT_S", None)
         env.pop("MEMORY_CONSOLIDATION_CANDIDATES_N", None)
         # Episode-classifier window key (issue #392). Same lifecycle
@@ -1838,7 +1748,6 @@ def _cmd_config() -> None:
         # when stage 1 fires, and stage 1 silently skips on backends
         # without a reasoner. Leaving these in the env file would
         # mislead an operator who flips backend.
-        env.pop("MEMORY_EPISODE_BUDGET_USD", None)
         env.pop("MEMORY_EPISODE_TIMEOUT_S", None)
         # Paraphrase-dedup threshold is consulted by `_store_facts`,
         # which only runs under the Haiku extraction path. Same
@@ -3753,10 +3662,16 @@ def _cmd_apply() -> None:
         if "AGENT_IDLE_TIMEOUT" not in env and "CLAUDE_IDLE_TIMEOUT" in env:
             env["AGENT_IDLE_TIMEOUT"] = env["CLAUDE_IDLE_TIMEOUT"]
         env.pop("CLAUDE_IDLE_TIMEOUT", None)
-        # CLAUDE_MAX_CONTEXT_WINDOW is retired outright (no canonical
-        # replacement); drop it at apply time so /etc/kai/env does not
-        # carry a setting the runtime no longer reads.
+        # Retired keys (no canonical replacement); drop them at apply
+        # time so /etc/kai/env does not carry settings the runtime no
+        # longer reads. Mirrors the `_retired_env_vars` warning map in
+        # load_config.
         env.pop("CLAUDE_MAX_CONTEXT_WINDOW", None)
+        env.pop("CLAUDE_MAX_BUDGET_USD", None)
+        env.pop("BUDGET_CEILING", None)
+        env.pop("PR_REVIEW_BUDGET_USD", None)
+        env.pop("MEMORY_EXTRACTION_BUDGET_USD", None)
+        env.pop("MEMORY_EPISODE_BUDGET_USD", None)
         _apply_secrets(env, dry_run, users_yaml_staging_path=users_yaml_staging_path)
 
         # -- Step 6: Deploy Goose config (if backend=goose) --

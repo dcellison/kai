@@ -7,11 +7,10 @@
 # defaults from .env / /etc/kai/env.
 
 workspaces:
-  # Example: heavy-duty workspace with Opus and a generous budget
+  # Example: heavy-duty workspace with Opus and a generous timeout
   # - path: ~/projects/complex-app
   #   claude:
   #     model: opus
-  #     budget: 20.0
   #     timeout: 300
   #     env:
   #       DATABASE_URL: "postgres://localhost/myapp"

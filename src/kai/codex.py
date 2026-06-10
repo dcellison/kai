@@ -106,7 +106,6 @@ class CodexBackend(AgentBackend):
         home_workspace: Path | None = None,
         webhook_port: int = 8080,
         webhook_secret: str = "",
-        max_budget_usd: float = 1.0,
         timeout_seconds: int = 120,
         services_info: list[dict] | None = None,
         workspace_config: WorkspaceConfig | None = None,
@@ -136,7 +135,6 @@ class CodexBackend(AgentBackend):
         self.model = model
         self.workspace = workspace
         self.home_workspace = home_workspace or workspace
-        self.max_budget_usd = max_budget_usd
         self.timeout_seconds = timeout_seconds
         self.workspace_config = workspace_config
         self.provider = provider  # ABC-mandated; bot.py reads this
@@ -885,7 +883,6 @@ class CodexBackend(AgentBackend):
                                 success=True,
                                 text=final_visible,
                                 session_id=self._session_id,
-                                cost_usd=0.0,
                                 duration_ms=0,
                             ),
                         )

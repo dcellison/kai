@@ -4,9 +4,8 @@ SQLite database layer for sessions, jobs, settings, and workspace history.
 Provides async CRUD operations for all persistent state in Kai, organized
 into four tables:
 
-1. **sessions** - Agent session tracking (session ID, model, cost).
-   One row per chat_id, upserted on each response. Cost accumulates across
-   the lifetime of a session.
+1. **sessions** - Agent session tracking (session ID, model).
+   One row per chat_id, upserted on each response.
 
 2. **jobs** - Scheduled tasks (reminders, agent jobs with job_type "claude", conditional monitors).
    Created via the scheduling API (POST /api/schedule) or the inner agent's curl.
@@ -99,8 +98,7 @@ async def init_db(db_path: Path) -> None:
                 session_id TEXT NOT NULL,
                 model TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                total_cost_usd REAL DEFAULT 0.0
+                last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         log.debug("Creating jobs table")
@@ -208,30 +206,28 @@ async def get_session(chat_id: int) -> str | None:
         return row["session_id"] if row else None
 
 
-async def save_session(chat_id: int, session_id: str, model: str, cost_usd: float) -> None:
+async def save_session(chat_id: int, session_id: str, model: str) -> None:
     """
     Save or update an agent session for a chat.
 
-    On conflict (existing chat_id), the session_id and model are updated,
-    last_used_at is refreshed, and total_cost_usd is accumulated (not replaced).
+    On conflict (existing chat_id), the session_id and model are updated
+    and last_used_at is refreshed.
 
     Args:
         chat_id: Telegram chat ID.
         session_id: Agent session identifier reported by the backend.
         model: Model name used for this session (e.g., "sonnet").
-        cost_usd: Cost of this particular interaction (added to running total).
     """
     await _get_db().execute(
         """
-        INSERT INTO sessions (chat_id, session_id, model, total_cost_usd)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO sessions (chat_id, session_id, model)
+        VALUES (?, ?, ?)
         ON CONFLICT(chat_id) DO UPDATE SET
             session_id = excluded.session_id,
             model = excluded.model,
-            last_used_at = CURRENT_TIMESTAMP,
-            total_cost_usd = total_cost_usd + excluded.total_cost_usd
+            last_used_at = CURRENT_TIMESTAMP
     """,
-        (chat_id, session_id, model, cost_usd),
+        (chat_id, session_id, model),
     )
     await _get_db().commit()
 
@@ -245,7 +241,7 @@ async def clear_session(chat_id: int) -> None:
 async def get_stats(chat_id: int) -> dict | None:
     """Get session statistics for the /stats command. Returns None if no session exists."""
     async with _get_db().execute(
-        "SELECT session_id, model, created_at, last_used_at, total_cost_usd FROM sessions WHERE chat_id = ?",
+        "SELECT session_id, model, created_at, last_used_at FROM sessions WHERE chat_id = ?",
         (chat_id,),
     ) as cursor:
         row = await cursor.fetchone()
@@ -505,7 +501,7 @@ async def get_workspace_config_settings(chat_id: int, workspace_path: str) -> di
     Get all config overrides for a user's workspace.
 
     Returns a dict of field->value pairs (e.g., {"model": "opus",
-    "budget": "20.0"}). Values are strings; callers parse as needed.
+    "timeout": "300"}). Values are strings; callers parse as needed.
     Config is per-user-per-workspace: each user has independent overrides.
     """
     # Use SUBSTR for exact prefix matching instead of LIKE, which
@@ -576,7 +572,6 @@ async def build_workspace_config(
 
     # Start from YAML baseline or empty defaults
     model = yaml_config.model if yaml_config else None
-    budget = yaml_config.budget if yaml_config else None
     timeout = yaml_config.timeout if yaml_config else None
     env = dict(yaml_config.env) if yaml_config and yaml_config.env else None
     env_file = yaml_config.env_file if yaml_config else None
@@ -587,11 +582,6 @@ async def build_workspace_config(
     # Layer database overrides
     if "model" in db_settings:
         model = db_settings["model"]
-    if "budget" in db_settings:
-        try:
-            budget = float(db_settings["budget"])
-        except (ValueError, TypeError):
-            log.warning("Corrupt budget in DB for chat %d workspace %s", chat_id, workspace_path)
     if "timeout" in db_settings:
         try:
             timeout = int(db_settings["timeout"])
@@ -619,7 +609,6 @@ async def build_workspace_config(
     return WorkspaceConfig(
         path=path,
         model=model,
-        budget=budget,
         timeout=timeout,
         env=env,
         env_file=env_file,
@@ -637,7 +626,7 @@ async def build_workspace_config(
 
 # Canonical field names for per-user settings. Must match the storage
 # keys used by set_user_setting / get_user_settings.
-_USER_SETTING_FIELDS = {"model", "budget", "timeout"}
+_USER_SETTING_FIELDS = {"model", "timeout"}
 
 
 async def get_user_settings(chat_id: int) -> dict[str, str]:
@@ -645,7 +634,7 @@ async def get_user_settings(chat_id: int) -> dict[str, str]:
     Get all per-user settings from the database.
 
     Returns a dict of field->value pairs (e.g., {"model": "opus",
-    "budget": "15.0"}). Values are strings; callers parse as needed.
+    "timeout": "300"}). Values are strings; callers parse as needed.
     Only includes fields that have been explicitly set - missing keys
     mean the user hasn't overridden that setting.
     """
@@ -658,7 +647,7 @@ async def get_user_settings(chat_id: int) -> dict[str, str]:
 
 
 async def set_user_setting(chat_id: int, field: str, value: str) -> None:
-    """Set a single per-user setting (e.g., model, budget, timeout)."""
+    """Set a single per-user setting (e.g., model, timeout)."""
     await set_setting(f"{field}:{chat_id}", value)
 
 
@@ -684,7 +673,6 @@ class UserDefaults(TypedDict):
     """Resolved per-user settings with concrete types (never None)."""
 
     model: str
-    budget: float
     timeout: int
 
 
@@ -696,7 +684,7 @@ async def resolve_user_defaults(
     Resolve per-user settings by layering DB overrides on top of
     users.yaml and env var defaults.
 
-    Returns a UserDefaults dict with keys: model, budget, timeout.
+    Returns a UserDefaults dict with keys: model, timeout.
     All values are resolved - never None.
 
     Precedence (highest to lowest):
@@ -726,19 +714,6 @@ async def resolve_user_defaults(
     yaml_model = raw_yaml_model.strip() if raw_yaml_model is not None else None
     model = db_model if db_model else yaml_model if yaml_model else config.default_model
 
-    # Budget: DB > users.yaml max_budget (as default only) > global ceiling.
-    # max_budget in users.yaml is the admin-set baseline default, NOT a
-    # ceiling. The ceiling comes solely from BUDGET_CEILING (config.budget_ceiling).
-    # Defensive try/except matches _restore_workspace and _show_settings.
-    yaml_budget = user_config.max_budget if user_config and user_config.max_budget is not None else None
-    try:
-        budget = float(db_settings["budget"]) if "budget" in db_settings else None
-    except (ValueError, TypeError):
-        budget = None
-    if budget is None:
-        # budget_ceiling doubles as the fallback default for unconfigured users
-        budget = yaml_budget if yaml_budget is not None else config.budget_ceiling
-
     # Timeout: DB > users.yaml > env > 120
     yaml_timeout = user_config.timeout if user_config and user_config.timeout is not None else None
     try:
@@ -750,7 +725,6 @@ async def resolve_user_defaults(
 
     return {
         "model": model,
-        "budget": budget,
         "timeout": timeout,
     }
 
@@ -1083,7 +1057,7 @@ async def resolve_github_settings(chat_id: int, config: Config) -> GitHubSetting
     repos = await get_effective_repos(chat_id, yaml_repos)
 
     # Notification destination: DB > yaml > telegram_id.
-    # Defensive try/except matches budget/timeout above.
+    # Defensive try/except matches timeout above.
     # A corrupt DB value falls through to yaml/default rather than
     # aborting the entire resolution.
     notify: int | None = None

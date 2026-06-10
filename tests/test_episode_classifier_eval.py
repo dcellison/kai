@@ -49,13 +49,12 @@ _BASE_CONFIG = Config(
 def _eval_config() -> Config:
     """Stage-1 config tuned for the eval pass: extraction enabled,
     consolidation off (the labeled exchanges have no prior facts to
-    consolidate against). Budget and timeout match production-tuned
-    values so the eval reflects realistic latency."""
+    consolidate against). The timeout matches the production-tuned
+    value so the eval reflects realistic latency."""
     return replace(
         _BASE_CONFIG,
         memory_enabled=True,
         memory_extraction_enabled=True,
-        memory_extraction_budget_usd=0.05,
         memory_extraction_timeout_s=60,
         memory_consolidation_candidates_n=0,
     )

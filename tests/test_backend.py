@@ -1042,7 +1042,6 @@ class TestDataTypes:
         """AgentResponse has sensible defaults."""
         resp = AgentResponse(success=True, text="hello")
         assert resp.session_id is None
-        assert resp.cost_usd == 0.0
         assert resp.duration_ms == 0
         assert resp.error is None
 

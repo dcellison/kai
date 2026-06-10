@@ -10,6 +10,7 @@ Covers:
 6. Legacy fallback via ALLOWED_USER_IDS
 """
 
+import logging
 import textwrap
 from pathlib import Path
 from unittest.mock import patch
@@ -37,7 +38,6 @@ class TestUserConfig:
         assert uc.github is None
         assert uc.os_user is None
         assert uc.home_workspace is None
-        assert uc.max_budget is None
         assert uc.model is None
         assert uc.timeout is None
         assert uc.workspace_base is None
@@ -57,7 +57,6 @@ class TestUserConfig:
             github="alice-dev",
             os_user="alice",
             home_workspace=Path("/home/alice/workspace"),
-            max_budget=15.0,
             model="opus",
             timeout=300,
             workspace_base=Path("/home/alice/projects"),
@@ -71,7 +70,6 @@ class TestUserConfig:
         assert uc.role == "admin"
         assert uc.github == "alice-dev"
         assert uc.os_user == "alice"
-        assert uc.max_budget == 15.0
         assert uc.model == "opus"
         assert uc.timeout == 300
         assert uc.workspace_base == Path("/home/alice/projects")
@@ -117,7 +115,6 @@ class TestLoadUserConfigs:
                 github: alice-dev
                 os_user: alice
                 home_workspace: {ws}
-                max_budget: 15.0
               - telegram_id: 222
                 name: bob
                 role: user
@@ -135,7 +132,6 @@ class TestLoadUserConfigs:
         assert configs[111].github == "alice-dev"
         assert configs[111].os_user == "alice"
         assert configs[111].home_workspace == ws.resolve()
-        assert configs[111].max_budget == 15.0
         assert configs[222].name == "bob"
         assert configs[222].role == "user"
 
@@ -254,37 +250,27 @@ class TestLoadUserConfigs:
         ):
             _load_user_configs("claude", "")
 
-    def test_invalid_budget(self, tmp_path):
-        """Negative budget causes the entry to be skipped."""
+    def test_lingering_max_budget_ignored_with_warning(self, tmp_path, caplog):
+        """A `max_budget` key from an older users.yaml is ignored with
+        a warning; the entry itself still loads. Tolerance keeps an
+        un-migrated file working after upgrade."""
         data = self._yaml_dict(
             """\
             users:
               - telegram_id: 111
                 name: alice
-                max_budget: -5.0
+                max_budget: 15.0
             """,
         )
         with (
             patch("kai.config._read_protected_yaml", return_value=data),
-            pytest.raises(SystemExit, match="no valid user entries"),
+            caplog.at_level(logging.WARNING, logger="kai.config"),
         ):
-            _load_user_configs("claude", "")
+            configs = _load_user_configs("claude", "")
 
-    def test_bool_budget_rejected(self, tmp_path):
-        """Boolean budget is rejected (same bool guard as workspace config)."""
-        data = self._yaml_dict(
-            """\
-            users:
-              - telegram_id: 111
-                name: alice
-                max_budget: true
-            """,
-        )
-        with (
-            patch("kai.config._read_protected_yaml", return_value=data),
-            pytest.raises(SystemExit, match="no valid user entries"),
-        ):
-            _load_user_configs("claude", "")
+        assert configs is not None
+        assert configs[111].name == "alice"
+        assert "'max_budget' for alice is no longer supported; ignoring" in caplog.text
 
     def test_bool_telegram_id_rejected(self, tmp_path):
         """Boolean telegram_id is rejected."""
