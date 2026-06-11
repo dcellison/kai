@@ -227,12 +227,26 @@ class ClaudeCodeBackend(AgentBackend):
             # applied to the subprocess env below survives sudo's
             # env_reset (see the TMPDIR block below for why the
             # anchoring exists).
+            #
+            # CLAUDE_CONFIG_DIR / ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
+            # mirror the one-shot wrap's preserve list in kai.oneshot,
+            # so env-key auth and custom-endpoint routing behave the
+            # same on the chat leg as on extraction / review / triage
+            # for the same users.yaml entry; OAuth installs carry none
+            # of these vars and are unaffected.
+            #
+            # CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is set into the
+            # subprocess env below when autocompact_pct > 0; without
+            # preservation, env_reset strips it and the per-user
+            # claude never sees the configured threshold.
             cmd = [
                 "sudo",
                 "-H",
                 "-u",
                 effective_claude_user,
-                "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR",
+                "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR,"
+                "CLAUDE_CONFIG_DIR,ANTHROPIC_API_KEY,ANTHROPIC_BASE_URL,"
+                "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
                 "--",
             ] + claude_cmd
         else:

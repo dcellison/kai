@@ -154,7 +154,10 @@ class TestCommandConstruction:
             assert cmd[1] == "-H"
             assert cmd[2] == "-u"
             assert cmd[3] == "daniel"
-            assert cmd[4] == "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR"
+            assert (
+                cmd[4]
+                == "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR,CLAUDE_CONFIG_DIR,ANTHROPIC_API_KEY,ANTHROPIC_BASE_URL,CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+            )
             assert cmd[5] == "--"
             assert cmd[6] == "claude"
 
@@ -229,7 +232,10 @@ class TestCommandConstruction:
             assert cmd[1] == "-H"
             assert cmd[2] == "-u"
             assert cmd[3] == "some_other_user"
-            assert cmd[4] == "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR"
+            assert (
+                cmd[4]
+                == "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR,CLAUDE_CONFIG_DIR,ANTHROPIC_API_KEY,ANTHROPIC_BASE_URL,CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+            )
             assert cmd[5] == "--"
             assert args[1].get("start_new_session") is True
 
@@ -277,7 +283,10 @@ class TestCommandConstruction:
             await claude._ensure_started()
 
             cmd = mock_exec.call_args[0]
-            assert "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR" in cmd
+            assert (
+                "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR,CLAUDE_CONFIG_DIR,ANTHROPIC_API_KEY,ANTHROPIC_BASE_URL,CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+                in cmd
+            )
             # Secret is also in the env dict (unchanged behavior).
             env = mock_exec.call_args[1]["env"]
             assert env["KAI_WEBHOOK_SECRET"] == "s3cret"
@@ -326,7 +335,10 @@ class TestCommandConstruction:
             cmd = mock_exec.call_args[0]
             env = mock_exec.call_args[1]["env"]
             assert env["TMPDIR"] == str(DATA_DIR / "tmp" / "some_other_user")
-            assert "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR" in cmd
+            assert (
+                "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR,CLAUDE_CONFIG_DIR,ANTHROPIC_API_KEY,ANTHROPIC_BASE_URL,CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+                in cmd
+            )
 
     @pytest.mark.asyncio
     async def test_tmpdir_not_injected_in_single_user_mode(self, monkeypatch):

@@ -361,15 +361,25 @@ class CodexBackend(AgentBackend):
         if effective_codex_user:
             # -H sets HOME to <codex_user>'s pw entry so codex reads
             # auth from ~<codex_user>/.codex/auth.json, not the bot's
-            # home. --preserve-env passes KAI_WEBHOOK_SECRET and
-            # TMPDIR through sudo's env_reset (the SETENV: sudoers
-            # rule allows this). Mirrors claude.py's sudo construction.
+            # home. --preserve-env passes the listed vars through
+            # sudo's env_reset (the SETENV: sudoers rule allows this).
+            # Mirrors claude.py's sudo construction.
+            #
+            # CODEX_HOME / OPENAI_API_KEY / OPENAI_BASE_URL mirror the
+            # one-shot wrap's preserve list in kai.oneshot, so env-key
+            # auth and custom-endpoint routing behave the same on the
+            # chat leg as on extraction / review / triage for the same
+            # users.yaml entry; subscription-OAuth installs carry none
+            # of these vars and are unaffected. CODEX_MODEL /
+            # CODEX_PROVIDER are deliberately NOT preserved: the
+            # authoritative model selection rides the per-turn
+            # protocol params, so the env mirrors are informational.
             argv: list[str] = [
                 "sudo",
                 "-H",
                 "-u",
                 effective_codex_user,
-                "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR",
+                "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR,CODEX_HOME,OPENAI_API_KEY,OPENAI_BASE_URL",
                 "--",
             ] + codex_argv
         else:

@@ -1572,7 +1572,7 @@ class TestCodexUserSudoWrap:
     Verify the per-user OAuth isolation lever.
 
     When codex_user is set to a non-self user, the subprocess argv is
-    wrapped in `sudo -H -u <user> --preserve-env=KAI_WEBHOOK_SECRET,TMPDIR --`
+    wrapped in `sudo -H -u <user> --preserve-env=<csv> --`
     so codex runs as <codex_user> and reads
     ~<codex_user>/.codex/auth.json. This is what makes a multi-user
     install (e.g., users.yaml has os_user=daniel for one chat and
@@ -1608,10 +1608,12 @@ class TestCodexUserSudoWrap:
         assert "-H" in argv
         i = argv.index("-u")
         assert argv[i + 1] == "ci-fake-user"
-        # KAI_WEBHOOK_SECRET and TMPDIR preserved through sudo's env_reset.
-        assert any(
-            arg.startswith("--preserve-env=") and "KAI_WEBHOOK_SECRET" in arg and "TMPDIR" in arg for arg in argv
-        )
+        # Exact preserve CSV: the webhook secret and TMPDIR anchor,
+        # plus the auth / endpoint vars mirroring the one-shot wrap
+        # (CODEX_HOME, OPENAI_API_KEY, OPENAI_BASE_URL) so env-key
+        # auth and custom-endpoint routing behave the same on the
+        # chat leg as on extraction / review / triage.
+        assert "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR,CODEX_HOME,OPENAI_API_KEY,OPENAI_BASE_URL" in argv
         # Codex binary follows the sudo prologue.
         codex_i = argv.index("codex")
         assert argv[codex_i + 1] == "app-server"
