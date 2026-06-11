@@ -7168,12 +7168,14 @@ class TestApplySudoersDryRun:
         assert "the claude sudoers rule" in captured.err
         assert "the opencode sudoers rule" not in captured.err
 
-    def test_goose_only_install_warns_about_nothing(self, tmp_path, capsys, monkeypatch):
-        """A goose-only install with os_users gets no missing-binary
-        warning at all: the backstop's binary map deliberately omits
-        goose because goose has no per-user sudoers rule (it always
-        runs as the service user), so there is no pinned binary path
-        that can drift out of sync with a rule."""
+    def test_goose_only_install_missing_binary_names_goose_bin(self, tmp_path, capsys, monkeypatch):
+        """A goose-only install with os_users warns when the goose
+        binary path does not exist, and the remedy names GOOSE_BIN:
+        goose now has a per-user sudoers rule with a pinned path, so
+        the backstop covers it the same way it covers the other
+        backends. The path is passed explicitly (never the host
+        fallback) so the assertion cannot flip on whether the test
+        host happens to have goose installed."""
         svc_home = tmp_path / "home" / "kai"
         svc_home.mkdir(parents=True)
         monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
@@ -7184,6 +7186,37 @@ class TestApplySudoersDryRun:
             "kai",
             dry_run=True,
             users_yaml_path=users_yaml,
+            goose_bin=str(tmp_path / "nope" / "goose"),
+            agent_backend="goose",
+        )
+
+        captured = capsys.readouterr()
+        assert "the goose sudoers rule" in captured.err
+        assert "GOOSE_BIN" in captured.err
+        # Scoping: a goose-only install must not be told about the
+        # other backends' binaries.
+        assert "the claude sudoers rule" not in captured.err
+        assert "the codex sudoers rule" not in captured.err
+
+    def test_goose_only_install_with_present_binary_warns_about_nothing(self, tmp_path, capsys, monkeypatch):
+        """A goose-only install whose pinned goose path exists gets no
+        missing-binary warning. Deterministic counterpart to the
+        missing-binary case above: the binary is a real executable
+        under tmp_path, so the check cannot depend on host state."""
+        svc_home = tmp_path / "home" / "kai"
+        svc_home.mkdir(parents=True)
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 1\n    os_user: alice\n")
+        goose = tmp_path / "goose"
+        goose.write_text("#!/bin/sh\necho hi\n")
+        goose.chmod(0o755)
+
+        _apply_sudoers(
+            "kai",
+            dry_run=True,
+            users_yaml_path=users_yaml,
+            goose_bin=str(goose),
             agent_backend="goose",
         )
 
