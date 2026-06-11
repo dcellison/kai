@@ -50,6 +50,7 @@ from kai.install import (
     _start_service,
     _stop_service,
     _user_home,
+    _users_yaml_agent_backends,
     _users_yaml_goose_providers,
     _validate_chat_id,
     _validate_display_name,
@@ -8880,16 +8881,19 @@ class TestWizardPerUserGooseProviderKeys:
 
     def test_peruser_goose_entry_prompts_for_key(self, tmp_path, monkeypatch, capsys):
         """Global claude install with a per-user goose+deepseek entry:
-        the wizard prompts for DEEPSEEK_API_KEY (inserted right after
-        the backend slot in the input chain) and emits it to env."""
+        the wizard prompts for DEEPSEEK_API_KEY and then the goose
+        binary path (both inserted right after the backend slot in
+        the input chain) and emits both to env."""
         self._setup(monkeypatch, tmp_path, self.GOOSE_DEEPSEEK_USERS_YAML)
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
         i = inputs.index("claude")
-        inputs = inputs[: i + 1] + ["sk-ds-peruser"] + inputs[i + 1 :]
+        inputs = inputs[: i + 1] + ["sk-ds-peruser", "/opt/homebrew/bin/goose"] + inputs[i + 1 :]
 
         env = self._run(monkeypatch, tmp_path, inputs)
 
         assert env["DEEPSEEK_API_KEY"] == "sk-ds-peruser"
+        assert env["GOOSE_BIN"] == "/opt/homebrew/bin/goose"
         out = capsys.readouterr().out
         assert "goose entry on deepseek" in out
         assert "DEEPSEEK_API_KEY" in out
@@ -8966,3 +8970,142 @@ class TestWizardPerUserGooseProviderKeys:
         env = self._run(monkeypatch, tmp_path, TestCmdConfigDefaultModelDispatch._inputs_for_codex_subscription())
 
         assert "OPENAI_API_KEY" not in env
+
+
+# ── Per-user backend binary collection ───────────────────────────────
+
+
+class TestUsersYamlAgentBackends:
+    """Direct tests for the wizard's per-user backend scan; parsing
+    and degrade behavior are shared with `_users_yaml_entries`."""
+
+    @staticmethod
+    def _write(tmp_path, content: str) -> Path:
+        p = tmp_path / "users.yaml"
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_collects_distinct_backends(self, tmp_path):
+        p = self._write(
+            tmp_path,
+            "users:\n"
+            "  - telegram_id: 1\n    name: a\n    agent_backend: goose\n"
+            "  - telegram_id: 2\n    name: b\n    agent_backend: codex\n"
+            "  - telegram_id: 3\n    name: c\n    agent_backend: codex\n"
+            "  - telegram_id: 4\n    name: d\n",
+        )
+        assert _users_yaml_agent_backends(p) == {"goose", "codex"}
+
+    def test_strips_whitespace_skips_non_strings(self, tmp_path):
+        p = self._write(
+            tmp_path,
+            "users:\n  - telegram_id: 1\n    name: a\n    agent_backend: ' codex '\n  - telegram_id: 2\n    name: b\n    agent_backend: 7\n",
+        )
+        assert _users_yaml_agent_backends(p) == {"codex"}
+
+    def test_missing_file_degrades_to_empty(self, tmp_path):
+        assert _users_yaml_agent_backends(tmp_path / "absent.yaml") == set()
+
+    def test_malformed_yaml_degrades_to_empty(self, tmp_path):
+        p = self._write(tmp_path, "users: [unclosed\n")
+        assert _users_yaml_agent_backends(p) == set()
+
+
+class TestWizardPerUserBackendBinaries:
+    """Wizard collection of agent binary paths when per-user entries
+    use a backend other than the global one. Mirrors the provider-key
+    collection: scan users.yaml, prompt only for binaries the global
+    blocks did not already collect, flow into the existing
+    persistence variables."""
+
+    CODEX_USERS_YAML = (
+        "users:\n"
+        "  - telegram_id: 1\n"
+        "    name: alice\n"
+        "    role: admin\n"
+        "  - telegram_id: 2\n"
+        "    name: bob\n"
+        "    agent_backend: codex\n"
+    )
+    PLAIN_USERS_YAML = "users:\n  - telegram_id: 1\n    name: alice\n    role: admin\n"
+
+    @staticmethod
+    def _setup(monkeypatch, tmp_path, users_yaml: str, existing_env: dict | None = None) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        TestCmdConfig._simulate_existing_etc_users_yaml(monkeypatch, users_yaml)
+        monkeypatch.setattr(
+            "kai.install._prompt_default_model",
+            lambda backend, prov, default: "sonnet",
+        )
+        if existing_env is not None:
+            (tmp_path / "install.conf").write_text(json.dumps({"env": existing_env, "version": 1}))
+
+    @staticmethod
+    def _run(monkeypatch, tmp_path, inputs: list[str]) -> dict:
+        feed = iter(inputs)
+        monkeypatch.setattr("builtins.input", lambda prompt: next(feed))
+        _cmd_config()
+        return json.loads((tmp_path / "install.conf").read_text())["env"]
+
+    def test_peruser_codex_entry_prompts_for_binary(self, tmp_path, monkeypatch, capsys):
+        """Global claude install with a per-user codex entry: the
+        wizard prompts for the codex binary path and CODEX_BIN lands
+        in env, so the fail-closed extraction gate can resolve codex
+        at startup. This is the incident shape: per-user codex on a
+        non-codex global install previously had no collection path
+        and the daemon exited at boot."""
+        self._setup(monkeypatch, tmp_path, self.CODEX_USERS_YAML)
+        monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
+        inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
+        i = inputs.index("claude")
+        inputs = inputs[: i + 1] + ["/per-user/npm/bin/codex"] + inputs[i + 1 :]
+
+        env = self._run(monkeypatch, tmp_path, inputs)
+
+        assert env["CODEX_BIN"] == "/per-user/npm/bin/codex"
+        assert "codex entry" in capsys.readouterr().out
+
+    def test_global_codex_does_not_reprompt(self, tmp_path, monkeypatch):
+        """Global codex install with a per-user codex entry: the
+        global block already collected codex_bin, so the per-user
+        block must not prompt again (the unmodified codex chain is
+        consumed exactly)."""
+        self._setup(monkeypatch, tmp_path, self.CODEX_USERS_YAML)
+        monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
+
+        env = self._run(monkeypatch, tmp_path, TestCmdConfigDefaultModelDispatch._inputs_for_codex_subscription())
+
+        assert env["CODEX_BIN"] == "/usr/local/bin/codex"
+
+    def test_plain_users_yaml_no_binary_prompt(self, tmp_path, monkeypatch):
+        """No per-user backend entries: the unmodified claude chain is
+        consumed exactly and no binary key lands in env."""
+        self._setup(monkeypatch, tmp_path, self.PLAIN_USERS_YAML)
+
+        env = self._run(monkeypatch, tmp_path, TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend())
+
+        assert "CODEX_BIN" not in env
+        assert "GOOSE_BIN" not in env
+        assert "OPENCODE_BIN" not in env
+
+    def test_stored_binary_offered_as_default(self, tmp_path, monkeypatch):
+        """Re-run with a stored CODEX_BIN: the prompt fires again for
+        the still-present codex entry and pressing Enter keeps the
+        stored path."""
+        self._setup(
+            monkeypatch,
+            tmp_path,
+            self.CODEX_USERS_YAML,
+            existing_env={"TELEGRAM_BOT_TOKEN": "fake-token", "CODEX_BIN": "/stored/bin/codex"},
+        )
+        monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
+        inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
+        i = inputs.index("claude")
+        # Empty answer accepts the prompt default (the stored path).
+        inputs = inputs[: i + 1] + [""] + inputs[i + 1 :]
+
+        env = self._run(monkeypatch, tmp_path, inputs)
+
+        assert env["CODEX_BIN"] == "/stored/bin/codex"

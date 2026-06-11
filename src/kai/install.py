@@ -494,33 +494,23 @@ def _read_users_yaml_text(path: Path) -> str | None:
     return result.stdout
 
 
-def _users_yaml_goose_providers(users_yaml_path: Path, global_provider: str) -> list[str]:
+def _users_yaml_entries(users_yaml_path: Path) -> list[dict]:
     """
-    Collect the distinct providers per-user goose entries need API
-    keys for.
+    Read the canonical users.yaml and return its well-formed user
+    entries for wizard-side scans.
 
-    Reads the canonical users.yaml via `_read_users_yaml_text` (sudo-
-    tolerant on protected installs) and returns the sorted set of
-    `llm_provider` values across entries whose `agent_backend` is
-    "goose", falling back to `global_provider` for entries that omit
-    the field - the same cascade the runtime applies. Goose is the
-    only backend whose per-user auth rides the daemon environment:
-    claude, codex, and opencode authenticate via per-OS-user on-disk
-    state managed outside the wizard, so entries on those backends
-    contribute nothing here.
-
-    A missing, unreadable, or malformed users.yaml degrades to an
-    empty list: the wizard then behaves as it does without per-user
-    goose entries, and the runtime's own users.yaml validation
-    surfaces any real misconfiguration at startup.
+    Reads via `_read_users_yaml_text` (sudo-tolerant on protected
+    installs) because the wizard runs as the operator account. A
+    missing, unreadable, or malformed file, a non-dict document, a
+    missing or non-list `users` key, and non-dict list items all
+    degrade to an empty result: wizard scans must never crash
+    mid-flow on user-owned YAML, and the runtime's own users.yaml
+    validation surfaces any real misconfiguration at startup.
 
     Deliberately NOT built on `_collect_backends_from_yaml`: that
     sibling serves `_apply_sudoers` (apply side), reads the file
-    directly as root, raises on malformed YAML so the install fails
-    loudly, and returns backends without the provider pairing this
-    prompt needs. The wizard side runs as the operator account
-    (hence the sudo-tolerant reader) and must degrade rather than
-    crash mid-flow.
+    directly as root, and raises on malformed YAML so the install
+    fails loudly - the opposite degrade posture from the wizard.
     """
     raw = _read_users_yaml_text(users_yaml_path)
     if raw is None:
@@ -534,16 +524,54 @@ def _users_yaml_goose_providers(users_yaml_path: Path, global_provider: str) -> 
     users = data.get("users")
     if not isinstance(users, list):
         return []
+    return [entry for entry in users if isinstance(entry, dict)]
+
+
+def _users_yaml_goose_providers(users_yaml_path: Path, global_provider: str) -> list[str]:
+    """
+    Collect the distinct providers per-user goose entries need API
+    keys for.
+
+    Returns the sorted set of `llm_provider` values across entries
+    whose `agent_backend` is "goose", falling back to
+    `global_provider` for entries that omit the field - the same
+    cascade the runtime applies. Goose is the only backend whose
+    per-user auth rides the daemon environment: claude, codex, and
+    opencode authenticate via per-OS-user on-disk state managed
+    outside the wizard, so entries on those backends contribute
+    nothing here. Parsing and degrade behavior live in
+    `_users_yaml_entries` (empty result on any malformed input).
+    """
     providers: set[str] = set()
-    for entry in users:
-        if not isinstance(entry, dict):
-            continue
+    for entry in _users_yaml_entries(users_yaml_path):
         if entry.get("agent_backend") != "goose":
             continue
         provider = entry.get("llm_provider") or global_provider
         if isinstance(provider, str) and provider:
             providers.add(provider)
     return sorted(providers)
+
+
+def _users_yaml_agent_backends(users_yaml_path: Path) -> set[str]:
+    """
+    Collect the distinct per-user `agent_backend` values for
+    wizard-side binary collection.
+
+    A users.yaml entry on a non-global backend makes that backend's
+    binary load-bearing at runtime (the chat spawn and the per-user
+    memory-extraction dispatch both route by each user's effective
+    backend, and the fail-closed startup gate refuses to boot when
+    an extraction-eligible user routes to an unresolvable binary),
+    so the wizard must know which backends are in play beyond the
+    global one. Parsing and degrade behavior live in
+    `_users_yaml_entries` (empty result on any malformed input).
+    """
+    backends: set[str] = set()
+    for entry in _users_yaml_entries(users_yaml_path):
+        backend = entry.get("agent_backend")
+        if isinstance(backend, str) and backend.strip():
+            backends.add(backend.strip())
+    return backends
 
 
 # ── Config subcommand ────────────────────────────────────────────────
@@ -1062,6 +1090,59 @@ def _cmd_config() -> None:
         )
     if extra_provider_keys:
         print()
+
+    # Per-user entries on a non-global backend make that backend's
+    # binary load-bearing: the chat spawn and the per-user memory-
+    # extraction dispatch both route by each user's effective
+    # backend, and the fail-closed startup gate refuses to boot when
+    # an extraction-eligible user routes to an unresolvable binary.
+    # The blocks above collect a binary only for the global backend,
+    # so collect here for every other backend per-user entries put
+    # in play; the values flow into the same codex_bin / opencode_bin
+    # / goose_bin variables, so the existing persistence (env var,
+    # install.conf, sudoers SETENV rule) needs no new emission sites.
+    # Claude is exempt: it has no *_BIN wizard surface and resolves
+    # through the service PATH the launchd plist pins. Prompt loops
+    # mirror the global blocks, including each backend's default
+    # posture (codex falls back to Homebrew; goose and opencode
+    # force an explicit path when `which` finds nothing).
+    peruser_backends = _users_yaml_agent_backends(users_yaml_path)
+    if "codex" in peruser_backends and not codex_bin:
+        print("  users.yaml has a codex entry; the daemon needs a resolvable codex binary.")
+        while True:
+            which_codex = shutil.which("codex") or "/opt/homebrew/bin/codex"
+            codex_bin = _prompt(
+                "Codex binary path",
+                existing_env.get("CODEX_BIN", which_codex),
+                required=True,
+            )
+            if _validate_codex_bin(codex_bin):
+                break
+            print(f"  Path '{codex_bin}' does not exist or is not executable.")
+    if "opencode" in peruser_backends and not opencode_bin:
+        print("  users.yaml has an opencode entry; the daemon needs a resolvable opencode binary.")
+        while True:
+            which_opencode = shutil.which("opencode") or ""
+            opencode_bin = _prompt(
+                "OpenCode binary path",
+                existing_env.get("OPENCODE_BIN", which_opencode),
+                required=True,
+            )
+            if _validate_opencode_bin(opencode_bin):
+                break
+            print(f"  Path '{opencode_bin}' does not exist or is not executable.")
+    if "goose" in peruser_backends and not goose_bin:
+        print("  users.yaml has a goose entry; the daemon needs a resolvable goose binary.")
+        while True:
+            which_goose = shutil.which("goose") or ""
+            goose_bin = _prompt(
+                "Goose binary path",
+                existing_env.get("GOOSE_BIN", which_goose),
+                required=True,
+            )
+            if _validate_goose_bin(goose_bin):
+                break
+            print(f"  Path '{goose_bin}' does not exist or is not executable.")
 
     # -- Agent --
     # DEFAULT_MODEL and AGENT_TIMEOUT_SECONDS are
