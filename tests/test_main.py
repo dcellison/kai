@@ -336,3 +336,47 @@ class TestFileCleanupLoop:
         # Error was logged
         mock_log.assert_called()
         # Should not raise - error is counted, not propagated
+
+
+# ── main() startup-error choke point ─────────────────────────────────
+
+
+class TestMainStartupErrorLogging:
+    """main()'s SystemExit choke point mirrors fail-closed gate
+    messages into the standard logger. Without it the message reaches
+    only stderr, which launchd redirects away from the main log, so a
+    gate exit reads as a hang to anyone tailing kai.log."""
+
+    def test_gate_message_logged_critical(self, caplog, monkeypatch):
+        from kai.main import main
+
+        monkeypatch.setattr("kai.main.setup_logging", lambda: None)
+        monkeypatch.setattr(
+            "kai.main.load_config",
+            lambda: (_ for _ in ()).throw(SystemExit("codex binary unreachable")),
+        )
+
+        with caplog.at_level(logging.CRITICAL), pytest.raises(SystemExit, match="codex binary unreachable"):
+            main()
+
+        assert any(
+            r.levelno == logging.CRITICAL and "codex binary unreachable" in r.getMessage() for r in caplog.records
+        )
+
+    @pytest.mark.parametrize("code", [None, 0, 2])
+    def test_clean_or_numeric_exits_stay_silent(self, caplog, monkeypatch, code):
+        """SystemExit with no message (clean shutdowns, numeric exit
+        codes) must not produce a CRITICAL line; only the string-
+        message gate exits carry a diagnostic worth mirroring."""
+        from kai.main import main
+
+        monkeypatch.setattr("kai.main.setup_logging", lambda: None)
+        monkeypatch.setattr(
+            "kai.main.load_config",
+            lambda: (_ for _ in ()).throw(SystemExit(code)),
+        )
+
+        with caplog.at_level(logging.CRITICAL), pytest.raises(SystemExit):
+            main()
+
+        assert not [r for r in caplog.records if r.levelno == logging.CRITICAL]

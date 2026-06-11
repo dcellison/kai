@@ -187,13 +187,37 @@ def main() -> None:
     """
     Top-level entry point for the Kai bot.
 
-    Sets up logging, loads configuration, and delegates to an async
-    initialization function that manages the full application lifecycle.
-    Catches KeyboardInterrupt for clean Ctrl+C shutdown and logs any
-    unexpected crashes.
+    Sets up logging, then delegates the entire startup and run
+    lifecycle to `_start` under a single SystemExit choke point: the
+    fail-closed startup gates (config validation, binary resolution,
+    users.yaml validation) raise SystemExit with an actionable
+    message, but that text only reaches stderr, which launchd
+    redirects to a separate file. Without the CRITICAL re-log, the
+    main log ends mid-startup with no explanation and a gate exit
+    reads as a hang to anyone tailing it. The re-raise keeps the
+    exit code and stderr behavior unchanged; clean exits (None or
+    integer codes) stay silent.
     """
     setup_logging()
 
+    try:
+        _start()
+    except SystemExit as e:
+        if isinstance(e.code, str) and e.code.strip():
+            logging.critical("Startup failed: %s", e.code)
+        raise
+
+
+def _start() -> None:
+    """
+    Load configuration and run the application lifecycle.
+
+    Loads configuration, then delegates to an async initialization
+    function that manages the full application lifecycle. Catches
+    KeyboardInterrupt for clean Ctrl+C shutdown and logs any
+    unexpected crashes. SystemExit propagates to `main`'s choke
+    point, which mirrors gate messages into the main log.
+    """
     config = load_config()
     logging.info("Kai starting (model=%s, users=%s)", config.default_model, config.allowed_user_ids)
 
