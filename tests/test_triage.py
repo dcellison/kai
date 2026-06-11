@@ -1,10 +1,7 @@
 """Tests for triage.py issue triage pipeline."""
 
 import json
-import os
-import pwd
 import re
-import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -302,34 +299,50 @@ class TestListProjects:
 # ── run_triage ──────────────────────────────────────────────────────
 
 
-class TestRunTriage:
-    @pytest.mark.asyncio
-    async def test_success(self):
-        """Successful Claude run returns stripped output."""
-        expected = '{"labels": ["bug"], "summary": "A bug."}'
-        mock_proc = _mock_subprocess(stdout=f"  {expected}  \n")
+class TestRunTriageClaudeDispatch:
+    """
+    `run_triage` with the default claude backend dispatches to
+    `ClaudeOneShotReasoner` (NOT an inline `claude --print` spawn).
+    The reasoner owns binary resolution, the free-form plain-text
+    argv, per-user os_user routing, and the allow-listed subprocess
+    env; this class pins the dispatch contract: ctor kwargs, registry
+    model resolution, override pass-through, raw-text return, and
+    the collapse of typed reasoner errors to RuntimeError.
+    """
 
-        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc):
-            result = await run_triage("test prompt")
-        assert result == expected
+    @staticmethod
+    def _fake_reasoner(text='{"labels": []}'):
+        from kai.oneshot import OneShotResult
+
+        fake = MagicMock()
+        fake.run = AsyncMock(return_value=OneShotResult(text=text, backend="claude", model="sonnet"))
+        return fake
 
     @pytest.mark.asyncio
-    async def test_claude_argv_uses_registry_model(self):
-        """
-        With agent_backend=claude and no env override, the --model
-        argv slot matches the registry's (claude, ISSUE_TRIAGE) row.
-        Locks the Phase 1 byte-identical invariant at the call site:
-        Phase 1 removed the _TRIAGE_MODEL constant, so this test is
-        the place the resolved string is observable.
-        """
-        mock_proc = _mock_subprocess(returncode=0, stdout='{"labels": []}')
-        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_triage("prompt", agent_backend="claude")
-        cmd = mock_exec.call_args[0]
-        # --model is followed immediately by the model identifier in
-        # the argv vector; index +1 gives the actual model string.
-        i = cmd.index("--model")
-        assert cmd[i + 1] == "sonnet"
+    async def test_run_triage_dispatches_to_claude_reasoner(self):
+        """The claude branch builds a ClaudeOneShotReasoner with the
+        os_user threaded through, awaits its run with the registry
+        model in free-form mode, and returns the reasoner's text."""
+        fake = self._fake_reasoner(text='{"labels": ["bug"], "summary": "A bug."}')
+
+        with (
+            patch("kai.triage.ClaudeOneShotReasoner", return_value=fake) as ctor,
+            patch("kai.triage.asyncio.create_subprocess_exec") as mock_exec,
+        ):
+            result = await run_triage("triage prompt", claude_user="someone")
+
+        assert result == '{"labels": ["bug"], "summary": "A bug."}'
+        ctor.assert_called_once()
+        assert ctor.call_args.kwargs == {"os_user": "someone"}
+        fake.run.assert_awaited_once()
+        run_kwargs = fake.run.call_args.kwargs
+        assert run_kwargs["prompt"] == "triage prompt"
+        assert run_kwargs["model"] == "sonnet"
+        assert run_kwargs["purpose"] == "issue_triage"
+        # Free-form mode: no json_schema kwarg reaches the reasoner;
+        # triage's downstream parser owns the JSON contract.
+        assert "json_schema" not in run_kwargs
+        mock_exec.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_model_override_param_wins_over_registry_default(self):
@@ -341,141 +354,38 @@ class TestRunTriage:
         `models.issue_triage` reach dispatch without the historic
         ISSUE_TRIAGE_MODEL_CLAUDE env-var read at the call site.
         """
-        mock_proc = _mock_subprocess(returncode=0, stdout='{"labels": []}')
-        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_triage("prompt", agent_backend="claude", model_override="opus")
-        cmd = mock_exec.call_args[0]
-        i = cmd.index("--model")
-        assert cmd[i + 1] == "opus"
+        fake = self._fake_reasoner()
+
+        with patch("kai.triage.ClaudeOneShotReasoner", return_value=fake):
+            await run_triage("prompt", model_override="opus")
+
+        assert fake.run.call_args.kwargs["model"] == "opus"
 
     @pytest.mark.asyncio
-    async def test_timeout(self):
-        """Timed-out subprocess raises RuntimeError and kills the process."""
-        mock_proc = AsyncMock()
-        mock_proc.pid = 12345
-        mock_proc.communicate = AsyncMock(side_effect=TimeoutError)
-        mock_proc.kill = AsyncMock()
-        mock_proc.wait = AsyncMock()
+    async def test_run_triage_collapses_oneshot_timeout_to_runtime_error(self):
+        from kai.oneshot import OneShotTimeout
+
+        fake = MagicMock()
+        fake.run = AsyncMock(side_effect=OneShotTimeout())
 
         with (
-            patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc),
-            pytest.raises(RuntimeError, match="timed out"),
+            patch("kai.triage.ClaudeOneShotReasoner", return_value=fake),
+            pytest.raises(RuntimeError, match=r"Triage subprocess timed out"),
         ):
-            await run_triage("test prompt")
-        mock_proc.kill.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_timeout_with_claude_user_kills_group(self):
-        """Timeout with claude_user kills the process group."""
-        mock_proc = AsyncMock()
-        mock_proc.pid = 12345
-        mock_proc.communicate = AsyncMock(side_effect=TimeoutError)
-        mock_proc.wait = AsyncMock()
-
-        with (
-            patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc),
-            patch("kai.triage.os.killpg") as mock_killpg,
-            # Ensure resolve_claude_user doesn't skip sudo on this machine
-            patch("kai.config.pwd.getpwuid", return_value=MagicMock(pw_name="notkai")),
-            pytest.raises(RuntimeError, match="timed out"),
-        ):
-            await run_triage("test prompt", claude_user="kai")
-
-        mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
-        mock_proc.wait.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_claude_user_starts_new_session(self):
-        """claude_user spawns with start_new_session=True."""
-        mock_proc = _mock_subprocess(returncode=0, stdout='{"labels": []}')
-
-        with (
-            patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
-            patch("kai.config.pwd.getpwuid", return_value=MagicMock(pw_name="notkai")),
-        ):
-            await run_triage("prompt", claude_user="kai")
-
-        kwargs = mock_exec.call_args[1]
-        assert kwargs.get("start_new_session") is True
-
-    @pytest.mark.asyncio
-    async def test_no_claude_user_no_new_session(self):
-        """Without claude_user, start_new_session is False."""
-        mock_proc = _mock_subprocess(returncode=0, stdout='{"labels": []}')
-
-        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
             await run_triage("prompt")
 
-        kwargs = mock_exec.call_args[1]
-        assert kwargs.get("start_new_session") is False
-
     @pytest.mark.asyncio
-    async def test_self_sudo_skipped(self):
-        """When claude_user matches bot user, triage skips sudo."""
-        try:
-            current_user = pwd.getpwuid(os.getuid()).pw_name
-        except KeyError:
-            pytest.skip("UID has no passwd entry")
-        mock_proc = _mock_subprocess(returncode=0, stdout='{"labels": [], "priority": "low", "summary": "test"}')
+    async def test_run_triage_collapses_oneshot_error_to_runtime_error(self):
+        from kai.oneshot import OneShotSubprocessError
 
-        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_triage("prompt", claude_user=current_user)
-
-        cmd = mock_exec.call_args[0]
-        assert cmd[0] != "sudo", "Self-sudo should be skipped"
-        assert cmd[0] == "claude"
-        kwargs = mock_exec.call_args[1]
-        assert kwargs["start_new_session"] is False
-
-    @pytest.mark.asyncio
-    async def test_self_sudo_timeout_kills_directly(self):
-        """When self-sudo is skipped, timeout kills proc directly (not killpg)."""
-        try:
-            current_user = pwd.getpwuid(os.getuid()).pw_name
-        except KeyError:
-            pytest.skip("UID has no passwd entry")
-        mock_proc = AsyncMock()
-        mock_proc.pid = 12345
-        mock_proc.wait = AsyncMock()
+        fake = MagicMock()
+        fake.run = AsyncMock(side_effect=OneShotSubprocessError(returncode=1, stderr=b"model error"))
 
         with (
-            patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc),
-            patch("kai.triage.asyncio.wait_for", side_effect=TimeoutError()),
-            patch("kai.triage.os.killpg") as mock_killpg,
-            pytest.raises(RuntimeError, match="timed out"),
+            patch("kai.triage.ClaudeOneShotReasoner", return_value=fake),
+            pytest.raises(RuntimeError, match=r"Claude triage failed"),
         ):
-            await run_triage("prompt", claude_user=current_user)
-
-        # Should kill the process directly, not the process group
-        mock_proc.kill.assert_called_once()
-        mock_killpg.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_nonzero_exit(self):
-        """Non-zero exit code raises RuntimeError."""
-        mock_proc = _mock_subprocess(returncode=1, stderr="model error")
-
-        with (
-            patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc),
-            pytest.raises(RuntimeError, match="exit 1"),
-        ):
-            await run_triage("test prompt")
-
-    @pytest.mark.asyncio
-    async def test_claude_user_sudo(self):
-        """When claude_user is set, command starts with sudo -H -u."""
-        mock_proc = _mock_subprocess(stdout='{"labels": []}')
-
-        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_triage("prompt", claude_user="testuser")
-
-        # First args should be sudo -H -u testuser --
-        args = mock_exec.call_args[0]
-        assert args[0] == "sudo"
-        assert args[1] == "-H"
-        assert args[2] == "-u"
-        assert args[3] == "testuser"
-        assert args[4] == "--"
+            await run_triage("prompt")
 
 
 # ── run_triage (Goose backend) ─────────────────────────────────────
@@ -588,15 +498,18 @@ class TestRunTriageGooseDispatch:
 
     @pytest.mark.asyncio
     async def test_default_backend_is_claude(self):
-        """Calling run_triage with no backend args still uses Claude."""
-        mock_proc = _mock_subprocess(stdout='{"labels": []}')
+        """Calling run_triage with no backend args still uses Claude
+        (dispatching to ClaudeOneShotReasoner, not goose)."""
+        from kai.oneshot import OneShotResult
 
-        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+        fake = MagicMock()
+        fake.run = AsyncMock(return_value=OneShotResult(text='{"labels": []}', backend="claude", model="sonnet"))
+
+        with patch("kai.triage.ClaudeOneShotReasoner", return_value=fake) as ctor:
             await run_triage("prompt")
 
-        cmd = mock_exec.call_args[0]
-        assert cmd[0] == "claude"
-        assert "--print" in cmd
+        ctor.assert_called_once()
+        fake.run.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_empty_provider_raises(self):
@@ -668,91 +581,65 @@ class TestRunTriageOpenCodeDispatch:
             await run_triage("prompt", agent_backend="opencode", provider="anthropic")
 
 
-class TestRunTriageCodex:
+class TestRunTriageCodexDispatch:
     """
-    Tests for the codex branch of run_triage.
-
-    The codex branch invokes `codex exec --json` and parses NDJSON
-    output via extract_codex_text. No sudo wrap; subscription auth
-    uses the service user's own ~/.codex/auth.json.
+    `run_triage` with `agent_backend="codex"` dispatches to
+    `CodexOneShotReasoner` (NOT an inline `codex exec` spawn). The
+    reasoner owns the `codex exec --json` argv, CODEX_BIN resolution,
+    per-user os_user routing, the allow-listed subprocess env, and
+    the NDJSON event walk; this class pins the dispatch contract:
+    ctor kwargs (no join_items override, so last-wins extraction
+    protects the one-JSON-object contract), registry model
+    resolution, override pass-through, raw-text return, and the
+    collapse of typed reasoner errors to RuntimeError.
     """
 
     @staticmethod
-    def _codex_ndjson(text: str) -> str:
-        """
-        Build a minimal NDJSON stream that mirrors the real
-        `codex exec --json` schema (codex-rs/exec/src/exec_events.rs):
-        each event has a top-level `type` tag; item.completed for an
-        agent_message item carries the full consolidated `text`.
-        """
-        events = [
-            {"type": "thread.started", "thread_id": "thr_test"},
-            {"type": "turn.started"},
-            {
-                "type": "item.completed",
-                "item": {"id": "item_1", "type": "agent_message", "text": text},
-            },
-            {"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}},
-        ]
-        return "\n".join(json.dumps(e) for e in events) + "\n"
+    def _fake_reasoner(text='{"labels": []}'):
+        from kai.oneshot import OneShotResult
+
+        fake = MagicMock()
+        fake.run = AsyncMock(return_value=OneShotResult(text=text, backend="codex", model="gpt-5.5"))
+        return fake
 
     @pytest.mark.asyncio
-    async def test_codex_argv_uses_codex_exec(self):
-        """
-        Argv is `codex exec --json --model <model>`, never claude or
-        goose. Locks the "no overlap" guarantee at the subprocess
-        boundary: the codex triage branch never spawns claude.
-        """
-        mock_proc = _mock_subprocess(stdout=self._codex_ndjson('{"labels": []}'))
+    async def test_run_triage_dispatches_to_codex_reasoner(self):
+        """The codex branch builds a CodexOneShotReasoner with the
+        os_user threaded through, awaits its run with the registry
+        model, and returns the reasoner's text."""
+        fake = self._fake_reasoner(text='{"labels": ["bug"], "summary": "A bug."}')
+
         with (
-            patch.dict(os.environ, {}, clear=False),
-            patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
+            patch("kai.triage.CodexOneShotReasoner", return_value=fake) as ctor,
+            patch("kai.triage.asyncio.create_subprocess_exec") as mock_exec,
         ):
-            os.environ.pop("CODEX_BIN", None)
-            await run_triage("prompt", agent_backend="codex")
-        cmd = mock_exec.call_args[0]
-        assert cmd[0] == "codex"
-        assert cmd[1] == "exec"
-        assert "--json" in cmd
-        # `--skip-git-repo-check` is load-bearing: codex exec refuses
-        # to spawn unless the cwd is on the user's trusted-directories
-        # list or this flag is passed. Production-only initial success
-        # was due to the bot's cwd happening to be trusted.
-        assert "--skip-git-repo-check" in cmd
-        assert "--print" not in cmd  # No claude flag
+            result = await run_triage("triage prompt", agent_backend="codex", claude_user="someone")
+
+        assert result == '{"labels": ["bug"], "summary": "A bug."}'
+        ctor.assert_called_once()
+        assert ctor.call_args.kwargs == {"os_user": "someone"}
+        fake.run.assert_awaited_once()
+        run_kwargs = fake.run.call_args.kwargs
+        assert run_kwargs["prompt"] == "triage prompt"
+        assert run_kwargs["model"] == "gpt-5.5"
+        assert run_kwargs["purpose"] == "issue_triage"
+        mock_exec.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_codex_argv_uses_codex_bin_env_var(self):
+    async def test_join_items_not_passed_keeps_last_wins(self):
         """
-        CODEX_BIN env var overrides bare "codex" in the triage argv.
-        Same install-time lever the persistent backend honors; needed
-        for multi-user installs where codex lives in a per-os_user
-        home not on the service user's PATH.
+        Triage constructs the reasoner WITHOUT join_items, leaving
+        the last-wins default in place: the downstream parser expects
+        exactly one JSON object, and joining a preamble agent_message
+        ahead of the JSON body would corrupt it (review passes
+        join_items=True for its free-form markdown instead).
         """
-        mock_proc = _mock_subprocess(stdout=self._codex_ndjson("{}"))
-        with (
-            patch.dict(os.environ, {"CODEX_BIN": "/Users/daniel/.npm-global/bin/codex"}),
-            patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
-        ):
-            await run_triage("prompt", agent_backend="codex")
-        cmd = mock_exec.call_args[0]
-        assert cmd[0] == "/Users/daniel/.npm-global/bin/codex"
-        assert cmd[1] == "exec"
+        fake = self._fake_reasoner()
 
-    @pytest.mark.asyncio
-    async def test_codex_argv_uses_registry_model(self):
-        """
-        With agent_backend=codex and no override, the --model argv
-        slot matches the registry's (codex, openai, ISSUE_TRIAGE) row
-        (gpt-5.5, the current frontier). Locks the registry as the
-        source of truth for the codex side.
-        """
-        mock_proc = _mock_subprocess(stdout=self._codex_ndjson("{}"))
-        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+        with patch("kai.triage.CodexOneShotReasoner", return_value=fake) as ctor:
             await run_triage("prompt", agent_backend="codex")
-        cmd = mock_exec.call_args[0]
-        i = cmd.index("--model")
-        assert cmd[i + 1] == "gpt-5.5"
+
+        assert "join_items" not in ctor.call_args.kwargs
 
     @pytest.mark.asyncio
     async def test_codex_model_override_param_wins(self):
@@ -762,114 +649,38 @@ class TestRunTriageCodex:
         load-time legacy env-var seeding) wins over the registry
         default the same way it does on the claude branch.
         """
-        mock_proc = _mock_subprocess(stdout=self._codex_ndjson("{}"))
-        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+        fake = self._fake_reasoner()
+
+        with patch("kai.triage.CodexOneShotReasoner", return_value=fake):
             await run_triage("prompt", agent_backend="codex", model_override="gpt-5.4")
-        cmd = mock_exec.call_args[0]
-        i = cmd.index("--model")
-        assert cmd[i + 1] == "gpt-5.4"
+
+        assert fake.run.call_args.kwargs["model"] == "gpt-5.4"
 
     @pytest.mark.asyncio
-    async def test_codex_no_sudo_when_user_unset(self):
-        """
-        With no claude_user passed, codex runs as the bot process user
-        directly: argv begins with "codex", no "sudo" wrap.
-        """
-        mock_proc = _mock_subprocess(stdout=self._codex_ndjson("{}"))
-        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_triage("prompt", agent_backend="codex")
-        cmd = mock_exec.call_args[0]
-        assert cmd[0] == "codex"
-        assert "sudo" not in cmd
+    async def test_run_triage_collapses_oneshot_timeout_to_runtime_error(self):
+        from kai.oneshot import OneShotTimeout
 
-    @pytest.mark.asyncio
-    async def test_codex_wraps_sudo_when_user_set(self):
-        """
-        With claude_user set to a non-self user, codex argv is wrapped
-        in `sudo -H -u <user> --preserve-env=KAI_WEBHOOK_SECRET --`.
-        The per-user os_user lever is what makes a multi-user install
-        spawn codex as each user, reading their per-user ~/.codex/auth.json.
+        fake = MagicMock()
+        fake.run = AsyncMock(side_effect=OneShotTimeout())
 
-        The current process user is determined at runtime; this test
-        passes a username that cannot match the test runner's user
-        ("ci-fake-user") so resolve_claude_user does NOT short-circuit
-        to no-sudo. If the test runner happens to actually be named
-        "ci-fake-user", the test would self-sudo-skip; that name is
-        chosen to be implausible enough to avoid the collision.
-        """
-        mock_proc = _mock_subprocess(stdout=self._codex_ndjson("{}"))
-        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_triage("prompt", agent_backend="codex", claude_user="ci-fake-user")
-        cmd = mock_exec.call_args[0]
-        # Sudo wrap is present and points at the target user.
-        assert cmd[0] == "sudo"
-        assert "-H" in cmd
-        i = cmd.index("-u")
-        assert cmd[i + 1] == "ci-fake-user"
-        # KAI_WEBHOOK_SECRET preserved through sudo's env_reset.
-        assert any(arg.startswith("--preserve-env=") and "KAI_WEBHOOK_SECRET" in arg for arg in cmd)
-        # Codex binary still gets invoked after the sudo wrap.
-        assert "codex" in cmd
-        codex_i = cmd.index("codex")
-        assert cmd[codex_i + 1] == "exec"
-
-    @pytest.mark.asyncio
-    async def test_codex_extracts_final_text_from_ndjson(self):
-        """
-        Return value is the agent message text extracted from the
-        NDJSON event stream, not the raw stdout. The downstream
-        _parse_triage_json receives a single JSON object, not
-        multi-line NDJSON.
-        """
-        expected_json = '{"labels": ["bug"], "summary": "A bug."}'
-        mock_proc = _mock_subprocess(stdout=self._codex_ndjson(expected_json))
-        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc):
-            result = await run_triage("prompt", agent_backend="codex")
-        # extract_codex_text strips, so the result is the expected
-        # JSON string with no leading/trailing whitespace.
-        assert result == expected_json
-
-    @pytest.mark.asyncio
-    async def test_codex_subprocess_failure_raises(self):
-        """Non-zero exit from codex raises RuntimeError with stderr."""
-        mock_proc = _mock_subprocess(returncode=1, stderr="auth failed")
         with (
-            patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc),
-            pytest.raises(RuntimeError, match="auth failed"),
+            patch("kai.triage.CodexOneShotReasoner", return_value=fake),
+            pytest.raises(RuntimeError, match=r"Triage subprocess timed out"),
         ):
             await run_triage("prompt", agent_backend="codex")
 
     @pytest.mark.asyncio
-    async def test_codex_completed_supersedes_updated(self):
-        """
-        End-to-end through run_triage: a stream that contains both
-        item.updated events (interim consolidated text) AND a final
-        item.completed returns the completed text exactly once,
-        parseable by _parse_triage_json.
+    async def test_run_triage_collapses_oneshot_error_to_runtime_error(self):
+        from kai.oneshot import OneShotSubprocessError
 
-        Without the completed-wins rule, the triage path could
-        accumulate or return stale interim text and the downstream
-        parser would fail on every codex run that streams.
-        """
-        expected_json = '{"labels": ["bug"], "summary": "ok"}'
-        events = [
-            {"type": "thread.started", "thread_id": "thr_test"},
-            {"type": "turn.started"},
-            {"type": "item.started", "item": {"id": "i1", "type": "agent_message", "text": ""}},
-            {"type": "item.updated", "item": {"id": "i1", "type": "agent_message", "text": '{"labels":'}},
-            {
-                "type": "item.updated",
-                "item": {"id": "i1", "type": "agent_message", "text": '{"labels": ["bug"], "summa'},
-            },
-            {"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": expected_json}},
-            {"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}},
-        ]
-        stream = "\n".join(json.dumps(e) for e in events) + "\n"
-        mock_proc = _mock_subprocess(stdout=stream)
-        with patch("kai.triage.asyncio.create_subprocess_exec", return_value=mock_proc):
-            result = await run_triage("prompt", agent_backend="codex")
-        # Exactly the completed text, not interim updates concatenated.
-        assert result == expected_json
+        fake = MagicMock()
+        fake.run = AsyncMock(side_effect=OneShotSubprocessError(returncode=1, stderr=b"auth failed"))
+
+        with (
+            patch("kai.triage.CodexOneShotReasoner", return_value=fake),
+            pytest.raises(RuntimeError, match=r"Codex triage failed"),
+        ):
+            await run_triage("prompt", agent_backend="codex")
 
 
 class TestGooseTriageModelResolutionViaRegistry:

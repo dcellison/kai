@@ -1,10 +1,7 @@
 """Tests for review.py PR review agent - metadata, prompts, subprocess, and output."""
 
 import json
-import os
-import pwd
 import re
-import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -496,295 +493,172 @@ class TestFetchPRDiff:
 # ── run_review ──────────────────────────────────────────────────────
 
 
-class TestRunReview:
+class TestRunReviewClaudeDispatch:
+    """
+    `run_review` with the default claude backend dispatches to
+    `ClaudeOneShotReasoner` (NOT an inline `claude --print` spawn).
+    The reasoner owns binary resolution, the free-form plain-text
+    argv, per-user os_user routing, and the allow-listed subprocess
+    env; this class pins the dispatch contract: ctor kwargs, registry
+    model resolution, override and timeout pass-through, raw-text
+    return, and the collapse of typed reasoner errors to
+    RuntimeError.
+    """
+
+    @staticmethod
+    def _fake_reasoner(text="review output"):
+        from kai.oneshot import OneShotResult
+
+        fake = MagicMock()
+        fake.run = AsyncMock(return_value=OneShotResult(text=text, backend="claude", model="sonnet"))
+        return fake
+
     @pytest.mark.asyncio
-    async def test_success(self):
-        """Successful Claude subprocess returns stripped review text."""
-        mock_proc = _mock_process(stdout=b"  Looks good, no issues found.  \n")
+    async def test_run_review_dispatches_to_claude_reasoner(self):
+        """The claude branch builds a ClaudeOneShotReasoner with the
+        os_user threaded through, awaits its run with the registry
+        model in free-form mode, and returns the reasoner's text."""
+        fake = self._fake_reasoner(text="review body from claude")
 
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            result = await run_review("review this code")
+        with (
+            patch("kai.review.ClaudeOneShotReasoner", return_value=fake) as ctor,
+            patch("kai.review.asyncio.create_subprocess_exec") as mock_exec,
+        ):
+            result = await run_review("review prompt", claude_user="someone")
 
-        assert result == "Looks good, no issues found."
-
-        # Verify the command structure: claude --print --model sonnet ...
-        call_args = mock_exec.call_args
-        cmd = call_args[0]
-        assert cmd[0] == "claude"
-        assert "--print" in cmd
-        assert "--model" in cmd
-        assert "sonnet" in cmd
+        assert result == "review body from claude"
+        ctor.assert_called_once()
+        assert ctor.call_args.kwargs == {"os_user": "someone"}
+        fake.run.assert_awaited_once()
+        run_kwargs = fake.run.call_args.kwargs
+        assert run_kwargs["prompt"] == "review prompt"
+        assert run_kwargs["model"] == "sonnet"
+        assert run_kwargs["purpose"] == "pr_review"
+        # Free-form mode: no json_schema kwarg reaches the reasoner,
+        # so the run stays on the plain-text path.
+        assert "json_schema" not in run_kwargs
+        mock_exec.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_model_override_param_wins_over_registry_default(self):
         """
         The `model_override` parameter (resolved by the caller in
-        webhook.py from `user_config.models[role.value]` and the
+        webhook.py from `user_config.models["pr_review"]` and the
         load-time legacy env-var seeding) wins over the registry
         default. Pins the wiring that lets per-user `models.pr_review`
-        reach dispatch without the historic env-var read at the call site.
+        reach dispatch without the historic env-var read at the call
+        site.
         """
-        mock_proc = _mock_process(stdout=b"ok")
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+        fake = self._fake_reasoner()
+
+        with patch("kai.review.ClaudeOneShotReasoner", return_value=fake):
             await run_review("prompt", model_override="opus")
-        cmd = mock_exec.call_args[0]
-        i = cmd.index("--model")
-        assert cmd[i + 1] == "opus"
+
+        assert fake.run.call_args.kwargs["model"] == "opus"
 
     @pytest.mark.asyncio
-    async def test_failure_raises(self):
-        """Non-zero exit from Claude subprocess raises RuntimeError."""
-        mock_proc = _mock_process(stderr=b"model not found", returncode=1)
+    async def test_timeout_s_passes_through_to_reasoner(self):
+        """run_review's timeout_s parameter becomes the reasoner's
+        per-call timeout (review diffs can need a larger cap than
+        the default)."""
+        fake = self._fake_reasoner()
+
+        with patch("kai.review.ClaudeOneShotReasoner", return_value=fake):
+            await run_review("prompt", timeout_s=777)
+
+        assert fake.run.call_args.kwargs["timeout"] == 777
+
+    @pytest.mark.asyncio
+    async def test_run_review_collapses_oneshot_timeout_to_runtime_error(self):
+        from kai.oneshot import OneShotTimeout
+
+        fake = MagicMock()
+        fake.run = AsyncMock(side_effect=OneShotTimeout())
 
         with (
-            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
-            pytest.raises(RuntimeError, match=r"Review subprocess failed.*model not found"),
+            patch("kai.review.ClaudeOneShotReasoner", return_value=fake),
+            pytest.raises(RuntimeError, match=r"Review subprocess timed out"),
         ):
-            await run_review("review this code")
-
-    @pytest.mark.asyncio
-    async def test_timeout_raises(self):
-        """Hanging subprocess is killed and raises RuntimeError."""
-        mock_proc = AsyncMock()
-        mock_proc.pid = 12345
-        # communicate's return value doesn't matter here - wait_for is
-        # patched to raise TimeoutError before communicate is ever called.
-        mock_proc.kill = MagicMock()
-        mock_proc.wait = AsyncMock()
-
-        with (
-            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
-            patch("kai.review.asyncio.wait_for", side_effect=TimeoutError()),
-            pytest.raises(RuntimeError, match="timed out"),
-        ):
-            await run_review("review this code")
-
-        # Without claude_user, kills the process directly
-        mock_proc.kill.assert_called_once()
-        mock_proc.wait.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_timeout_with_claude_user_kills_group(self):
-        """Timeout with claude_user kills the process group, not just sudo."""
-        mock_proc = AsyncMock()
-        mock_proc.pid = 12345
-        mock_proc.wait = AsyncMock()
-
-        with (
-            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
-            patch("kai.review.asyncio.wait_for", side_effect=TimeoutError()),
-            patch("kai.review.os.killpg") as mock_killpg,
-            # Ensure resolve_claude_user doesn't skip sudo on this machine
-            patch("kai.config.pwd.getpwuid", return_value=MagicMock(pw_name="notkai")),
-            pytest.raises(RuntimeError, match="timed out"),
-        ):
-            await run_review("review this code", claude_user="kai")
-
-        # With claude_user, kills the entire process group
-        mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
-        mock_proc.wait.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_claude_user_starts_new_session(self):
-        """claude_user spawns with start_new_session=True for group kill."""
-        mock_proc = _mock_process(stdout=b"review output")
-
-        with (
-            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
-            patch("kai.config.pwd.getpwuid", return_value=MagicMock(pw_name="notkai")),
-        ):
-            await run_review("prompt", claude_user="kai")
-
-        kwargs = mock_exec.call_args[1]
-        assert kwargs.get("start_new_session") is True
-
-    @pytest.mark.asyncio
-    async def test_no_claude_user_no_new_session(self):
-        """Without claude_user, start_new_session is False."""
-        mock_proc = _mock_process(stdout=b"review output")
-
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
             await run_review("prompt")
 
-        kwargs = mock_exec.call_args[1]
-        assert kwargs.get("start_new_session") is False
-
     @pytest.mark.asyncio
-    async def test_with_claude_user(self):
-        """When claude_user is set, command is prefixed with sudo -H -u."""
-        mock_proc = _mock_process(stdout=b"review output")
+    async def test_run_review_collapses_oneshot_error_to_runtime_error(self):
+        from kai.oneshot import OneShotSubprocessError
+
+        fake = MagicMock()
+        fake.run = AsyncMock(side_effect=OneShotSubprocessError(returncode=1, stderr=b"model not found"))
 
         with (
-            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
-            patch("kai.config.pwd.getpwuid", return_value=MagicMock(pw_name="notkai")),
+            patch("kai.review.ClaudeOneShotReasoner", return_value=fake),
+            # The collapsed message must keep the exit code and stderr
+            # detail; this is what reaches the Telegram failure notice.
+            pytest.raises(RuntimeError, match=r"Claude review failed: exit 1: model not found"),
         ):
-            await run_review("prompt", claude_user="kai")
-
-        cmd = mock_exec.call_args[0]
-        assert cmd[:5] == ("sudo", "-H", "-u", "kai", "--")
-        assert "claude" in cmd
-        assert "--print" in cmd
-
-    @pytest.mark.asyncio
-    async def test_without_claude_user(self):
-        """Without claude_user, command starts directly with claude."""
-        mock_proc = _mock_process(stdout=b"review output")
-
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
             await run_review("prompt")
-
-        cmd = mock_exec.call_args[0]
-        assert cmd[0] == "claude"
-        assert "sudo" not in cmd
-
-    @pytest.mark.asyncio
-    async def test_self_sudo_skipped(self):
-        """When claude_user matches bot user, review skips sudo."""
-        try:
-            current_user = pwd.getpwuid(os.getuid()).pw_name
-        except KeyError:
-            pytest.skip("UID has no passwd entry")
-        mock_proc = _mock_process(stdout=b"review output")
-
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_review("prompt", claude_user=current_user)
-
-        cmd = mock_exec.call_args[0]
-        assert cmd[0] != "sudo", "Self-sudo should be skipped"
-        assert cmd[0] == "claude"
-        kwargs = mock_exec.call_args[1]
-        assert kwargs["start_new_session"] is False
-
-    @pytest.mark.asyncio
-    async def test_self_sudo_timeout_kills_directly(self):
-        """When self-sudo is skipped, timeout kills proc directly (not killpg)."""
-        try:
-            current_user = pwd.getpwuid(os.getuid()).pw_name
-        except KeyError:
-            pytest.skip("UID has no passwd entry")
-        mock_proc = AsyncMock()
-        mock_proc.pid = 12345
-        mock_proc.wait = AsyncMock()
-
-        with (
-            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
-            patch("kai.review.asyncio.wait_for", side_effect=TimeoutError()),
-            patch("kai.review.os.killpg") as mock_killpg,
-            pytest.raises(RuntimeError, match="timed out"),
-        ):
-            await run_review("prompt", claude_user=current_user)
-
-        # Should kill the process directly, not the process group
-        mock_proc.kill.assert_called_once()
-        mock_killpg.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_prompt_sent_via_stdin(self):
-        """The review prompt is sent to the subprocess via stdin, not as an argument."""
-        mock_proc = _mock_process(stdout=b"review output")
-
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
-            await run_review("the review prompt")
-
-        # communicate() should have been called with the prompt as input bytes
-        mock_proc.communicate.assert_called_once()
-        call_kwargs = mock_proc.communicate.call_args
-        # The input kwarg contains the encoded prompt
-        assert call_kwargs[1]["input"] == b"the review prompt"
 
 
 # ── run_review (Codex backend) ─────────────────────────────────────
 
 
-class TestRunReviewCodex:
+class TestRunReviewCodexDispatch:
     """
-    Tests for the codex branch of run_review.
-
-    Mirrors TestRunTriageCodex in test_triage.py: the two codex
-    branches share the same pattern (codex exec --json + sudo -H -u
-    wrap + NDJSON parse) and the same kai.codex_exec parser. Locks
-    the "no overlap" guarantee at the subprocess boundary - a codex-
-    backed review never spawns claude or goose.
+    `run_review` with `agent_backend="codex"` dispatches to
+    `CodexOneShotReasoner` (NOT an inline `codex exec` spawn). The
+    reasoner owns the `codex exec --json` argv, CODEX_BIN resolution,
+    per-user os_user routing, the allow-listed subprocess env, and
+    the NDJSON event walk; this class pins the dispatch contract:
+    ctor kwargs (including join_items=True), registry model
+    resolution, override and timeout pass-through, raw-text return,
+    and the collapse of typed reasoner errors to RuntimeError.
     """
 
     @staticmethod
-    def _codex_ndjson(text: str) -> bytes:
-        """
-        Build a minimal NDJSON stream that mirrors the real
-        `codex exec --json` schema: each event has a top-level `type`
-        tag; item.completed for an agent_message carries the full
-        consolidated `text` field. Returns bytes (the review tests'
-        _mock_process expects bytes via communicate()).
-        """
-        events = [
-            {"type": "thread.started", "thread_id": "thr_test"},
-            {"type": "turn.started"},
-            {
-                "type": "item.completed",
-                "item": {"id": "item_1", "type": "agent_message", "text": text},
-            },
-            {"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}},
-        ]
-        return ("\n".join(json.dumps(e) for e in events) + "\n").encode()
+    def _fake_reasoner(text="review output"):
+        from kai.oneshot import OneShotResult
+
+        fake = MagicMock()
+        fake.run = AsyncMock(return_value=OneShotResult(text=text, backend="codex", model="gpt-5.5"))
+        return fake
 
     @pytest.mark.asyncio
-    async def test_codex_argv_uses_codex_exec(self):
-        """
-        Argv is `codex exec --json --model <model>`, never claude or
-        goose. Locks the "no overlap" guarantee at the subprocess
-        boundary: the codex review branch never spawns claude.
-        """
-        mock_proc = _mock_process(stdout=self._codex_ndjson("review body"))
+    async def test_run_review_dispatches_to_codex_reasoner(self):
+        """The codex branch builds a CodexOneShotReasoner with the
+        os_user threaded through, awaits its run with the registry
+        model, and returns the reasoner's text."""
+        fake = self._fake_reasoner(text="review body from codex")
+
         with (
-            patch.dict(os.environ, {}, clear=False),
-            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
+            patch("kai.review.CodexOneShotReasoner", return_value=fake) as ctor,
+            patch("kai.review.asyncio.create_subprocess_exec") as mock_exec,
         ):
-            os.environ.pop("CODEX_BIN", None)
-            await run_review("prompt", agent_backend="codex")
-        cmd = mock_exec.call_args[0]
-        assert cmd[0] == "codex"
-        assert cmd[1] == "exec"
-        assert "--json" in cmd
-        # `--skip-git-repo-check` is load-bearing: codex exec refuses
-        # to spawn unless the cwd is on the user's trusted-directories
-        # list or this flag is passed. Production-only initial success
-        # was due to the bot's cwd happening to be trusted.
-        assert "--skip-git-repo-check" in cmd
-        assert "--print" not in cmd  # No claude flag
+            result = await run_review("review prompt", agent_backend="codex", claude_user="someone")
+
+        assert result == "review body from codex"
+        ctor.assert_called_once()
+        assert ctor.call_args.kwargs == {"os_user": "someone", "join_items": True}
+        fake.run.assert_awaited_once()
+        run_kwargs = fake.run.call_args.kwargs
+        assert run_kwargs["prompt"] == "review prompt"
+        assert run_kwargs["model"] == "gpt-5.5"
+        assert run_kwargs["purpose"] == "pr_review"
+        mock_exec.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_codex_argv_uses_codex_bin_env_var(self):
+    async def test_join_items_true_so_multi_message_reviews_survive(self):
         """
-        CODEX_BIN env var overrides bare "codex" in the review argv.
-        Same install-time lever the persistent backend and the codex
-        triage branch honor; needed for multi-user installs where
-        codex lives in a per-os_user home not on the service user's
-        PATH.
+        Review constructs the reasoner with join_items=True: a codex
+        turn can emit multiple agent_message items (preamble, then
+        body), and a last-wins extraction would silently truncate the
+        posted review to the final item. The joining behavior itself
+        is pinned at the reasoner layer in test_oneshot.py; this test
+        pins that review opts into it.
         """
-        mock_proc = _mock_process(stdout=self._codex_ndjson(""))
-        with (
-            patch.dict(os.environ, {"CODEX_BIN": "/Users/daniel/.npm-global/bin/codex"}),
-            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
-        ):
-            await run_review("prompt", agent_backend="codex")
-        cmd = mock_exec.call_args[0]
-        assert cmd[0] == "/Users/daniel/.npm-global/bin/codex"
-        assert cmd[1] == "exec"
+        fake = self._fake_reasoner()
 
-    @pytest.mark.asyncio
-    async def test_codex_argv_uses_registry_model(self):
-        """
-        With agent_backend=codex and no override, the --model argv
-        slot matches the registry's (codex, openai, PR_REVIEW) row
-        (gpt-5.5, the current frontier). Locks the registry as the
-        source of truth for the codex side.
-        """
-        mock_proc = _mock_process(stdout=self._codex_ndjson(""))
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+        with patch("kai.review.CodexOneShotReasoner", return_value=fake) as ctor:
             await run_review("prompt", agent_backend="codex")
-        cmd = mock_exec.call_args[0]
-        i = cmd.index("--model")
-        assert cmd[i + 1] == "gpt-5.5"
+
+        assert ctor.call_args.kwargs["join_items"] is True
 
     @pytest.mark.asyncio
     async def test_codex_model_override_param_wins(self):
@@ -794,149 +668,49 @@ class TestRunReviewCodex:
         load-time legacy env-var seeding) wins over the registry
         default the same way it does on the claude branch.
         """
-        mock_proc = _mock_process(stdout=self._codex_ndjson(""))
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+        fake = self._fake_reasoner()
+
+        with patch("kai.review.CodexOneShotReasoner", return_value=fake):
             await run_review("prompt", agent_backend="codex", model_override="gpt-5.4")
-        cmd = mock_exec.call_args[0]
-        i = cmd.index("--model")
-        assert cmd[i + 1] == "gpt-5.4"
+
+        assert fake.run.call_args.kwargs["model"] == "gpt-5.4"
 
     @pytest.mark.asyncio
-    async def test_codex_no_sudo_when_user_unset(self):
-        """
-        With no claude_user passed, codex runs as the bot process
-        user directly: argv begins with "codex", no "sudo" wrap.
-        """
-        mock_proc = _mock_process(stdout=self._codex_ndjson(""))
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_review("prompt", agent_backend="codex")
-        cmd = mock_exec.call_args[0]
-        assert cmd[0] == "codex"
-        assert "sudo" not in cmd
+    async def test_timeout_s_passes_through_to_reasoner(self):
+        """run_review's timeout_s parameter becomes the reasoner's
+        per-call timeout on the codex branch too."""
+        fake = self._fake_reasoner()
+
+        with patch("kai.review.CodexOneShotReasoner", return_value=fake):
+            await run_review("prompt", agent_backend="codex", timeout_s=888)
+
+        assert fake.run.call_args.kwargs["timeout"] == 888
 
     @pytest.mark.asyncio
-    async def test_codex_wraps_sudo_when_user_set(self):
-        """
-        With claude_user set to a non-self user, codex argv is wrapped
-        in `sudo -H -u <user> --preserve-env=KAI_WEBHOOK_SECRET --`.
-        The per-user os_user lever is what makes a multi-user install
-        spawn codex as each user, reading their per-user
-        ~/.codex/auth.json.
+    async def test_run_review_collapses_oneshot_timeout_to_runtime_error(self):
+        from kai.oneshot import OneShotTimeout
 
-        Same fake-username trick as the triage codex tests: pass a
-        username implausible enough to never match the test runner's
-        user, so resolve_claude_user does NOT short-circuit to no-sudo.
-        """
-        mock_proc = _mock_process(stdout=self._codex_ndjson(""))
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_review("prompt", agent_backend="codex", claude_user="ci-fake-user")
-        cmd = mock_exec.call_args[0]
-        assert cmd[0] == "sudo"
-        assert "-H" in cmd
-        i = cmd.index("-u")
-        assert cmd[i + 1] == "ci-fake-user"
-        assert any(arg.startswith("--preserve-env=") and "KAI_WEBHOOK_SECRET" in arg for arg in cmd)
-        assert "codex" in cmd
-        codex_i = cmd.index("codex")
-        assert cmd[codex_i + 1] == "exec"
+        fake = MagicMock()
+        fake.run = AsyncMock(side_effect=OneShotTimeout())
 
-    @pytest.mark.asyncio
-    async def test_codex_extracts_final_text_from_ndjson(self):
-        """
-        Return value is the agent message text extracted from the
-        NDJSON event stream, not the raw stdout. The downstream
-        webhook handler posts the returned text directly as a PR
-        comment; it must not see multi-line NDJSON.
-        """
-        body = "## Review\n\nLooks good."
-        mock_proc = _mock_process(stdout=self._codex_ndjson(body))
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
-            result = await run_review("prompt", agent_backend="codex")
-        assert result == body
-
-    @pytest.mark.asyncio
-    async def test_codex_multi_item_review_preserves_all_findings(self):
-        """
-        A codex review turn can emit multiple agent_message items
-        (preamble before a tool call, post-tool summary after). The
-        review path must surface ALL of them joined with a blank-line
-        separator; the prior parser dropped earlier completions and
-        only returned the last item's text, silently truncating
-        reviews. Regression guard for the multi-item truncation bug:
-        the prior parser returned only the last completed item, which
-        is the same class of failure as the persistent backend bug
-        fixed by PR #491.
-        """
-        # Build a two-item NDJSON stream by hand because the single-
-        # item _codex_ndjson helper above can't express it.
-        events = [
-            {"type": "thread.started", "thread_id": "thr_test"},
-            {"type": "turn.started"},
-            {
-                "type": "item.completed",
-                "item": {"id": "item_1", "type": "agent_message", "text": "First finding: foo.py has a bug."},
-            },
-            {
-                "type": "item.completed",
-                "item": {
-                    "id": "item_2",
-                    "type": "agent_message",
-                    "text": "Second finding: bar.py needs a docstring.",
-                },
-            },
-            {"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}},
-        ]
-        stream = ("\n".join(json.dumps(e) for e in events) + "\n").encode()
-        mock_proc = _mock_process(stdout=stream)
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
-            result = await run_review("prompt", agent_backend="codex")
-        # Both findings present, blank-line separated. The prior
-        # "last wins" behavior would have returned only the second.
-        assert result == "First finding: foo.py has a bug.\n\nSecond finding: bar.py needs a docstring."
-
-    @pytest.mark.asyncio
-    async def test_codex_subprocess_failure_raises(self):
-        """Non-zero exit from codex raises RuntimeError with stderr."""
-        mock_proc = _mock_process(returncode=1, stderr=b"auth failed")
         with (
-            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
-            pytest.raises(RuntimeError, match="auth failed"),
+            patch("kai.review.CodexOneShotReasoner", return_value=fake),
+            pytest.raises(RuntimeError, match=r"Review subprocess timed out"),
         ):
             await run_review("prompt", agent_backend="codex")
 
     @pytest.mark.asyncio
-    async def test_codex_timeout_kills_process_group(self):
-        """
-        On TimeoutError with claude_user set, the subprocess group is
-        killed via os.killpg(PID, SIGKILL) so both sudo and the codex
-        grandchild die. Mirror of the claude branch's process-group
-        teardown.
-        """
-        proc = AsyncMock()
-        proc.communicate = AsyncMock(side_effect=TimeoutError())
-        proc.kill = MagicMock()
-        proc.wait = AsyncMock()
-        proc.pid = 99999  # Fake PID for killpg
-        with (
-            patch("kai.review.asyncio.create_subprocess_exec", return_value=proc),
-            patch("kai.review.os.killpg") as mock_killpg,
-            pytest.raises(RuntimeError, match="timed out"),
-        ):
-            await run_review("prompt", agent_backend="codex", claude_user="ci-fake-user", timeout_s=1)
-        mock_killpg.assert_called_once_with(99999, signal.SIGKILL)
+    async def test_run_review_collapses_oneshot_error_to_runtime_error(self):
+        from kai.oneshot import OneShotSubprocessError
 
-    @pytest.mark.asyncio
-    async def test_codex_stdin_carries_prompt(self):
-        """
-        Codex one-shot mode reads the review prompt from stdin (the
-        prompt is too large for argv on real diffs). Mirrors the
-        existing claude- and goose-side stdin assertions.
-        """
-        mock_proc = _mock_process(stdout=self._codex_ndjson(""))
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
-            await run_review("the review prompt", agent_backend="codex")
-        mock_proc.communicate.assert_called_once()
-        assert mock_proc.communicate.call_args.kwargs["input"] == b"the review prompt"
+        fake = MagicMock()
+        fake.run = AsyncMock(side_effect=OneShotSubprocessError(returncode=1, stderr=b"auth failed"))
+
+        with (
+            patch("kai.review.CodexOneShotReasoner", return_value=fake),
+            pytest.raises(RuntimeError, match=r"Codex review failed"),
+        ):
+            await run_review("prompt", agent_backend="codex")
 
 
 # ── run_review (Goose backend) ─────────────────────────────────────
@@ -1061,15 +835,18 @@ class TestRunReviewGooseDispatch:
 
     @pytest.mark.asyncio
     async def test_default_backend_is_claude(self):
-        """Calling run_review with no backend args still uses Claude."""
-        mock_proc = _mock_process(stdout=b"review output")
+        """Calling run_review with no backend args still uses Claude
+        (dispatching to ClaudeOneShotReasoner, not goose)."""
+        from kai.oneshot import OneShotResult
 
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+        fake = MagicMock()
+        fake.run = AsyncMock(return_value=OneShotResult(text="ok", backend="claude", model="sonnet"))
+
+        with patch("kai.review.ClaudeOneShotReasoner", return_value=fake) as ctor:
             await run_review("prompt")
 
-        cmd = mock_exec.call_args[0]
-        assert cmd[0] == "claude"
-        assert "--print" in cmd
+        ctor.assert_called_once()
+        fake.run.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_empty_provider_raises(self):

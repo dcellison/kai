@@ -220,6 +220,22 @@ class TestClaudeOneShotReasonerArgv:
         cmd = mock_exec.call_args[0]
         assert "--json-schema" not in cmd
 
+    @pytest.mark.asyncio
+    async def test_output_format_omitted_in_free_form_mode(self, tmp_path):
+        """Free-form mode (json_schema=None) must not pass
+        --output-format json: stdout IS the response text, and the
+        review / triage callers hand it to their downstream consumers
+        without any envelope parse. Emitting the envelope here would
+        post raw JSON as a PR comment."""
+        reasoner = ClaudeOneShotReasoner(cwd=tmp_path)
+        proc = _make_proc()
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await reasoner.run(prompt="p", purpose="pr_review", json_schema=None)
+
+        cmd = mock_exec.call_args[0]
+        assert "--output-format" not in cmd
+
 
 class TestClaudeOneShotReasonerEnv:
     """The subprocess env must be allow-listed - the parent's full env
@@ -312,6 +328,25 @@ class TestClaudeOneShotReasonerSubprocessError:
         assert excinfo.value.stderr == b"oauth refused"
 
 
+class TestOneShotSubprocessErrorStr:
+    """str() must carry the exit code and a stderr snippet: review and
+    triage embed the exception in their RuntimeError messages, and the
+    dataclass-generated __init__ leaves Exception.args empty, which
+    would otherwise render a bare prefix with no failure detail."""
+
+    def test_str_includes_exit_code_and_stderr(self):
+        err = OneShotSubprocessError(returncode=2, stderr=b"  oauth refused\n")
+        assert str(err) == "exit 2: oauth refused"
+
+    def test_str_without_stderr_is_exit_code_only(self):
+        err = OneShotSubprocessError(returncode=1, stderr=b"")
+        assert str(err) == "exit 1"
+
+    def test_str_bounds_stderr_snippet(self):
+        err = OneShotSubprocessError(returncode=1, stderr=b"x" * 500)
+        assert str(err) == "exit 1: " + "x" * 200
+
+
 class TestClaudeOneShotReasonerSuccess:
     """A successful run returns a populated OneShotResult: decoded
     stdout, backend tag, model passthrough, raw_metadata with
@@ -354,6 +389,38 @@ class TestClaudeOneShotReasonerSuccess:
         # Phase 1 must keep raw_metadata free of envelope-parsed fields.
         for forbidden in ("is_error", "total_cost_usd", "subtype", "result", "structured_output"):
             assert forbidden not in result.raw_metadata
+
+    @pytest.mark.asyncio
+    async def test_free_form_text_is_stripped(self, tmp_path):
+        """Free-form mode (json_schema=None) returns the response text
+        itself, stripped of surrounding whitespace - the same
+        free-form contract the goose reasoner exposes, and what the
+        review / triage callers post or parse directly."""
+        reasoner = ClaudeOneShotReasoner(cwd=tmp_path)
+        proc = _make_proc(stdout=b"  the review body  \n")
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(prompt="p", purpose="pr_review", json_schema=None)
+
+        assert result.text == "the review body"
+
+    @pytest.mark.asyncio
+    async def test_schema_mode_text_is_unstripped(self, tmp_path):
+        """Schema mode hands raw stdout back unmodified (no strip):
+        the envelope parse downstream is the caller's contract, and
+        the memory path must stay byte-identical to its pre-refactor
+        behavior."""
+        reasoner = ClaudeOneShotReasoner(cwd=tmp_path)
+        proc = _make_proc(stdout=b'{"result": "x"}\n')
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema={"type": "object", "properties": {}},
+            )
+
+        assert result.text == '{"result": "x"}\n'
 
 
 class TestClaudeOneShotReasonerLogging:
@@ -1160,8 +1227,8 @@ class TestCodexOneShotReasonerSuccess:
     async def test_non_schema_success_returns_raw_text(self, tmp_path):
         """A None schema means the caller wants the free-form
         agent_message text back unchanged; no envelope wrapping
-        happens. Memory extraction never takes this branch, but the
-        protocol permits it for future callers."""
+        happens. Review and triage are the production callers of
+        this branch (memory extraction always supplies a schema)."""
         reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
         stdout = _codex_event("agent_message", "free-form reply").encode("utf-8") + b"\n"
         proc = _make_proc(stdout=stdout, returncode=0)
@@ -1175,6 +1242,69 @@ class TestCodexOneShotReasonerSuccess:
 
         assert result.text == "free-form reply"
         assert result.backend == "codex"
+
+    @pytest.mark.asyncio
+    async def test_non_schema_default_keeps_last_message_only(self, tmp_path):
+        """Without join_items, the free-form path keeps the last-wins
+        extraction: triage's downstream parser expects exactly one
+        JSON object, and a preamble agent_message joined ahead of it
+        would corrupt the parse."""
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user())
+        first = _codex_event("agent_message", "preamble text")
+        second = _codex_event("agent_message", '{"labels": []}')
+        proc = _make_proc(stdout=(first + "\n" + second + "\n").encode("utf-8"), returncode=0)
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(
+                prompt="p",
+                purpose="issue_triage",
+                json_schema=None,
+            )
+
+        assert result.text == '{"labels": []}'
+
+    @pytest.mark.asyncio
+    async def test_non_schema_join_items_joins_all_messages(self, tmp_path):
+        """With join_items=True, the free-form path joins every
+        completed agent_message with a blank-line separator. This is
+        the review contract: a turn that emits a preamble and then
+        the body must surface BOTH in the posted markdown; last-wins
+        would silently truncate the review to the final item."""
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user(), join_items=True)
+        first = _codex_event("agent_message", "First finding: foo.py has a bug.")
+        second = _codex_event("agent_message", "Second finding: bar.py needs a docstring.")
+        proc = _make_proc(stdout=(first + "\n" + second + "\n").encode("utf-8"), returncode=0)
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(
+                prompt="p",
+                purpose="pr_review",
+                json_schema=None,
+            )
+
+        assert result.text == "First finding: foo.py has a bug.\n\nSecond finding: bar.py needs a docstring."
+
+    @pytest.mark.asyncio
+    async def test_schema_mode_ignores_join_items(self, tmp_path):
+        """Schema-backed calls pin last-wins even when the reasoner
+        was constructed with join_items=True: the JSON body must
+        never get a preamble glued ahead of it, regardless of how
+        the free-form flag is set."""
+        reasoner = CodexOneShotReasoner(cwd=tmp_path, os_user=_current_user(), join_items=True)
+        preamble = _codex_event("agent_message", "preamble text, not JSON")
+        payload = {"facts": []}
+        final = _codex_event("agent_message", json.dumps(payload))
+        proc = _make_proc(stdout=(preamble + "\n" + final + "\n").encode("utf-8"), returncode=0)
+
+        with patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await reasoner.run(
+                prompt="p",
+                purpose="fact_extraction",
+                json_schema={"type": "object"},
+            )
+
+        envelope = json.loads(result.text)
+        assert envelope == {"is_error": False, "structured_output": payload}
 
 
 class TestCodexOneShotReasonerLogging:

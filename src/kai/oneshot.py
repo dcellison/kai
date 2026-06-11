@@ -222,6 +222,19 @@ class OneShotSubprocessError(OneShotError):
     returncode: int
     stderr: bytes
 
+    def __str__(self) -> str:
+        # The dataclass-generated __init__ never populates
+        # Exception.args, so the inherited str() renders empty and
+        # any caller embedding this error in a message (the review /
+        # triage RuntimeError collapse) would surface a bare prefix
+        # with no failure detail. Render the exit code plus a bounded
+        # stderr snippet instead, mirroring the shape stage 2 builds
+        # from the same fields.
+        snippet = self.stderr[:200].decode("utf-8", errors="replace").strip()
+        if snippet:
+            return f"exit {self.returncode}: {snippet}"
+        return f"exit {self.returncode}"
+
 
 class OneShotOutputError(OneShotError):
     """
@@ -454,15 +467,27 @@ def _parse_schema_payload(text: str) -> Any:
 
 class ClaudeOneShotReasoner:
     """
-    Spawns `claude --print` once per call and returns the raw stdout.
+    Spawns `claude --print` once per call and returns either the raw
+    JSON result envelope (schema mode) or the plain response text
+    (free-form mode).
 
-    The argv, env allow-list, neutral cwd, and timeout semantics are
-    lifted verbatim from the pre-refactor `_run_extractor` /
+    Schema mode (`json_schema` supplied): the argv carries
+    `--output-format json` plus `--json-schema`, and the raw stdout
+    (the CLI's JSON result envelope) is returned unparsed; envelope
+    parsing is the caller's contract (memory extraction). The argv,
+    env allow-list, neutral cwd, and timeout semantics of this mode
+    are lifted verbatim from the pre-refactor `_run_extractor` /
     `_run_episode_extractor` paths in `kai.memory_extraction`. That
     is the load-bearing invariant for the Phase 1 refactor: the
     Claude memory path must stay byte-identical to its prior
     behavior, so any future drift in this implementation is a
     semantic change and not a refactor.
+
+    Free-form mode (`json_schema=None`): the output-format flag is
+    omitted so `claude --print` emits the response text itself, and
+    the result text is the stripped stdout - the same free-form
+    contract the goose and opencode reasoners expose for the review
+    and triage callers.
 
     Flag rationale (carried over from the original site):
 
@@ -541,14 +566,17 @@ class ClaudeOneShotReasoner:
         cmd: list[str] = [resolved_binary, "--print"]
         if model is not None:
             cmd.extend(["--model", model])
-        cmd.extend(["--output-format", "json"])
         if json_schema is not None:
+            # Schema mode rides the JSON result envelope, so the
+            # output format is pinned alongside the schema flag;
+            # free-form callers get plain-text stdout instead.
             # `claude --print --json-schema <schema>` validates the
             # model's structured-output payload CLI-side. Stage 1 and
             # stage 2 both rely on this defense-in-depth gate; the
             # caller's Python validation is the primary contract, but
             # losing the CLI gate would let more malformed payloads
             # reach the parser.
+            cmd.extend(["--output-format", "json"])
             cmd.extend(["--json-schema", json.dumps(json_schema)])
         if system_prompt is not None:
             cmd.extend(["--system-prompt", system_prompt])
@@ -653,8 +681,16 @@ class ClaudeOneShotReasoner:
         # provider implementations may populate backend-specific
         # metadata, but current callers depend on nothing beyond
         # what is captured below.
+        text = stdout.decode("utf-8", errors="replace")
+        if json_schema is None:
+            # Free-form mode: stdout IS the response text (no JSON
+            # envelope to preserve), so strip the surrounding
+            # whitespace the same way the goose reasoner does. Schema
+            # mode stays unstripped to keep the envelope bytes the
+            # caller parses identical to the pre-refactor path.
+            text = text.strip()
         return OneShotResult(
-            text=stdout.decode("utf-8", errors="replace"),
+            text=text,
             backend="claude",
             model=model,
             raw_metadata={
@@ -903,12 +939,13 @@ class CodexOneShotReasoner:
       removes it on every exit path (success, timeout, non-zero exit,
       or output-parse failure).
     - NDJSON event output instead of a single envelope: stdout is a
-      sequence of `thread.*`, `turn.*`, and `item.*` events. The final
-      `agent_message` text is recovered via `extract_codex_text` with
-      `join_items=False`, which matches triage's "last completed
-      message only" contract for structured-output callers. A
-      preamble agent_message followed by a JSON body would otherwise
-      corrupt the parse.
+      sequence of `thread.*`, `turn.*`, and `item.*` events. The
+      `agent_message` text is recovered via `extract_codex_text`.
+      Schema mode always takes `join_items=False` ("last completed
+      message only"): a preamble agent_message glued ahead of the
+      JSON body would otherwise corrupt the parse. Free-form mode
+      takes the constructor's `join_items` flag so callers pick the
+      contract that matches their downstream parser.
 
     The schema-backed call always returns a wrapped envelope so the
     caller's nested-vs-root resolution path (the one already in
@@ -916,11 +953,11 @@ class CodexOneShotReasoner:
     sees the same `structured_output` shape it sees from Claude. The
     reasoner does not inspect fact / episode / tag / confidence
     fields; that contract stays with the caller. When no schema is
-    supplied (`json_schema is None`), the final agent_message text is
+    supplied (`json_schema is None`), the agent_message text is
     returned directly without wrapping; memory extraction always
     supplies a schema, so the wrap path is the production memory
-    path and the non-schema branch exists only for future free-form
-    callers.
+    path while the non-schema branch carries the free-form review
+    and triage callers.
 
     Flag rationale:
 
@@ -969,7 +1006,7 @@ class CodexOneShotReasoner:
     exception masking the original failure.
     """
 
-    def __init__(self, *, cwd: Path | None = None, os_user: str | None = None) -> None:
+    def __init__(self, *, cwd: Path | None = None, os_user: str | None = None, join_items: bool = False) -> None:
         """
         Args:
             cwd: Override for the subprocess working directory and the
@@ -990,9 +1027,21 @@ class CodexOneShotReasoner:
                 claude does. The persistent codex chat backend in
                 `src/kai/codex.py` already uses this resolution
                 shape; this reasoner now follows it.
+            join_items: Output-joining mode for the free-form
+                (no-schema) path. True joins every completed
+                agent_message with blank-line separators - the right
+                contract for free-form markdown callers like PR
+                review, where codex may emit a preamble message ahead
+                of the body and both must survive. False (the
+                default) returns only the last completed message,
+                which JSON-contract callers like triage need so a
+                preamble never gets glued ahead of the JSON object.
+                Schema-backed calls ignore this flag and always take
+                last-wins for the same reason.
         """
         self._cwd = cwd if cwd is not None else _EXTRACTOR_CWD
         self._os_user = os_user
+        self._join_items = join_items
 
     async def run(
         self,
@@ -1169,13 +1218,16 @@ class CodexOneShotReasoner:
                 raise OneShotSubprocessError(returncode=returncode, stderr=stderr)
 
             stdout_text = stdout.decode("utf-8", errors="replace")
-            # Triage's lesson carried over: structured-output callers
-            # want only the LAST completed agent_message so a preamble
-            # message does not get glued ahead of the JSON body. Memory
-            # extraction is the canonical structured caller here; the
-            # `join_items=True` (review/chat) path has no caller in
-            # #497 but the protocol leaves room for one.
-            final_text = extract_codex_text(stdout_text, join_items=False)
+            # Structured-output callers want only the LAST completed
+            # agent_message so a preamble message does not get glued
+            # ahead of the JSON body; schema mode therefore pins
+            # last-wins regardless of the constructor flag. Free-form
+            # callers pick their contract at construction: PR review
+            # joins every completed message (a preamble plus body must
+            # both survive in the posted markdown), triage keeps
+            # last-wins for its one-JSON-object parser.
+            join_items = self._join_items if json_schema is None else False
+            final_text = extract_codex_text(stdout_text, join_items=join_items)
 
             if json_schema is None:
                 # Free-form path: hand the final agent_message text

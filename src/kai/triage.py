@@ -1,5 +1,5 @@
 """
-Issue triage agent - one-shot subprocess (Claude or Goose) for automated issue triage.
+Issue triage agent - one-shot subprocess (Claude, Codex, Goose, or OpenCode) for automated issue triage.
 
 Provides functionality to:
 1. Extract metadata from GitHub issue webhook payloads
@@ -11,33 +11,34 @@ Provides functionality to:
 7. Apply triage results: labels, project assignment, comments, notifications
 8. Orchestrate the full pipeline from webhook event to posted triage
 
-Follows the same fire-and-forget subprocess pattern established by the PR
-review agent (review.py). Each triage is a fresh LLM invocation with no
-persistent state. The subprocess runs in one-shot mode: `claude --print`
-for Claude, `goose run -i -` for Goose (non-interactive, no tools, no
-streaming).
+Follows the same fire-and-forget subprocess pattern established by the
+PR review agent (review.py). Each triage is a fresh LLM invocation with
+no persistent state. The subprocess runs in one-shot mode
+(non-interactive, no tools, no streaming) through the per-backend
+OneShotReasoner implementations in `kai.oneshot`, which own binary
+resolution, argv shape, per-user os_user routing, the allow-listed
+subprocess env, and timeout / kill semantics.
 
 Unlike the review agent (which returns free-form markdown), triage uses
-structured JSON output from Claude to drive automated actions (label
+structured JSON output from the model to drive automated actions (label
 application, project assignment). This requires parsing and validation
-of Claude's response before acting on it.
+of the model's response before acting on it.
 """
 
 import asyncio
 import json
 import logging
-import os
 import re
-import signal
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
 
-from kai.codex_exec import extract_codex_text
-from kai.config import ModelRole, get_model_for, resolve_claude_user
+from kai.config import ModelRole, get_model_for
 from kai.oneshot import (
+    ClaudeOneShotReasoner,
+    CodexOneShotReasoner,
     GooseOneShotReasoner,
     OneShotError,
     OneShotTimeout,
@@ -358,19 +359,22 @@ async def run_triage(
     """
     Spawn a one-shot LLM subprocess to perform the triage analysis.
 
-    Dispatches by agent_backend: Claude (`claude --print`) and Codex
-    (`codex exec --json`) spawn inline; Goose and OpenCode dispatch
-    through their OneShotReasoner implementations in `kai.oneshot`,
-    which own binary resolution, per-user os_user routing, and the
-    allow-listed subprocess env. All paths read the prompt and
-    return a single text string. Same pattern as run_review() in
-    review.py.
+    Dispatches by agent_backend: every backend routes through its
+    OneShotReasoner implementation in `kai.oneshot`, which owns
+    binary resolution, the argv shape, per-OS-user routing via
+    `sudo -H -u <user>`, the allow-listed subprocess env, and
+    timeout / kill semantics. All paths read the prompt, return a
+    single text string, and collapse typed reasoner errors to
+    RuntimeError. Same pattern as run_review() in review.py, with
+    one codex-side difference: triage keeps the reasoner's last-wins
+    default (`join_items=False`) because its downstream parser
+    expects exactly one JSON object, while review joins every
+    completed message for free-form markdown.
 
     Args:
         prompt: The complete triage prompt (from build_triage_prompt).
-        claude_user: Optional OS user to run the subprocess as (via
-            sudo -u for claude, sudo -H -u for codex / goose /
-            opencode).
+        claude_user: Optional OS user to run the subprocess as (the
+            reasoners apply the sudo -H -u wrap).
         agent_backend: Which LLM backend to use ("claude", "codex",
             "opencode", or "goose").
         provider: LLM provider name (e.g. "anthropic", "openai").
@@ -414,117 +418,38 @@ async def run_triage(
         return result.text
 
     if agent_backend == "codex":
-        # Codex one-shot mode: --json emits NDJSON events on stdout
-        # (thread.started, turn.started, item.*, turn.completed, error).
-        # The final agent message text is recovered by walking the
-        # events and accumulating any text content; see
-        # extract_codex_text (kai.codex_exec) is the schema-defensive parser.
-        # Per-user OAuth isolation: when claude_user is set (the
-        # webhook handler passes the same os_user value to both
-        # backends through this parameter), wrap the codex argv in
-        # `sudo -H -u <user>` so codex reads ~<user>/.codex/auth.json
-        # instead of the service user's home. The parameter name is
-        # claude-historical; rename is out of scope for this fix.
-        # No cost cap is passed: subscription auth has no per-call
-        # billing; runaway protection comes from _TRIAGE_TIMEOUT at
-        # the asyncio.wait_for below.
+        # Dispatch to the codex one-shot reasoner, which owns the
+        # `codex exec --json` argv (--skip-git-repo-check plus the
+        # --ephemeral / --ignore-rules sandboxing flags), CODEX_BIN
+        # resolution, per-user os_user routing via the shared
+        # sudo -H wrap, the allow-listed subprocess env, and the
+        # NDJSON event walk. The reasoner's last-wins default
+        # (join_items=False) is the right contract here: triage's
+        # downstream parser expects exactly one JSON object, and a
+        # preamble agent_message joined ahead of the JSON body would
+        # corrupt it (review.py passes join_items=True for its
+        # free-form markdown instead). Typed reasoner errors
+        # collapse to RuntimeError so the webhook handler's existing
+        # catch surface is unchanged.
         triage_model = get_model_for(
             ModelRole.ISSUE_TRIAGE,
             agent_backend,
             provider,
             override=model_override,
         )
-        # Pin the absolute codex path when CODEX_BIN is set; same
-        # rationale as codex.py - sudo cannot resolve bare `codex`
-        # when the binary lives in a per-os_user home that isn't on
-        # the service user's PATH. Falls back to bare "codex" for
-        # installs where codex is on PATH.
-        codex_bin = os.environ.get("CODEX_BIN") or "codex"
-        codex_cmd = [
-            codex_bin,
-            "exec",
-            "--json",
-            # `codex exec` refuses to spawn unless the cwd is on the
-            # user's trusted-directories list OR this flag is passed.
-            # Production worked at first only because the bot's cwd
-            # happened to be trusted; one-shot callers from any other
-            # cwd hit "Not inside a trusted directory" and rc=1. The
-            # safety check is meant for the interactive code-modifying
-            # path, not a non-interactive triage / review / eval call.
-            "--skip-git-repo-check",
-            "--model",
-            triage_model,
-        ]
-
-        # Resolve self-sudo: skip the sudo wrap when claude_user matches
-        # the bot process user. Mirrors the claude branch's pattern.
-        effective_user = resolve_claude_user(claude_user)
-        if effective_user:
-            # -H sets HOME to <effective_user>'s pw entry so codex
-            # reads auth from the right home. --preserve-env passes
-            # KAI_WEBHOOK_SECRET through sudo's env_reset (the SETENV:
-            # sudoers rule allows this). Same shape claude uses.
-            cmd = [
-                "sudo",
-                "-H",
-                "-u",
-                effective_user,
-                "--preserve-env=KAI_WEBHOOK_SECRET",
-                "--",
-            ] + codex_cmd
-        else:
-            cmd = codex_cmd
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            # New session group in cross-user mode so killing sudo
-            # also kills the codex grandchild (mirrors claude branch).
-            start_new_session=bool(effective_user),
-        )
-
+        reasoner = CodexOneShotReasoner(os_user=claude_user)
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=prompt.encode()),
+            result = await reasoner.run(
+                prompt=prompt,
+                model=triage_model,
                 timeout=_TRIAGE_TIMEOUT,
+                purpose="issue_triage",
             )
-        except TimeoutError:
-            # Kill the subprocess tree if it exceeds the timeout. In
-            # cross-user mode (effective_user set) the process is in
-            # a new group (PGID == PID); kill the group so both sudo
-            # and the codex grandchild die, preventing orphans.
-            if effective_user:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass  # Already dead
-            else:
-                proc.kill()
-            await proc.wait()
-            raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from None
-
-        if proc.returncode != 0:
-            error = stderr.decode().strip()
-            raise RuntimeError(f"Triage subprocess failed (exit {proc.returncode}): {error}")
-
-        # Codex emits NDJSON; extract the final agent message text and
-        # return it (mirrors the contract the claude / goose branches
-        # already satisfy: a single string the caller hands to
-        # _parse_triage_json). extract_codex_text lives in codex_exec
-        # so review.py can share the same parser without importing
-        # from triage.py.
-        #
-        # join_items=False: triage's downstream contract is "exactly
-        # one JSON object." If codex emits a preamble agent_message
-        # followed by the JSON body as a separate agent_message,
-        # joining them would yield "preamble\n\n{json}" which
-        # _parse_triage_json's fence-stripping cannot recover from.
-        # Last-wins preserves the prior helper behavior and keeps the
-        # JSON contract intact; review.py (free-form markdown) uses
-        # the joining default instead.
-        return extract_codex_text(stdout.decode(), join_items=False)
+        except OneShotTimeout as exc:
+            raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from exc
+        except OneShotError as exc:
+            raise RuntimeError(f"Codex triage failed: {exc}") from exc
+        return result.text
 
     if agent_backend == "goose":
         if not provider:
@@ -562,77 +487,39 @@ async def run_triage(
             raise RuntimeError(f"Goose triage failed: {exc}") from exc
         return result.text
     else:
-        # Claude one-shot mode: --print reads from stdin, writes to stdout.
-        # No cost cap is passed: subscription auth has no real per-token
-        # cost. Runaway protection comes from _TRIAGE_TIMEOUT at the
-        # asyncio.wait_for call below: a stuck subprocess cannot hold the
-        # executor longer than that timeout.
-        # Model identifier comes from the per-role registry indexed
-        # by (backend, provider, role). Caller's per-user
-        # `models.issue_triage` override (when set in users.yaml)
-        # wins via the `model_override` parameter; the load-time
-        # env-var seeding pass also routes deprecated
+        # Claude (the default backend). Dispatch to the claude
+        # one-shot reasoner in free-form mode (json_schema=None):
+        # plain `claude --print` text output with no tools, no
+        # session persistence, a neutral cwd, the allow-listed
+        # subprocess env, and binary resolution shared with config
+        # validation. Per-user os_user routing rides the shared
+        # sudo -H wrap. Triage's downstream parser owns the JSON
+        # contract, matching the other backends. The caller's
+        # per-user `models.issue_triage` override (when set in
+        # users.yaml) wins via the `model_override` parameter; the
+        # load-time env-var seeding pass also routes deprecated
         # ISSUE_TRIAGE_MODEL_* values through that same parameter.
+        # Typed reasoner errors collapse to RuntimeError so the
+        # webhook handler's existing catch surface is unchanged.
         triage_model = get_model_for(
             ModelRole.ISSUE_TRIAGE,
             agent_backend,
             provider,
             override=model_override,
         )
-        cmd = [
-            "claude",
-            "--print",
-            "--model",
-            triage_model,
-        ]
-
-        # Resolve self-sudo: skip sudo when claude_user matches the bot
-        # process user. Uses the resolved value for both the spawn command
-        # and the cleanup path below.
-        effective_user = resolve_claude_user(claude_user)
-
-        if effective_user:
-            # -H sets HOME to the target user's pw entry. Without it, claude
-            # reads OAuth creds from the caller's ~/.claude/.credentials.json
-            # and silently exits.
-            cmd = ["sudo", "-H", "-u", effective_user, "--"] + cmd
-
-        # When spawned via sudo, start in a new process group so the
-        # entire tree (sudo + claude) can be killed via os.killpg().
-        # Without this, killing sudo orphans the claude Node.js process.
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=bool(effective_user),
-        )
-
+        reasoner = ClaudeOneShotReasoner(os_user=claude_user)
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=prompt.encode()),
+            result = await reasoner.run(
+                prompt=prompt,
+                model=triage_model,
                 timeout=_TRIAGE_TIMEOUT,
+                purpose="issue_triage",
             )
-        except TimeoutError:
-            # Kill the subprocess tree if it exceeds the timeout.
-            # When effective_user is set, start_new_session=True puts the
-            # process in a new group (PGID == PID). Kill the group so
-            # both sudo and its claude child die, preventing orphans.
-            if effective_user:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass  # Already dead
-            else:
-                proc.kill()
-            await proc.wait()
-            raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from None
-
-    if proc.returncode != 0:
-        error = stderr.decode().strip()
-        raise RuntimeError(f"Triage subprocess failed (exit {proc.returncode}): {error}")
-
-    return stdout.decode().strip()
+        except OneShotTimeout as exc:
+            raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from exc
+        except OneShotError as exc:
+            raise RuntimeError(f"Claude triage failed: {exc}") from exc
+        return result.text
 
 
 def _parse_triage_json(raw: str) -> dict:
