@@ -287,11 +287,22 @@ _CODEX_PRESERVED_AUTH_VARS: tuple[str, ...] = (
 # resolves automatically; what must survive `env_reset` are the per-
 # provider API keys operators commonly export when their auth flow
 # does not use the on-disk auth.json (e.g., a CI secret, a per-shell
-# `direnv` injection, or a temporary key from a vault). HOME and PATH
-# are NOT listed here for the same reason they are omitted from the
-# claude / codex lists: PATH comes through the subprocess env allow-
-# list and HOME is rewritten by `sudo -H`.
+# `direnv` injection, or a temporary key from a vault).
+# OPENCODE_CONFIG_CONTENT is the reasoner's model-selection channel
+# (set into the subprocess env at run time, the same mechanism the
+# conversational backend uses); without preservation, sudo's
+# env_reset strips the model selection itself and the wrapped
+# opencode silently falls back to the target user's config defaults.
+# No endpoint-override vars exist for opencode: custom base URLs are
+# config-file state (`provider.<id>.options.baseURL` in
+# opencode.json), which reaches the agent through the per-user
+# config under the rewritten HOME or through this same
+# OPENCODE_CONFIG_CONTENT channel. HOME and PATH are NOT listed here
+# for the same reason they are omitted from the claude / codex
+# lists: PATH comes through the subprocess env allow-list and HOME
+# is rewritten by `sudo -H`.
 _OPENCODE_PRESERVED_AUTH_VARS: tuple[str, ...] = (
+    "OPENCODE_CONFIG_CONTENT",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "GOOGLE_API_KEY",
@@ -300,11 +311,28 @@ _OPENCODE_PRESERVED_AUTH_VARS: tuple[str, ...] = (
 )
 # Goose authenticates per provider via env keys (or the target user's
 # keychain, which `sudo -H` reaches through the rewritten HOME), so
-# the preserve list is the same five provider keys opencode carries.
-# GOOSE_MODEL / GOOSE_PROVIDER are deliberately absent: the one-shot
-# passes model and provider as argv flags, so nothing model-related
-# rides the environment on this path.
-_GOOSE_PRESERVED_AUTH_VARS: tuple[str, ...] = _OPENCODE_PRESERVED_AUTH_VARS
+# the preserve list carries the same five provider keys opencode
+# does, plus goose's endpoint-override vars: goose reads custom
+# endpoints from the environment (ANTHROPIC_HOST, OPENAI_HOST plus
+# OPENAI_BASE_PATH, OLLAMA_HOST; verified against goose's provider
+# docs), so a custom-endpoint install loses its routing under
+# env_reset without them. DeepSeek has no host var (goose ships it
+# as a declarative provider with a fixed base_url) and google has no
+# documented host var; both ride their API keys alone. GOOSE_MODEL /
+# GOOSE_PROVIDER are deliberately absent: the one-shot passes model
+# and provider as argv flags, so nothing model-related rides the
+# environment on this path.
+_GOOSE_PRESERVED_AUTH_VARS: tuple[str, ...] = (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "ANTHROPIC_HOST",
+    "OPENAI_HOST",
+    "OPENAI_BASE_PATH",
+    "OLLAMA_HOST",
+)
 
 
 def _preserved_auth_vars_for(backend: str) -> tuple[str, ...]:
@@ -1396,11 +1424,15 @@ class CodexOneShotReasoner:
 # Env vars forwarded to the opencode one-shot subprocess. Distinct from
 # the claude / codex allow-lists because opencode does not consume
 # CLAUDE_CONFIG_DIR or CODEX_HOME; it has its own auth state under
-# ~/.local/share/opencode/. The provider API keys mirror
-# `_OPENCODE_PRESERVED_AUTH_VARS` exactly because the same vars that
-# survive sudo's env_reset are the ones the in-process spawn also
-# needs (no-wrap path is the bot user; cross-user path is the target
-# user with the same per-provider key contract). PATH is required so
+# ~/.local/share/opencode/. The provider API keys mirror the key
+# entries of `_OPENCODE_PRESERVED_AUTH_VARS` because the same vars
+# that survive sudo's env_reset are the ones the in-process spawn
+# also needs (no-wrap path is the bot user; cross-user path is the
+# target user with the same per-provider key contract).
+# OPENCODE_CONFIG_CONTENT is deliberately NOT forwarded from the
+# parent env: the reasoner constructs that var itself for model
+# selection, and forwarding the daemon's own value would shadow the
+# per-call model. PATH is required so
 # opencode resolves its own bundled helpers and any subprocesses it
 # spawns. HOME is required so opencode finds `~/.local/share/opencode/
 # auth.json`; on the wrap path `sudo -H` rewrites HOME to the target
@@ -2110,13 +2142,16 @@ async def _shutdown_opencode_proc(
 # ── Goose implementation ────────────────────────────────────────────
 
 
-# Env vars forwarded to the goose one-shot subprocess. Identical in
-# content to the opencode list: PATH for binary resolution, HOME for
-# the keychain / config state goose reads per user, and the five
-# provider API keys for env-key auth flows. GOOSE_MODEL and
-# GOOSE_PROVIDER are deliberately absent: the one-shot passes model
-# and provider as argv flags (unlike the conversational GooseBackend,
-# which delivers both via env), so the env surface stays minimal.
+# Env vars forwarded to the goose one-shot subprocess: PATH for
+# binary resolution, HOME for the keychain / config state goose reads
+# per user, the five provider API keys for env-key auth flows, and
+# goose's endpoint-override vars (ANTHROPIC_HOST, OPENAI_HOST plus
+# OPENAI_BASE_PATH, OLLAMA_HOST) so a custom-endpoint install routes
+# correctly on the in-process spawn path too, not just through the
+# sudo wrap's preserve list. GOOSE_MODEL and GOOSE_PROVIDER are
+# deliberately absent: the one-shot passes model and provider as
+# argv flags (unlike the conversational GooseBackend, which delivers
+# both via env), so the env surface stays minimal.
 # KAI_WEBHOOK_SECRET is likewise absent; one-shots never serve the
 # webhook API.
 _GOOSE_ENV_ALLOWLIST = (
@@ -2127,6 +2162,10 @@ _GOOSE_ENV_ALLOWLIST = (
     "GOOGLE_API_KEY",
     "OPENROUTER_API_KEY",
     "DEEPSEEK_API_KEY",
+    "ANTHROPIC_HOST",
+    "OPENAI_HOST",
+    "OPENAI_BASE_PATH",
+    "OLLAMA_HOST",
 )
 
 

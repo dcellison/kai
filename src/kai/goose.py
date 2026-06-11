@@ -159,9 +159,15 @@ class GooseBackend(AcpBackend):
         config files say. The five provider key vars cover env-key
         auth flows centrally; keychain-based auth (per-user
         `goose configure`) rides the HOME rewrite from `sudo -H`
-        instead and needs no preservation. KAI_WEBHOOK_SECRET and
-        TMPDIR mirror the AcpBackend default (webhook callback auth
-        and the per-os-user temp anchor).
+        instead and needs no preservation. The endpoint-override vars
+        (ANTHROPIC_HOST, OPENAI_HOST plus OPENAI_BASE_PATH,
+        OLLAMA_HOST; verified against goose's provider docs) keep a
+        custom-endpoint install routed at its proxy or gateway under
+        the wrap, mirroring the claude / codex precedent of
+        preserving each backend's base-URL override. DeepSeek and
+        google have no host vars and ride their API keys alone.
+        KAI_WEBHOOK_SECRET and TMPDIR mirror the AcpBackend default
+        (webhook callback auth and the per-os-user temp anchor).
         """
         return (
             "GOOSE_MODEL",
@@ -171,6 +177,10 @@ class GooseBackend(AcpBackend):
             "GOOGLE_API_KEY",
             "OPENROUTER_API_KEY",
             "DEEPSEEK_API_KEY",
+            "ANTHROPIC_HOST",
+            "OPENAI_HOST",
+            "OPENAI_BASE_PATH",
+            "OLLAMA_HOST",
             "KAI_WEBHOOK_SECRET",
             "TMPDIR",
         )

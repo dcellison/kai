@@ -1261,8 +1261,10 @@ class TestPreservedEnvVars:
     provider selection via env vars (GOOSE_MODEL / GOOSE_PROVIDER in
     build_env), so the override must carry them through env_reset or
     the wrapped goose silently loses its model selection; the five
-    provider keys cover env-key auth, and KAI_WEBHOOK_SECRET / TMPDIR
-    mirror the AcpBackend default."""
+    provider keys cover env-key auth, the endpoint-override vars
+    (ANTHROPIC_HOST, OPENAI_HOST, OPENAI_BASE_PATH, OLLAMA_HOST) keep
+    a custom-endpoint install routed at its gateway under the wrap,
+    and KAI_WEBHOOK_SECRET / TMPDIR mirror the AcpBackend default."""
 
     def test_content_exact(self):
         g = _make_goose()
@@ -1274,6 +1276,10 @@ class TestPreservedEnvVars:
             "GOOGLE_API_KEY",
             "OPENROUTER_API_KEY",
             "DEEPSEEK_API_KEY",
+            "ANTHROPIC_HOST",
+            "OPENAI_HOST",
+            "OPENAI_BASE_PATH",
+            "OLLAMA_HOST",
             "KAI_WEBHOOK_SECRET",
             "TMPDIR",
         )
@@ -1301,6 +1307,7 @@ class TestPreservedEnvVars:
         assert argv[4] == (
             "--preserve-env=GOOSE_MODEL,GOOSE_PROVIDER,ANTHROPIC_API_KEY,"
             "OPENAI_API_KEY,GOOGLE_API_KEY,OPENROUTER_API_KEY,DEEPSEEK_API_KEY,"
+            "ANTHROPIC_HOST,OPENAI_HOST,OPENAI_BASE_PATH,OLLAMA_HOST,"
             "KAI_WEBHOOK_SECRET,TMPDIR"
         )
         assert argv[5] == "--"

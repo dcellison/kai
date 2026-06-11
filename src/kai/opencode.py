@@ -304,7 +304,12 @@ class OpenCodeBackend(AcpBackend):
         the primary auth store (`~/.local/share/opencode/auth.json`,
         written by `opencode auth login` run as the target user) rides
         the HOME rewrite from `sudo -H` instead and needs no
-        preservation. KAI_WEBHOOK_SECRET and TMPDIR mirror the
+        preservation. No endpoint-override vars appear here because
+        opencode has none: custom base URLs are config-file state
+        (`provider.<id>.options.baseURL` in opencode.json), which
+        reaches the agent through the per-user config under the
+        rewritten HOME or through OPENCODE_CONFIG_CONTENT, both
+        already covered. KAI_WEBHOOK_SECRET and TMPDIR mirror the
         AcpBackend default (webhook callback auth and the per-os-user
         temp anchor).
         """

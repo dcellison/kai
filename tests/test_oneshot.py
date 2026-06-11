@@ -20,6 +20,7 @@ import pytest
 from kai.oneshot import (
     _CODEX_ENV_ALLOWLIST,
     _GOOSE_ENV_ALLOWLIST,
+    _GOOSE_PRESERVED_AUTH_VARS,
     _OPENCODE_PRESERVED_AUTH_VARS,
     _SUBPROCESS_ENV_ALLOWLIST,
     ClaudeOneShotReasoner,
@@ -2463,9 +2464,51 @@ class TestOpenCodePreservedAuthVars:
     def test_returns_opencode_specific_list(self):
         assert _preserved_auth_vars_for("opencode") == _OPENCODE_PRESERVED_AUTH_VARS
 
+    def test_config_content_survives_the_wrap(self):
+        """OPENCODE_CONFIG_CONTENT is the reasoner's model-selection
+        channel; without it in the preserve list, sudo's env_reset
+        strips the per-call model on the cross-user path and the
+        wrapped opencode silently falls back to the target user's
+        config defaults (the conversational backend has always
+        preserved it; the one-shot must match)."""
+        assert "OPENCODE_CONFIG_CONTENT" in _OPENCODE_PRESERVED_AUTH_VARS
+
     def test_unknown_backend_still_raises(self):
         with pytest.raises(ValueError):
             _preserved_auth_vars_for("nonsense")
+
+
+class TestGoosePreservedAuthVars:
+    """`_preserved_auth_vars_for("goose")` carries the five provider
+    keys plus goose's endpoint-override vars. The goose list is no
+    longer an alias of the opencode one: opencode has no endpoint
+    env vars (custom base URLs are opencode.json config state), while
+    goose reads its custom endpoints from the environment."""
+
+    def test_returns_goose_specific_list(self):
+        assert _preserved_auth_vars_for("goose") == _GOOSE_PRESERVED_AUTH_VARS
+
+    def test_endpoint_override_vars_survive_the_wrap(self):
+        """ANTHROPIC_HOST / OPENAI_HOST / OPENAI_BASE_PATH /
+        OLLAMA_HOST are how goose points a provider at a proxy or
+        gateway; a custom-endpoint install loses its routing under
+        env_reset without them (the claude / codex lists preserve
+        their base-URL overrides the same way)."""
+        for var in ("ANTHROPIC_HOST", "OPENAI_HOST", "OPENAI_BASE_PATH", "OLLAMA_HOST"):
+            assert var in _GOOSE_PRESERVED_AUTH_VARS
+
+    def test_endpoint_override_vars_forwarded_in_process(self):
+        """The same endpoint vars ride the subprocess env allow-list
+        so the in-process (no-wrap) spawn routes correctly too; the
+        preserve list only matters cross-user."""
+        for var in ("ANTHROPIC_HOST", "OPENAI_HOST", "OPENAI_BASE_PATH", "OLLAMA_HOST"):
+            assert var in _GOOSE_ENV_ALLOWLIST
+
+    def test_opencode_config_content_not_in_goose_list(self):
+        """The alias split must not leak opencode's config-content
+        channel into the goose list; goose delivers nothing through
+        OPENCODE_CONFIG_CONTENT."""
+        assert "OPENCODE_CONFIG_CONTENT" not in _GOOSE_PRESERVED_AUTH_VARS
 
 
 class TestOpenCodeOneShotReasonerArgvAndEnv:
@@ -3294,7 +3337,8 @@ class TestGooseRouting:
         cmd = list(mock_exec.call_args[0])
         assert cmd[:4] == ["sudo", "-H", "-u", "other-user"]
         assert cmd[4] == (
-            "--preserve-env=ANTHROPIC_API_KEY,OPENAI_API_KEY,GOOGLE_API_KEY,OPENROUTER_API_KEY,DEEPSEEK_API_KEY"
+            "--preserve-env=ANTHROPIC_API_KEY,OPENAI_API_KEY,GOOGLE_API_KEY,OPENROUTER_API_KEY,DEEPSEEK_API_KEY,"
+            "ANTHROPIC_HOST,OPENAI_HOST,OPENAI_BASE_PATH,OLLAMA_HOST"
         )
         assert cmd[5] == "--"
         assert cmd[6] == "goose"
