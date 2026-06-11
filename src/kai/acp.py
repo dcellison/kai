@@ -1008,7 +1008,17 @@ class AcpBackend(AgentBackend):
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.workspace),
             env=env,
-            limit=1024 * 1024,  # 1MB per-line buffer
+            # A single ACP notification line can carry a large payload
+            # (a tool result echoed into a chunk, a long final
+            # message). The asyncio.StreamReader default limit is
+            # 64KB, and a 1MB ceiling is too tight for PR-review-sized
+            # payloads (readline raises "Separator is not found, and
+            # chunk exceed the limit", killing the turn). 16MB matches
+            # the codex backend's ceiling so the per-line headroom is
+            # uniform across backends: well above any plausible
+            # single-event payload while still bounding memory on a
+            # runaway line.
+            limit=16 * 1024 * 1024,
             # Cross-user mode: new session group so the sudo wrapper
             # is the session leader (PGID == PID) and the kill paths
             # can SIGKILL the whole target-user tree by negative

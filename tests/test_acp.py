@@ -2380,3 +2380,26 @@ class TestSessionAgeRecycling:
         # _kill fires at least once for the recycle (and again from
         # the streaming loop's EOF handler, which is expected).
         assert mock_kill.await_count >= 1
+
+
+class TestStreamLineLimit:
+    """The asyncio.StreamReader limit on the ACP subprocess stdout."""
+
+    @pytest.mark.asyncio
+    async def test_subprocess_limit_is_at_least_16mb(self):
+        """
+        A single notification line must fit any plausible payload; a
+        1MB ceiling is too tight for PR-review-sized tool results
+        (readline raises "Separator is not found, and chunk exceed
+        the limit", killing the turn). Lock the lower bound, matching
+        the codex backend's pin, so a future shrinkback gets caught
+        here rather than on a live operator turn.
+        """
+        b = _make_fake()
+        proc = _make_mock_proc(_handshake_lines())
+
+        with patch("kai.acp.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await b._ensure_started()
+
+        call_kwargs = mock_exec.call_args[1]
+        assert call_kwargs["limit"] >= 16 * 1024 * 1024

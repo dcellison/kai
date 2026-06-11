@@ -299,7 +299,16 @@ class ClaudeCodeBackend(AgentBackend):
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.workspace),
             env=env,
-            limit=1024 * 1024,  # 1 MiB; default 64 KiB too small for large tool results
+            # A single stream-json line can inline the full text of a
+            # large tool result. The asyncio.StreamReader default
+            # limit is 64KB, and a 1MB ceiling is too tight for
+            # PR-review-sized payloads (readline raises "Separator is
+            # not found, and chunk exceed the limit", killing the
+            # turn). 16MB matches the codex backend's ceiling so the
+            # per-line headroom is uniform across backends: well above
+            # any plausible single-event payload while still bounding
+            # memory on a runaway line.
+            limit=16 * 1024 * 1024,
             # When spawned via sudo, start in a new process group so we can
             # kill the entire tree (sudo + claude) via os.killpg(). Without
             # this, killing sudo may orphan the claude process.

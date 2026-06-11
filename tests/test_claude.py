@@ -904,6 +904,30 @@ class TestEnsureStarted:
             assert call_kwargs["env"]["KAI_WEBHOOK_SECRET"] == "my-secret"
 
     @pytest.mark.asyncio
+    async def test_subprocess_limit_is_at_least_16mb(self):
+        """
+        The asyncio.StreamReader limit on stdout must be large enough
+        for any single stream-json event payload; a 1MB ceiling is too
+        tight for PR-review-sized tool results (readline raises
+        "Separator is not found, and chunk exceed the limit", killing
+        the turn). Lock the lower bound, matching the codex backend's
+        pin, so a future shrinkback gets caught here rather than on a
+        live operator turn.
+        """
+        claude = _make_claude()
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+        call_kwargs = mock_exec.call_args[1]
+        assert call_kwargs["limit"] >= 16 * 1024 * 1024
+
+    @pytest.mark.asyncio
     async def test_sets_fresh_session(self):
         """_fresh_session is True after starting a new process."""
         claude = _make_claude()
