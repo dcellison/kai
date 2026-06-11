@@ -25,14 +25,20 @@ log = logging.getLogger(__name__)
 
 
 # Map Kai logical model names to Anthropic model IDs for GOOSE_MODEL.
-# These IDs will go stale as new model versions are released.
-# The .get(key, key) fallback passes unrecognized values through
-# unchanged, so full model IDs (e.g. "claude-opus-4-6") work without
-# being in the map.
+# Values are the API's undated alias forms, the same IDs the claude
+# CLI resolves its short aliases to, so the two backends agree on
+# which SKU a logical name means. The aliases pin a family version
+# (claude-opus-4-8 does not track a future 4.9), so this map needs a
+# bump on each Anthropic release. The .get(key, key) fallback passes
+# unrecognized values through unchanged, so full model IDs (e.g.
+# "claude-opus-4-7" to pin the previous generation) work without
+# being in the map; validate_model_for_backend admits any claude-*
+# ID on goose-on-anthropic so the pass-through is reachable from
+# /model and per-user config.
 _ANTHROPIC_MODEL_MAP: dict[str, str] = {
     "sonnet": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-6",
-    "haiku": "claude-haiku-4-5-20251001",
+    "opus": "claude-opus-4-8",
+    "haiku": "claude-haiku-4-5",
 }
 
 

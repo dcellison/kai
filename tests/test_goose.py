@@ -201,14 +201,17 @@ class TestModelMapping:
     """Verify _ANTHROPIC_MODEL_MAP translates logical names to provider IDs."""
 
     def test_known_models(self):
-        """Logical names map to full Anthropic model IDs."""
+        """Logical names map to the current Anthropic API aliases (the
+        same SKUs the claude CLI resolves its short aliases to)."""
         assert _ANTHROPIC_MODEL_MAP["sonnet"] == "claude-sonnet-4-6"
-        assert _ANTHROPIC_MODEL_MAP["opus"] == "claude-opus-4-6"
-        assert _ANTHROPIC_MODEL_MAP["haiku"] == "claude-haiku-4-5-20251001"
+        assert _ANTHROPIC_MODEL_MAP["opus"] == "claude-opus-4-8"
+        assert _ANTHROPIC_MODEL_MAP["haiku"] == "claude-haiku-4-5"
 
     def test_passthrough_for_unknown(self):
-        """Unrecognized values pass through via .get(key, key) fallback."""
-        model_id = "claude-sonnet-4-5-20250514"
+        """Unrecognized values pass through via .get(key, key) fallback,
+        so full model IDs can pin a SKU the map does not list (e.g. the
+        previous-generation opus)."""
+        model_id = "claude-opus-4-7"
         assert _ANTHROPIC_MODEL_MAP.get(model_id, model_id) == model_id
 
 
@@ -375,7 +378,7 @@ class TestHandshake:
             await g._ensure_started()
 
         call_kwargs = mock_exec.call_args[1]
-        assert call_kwargs["env"]["GOOSE_MODEL"] == "claude-opus-4-6"
+        assert call_kwargs["env"]["GOOSE_MODEL"] == "claude-opus-4-8"
 
     @pytest.mark.asyncio
     async def test_model_passthrough_for_non_anthropic(self):

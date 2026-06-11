@@ -2446,6 +2446,43 @@ class TestValidateModelForBackend:
 
         assert validate_model_for_backend("opus", "claude", "anthropic") is True
 
+    def test_goose_anthropic_accepts_full_claude_ids(self):
+        """Goose hands GOOSE_MODEL verbatim to the Anthropic API, so any
+        claude-* ID passes structurally; a stale alias map must never be
+        a ceiling on which SKUs a goose user can reach."""
+        from kai.config import validate_model_for_backend
+
+        assert validate_model_for_backend("claude-opus-4-8", "goose", "anthropic") is True
+        assert validate_model_for_backend("claude-opus-4-7", "goose", "anthropic") is True
+        assert validate_model_for_backend("claude-haiku-4-5-20251001", "goose", "anthropic") is True
+        # The curated alias trio keeps working alongside the passthrough.
+        assert validate_model_for_backend("opus", "goose", "anthropic") is True
+        assert validate_model_for_backend("sonnet", "goose", "anthropic") is True
+
+    def test_goose_anthropic_rejects_non_claude_garbage(self):
+        """The structural passthrough is claude-* scoped; other strings
+        still validate against the curated provider surface."""
+        from kai.config import validate_model_for_backend
+
+        assert validate_model_for_backend("gpt-5.5", "goose", "anthropic") is False
+        assert validate_model_for_backend("clearly-bogus", "goose", "anthropic") is False
+
+    def test_claude_full_ids_stay_curated_only(self):
+        """The passthrough is goose-specific: the claude backend's CLI
+        resolves short aliases to the newest SKU itself, so its surface
+        stays the curated trio."""
+        from kai.config import validate_model_for_backend
+
+        assert validate_model_for_backend("claude-opus-4-8", "claude", "anthropic") is False
+
+    def test_goose_non_anthropic_providers_unaffected_by_passthrough(self):
+        """A claude-* string on goose-with-another-provider is not a
+        valid model for that provider's API; the passthrough must not
+        leak across providers."""
+        from kai.config import validate_model_for_backend
+
+        assert validate_model_for_backend("claude-opus-4-8", "goose", "openai") is False
+
     def test_opencode_accepts_provider_slash_model_shape(self):
         """OpenCode requires the `provider/model` structural shape."""
         from kai.config import validate_model_for_backend
