@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
+import kai.install
 from kai.install import (
     _LAUNCHD_LABEL,
     ServiceStartError,
@@ -1055,18 +1056,6 @@ class TestPromptChoice:
 
 class TestCmdConfig:
     @staticmethod
-    def _block_etc_kai(monkeypatch):
-        """Prevent the wizard from detecting /etc/kai/users.yaml on the host."""
-        _real_exists = Path.exists
-
-        def _exists_no_etc(self):
-            if str(self) == "/etc/kai/users.yaml":
-                return False
-            return _real_exists(self)
-
-        monkeypatch.setattr(Path, "exists", _exists_no_etc)
-
-    @staticmethod
     def _redirect_staging(monkeypatch, tmp_path):
         """Redirect the staging-path helper so the wizard writes under tmp_path.
 
@@ -1082,23 +1071,26 @@ class TestCmdConfig:
 
     @staticmethod
     def _simulate_existing_etc_users_yaml(monkeypatch, content):
-        """Simulate `/etc/kai/users.yaml` already existing with the given content.
+        """Simulate the canonical users.yaml already existing with the given content.
 
         Used by tests that want to exercise the wizard's "skip user
         prompts; summarize existing config" branch without touching the
         real `/etc/kai/`. Patches the path's existence check AND the
         sudo-cat reader that the wizard goes through (`Path.exists` for
         the existence gate; `_read_users_yaml_text` for the body the
-        wizard prints a summary of).
+        wizard prints a summary of). The existence patch compares
+        against the live `kai.install.USERS_YAML` attribute rather than
+        a hardcoded path, so it stacks on top of the autouse
+        `_isolate_users_yaml` redirect from conftest.
         """
         _real_exists = Path.exists
 
-        def _exists_with_etc(self):
-            if str(self) == "/etc/kai/users.yaml":
+        def _exists_with_canonical(self):
+            if self == kai.install.USERS_YAML:
                 return True
             return _real_exists(self)
 
-        monkeypatch.setattr(Path, "exists", _exists_with_etc)
+        monkeypatch.setattr(Path, "exists", _exists_with_canonical)
         monkeypatch.setattr("kai.install._read_users_yaml_text", lambda path: content)
 
     def test_writes_install_conf(self, tmp_path, monkeypatch):
@@ -1106,7 +1098,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         # Simulate user inputs for each prompt (in order)
@@ -1184,7 +1175,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         inputs = iter(
@@ -1268,7 +1258,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         inputs_basic = iter(
@@ -1393,7 +1382,6 @@ class TestCmdConfig:
         conf_path = tmp_path / "install.conf"
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         # Pre-seed existing config with goose backend so the prompt
@@ -1461,7 +1449,6 @@ class TestCmdConfig:
         conf_path = tmp_path / "install.conf"
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         existing = {"version": 1, "env": {"AGENT_BACKEND": "goose"}}
@@ -1504,7 +1491,6 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(install_module, "ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         existing = {"version": 1, "env": {"AGENT_BACKEND": "goose"}}
@@ -1529,7 +1515,6 @@ class TestCmdConfig:
         conf_path = tmp_path / "install.conf"
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         existing = {"version": 1, "env": {"AGENT_BACKEND": "goose"}}
@@ -1744,7 +1729,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         inputs = iter(self._base_inputs(["false"]))  # memory disabled
@@ -1765,7 +1749,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         inputs = iter(self._base_inputs(["false"], effort=""))
@@ -1788,7 +1771,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         inputs = iter(self._base_inputs(["false"], effort="xhigh"))
@@ -1817,7 +1799,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
@@ -1855,7 +1836,6 @@ class TestCmdConfig:
         conf_path = tmp_path / "install.conf"
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         # Pre-seed: an install.conf as if the operator had previously
@@ -1893,7 +1873,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         # Memory on, extraction on, custom timeout + consolidation candidates + episode tunables + token budget + search limit.
@@ -1949,7 +1928,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         # Every input matches the corresponding dataclass default so
@@ -1992,7 +1970,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         # Inputs in wizard order: enabled, ext enabled, timeout, consolidation, classifier-window, episode timeout, dedup threshold, token budget, search limit.
@@ -2097,7 +2074,6 @@ class TestCmdConfig:
         conf_path = tmp_path / "install.conf"
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         # Disabling memory must strip stale keys; otherwise the daemon keeps memory live after the operator opts out.
@@ -2136,7 +2112,6 @@ class TestCmdConfig:
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(install_module, "ONESHOT_REASONER_BACKENDS", frozenset({"claude", "codex"}))
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         # Switching claude -> goose must drop extraction keys: bot.py:3609 silently ignores them on non-claude.
@@ -2218,7 +2193,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         memory_block = [
@@ -2259,7 +2233,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         # All other fields at default; only the classifier window is
@@ -2292,7 +2265,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         memory_block = [
@@ -2323,7 +2295,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         # Goose now reaches the extraction-enabled prompt; declining it
@@ -2348,7 +2319,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
 
         # Goose now reaches the extraction prompt; declining keeps the
@@ -2482,7 +2452,6 @@ class TestCmdConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
         # Pin the model + codex-binary helpers so the test does not
         # depend on the host having codex installed or a curated
@@ -2839,17 +2808,18 @@ class TestCmdConfigDefaultModelDispatch:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        # Pretend /etc/kai/users.yaml exists with empty user list; only
-        # the presence flag matters for this dispatch test, not the
-        # content.
+        # Pretend the canonical users.yaml exists with empty user list;
+        # only the presence flag matters for this dispatch test, not the
+        # content. Compares against the live USERS_YAML attribute so it
+        # stacks on the autouse `_isolate_users_yaml` redirect.
         _real_exists = Path.exists
 
-        def _exists_with_etc(self):
-            if str(self) == "/etc/kai/users.yaml":
+        def _exists_with_canonical(self):
+            if self == kai.install.USERS_YAML:
                 return True
             return _real_exists(self)
 
-        monkeypatch.setattr(Path, "exists", _exists_with_etc)
+        monkeypatch.setattr(Path, "exists", _exists_with_canonical)
         monkeypatch.setattr("kai.install._read_users_yaml_text", lambda path: "users: []\n")
 
         if existing_env is not None:
@@ -3815,19 +3785,6 @@ class TestSrcChecksum:
 
 
 class TestApplyMigrate:
-    @pytest.fixture(autouse=True)
-    def _isolate_users_yaml(self, monkeypatch):
-        """
-        Default the per-user MEMORY.md migration to a no-op for tests
-        that do not care about it. Without this fixture, _apply_migrate
-        falls through to its real default of /etc/kai/users.yaml, which
-        on a developer machine is a populated file that triggers
-        chown calls outside the tmp_path sandbox. Tests that DO care
-        about memory migration pass `users_yaml_path=` explicitly and
-        are unaffected by this stub.
-        """
-        monkeypatch.setattr("kai.install._collect_user_memory_owners", lambda _path: [])
-
     def test_copies_database(self, tmp_path, monkeypatch):
         """Copies kai.db from PROJECT_ROOT to data_path when destination doesn't exist."""
         # Set up source database
@@ -4073,12 +4030,11 @@ class TestApplyMigrate:
 
 # ── Per-user MEMORY.md migration ─────────────────────────────────────
 #
-# These tests intentionally live OUTSIDE TestApplyMigrate so that the
-# autouse `_isolate_users_yaml` fixture (which stubs
-# _collect_user_memory_owners to return []) does not apply. The tests
-# below need the real function to exercise the per-user migration path
-# end-to-end. Each test passes `users_yaml_path=` explicitly, isolated
-# under tmp_path, so nothing escapes the sandbox.
+# These tests exercise the per-user migration path end-to-end with the
+# real _collect_user_memory_owners. Each test passes `users_yaml_path=`
+# explicitly, isolated under tmp_path, so nothing escapes the sandbox
+# (the conftest `_isolate_users_yaml` redirect only covers the
+# default-path case).
 
 
 class TestApplyMigratePerUserMemory:
@@ -6536,7 +6492,6 @@ class TestCmdConfigCanonicalUsersYaml:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        TestCmdConfig._block_etc_kai(monkeypatch)
         TestCmdConfig._redirect_staging(monkeypatch, tmp_path)
 
         stray = tmp_path / "users.yaml"
@@ -6566,7 +6521,6 @@ class TestCmdConfigCanonicalUsersYaml:
         conf_path = tmp_path / "install.conf"
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        TestCmdConfig._block_etc_kai(monkeypatch)
         # Use a sibling staging location so we can distinguish "top-level
         # key matches the actual staging path" from "test stuffed the
         # value via redirect at tmp_path/users.yaml".
@@ -6598,7 +6552,6 @@ class TestCmdConfigCanonicalUsersYaml:
         conf_path = tmp_path / "install.conf"
         monkeypatch.setattr("kai.install.INSTALL_CONF", conf_path)
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        TestCmdConfig._block_etc_kai(monkeypatch)
         TestCmdConfig._redirect_staging(monkeypatch, tmp_path)
 
         inputs = iter(self._base_inputs())
@@ -6908,7 +6861,6 @@ class TestCmdConfigSingleUserMode:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        TestCmdConfig._block_etc_kai(monkeypatch)
         self._redirect_xdg(monkeypatch, tmp_path)
         self._no_protected_artifacts(monkeypatch)
 
@@ -6947,7 +6899,6 @@ class TestCmdConfigSingleUserMode:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        TestCmdConfig._block_etc_kai(monkeypatch)
         self._redirect_xdg(monkeypatch, tmp_path)
         # Simulate the leftover sudoers rule: /etc/kai/env reads back
         # non-empty content via sudo -n cat.
@@ -7000,7 +6951,6 @@ class TestCmdConfigSingleUserMode:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        TestCmdConfig._block_etc_kai(monkeypatch)
         self._redirect_xdg(monkeypatch, tmp_path)
         self._no_protected_artifacts(monkeypatch)
 
@@ -8125,17 +8075,6 @@ class TestOpenCodeBinWizardPrompt:
     and the matching opencode regression tests in test_install.py.
     """
 
-    def _block_etc_kai(self, monkeypatch):
-        """Prevent the wizard from detecting /etc/kai/users.yaml on the host."""
-        _real_exists = Path.exists
-
-        def _exists_no_etc(self):
-            if str(self) == "/etc/kai/users.yaml":
-                return False
-            return _real_exists(self)
-
-        monkeypatch.setattr(Path, "exists", _exists_no_etc)
-
     def _redirect_staging(self, monkeypatch, tmp_path):
         """Redirect the staging-path helper so the wizard writes under tmp_path."""
         monkeypatch.setattr(
@@ -8205,7 +8144,6 @@ class TestOpenCodeBinWizardPrompt:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
         # Mock the model prompt so the test doesn't drive the
         # provider/model free-text branch directly.
@@ -8235,7 +8173,6 @@ class TestOpenCodeBinWizardPrompt:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
         monkeypatch.setattr(
             "kai.install._prompt_default_model",
@@ -8286,7 +8223,6 @@ class TestOpenCodeBinWizardPrompt:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
         monkeypatch.setattr(
             "kai.install._prompt_default_model",
@@ -8351,7 +8287,6 @@ class TestOpenCodeBinWizardPrompt:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
         monkeypatch.setattr(
             "kai.install._prompt_default_model",
@@ -8446,7 +8381,6 @@ class TestOpenCodeBinWizardPrompt:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
         monkeypatch.setattr(
             "kai.install._prompt_default_model",
@@ -8504,7 +8438,6 @@ class TestOpenCodeBinWizardPrompt:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._block_etc_kai(monkeypatch)
         self._redirect_staging(monkeypatch, tmp_path)
         monkeypatch.setattr(
             "kai.install._prompt_default_model",

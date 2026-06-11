@@ -62,6 +62,14 @@ from kai.config import (
 # Anchored to PROJECT_ROOT so it resolves correctly regardless of CWD.
 INSTALL_CONF = PROJECT_ROOT / "install.conf"
 
+# Canonical post-install location of users.yaml (the secrets apply step
+# deploys any staged copy here). The apply steps that read users.yaml
+# resolve this attribute at call time as their users_yaml_path default,
+# and the wizard reads it directly for its protected-mode path, so the
+# test suite can patch one attribute and stay isolated from the host's
+# real runtime config.
+USERS_YAML = Path("/etc/kai/users.yaml")
+
 # Default installation paths
 _DEFAULT_INSTALL_DIR = "/opt/kai"
 _DEFAULT_DATA_DIR = "/var/lib/kai"
@@ -745,7 +753,7 @@ def _cmd_config() -> None:
     print("-- User setup --")
     stray_project_users_yaml = PROJECT_ROOT / "users.yaml"
     if deployment_mode == "protected":
-        users_yaml_path = Path("/etc/kai/users.yaml")
+        users_yaml_path = USERS_YAML
     else:
         users_yaml_path = _xdg_users_yaml_path()
     if stray_project_users_yaml.exists():
@@ -2480,7 +2488,7 @@ def _collect_goose_os_users_from_yaml(
 def _build_codex_login_reminder(
     env: dict[str, str],
     service_user: str,
-    users_yaml_path: str | Path = "/etc/kai/users.yaml",
+    users_yaml_path: str | Path | None = None,
 ) -> str | None:
     """Compose the post-install codex subscription-auth reminder.
 
@@ -3192,7 +3200,7 @@ def _apply_migrate(
     svc_uid: int,
     svc_gid: int,
     dry_run: bool,
-    users_yaml_path: Path = Path("/etc/kai/users.yaml"),
+    users_yaml_path: Path | None = None,
 ) -> None:
     """
     Migrate runtime data from the development directory to the data directory.
@@ -3208,12 +3216,17 @@ def _apply_migrate(
         svc_uid: Numeric UID for file ownership.
         svc_gid: Numeric GID for file ownership.
         dry_run: If True, print actions without executing.
-        users_yaml_path: Path to the installed users.yaml. Defaults to
-            /etc/kai/users.yaml (the post-_apply_secrets location).
-            Parameterized so tests can supply a fixture path without
-            patching module globals; production callers always rely on
-            the default.
+        users_yaml_path: Path to the installed users.yaml. None means
+            the module-level USERS_YAML (the post-_apply_secrets
+            location); tests redirect it by patching that attribute.
     """
+    # None resolves to the module-level USERS_YAML at call time rather
+    # than in the signature: a def-time default would bake the
+    # production path in at import and bypass the patch the test suite
+    # uses to keep the host's real config out of test outcomes.
+    if users_yaml_path is None:
+        users_yaml_path = USERS_YAML
+
     # -- Database migration --
     db_src = PROJECT_ROOT / "kai.db"
     db_dst = data_path / "kai.db"
@@ -5143,7 +5156,7 @@ def _apply_goose_config(
     svc_uid: int,
     svc_gid: int,
     dry_run: bool,
-    users_yaml_path: str | Path = "/etc/kai/users.yaml",
+    users_yaml_path: str | Path | None = None,
     agent_backend: str = "claude",
 ) -> None:
     """
@@ -5166,6 +5179,13 @@ def _apply_goose_config(
     override - so the apply pipeline can call it unconditionally and
     a claude-only install is never blocked on the goose template.
     """
+    # None resolves to the module-level USERS_YAML at call time rather
+    # than in the signature: a def-time default would bake the
+    # production path in at import and bypass the patch the test suite
+    # uses to keep the host's real config out of test outcomes.
+    if users_yaml_path is None:
+        users_yaml_path = USERS_YAML
+
     # Gate before the template check: a goose template is only a
     # requirement when some session will spawn `goose acp`. users.yaml
     # is canonical at /etc/kai by this step (the secrets step deploys
@@ -5255,7 +5275,7 @@ def _apply_goose_config(
 def _apply_sudoers(
     service_user: str,
     dry_run: bool,
-    users_yaml_path: str | Path = "/etc/kai/users.yaml",
+    users_yaml_path: str | Path | None = None,
     codex_bin: str | None = None,
     opencode_bin: str | None = None,
     goose_bin: str | None = None,
@@ -5264,9 +5284,10 @@ def _apply_sudoers(
     """
     Write sudoers rules for the service user to read protected config.
 
-    Loads `users_yaml_path` (default /etc/kai/users.yaml) to discover every
-    distinct `os_user` the runtime may target via `sudo -u`, so each gets a
-    matching SETENV: NOPASSWD: rule. Without this, hand-added per-user rules
+    Loads `users_yaml_path` (None means the module-level USERS_YAML,
+    resolved at call time) to discover every distinct `os_user` the
+    runtime may target via `sudo -u`, so each gets a matching
+    SETENV: NOPASSWD: rule. Without this, hand-added per-user rules
     were silently wiped on every `sudo make install`.
 
     `codex_bin`, `opencode_bin`, and `goose_bin` are threaded from
@@ -5284,6 +5305,13 @@ def _apply_sudoers(
     agent_backend overrides in users.yaml it scopes the missing-binary
     backstop below to backends the install actually uses.
     """
+    # None resolves to the module-level USERS_YAML at call time rather
+    # than in the signature: a def-time default would bake the
+    # production path in at import and bypass the patch the test suite
+    # uses to keep the host's real config out of test outcomes.
+    if users_yaml_path is None:
+        users_yaml_path = USERS_YAML
+
     sudoers_path = Path("/etc/sudoers.d/kai")
     # Load and validate users.yaml *before* the dry_run gate. Intentional:
     # a malformed YAML file or invalid os_user value should abort even a

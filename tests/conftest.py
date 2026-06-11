@@ -148,3 +148,30 @@ def _isolate_backend_data_dir(tmp_path):
     """
     with patch("kai.backend.DATA_DIR", tmp_path):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_users_yaml(tmp_path):
+    """Redirect kai.install.USERS_YAML to an absent tmp file for ALL tests.
+
+    Mirrors _isolate_backend_data_dir in shape (autouse, redirects a
+    module-level path constant via unittest.mock.patch) and in intent
+    (keep host state out of test outcomes). The install apply steps
+    that read users.yaml (_apply_migrate, _apply_goose_config,
+    _apply_sudoers) resolve their users_yaml_path default from the
+    USERS_YAML attribute at call time, and the config wizard reads the
+    attribute directly for its protected-mode path. Without this
+    guarantee, any test that reaches one of them through the default
+    reads the host's real /etc/kai/users.yaml, and test outcomes track
+    whatever entries the machine's runtime config happens to contain
+    (absent on CI runners, populated on a configured host). An absent
+    path is the documented empty case: no per-user entries, no
+    goose-backed users.
+
+    Tests that need users.yaml content still pass an explicit
+    users_yaml_path pointing at a fixture file, or patch the existence
+    gate and reader on top of this redirect; this only sets the safe
+    default.
+    """
+    with patch("kai.install.USERS_YAML", tmp_path / "absent-users.yaml"):
+        yield
