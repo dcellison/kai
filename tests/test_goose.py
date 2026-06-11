@@ -1285,18 +1285,7 @@ class TestPreservedEnvVars:
 
         async def _fake_spawn(*args, **kwargs):
             captured["argv"] = args
-            proc = MagicMock()
-            proc.returncode = None
-            proc.pid = 11111
-            proc.stdin = MagicMock()
-            proc.stdin.write = MagicMock()
-            proc.stdin.drain = AsyncMock()
-            proc.stdout = MagicMock()
-            lines = [_initialize_result(), _session_new_result()]
-            proc.stdout.readline = AsyncMock(side_effect=lambda: lines.pop(0) if lines else b"")
-            proc.stderr = MagicMock()
-            proc.stderr.readline = AsyncMock(return_value=b"")
-            return proc
+            return _make_mock_proc(_handshake_lines())
 
         with (
             patch("kai.acp.resolve_claude_user", return_value="goose-user"),
