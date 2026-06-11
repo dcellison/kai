@@ -494,6 +494,58 @@ def _read_users_yaml_text(path: Path) -> str | None:
     return result.stdout
 
 
+def _users_yaml_goose_providers(users_yaml_path: Path, global_provider: str) -> list[str]:
+    """
+    Collect the distinct providers per-user goose entries need API
+    keys for.
+
+    Reads the canonical users.yaml via `_read_users_yaml_text` (sudo-
+    tolerant on protected installs) and returns the sorted set of
+    `llm_provider` values across entries whose `agent_backend` is
+    "goose", falling back to `global_provider` for entries that omit
+    the field - the same cascade the runtime applies. Goose is the
+    only backend whose per-user auth rides the daemon environment:
+    claude, codex, and opencode authenticate via per-OS-user on-disk
+    state managed outside the wizard, so entries on those backends
+    contribute nothing here.
+
+    A missing, unreadable, or malformed users.yaml degrades to an
+    empty list: the wizard then behaves as it does without per-user
+    goose entries, and the runtime's own users.yaml validation
+    surfaces any real misconfiguration at startup.
+
+    Deliberately NOT built on `_collect_backends_from_yaml`: that
+    sibling serves `_apply_sudoers` (apply side), reads the file
+    directly as root, raises on malformed YAML so the install fails
+    loudly, and returns backends without the provider pairing this
+    prompt needs. The wizard side runs as the operator account
+    (hence the sudo-tolerant reader) and must degrade rather than
+    crash mid-flow.
+    """
+    raw = _read_users_yaml_text(users_yaml_path)
+    if raw is None:
+        return []
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    users = data.get("users")
+    if not isinstance(users, list):
+        return []
+    providers: set[str] = set()
+    for entry in users:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("agent_backend") != "goose":
+            continue
+        provider = entry.get("llm_provider") or global_provider
+        if isinstance(provider, str) and provider:
+            providers.add(provider)
+    return sorted(providers)
+
+
 # ── Config subcommand ────────────────────────────────────────────────
 
 
@@ -977,6 +1029,39 @@ def _cmd_config() -> None:
                 # goose path.
                 print(f"  {llm_provider} does not require an API key.")
     print()
+
+    # Per-user goose entries authenticate from the daemon environment
+    # (their provider keys are forwarded through the per-backend env
+    # allowlists and sudo preserve lists), and the wizard is the only
+    # owner of that environment. This is why goose key collection is
+    # per-user-aware while codex / opencode per-user overrides stay
+    # out-of-band: those backends authenticate via per-OS-user files
+    # (codex login, opencode auth login) the wizard does not manage,
+    # but a goose entry has no equivalent the operator could use -
+    # keys added to the env file by hand are wiped on regeneration.
+    # Scan users.yaml for goose entries and prompt for any provider
+    # key the global block above did not already collect; defaults
+    # come from the existing env so a re-run keeps stored values.
+    extra_provider_keys: dict[str, str] = {}
+    for peruser_provider in _users_yaml_goose_providers(
+        users_yaml_path,
+        llm_provider or existing_env.get("LLM_PROVIDER", ""),
+    ):
+        peruser_key_var = PROVIDER_KEY_VARS.get(peruser_provider, "")
+        if not peruser_key_var:
+            # Ollama and any other auth-less provider.
+            continue
+        if peruser_key_var == llm_api_key_var and llm_api_key:
+            # The global block already collected this exact var.
+            continue
+        print(f"  users.yaml has a goose entry on {peruser_provider}; the daemon env needs {peruser_key_var}.")
+        extra_provider_keys[peruser_key_var] = _prompt(
+            peruser_key_var,
+            existing_env.get(peruser_key_var, ""),
+            required=True,
+        )
+    if extra_provider_keys:
+        print()
 
     # -- Agent --
     # DEFAULT_MODEL and AGENT_TIMEOUT_SECONDS are
@@ -1602,6 +1687,30 @@ def _cmd_config() -> None:
             env["CODEX_AUTH_MODE"] = codex_auth_mode
         if codex_api_key:
             env["OPENAI_API_KEY"] = codex_api_key
+
+    # Keys collected for per-user goose entries. Required prompts, so
+    # values are non-empty whenever the scan found a keyed provider.
+    for peruser_key_var, peruser_key_value in sorted(extra_provider_keys.items()):
+        if peruser_key_value:
+            env[peruser_key_var] = peruser_key_value
+
+    # Provider keys already stored in the env survive regeneration
+    # even when this run's prompts did not fire, so a key collected
+    # once is never silently dropped by an unrelated re-run (the env
+    # dict is built fresh above; without this pass, only keys a
+    # prompt produced this session would be emitted). The one
+    # exception is OPENAI_API_KEY on a codex install: the codex auth
+    # block owns that var's lifecycle (api_key mode collects it,
+    # subscription mode deliberately sheds it), and preservation must
+    # not resurrect a key the operator just chose to retire.
+    for provider_key_var in sorted(set(PROVIDER_KEY_VARS.values())):
+        if provider_key_var in env:
+            continue
+        if agent_backend == "codex" and provider_key_var == "OPENAI_API_KEY":
+            continue
+        existing_key_value = existing_env.get(provider_key_var, "")
+        if existing_key_value:
+            env[provider_key_var] = existing_key_value
 
     # Persist the wizard-collected codex binary path whenever any
     # codex surface (agent backend or memory reasoner) is in play.

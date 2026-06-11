@@ -50,6 +50,7 @@ from kai.install import (
     _start_service,
     _stop_service,
     _user_home,
+    _users_yaml_goose_providers,
     _validate_chat_id,
     _validate_display_name,
     _validate_os_user,
@@ -8758,3 +8759,210 @@ class TestBuildCodexLoginReminder:
 
         users_yaml = self._write_users_yaml(tmp_path, [])
         assert _build_codex_login_reminder({}, "kai", users_yaml_path=users_yaml) is None
+
+
+# ── Per-user goose provider keys ─────────────────────────────────────
+
+
+class TestUsersYamlGooseProviders:
+    """Direct tests for the wizard's per-user goose provider scan.
+
+    The helper reads the canonical users.yaml and returns the distinct
+    providers goose entries need API keys for; everything that is not
+    a well-formed goose entry degrades to an empty result so the
+    wizard never crashes mid-flow on user-owned YAML."""
+
+    @staticmethod
+    def _write(tmp_path, content: str) -> Path:
+        p = tmp_path / "users.yaml"
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_goose_entry_with_explicit_provider(self, tmp_path):
+        p = self._write(
+            tmp_path,
+            "users:\n  - telegram_id: 1\n    name: a\n    agent_backend: goose\n    llm_provider: deepseek\n",
+        )
+        assert _users_yaml_goose_providers(p, "") == ["deepseek"]
+
+    def test_falls_back_to_global_provider(self, tmp_path):
+        """An entry that omits llm_provider inherits the global
+        provider, mirroring the runtime cascade."""
+        p = self._write(tmp_path, "users:\n  - telegram_id: 1\n    name: a\n    agent_backend: goose\n")
+        assert _users_yaml_goose_providers(p, "deepseek") == ["deepseek"]
+
+    def test_no_global_fallback_yields_nothing(self, tmp_path):
+        """No llm_provider anywhere: the scan returns nothing and the
+        runtime's users.yaml validation owns the error."""
+        p = self._write(tmp_path, "users:\n  - telegram_id: 1\n    name: a\n    agent_backend: goose\n")
+        assert _users_yaml_goose_providers(p, "") == []
+
+    def test_distinct_providers_deduplicated_and_sorted(self, tmp_path):
+        p = self._write(
+            tmp_path,
+            "users:\n"
+            "  - telegram_id: 1\n    name: a\n    agent_backend: goose\n    llm_provider: openai\n"
+            "  - telegram_id: 2\n    name: b\n    agent_backend: goose\n    llm_provider: deepseek\n"
+            "  - telegram_id: 3\n    name: c\n    agent_backend: goose\n    llm_provider: deepseek\n",
+        )
+        assert _users_yaml_goose_providers(p, "") == ["deepseek", "openai"]
+
+    def test_non_goose_entries_contribute_nothing(self, tmp_path):
+        """claude / codex / opencode per-user auth is per-OS-user state
+        the wizard does not manage; only goose rides the daemon env."""
+        p = self._write(
+            tmp_path,
+            "users:\n"
+            "  - telegram_id: 1\n    name: a\n    agent_backend: opencode\n    llm_provider: deepseek\n"
+            "  - telegram_id: 2\n    name: b\n    agent_backend: codex\n"
+            "  - telegram_id: 3\n    name: c\n",
+        )
+        assert _users_yaml_goose_providers(p, "deepseek") == []
+
+    def test_missing_file_degrades_to_empty(self, tmp_path):
+        assert _users_yaml_goose_providers(tmp_path / "absent.yaml", "deepseek") == []
+
+    def test_malformed_yaml_degrades_to_empty(self, tmp_path):
+        p = self._write(tmp_path, "users: [unclosed\n")
+        assert _users_yaml_goose_providers(p, "deepseek") == []
+
+    def test_non_dict_entries_skipped(self, tmp_path):
+        p = self._write(tmp_path, "users:\n  - 42\n  - goose\n")
+        assert _users_yaml_goose_providers(p, "deepseek") == []
+
+
+class TestWizardPerUserGooseProviderKeys:
+    """Wizard collection of provider API keys for per-user goose
+    entries, the deepseek PROVIDER_KEY_VARS row, and the provider-key
+    preservation pass on env regeneration."""
+
+    PLAIN_USERS_YAML = "users:\n  - telegram_id: 1\n    name: alice\n    role: admin\n"
+    GOOSE_DEEPSEEK_USERS_YAML = (
+        "users:\n"
+        "  - telegram_id: 1\n"
+        "    name: alice\n"
+        "    role: admin\n"
+        "  - telegram_id: 2\n"
+        "    name: bob\n"
+        "    agent_backend: goose\n"
+        "    llm_provider: deepseek\n"
+    )
+
+    @staticmethod
+    def _setup(monkeypatch, tmp_path, users_yaml: str, existing_env: dict | None = None) -> None:
+        """Wizard sandbox: users.yaml exists with the given content,
+        install.conf optionally seeded, model prompt mocked."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        TestCmdConfig._simulate_existing_etc_users_yaml(monkeypatch, users_yaml)
+        monkeypatch.setattr(
+            "kai.install._prompt_default_model",
+            lambda backend, prov, default: "sonnet",
+        )
+        if existing_env is not None:
+            (tmp_path / "install.conf").write_text(json.dumps({"env": existing_env, "version": 1}))
+
+    @staticmethod
+    def _run(monkeypatch, tmp_path, inputs: list[str]) -> dict:
+        feed = iter(inputs)
+        monkeypatch.setattr("builtins.input", lambda prompt: next(feed))
+        _cmd_config()
+        return json.loads((tmp_path / "install.conf").read_text())["env"]
+
+    def test_deepseek_has_a_provider_key_var(self):
+        """The map row the whole goose-on-deepseek flow keys on: the
+        wizard prompt, the env emission, and refresh_models all
+        resolve the var through PROVIDER_KEY_VARS."""
+        from kai.config import PROVIDER_KEY_VARS
+
+        assert PROVIDER_KEY_VARS["deepseek"] == "DEEPSEEK_API_KEY"
+
+    def test_peruser_goose_entry_prompts_for_key(self, tmp_path, monkeypatch, capsys):
+        """Global claude install with a per-user goose+deepseek entry:
+        the wizard prompts for DEEPSEEK_API_KEY (inserted right after
+        the backend slot in the input chain) and emits it to env."""
+        self._setup(monkeypatch, tmp_path, self.GOOSE_DEEPSEEK_USERS_YAML)
+        inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
+        i = inputs.index("claude")
+        inputs = inputs[: i + 1] + ["sk-ds-peruser"] + inputs[i + 1 :]
+
+        env = self._run(monkeypatch, tmp_path, inputs)
+
+        assert env["DEEPSEEK_API_KEY"] == "sk-ds-peruser"
+        out = capsys.readouterr().out
+        assert "goose entry on deepseek" in out
+        assert "DEEPSEEK_API_KEY" in out
+
+    def test_no_goose_entries_means_no_prompt(self, tmp_path, monkeypatch):
+        """Plain users.yaml: the unmodified claude input chain must be
+        consumed exactly (an unexpected key prompt would raise
+        StopIteration), and no key lands in env."""
+        self._setup(monkeypatch, tmp_path, self.PLAIN_USERS_YAML)
+
+        env = self._run(monkeypatch, tmp_path, TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend())
+
+        assert "DEEPSEEK_API_KEY" not in env
+
+    def test_global_goose_deepseek_prompts_for_key(self, tmp_path, monkeypatch, capsys):
+        """Global goose+deepseek: the key prompt fires through the
+        global block now that deepseek has a PROVIDER_KEY_VARS row;
+        the auth-less fallback message must not appear."""
+        self._setup(monkeypatch, tmp_path, self.PLAIN_USERS_YAML)
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
+        inputs = list(TestCmdConfigDefaultModelDispatch._inputs_for_goose_openai())
+        inputs[inputs.index("openai")] = "deepseek"
+        inputs[inputs.index("openai-key")] = "sk-ds-global"
+
+        env = self._run(monkeypatch, tmp_path, inputs)
+
+        assert env["LLM_PROVIDER"] == "deepseek"
+        assert env["DEEPSEEK_API_KEY"] == "sk-ds-global"
+        assert "does not require an API key" not in capsys.readouterr().out
+
+    def test_peruser_key_already_collected_globally_not_reprompted(self, tmp_path, monkeypatch):
+        """Global goose+deepseek AND a per-user goose+deepseek entry:
+        the global block collects DEEPSEEK_API_KEY, so the per-user
+        scan must not prompt again (the unmodified goose chain is
+        consumed exactly)."""
+        self._setup(monkeypatch, tmp_path, self.GOOSE_DEEPSEEK_USERS_YAML)
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
+        inputs = list(TestCmdConfigDefaultModelDispatch._inputs_for_goose_openai())
+        inputs[inputs.index("openai")] = "deepseek"
+        inputs[inputs.index("openai-key")] = "sk-ds-once"
+
+        env = self._run(monkeypatch, tmp_path, inputs)
+
+        assert env["DEEPSEEK_API_KEY"] == "sk-ds-once"
+
+    def test_stored_key_survives_unrelated_regeneration(self, tmp_path, monkeypatch):
+        """A provider key already in the env survives a wizard re-run
+        whose prompts never fire (the env dict is rebuilt fresh, so
+        without the preservation pass the key would silently vanish)."""
+        self._setup(
+            monkeypatch,
+            tmp_path,
+            self.PLAIN_USERS_YAML,
+            existing_env={"TELEGRAM_BOT_TOKEN": "fake-token", "DEEPSEEK_API_KEY": "sk-stored"},
+        )
+
+        env = self._run(monkeypatch, tmp_path, TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend())
+
+        assert env["DEEPSEEK_API_KEY"] == "sk-stored"
+
+    def test_codex_subscription_does_not_resurrect_openai_key(self, tmp_path, monkeypatch):
+        """The preservation pass defers to the codex auth flow's
+        ownership of OPENAI_API_KEY: switching a codex install to
+        subscription mode sheds the stored key, and preservation must
+        not carry it back in."""
+        self._setup(
+            monkeypatch,
+            tmp_path,
+            self.PLAIN_USERS_YAML,
+            existing_env={"TELEGRAM_BOT_TOKEN": "fake-token", "OPENAI_API_KEY": "sk-old"},
+        )
+        monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
+
+        env = self._run(monkeypatch, tmp_path, TestCmdConfigDefaultModelDispatch._inputs_for_codex_subscription())
+
+        assert "OPENAI_API_KEY" not in env

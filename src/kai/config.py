@@ -111,13 +111,18 @@ BACKENDS_NEEDING_PROVIDER_PROMPT: frozenset[str] = frozenset(b for b, ps in BACK
 
 # Maps LLM provider to its API key environment variable name.
 # Backend-agnostic - the API key for Anthropic is the same env var
-# regardless of which backend is using it.
+# regardless of which backend is using it. DEEPSEEK_API_KEY is the
+# var goose's declarative DeepSeek provider names as its api_key_env
+# (and the one the per-backend env allowlists / preserve lists
+# already forward), so deepseek-on-goose key collection routes
+# through the same map as every other provider.
 # Ollama is absent because it requires no API key (local inference).
 PROVIDER_KEY_VARS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
     "google": "GOOGLE_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
 }
 
 # ── Provider-aware model registry ──────────────────────────────────────
