@@ -1,10 +1,13 @@
 """Tests for the protected installation module (install.py)."""
 
+import contextlib
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -5236,6 +5239,70 @@ class TestGenerateLauncherScript:
         script = _generate_launcher_script("/opt/kai")
         assert "seq 1 60" in script
         assert "sleep 2" in script
+
+    def test_trap_installed_before_bind_poll(self):
+        """The TERM trap must be armed before the launcher enters the
+        bind poll: a service stop during the startup window otherwise
+        exits bash alone with the default signal action and orphans
+        the starting python."""
+        script = _generate_launcher_script("/opt/kai")
+        assert script.index("trap cleanup TERM INT") < script.index("seq 1 60")
+
+    def test_sigterm_during_bind_poll_tears_down_the_child(self, tmp_path):
+        """Behavioral check on the generated script: SIGTERM arriving
+        while the launcher is still polling for the listener must
+        tear the spawned python down, not exit the wrapper alone. The
+        trap signals the launcher's process group, so the agent dies
+        even in the window where it has no resolvable pid; a wrapper
+        that exits alone leaves an orphan holding the webhook port,
+        which blocks the next boot's bind. Uses a real subprocess and
+        short real waits because the contract under test is bash
+        signal delivery, which cannot be mocked."""
+        venv_bin = tmp_path / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        pid_file = tmp_path / "fake.pid"
+        fake = venv_bin / "python3"
+        # The fake agent records its pid, then execs a sleep (same
+        # pid) without ever binding the port, pinning the launcher
+        # inside its bind poll.
+        fake.write_text(f"#!/bin/bash\necho $$ > {pid_file}\nexec sleep 30\n")
+        fake.chmod(0o755)
+
+        script_path = tmp_path / "run.sh"
+        # Port 1 is never listened on, so the poll cannot succeed.
+        script_path.write_text(_generate_launcher_script(str(tmp_path), webhook_port=1))
+        script_path.chmod(0o755)
+
+        # New session mirrors launchd: the wrapper is its own process
+        # group leader, the same topology the group signal relies on.
+        proc = subprocess.Popen(["/bin/bash", str(script_path)], start_new_session=True)
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if pid_file.exists() and pid_file.read_text().strip():
+                    break
+                time.sleep(0.1)
+            fake_pid = int(pid_file.read_text().strip())
+
+            proc.send_signal(signal.SIGTERM)
+            # The trap fires once the in-flight 2s poll sleep returns;
+            # allow margin beyond that for teardown.
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                try:
+                    os.kill(fake_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.2)
+            else:
+                pytest.fail("fake python survived SIGTERM to the launcher")
+        finally:
+            # EPERM joins ESRCH here: once the wrapper has exited and
+            # awaits reaping, macOS refuses killpg on the zombie-led
+            # group rather than reporting it gone.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
 
 
 # ── _apply_source ────────────────────────────────────────────────────
