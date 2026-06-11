@@ -17,6 +17,7 @@ The Goose ACP protocol:
 """
 
 import logging
+import os
 
 from kai.acp import AcpBackend
 
@@ -89,12 +90,21 @@ class GooseBackend(AcpBackend):
 
     def build_argv(self) -> list[str]:
         """
-        Static argv for `goose acp` with the developer builtin enabled.
+        Argv for `goose acp` with the developer builtin enabled.
 
         Goose injects the model via GOOSE_MODEL env, not argv, so model
         does not appear here.
+
+        GOOSE_BIN pins an absolute binary path (mirrors codex's
+        CODEX_BIN): when goose is not on the service user's PATH, or
+        the spawn is sudo-wrapped for a per-user os_user, the bare
+        name either fails to resolve or resolves to a path different
+        from the one the sudoers rule pins, and the spawn dies. Falls
+        back to bare "goose" so installs with goose on PATH keep
+        working without the override.
         """
-        return ["goose", "acp", "--with-builtin", "developer"]
+        goose_bin = os.environ.get("GOOSE_BIN") or "goose"
+        return [goose_bin, "acp", "--with-builtin", "developer"]
 
     def build_env(self, base_env: dict[str, str]) -> dict[str, str]:
         """
@@ -130,6 +140,34 @@ class GooseBackend(AcpBackend):
         if self.provider:
             base_env["GOOSE_PROVIDER"] = goose_provider_id(self.provider)
         return base_env
+
+    def preserved_env_vars(self) -> tuple[str, ...]:
+        """
+        Env vars the cross-user sudo wrap forwards through env_reset.
+
+        Goose reads its model and provider selection from GOOSE_MODEL
+        / GOOSE_PROVIDER (set in build_env), unlike claude and codex,
+        which pass model on argv. Without preservation, sudo's
+        env_reset strips the model selection itself, not just auth,
+        and the wrapped goose falls back to whatever its per-user
+        config files say. The five provider key vars cover env-key
+        auth flows centrally; keychain-based auth (per-user
+        `goose configure`) rides the HOME rewrite from `sudo -H`
+        instead and needs no preservation. KAI_WEBHOOK_SECRET and
+        TMPDIR mirror the AcpBackend default (webhook callback auth
+        and the per-os-user temp anchor).
+        """
+        return (
+            "GOOSE_MODEL",
+            "GOOSE_PROVIDER",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OPENROUTER_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "KAI_WEBHOOK_SECRET",
+            "TMPDIR",
+        )
 
     def build_session_new_params(self) -> dict:
         """

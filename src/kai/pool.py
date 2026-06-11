@@ -207,6 +207,16 @@ class SubprocessPool:
         # clarity of two separate resolution calls is worth it.
         home_ws = resolve_home_workspace(chat_id, self._config)
 
+        # os_user for sudo -u isolation. None = run as bot user.
+        # Resolved here (rather than inside each branch) because the
+        # claude, codex, and goose backends all consume it for
+        # per-user subprocess isolation. OpenCode does not: its auth
+        # file (~/.local/share/opencode/auth.json) is per-OS-user and
+        # operator-provisioned via `opencode auth login` outside the
+        # wizard, so opencode chat stays on the service user until
+        # that provisioning story exists.
+        os_user = user.os_user if user else None
+
         # Backend selection: "goose" uses Goose ACP, "opencode" uses
         # OpenCode ACP, "codex" uses OpenAI Codex CLI's app-server
         # JSON-RPC protocol, anything else (including the default
@@ -223,6 +233,7 @@ class SubprocessPool:
                 workspace_config=ws_config,
                 provider=effective_provider,
                 memory_enabled=self._config.memory_enabled,
+                os_user=os_user,
             )
 
         if backend == "opencode":
@@ -243,16 +254,6 @@ class SubprocessPool:
                 provider=effective_provider,
                 memory_enabled=self._config.memory_enabled,
             )
-
-        # os_user for sudo -u isolation. None = run as bot user.
-        # Resolved here (rather than inside each branch) because both
-        # ClaudeCodeBackend and CodexBackend consume it for per-user
-        # subprocess isolation. Goose and OpenCode do not: both run as
-        # the service user. Goose bills against a single GOOSE_PROVIDER
-        # auth set in /etc/kai/env; OpenCode reads its auth from
-        # ~/.local/share/opencode/auth.json which is per-OS-user but
-        # operator-managed via `opencode auth login` outside the wizard.
-        os_user = user.os_user if user else None
 
         if backend == "codex":
             # Import locally so codex.py is only imported on a

@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from kai.acp import drain_late_text, read_result, write_rpc
+from kai.acp import _kill_target_user_tree, drain_late_text, read_result, write_rpc
 from kai.codex_exec import extract_codex_text
 from kai.config import DATA_DIR, resolve_claude_user
 from kai.goose import goose_provider_id
@@ -316,14 +316,6 @@ def _preserved_auth_vars_for(backend: str) -> tuple[str, ...]:
     raise ValueError(f"unknown backend for preserve-env: {backend!r}")
 
 
-# Timeout (seconds) for the cross-user kill subprocess on the wrap
-# path. Matches the persistent backend's `_async_sudo_kill` cap. A
-# hung kill must not stall the reasoner's own timeout cleanup, so
-# the cap is intentionally short relative to memory_extraction's
-# stage-1 / stage-2 timeouts.
-_CROSS_USER_KILL_TIMEOUT_S: float = 5.0
-
-
 # ── Shared wrap / kill helpers ──────────────────────────────────────
 
 
@@ -352,79 +344,6 @@ def _wrap_cmd_for_user(cmd: list[str], target_user: str, backend: str) -> list[s
         "--",
         *cmd,
     ]
-
-
-async def _kill_target_user_tree(
-    *,
-    target_user: str,
-    pgid: int,
-    purpose: str,
-    backend: str,
-) -> None:
-    """
-    Send SIGKILL to every target-user process in the spawn's group.
-
-    The sudo wrap leaves the bot holding the `sudo` process while
-    the agent (and any descendants like the npm-wrapped codex's
-    node/Rust child pair) runs under `target_user`. POSIX
-    permission rules prevent the service user from signaling those
-    descendants directly; the workaround is `sudo -n -u <target>
-    /bin/kill -KILL -<pgid>` which the target user CAN run
-    (authorized by the per-os_user `/bin/kill` rule
-    `_generate_sudoers` already emits). The leading `-` on the
-    PID arg makes kill's target a process group; sending to the
-    negative group id signals every process the target user has
-    permission to signal in that group, covering descendants at
-    every tree depth without per-PID discovery.
-
-    Bounded by `_CROSS_USER_KILL_TIMEOUT_S` so a hung sudo or
-    missing `/bin/kill` does not stall the reasoner's own timeout
-    cleanup. Failures (non-zero rc, timeout, FileNotFoundError on
-    sudo itself) are logged and swallowed; the caller still reaps
-    the wrapper afterward, accepting the orphan risk for that
-    deployment edge case.
-    """
-    cmd = ["sudo", "-n", "-u", target_user, "/bin/kill", "-KILL", f"-{pgid}"]
-    try:
-        kill_proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        log.warning(
-            "cross-user kill spawn failed: sudo not found (purpose=%s backend=%s target=%s pgid=%d)",
-            purpose,
-            backend,
-            target_user,
-            pgid,
-        )
-        return
-    try:
-        _stdout, stderr = await asyncio.wait_for(kill_proc.communicate(), timeout=_CROSS_USER_KILL_TIMEOUT_S)
-    except TimeoutError:
-        kill_proc.kill()
-        with contextlib.suppress(BaseException):
-            await kill_proc.wait()
-        log.warning(
-            "cross-user kill timed out (purpose=%s backend=%s target=%s pgid=%d)",
-            purpose,
-            backend,
-            target_user,
-            pgid,
-        )
-        return
-    rc = kill_proc.returncode if kill_proc.returncode is not None else -1
-    if rc != 0:
-        log.warning(
-            "cross-user kill returned rc=%d (purpose=%s backend=%s target=%s pgid=%d stderr=%r)",
-            rc,
-            purpose,
-            backend,
-            target_user,
-            pgid,
-            stderr[:200],
-        )
 
 
 def _os_user_log_field(effective_user: str | None) -> str:

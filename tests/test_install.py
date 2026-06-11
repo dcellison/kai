@@ -7273,7 +7273,13 @@ class TestApplyServiceDryRun:
 
 
 class TestApplyGooseConfig:
-    """Tests for _apply_goose_config() goose binary check."""
+    """Tests for _apply_goose_config() goose binary check.
+
+    Every call passes an explicit (absent) users_yaml_path so the
+    assertions cannot flip on the host's real /etc/kai/users.yaml;
+    an absent file means no goose-backed os_users, i.e. the
+    service-user-only deploy these tests pin.
+    """
 
     def _setup(self, tmp_path):
         """Create a minimal install tree with the goose config template."""
@@ -7295,7 +7301,15 @@ class TestApplyGooseConfig:
 
         uid = os.getuid()
         gid = os.getgid()
-        _apply_goose_config("kai", install_path, uid, gid, dry_run=False)
+        _apply_goose_config(
+            "kai",
+            install_path,
+            uid,
+            gid,
+            dry_run=False,
+            users_yaml_path=tmp_path / "absent-users.yaml",
+            agent_backend="goose",
+        )
 
         output = capsys.readouterr().out
         assert "WARNING" in output
@@ -7311,7 +7325,15 @@ class TestApplyGooseConfig:
 
         uid = os.getuid()
         gid = os.getgid()
-        _apply_goose_config("kai", install_path, uid, gid, dry_run=True)
+        _apply_goose_config(
+            "kai",
+            install_path,
+            uid,
+            gid,
+            dry_run=True,
+            users_yaml_path=tmp_path / "absent-users.yaml",
+            agent_backend="goose",
+        )
 
         output = capsys.readouterr().out
         assert "WARNING" not in output
@@ -7329,10 +7351,288 @@ class TestApplyGooseConfig:
 
         uid = os.getuid()
         gid = os.getgid()
-        _apply_goose_config("kai", install_path, uid, gid, dry_run=False)
+        _apply_goose_config(
+            "kai",
+            install_path,
+            uid,
+            gid,
+            dry_run=False,
+            users_yaml_path=tmp_path / "absent-users.yaml",
+            agent_backend="goose",
+        )
 
         output = capsys.readouterr().out
         assert "WARNING" not in output
+
+    def test_deploys_to_each_goose_backed_os_user(self, tmp_path, monkeypatch):
+        """The config lands in the service user's home AND in each
+        distinct goose-backed os_user's home, each file owned by its
+        home's user (the per-user `goose acp` spawn runs under
+        `sudo -H` and resolves config beneath the target home)."""
+        import types
+
+        install_path = self._setup(tmp_path)
+        svc_home = tmp_path / "home" / "kai"
+        svc_home.mkdir(parents=True)
+        alice_home = tmp_path / "home" / "alice"
+        alice_home.mkdir(parents=True)
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/goose")
+
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            "users:\n"
+            "  - telegram_id: 1\n"
+            "    name: alice\n"
+            "    agent_backend: goose\n"
+            "    os_user: alice\n"
+            # Duplicate os_user entry: the deploy must dedupe.
+            "  - telegram_id: 2\n"
+            "    name: alice2\n"
+            "    agent_backend: goose\n"
+            "    os_user: alice\n"
+            # Non-goose user with an os_user: not a deploy target.
+            "  - telegram_id: 3\n"
+            "    name: bob\n"
+            "    agent_backend: codex\n"
+            "    os_user: bob\n"
+        )
+
+        # Fake passwd database so the os_user lookup does not depend
+        # on accounts existing on the test host.
+        def _fake_getpwnam(name):
+            if name == "alice":
+                return types.SimpleNamespace(pw_dir=str(alice_home), pw_uid=2001, pw_gid=2001)
+            raise KeyError(name)
+
+        monkeypatch.setattr("kai.install.pwd", types.SimpleNamespace(getpwnam=_fake_getpwnam))
+
+        # Record chowns instead of performing them: the test runner
+        # cannot chown to arbitrary uids, and the recorded calls ARE
+        # the ownership contract under test.
+        chowns: list[tuple[str, int, int]] = []
+        monkeypatch.setattr(
+            "kai.install._set_ownership",
+            lambda path, uid, gid, recursive=False: chowns.append((str(path), uid, gid)),
+        )
+
+        _apply_goose_config(
+            "kai",
+            install_path,
+            1001,
+            1001,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+            agent_backend="claude",
+        )
+
+        # Both homes got the template.
+        assert (svc_home / ".config" / "goose" / "config.yaml").exists()
+        assert (alice_home / ".config" / "goose" / "config.yaml").exists()
+        # Exactly one per-os_user deploy (deduped), none for bob.
+        assert not (tmp_path / "home" / "bob").exists()
+        # Ownership followed each home's user.
+        svc_cfg = str(svc_home / ".config" / "goose" / "config.yaml")
+        alice_cfg = str(alice_home / ".config" / "goose" / "config.yaml")
+        assert (svc_cfg, 1001, 1001) in chowns
+        assert (alice_cfg, 2001, 2001) in chowns
+
+    def test_global_goose_install_deploys_to_os_users_without_override(self, tmp_path, monkeypatch):
+        """On a global goose install, users.yaml entries with no
+        per-user agent_backend inherit goose and their os_user homes
+        are deploy targets."""
+        import types
+
+        install_path = self._setup(tmp_path)
+        svc_home = tmp_path / "home" / "kai"
+        svc_home.mkdir(parents=True)
+        carol_home = tmp_path / "home" / "carol"
+        carol_home.mkdir(parents=True)
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+        monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/goose")
+
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - telegram_id: 1\n    name: carol\n    os_user: carol\n")
+
+        monkeypatch.setattr(
+            "kai.install.pwd",
+            types.SimpleNamespace(
+                getpwnam=lambda name: types.SimpleNamespace(pw_dir=str(carol_home), pw_uid=2002, pw_gid=2002)
+            ),
+        )
+        monkeypatch.setattr(
+            "kai.install._set_ownership",
+            lambda path, uid, gid, recursive=False: None,
+        )
+
+        _apply_goose_config(
+            "kai",
+            install_path,
+            1001,
+            1001,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+            agent_backend="goose",
+        )
+
+        assert (carol_home / ".config" / "goose" / "config.yaml").exists()
+
+    def test_dry_run_lists_every_target(self, tmp_path, capsys, monkeypatch):
+        """Dry run prints the create/copy pair for the service user
+        and each goose-backed os_user, mutating nothing."""
+        import types
+
+        install_path = self._setup(tmp_path)
+        svc_home = tmp_path / "home" / "kai"
+        svc_home.mkdir(parents=True)
+        alice_home = tmp_path / "home" / "alice"
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            "users:\n  - telegram_id: 1\n    name: alice\n    agent_backend: goose\n    os_user: alice\n"
+        )
+        monkeypatch.setattr(
+            "kai.install.pwd",
+            types.SimpleNamespace(
+                getpwnam=lambda name: types.SimpleNamespace(pw_dir=str(alice_home), pw_uid=2001, pw_gid=2001)
+            ),
+        )
+
+        _apply_goose_config(
+            "kai",
+            install_path,
+            1001,
+            1001,
+            dry_run=True,
+            users_yaml_path=users_yaml,
+            agent_backend="claude",
+        )
+
+        output = capsys.readouterr().out
+        assert f"[DRY RUN] Would create: {svc_home / '.config' / 'goose'}" in output
+        assert f"[DRY RUN] Would create: {alice_home / '.config' / 'goose'}" in output
+        # Nothing was written.
+        assert not (svc_home / ".config").exists()
+        assert not alice_home.exists()
+
+    def test_noop_when_nothing_goose_backed(self, tmp_path, capsys):
+        """A claude-only install (no global goose, no per-user goose
+        override) deploys nothing and is never blocked on the goose
+        template - the apply pipeline calls this unconditionally."""
+        # Deliberately NO template in the install tree: the gate must
+        # return before the template existence check.
+        install_path = tmp_path / "opt" / "kai"
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users:\n  - {telegram_id: 1, name: a, agent_backend: codex, os_user: bob}\n")
+
+        _apply_goose_config(
+            "kai",
+            install_path,
+            1001,
+            1001,
+            dry_run=False,
+            users_yaml_path=users_yaml,
+            agent_backend="claude",
+        )
+
+        assert capsys.readouterr().out == ""
+
+    def test_unknown_os_user_fails_before_any_deploy(self, tmp_path, monkeypatch):
+        """An os_user missing from the passwd database aborts the
+        whole step BEFORE the service-user copy, so a typo cannot
+        leave a half-deployed set of homes."""
+        import types
+
+        install_path = self._setup(tmp_path)
+        svc_home = tmp_path / "home" / "kai"
+        svc_home.mkdir(parents=True)
+        monkeypatch.setattr("kai.install._user_home", lambda u: str(svc_home))
+
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text(
+            "users:\n  - telegram_id: 1\n    name: ghost\n    agent_backend: goose\n    os_user: ghost\n"
+        )
+
+        def _raise_keyerror(name):
+            raise KeyError(name)
+
+        monkeypatch.setattr("kai.install.pwd", types.SimpleNamespace(getpwnam=_raise_keyerror))
+
+        with pytest.raises(ValueError, match="does not exist"):
+            _apply_goose_config(
+                "kai",
+                install_path,
+                1001,
+                1001,
+                dry_run=False,
+                users_yaml_path=users_yaml,
+                agent_backend="claude",
+            )
+
+        assert not (svc_home / ".config").exists()
+
+
+class TestCollectGooseOsUsersFromYaml:
+    """The goose-backed os_user collector behind _apply_goose_config:
+    per-user overrides and global-backend inheritance select entries;
+    empty/absent os_users are skipped (service-user deploy covers
+    them); validation failures raise before any path is built."""
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        from kai.install import _collect_goose_os_users_from_yaml
+
+        assert _collect_goose_os_users_from_yaml(tmp_path / "nope.yaml", "goose") == []
+
+    def test_per_user_override_selected_on_non_goose_global(self, tmp_path):
+        from kai.install import _collect_goose_os_users_from_yaml
+
+        path = tmp_path / "users.yaml"
+        path.write_text(
+            "users:\n"
+            "  - {telegram_id: 1, name: a, agent_backend: goose, os_user: alice}\n"
+            "  - {telegram_id: 2, name: b, agent_backend: codex, os_user: bob}\n"
+            "  - {telegram_id: 3, name: c, os_user: carol}\n"
+        )
+        assert _collect_goose_os_users_from_yaml(path, "claude") == ["alice"]
+
+    def test_global_goose_inherited_by_unset_entries(self, tmp_path):
+        from kai.install import _collect_goose_os_users_from_yaml
+
+        path = tmp_path / "users.yaml"
+        path.write_text(
+            "users:\n"
+            "  - {telegram_id: 1, name: a, os_user: alice}\n"
+            "  - {telegram_id: 2, name: b, agent_backend: claude, os_user: bob}\n"
+        )
+        assert _collect_goose_os_users_from_yaml(path, "goose") == ["alice"]
+
+    def test_entries_without_os_user_skipped(self, tmp_path):
+        from kai.install import _collect_goose_os_users_from_yaml
+
+        path = tmp_path / "users.yaml"
+        path.write_text("users:\n  - {telegram_id: 1, name: a, agent_backend: goose}\n")
+        assert _collect_goose_os_users_from_yaml(path, "claude") == []
+
+    def test_duplicates_deduped_preserving_order(self, tmp_path):
+        from kai.install import _collect_goose_os_users_from_yaml
+
+        path = tmp_path / "users.yaml"
+        path.write_text(
+            "users:\n"
+            "  - {telegram_id: 1, name: a, agent_backend: goose, os_user: alice}\n"
+            "  - {telegram_id: 2, name: b, agent_backend: goose, os_user: dana}\n"
+            "  - {telegram_id: 3, name: c, agent_backend: goose, os_user: alice}\n"
+        )
+        assert _collect_goose_os_users_from_yaml(path, "claude") == ["alice", "dana"]
+
+    def test_invalid_os_user_raises(self, tmp_path):
+        from kai.install import _collect_goose_os_users_from_yaml
+
+        path = tmp_path / "users.yaml"
+        path.write_text('users:\n  - {telegram_id: 1, name: a, agent_backend: goose, os_user: "bad)user"}\n')
+        with pytest.raises(ValueError, match="Invalid os_user"):
+            _collect_goose_os_users_from_yaml(path, "claude")
 
 
 # ── _apply_migrate per-os-user tmp dir (issue #454) ────────────────────

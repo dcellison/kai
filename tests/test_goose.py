@@ -1221,3 +1221,95 @@ class TestSendLock:
             events.append(event)
         assert not g._lock.locked()
         assert len(events) > 0
+
+
+# ── Argv binary resolution ──────────────────────────────────────────
+
+
+class TestBuildArgv:
+    """GOOSE_BIN pins the binary path so a sudo-wrapped per-user spawn
+    matches the absolute path the sudoers rule names (mirrors codex's
+    CODEX_BIN contract); bare "goose" remains the default for installs
+    with goose on PATH."""
+
+    def test_bare_goose_without_override(self, monkeypatch):
+        monkeypatch.delenv("GOOSE_BIN", raising=False)
+        g = _make_goose()
+        assert g.build_argv() == ["goose", "acp", "--with-builtin", "developer"]
+
+    def test_goose_bin_override_pins_absolute_path(self, monkeypatch):
+        monkeypatch.setenv("GOOSE_BIN", "/opt/homebrew/bin/goose")
+        g = _make_goose()
+        assert g.build_argv() == ["/opt/homebrew/bin/goose", "acp", "--with-builtin", "developer"]
+
+    def test_empty_goose_bin_falls_back_to_bare_name(self, monkeypatch):
+        """An empty-string GOOSE_BIN (unset-but-present in /etc/kai/env)
+        must not produce an empty argv head."""
+        monkeypatch.setenv("GOOSE_BIN", "")
+        g = _make_goose()
+        assert g.build_argv()[0] == "goose"
+
+
+# ── Cross-user preserve list ────────────────────────────────────────
+
+
+class TestPreservedEnvVars:
+    """The sudo wrap's --preserve-env list. Goose delivers model and
+    provider selection via env vars (GOOSE_MODEL / GOOSE_PROVIDER in
+    build_env), so the override must carry them through env_reset or
+    the wrapped goose silently loses its model selection; the five
+    provider keys cover env-key auth, and KAI_WEBHOOK_SECRET / TMPDIR
+    mirror the AcpBackend default."""
+
+    def test_content_exact(self):
+        g = _make_goose()
+        assert g.preserved_env_vars() == (
+            "GOOSE_MODEL",
+            "GOOSE_PROVIDER",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OPENROUTER_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "KAI_WEBHOOK_SECRET",
+            "TMPDIR",
+        )
+
+    @pytest.mark.asyncio
+    async def test_wrap_argv_carries_goose_preserve_list(self, monkeypatch):
+        """End-to-end through _ensure_started: the goose wrap's
+        --preserve-env CSV is the hook's list, not the base default."""
+        monkeypatch.delenv("GOOSE_BIN", raising=False)
+        g = _make_goose(os_user="goose-user", provider="anthropic")
+        captured: dict = {}
+
+        async def _fake_spawn(*args, **kwargs):
+            captured["argv"] = args
+            proc = MagicMock()
+            proc.returncode = None
+            proc.pid = 11111
+            proc.stdin = MagicMock()
+            proc.stdin.write = MagicMock()
+            proc.stdin.drain = AsyncMock()
+            proc.stdout = MagicMock()
+            lines = [_initialize_result(), _session_new_result()]
+            proc.stdout.readline = AsyncMock(side_effect=lambda: lines.pop(0) if lines else b"")
+            proc.stderr = MagicMock()
+            proc.stderr.readline = AsyncMock(return_value=b"")
+            return proc
+
+        with (
+            patch("kai.acp.resolve_claude_user", return_value="goose-user"),
+            patch("kai.acp.asyncio.create_subprocess_exec", side_effect=_fake_spawn),
+        ):
+            await g._ensure_started()
+
+        argv = list(captured["argv"])
+        assert argv[:4] == ["sudo", "-H", "-u", "goose-user"]
+        assert argv[4] == (
+            "--preserve-env=GOOSE_MODEL,GOOSE_PROVIDER,ANTHROPIC_API_KEY,"
+            "OPENAI_API_KEY,GOOGLE_API_KEY,OPENROUTER_API_KEY,DEEPSEEK_API_KEY,"
+            "KAI_WEBHOOK_SECRET,TMPDIR"
+        )
+        assert argv[5] == "--"
+        assert argv[6:] == ["goose", "acp", "--with-builtin", "developer"]

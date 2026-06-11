@@ -25,6 +25,7 @@ The hook surface:
     backend_label          : human-readable label for error messages
     build_argv()           : subprocess command vector (may include model)
     build_env(base_env)    : layer backend-specific env onto base_env
+    preserved_env_vars()   : env vars the cross-user sudo wrap preserves
     build_initialize_params() : params for the initialize JSON-RPC call
     build_session_new_params() : params for the session/new JSON-RPC call
     extract_session_id(result) : pull session ID from session/new result
@@ -35,9 +36,11 @@ The hook surface:
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import subprocess
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -55,7 +58,7 @@ from kai.backend import (
     ensure_user_memory,
     ensure_user_preferences,
 )
-from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file
+from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
 
 log = logging.getLogger(__name__)
 
@@ -283,6 +286,214 @@ def convert_image_block(block: dict) -> dict | None:
     return {"type": "image", "mimeType": media_type, "data": data}
 
 
+# ── Shared cross-user subprocess helpers ─────────────────────────
+
+
+# Timeout (seconds) for the cross-user kill subprocess on the wrap
+# path. A hung kill must not stall the caller's own timeout cleanup
+# (a one-shot reasoner's typed-error path, or the conversational
+# backend's _kill/shutdown chain), so the cap is intentionally short
+# relative to the timeouts those callers run under.
+_CROSS_USER_KILL_TIMEOUT_S: float = 5.0
+
+
+def _stderr_is_esrch(stderr: bytes | None) -> bool:
+    """
+    True iff `stderr` carries the POSIX ESRCH diagnostic from
+    `/bin/kill` for a no-such-process condition.
+
+    Discriminates the benign race (the target tree already exited
+    between the caller's decision to kill and the signal delivery;
+    kill returns rc=1 with "No such process") from real failure
+    modes (sudoers misconfiguration, signal permission denied, kill
+    binary missing). The benign case logs at DEBUG; everything else
+    keeps the WARNING.
+
+    Substring match because BSD `/bin/kill` on macOS and util-linux
+    `kill` on Linux both emit `kill: <pid>: No such process`; the
+    prefix varies slightly but the "No such process" portion is the
+    stable POSIX `strerror(ESRCH)` text, fixed by libc and not
+    localized for these binaries on any production platform.
+
+    Returns False on `None` or empty bytes so a missing-stderr
+    rc!=0 (itself unusual and probably a real failure) keeps the
+    WARNING.
+    """
+    if not stderr:
+        return False
+    return b"No such process" in stderr
+
+
+def _log_cross_user_kill_result(
+    *,
+    rc: int,
+    stderr: bytes,
+    target_user: str,
+    pgid: int,
+    purpose: str,
+    backend: str,
+) -> None:
+    """
+    Log the outcome of a cross-user kill subprocess.
+
+    Shared by the async and sync kill variants so the rc/ESRCH
+    classification cannot drift between them: rc=0 is silent
+    success, ESRCH is the benign already-gone race at DEBUG, any
+    other non-zero rc is a WARNING an operator needs to see.
+    """
+    if rc == 0:
+        return
+    if _stderr_is_esrch(stderr):
+        log.debug(
+            "cross-user kill: process group already gone (purpose=%s backend=%s target=%s pgid=%d); benign race",
+            purpose,
+            backend,
+            target_user,
+            pgid,
+        )
+        return
+    log.warning(
+        "cross-user kill returned rc=%d (purpose=%s backend=%s target=%s pgid=%d stderr=%r)",
+        rc,
+        purpose,
+        backend,
+        target_user,
+        pgid,
+        stderr[:200],
+    )
+
+
+async def _kill_target_user_tree(
+    *,
+    target_user: str,
+    pgid: int,
+    purpose: str,
+    backend: str,
+) -> None:
+    """
+    Send SIGKILL to every target-user process in the spawn's group.
+
+    The sudo wrap leaves the bot holding the `sudo` process while
+    the agent (and any descendants like the npm-wrapped codex's
+    node/Rust child pair) runs under `target_user`. POSIX
+    permission rules prevent the service user from signaling those
+    descendants directly; the workaround is `sudo -n -u <target>
+    /bin/kill -KILL -<pgid>` which the target user CAN run
+    (authorized by the per-os_user `/bin/kill` rule
+    `install._generate_sudoers` already emits). The leading `-` on
+    the PID arg makes kill's target a process group; sending to the
+    negative group id signals every process the target user has
+    permission to signal in that group, covering descendants at
+    every tree depth without per-PID discovery.
+
+    Shared by the one-shot reasoners (timeout escalation) and the
+    conversational `AcpBackend` kill paths so the cross-user kill
+    semantics cannot drift between them. Bounded by
+    `_CROSS_USER_KILL_TIMEOUT_S` so a hung sudo or missing
+    `/bin/kill` does not stall the caller's own cleanup. Failures
+    (non-ESRCH rc, timeout, FileNotFoundError on sudo itself) are
+    logged and swallowed; the caller still reaps the wrapper
+    afterward, accepting the orphan risk for that deployment edge
+    case.
+    """
+    cmd = ["sudo", "-n", "-u", target_user, "/bin/kill", "-KILL", f"-{pgid}"]
+    try:
+        kill_proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        log.warning(
+            "cross-user kill spawn failed: sudo not found (purpose=%s backend=%s target=%s pgid=%d)",
+            purpose,
+            backend,
+            target_user,
+            pgid,
+        )
+        return
+    try:
+        _stdout, stderr = await asyncio.wait_for(kill_proc.communicate(), timeout=_CROSS_USER_KILL_TIMEOUT_S)
+    except TimeoutError:
+        kill_proc.kill()
+        with contextlib.suppress(BaseException):
+            await kill_proc.wait()
+        log.warning(
+            "cross-user kill timed out (purpose=%s backend=%s target=%s pgid=%d)",
+            purpose,
+            backend,
+            target_user,
+            pgid,
+        )
+        return
+    rc = kill_proc.returncode if kill_proc.returncode is not None else -1
+    _log_cross_user_kill_result(
+        rc=rc,
+        stderr=stderr,
+        target_user=target_user,
+        pgid=pgid,
+        purpose=purpose,
+        backend=backend,
+    )
+
+
+def _kill_target_user_tree_sync(
+    *,
+    target_user: str,
+    pgid: int,
+    purpose: str,
+    backend: str,
+) -> None:
+    """
+    Synchronous companion to `_kill_target_user_tree` for sync-only
+    callers.
+
+    `AgentBackend.force_kill` is a synchronous method (the pool's
+    last-resort path after `shutdown` failed or timed out), so it
+    cannot await the canonical async helper; the claude and codex
+    backends keep a sync signal path for exactly this reason. Same
+    argv, timeout bound, and rc/ESRCH log classification as the
+    async variant. Blocking the loop for up to
+    `_CROSS_USER_KILL_TIMEOUT_S` is accepted on this path: it only
+    runs when a graceful shutdown already failed and the
+    alternative is an orphaned target-user process tree.
+    """
+    cmd = ["sudo", "-n", "-u", target_user, "/bin/kill", "-KILL", f"-{pgid}"]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=_CROSS_USER_KILL_TIMEOUT_S,
+            check=False,
+        )
+    except FileNotFoundError:
+        log.warning(
+            "cross-user kill spawn failed: sudo not found (purpose=%s backend=%s target=%s pgid=%d)",
+            purpose,
+            backend,
+            target_user,
+            pgid,
+        )
+        return
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "cross-user kill timed out (purpose=%s backend=%s target=%s pgid=%d)",
+            purpose,
+            backend,
+            target_user,
+            pgid,
+        )
+        return
+    _log_cross_user_kill_result(
+        rc=result.returncode,
+        stderr=result.stderr,
+        target_user=target_user,
+        pgid=pgid,
+        purpose=purpose,
+        backend=backend,
+    )
+
+
 # ── ACP base backend ──────────────────────────────────────────────
 
 
@@ -327,6 +538,13 @@ class AcpBackend(AgentBackend):
         # the kwarg; production callers (pool.py) always pass an
         # explicit value.
         memory_enabled: bool = False,
+        # Optional OS user to run the ACP subprocess as, via
+        # `sudo -H -u <user>`. None = run as the bot's process user.
+        # Same per-user isolation contract as claude_user / codex_user
+        # on the sibling backends; resolved through resolve_claude_user
+        # at spawn time so a value naming the bot's own user collapses
+        # to the direct-spawn path (self-sudo skip).
+        os_user: str | None = None,
     ):
         # ABC-required attributes (pool.py reads/writes these)
         self.model = model
@@ -336,6 +554,7 @@ class AcpBackend(AgentBackend):
         self.workspace_config = workspace_config
         self.provider = provider
         self.memory_enabled = memory_enabled
+        self.os_user = os_user
 
         # API context for session injection (passed to build_session_context).
         self._api_context = ApiContext(
@@ -363,6 +582,15 @@ class AcpBackend(AgentBackend):
         # Subprocess and session state.
         self._proc: asyncio.subprocess.Process | None = None
         self._session_id: str | None = None
+        # Cross-user spawn state, set per incarnation in
+        # _ensure_started. `_effective_os_user` is the resolved sudo
+        # target (None on the direct path); `_pgid` is the wrapper's
+        # process group id, recorded only on the wrap path so the
+        # kill paths know whether a sudo escalation is needed and
+        # which group to target. _kill nulls both so a recycled
+        # instance cannot carry stale routing into a fresh spawn.
+        self._effective_os_user: str | None = None
+        self._pgid: int | None = None
         # Whether the agent accepts image content blocks on
         # session/prompt, read from `promptCapabilities.image` in the
         # initialize result. False until a handshake completes so a
@@ -410,6 +638,30 @@ class AcpBackend(AgentBackend):
         it may mutate in place or return a different dict.
         """
         raise NotImplementedError
+
+    def preserved_env_vars(self) -> tuple[str, ...]:
+        """
+        Return the env var names the cross-user sudo wrap forwards
+        through sudo's env_reset (the `--preserve-env=<csv>` clause).
+
+        Only consulted on the wrap path (`os_user` resolved to a
+        non-bot user); the direct spawn hands the full env built in
+        `_ensure_started` to the subprocess unfiltered. The per-user
+        sudoers entries generated by `install._generate_sudoers`
+        carry the `SETENV:` tag that authorizes the passthrough.
+
+        Default mirrors claude.py's wrap: KAI_WEBHOOK_SECRET (the
+        per-session token the agent needs to call back into Kai's
+        webhook API) and TMPDIR (the per-os-user temp anchor set in
+        `_ensure_started`; without preservation env_reset strips the
+        anchor and the agent falls back to the shared /tmp).
+        Concrete adapters whose harness reads configuration or auth
+        from the environment must override and EXTEND this list -
+        sudo strips everything not named here, so an adapter that
+        delivers model selection via env (GooseBackend) loses it
+        silently otherwise.
+        """
+        return ("KAI_WEBHOOK_SECRET", "TMPDIR")
 
     def build_initialize_params(self) -> dict:
         """
@@ -558,18 +810,36 @@ class AcpBackend(AgentBackend):
         1. initialize - establishes protocol version and capabilities
         2. session/new - creates a session with backend-specific params
 
+        When `os_user` resolves to a non-bot user, the argv is wrapped
+        in `sudo -H -u <target> --preserve-env=<csv> --` so the agent
+        runs as that user (per-user OS isolation, same contract as the
+        claude and codex backends). `-H` rewrites HOME so the agent
+        reads its config and auth state under the target user's home;
+        the preserve list comes from the preserved_env_vars() hook.
+
         The process persists across prompts. Restarts (via /new or a
         workspace switch) re-run the handshake with a fresh session.
         """
         if self.is_alive:
             return
 
+        # Per-user OS routing. resolve_claude_user (named claude-
+        # historically; its body is backend-agnostic) returns None
+        # when os_user is unset OR matches the bot's own user, so the
+        # self-sudo-skip path is byte-identical to a no-os_user spawn.
+        effective_os_user = resolve_claude_user(self.os_user)
+
         # Build the subprocess environment. Layering order:
         # 1. Base environment (inherited from parent process)
         # 2. Backend-specific keys (via self.build_env)
         # 3. Per-workspace env_file values
         # 4. Per-workspace inline env values (override env_file)
-        # 5. Webhook secret (LAST - workspace env can't override it)
+        # 5. Webhook secret (workspace env can't override it)
+        # 6. Per-os-user TMPDIR anchor (cross-user mode only; LAST so
+        #    workspace env cannot point one user's temp writes at
+        #    another's). The per-user dirs under <DATA_DIR>/tmp/ are
+        #    created and chowned by install.py; TMPDIR survives
+        #    sudo's env_reset via the preserved_env_vars() default.
         env = self.build_env(os.environ.copy())
         if self.workspace_config:
             if self.workspace_config.env_file:
@@ -578,9 +848,32 @@ class AcpBackend(AgentBackend):
                 env.update(self.workspace_config.env)
         if self._api_context.webhook_secret:
             env["KAI_WEBHOOK_SECRET"] = self._api_context.webhook_secret
+        if effective_os_user:
+            env["TMPDIR"] = str(DATA_DIR / "tmp" / effective_os_user)
 
         argv = self.build_argv()
-        log.info("Starting persistent %s ACP process (model=%s)", self.backend_label, self.model)
+        if effective_os_user:
+            # The SETENV: tag on the per-os_user sudoers rule
+            # authorizes --preserve-env; the rule pins the absolute
+            # agent binary path, so sudo's PATH resolution of the
+            # argv head must land on the same file the rule names.
+            preserve = ",".join(self.preserved_env_vars())
+            argv = [
+                "sudo",
+                "-H",
+                "-u",
+                effective_os_user,
+                f"--preserve-env={preserve}",
+                "--",
+                *argv,
+            ]
+
+        log.info(
+            "Starting persistent %s ACP process (model=%s, user=%s)",
+            self.backend_label,
+            self.model,
+            effective_os_user or "(same as bot)",
+        )
 
         self._proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -590,7 +883,19 @@ class AcpBackend(AgentBackend):
             cwd=str(self.workspace),
             env=env,
             limit=1024 * 1024,  # 1MB per-line buffer
+            # Cross-user mode: new session group so the sudo wrapper
+            # is the session leader (PGID == PID) and the kill paths
+            # can SIGKILL the whole target-user tree by negative
+            # group id. Direct mode keeps default semantics so a
+            # plain kill on _proc reaches the agent alone.
+            start_new_session=bool(effective_os_user),
         )
+        # PGID == PID for session leaders. Recorded now because
+        # os.getpgid() fails once the wrapper exits, while the group
+        # kill works as long as any member survives (the orphaned
+        # agent is exactly the member that survives the wrapper).
+        self._pgid = self._proc.pid if effective_os_user else None
+        self._effective_os_user = effective_os_user
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
         # Step 1: initialize - establish protocol version and read the
@@ -1062,8 +1367,25 @@ class AcpBackend(AgentBackend):
         Safe to call without holding the lock. Called by /stop to abort
         an in-flight response. Does NOT null _proc - full cleanup
         happens in _kill() when the read loop detects EOF.
+
+        Cross-user mode: _proc is the sudo wrapper, owned by the
+        service user; the agent underneath is owned by the target
+        user, and SIGKILL cannot be relayed by sudo. Killing only the
+        wrapper would orphan the agent, so the target-user process
+        group is sudo-escalated FIRST (sync variant; this method is
+        the pool's synchronous last resort). _pgid is nulled after
+        the escalation so the async kill paths that follow (read
+        loop EOF -> _kill) do not re-kill an already-dead group.
         """
         if self._proc is not None:
+            if self._effective_os_user is not None and self._pgid is not None:
+                _kill_target_user_tree_sync(
+                    target_user=self._effective_os_user,
+                    pgid=self._pgid,
+                    purpose="chat",
+                    backend=self.backend_name,
+                )
+                self._pgid = None
             try:
                 self._proc.kill()
             except OSError:
@@ -1077,9 +1399,21 @@ class AcpBackend(AgentBackend):
         Kill the subprocess and clean up all process state.
 
         Sends SIGKILL, waits up to 5 seconds for exit, then nulls all
-        process references. Idempotent.
+        process references. Idempotent. Cross-user mode escalates the
+        target-user group kill through the canonical async helper
+        BEFORE the wrapper is reaped, and nulls _pgid so the
+        force_kill() call below does not repeat the escalation
+        synchronously.
         """
         if self._proc:
+            if self._effective_os_user is not None and self._pgid is not None:
+                await _kill_target_user_tree(
+                    target_user=self._effective_os_user,
+                    pgid=self._pgid,
+                    purpose="chat",
+                    backend=self.backend_name,
+                )
+                self._pgid = None
             self.force_kill()
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
@@ -1089,6 +1423,8 @@ class AcpBackend(AgentBackend):
             # None, so no additional cleanup needed here.
             self._proc = None
             self._session_id = None
+            self._pgid = None
+            self._effective_os_user = None
 
     async def restart(self) -> None:
         """
@@ -1134,6 +1470,14 @@ class AcpBackend(AgentBackend):
 
         Sends SIGTERM first and waits up to 5 seconds for clean exit.
         Falls back to SIGKILL if the process doesn't terminate in time.
+
+        Cross-user mode: the SIGTERM lands on the sudo wrapper, which
+        relays catchable signals to the target-user agent, so the
+        graceful path needs no escalation. The SIGKILL fallback DOES:
+        SIGKILL cannot be relayed, so the target-user group is
+        escalated through the canonical async helper before
+        force_kill() reaps the wrapper (with _pgid nulled so
+        force_kill skips its own sync escalation).
         """
         if self._proc:
             try:
@@ -1146,6 +1490,14 @@ class AcpBackend(AgentBackend):
                 try:
                     await asyncio.wait_for(self._proc.wait(), timeout=5)
                 except TimeoutError:
+                    if self._effective_os_user is not None and self._pgid is not None:
+                        await _kill_target_user_tree(
+                            target_user=self._effective_os_user,
+                            pgid=self._pgid,
+                            purpose="chat",
+                            backend=self.backend_name,
+                        )
+                        self._pgid = None
                     self.force_kill()
                     try:
                         await asyncio.wait_for(self._proc.wait(), timeout=5)
@@ -1156,3 +1508,5 @@ class AcpBackend(AgentBackend):
             self._stderr_task = None
         self._proc = None
         self._session_id = None
+        self._pgid = None
+        self._effective_os_user = None

@@ -34,6 +34,12 @@ Covers:
     initialize result, Anthropic-to-ACP block conversion, forwarding
     when supported, drop notice in the reply text when not, and the
     EOF-after-drop path staying an error
+19. os_user routing: direct spawn vs sudo -H wrap, preserve-env CSV
+    from the preserved_env_vars() hook, per-os-user TMPDIR anchor
+20. Cross-user kill escalation on force_kill / _kill / shutdown /
+    in-stream timeout when wrapped, and its absence when direct
+21. The shared _kill_target_user_tree helpers (argv shape, ESRCH
+    demotion, timeout bound)
 """
 
 import asyncio
@@ -1687,3 +1693,483 @@ class TestReadResultFreeFunction:
             backend_label="OpenCode",
         )
         assert result == {"ok": True}
+
+
+# ── Cross-user os_user routing ──────────────────────────────────────
+
+
+class TestOsUserRouting:
+    """`os_user` controls the sudo wrap in _ensure_started, mirroring
+    the claude/codex routing contract: an unset (or bot-matching)
+    target spawns the agent directly; a non-bot target wraps the argv
+    in `sudo -H -u <target> --preserve-env=<csv> --`, runs the spawn
+    in a new session group, and records the escalation target + pgid
+    the kill paths need."""
+
+    @pytest.mark.asyncio
+    async def test_direct_spawn_when_os_user_none(self):
+        """No os_user: argv is the bare build_argv() vector, no new
+        session group, no escalation state recorded."""
+        b = _make_fake()
+        captured: dict = {}
+
+        async def _fake_spawn(*args, **kwargs):
+            captured["argv"] = args
+            captured.update(kwargs)
+            return _make_mock_proc(_handshake_lines())
+
+        with patch("kai.acp.asyncio.create_subprocess_exec", side_effect=_fake_spawn):
+            await b._ensure_started()
+
+        assert captured["argv"][0] == "fake_acp_binary"
+        assert "sudo" not in captured["argv"]
+        assert captured["start_new_session"] is False
+        assert b._pgid is None
+        assert b._effective_os_user is None
+
+    @pytest.mark.asyncio
+    async def test_self_sudo_skip_spawns_direct(self):
+        """An os_user that resolve_claude_user collapses to None (the
+        bot's own user) takes the byte-identical direct path. The
+        resolver is patched so the assertion does not depend on which
+        OS user the test runner happens to be."""
+        b = _make_fake(os_user="bot-user-itself")
+        captured: dict = {}
+
+        async def _fake_spawn(*args, **kwargs):
+            captured["argv"] = args
+            captured.update(kwargs)
+            return _make_mock_proc(_handshake_lines())
+
+        with (
+            patch("kai.acp.resolve_claude_user", return_value=None) as mock_resolve,
+            patch("kai.acp.asyncio.create_subprocess_exec", side_effect=_fake_spawn),
+        ):
+            await b._ensure_started()
+
+        mock_resolve.assert_called_once_with("bot-user-itself")
+        assert captured["argv"][0] == "fake_acp_binary"
+        assert captured["start_new_session"] is False
+        assert b._pgid is None
+        assert b._effective_os_user is None
+
+    @pytest.mark.asyncio
+    async def test_wrap_argv_preserve_env_and_state(self):
+        """A non-bot os_user wraps the argv with -H and the default
+        preserve list, spawns a new session group, and records pgid
+        (== wrapper pid for session leaders) plus the resolved target
+        for the kill paths."""
+        b = _make_fake(os_user="other-user")
+        captured: dict = {}
+
+        async def _fake_spawn(*args, **kwargs):
+            captured["argv"] = args
+            captured.update(kwargs)
+            return _make_mock_proc(_handshake_lines())
+
+        with (
+            patch("kai.acp.resolve_claude_user", return_value="other-user"),
+            patch("kai.acp.asyncio.create_subprocess_exec", side_effect=_fake_spawn),
+        ):
+            await b._ensure_started()
+
+        argv = list(captured["argv"])
+        assert argv[:4] == ["sudo", "-H", "-u", "other-user"]
+        # Preserve-env CSV exact contract: the AcpBackend default
+        # (webhook callback auth + per-os-user temp anchor). Backends
+        # that need more override preserved_env_vars(); see the
+        # hook-driven test below.
+        assert argv[4] == "--preserve-env=KAI_WEBHOOK_SECRET,TMPDIR"
+        assert argv[5] == "--"
+        assert argv[6] == "fake_acp_binary"
+        assert captured["start_new_session"] is True
+        # _make_mock_proc pins pid=12345; PGID == PID for session
+        # leaders, recorded at spawn time.
+        assert b._pgid == 12345
+        assert b._effective_os_user == "other-user"
+
+    @pytest.mark.asyncio
+    async def test_preserve_env_csv_comes_from_hook(self):
+        """The CSV is whatever preserved_env_vars() returns, so a
+        concrete adapter (GooseBackend) can extend the list without
+        the shared layer hardcoding backend specifics."""
+
+        class _CustomPreserve(_FakeAcp):
+            def preserved_env_vars(self) -> tuple[str, ...]:
+                return ("ALPHA", "BETA")
+
+        b = _CustomPreserve(model="sonnet", workspace=Path("/tmp/test-workspace"), os_user="other-user")
+        captured: dict = {}
+
+        async def _fake_spawn(*args, **kwargs):
+            captured["argv"] = args
+            return _make_mock_proc(_handshake_lines())
+
+        with (
+            patch("kai.acp.resolve_claude_user", return_value="other-user"),
+            patch("kai.acp.asyncio.create_subprocess_exec", side_effect=_fake_spawn),
+        ):
+            await b._ensure_started()
+
+        assert captured["argv"][4] == "--preserve-env=ALPHA,BETA"
+
+    @pytest.mark.asyncio
+    async def test_tmpdir_anchored_per_os_user_on_wrap(self):
+        """Cross-user mode anchors TMPDIR under <DATA_DIR>/tmp/<user>
+        so each os_user has its own temp namespace; the anchor is
+        applied AFTER workspace env so a workspace cannot point one
+        user's temp writes at another's."""
+        from kai.config import DATA_DIR
+
+        b = _make_fake(os_user="other-user")
+        captured: dict = {}
+
+        async def _fake_spawn(*args, **kwargs):
+            captured.update(kwargs)
+            return _make_mock_proc(_handshake_lines())
+
+        with (
+            patch("kai.acp.resolve_claude_user", return_value="other-user"),
+            patch("kai.acp.asyncio.create_subprocess_exec", side_effect=_fake_spawn),
+        ):
+            await b._ensure_started()
+
+        assert captured["env"]["TMPDIR"] == str(DATA_DIR / "tmp" / "other-user")
+
+    @pytest.mark.asyncio
+    async def test_tmpdir_not_anchored_on_direct_spawn(self):
+        """Direct mode keeps the inherited TMPDIR (or its absence):
+        no cross-user collision is possible when everything runs as
+        the bot user, matching the claude backend's contract."""
+        import os as _os
+
+        b = _make_fake()
+        captured: dict = {}
+
+        async def _fake_spawn(*args, **kwargs):
+            captured.update(kwargs)
+            return _make_mock_proc(_handshake_lines())
+
+        with patch("kai.acp.asyncio.create_subprocess_exec", side_effect=_fake_spawn):
+            await b._ensure_started()
+
+        assert captured["env"].get("TMPDIR") == _os.environ.get("TMPDIR")
+
+
+# ── Cross-user kill escalation ──────────────────────────────────────
+
+
+class TestCrossUserKillEscalation:
+    """When the spawn is wrapped, _proc is the service-user-owned sudo
+    wrapper and the agent underneath is target-user-owned; plain
+    SIGKILL on the wrapper would orphan the agent. force_kill, _kill,
+    and shutdown therefore escalate a group kill through the target
+    user first - and never do so on the direct path, where _proc IS
+    the agent."""
+
+    def _wrapped_backend(self) -> tuple[_FakeAcp, MagicMock]:
+        """Backend in post-spawn cross-user state, without a real
+        spawn: _proc is a live-looking wrapper mock and the routing
+        state is what _ensure_started records on the wrap path."""
+        b = _make_fake()
+        proc = MagicMock()
+        proc.returncode = None
+        proc.pid = 4242
+        proc.kill = MagicMock()
+        proc.terminate = MagicMock()
+        proc.wait = AsyncMock()
+        b._proc = proc
+        b._effective_os_user = "other-user"
+        b._pgid = 4242
+        b._stderr_task = None
+        return b, proc
+
+    def test_force_kill_escalates_sync_then_kills_wrapper(self):
+        """force_kill (sync, the pool's last resort) runs the sync
+        group-kill variant before SIGKILLing the wrapper, and nulls
+        _pgid so the async paths that follow (read loop EOF -> _kill)
+        do not re-kill the already-dead group."""
+        b, proc = self._wrapped_backend()
+
+        with patch("kai.acp._kill_target_user_tree_sync") as mock_sync:
+            b.force_kill()
+
+        mock_sync.assert_called_once_with(
+            target_user="other-user",
+            pgid=4242,
+            purpose="chat",
+            backend="fake",
+        )
+        proc.kill.assert_called_once()
+        assert b._pgid is None
+        # force_kill does NOT null _proc; _kill owns full cleanup.
+        assert b._proc is proc
+
+    def test_force_kill_direct_no_escalation(self):
+        """Direct mode: no escalation subprocess, just the SIGKILL."""
+        b = _make_fake()
+        proc = MagicMock()
+        proc.kill = MagicMock()
+        b._proc = proc
+        b._stderr_task = None
+
+        with patch("kai.acp._kill_target_user_tree_sync") as mock_sync:
+            b.force_kill()
+
+        mock_sync.assert_not_called()
+        proc.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_kill_escalates_async_once(self):
+        """_kill escalates through the canonical async helper, then
+        falls through to force_kill - which must NOT re-escalate
+        (the _pgid nulling between the two is the dedup)."""
+        b, proc = self._wrapped_backend()
+
+        with (
+            patch("kai.acp._kill_target_user_tree", new=AsyncMock()) as mock_async,
+            patch("kai.acp._kill_target_user_tree_sync") as mock_sync,
+        ):
+            await b._kill()
+
+        mock_async.assert_awaited_once_with(
+            target_user="other-user",
+            pgid=4242,
+            purpose="chat",
+            backend="fake",
+        )
+        mock_sync.assert_not_called()
+        proc.kill.assert_called_once()
+        # Full cleanup: a recycled instance must not carry stale
+        # routing state into a fresh spawn.
+        assert b._proc is None
+        assert b._pgid is None
+        assert b._effective_os_user is None
+
+    @pytest.mark.asyncio
+    async def test_kill_direct_no_escalation(self):
+        """Direct mode _kill: SIGKILL + reap only."""
+        b = _make_fake()
+        proc = MagicMock()
+        proc.returncode = None
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        b._proc = proc
+        b._stderr_task = None
+
+        with patch("kai.acp._kill_target_user_tree", new=AsyncMock()) as mock_async:
+            await b._kill()
+
+        mock_async.assert_not_awaited()
+        proc.kill.assert_called_once()
+        assert b._proc is None
+
+    @pytest.mark.asyncio
+    async def test_response_timeout_escalates_when_wrapped(self):
+        """The in-stream timeout path (response/idle timeouts both
+        funnel into _kill) escalates for a wrapped backend, so an
+        eviction or hung turn cannot orphan the target-user agent."""
+        b, proc = self._wrapped_backend()
+        b.timeout_seconds = 1
+        proc.stdout = MagicMock()
+        proc.stdout.readline = AsyncMock(side_effect=TimeoutError())
+        proc.stdin = MagicMock()
+        proc.stdin.write = MagicMock()
+        proc.stdin.drain = AsyncMock()
+        b._session_id = "sess-1"
+        b._fresh_session = False
+        b._next_id = 3
+
+        with patch("kai.acp._kill_target_user_tree", new=AsyncMock()) as mock_async:
+            events = await _collect_events(b, prompt="hi")
+
+        assert events[-1].done is True
+        assert events[-1].response is not None
+        assert events[-1].response.success is False
+        mock_async.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_graceful_path_no_escalation(self):
+        """SIGTERM lands on the sudo wrapper, which relays catchable
+        signals to the agent; when the wait succeeds there is nothing
+        left to escalate."""
+        b, proc = self._wrapped_backend()
+        proc.wait = AsyncMock(return_value=None)
+
+        with patch("kai.acp._kill_target_user_tree", new=AsyncMock()) as mock_async:
+            await b.shutdown()
+
+        mock_async.assert_not_awaited()
+        proc.terminate.assert_called_once()
+        proc.kill.assert_not_called()
+        assert b._proc is None
+        assert b._pgid is None
+        assert b._effective_os_user is None
+
+    @pytest.mark.asyncio
+    async def test_shutdown_timeout_escalates_before_sigkill(self):
+        """When SIGTERM is ignored, the group escalation runs BEFORE
+        force_kill reaps the wrapper, mirroring the one-shot
+        reasoners' kill ordering (target tree first, wrapper reap
+        after). The sync variant must not fire: the _pgid nulling
+        between escalation and force_kill is the dedup."""
+        b, proc = self._wrapped_backend()
+        proc.wait = AsyncMock(side_effect=[TimeoutError(), None])
+        order: list[str] = []
+
+        async def _fake_tree_kill(**kwargs) -> None:
+            order.append("escalate")
+
+        proc.kill = MagicMock(side_effect=lambda: order.append("sigkill"))
+
+        with (
+            patch("kai.acp._kill_target_user_tree", side_effect=_fake_tree_kill),
+            patch("kai.acp._kill_target_user_tree_sync") as mock_sync,
+        ):
+            await b.shutdown()
+
+        assert order == ["escalate", "sigkill"]
+        mock_sync.assert_not_called()
+        assert b._proc is None
+
+
+# ── Cross-user kill helper free functions ───────────────────────────
+
+
+class TestKillTargetUserTreeFreeFunctions:
+    """The canonical cross-user group-kill helpers shared by the
+    one-shot reasoners and the conversational AcpBackend. Argv shape,
+    bounded wait, and the rc/ESRCH log classification (benign
+    already-gone race demotes to DEBUG; real failures keep WARNING)."""
+
+    @pytest.mark.asyncio
+    async def test_async_kill_argv_shape(self):
+        from kai.acp import _kill_target_user_tree
+
+        kill_proc = MagicMock()
+        kill_proc.communicate = AsyncMock(return_value=(b"", b""))
+        kill_proc.returncode = 0
+        captured: dict = {}
+
+        async def _fake_exec(*args, **kwargs):
+            captured["argv"] = args
+            return kill_proc
+
+        with patch("kai.acp.asyncio.create_subprocess_exec", side_effect=_fake_exec):
+            await _kill_target_user_tree(
+                target_user="other-user",
+                pgid=777,
+                purpose="chat",
+                backend="goose",
+            )
+
+        # Negative-PGID group kill through the target user's /bin/kill
+        # sudoers permission; -n so a missing rule fails fast instead
+        # of prompting.
+        assert list(captured["argv"]) == ["sudo", "-n", "-u", "other-user", "/bin/kill", "-KILL", "-777"]
+
+    @pytest.mark.asyncio
+    async def test_async_kill_esrch_demotes_to_debug(self, caplog):
+        """rc=1 with the POSIX ESRCH diagnostic is the benign race
+        (tree already exited); it must not pollute the WARNING
+        stream the operator watches for real sudoers failures."""
+        from kai.acp import _kill_target_user_tree
+
+        kill_proc = MagicMock()
+        kill_proc.communicate = AsyncMock(return_value=(b"", b"kill: -777: No such process"))
+        kill_proc.returncode = 1
+
+        with (
+            patch("kai.acp.asyncio.create_subprocess_exec", AsyncMock(return_value=kill_proc)),
+            caplog.at_level(logging.DEBUG, logger="kai.acp"),
+        ):
+            await _kill_target_user_tree(
+                target_user="other-user",
+                pgid=777,
+                purpose="chat",
+                backend="goose",
+            )
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warnings
+        debugs = [r for r in caplog.records if "benign race" in r.getMessage()]
+        assert debugs
+
+    @pytest.mark.asyncio
+    async def test_async_kill_real_failure_keeps_warning(self, caplog):
+        """A non-ESRCH rc!=0 (sudoers misconfiguration, permission
+        denied) keeps the WARNING so the orphan risk is visible."""
+        from kai.acp import _kill_target_user_tree
+
+        kill_proc = MagicMock()
+        kill_proc.communicate = AsyncMock(return_value=(b"", b"sudo: a password is required"))
+        kill_proc.returncode = 1
+
+        with (
+            patch("kai.acp.asyncio.create_subprocess_exec", AsyncMock(return_value=kill_proc)),
+            caplog.at_level(logging.WARNING, logger="kai.acp"),
+        ):
+            await _kill_target_user_tree(
+                target_user="other-user",
+                pgid=777,
+                purpose="chat",
+                backend="goose",
+            )
+
+        warnings = [r for r in caplog.records if "cross-user kill returned rc=1" in r.getMessage()]
+        assert warnings
+
+    def test_sync_kill_argv_and_esrch_classification(self, caplog):
+        """The sync companion (force_kill path) shares the argv shape
+        and the ESRCH demotion with the async canonical helper."""
+        from kai.acp import _kill_target_user_tree_sync
+
+        captured: dict = {}
+
+        def _fake_run(cmd, **kwargs):
+            captured["argv"] = cmd
+            result = MagicMock()
+            result.returncode = 1
+            result.stderr = b"kill: -888: No such process"
+            return result
+
+        with (
+            patch("kai.acp.subprocess.run", side_effect=_fake_run),
+            caplog.at_level(logging.DEBUG, logger="kai.acp"),
+        ):
+            _kill_target_user_tree_sync(
+                target_user="other-user",
+                pgid=888,
+                purpose="chat",
+                backend="goose",
+            )
+
+        assert captured["argv"] == ["sudo", "-n", "-u", "other-user", "/bin/kill", "-KILL", "-888"]
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warnings
+        debugs = [r for r in caplog.records if "benign race" in r.getMessage()]
+        assert debugs
+
+    def test_sync_kill_timeout_logs_warning(self, caplog):
+        """A hung sudo is bounded and logged; the caller's cleanup
+        must not stall behind the escalation."""
+        import subprocess as _subprocess
+
+        from kai.acp import _kill_target_user_tree_sync
+
+        with (
+            patch(
+                "kai.acp.subprocess.run",
+                side_effect=_subprocess.TimeoutExpired(cmd="sudo", timeout=5.0),
+            ),
+            caplog.at_level(logging.WARNING, logger="kai.acp"),
+        ):
+            _kill_target_user_tree_sync(
+                target_user="other-user",
+                pgid=999,
+                purpose="chat",
+                backend="goose",
+            )
+
+        warnings = [r for r in caplog.records if "cross-user kill timed out" in r.getMessage()]
+        assert warnings

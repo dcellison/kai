@@ -1460,14 +1460,13 @@ class TestRoutingTimeoutCleanup:
 
     @pytest.mark.asyncio
     async def test_cross_user_kill_failure_logs_and_reaps(self, tmp_path, caplog):
-        """A kill subprocess returning rc != 0 (e.g., the agent
-        already exited between TimeoutError and the kill spawn)
-        logs a warning, still reaps the wrapper, and still raises
-        OneShotTimeout."""
+        """A kill subprocess failing for a real reason (sudoers
+        misconfiguration, permission denied) logs a warning, still
+        reaps the wrapper, and still raises OneShotTimeout."""
         reasoner = ClaudeOneShotReasoner(cwd=tmp_path, os_user="other-user")
         proc = _make_proc(raise_timeout=True)
         proc.pid = 999
-        kill_proc = _make_proc(stdout=b"", stderr=b"No such process", returncode=1)
+        kill_proc = _make_proc(stdout=b"", stderr=b"sudo: a password is required", returncode=1)
 
         async def _fake_exec(*args, **kwargs):
             if args[0] == "sudo" and len(args) > 4 and args[4] == "/bin/kill":
@@ -1477,7 +1476,7 @@ class TestRoutingTimeoutCleanup:
         with (
             patch("kai.oneshot.resolve_claude_user", return_value="other-user"),
             patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(side_effect=_fake_exec)),
-            caplog.at_level(logging.WARNING, logger="kai.oneshot"),
+            caplog.at_level(logging.WARNING, logger="kai.acp"),
             pytest.raises(OneShotTimeout),
         ):
             await reasoner.run(prompt="p", purpose="fact_extraction", timeout=0.1)
@@ -1485,6 +1484,37 @@ class TestRoutingTimeoutCleanup:
         proc.kill.assert_called_once()
         warnings = [r for r in caplog.records if "cross-user kill returned rc=1" in r.getMessage()]
         assert warnings, "expected a warning about the failing kill subprocess"
+
+    @pytest.mark.asyncio
+    async def test_cross_user_kill_esrch_is_benign(self, tmp_path, caplog):
+        """rc=1 with the POSIX ESRCH diagnostic means the agent
+        already exited between TimeoutError and the kill spawn: a
+        benign race that must NOT hit the WARNING stream an operator
+        watches for real sudoers failures. Still reaps the wrapper
+        and still raises OneShotTimeout."""
+        reasoner = ClaudeOneShotReasoner(cwd=tmp_path, os_user="other-user")
+        proc = _make_proc(raise_timeout=True)
+        proc.pid = 999
+        kill_proc = _make_proc(stdout=b"", stderr=b"kill: -999: No such process", returncode=1)
+
+        async def _fake_exec(*args, **kwargs):
+            if args[0] == "sudo" and len(args) > 4 and args[4] == "/bin/kill":
+                return kill_proc
+            return proc
+
+        with (
+            patch("kai.oneshot.resolve_claude_user", return_value="other-user"),
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(side_effect=_fake_exec)),
+            caplog.at_level(logging.DEBUG, logger="kai.acp"),
+            pytest.raises(OneShotTimeout),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", timeout=0.1)
+
+        proc.kill.assert_called_once()
+        warnings = [r for r in caplog.records if "cross-user kill" in r.getMessage() and r.levelno >= logging.WARNING]
+        assert not warnings, "ESRCH must demote to DEBUG, not WARNING"
+        debugs = [r for r in caplog.records if "benign race" in r.getMessage()]
+        assert debugs
 
     @pytest.mark.asyncio
     async def test_direct_spawn_does_not_run_cross_user_kill(self, tmp_path):

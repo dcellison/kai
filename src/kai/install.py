@@ -2207,6 +2207,71 @@ def _collect_backends_from_yaml(users_yaml_path: str | Path) -> set[str]:
     return backends
 
 
+def _collect_goose_os_users_from_yaml(
+    users_yaml_path: str | Path,
+    agent_backend: str,
+) -> list[str]:
+    """
+    Read users.yaml and return distinct, validated os_user values of
+    goose-backed users.
+
+    A user is goose-backed when their entry's `agent_backend` is
+    "goose", or when the entry carries no per-user backend and the
+    install's global backend (`agent_backend`) is goose - the same
+    inheritance contract the runtime applies. `_apply_goose_config`
+    deploys the goose config template into each such user's home:
+    the per-user `goose acp` spawn runs under `sudo -H`, so goose
+    resolves `~/.config/goose/config.yaml` beneath the TARGET user's
+    home, where the service-user deploy is invisible.
+
+    Same lightweight posture and failure behavior as
+    `_collect_os_users_from_yaml`: missing file, empty file, non-dict
+    document, or missing `users:` list yield an empty list; malformed
+    YAML raises; non-string / empty os_user values are skipped (those
+    users run as the service user, which gets its own deploy
+    unconditionally); os_user values failing username validation
+    raise ValueError before any filesystem path is built from them.
+    """
+    path = Path(users_yaml_path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    if not text.strip():
+        return []
+    data = yaml.safe_load(text)
+    if not isinstance(data, dict):
+        return []
+    users = data.get("users")
+    if not isinstance(users, list):
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for entry in users:
+        if not isinstance(entry, dict):
+            continue
+        backend = entry.get("agent_backend")
+        # Non-string / empty per-user values mean "inherit the global
+        # backend" (PyYAML may parse unquoted scalars as non-strings;
+        # the runtime loader rejects those separately).
+        effective = backend.strip() if isinstance(backend, str) and backend.strip() else agent_backend
+        if effective != "goose":
+            continue
+        os_user = entry.get("os_user")
+        if not isinstance(os_user, str):
+            continue
+        normalized = os_user.strip()
+        if not normalized:
+            continue
+        if not _validate_os_user(normalized):
+            raise ValueError(f"Invalid os_user {normalized!r} in {path}: must match {_OS_USER_RE.pattern}")
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
 def _build_codex_login_reminder(
     env: dict[str, str],
     service_user: str,
@@ -3468,11 +3533,11 @@ def _apply_migrate(
     # whose --settings JSON hashes to the same hex collide on the
     # default /tmp path; the first writer owns the file at mode
     # 0o644 and the second claude exits with EACCES on the
-    # write-open. claude.py anchors TMPDIR per-os_user under
+    # write-open. The cross-user spawn paths (claude.py and the
+    # shared ACP layer in acp.py) anchor TMPDIR per-os_user under
     # <DATA_DIR>/tmp/<os_user>/ so each identity has its own temp
     # namespace. Create those dirs here, mode 0o700 chowned to the
-    # target os_user (only their owner needs to read them; they
-    # hold cache state for that user's claude.ai session). Parent
+    # target os_user (only their owner needs to read them). Parent
     # tmp/ is service-owned mode 0o755 so the per-user subdirs
     # are traversable for the sudo -u <os_user> subprocess.
     #
@@ -3767,9 +3832,19 @@ def _cmd_apply() -> None:
         env.pop("MEMORY_EPISODE_BUDGET_USD", None)
         _apply_secrets(env, dry_run, users_yaml_staging_path=users_yaml_staging_path)
 
-        # -- Step 6: Deploy Goose config (if backend=goose) --
-        if env.get("AGENT_BACKEND") == "goose":
-            _apply_goose_config(service_user, install_path, svc_uid, svc_gid, dry_run)
+        # -- Step 6: Deploy Goose config (if any goose-backed user) --
+        # The function gates itself: global AGENT_BACKEND=goose or a
+        # per-user agent_backend override in users.yaml both mean some
+        # session spawns `goose acp`; otherwise it no-ops.
+        agent_backend = env.get("AGENT_BACKEND", "claude")
+        _apply_goose_config(
+            service_user,
+            install_path,
+            svc_uid,
+            svc_gid,
+            dry_run,
+            agent_backend=agent_backend,
+        )
 
         # -- Step 7: Configure sudoers --
         _apply_sudoers(
@@ -3778,7 +3853,7 @@ def _cmd_apply() -> None:
             codex_bin=env.get("CODEX_BIN"),
             opencode_bin=env.get("OPENCODE_BIN"),
             goose_bin=env.get("GOOSE_BIN"),
-            agent_backend=env.get("AGENT_BACKEND", "claude"),
+            agent_backend=agent_backend,
         )
 
         # -- Step 8: Migrate runtime data --
@@ -4827,18 +4902,36 @@ def _apply_goose_config(
     svc_uid: int,
     svc_gid: int,
     dry_run: bool,
+    users_yaml_path: str | Path = "/etc/kai/users.yaml",
+    agent_backend: str = "claude",
 ) -> None:
     """
-    Deploy the Goose extension config to the service user's home.
+    Deploy the Goose extension config to every home goose runs from.
 
     Copies config/goose-config.yaml from the install tree to
-    `~/.config/goose/config.yaml` so that `goose acp` picks up the
-    right extension settings. The directory is created if it does
-    not exist. Only called when AGENT_BACKEND=goose.
+    `~/.config/goose/config.yaml` for the service user AND for each
+    distinct goose-backed `os_user` in users.yaml, so `goose acp`
+    picks up the right extension settings wherever it spawns. The
+    service-user copy covers goose-backed users with no os_user (they
+    run as the service user); the per-os_user copies cover isolated
+    users, whose spawn runs under `sudo -H` and therefore resolves
+    config beneath the target user's home. Directories are created if
+    missing, with each user's tree owned by that user.
+
+    `agent_backend` is the install's global backend; users.yaml
+    entries without a per-user override inherit it (same contract as
+    `_apply_sudoers`). No-ops when nothing in the install is
+    goose-backed - neither the global backend nor any users.yaml
+    override - so the apply pipeline can call it unconditionally and
+    a claude-only install is never blocked on the goose template.
     """
-    svc_home = Path(_user_home(service_user))
-    goose_dir = svc_home / ".config" / "goose"
-    dst = goose_dir / "config.yaml"
+    # Gate before the template check: a goose template is only a
+    # requirement when some session will spawn `goose acp`. users.yaml
+    # is canonical at /etc/kai by this step (the secrets step deploys
+    # any staged copy first).
+    if agent_backend != "goose" and "goose" not in _collect_backends_from_yaml(users_yaml_path):
+        return
+
     src = install_path / "config" / "goose-config.yaml"
 
     # Check before dry_run so a missing template is caught during
@@ -4846,9 +4939,39 @@ def _apply_goose_config(
     if not src.exists():
         raise SystemExit(f"Goose config template not found at {src}")
 
+    # Resolve every target home and its ownership BEFORE touching
+    # disk, so a users.yaml entry naming an os_user that does not
+    # exist on this host fails the whole step with a clear message
+    # instead of leaving a half-deployed set of homes (mirrors the
+    # pre-validation posture of _apply_migrate). The service user is
+    # always a target; its uid/gid arrive pre-resolved from the
+    # caller and its home resolves through _user_home like the rest
+    # of the installer's service-user paths.
+    targets: list[tuple[Path, int, int]] = [
+        (Path(_user_home(service_user)), svc_uid, svc_gid),
+    ]
+    for name in _collect_goose_os_users_from_yaml(users_yaml_path, agent_backend):
+        # An os_user matching the service user is already covered by
+        # the unconditional service-user deploy (the runtime self-
+        # sudo-skips that case anyway).
+        if name == service_user:
+            continue
+        try:
+            pwd_entry = pwd.getpwnam(name)
+        except KeyError as exc:
+            raise ValueError(
+                f"users.yaml names os_user {name!r}, which does not exist "
+                f"on this host. Source: {users_yaml_path}. Create the OS "
+                "account or correct the users.yaml entry, then re-run "
+                "sudo make install."
+            ) from exc
+        targets.append((Path(pwd_entry.pw_dir), pwd_entry.pw_uid, pwd_entry.pw_gid))
+
     if dry_run:
-        print(f"[DRY RUN] Would create: {goose_dir}")
-        print(f"[DRY RUN] Would copy: {src} -> {dst}")
+        for home, _uid, _gid in targets:
+            goose_dir = home / ".config" / "goose"
+            print(f"[DRY RUN] Would create: {goose_dir}")
+            print(f"[DRY RUN] Would copy: {src} -> {goose_dir / 'config.yaml'}")
         return
 
     # Warn if the goose binary isn't on PATH. Not fatal because the
@@ -4861,26 +4984,31 @@ def _apply_goose_config(
         print("  Kai will fail to start the Goose backend until goose is installed.")
         print("  See https://github.com/block/goose for installation instructions.")
 
-    # Track whether we're creating .config for the first time so we
-    # can set ownership on it below. mkdir(parents=True) creates both
-    # .config/ and .config/goose/ if needed.
-    config_dir = svc_home / ".config"
-    config_dir_is_new = not config_dir.exists()
+    for home, uid, gid in targets:
+        goose_dir = home / ".config" / "goose"
+        dst = goose_dir / "config.yaml"
 
-    goose_dir.mkdir(parents=True, exist_ok=True)
-    # Own the .config/goose tree by the service user so Goose can
-    # write runtime state (session logs, etc.) alongside the config.
-    _set_ownership(goose_dir, svc_uid, svc_gid)
-    # Only chown .config itself if we just created it. An existing
-    # .config may be shared with other tools and should keep its
-    # current ownership.
-    if config_dir_is_new:
-        _set_ownership(config_dir, svc_uid, svc_gid)
+        # Track whether we're creating .config for the first time so
+        # we can set ownership on it below. mkdir(parents=True)
+        # creates both .config/ and .config/goose/ if needed.
+        config_dir = home / ".config"
+        config_dir_is_new = not config_dir.exists()
 
-    shutil.copy2(src, dst)
-    os.chmod(dst, 0o644)
-    _set_ownership(dst, svc_uid, svc_gid)
-    print(f"  Deployed Goose config to {dst}")
+        goose_dir.mkdir(parents=True, exist_ok=True)
+        # Own the .config/goose tree by the home's user so Goose can
+        # write runtime state (session logs, etc.) alongside the
+        # config.
+        _set_ownership(goose_dir, uid, gid)
+        # Only chown .config itself if we just created it. An existing
+        # .config may be shared with other tools and should keep its
+        # current ownership.
+        if config_dir_is_new:
+            _set_ownership(config_dir, uid, gid)
+
+        shutil.copy2(src, dst)
+        os.chmod(dst, 0o644)
+        _set_ownership(dst, uid, gid)
+        print(f"  Deployed Goose config to {dst}")
 
 
 def _apply_sudoers(

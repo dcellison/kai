@@ -322,6 +322,45 @@ class TestPerUserBackendRouting:
         assert instance.model == "gpt-5.5"
         assert instance.provider == "openai"
 
+    def test_goose_user_receives_os_user(self):
+        """A goose user's os_user reaches GooseBackend, which wires
+        the per-user sudo isolation in the shared ACP layer (same
+        contract claude_user / codex_user carry on their backends)."""
+        user = UserConfig(
+            telegram_id=111,
+            name="alice",
+            agent_backend="goose",
+            llm_provider="anthropic",
+            model="sonnet",
+            os_user="alice-os",
+        )
+        config = _make_config(user_configs={111: user})
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+        assert isinstance(instance, GooseBackend)
+        assert instance.os_user == "alice-os"
+
+    def test_opencode_user_does_not_receive_os_user(self):
+        """OpenCode chat stays on the service user even when the
+        users.yaml entry carries an os_user: its auth file is
+        per-OS-user and operator-provisioned, so the pool does not
+        wire the isolation for opencode until that provisioning
+        story exists."""
+        from kai.opencode import OpenCodeBackend
+
+        user = UserConfig(
+            telegram_id=111,
+            name="alice",
+            agent_backend="opencode",
+            model="anthropic/claude-sonnet-4-6",
+            os_user="alice-os",
+        )
+        config = _make_config(user_configs={111: user})
+        pool = SubprocessPool(config=config, services_info=[])
+        instance = pool.get(111)
+        assert isinstance(instance, OpenCodeBackend)
+        assert instance.os_user is None
+
 
 # ── Per-user actions ────────────────────────────────────────────────
 
