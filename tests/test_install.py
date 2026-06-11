@@ -8786,6 +8786,17 @@ class TestUsersYamlGooseProviders:
         )
         assert _users_yaml_goose_providers(p, "") == ["deepseek"]
 
+    def test_mixed_case_normalized_like_runtime(self, tmp_path):
+        """Mixed-case `Goose` / `DeepSeek` are valid at runtime (the
+        loader lowercases both fields before validation), so the scan
+        must match the backend case-insensitively and emit the
+        canonical provider form PROVIDER_KEY_VARS is keyed on."""
+        p = self._write(
+            tmp_path,
+            "users:\n  - telegram_id: 1\n    name: a\n    agent_backend: Goose\n    llm_provider: DeepSeek\n",
+        )
+        assert _users_yaml_goose_providers(p, "") == ["deepseek"]
+
     def test_falls_back_to_global_provider(self, tmp_path):
         """An entry that omits llm_provider inherits the global
         provider, mirroring the runtime cascade."""
@@ -9003,6 +9014,17 @@ class TestUsersYamlAgentBackends:
         )
         assert _users_yaml_agent_backends(p) == {"codex"}
 
+    def test_mixed_case_normalized_like_runtime(self, tmp_path):
+        """The runtime loader accepts `agent_backend` case-insensitively
+        (str.strip().lower() before validation), so mixed-case entries
+        route users at runtime; the scan must produce the canonical
+        lower-case form or the prompt gates silently miss them."""
+        p = self._write(
+            tmp_path,
+            "users:\n  - telegram_id: 1\n    name: a\n    agent_backend: Codex\n  - telegram_id: 2\n    name: b\n    agent_backend: ' GOOSE '\n",
+        )
+        assert _users_yaml_agent_backends(p) == {"codex", "goose"}
+
     def test_missing_file_degrades_to_empty(self, tmp_path):
         assert _users_yaml_agent_backends(tmp_path / "absent.yaml") == set()
 
@@ -9109,3 +9131,53 @@ class TestWizardPerUserBackendBinaries:
         env = self._run(monkeypatch, tmp_path, inputs)
 
         assert env["CODEX_BIN"] == "/stored/bin/codex"
+
+    def test_mixed_case_codex_entry_still_prompts(self, tmp_path, monkeypatch):
+        """`agent_backend: Codex` is valid at runtime (the loader
+        lowercases before validation) and routes the user, so the
+        scan must normalize the same way; a casing difference must
+        not skip the binary prompt and reintroduce the startup-gate
+        failure."""
+        mixed_yaml = (
+            "users:\n"
+            "  - telegram_id: 1\n"
+            "    name: alice\n"
+            "    role: admin\n"
+            "  - telegram_id: 2\n"
+            "    name: bob\n"
+            "    agent_backend: Codex\n"
+        )
+        self._setup(monkeypatch, tmp_path, mixed_yaml)
+        monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
+        inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
+        i = inputs.index("claude")
+        inputs = inputs[: i + 1] + ["/per-user/npm/bin/codex"] + inputs[i + 1 :]
+
+        env = self._run(monkeypatch, tmp_path, inputs)
+
+        assert env["CODEX_BIN"] == "/per-user/npm/bin/codex"
+
+    def test_peruser_opencode_entry_prompts_for_binary(self, tmp_path, monkeypatch, capsys):
+        """Global claude install with a per-user opencode entry: the
+        wizard prompts for the opencode binary path and OPENCODE_BIN
+        lands in env, completing the acceptance triple (codex, goose,
+        opencode) on the per-user scan."""
+        opencode_yaml = (
+            "users:\n"
+            "  - telegram_id: 1\n"
+            "    name: alice\n"
+            "    role: admin\n"
+            "  - telegram_id: 2\n"
+            "    name: bob\n"
+            "    agent_backend: opencode\n"
+        )
+        self._setup(monkeypatch, tmp_path, opencode_yaml)
+        monkeypatch.setattr("kai.install._validate_opencode_bin", lambda p: bool(p))
+        inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
+        i = inputs.index("claude")
+        inputs = inputs[: i + 1] + ["/custom/bin/opencode"] + inputs[i + 1 :]
+
+        env = self._run(monkeypatch, tmp_path, inputs)
+
+        assert env["OPENCODE_BIN"] == "/custom/bin/opencode"
+        assert "opencode entry" in capsys.readouterr().out

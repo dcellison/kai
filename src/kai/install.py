@@ -544,11 +544,16 @@ def _users_yaml_goose_providers(users_yaml_path: Path, global_provider: str) -> 
     """
     providers: set[str] = set()
     for entry in _users_yaml_entries(users_yaml_path):
-        if entry.get("agent_backend") != "goose":
+        # Normalize the same way the runtime loader does
+        # (str.strip().lower()): mixed-case `Goose` / `DeepSeek`
+        # values are valid at runtime, so the scan must not let a
+        # casing difference skip a key the daemon will demand.
+        backend = entry.get("agent_backend")
+        if not isinstance(backend, str) or backend.strip().lower() != "goose":
             continue
         provider = entry.get("llm_provider") or global_provider
-        if isinstance(provider, str) and provider:
-            providers.add(provider)
+        if isinstance(provider, str) and provider.strip():
+            providers.add(provider.strip().lower())
     return sorted(providers)
 
 
@@ -569,8 +574,14 @@ def _users_yaml_agent_backends(users_yaml_path: Path) -> set[str]:
     backends: set[str] = set()
     for entry in _users_yaml_entries(users_yaml_path):
         backend = entry.get("agent_backend")
+        # Normalize the same way the runtime loader does
+        # (str.strip().lower()): mixed-case values like `Codex` are
+        # valid at runtime and route the user, so the scan must
+        # produce the canonical form the prompt gates compare
+        # against. Non-string values are skipped here; the runtime
+        # loader rejects them loudly at startup.
         if isinstance(backend, str) and backend.strip():
-            backends.add(backend.strip())
+            backends.add(backend.strip().lower())
     return backends
 
 
@@ -904,10 +915,10 @@ def _cmd_config() -> None:
     #
     # Gate on the global `agent_backend` selection only. Per-user
     # `agent_backend: codex` overrides in users.yaml do NOT trigger
-    # codex setup here; the operator is responsible for installing /
-    # authenticating codex out-of-band for those users, and the
-    # runtime surfaces a chat-visible startup-failure event when
-    # tooling is missing.
+    # the auth-mode setup here; codex AUTH for those users stays
+    # out-of-band (per-OS-user `codex login`). Their BINARY path is
+    # collected by the per-user backend scan after the provider
+    # block, which feeds this same codex_bin variable.
     codex_auth_mode = ""
     codex_api_key = ""
     codex_bin = ""
@@ -967,9 +978,11 @@ def _cmd_config() -> None:
     # a free-text prompt for a full `provider/model` ID.
     #
     # Gate on the global `agent_backend` selection only. Per-user
-    # `agent_backend: opencode` overrides in users.yaml do NOT trigger
-    # opencode setup here; the operator handles those installs and
-    # auth out-of-band.
+    # `agent_backend: opencode` overrides in users.yaml do NOT
+    # trigger the setup here; opencode AUTH for those users stays
+    # out-of-band (`opencode auth login` per OS user). Their BINARY
+    # path is collected by the per-user backend scan after the
+    # provider block, which feeds this same opencode_bin variable.
     if agent_backend == "opencode":
         # OpenCode binary path: wizard-prompted and persisted in
         # install.conf so `make install` writes both /etc/kai/env's
