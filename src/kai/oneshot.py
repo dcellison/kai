@@ -1,9 +1,10 @@
 """
 Provider-agnostic one-shot reasoning boundary.
 
-Used by semantic memory extraction (and any future caller that needs a
-bounded, stateless model call) so the caller does not embed provider
-subprocess mechanics. Distinct from `kai.backend.AgentBackend`: that
+Used by semantic memory extraction, episode generation, PR review,
+and issue triage (and any caller that needs a bounded, stateless
+model call) so the caller does not embed provider subprocess
+mechanics. Distinct from `kai.backend.AgentBackend`: that
 abstraction is for persistent, interactive sessions that own a long-
 running subprocess and inject Kai's identity / memory / history
 context. A one-shot reasoner has different lifecycle requirements: no
@@ -11,12 +12,11 @@ persistent state, a hard per-call timeout, stdin-only prompt delivery,
 optional structured-output schema, and an envelope that the CALLER
 parses (the reasoner returns raw text, not parsed memory objects).
 
-Phase 1 ships exactly one implementation: `ClaudeOneShotReasoner`. Its
-argv, env allow-list, neutral cwd, and timeout semantics are lifted
-verbatim from `kai.memory_extraction`'s previous direct subprocess
-spawn so that the Claude memory path stays byte-identical to its
-pre-refactor behavior. Future Codex / OpenCode implementations of the
-same `OneShotReasoner` protocol live here as siblings.
+Four sibling implementations of the same `OneShotReasoner` protocol
+live here: `ClaudeOneShotReasoner`, `CodexOneShotReasoner`,
+`OpenCodeOneShotReasoner`, and `GooseOneShotReasoner`. Memory
+extraction, episode generation, PR review, and issue triage all
+dispatch onto this family by the user's effective backend.
 
 `_EXTRACTOR_CWD`, `_ensure_extractor_cwd`, and `_SUBPROCESS_ENV_ALLOWLIST`
 are canonical here, not in memory_extraction. The behavioral eval
@@ -120,9 +120,9 @@ class OneShotResult:
     Return value from a `OneShotReasoner.run()` call.
 
     Attributes:
-        text: The model's raw output text. For Claude in Phase 1 this
-            is the stdout of `claude --print`, which the caller parses
-            for the JSON envelope it expects (`is_error`,
+        text: The model's raw output text. For claude in schema mode
+            this is the stdout of `claude --print`, which the caller
+            parses for the JSON envelope it expects (`is_error`,
             `structured_output`, etc.). The reasoner does not parse
             the envelope; that contract lives in memory_extraction.
         backend: Provider tag ("claude", "codex", "goose", or
@@ -134,12 +134,12 @@ class OneShotResult:
             responsibility.
         raw_metadata: Subprocess-layer metadata only - returncode,
             stderr bytes, and optionally cmd / cwd for log forensics.
-            Phase 1 deliberately does NOT include parsed-envelope
+            The dict deliberately does NOT include parsed-envelope
             fields (is_error, total_cost_usd, etc.); those stay in
             memory_extraction so the envelope is parsed exactly once.
-            Future provider implementations may populate
-            backend-specific fields, but no Phase 1 caller depends on
-            anything beyond returncode and stderr.
+            Implementations may populate backend-specific fields, but
+            no caller depends on anything beyond returncode and
+            stderr.
         duration_ms: Wall-clock duration of the underlying provider
             call, measured around the subprocess spawn + wait. Used
             for structured logging and for operator-side latency
@@ -204,7 +204,7 @@ class OneShotError(Exception):
 
 class OneShotTimeout(OneShotError):
     """The provider subprocess exceeded the call's timeout and was
-    killed. No payload fields in Phase 1: stage 1 maps this to
+    killed. No payload fields: stage 1 maps this to
     `ExtractionResult(facts=[], has_episode=False)`, stage 2 to the
     literal reason `"timeout"`, neither of which needs additional
     context off the exception. If a future caller needs the elapsed
@@ -514,10 +514,9 @@ class ClaudeOneShotReasoner:
     env allow-list, neutral cwd, and timeout semantics of this mode
     are lifted verbatim from the pre-refactor `_run_extractor` /
     `_run_episode_extractor` paths in `kai.memory_extraction`. That
-    is the load-bearing invariant for the Phase 1 refactor: the
-    Claude memory path must stay byte-identical to its prior
-    behavior, so any future drift in this implementation is a
-    semantic change and not a refactor.
+    is the load-bearing invariant: the Claude memory path must stay
+    byte-identical to its prior behavior, so any future drift in
+    this implementation is a semantic change and not a refactor.
 
     Free-form mode (`json_schema=None`): the output-format flag is
     omitted so `claude --print` emits the response text itself, and
