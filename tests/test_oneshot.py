@@ -3041,6 +3041,22 @@ class TestGooseOneShotReasonerOutput:
             await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
 
     @pytest.mark.asyncio
+    async def test_invalid_json_error_carries_response_snippet(self, tmp_path):
+        """The invalid_json error message carries the start of the
+        offending text so non-JSON output is self-diagnosing in the
+        operator log. This is the goose auth-failure surface: goose
+        prints auth errors to stdout and exits 0, so without the
+        snippet an expired credential reads as a bare position-only
+        parse error."""
+        reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="anthropic")
+        proc = _make_proc(stdout=b"Error: no credentials configured for provider anthropic")
+        with (
+            patch("kai.oneshot.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+            pytest.raises(OneShotOutputError, match=r"no credentials configured"),
+        ):
+            await reasoner.run(prompt="p", purpose="fact_extraction", json_schema={"type": "object"})
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("non_object_payload", ['"a plain string"', "[]", "42", "true", "null"])
     async def test_non_object_json_raises_output_error(self, tmp_path, non_object_payload):
         reasoner = GooseOneShotReasoner(cwd=tmp_path, os_user=_current_user(), provider="anthropic")

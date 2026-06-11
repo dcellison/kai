@@ -1237,7 +1237,13 @@ class CodexOneShotReasoner:
                     duration_ms,
                     os_user_field,
                 )
-                raise OneShotOutputError(f"codex final text did not contain a JSON object: {exc}") from None
+                # Carry a snippet of the offending text so non-JSON
+                # output is self-diagnosing in the operator log (e.g.
+                # a provider that prints its error text to stdout and
+                # exits 0).
+                raise OneShotOutputError(
+                    f"codex final text did not contain a JSON object: {exc}; response begins: {final_text[:200]!r}"
+                ) from None
 
             # Codex's `--output-schema` enforcement is best-effort:
             # the CLI does not hard-reject a final message that
@@ -1689,7 +1695,14 @@ class OpenCodeOneShotReasoner:
                     duration_ms,
                     os_user_field,
                 )
-                raise OneShotOutputError(f"opencode accumulated text did not contain a JSON object: {exc}") from None
+                # Carry a snippet of the offending text so non-JSON
+                # output is self-diagnosing in the operator log (e.g.
+                # a provider that prints its error text to stdout and
+                # exits 0).
+                raise OneShotOutputError(
+                    f"opencode accumulated text did not contain a JSON object: {exc}; "
+                    f"response begins: {accumulated[:200]!r}"
+                ) from None
 
             if not isinstance(payload, dict):
                 log.info(
@@ -2308,7 +2321,15 @@ class GooseOneShotReasoner:
                 duration_ms,
                 os_user_field,
             )
-            raise OneShotOutputError(f"goose response text did not contain a JSON object: {exc}") from None
+            # Carry a snippet of the offending text so non-JSON output
+            # is self-diagnosing in the operator log. This is the
+            # goose auth-failure surface: goose prints auth errors to
+            # stdout and exits 0, so without the snippet an expired or
+            # missing credential reads as a bare position-only JSON
+            # parse error with no pointer to the real cause.
+            raise OneShotOutputError(
+                f"goose response text did not contain a JSON object: {exc}; response begins: {response_text[:200]!r}"
+            ) from None
 
         if not isinstance(payload, dict):
             log.info(
