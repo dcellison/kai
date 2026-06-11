@@ -410,8 +410,12 @@ def _build_judge_cmd(config: BehavioralConfig) -> list[str]:
     probe as judge_error with no diagnostic. Re-run the verification
     if upgrading the CLI past 2.x.
     """
+    # CLAUDE_BIN env override is honored same as triage/review and the
+    # one-shot resolver, so the eval spawns the same binary the rest
+    # of the system pins.
+    claude_bin = os.environ.get("CLAUDE_BIN") or "claude"
     return [
-        "claude",
+        claude_bin,
         "--print",
         "--model",
         config.judge_model,
@@ -450,8 +454,10 @@ def _build_gen_cmd(config: BehavioralConfig) -> list[str]:
       `claude_cli_version` field in the output JSON lets cross-run
       comparisons detect drift in that residual.
     """
+    # Same CLAUDE_BIN precedence as the judge builder above.
+    claude_bin = os.environ.get("CLAUDE_BIN") or "claude"
     return [
-        "claude",
+        claude_bin,
         "--print",
         "--model",
         config.gen_model,
@@ -1717,11 +1723,12 @@ def _capture_agent_cli_version(backend: str) -> tuple[str, str]:
     is the most likely cause of a swing in win-rate that does not
     correspond to any code change in Kai or in the probe set.
 
-    The codex branch honors `CODEX_BIN`. Recording the version of
-    `codex` from PATH when the eval subprocess actually spawned
-    `$CODEX_BIN` would be a debugging trap: an operator chasing a
-    schema-drift bug would see the wrong version string. The
-    `--version` flag goes to the same binary the eval will spawn.
+    Both branches honor their binary override (`CLAUDE_BIN` /
+    `CODEX_BIN`). Recording the version of the PATH binary when the
+    eval subprocess actually spawned the override would be a
+    debugging trap: an operator chasing a schema-drift bug would see
+    the wrong version string. The `--version` flag goes to the same
+    binary the eval will spawn.
 
     Best-effort: if the CLI is missing, mis-aliased, or `--version`
     fails for any reason, the value is the literal "unknown". The
@@ -1734,10 +1741,11 @@ def _capture_agent_cli_version(backend: str) -> tuple[str, str]:
         codex_bin = os.environ.get("CODEX_BIN") or "codex"
         argv = [codex_bin, "--version"]
     else:
-        # claude (and any unknown backend, by design) - preserve the
-        # historical lookup.
+        # claude (and any unknown backend, by design) - same binary
+        # precedence as the judge / generator builders.
         field_name = "claude_cli_version"
-        argv = ["claude", "--version"]
+        claude_bin = os.environ.get("CLAUDE_BIN") or "claude"
+        argv = [claude_bin, "--version"]
     try:
         result = subprocess.run(
             argv,

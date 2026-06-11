@@ -1521,6 +1521,27 @@ class TestBuildGenCmdCodex:
         assert cmd[0] == "/tmp/fake-codex"
 
 
+class TestClaudeBinOverride:
+    """The claude judge / generator builders honor CLAUDE_BIN the
+    same way the codex builders honor CODEX_BIN, so the eval spawns
+    the binary the rest of the system pins."""
+
+    def test_judge_cmd_honors_claude_bin(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BIN", "/tmp/fake-claude")
+        cmd = _build_judge_cmd(_make_config())
+        assert cmd[0] == "/tmp/fake-claude"
+
+    def test_gen_cmd_honors_claude_bin(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BIN", "/tmp/fake-claude")
+        cmd = _build_gen_cmd(_make_config())
+        assert cmd[0] == "/tmp/fake-claude"
+
+    def test_unset_claude_bin_uses_bare_name(self, monkeypatch):
+        monkeypatch.delenv("CLAUDE_BIN", raising=False)
+        assert _build_judge_cmd(_make_config())[0] == "claude"
+        assert _build_gen_cmd(_make_config())[0] == "claude"
+
+
 class TestRenderCodexStdin:
     """The stdin renderer prepends a boundary-delimited SYSTEM block when
     a system prompt is set, and emits the user payload unchanged when
@@ -1663,6 +1684,7 @@ class TestCaptureAgentCliVersionCodex:
 
     def test_claude_branch_uses_claude_version(self, monkeypatch):
         monkeypatch.delenv("CODEX_BIN", raising=False)
+        monkeypatch.delenv("CLAUDE_BIN", raising=False)
         fake_result = MagicMock()
         fake_result.returncode = 0
         fake_result.stdout = "claude 2.1.118\n"
@@ -1671,6 +1693,16 @@ class TestCaptureAgentCliVersionCodex:
         assert field == "claude_cli_version"
         assert value == "claude 2.1.118"
         assert mock_run.call_args[0][0] == ["claude", "--version"]
+
+    def test_claude_branch_honors_claude_bin(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BIN", "/tmp/fake-claude")
+        fake_result = MagicMock()
+        fake_result.returncode = 0
+        fake_result.stdout = "claude 2.1.118\n"
+        with patch("kai.eval.behavioral.subprocess.run", return_value=fake_result) as mock_run:
+            field, _value = _capture_agent_cli_version("claude")
+        assert field == "claude_cli_version"
+        assert mock_run.call_args[0][0] == ["/tmp/fake-claude", "--version"]
 
     def test_codex_branch_uses_codex_version(self, monkeypatch):
         monkeypatch.delenv("CODEX_BIN", raising=False)
@@ -1695,6 +1727,7 @@ class TestCaptureAgentCliVersionCodex:
 
     def test_unknown_backend_falls_back_to_claude(self, monkeypatch):
         monkeypatch.delenv("CODEX_BIN", raising=False)
+        monkeypatch.delenv("CLAUDE_BIN", raising=False)
         fake_result = MagicMock()
         fake_result.returncode = 0
         fake_result.stdout = "claude 2.1.118\n"

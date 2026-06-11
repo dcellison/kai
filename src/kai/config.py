@@ -2920,10 +2920,11 @@ def load_config() -> Config:
     # _check_model_registry_complete() call is self-driving over every
     # (backend, provider) pair in BACKEND_PROVIDERS, so registry rows
     # are already validated for every backend including per-user
-    # overrides. `resolve_oneshot_binary` is per-backend (CODEX_BIN
-    # location, opencode binary path) so it stays in the loop;
-    # a missing CODEX_BIN on a deployment where any user routes to
-    # codex fails fast at startup instead of at the first extraction.
+    # overrides. `resolve_oneshot_binary` is per-backend (each backend
+    # honors its *_BIN override, falling back to PATH) so it stays in
+    # the loop; a missing binary on a deployment where any user routes
+    # to that backend fails fast at startup instead of at the first
+    # extraction.
     if memory_extraction_enabled and extraction_eligible_backends:
         from kai.oneshot_binary import BinaryResolutionError, resolve_oneshot_binary
 
@@ -2934,8 +2935,9 @@ def load_config() -> Config:
                 raise SystemExit(
                     f"Memory extraction requires the {_backend!r} binary to be reachable "
                     f"at startup (at least one extraction-eligible user routes to it), but "
-                    f"{e}. Set CODEX_BIN (for codex) or fix PATH (for either backend); "
-                    f"rerun the wizard if you no longer want memory extraction enabled."
+                    f"{e}. Set {_backend.upper()}_BIN to the binary's absolute path or "
+                    f"fix PATH; rerun the wizard if you no longer want memory extraction "
+                    f"enabled."
                 ) from None
 
     # Renamed env vars: warn when the legacy name is present so the

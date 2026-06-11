@@ -366,6 +366,44 @@ class TestCommandConstruction:
             assert "TMPDIR" not in env
 
     @pytest.mark.asyncio
+    async def test_claude_bin_override_pins_absolute_path(self, monkeypatch):
+        """CLAUDE_BIN pins the argv head so a sudo-wrapped per-user
+        spawn matches the absolute path the sudoers rule names
+        (mirrors codex's CODEX_BIN and opencode's OPENCODE_BIN
+        contract)."""
+        monkeypatch.setenv("CLAUDE_BIN", "/opt/homebrew/bin/claude")
+        claude = _make_claude()
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            cmd = mock_exec.call_args[0]
+            assert cmd[0] == "/opt/homebrew/bin/claude"
+
+    @pytest.mark.asyncio
+    async def test_empty_claude_bin_falls_back_to_bare_name(self, monkeypatch):
+        """An empty-string CLAUDE_BIN (unset-but-present in
+        /etc/kai/env) must not produce an empty argv head."""
+        monkeypatch.setenv("CLAUDE_BIN", "")
+        claude = _make_claude()
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stderr = AsyncMock()
+            mock_exec.return_value = mock_proc
+
+            await claude._ensure_started()
+
+            cmd = mock_exec.call_args[0]
+            assert cmd[0] == "claude"
+
+    @pytest.mark.asyncio
     async def test_no_settings_flag_in_cmd(self):
         """The argv carries no --settings flag: the context window
         setting was removed, and no other knob routes through the

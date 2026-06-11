@@ -352,6 +352,20 @@ def _validate_chat_id(value: str) -> bool:
         return False
 
 
+def _validate_claude_bin(value: str) -> bool:
+    """Return True when the path exists and is executable.
+
+    Required by the claude wizard prompt; the path is baked into both
+    the runtime CLAUDE_BIN env var and the sudoers rule that allows
+    cross-os_user claude spawns, so a non-existent path here would
+    surface as a confusing 'a password is required' at first message.
+    """
+    if not value:
+        return False
+    p = Path(value)
+    return p.is_file() and os.access(p, os.X_OK)
+
+
 def _validate_codex_bin(value: str) -> bool:
     """Return True when the path exists and is executable.
 
@@ -941,6 +955,34 @@ def _cmd_config() -> None:
     # opencode above (global-goose block, extraction defense-in-depth
     # re-prompt, empty-skip persistence gate for GOOSE_BIN).
     goose_bin = ""
+    # Claude binary path: same collection and persistence shape as
+    # opencode (global-claude block, extraction defense-in-depth
+    # re-prompt, empty-skip persistence gate for CLAUDE_BIN).
+    claude_bin = ""
+    if agent_backend == "claude":
+        # Claude binary path: wizard-prompted and persisted in
+        # install.conf so `make install` writes both /etc/kai/env's
+        # CLAUDE_BIN and the sudoers SETENV rule from the same source
+        # of truth. Default suggestion uses `which claude` from the
+        # operator's PATH; falls back to the empty string when which
+        # finds nothing (claude has two canonical install locations,
+        # the native installer's ~/.local/bin/claude and the Homebrew
+        # cask's /opt/homebrew/bin/claude, so an empty default forces
+        # the operator to type the path explicitly rather than accept
+        # a wrong guess between the two). The _cmd_apply env
+        # passthrough (`sudo CLAUDE_BIN=... make install`) still works
+        # as the ad-hoc deploy escape hatch; the wizard path is the
+        # canonical source of truth.
+        while True:
+            which_claude = shutil.which("claude") or ""
+            claude_bin = _prompt(
+                "Claude binary path",
+                existing_env.get("CLAUDE_BIN", which_claude),
+                required=True,
+            )
+            if _validate_claude_bin(claude_bin):
+                break
+            print(f"  Path '{claude_bin}' does not exist or is not executable.")
     if agent_backend == "codex":
         codex_auth_mode = _prompt_choice(
             "Codex auth mode",
@@ -1122,12 +1164,22 @@ def _cmd_config() -> None:
     # in play; the values flow into the same codex_bin / opencode_bin
     # / goose_bin variables, so the existing persistence (env var,
     # install.conf, sudoers SETENV rule) needs no new emission sites.
-    # Claude is exempt: it has no *_BIN wizard surface and resolves
-    # through the service PATH the launchd plist pins. Prompt loops
-    # mirror the global blocks, including each backend's default
-    # posture (codex falls back to Homebrew; goose and opencode
-    # force an explicit path when `which` finds nothing).
+    # Prompt loops mirror the global blocks, including each backend's
+    # default posture (codex falls back to Homebrew; claude, goose,
+    # and opencode force an explicit path when `which` finds nothing).
     peruser_backends = _users_yaml_agent_backends(users_yaml_path)
+    if "claude" in peruser_backends and not claude_bin:
+        print("  users.yaml has a claude entry; the daemon needs a resolvable claude binary.")
+        while True:
+            which_claude = shutil.which("claude") or ""
+            claude_bin = _prompt(
+                "Claude binary path",
+                existing_env.get("CLAUDE_BIN", which_claude),
+                required=True,
+            )
+            if _validate_claude_bin(claude_bin):
+                break
+            print(f"  Path '{claude_bin}' does not exist or is not executable.")
     if "codex" in peruser_backends and not codex_bin:
         print("  users.yaml has a codex entry; the daemon needs a resolvable codex binary.")
         while True:
@@ -1609,6 +1661,25 @@ def _cmd_config() -> None:
                         if _validate_goose_bin(goose_bin):
                             break
                         print(f"  Path '{goose_bin}' does not exist or is not executable.")
+                # Same defense-in-depth shape for the claude global
+                # backend, completing the four-backend set: the
+                # global-claude block above collects claude_bin on
+                # the normal flow; this gate covers a future refactor
+                # that reaches the extraction prompts with claude_bin
+                # still empty. Defaults mirror the global block
+                # (`which claude`, else empty so the operator types
+                # the path explicitly).
+                if agent_backend == "claude" and not claude_bin:
+                    while True:
+                        which_claude = shutil.which("claude") or ""
+                        claude_bin = _prompt(
+                            "Claude binary path (required by claude memory reasoner)",
+                            existing_env.get("CLAUDE_BIN", which_claude),
+                            required=True,
+                        )
+                        if _validate_claude_bin(claude_bin):
+                            break
+                        print(f"  Path '{claude_bin}' does not exist or is not executable.")
                 # Extraction timeout is the LLM-call hard cap inside
                 # memory_extraction.py:541. Default 10s is too aggressive
                 # for production - real extractions routinely take 20-30s
@@ -1844,6 +1915,13 @@ def _cmd_config() -> None:
     # GOOSE_BIN and the sudoers SETENV rule so the two cannot drift.
     if goose_bin:
         env["GOOSE_BIN"] = goose_bin
+    # Same gating shape again for claude: persist only when the wizard
+    # collected a value, so installs that never collected one carry no
+    # CLAUDE_BIN= line and keep resolving claude via the service PATH.
+    # The single emission drives both /etc/kai/env's CLAUDE_BIN and
+    # the sudoers SETENV rule so the two cannot drift.
+    if claude_bin:
+        env["CLAUDE_BIN"] = claude_bin
 
     # Remove stale renamed keys if present - leaving both the old and
     # new key causes silent confusion (the deprecation warning is
@@ -2663,6 +2741,7 @@ def _collect_user_home_overrides(users_yaml_path: str | Path) -> dict[int, Path]
 def _generate_sudoers(
     service_user: str,
     os_users: Iterable[str] = (),
+    claude_bin: str | None = None,
     codex_bin: str | None = None,
     opencode_bin: str | None = None,
     goose_bin: str | None = None,
@@ -2683,14 +2762,17 @@ def _generate_sudoers(
     cross-user kill escalation) are emitted for every distinct `os_user`
     value in users.yaml. Users matching `service_user` are skipped (the
     runtime detects self-sudo via resolve_claude_user() and spawns the
-    agent directly without sudo). The codex binary path defaults to
-    /opt/homebrew/bin/codex; Linux installs override with the CODEX_BIN
-    env var at install time. The opencode rule uses the service user's
-    `~/.local/bin/opencode` path (where the upstream installer drops the
-    binary by default); operators with a custom install location can
-    override via OPENCODE_BIN. The goose rule defaults to
-    /opt/homebrew/bin/goose (the Homebrew cask location) with the same
-    GOOSE_BIN override shape.
+    agent directly without sudo). The claude rule defaults to the
+    service user's `~/.local/bin/claude` (the native installer
+    location); operators with a custom install location (e.g. the
+    Homebrew cask) override via CLAUDE_BIN. The codex binary path
+    defaults to /opt/homebrew/bin/codex; Linux installs override with
+    the CODEX_BIN env var at install time. The opencode rule uses the
+    service user's `~/.local/bin/opencode` path (where the upstream
+    installer drops the binary by default); operators with a custom
+    install location can override via OPENCODE_BIN. The goose rule
+    defaults to /opt/homebrew/bin/goose (the Homebrew cask location)
+    with the same GOOSE_BIN override shape.
 
     Args:
         service_user: The OS username that runs the Kai service.
@@ -2739,18 +2821,19 @@ def _generate_sudoers(
         target_users.append(candidate)
 
     if target_users:
-        # Anchor the rule path to the SERVICE user's claude install. The
-        # bot spawns `sudo -u <target> -- claude` and sudo resolves the
-        # bare `claude` against the caller's PATH (the service user's,
-        # not the target's), so the rule must reference the service
-        # user's binary. shutil.which("claude") used to be the first
-        # half of this expression but resolved against whatever PATH
-        # root happened to have when `sudo make install` ran - which
-        # picked up any user's `~/.local/bin/claude` that happened to
-        # be on PATH at install time, baking the wrong path into the
-        # rule and breaking the bot's sudo dispatch.
+        # Anchor the rule path to the wizard-collected CLAUDE_BIN when
+        # present, else the SERVICE user's native-installer location.
+        # The runtime spawn uses the same precedence (claude.py reads
+        # CLAUDE_BIN, else spawns bare `claude` which sudo resolves
+        # against the caller's PATH, the service user's), so the rule
+        # references the same binary the bot invokes. We deliberately
+        # do NOT call shutil.which here: resolving against whatever
+        # PATH root has when `sudo make install` runs can pick up any
+        # user's `~/.local/bin/claude` that happens to be on PATH at
+        # install time, baking the wrong path into the rule and
+        # breaking the bot's sudo dispatch.
         svc_home = _user_home(service_user)
-        claude_bin = f"{svc_home}/.local/bin/claude"
+        claude_bin_resolved = claude_bin or f"{svc_home}/.local/bin/claude"
         # Codex binary path is now threaded as an argument. The wizard
         # prompts for and persists the value in install.conf; _cmd_apply
         # passes it to _apply_sudoers which passes it here. We
@@ -2821,7 +2904,7 @@ def _generate_sudoers(
             # delta is zero.
         """)
         for target in target_users:
-            rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {claude_bin}\n"
+            rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {claude_bin_resolved}\n"
             rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {codex_bin_resolved}\n"
             rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {opencode_bin_resolved}\n"
             rules += f"{service_user} ALL=({target}) SETENV: NOPASSWD: {goose_bin_resolved}\n"
@@ -4060,6 +4143,12 @@ def _cmd_apply() -> None:
         env_goose_bin = os.environ.get("GOOSE_BIN")
         if env_goose_bin and env.get("AGENT_BACKEND") == "goose":
             env["GOOSE_BIN"] = env_goose_bin
+        # And for CLAUDE_BIN, completing the per-backend set. The
+        # AGENT_BACKEND gate compares against the runtime default
+        # because the wizard omits the key on claude installs.
+        env_claude_bin = os.environ.get("CLAUDE_BIN")
+        if env_claude_bin and env.get("AGENT_BACKEND", "claude") == "claude":
+            env["CLAUDE_BIN"] = env_claude_bin
         # AGENT_TIMEOUT_SECONDS migration. Operators upgrading without
         # re-running the wizard carry the legacy CLAUDE_TIMEOUT_SECONDS
         # key in install.conf; rewrite to the canonical name at apply
@@ -4106,6 +4195,7 @@ def _cmd_apply() -> None:
         _apply_sudoers(
             service_user,
             dry_run,
+            claude_bin=env.get("CLAUDE_BIN"),
             codex_bin=env.get("CODEX_BIN"),
             opencode_bin=env.get("OPENCODE_BIN"),
             goose_bin=env.get("GOOSE_BIN"),
@@ -5278,6 +5368,7 @@ def _apply_sudoers(
     service_user: str,
     dry_run: bool,
     users_yaml_path: str | Path | None = None,
+    claude_bin: str | None = None,
     codex_bin: str | None = None,
     opencode_bin: str | None = None,
     goose_bin: str | None = None,
@@ -5292,14 +5383,16 @@ def _apply_sudoers(
     SETENV: NOPASSWD: rule. Without this, hand-added per-user rules
     were silently wiped on every `sudo make install`.
 
-    `codex_bin`, `opencode_bin`, and `goose_bin` are threaded from
-    `_cmd_apply`'s env dict (which sources them from install.conf,
-    after the apply-time env-var override block) so the SETENV rules
-    pin the same absolute paths the running bot will invoke.
+    `claude_bin`, `codex_bin`, `opencode_bin`, and `goose_bin` are
+    threaded from `_cmd_apply`'s env dict (which sources them from
+    install.conf, after the apply-time env-var override block) so the
+    SETENV rules pin the same absolute paths the running bot will
+    invoke. `claude_bin` falls back to the service user's
+    `~/.local/bin/claude` (the native installer location);
     `codex_bin` falls back to /opt/homebrew/bin/codex; `opencode_bin`
     falls back to the service user's `~/.local/bin/opencode`;
     `goose_bin` falls back to /opt/homebrew/bin/goose. The fallbacks
-    fire only on first-time installs where the wizard has not run yet.
+    fire only on installs where the wizard has not collected a value.
 
     `agent_backend` is the install's global backend (the env dict's
     AGENT_BACKEND, defaulting to claude when the key is absent, which
@@ -5323,6 +5416,7 @@ def _apply_sudoers(
     sudoers_content = _generate_sudoers(
         service_user,
         os_users,
+        claude_bin=claude_bin,
         codex_bin=codex_bin,
         opencode_bin=opencode_bin,
         goose_bin=goose_bin,
@@ -5351,11 +5445,9 @@ def _apply_sudoers(
         # backend with a sudoers rule needs an entry in both places.
         expected_bins: dict[str, tuple[Path, str]] = {
             "claude": (
-                Path(f"{svc_home}/.local/bin/claude"),
-                "The bot's runtime spawn resolves bare `claude` against the "
-                "service user's PATH - install claude via the native installer "
-                "(`~/.local/bin/claude`) or symlink your existing install there "
-                "to keep the rule and runtime in sync.",
+                Path(claude_bin or f"{svc_home}/.local/bin/claude"),
+                "Re-run 'make config' and point CLAUDE_BIN at the actual claude "
+                "install location to keep the rule and runtime in sync.",
             ),
             "codex": (
                 Path(codex_bin or "/opt/homebrew/bin/codex"),

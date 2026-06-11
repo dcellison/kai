@@ -184,9 +184,19 @@ class ClaudeCodeBackend(AgentBackend):
         if self.is_alive:
             return
 
+        # Resolve the claude binary path. The CLAUDE_BIN env var lets
+        # the install (or operator) pin an absolute path; the sudoers
+        # rule for cross-user spawns names the same file, and sudo's
+        # PATH resolution of a bare name must land on exactly that
+        # file for the rule to match. Falls back to bare "claude" so
+        # installs with claude on the service user's PATH and no
+        # override keep working. Mirrors the CODEX_BIN handling in
+        # codex.py.
+        claude_bin = os.environ.get("CLAUDE_BIN") or "claude"
+
         # Build the Claude command arguments.
         claude_cmd = [
-            "claude",
+            claude_bin,
             "--input-format",
             "stream-json",
             "--output-format",

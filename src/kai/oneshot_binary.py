@@ -55,9 +55,11 @@ def resolve_oneshot_binary(backend: str) -> str:
     Return the absolute path of the agent binary the OneShotReasoner
     of `backend` will invoke.
 
-    `backend == "claude"`: `shutil.which("claude")`. Resolution
-    sequence: claude on PATH only. Failure message names that
-    sequence.
+    `backend == "claude"`: branch on `CLAUDE_BIN` with the same
+    is-file plus executable validation pattern as the codex arm.
+    Unset falls through to `shutil.which("claude")`, which covers
+    the native-installer layout where the launcher is already on
+    the service user's PATH.
 
     `backend == "codex"`: branch on `CODEX_BIN`.
       - Explicit override: when `CODEX_BIN` is set, resolve to that
@@ -91,13 +93,24 @@ def resolve_oneshot_binary(backend: str) -> str:
     bug, not the operator's PATH.
     """
     if backend == "claude":
-        # Resolution: claude on PATH only. No explicit-override
-        # variable for claude (CLAUDE_CONFIG_DIR controls auth state,
-        # not binary discovery). A future CLAUDE_BIN override would
-        # land here as the second branch.
+        # Structural mirror of the codex / opencode / goose arms.
+        # CLAUDE_BIN, when set, is validated as a configuration error
+        # with no PATH fallback; unset falls through to PATH
+        # discovery, which covers the native-installer layout where
+        # `~/.local/bin/claude` is already on the service user's
+        # PATH. (CLAUDE_CONFIG_DIR controls auth state, not binary
+        # discovery; it is unrelated to this resolution.)
+        override = os.environ.get("CLAUDE_BIN")
+        if override:
+            override_path = Path(override)
+            if not override_path.is_file():
+                raise BinaryResolutionError(f"could not resolve claude binary: CLAUDE_BIN={override!r} not-a-file")
+            if not os.access(str(override_path), os.X_OK):
+                raise BinaryResolutionError(f"could not resolve claude binary: CLAUDE_BIN={override!r} not-executable")
+            return str(override_path)
         resolved = shutil.which("claude")
         if resolved is None:
-            raise BinaryResolutionError("could not resolve claude binary: `claude` not on PATH")
+            raise BinaryResolutionError("could not resolve claude binary: CLAUDE_BIN unset, `claude` not on PATH")
         return resolved
 
     if backend == "codex":

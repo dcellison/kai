@@ -382,6 +382,15 @@ class TestGenerateSudoers:
         assert "/home/kai/.local/bin/claude" in result
         assert "/some/other/users/local/bin/claude" not in result
 
+    def test_claude_bin_arg_overrides_default(self, monkeypatch):
+        """An explicit claude_bin (the wizard-collected CLAUDE_BIN)
+        replaces the service-home fallback in the per-user rule, so
+        the rule names the same binary the runtime spawn pins."""
+        monkeypatch.setattr("kai.install._user_home", lambda u: f"/home/{u}")
+        result = _generate_sudoers("kai", os_users=["alice"], claude_bin="/opt/homebrew/bin/claude")
+        assert "kai ALL=(alice) SETENV: NOPASSWD: /opt/homebrew/bin/claude" in result
+        assert "/home/kai/.local/bin/claude" not in result
+
     # -- Issue #341: per-user rules from users.yaml -----------------------
 
     def test_no_per_user_rule_when_os_users_empty(self, monkeypatch):
@@ -1114,6 +1123,7 @@ class TestCmdConfig:
                 "false",  # advanced user options
                 "polling",  # transport
                 "claude",  # agent backend
+                "/usr/bin/true",  # claude binary path
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
@@ -1162,6 +1172,25 @@ class TestCmdConfig:
         assert data["users"][0]["telegram_id"] == 12345
         assert data["users"][0]["role"] == "admin"
 
+    def test_claude_install_emits_claude_bin(self, tmp_path, monkeypatch):
+        """The wizard-collected claude binary path lands in
+        install.conf's env as CLAUDE_BIN, so `make install` writes
+        /etc/kai/env's CLAUDE_BIN and the sudoers SETENV rule from the
+        same source of truth (the same contract CODEX_BIN /
+        OPENCODE_BIN / GOOSE_BIN follow)."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._redirect_staging(monkeypatch, tmp_path)
+
+        inputs = iter(self._base_inputs(["false"]))
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+        _cmd_config()
+
+        conf = json.loads((tmp_path / "install.conf").read_text())
+        assert conf["env"]["CLAUDE_BIN"] == "/usr/bin/true"
+
     def test_advanced_user_options(self, tmp_path, monkeypatch):
         """
         Advanced path writes os_user and skips CLAUDE_USER.
@@ -1192,6 +1221,7 @@ class TestCmdConfig:
                 # no home_workspace prompt post-#353
                 "polling",  # transport
                 "claude",  # agent backend
+                "/usr/bin/true",  # claude binary path
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
@@ -1273,6 +1303,7 @@ class TestCmdConfig:
                 "false",  # advanced user options -> no os_user, no home prompt
                 "polling",  # transport
                 "claude",  # agent backend
+                "/usr/bin/true",  # claude binary path
                 "sonnet",  # model
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",  # timeout
@@ -1342,6 +1373,7 @@ class TestCmdConfig:
                 "testuser",  # os_user (no home_workspace prompt should follow)
                 "polling",
                 "claude",
+                "/usr/bin/true",  # claude binary path
                 "sonnet",
                 "false",  # customize per-role models (decline; use registry defaults)
                 "120",
@@ -1593,8 +1625,13 @@ class TestCmdConfig:
         existing_users_yaml = "users:\n  - telegram_id: 999\n    name: existing\n    role: admin\n"
         self._simulate_existing_etc_users_yaml(monkeypatch, existing_users_yaml)
 
-        # Press Enter for everything (accept all defaults)
-        monkeypatch.setattr("builtins.input", lambda prompt: "")
+        # Press Enter for everything except the claude binary prompt,
+        # whose default depends on the runner's PATH (`which claude`);
+        # an explicit answer keeps the test host-independent.
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda prompt: "/usr/bin/true" if "Claude binary path" in prompt else "",
+        )
 
         _cmd_config()
 
@@ -1676,6 +1713,13 @@ class TestCmdConfig:
         # wizard-test precedent), so the literal path here never
         # touches the host filesystem.
         backend_block: list[str] = []
+        if agent_backend == "claude":
+            # The global-claude block prompts for the binary path
+            # right after backend selection. /usr/bin/true exists and
+            # is executable on macOS and Linux CI runners alike, so
+            # the real _validate_claude_bin passes without a claude
+            # install on the host and without a validator stub.
+            backend_block.append("/usr/bin/true")
         if agent_backend == "goose":
             backend_block.append("/opt/homebrew/bin/goose")
         if agent_backend != "claude":
@@ -2050,9 +2094,13 @@ class TestCmdConfig:
         conf_path.write_text(json.dumps(existing))
         # users.yaml is simulated above via _simulate_existing_etc_users_yaml,
         # which keeps the wizard on the existing-config branch and skips
-        # the per-user prompts that lack defaults.
-
-        monkeypatch.setattr("builtins.input", lambda prompt: "")
+        # the per-user prompts that lack defaults. The claude binary
+        # prompt gets an explicit answer because its default depends
+        # on the runner's PATH (`which claude`).
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda prompt: "/usr/bin/true" if "Claude binary path" in prompt else "",
+        )
 
         _cmd_config()
 
@@ -2844,6 +2892,7 @@ class TestCmdConfigDefaultModelDispatch:
             "fake-token",  # bot token
             "polling",  # transport
             "claude",  # agent backend
+            "/usr/bin/true",  # claude binary path
             # model prompt is handled by the _prompt_default_model mock
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # agent timeout (global default)
@@ -6460,6 +6509,7 @@ class TestCmdConfigCanonicalUsersYaml:
             "false",  # advanced
             "polling",
             "claude",
+            "/usr/bin/true",  # claude binary path
             "sonnet",
             "false",  # customize per-role models (decline)
             "120",
@@ -6809,6 +6859,7 @@ class TestCmdConfigSingleUserMode:
             "false",  # advanced
             "polling",  # transport
             "claude",  # backend
+            "/usr/bin/true",  # claude binary path
             "sonnet",  # model
             "false",  # customize per-role models (decline; use registry defaults)
             "120",  # timeout
@@ -7948,6 +7999,42 @@ class TestApplyMigratePerOsUserTmpdir:
 # ── Codex wizard hardening: validators and apply-time checks ─────────
 
 
+class TestValidateClaudeBin:
+    """claude binary path existence validator. Mirrors
+    `TestValidateCodexBin` exactly: same five edge cases (empty,
+    nonexistent, directory, non-executable file, executable file)."""
+
+    def test_empty_value_rejected(self):
+        from kai.install import _validate_claude_bin
+
+        assert _validate_claude_bin("") is False
+
+    def test_nonexistent_path_rejected(self, tmp_path):
+        from kai.install import _validate_claude_bin
+
+        assert _validate_claude_bin(str(tmp_path / "does_not_exist")) is False
+
+    def test_directory_rejected(self, tmp_path):
+        from kai.install import _validate_claude_bin
+
+        assert _validate_claude_bin(str(tmp_path)) is False
+
+    def test_non_executable_file_rejected(self, tmp_path):
+        from kai.install import _validate_claude_bin
+
+        f = tmp_path / "fake_claude"
+        f.write_text("#!/bin/sh\necho hi\n")
+        assert _validate_claude_bin(str(f)) is False
+
+    def test_executable_file_accepted(self, tmp_path):
+        from kai.install import _validate_claude_bin
+
+        f = tmp_path / "fake_claude"
+        f.write_text("#!/bin/sh\necho hi\n")
+        f.chmod(0o755)
+        assert _validate_claude_bin(str(f)) is True
+
+
 class TestValidateCodexBin:
     """codex binary path existence validator."""
 
@@ -8915,12 +9002,12 @@ class TestWizardPerUserGooseProviderKeys:
     def test_peruser_goose_entry_prompts_for_key(self, tmp_path, monkeypatch, capsys):
         """Global claude install with a per-user goose+deepseek entry:
         the wizard prompts for DEEPSEEK_API_KEY and then the goose
-        binary path (both inserted right after the backend slot in
-        the input chain) and emits both to env."""
+        binary path (both inserted right after the global claude-
+        binary slot in the input chain) and emits both to env."""
         self._setup(monkeypatch, tmp_path, self.GOOSE_DEEPSEEK_USERS_YAML)
         monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
         inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
-        i = inputs.index("claude")
+        i = inputs.index("/usr/bin/true")
         inputs = inputs[: i + 1] + ["sk-ds-peruser", "/opt/homebrew/bin/goose"] + inputs[i + 1 :]
 
         env = self._run(monkeypatch, tmp_path, inputs)
@@ -9071,6 +9158,15 @@ class TestWizardPerUserBackendBinaries:
         "    name: bob\n"
         "    agent_backend: codex\n"
     )
+    CLAUDE_USERS_YAML = (
+        "users:\n"
+        "  - telegram_id: 1\n"
+        "    name: alice\n"
+        "    role: admin\n"
+        "  - telegram_id: 2\n"
+        "    name: bob\n"
+        "    agent_backend: claude\n"
+    )
     PLAIN_USERS_YAML = "users:\n  - telegram_id: 1\n    name: alice\n    role: admin\n"
 
     @staticmethod
@@ -9103,13 +9199,30 @@ class TestWizardPerUserBackendBinaries:
         self._setup(monkeypatch, tmp_path, self.CODEX_USERS_YAML)
         monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
         inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
-        i = inputs.index("claude")
+        i = inputs.index("/usr/bin/true")
         inputs = inputs[: i + 1] + ["/per-user/npm/bin/codex"] + inputs[i + 1 :]
 
         env = self._run(monkeypatch, tmp_path, inputs)
 
         assert env["CODEX_BIN"] == "/per-user/npm/bin/codex"
         assert "codex entry" in capsys.readouterr().out
+
+    def test_peruser_claude_entry_prompts_for_binary(self, tmp_path, monkeypatch, capsys):
+        """Global goose install with a per-user claude entry: the
+        wizard prompts for the claude binary path and CLAUDE_BIN
+        lands in env, the same collection contract the other three
+        backends follow. The answer is a real executable so the
+        unstubbed _validate_claude_bin passes on any runner."""
+        self._setup(monkeypatch, tmp_path, self.CLAUDE_USERS_YAML)
+        monkeypatch.setattr("kai.install._validate_goose_bin", lambda p: bool(p))
+        inputs = list(TestCmdConfigDefaultModelDispatch._inputs_for_goose_openai())
+        i = inputs.index("openai-key")
+        inputs = inputs[: i + 1] + ["/usr/bin/true"] + inputs[i + 1 :]
+
+        env = self._run(monkeypatch, tmp_path, inputs)
+
+        assert env["CLAUDE_BIN"] == "/usr/bin/true"
+        assert "claude entry" in capsys.readouterr().out
 
     def test_global_codex_does_not_reprompt(self, tmp_path, monkeypatch):
         """Global codex install with a per-user codex entry: the
@@ -9146,7 +9259,7 @@ class TestWizardPerUserBackendBinaries:
         )
         monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
         inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
-        i = inputs.index("claude")
+        i = inputs.index("/usr/bin/true")
         # Empty answer accepts the prompt default (the stored path).
         inputs = inputs[: i + 1] + [""] + inputs[i + 1 :]
 
@@ -9172,7 +9285,7 @@ class TestWizardPerUserBackendBinaries:
         self._setup(monkeypatch, tmp_path, mixed_yaml)
         monkeypatch.setattr("kai.install._validate_codex_bin", lambda p: bool(p))
         inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
-        i = inputs.index("claude")
+        i = inputs.index("/usr/bin/true")
         inputs = inputs[: i + 1] + ["/per-user/npm/bin/codex"] + inputs[i + 1 :]
 
         env = self._run(monkeypatch, tmp_path, inputs)
@@ -9196,7 +9309,7 @@ class TestWizardPerUserBackendBinaries:
         self._setup(monkeypatch, tmp_path, opencode_yaml)
         monkeypatch.setattr("kai.install._validate_opencode_bin", lambda p: bool(p))
         inputs = TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend()
-        i = inputs.index("claude")
+        i = inputs.index("/usr/bin/true")
         inputs = inputs[: i + 1] + ["/custom/bin/opencode"] + inputs[i + 1 :]
 
         env = self._run(monkeypatch, tmp_path, inputs)
