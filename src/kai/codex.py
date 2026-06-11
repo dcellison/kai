@@ -50,6 +50,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import kai
+from kai.acp import _signal_target_user_pid, _signal_target_user_pid_sync
 from kai.backend import (
     AgentBackend,
     AgentResponse,
@@ -1241,102 +1242,27 @@ class CodexBackend(AgentBackend):
         except ValueError:
             return None
 
-    @staticmethod
-    def _stderr_is_esrch(stderr: bytes | None) -> bool:
-        """
-        True iff `stderr` contains the POSIX ESRCH diagnostic from
-        `/bin/kill` for a no-such-process condition.
-
-        Used by `_async_sudo_kill` and `_send_signal` to discriminate
-        the benign race (inner codex already exited between PID cache
-        and signal delivery; kill returns rc=1 with "No such process")
-        from real failure modes (sudoers misconfiguration, signal
-        permission denied, kill binary missing). The benign case
-        demotes to DEBUG; everything else keeps the existing WARNING.
-
-        Substring match because BSD `/bin/kill` on macOS and util-linux
-        `kill` on Linux both emit `kill: <pid>: No such process\\n`;
-        the prefix varies slightly but the "No such process" portion is
-        the stable POSIX `strerror(ESRCH)` text. Case-sensitive because
-        that diagnostic is fixed by libc and not localized for these
-        binaries on any production platform.
-
-        Returns False on `None` or empty bytes so a missing-stderr
-        rc!=0 (itself unusual and probably a real failure) keeps the
-        WARNING.
-
-        Bytes rather than decoded str because both call sites already
-        hold raw bytes from the subprocess result; keeping the helper
-        one level lower avoids duplicating the `.decode(errors="replace")`
-        rendering the WARNING line already does for display.
-        """
-        if not stderr:
-            return False
-        return b"No such process" in stderr
-
     async def _async_sudo_kill(self, target_user: str, pid: int, sig: int) -> None:
         """
-        Run `sudo -n -u <target> /bin/kill -<sig> <pid>` without blocking.
+        Signal one inner codex PID through the canonical cross-user
+        helper in kai.acp.
 
-        Equivalent to the synchronous subprocess.run inside _send_signal,
-        but uses asyncio.create_subprocess_exec so a hung sudo or kill
-        does not stall other coroutines. Logs at WARNING on non-zero
-        exit and on timeout so a missing sudoers rule or other failure
-        mode surfaces in the operator log instead of silently leaking
-        an orphan. Mirrors claude.py's _async_sudo_kill (#459).
+        Thin delegation seam kept as a method so the kill-ordering
+        tests can patch one name on the instance. The helper owns
+        the `sudo -n -u <target> /bin/kill -<sig> <pid>` spawn, the
+        bounded wait, and the rc/ESRCH classification: the benign
+        already-exited race (inner codex died between the PID cache
+        time and signal delivery) logs at DEBUG, while real failures
+        (sudoers rule missing, signal permission denied, kill binary
+        missing) reach the WARNING stream operators watch.
         """
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "sudo",
-                "-n",
-                "-u",
-                target_user,
-                "/bin/kill",
-                f"-{int(sig)}",
-                str(pid),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except (OSError, FileNotFoundError):
-            return
-        try:
-            _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=5)
-        except TimeoutError:
-            try:
-                proc.kill()
-            except OSError:
-                pass
-            try:
-                await proc.wait()
-            except OSError:
-                pass
-            log.warning(
-                "async sudo kill timed out after 5s (target=%s, pid=%d, sig=%d); inner codex may orphan",
-                target_user,
-                pid,
-                int(sig),
-            )
-            return
-        if proc.returncode != 0:
-            # ESRCH from `/bin/kill` means the inner codex exited on its
-            # own between the PID cache time and this signal delivery;
-            # the process is already reaped, not orphaned. Demoting the
-            # benign race to DEBUG keeps the WARNING stream focused on
-            # real failures (sudoers missing, signal permission denied,
-            # kill binary missing) that an operator actually needs to
-            # see.
-            if self._stderr_is_esrch(stderr_bytes):
-                log.debug(
-                    "sudo kill escalation: inner codex pid=%d already gone (ESRCH); benign race",
-                    pid,
-                )
-            else:
-                log.warning(
-                    "sudo kill escalation failed (rc=%d, stderr=%r); inner codex pid=%d may orphan",
-                    proc.returncode,
-                    stderr_bytes[:200].decode(errors="replace") if stderr_bytes else "",
-                    pid,
-                )
+        await _signal_target_user_pid(
+            target_user=target_user,
+            pid=pid,
+            sig=sig,
+            purpose="chat",
+            backend=self.backend_name,
+        )
 
     def _send_signal(self, sig: int) -> None:
         """
@@ -1372,54 +1298,21 @@ class CodexBackend(AgentBackend):
                 # body runs exactly once. _inner_codex_pids is set up
                 # in inner-to-outer order by _lookup_inner_codex_pids.
                 for pid in self._inner_codex_pids:
-                    try:
-                        # Absolute /bin/kill path so sudo's secure_path
-                        # resolution cannot silently pick a different
-                        # binary than the sudoers rule names. The
-                        # install.py rule also pins /bin/kill; the two
-                        # must match exactly. int(sig) explicit because
-                        # IntEnum f-string behavior changed in 3.11;
-                        # cast is the contract regardless of version.
-                        result = subprocess.run(
-                            [
-                                "sudo",
-                                "-n",
-                                "-u",
-                                self._effective_codex_user,
-                                "/bin/kill",
-                                f"-{int(sig)}",
-                                str(pid),
-                            ],
-                            capture_output=True,
-                            timeout=5,
-                            check=False,
-                        )
-                        if result.returncode != 0:
-                            # ESRCH branches to DEBUG; everything else
-                            # keeps the WARNING. See `_async_sudo_kill`
-                            # for the full rationale; the two call
-                            # sites must stay in lockstep so the
-                            # operator-visible WARNING surface is the
-                            # same regardless of which path delivered
-                            # the signal.
-                            if self._stderr_is_esrch(result.stderr):
-                                log.debug(
-                                    "sudo kill escalation: codex pid=%d already gone (ESRCH); benign race",
-                                    pid,
-                                )
-                            else:
-                                log.warning(
-                                    "sudo kill escalation failed (rc=%d, stderr=%r); codex pid=%d may orphan",
-                                    result.returncode,
-                                    result.stderr[:200].decode(errors="replace") if result.stderr else "",
-                                    pid,
-                                )
-                    except (subprocess.TimeoutExpired, OSError):
-                        # Inner codex already dead, sudoers rule
-                        # missing on an old install, or kill timed
-                        # out. Continue to the next PID and then to
-                        # killpg; the wrapper still needs reaping.
-                        continue
+                    # Canonical sync helper: owns the absolute
+                    # /bin/kill argv (matching the sudoers rule
+                    # install.py pins), the bounded wait, and the
+                    # rc/ESRCH classification. Failures are logged
+                    # and swallowed inside the helper, so the loop
+                    # always proceeds to the next PID and then to
+                    # killpg - the wrapper still needs reaping
+                    # regardless of how each inner-PID signal went.
+                    _signal_target_user_pid_sync(
+                        target_user=self._effective_codex_user,
+                        pid=pid,
+                        sig=int(sig),
+                        purpose="chat",
+                        backend=self.backend_name,
+                    )
             try:
                 os.killpg(self._pgid, sig)
             except OSError:

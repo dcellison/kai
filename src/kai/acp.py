@@ -329,7 +329,7 @@ def _log_cross_user_kill_result(
     rc: int,
     stderr: bytes,
     target_user: str,
-    pgid: int,
+    target_desc: str,
     purpose: str,
     backend: str,
 ) -> None:
@@ -340,26 +340,149 @@ def _log_cross_user_kill_result(
     classification cannot drift between them: rc=0 is silent
     success, ESRCH is the benign already-gone race at DEBUG, any
     other non-zero rc is a WARNING an operator needs to see.
+
+    `target_desc` names what the kill aimed at (`pgid=<n>` for the
+    group variants, `pid=<n> sig=<n>` for the per-PID variants) so
+    one log shape serves both without the group lines losing their
+    pgid field.
     """
     if rc == 0:
         return
     if _stderr_is_esrch(stderr):
         log.debug(
-            "cross-user kill: process group already gone (purpose=%s backend=%s target=%s pgid=%d); benign race",
+            "cross-user kill: target already gone (purpose=%s backend=%s target=%s %s); benign race",
             purpose,
             backend,
             target_user,
-            pgid,
+            target_desc,
         )
         return
     log.warning(
-        "cross-user kill returned rc=%d (purpose=%s backend=%s target=%s pgid=%d stderr=%r)",
+        "cross-user kill returned rc=%d (purpose=%s backend=%s target=%s %s stderr=%r)",
         rc,
         purpose,
         backend,
         target_user,
-        pgid,
+        target_desc,
         stderr[:200],
+    )
+
+
+async def _run_cross_user_kill(
+    *,
+    target_user: str,
+    kill_args: list[str],
+    target_desc: str,
+    purpose: str,
+    backend: str,
+) -> None:
+    """
+    Run `sudo -n -u <target> /bin/kill <kill_args...>` asynchronously
+    and classify the outcome.
+
+    Core shared by every async cross-user signal variant (group kill
+    and per-PID signal) so the spawn shape, the
+    `_CROSS_USER_KILL_TIMEOUT_S` bound, and the rc/ESRCH log
+    classification cannot drift between them. Failures (non-ESRCH
+    rc, timeout, FileNotFoundError on sudo itself) are logged and
+    swallowed; the caller still reaps its own wrapper afterward,
+    accepting the orphan risk for that deployment edge case. The
+    timeout path guards `kill()` against the race where sudo exits
+    between `wait_for` timing out and the kill call
+    (ProcessLookupError, an OSError subclass, on an already-dead
+    PID): the outcome wanted (process gone) is already true.
+    """
+    cmd = ["sudo", "-n", "-u", target_user, "/bin/kill", *kill_args]
+    try:
+        kill_proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except (OSError, FileNotFoundError):
+        log.warning(
+            "cross-user kill spawn failed: sudo not found (purpose=%s backend=%s target=%s %s)",
+            purpose,
+            backend,
+            target_user,
+            target_desc,
+        )
+        return
+    try:
+        _stdout, stderr = await asyncio.wait_for(kill_proc.communicate(), timeout=_CROSS_USER_KILL_TIMEOUT_S)
+    except TimeoutError:
+        with contextlib.suppress(OSError):
+            kill_proc.kill()
+        with contextlib.suppress(BaseException):
+            await kill_proc.wait()
+        log.warning(
+            "cross-user kill timed out (purpose=%s backend=%s target=%s %s)",
+            purpose,
+            backend,
+            target_user,
+            target_desc,
+        )
+        return
+    rc = kill_proc.returncode if kill_proc.returncode is not None else -1
+    _log_cross_user_kill_result(
+        rc=rc,
+        stderr=stderr,
+        target_user=target_user,
+        target_desc=target_desc,
+        purpose=purpose,
+        backend=backend,
+    )
+
+
+def _run_cross_user_kill_sync(
+    *,
+    target_user: str,
+    kill_args: list[str],
+    target_desc: str,
+    purpose: str,
+    backend: str,
+) -> None:
+    """
+    Synchronous companion to `_run_cross_user_kill` for sync-only
+    callers (`AgentBackend.force_kill` paths). Same argv shape,
+    timeout bound, and rc/ESRCH log classification. Blocking the
+    loop for up to `_CROSS_USER_KILL_TIMEOUT_S` is accepted on this
+    path: it only runs when a graceful shutdown already failed and
+    the alternative is an orphaned target-user process tree.
+    """
+    cmd = ["sudo", "-n", "-u", target_user, "/bin/kill", *kill_args]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=_CROSS_USER_KILL_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, FileNotFoundError):
+        log.warning(
+            "cross-user kill spawn failed: sudo not found (purpose=%s backend=%s target=%s %s)",
+            purpose,
+            backend,
+            target_user,
+            target_desc,
+        )
+        return
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "cross-user kill timed out (purpose=%s backend=%s target=%s %s)",
+            purpose,
+            backend,
+            target_user,
+            target_desc,
+        )
+        return
+    _log_cross_user_kill_result(
+        rc=result.returncode,
+        stderr=result.stderr,
+        target_user=target_user,
+        target_desc=target_desc,
+        purpose=purpose,
+        backend=backend,
     )
 
 
@@ -388,50 +511,14 @@ async def _kill_target_user_tree(
 
     Shared by the one-shot reasoners (timeout escalation) and the
     conversational `AcpBackend` kill paths so the cross-user kill
-    semantics cannot drift between them. Bounded by
-    `_CROSS_USER_KILL_TIMEOUT_S` so a hung sudo or missing
-    `/bin/kill` does not stall the caller's own cleanup. Failures
-    (non-ESRCH rc, timeout, FileNotFoundError on sudo itself) are
-    logged and swallowed; the caller still reaps the wrapper
-    afterward, accepting the orphan risk for that deployment edge
-    case.
+    semantics cannot drift between them. Thin wrapper over
+    `_run_cross_user_kill`, which owns the timeout bound and the
+    rc/ESRCH classification.
     """
-    cmd = ["sudo", "-n", "-u", target_user, "/bin/kill", "-KILL", f"-{pgid}"]
-    try:
-        kill_proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        log.warning(
-            "cross-user kill spawn failed: sudo not found (purpose=%s backend=%s target=%s pgid=%d)",
-            purpose,
-            backend,
-            target_user,
-            pgid,
-        )
-        return
-    try:
-        _stdout, stderr = await asyncio.wait_for(kill_proc.communicate(), timeout=_CROSS_USER_KILL_TIMEOUT_S)
-    except TimeoutError:
-        kill_proc.kill()
-        with contextlib.suppress(BaseException):
-            await kill_proc.wait()
-        log.warning(
-            "cross-user kill timed out (purpose=%s backend=%s target=%s pgid=%d)",
-            purpose,
-            backend,
-            target_user,
-            pgid,
-        )
-        return
-    rc = kill_proc.returncode if kill_proc.returncode is not None else -1
-    _log_cross_user_kill_result(
-        rc=rc,
-        stderr=stderr,
+    await _run_cross_user_kill(
         target_user=target_user,
-        pgid=pgid,
+        kill_args=["-KILL", f"-{pgid}"],
+        target_desc=f"pgid={pgid}",
         purpose=purpose,
         backend=backend,
     )
@@ -450,45 +537,73 @@ def _kill_target_user_tree_sync(
 
     `AgentBackend.force_kill` is a synchronous method (the pool's
     last-resort path after `shutdown` failed or timed out), so it
-    cannot await the canonical async helper; the claude and codex
-    backends keep a sync signal path for exactly this reason. Same
-    argv, timeout bound, and rc/ESRCH log classification as the
-    async variant. Blocking the loop for up to
-    `_CROSS_USER_KILL_TIMEOUT_S` is accepted on this path: it only
-    runs when a graceful shutdown already failed and the
-    alternative is an orphaned target-user process tree.
+    cannot await the canonical async helper. Thin wrapper over
+    `_run_cross_user_kill_sync`; same argv, timeout bound, and
+    rc/ESRCH log classification as the async variant.
     """
-    cmd = ["sudo", "-n", "-u", target_user, "/bin/kill", "-KILL", f"-{pgid}"]
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=_CROSS_USER_KILL_TIMEOUT_S,
-            check=False,
-        )
-    except FileNotFoundError:
-        log.warning(
-            "cross-user kill spawn failed: sudo not found (purpose=%s backend=%s target=%s pgid=%d)",
-            purpose,
-            backend,
-            target_user,
-            pgid,
-        )
-        return
-    except subprocess.TimeoutExpired:
-        log.warning(
-            "cross-user kill timed out (purpose=%s backend=%s target=%s pgid=%d)",
-            purpose,
-            backend,
-            target_user,
-            pgid,
-        )
-        return
-    _log_cross_user_kill_result(
-        rc=result.returncode,
-        stderr=result.stderr,
+    _run_cross_user_kill_sync(
         target_user=target_user,
-        pgid=pgid,
+        kill_args=["-KILL", f"-{pgid}"],
+        target_desc=f"pgid={pgid}",
+        purpose=purpose,
+        backend=backend,
+    )
+
+
+async def _signal_target_user_pid(
+    *,
+    target_user: str,
+    pid: int,
+    sig: int,
+    purpose: str,
+    backend: str,
+) -> None:
+    """
+    Send `sig` to a single target-user PID via sudo escalation.
+
+    Per-PID companion to `_kill_target_user_tree` for backends that
+    track specific inner-agent PIDs rather than a whole process
+    group: the claude and codex backends pgrep their sudo wrapper's
+    descendants and signal each PID directly (SIGTERM on graceful
+    shutdown, SIGKILL elsewhere), because killpg from the service
+    user cannot reach a target-user grandchild (POSIX signal
+    permission rules). Thin wrapper over `_run_cross_user_kill`,
+    which owns the timeout bound and the rc/ESRCH classification,
+    so the benign already-exited race logs at DEBUG and only real
+    failures (sudoers missing, permission denied, kill binary
+    missing) reach the WARNING stream.
+    """
+    # int(sig) explicit because IntEnum __format__ changed in 3.11:
+    # on older Pythons an f-string of signal.SIGKILL produces
+    # "Signals.SIGKILL" rather than "9", which /bin/kill rejects
+    # silently. The cast is the contract regardless of version.
+    await _run_cross_user_kill(
+        target_user=target_user,
+        kill_args=[f"-{int(sig)}", str(pid)],
+        target_desc=f"pid={pid} sig={int(sig)}",
+        purpose=purpose,
+        backend=backend,
+    )
+
+
+def _signal_target_user_pid_sync(
+    *,
+    target_user: str,
+    pid: int,
+    sig: int,
+    purpose: str,
+    backend: str,
+) -> None:
+    """
+    Synchronous companion to `_signal_target_user_pid` for the
+    sync `force_kill` paths. Thin wrapper over
+    `_run_cross_user_kill_sync`; same argv, timeout bound, and
+    rc/ESRCH log classification as the async variant.
+    """
+    _run_cross_user_kill_sync(
+        target_user=target_user,
+        kill_args=[f"-{int(sig)}", str(pid)],
+        target_desc=f"pid={pid} sig={int(sig)}",
         purpose=purpose,
         backend=backend,
     )

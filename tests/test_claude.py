@@ -2538,9 +2538,12 @@ class TestAsyncLookupInnerClaudePid:
 
 class TestAsyncSudoKill:
     """
-    Async sudo-kill helper (#459). Verifies command shape,
-    diagnostic-log behavior on non-zero exit, and timeout/OSError
-    handling parallel to the sync subprocess.run-based equivalent.
+    Async sudo-kill delegation seam. `_async_sudo_kill` hands the
+    spawn, bounded wait, and rc/ESRCH classification to the canonical
+    per-PID helper in kai.acp; these tests verify the command shape,
+    the log classification (ESRCH demotes to DEBUG, real failures
+    keep WARNING on the kai.acp logger), and timeout/OSError handling
+    as observed through the claude method.
     """
 
     @pytest.mark.asyncio
@@ -2559,17 +2562,36 @@ class TestAsyncSudoKill:
 
     @pytest.mark.asyncio
     async def test_logs_warning_on_nonzero_exit(self, caplog):
-        """ESRCH, missing sudoers rule, etc. surface at WARNING."""
+        """A non-ESRCH rc!=0 (missing sudoers rule, permission denied)
+        surfaces at WARNING through the shared acp classifier."""
         claude = _make_claude(claude_user="daniel")
         fake = _fake_async_proc(returncode=1, stderr=b"sudo: a password is required")
         with (
             patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)),
-            caplog.at_level("WARNING", logger="kai.claude"),
+            caplog.at_level("WARNING", logger="kai.acp"),
         ):
             await claude._async_sudo_kill("daniel", 99999, int(signal.SIGKILL))
 
-        assert "sudo kill escalation failed" in caplog.text
-        assert "99999" in caplog.text
+        assert "cross-user kill returned rc=1" in caplog.text
+        assert "pid=99999" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_esrch_demoted_to_debug(self, caplog):
+        """rc=1 with the POSIX ESRCH diagnostic is the benign race
+        (inner claude already exited between PID cache and signal
+        delivery); it logs at DEBUG, never WARNING, so the WARNING
+        stream stays focused on real sudoers failures."""
+        claude = _make_claude(claude_user="daniel")
+        fake = _fake_async_proc(returncode=1, stderr=b"kill: 99999: No such process\n")
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)),
+            caplog.at_level("DEBUG", logger="kai.acp"),
+        ):
+            await claude._async_sudo_kill("daniel", 99999, int(signal.SIGKILL))
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert warnings == [], f"expected no WARNING, got {warnings}"
+        assert any("benign race" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_silent_on_zero_exit(self, caplog):
@@ -2578,11 +2600,11 @@ class TestAsyncSudoKill:
         fake = _fake_async_proc(returncode=0)
         with (
             patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)),
-            caplog.at_level("WARNING", logger="kai.claude"),
+            caplog.at_level("WARNING", logger="kai.acp"),
         ):
             await claude._async_sudo_kill("daniel", 99999, int(signal.SIGKILL))
 
-        assert "escalation failed" not in caplog.text
+        assert "cross-user kill" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_logs_warning_on_timeout(self, caplog):
@@ -2594,11 +2616,11 @@ class TestAsyncSudoKill:
         fake.wait = AsyncMock()
         with (
             patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)),
-            caplog.at_level("WARNING", logger="kai.claude"),
+            caplog.at_level("WARNING", logger="kai.acp"),
         ):
             await claude._async_sudo_kill("daniel", 99999, int(signal.SIGKILL))
 
-        assert "timed out" in caplog.text
+        assert "cross-user kill timed out" in caplog.text
         fake.kill.assert_called_once()
 
     @pytest.mark.asyncio

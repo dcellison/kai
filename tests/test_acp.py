@@ -45,6 +45,7 @@ Covers:
 import asyncio
 import json
 import logging
+import signal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2173,3 +2174,135 @@ class TestKillTargetUserTreeFreeFunctions:
 
         warnings = [r for r in caplog.records if "cross-user kill timed out" in r.getMessage()]
         assert warnings
+
+
+class TestSignalTargetUserPidFreeFunctions:
+    """The per-PID cross-user signal helpers the claude and codex
+    backends delegate to for inner-agent PID targeting. Same core as
+    the group-kill helpers (argv shape, bounded wait, rc/ESRCH
+    classification); the kill target is `-<sig> <pid>` instead of
+    `-KILL -<pgid>`."""
+
+    def test_stderr_is_esrch_classifier(self):
+        """Pure unit test of the shared discriminator. Matching
+        substring is the POSIX `strerror(ESRCH)` text; everything
+        else returns False, including `None` and empty bytes (a
+        missing-stderr rc!=0 is itself unusual and should keep the
+        WARNING)."""
+        from kai.acp import _stderr_is_esrch
+
+        # Matching: the exact macOS/Linux /bin/kill diagnostic, and
+        # the bare substring regardless of prefix shape.
+        assert _stderr_is_esrch(b"kill: 12345: No such process\n") is True
+        assert _stderr_is_esrch(b"No such process") is True
+        # Non-matching: real failure modes that must keep the WARNING.
+        assert _stderr_is_esrch(b"a password is required") is False
+        assert _stderr_is_esrch(b"kill: Operation not permitted") is False
+        assert _stderr_is_esrch(b"") is False
+        assert _stderr_is_esrch(None) is False
+
+    @pytest.mark.asyncio
+    async def test_async_signal_argv_shape_with_int_sig_cast(self):
+        """Argv anchors /bin/kill (matching the sudoers rule) and
+        renders the signal as a bare integer: IntEnum __format__
+        produced "Signals.SIGTERM" on pre-3.11 Pythons, which
+        /bin/kill rejects silently, so the int() cast is the
+        contract regardless of version. Passing the enum itself
+        exercises the cast."""
+        from kai.acp import _signal_target_user_pid
+
+        kill_proc = MagicMock()
+        kill_proc.communicate = AsyncMock(return_value=(b"", b""))
+        kill_proc.returncode = 0
+        captured: dict = {}
+
+        async def _fake_exec(*args, **kwargs):
+            captured["argv"] = args
+            return kill_proc
+
+        with patch("kai.acp.asyncio.create_subprocess_exec", side_effect=_fake_exec):
+            await _signal_target_user_pid(
+                target_user="other-user",
+                pid=4242,
+                sig=signal.SIGTERM,
+                purpose="chat",
+                backend="claude_code",
+            )
+
+        assert list(captured["argv"]) == [
+            "sudo",
+            "-n",
+            "-u",
+            "other-user",
+            "/bin/kill",
+            f"-{int(signal.SIGTERM)}",
+            "4242",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_async_signal_esrch_demotes_to_debug(self, caplog):
+        """rc=1 with the POSIX ESRCH diagnostic is the benign race
+        (inner PID already exited); it must not pollute the WARNING
+        stream the operator watches for real sudoers failures."""
+        from kai.acp import _signal_target_user_pid
+
+        kill_proc = MagicMock()
+        kill_proc.communicate = AsyncMock(return_value=(b"", b"kill: 4242: No such process"))
+        kill_proc.returncode = 1
+
+        with (
+            patch("kai.acp.asyncio.create_subprocess_exec", AsyncMock(return_value=kill_proc)),
+            caplog.at_level(logging.DEBUG, logger="kai.acp"),
+        ):
+            await _signal_target_user_pid(
+                target_user="other-user",
+                pid=4242,
+                sig=int(signal.SIGKILL),
+                purpose="chat",
+                backend="claude_code",
+            )
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warnings
+        debugs = [r for r in caplog.records if "benign race" in r.getMessage()]
+        assert debugs
+
+    def test_sync_signal_argv_and_esrch_classification(self, caplog):
+        """The sync companion (force_kill path) shares the argv shape
+        and the ESRCH demotion with the async canonical helper."""
+        from kai.acp import _signal_target_user_pid_sync
+
+        captured: dict = {}
+
+        def _fake_run(cmd, **kwargs):
+            captured["argv"] = cmd
+            result = MagicMock()
+            result.returncode = 1
+            result.stderr = b"kill: 4242: No such process"
+            return result
+
+        with (
+            patch("kai.acp.subprocess.run", side_effect=_fake_run),
+            caplog.at_level(logging.DEBUG, logger="kai.acp"),
+        ):
+            _signal_target_user_pid_sync(
+                target_user="other-user",
+                pid=4242,
+                sig=int(signal.SIGKILL),
+                purpose="chat",
+                backend="codex",
+            )
+
+        assert captured["argv"] == [
+            "sudo",
+            "-n",
+            "-u",
+            "other-user",
+            "/bin/kill",
+            f"-{int(signal.SIGKILL)}",
+            "4242",
+        ]
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warnings
+        debugs = [r for r in caplog.records if "benign race" in r.getMessage()]
+        assert debugs
