@@ -643,17 +643,16 @@ def validate_model_for_backend(model: str, backend: str, eff_provider: str) -> b
     operator typo (bare Anthropic names like "opus" or "sonnet" that
     are correct on other backends but unusable on OpenCode).
 
-    Goose-on-anthropic additionally accepts any `claude-*` ID
-    structurally, beyond the curated alias trio. Goose hands
-    GOOSE_MODEL verbatim to the Anthropic API, which accepts full
-    model IDs (current aliases like claude-opus-4-8 and dated SKUs
-    alike), so the alias map in goose.py going stale must never be a
-    ceiling on which SKUs a goose user can reach. A bogus claude-*
-    string fails at the provider with a clear API error, the same
-    contract opencode accepts for its structurally-validated IDs.
-    The claude backend keeps curated-only validation: its CLI
-    resolves the short aliases to the newest SKU itself, so the
-    alias surface does not pin generations there.
+    The claude backend and goose-on-anthropic additionally accept
+    any `claude-*` ID structurally, beyond the curated alias trio.
+    Both hand the model string verbatim to a surface that resolves
+    full IDs (the claude CLI's --model flag; the Anthropic API via
+    GOOSE_MODEL), so the curated aliases must never be a ceiling on
+    which SKUs a user can reach: pinning a previous generation (e.g.
+    claude-opus-4-7) is a real operator need when the newest SKU
+    misbehaves. A bogus claude-* string fails at the CLI or provider
+    with a clear error on the next message, the same contract
+    opencode accepts for its structurally-validated IDs.
 
     Canonical model validator: every model-selection site in the
     codebase routes through this function so codex / goose / opencode
@@ -663,6 +662,8 @@ def validate_model_for_backend(model: str, backend: str, eff_provider: str) -> b
         return model in CODEX_MODELS
     if backend == "opencode":
         return is_opencode_model_shape(model)
+    if backend == "claude" and model.startswith("claude-"):
+        return True
     if backend == "goose" and eff_provider == "anthropic" and model.startswith("claude-"):
         return True
     return validate_model_for_provider(model, eff_provider)
