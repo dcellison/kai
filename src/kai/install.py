@@ -2858,16 +2858,36 @@ def _generate_launcher_script(install_dir: str, webhook_port: int = 8080) -> str
         # bash script instead, and we forward signals to the real Python.
         {install_dir}/venv/bin/python3 -m kai &
 
-        # Wait for Python to re-exec and start listening
-        sleep 2
-
-        # Find the actual Python process (the re-exec'd grandchild).
-        # lsof lives at /usr/sbin/ which may not be in the service PATH.
-        REAL_PID=$(/usr/sbin/lsof -ti :{webhook_port} -sTCP:LISTEN 2>/dev/null)
-        if [ -z "$REAL_PID" ]; then
-            # Hasn't bound yet; wait a bit more
-            sleep 3
+        # Find the actual Python process (the re-exec'd grandchild) by
+        # its listen port. lsof lives at /usr/sbin/ which may not be in
+        # the service PATH. Healthy startups bind in 15-25 seconds on
+        # this stack (the memory subsystem loads its embedding model
+        # before the webhook server starts), so poll for up to 120s.
+        # The direct child exits on the framework re-exec in normal
+        # operation, so child death alone is not a failure signal;
+        # only the port answers whether the agent came up.
+        REAL_PID=""
+        for _ in $(seq 1 60); do
             REAL_PID=$(/usr/sbin/lsof -ti :{webhook_port} -sTCP:LISTEN 2>/dev/null)
+            [ -n "$REAL_PID" ] && break
+            sleep 2
+        done
+
+        if [ -z "$REAL_PID" ]; then
+            # No listener after the window: startup is dead (a
+            # fail-closed config gate, a crash, or a hang that is
+            # indistinguishable from one). Exit non-zero so launchd's
+            # KeepAlive restarts the service - a throttled, visible
+            # retry loop instead of an eternal sleep that reports
+            # state=running with no agent behind it. Residual risk: a
+            # python that binds AFTER the window is orphaned by this
+            # exit and the restarted instance then fails its own bind
+            # with a visible address-in-use startup error; that beats
+            # silently supervising nothing, and no safe kill target
+            # exists here (the re-exec'd argv carries no install
+            # path to match on).
+            echo "kai launcher: no listener on :{webhook_port} after 120s; exiting so launchd restarts the service" >&2
+            exit 1
         fi
 
         cleanup() {{
@@ -2880,13 +2900,7 @@ def _generate_launcher_script(install_dir: str, webhook_port: int = 8080) -> str
         # Poll for the real Python process to exit.
         # kill -0 checks if PID exists without sending a signal.
         # This is macOS-compatible (no GNU tail --pid needed).
-        if [ -n "$REAL_PID" ]; then
-            while kill -0 "$REAL_PID" 2>/dev/null; do sleep 1; done
-        else
-            # Could not find the process; wait indefinitely.
-            # BSD sleep doesn't support "infinity", so loop with a long sleep.
-            while true; do sleep 86400; done
-        fi
+        while kill -0 "$REAL_PID" 2>/dev/null; do sleep 1; done
     """)
 
 

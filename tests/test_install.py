@@ -5215,6 +5215,28 @@ class TestGenerateLauncherScript:
         assert "trap" in script
         assert "TERM" in script
 
+    def test_no_listener_exits_nonzero_instead_of_sleeping(self):
+        """Python dying before it binds the webhook port must end the
+        launcher with a non-zero exit so launchd's KeepAlive restarts
+        the service (visible, throttled). Any unconditional-sleep
+        fallback would leave launchd reporting state=running with no
+        agent behind it and the TERM trap with nothing to signal."""
+        script = _generate_launcher_script("/opt/kai")
+        assert "exit 1" in script
+        assert "sleep 86400" not in script
+
+    def test_bind_poll_window_covers_slow_startups(self):
+        """The port poll must outlast a healthy startup's bind time
+        (15-25s on this stack; the memory subsystem loads its
+        embedding model before the webhook server starts). 60
+        iterations at 2s gives the 120s window the script comment
+        promises; a window shorter than the bind time expires on
+        every healthy boot and leaves the launcher supervising
+        nothing."""
+        script = _generate_launcher_script("/opt/kai")
+        assert "seq 1 60" in script
+        assert "sleep 2" in script
+
 
 # ── _apply_source ────────────────────────────────────────────────────
 
