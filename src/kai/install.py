@@ -3984,28 +3984,31 @@ def _cmd_apply() -> None:
         # without round-tripping through the wizard. Apply-time env
         # wins over any value already in install.conf.
         #
-        # Gate on the global AGENT_BACKEND only. The wizard and the
-        # apply-time CODEX_BIN env pass-through are both scoped to
-        # global Codex installs. A per-user `agent_backend: codex`
-        # entry on a non-Codex global install is operator-managed:
-        # ensure Codex is installed and authenticated out of band for
-        # that user's os_user; the runtime startup-failure event
-        # surfaces missing tooling at first message.
+        # Gate the apply-time shell env pass-through on the global
+        # AGENT_BACKEND only: it is an ad-hoc escape hatch for global
+        # backend installs (`sudo CODEX_BIN=... kai install apply`).
+        # Per-user backend entries do NOT need it; their binary paths
+        # are collected by the `make config` per-user backend scan
+        # and arrive here through install.conf, which `_apply_sudoers`
+        # consumes below. Codex AUTH for per-user entries stays
+        # out-of-band (per-OS-user `codex login`).
         env_codex_bin = os.environ.get("CODEX_BIN")
         if env_codex_bin and env.get("AGENT_BACKEND") == "codex":
             env["CODEX_BIN"] = env_codex_bin
         # Mirror the same env pass-through for OPENCODE_BIN so an
         # `sudo OPENCODE_BIN=... kai install apply` invocation pins
         # the same path the running bot will resolve via
-        # resolve_oneshot_binary("opencode"). Gating on the global
-        # AGENT_BACKEND keeps per-user opencode overrides
-        # operator-managed (the runtime surfaces missing tooling on
-        # first message), same posture as CODEX_BIN.
+        # resolve_oneshot_binary("opencode"). Same scoping as
+        # CODEX_BIN above: global installs only; per-user opencode
+        # entries get their path from the wizard scan via
+        # install.conf, with auth out-of-band (`opencode auth login`).
         env_opencode_bin = os.environ.get("OPENCODE_BIN")
         if env_opencode_bin and env.get("AGENT_BACKEND") == "opencode":
             env["OPENCODE_BIN"] = env_opencode_bin
         # And for GOOSE_BIN, completing the per-backend trio. Same
-        # global-AGENT_BACKEND gating posture as the two above.
+        # split as the two above: shell env override for global goose
+        # installs, install.conf from the wizard scan for per-user
+        # entries.
         env_goose_bin = os.environ.get("GOOSE_BIN")
         if env_goose_bin and env.get("AGENT_BACKEND") == "goose":
             env["GOOSE_BIN"] = env_goose_bin
