@@ -657,6 +657,18 @@ class ClaudeCodeBackend(AgentBackend):
                 response=AgentResponse(success=False, text="", error="claude CLI not found"),
             )
             return
+        except OSError as exc:
+            # Non-ENOENT spawn failures (EACCES on the binary, fork
+            # resource exhaustion, a bad cwd) surface as a clean error
+            # event, matching the codex and ACP backends' startup
+            # catch, instead of propagating an unhandled exception
+            # into the bot layer.
+            yield StreamEvent(
+                text_so_far="",
+                done=True,
+                response=AgentResponse(success=False, text="", error=f"Claude startup failed: {exc}"),
+            )
+            return
 
         # Per-turn prompt context. Build the fresh-session bootstrap
         # (MEMORY.md / PREFERENCES.md seed + session_context block)

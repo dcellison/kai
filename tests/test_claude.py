@@ -1236,6 +1236,25 @@ class TestSendLockedErrors:
         assert "not found" in events[0].response.error
 
     @pytest.mark.asyncio
+    async def test_non_enoent_spawn_failure_yields_error_event(self):
+        """A non-ENOENT OSError from _ensure_started (EACCES on the
+        binary, fork resource exhaustion, a bad cwd) surfaces as a
+        clean error event, matching the codex and ACP backends'
+        startup catch, instead of propagating an unhandled exception
+        into the bot layer."""
+        claude = _make_claude()
+        claude._proc = None
+        claude._fresh_session = False
+
+        with patch.object(claude, "_ensure_started", side_effect=PermissionError("EACCES: claude")):
+            events = await _collect_events(claude)
+
+        assert len(events) == 1
+        assert events[0].done is True
+        assert "Claude startup failed" in events[0].response.error
+        assert "EACCES" in events[0].response.error
+
+    @pytest.mark.asyncio
     async def test_stdin_write_failure(self):
         """OSError on stdin.write kills the process and yields an error event."""
         proc = _make_mock_proc([])

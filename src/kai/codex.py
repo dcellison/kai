@@ -211,9 +211,9 @@ class CodexBackend(AgentBackend):
         # emission and gates MEMORY.md inject in build_session_context.
         # Default False so direct test instantiations need not plumb
         # the kwarg; production callers (pool.py) always pass an
-        # explicit value. Codex installs run with memory disabled
-        # (the install wizard's guard forces MEMORY_ENABLED=false on
-        # codex), so this flag is effectively always False in v1.
+        # explicit value. Codex installs support full semantic memory:
+        # extraction dispatches per user through CodexOneShotReasoner,
+        # the same as every backend in ONESHOT_REASONER_BACKENDS.
         memory_enabled: bool = False,
         # Hours before the subprocess is recycled (0 = no limit).
         # Same contract as the claude and ACP backends: prevents
