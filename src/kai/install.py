@@ -1767,8 +1767,10 @@ def _cmd_config() -> None:
         "TTS_ENABLED": str(tts_enabled).lower(),
     }
 
-    # Agent backend is truly global (one backend per deployment).
-    # Only write non-default values to keep the env file clean.
+    # AGENT_BACKEND is the global default backend; users.yaml entries
+    # can override it per user. Only write non-default values to keep
+    # the env file clean (the runtime defaults to claude when the key
+    # is absent).
     if agent_backend != "claude":
         env["AGENT_BACKEND"] = agent_backend
 
@@ -3784,8 +3786,8 @@ def _apply_migrate(
     # whose --settings JSON hashes to the same hex collide on the
     # default /tmp path; the first writer owns the file at mode
     # 0o644 and the second claude exits with EACCES on the
-    # write-open. The cross-user spawn paths (claude.py and the
-    # shared ACP layer in acp.py) anchor TMPDIR per-os_user under
+    # write-open. The cross-user spawn paths (claude.py, codex.py,
+    # and the shared ACP layer in acp.py) anchor TMPDIR per-os_user under
     # <DATA_DIR>/tmp/<os_user>/ so each identity has its own temp
     # namespace. Create those dirs here, mode 0o700 chowned to the
     # target os_user (only their owner needs to read them). Parent

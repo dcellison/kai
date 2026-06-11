@@ -325,7 +325,11 @@ class CodexBackend(AgentBackend):
         # 3. CODEX_PROVIDER (forward-compat placeholder; "openai" today)
         # 4. Per-workspace env_file values
         # 5. Per-workspace inline env values (override env_file)
-        # 6. Webhook secret (LAST - workspace env can't override it)
+        # 6. Webhook secret (workspace env can't override it)
+        # 7. Per-os-user TMPDIR anchor (cross-user mode only; set
+        #    below once the effective user is resolved, LAST so
+        #    workspace env cannot point one user's temp writes at
+        #    another's)
         env = os.environ.copy()
         if self.model:
             env["CODEX_MODEL"] = self.model
@@ -347,6 +351,17 @@ class CodexBackend(AgentBackend):
         # None when codex_user matches the bot's own user (skipping
         # an unnecessary self-sudo) and the value unchanged otherwise.
         effective_codex_user = resolve_claude_user(self.codex_user)
+
+        # Per-os-user TMPDIR anchor (cross-user mode only). Namespaces
+        # every codex temp write under <DATA_DIR>/tmp/<os_user>/ (per-
+        # user dir created and chowned by install.py `_apply_migrate`)
+        # so two os_users sharing /tmp cannot collide on same-named
+        # temp artifacts; the --preserve-env clause below carries
+        # TMPDIR through sudo's env_reset. Same posture as the claude
+        # and ACP backends. Single-user mode (no codex_user) inherits
+        # the system default temp directory.
+        if effective_codex_user:
+            env["TMPDIR"] = str(DATA_DIR / "tmp" / effective_codex_user)
 
         # Resolve the codex binary path. When `codex` is not on the
         # service user's PATH (multi-user installs where codex lives

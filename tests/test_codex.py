@@ -37,7 +37,7 @@ import pytest
 
 from kai.backend import USER_MESSAGE_MARKER, StreamEvent
 from kai.codex import CodexBackend, write_turn_image_file
-from kai.config import WorkspaceConfig
+from kai.config import DATA_DIR, WorkspaceConfig
 
 # ── Shared helpers ──────────────────────────────────────────────────
 
@@ -1617,6 +1617,46 @@ class TestCodexUserSudoWrap:
         # Codex binary follows the sudo prologue.
         codex_i = argv.index("codex")
         assert argv[codex_i + 1] == "app-server"
+
+    @pytest.mark.asyncio
+    async def test_tmpdir_anchored_per_os_user_in_cross_user_mode(self):
+        """
+        When codex_user is set, the subprocess env must include
+        TMPDIR=<DATA_DIR>/tmp/<os_user>/ so every codex temp write
+        lands in a per-os-user namespace rather than the shared
+        system /tmp, where two distinct os_users can collide on
+        same-named temp artifacts. Mirrors the claude and ACP
+        backends' anchor; the per-user dirs are created and chowned
+        by the install.
+        """
+        c = _make_codex(codex_user="ci-fake-user")
+        proc = _make_mock_proc(_handshake_lines())
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await c._ensure_started()
+        env = mock_exec.call_args[1]["env"]
+        assert env["TMPDIR"] == str(DATA_DIR / "tmp" / "ci-fake-user")
+        # The anchor only matters if it survives sudo's env_reset.
+        argv = mock_exec.call_args[0]
+        assert any("TMPDIR" in str(a) for a in argv if str(a).startswith("--preserve-env="))
+
+    @pytest.mark.asyncio
+    async def test_tmpdir_not_injected_in_single_user_mode(self, monkeypatch):
+        """
+        Single-user mode (no codex_user, or codex_user == service
+        user) runs codex directly without sudo and has no cross-
+        os-user temp collision risk. TMPDIR must NOT be injected so
+        the inner codex inherits the system default.
+        """
+        # Ensure the parent env has no TMPDIR so any value showing up
+        # in the subprocess env can only have come from our code path.
+        monkeypatch.delenv("TMPDIR", raising=False)
+
+        c = _make_codex()  # no codex_user, no sudo wrapper
+        proc = _make_mock_proc(_handshake_lines())
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await c._ensure_started()
+        env = mock_exec.call_args[1]["env"]
+        assert "TMPDIR" not in env
 
     @pytest.mark.asyncio
     async def test_start_new_session_when_codex_user_set(self):

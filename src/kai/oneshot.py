@@ -125,9 +125,9 @@ class OneShotResult:
             for the JSON envelope it expects (`is_error`,
             `structured_output`, etc.). The reasoner does not parse
             the envelope; that contract lives in memory_extraction.
-        backend: Provider tag ("claude" today; "codex" / "opencode" in
-            future implementations). Surfaces in structured logs and
-            run-record JSON so cross-backend comparisons are possible.
+        backend: Provider tag ("claude", "codex", "goose", or
+            "opencode"). Surfaces in structured logs and run-record
+            JSON so cross-backend comparisons are possible.
         model: Model name passed to the provider, or None when the
             caller did not request a specific model. The reasoner
             does not validate model strings; that is the caller's
@@ -171,6 +171,14 @@ class OneShotReasoner(Protocol):
     in structured logs only; the reasoner does not branch on it. The
     field is required (not optional) so log streams can always
     identify which caller spawned the subprocess.
+
+    Constructors are not part of this protocol and differ where the
+    underlying CLI demands it: `GooseOneShotReasoner` additionally
+    requires a `provider` argument (goose is multi-provider and its
+    argv carries the provider's wire-level name), while the claude /
+    codex / opencode reasoners derive their provider implicitly.
+    Callers constructing reasoners by backend name must thread the
+    user's effective provider when the backend is goose.
     """
 
     async def run(
