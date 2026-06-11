@@ -716,7 +716,7 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
 
     # Timeout
     yaml_timeout = user_config.timeout if user_config else None
-    timeout, timeout_src = _resolve("timeout", yaml_timeout, config.claude_timeout_seconds, lambda v: f"{int(v)}s")
+    timeout, timeout_src = _resolve("timeout", yaml_timeout, config.agent_timeout_seconds, lambda v: f"{int(v)}s")
 
     # Provider info - always show so users know their configuration.
     # Uses the shared helper that checks the running instance first,
@@ -768,7 +768,7 @@ def _revert_instance_field(pool: SubprocessPool, chat_id: int, field: str, confi
                     fallback = config.default_model
                 instance.model = fallback
     elif field == "timeout":
-        instance.timeout_seconds = user.timeout if user and user.timeout is not None else config.claude_timeout_seconds
+        instance.timeout_seconds = user.timeout if user and user.timeout is not None else config.agent_timeout_seconds
 
 
 async def _handle_settings_reset(
@@ -1454,7 +1454,7 @@ async def _show_workspace_config(
         elif user_config and user_config.timeout is not None:
             timeout, timeout_src = user_config.timeout, "users.yaml"
         else:
-            timeout, timeout_src = config.claude_timeout_seconds, "global default"
+            timeout, timeout_src = config.agent_timeout_seconds, "global default"
         lines.append(f"  Timeout: {timeout}s ({timeout_src})")
     except (ValueError, TypeError):
         lines.append("  Timeout: (corrupted - reset with /workspace config reset timeout)")

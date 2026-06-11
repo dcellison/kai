@@ -968,7 +968,8 @@ class Config:
             Only required in webhook mode. Defaults to WEBHOOK_SECRET if not explicitly set.
         allowed_user_ids: Set of Telegram user IDs permitted to interact with the bot (required)
         default_model: Default model name, provider-dependent (e.g. sonnet, gpt-5.5-pro, gemini-2.5-pro)
-        claude_timeout_seconds: Seconds before a Claude response is considered timed out
+        agent_timeout_seconds: Seconds before an agent response is considered timed
+            out, on every backend
         agent_max_session_hours: Hours before an agent subprocess is recycled, on every
             backend. Prevents unbounded memory growth in long-lived agent processes (the
             original motivator: V8 growth in the claude CLI triggering macOS Jetsam kernel
@@ -1005,7 +1006,7 @@ class Config:
     # MODEL_REGISTRY[(backend, provider, role)] (lowest) in the
     # resolution chain that `resolve_user_model` implements.
     default_models: dict[str, str] = field(default_factory=dict)
-    claude_timeout_seconds: int = 120
+    agent_timeout_seconds: int = 120
     # Backend-generic pool lifecycle tunables, matching the AGENT_-
     # prefixed env vars they load from: every backend's subprocess is
     # recycled by age and evicted when idle.
@@ -2567,7 +2568,7 @@ def load_config() -> Config:
         else:
             raw_timeout = "120"
     try:
-        claude_timeout_seconds = int(raw_timeout)
+        agent_timeout_seconds = int(raw_timeout)
     except ValueError:
         raise SystemExit("AGENT_TIMEOUT_SECONDS must be an integer") from None
     # AGENT_MAX_SESSION_HOURS / AGENT_IDLE_TIMEOUT are the canonical
@@ -3057,7 +3058,7 @@ def load_config() -> Config:
         allowed_user_ids=allowed_ids,
         default_model=default_model,
         default_models=default_models,
-        claude_timeout_seconds=claude_timeout_seconds,
+        agent_timeout_seconds=agent_timeout_seconds,
         agent_max_session_hours=agent_max_session_hours,
         agent_idle_timeout=agent_idle_timeout,
         claude_autocompact_pct=claude_autocompact_pct,

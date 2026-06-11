@@ -188,7 +188,7 @@ class SubprocessPool:
                 )
                 model = self._config.default_model
 
-        timeout = user.timeout if user and user.timeout is not None else self._config.claude_timeout_seconds
+        timeout = user.timeout if user and user.timeout is not None else self._config.agent_timeout_seconds
         # home_ws is what the backend treats as "home" for the foreign-
         # workspace reminder. Same resolution as the workspace above so
         # the two cannot drift; pre-#353 this took a different path that

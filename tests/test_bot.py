@@ -4289,7 +4289,7 @@ class TestHandleSettings:
             await handle_settings(update, ctx)
 
         assert instance.model == config.default_model
-        assert instance.timeout_seconds == config.claude_timeout_seconds
+        assert instance.timeout_seconds == config.agent_timeout_seconds
 
 
 # ── /github command ─────────────────────────────────────────────────

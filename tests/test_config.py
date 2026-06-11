@@ -185,7 +185,7 @@ class TestLoadConfigDefaults:
         _set_required(monkeypatch)
         config = load_config()
         assert config.default_model == "sonnet"
-        assert config.claude_timeout_seconds == 120
+        assert config.agent_timeout_seconds == 120
         assert config.agent_max_session_hours == 0
         assert config.webhook_port == 8080
         # Without TELEGRAM_WEBHOOK_URL, defaults to polling mode
@@ -976,7 +976,7 @@ class TestMinimalEnvWithUsersYaml:
         config = load_config()
         # Uses dataclass defaults when no env var is set
         assert config.default_model == "sonnet"
-        assert config.claude_timeout_seconds == 120
+        assert config.agent_timeout_seconds == 120
         assert config.workspace_base is None
         assert config.allowed_workspaces == []
         # users.yaml IDs are the authorization surface
@@ -2675,19 +2675,19 @@ class TestAgentTimeoutSecondsRename:
             CLAUDE_TIMEOUT_SECONDS="60",
         )
         cfg = load_config()
-        assert cfg.claude_timeout_seconds == 180
+        assert cfg.agent_timeout_seconds == 180
 
     def test_legacy_only_falls_back_with_warning(self, monkeypatch, caplog):
         self._required_env(monkeypatch, CLAUDE_TIMEOUT_SECONDS="240")
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             cfg = load_config()
-        assert cfg.claude_timeout_seconds == 240
+        assert cfg.agent_timeout_seconds == 240
         assert any("CLAUDE_TIMEOUT_SECONDS is deprecated" in r.message for r in caplog.records)
 
     def test_neither_set_defaults_to_120(self, monkeypatch):
         self._required_env(monkeypatch)
         cfg = load_config()
-        assert cfg.claude_timeout_seconds == 120
+        assert cfg.agent_timeout_seconds == 120
 
 
 class TestAgentSessionLifecycleRename:

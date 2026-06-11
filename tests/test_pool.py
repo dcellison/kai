@@ -43,7 +43,7 @@ def _make_config(**overrides) -> Config:
         "telegram_bot_token": "test",
         "allowed_user_ids": {111, 222},
         "default_model": "sonnet",
-        "claude_timeout_seconds": 30,
+        "agent_timeout_seconds": 30,
         "agent_max_session_hours": 0,
         "agent_idle_timeout": 1800,
         "webhook_port": 8080,
@@ -131,7 +131,7 @@ class TestInstanceCreation:
         config = _make_config(
             user_configs={111: user},
             default_model="haiku",
-            claude_timeout_seconds=60,
+            agent_timeout_seconds=60,
         )
         pool = SubprocessPool(config=config, services_info=[])
         instance = pool.get(111)

@@ -721,7 +721,7 @@ async def resolve_user_defaults(
     except (ValueError, TypeError):
         timeout = None
     if timeout is None:
-        timeout = yaml_timeout if yaml_timeout is not None else config.claude_timeout_seconds
+        timeout = yaml_timeout if yaml_timeout is not None else config.agent_timeout_seconds
 
     return {
         "model": model,
