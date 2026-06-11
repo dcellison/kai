@@ -31,11 +31,15 @@ the active model into a one-shot JSON blob per process.
 Operator authentication is handled OUTSIDE Kai: `opencode auth login`
 writes credentials to `~/.local/share/opencode/auth.json`. The Kai
 installer prints a reminder; the wizard does not attempt to manage
-OpenCode auth state.
+OpenCode auth state. On installs with per-user OS isolation
+(users.yaml `os_user`), the login must be run AS each target user so
+the auth file lands under that user's home; the `sudo -H` wrap the
+shared AcpBackend applies points the subprocess at exactly that file.
 """
 
 import json
 import logging
+import os
 from typing import Literal
 
 from kai.acp import AcpBackend
@@ -245,14 +249,24 @@ class OpenCodeBackend(AcpBackend):
 
     def build_argv(self) -> list[str]:
         """
-        Static argv for `opencode acp`.
+        Argv for `opencode acp`.
 
         The CLI does not accept `--model` on argv; model selection
         flows through `OPENCODE_CONFIG_CONTENT` in `build_env`. `--cwd`
         is supplied via the subprocess `cwd=` argument in
         `AcpBackend._ensure_started`, not as an explicit argv entry.
+
+        OPENCODE_BIN pins an absolute binary path (mirrors codex's
+        CODEX_BIN and goose's GOOSE_BIN): when opencode is not on the
+        service user's PATH, or the spawn is sudo-wrapped for a
+        per-user os_user, the bare name either fails to resolve or
+        resolves to a path different from the one the sudoers rule
+        pins, and the spawn dies. Falls back to bare "opencode" so
+        installs with opencode on PATH keep working without the
+        override.
         """
-        return ["opencode", "acp"]
+        opencode_bin = os.environ.get("OPENCODE_BIN") or "opencode"
+        return [opencode_bin, "acp"]
 
     def build_env(self, base_env: dict[str, str]) -> dict[str, str]:
         """
@@ -274,6 +288,36 @@ class OpenCodeBackend(AcpBackend):
         if self.model:
             base_env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"model": self.model})
         return base_env
+
+    def preserved_env_vars(self) -> tuple[str, ...]:
+        """
+        Env vars the cross-user sudo wrap forwards through env_reset.
+
+        OpenCode reads its model selection from OPENCODE_CONFIG_CONTENT
+        (set in build_env). claude and codex carry model selection
+        outside the environment (argv flag and per-turn protocol
+        params respectively), but for an env-driven backend sudo's
+        env_reset strips the model selection itself, not just auth,
+        and the wrapped opencode falls back to whatever its per-user
+        config files say.
+        The five provider key vars cover env-key auth flows centrally;
+        the primary auth store (`~/.local/share/opencode/auth.json`,
+        written by `opencode auth login` run as the target user) rides
+        the HOME rewrite from `sudo -H` instead and needs no
+        preservation. KAI_WEBHOOK_SECRET and TMPDIR mirror the
+        AcpBackend default (webhook callback auth and the per-os-user
+        temp anchor).
+        """
+        return (
+            "OPENCODE_CONFIG_CONTENT",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OPENROUTER_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "KAI_WEBHOOK_SECRET",
+            "TMPDIR",
+        )
 
     def build_initialize_params(self) -> dict:
         """

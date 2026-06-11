@@ -5,7 +5,8 @@ Covers OpenCode-specific hook implementations on top of the shared
 AcpBackend layer:
 
 1. backend_name / backend_label class attributes
-2. Static argv `opencode acp` (no --model flag; flag is not accepted)
+2. Argv `opencode acp` with OPENCODE_BIN binary pinning (no --model
+   flag; flag is not accepted)
 3. build_env injects OPENCODE_CONFIG_CONTENT with the active model
 4. Integer protocolVersion in build_initialize_params (NOT string "v1")
 5. session/new params: cwd + empty mcpServers (same as Goose)
@@ -15,12 +16,14 @@ AcpBackend layer:
    allow_always (falls back through allow_once and the first option;
    returns None when no usable option is found)
 8. Other server-request methods return None (no auto-response)
+9. preserved_env_vars carries OPENCODE_CONFIG_CONTENT plus the
+   provider auth keys through the cross-user sudo wrap
 """
 
 import json
 import logging
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -36,6 +39,77 @@ def _make_opencode(**kwargs) -> OpenCodeBackend:
     }
     defaults.update(kwargs)
     return OpenCodeBackend(**defaults)
+
+
+def _json_line(obj: dict) -> bytes:
+    """Encode a dict as a JSON line (bytes with trailing newline)."""
+    return json.dumps(obj).encode() + b"\n"
+
+
+def _initialize_result() -> bytes:
+    """Build the server's response to an initialize request."""
+    return _json_line(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": True,
+                    "promptCapabilities": {"image": True, "audio": False},
+                },
+            },
+        }
+    )
+
+
+def _session_new_result(session_id: str = "ses_test01") -> bytes:
+    """Build the server's response to a session/new request."""
+    return _json_line(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"sessionId": session_id},
+        }
+    )
+
+
+def _handshake_lines(session_id: str = "ses_test01") -> list[bytes]:
+    """Return the two stdout lines for a successful handshake."""
+    return [_initialize_result(), _session_new_result(session_id)]
+
+
+def _make_mock_proc(stdout_lines: list[bytes]) -> MagicMock:
+    """
+    Build a mock subprocess that yields predefined stdout lines.
+
+    stdout_lines should be a list of bytes, each ending with b"\\n".
+    Once the list is exhausted, every further readline call returns
+    b"" (EOF), so tests do not need to count exactly how many reads
+    the caller performs. Same shape as the test_acp.py / test_goose.py
+    helpers; per-file duplication is the deliberate pattern there.
+    """
+    proc = MagicMock()
+    proc.returncode = None
+    proc.pid = 12345
+    proc.stdin = MagicMock()
+    proc.stdin.write = MagicMock()
+    proc.stdin.drain = AsyncMock()
+    proc.stdout = MagicMock()
+    queue = list(stdout_lines)
+
+    async def _readline() -> bytes:
+        if not queue:
+            return b""
+        return queue.pop(0)
+
+    proc.stdout.readline = _readline
+    proc.stderr = MagicMock()
+    proc.stderr.readline = AsyncMock(return_value=b"")
+    proc.wait = AsyncMock()
+    proc.kill = MagicMock()
+    proc.terminate = MagicMock()
+    return proc
 
 
 # ── Class attributes ────────────────────────────────────────────────
@@ -57,17 +131,35 @@ class TestClassAttributes:
 
 
 class TestBuildArgv:
-    """The CLI does not accept --model on argv; model flows through env."""
+    """The CLI does not accept --model on argv; model flows through
+    env. OPENCODE_BIN pins the binary path so a sudo-wrapped per-user
+    spawn matches the absolute path the sudoers rule names (mirrors
+    codex's CODEX_BIN and goose's GOOSE_BIN contract); bare "opencode"
+    remains the default for installs with opencode on PATH."""
 
-    def test_static_argv_no_model_flag(self):
+    def test_static_argv_no_model_flag(self, monkeypatch):
         """argv is exactly `opencode acp` regardless of self.model."""
+        monkeypatch.delenv("OPENCODE_BIN", raising=False)
         b = _make_opencode(model="anthropic/claude-sonnet-4-6")
         assert b.build_argv() == ["opencode", "acp"]
 
-    def test_argv_unchanged_with_empty_model(self):
+    def test_argv_unchanged_with_empty_model(self, monkeypatch):
         """Empty model still produces the same argv (model goes via env)."""
+        monkeypatch.delenv("OPENCODE_BIN", raising=False)
         b = _make_opencode(model="")
         assert b.build_argv() == ["opencode", "acp"]
+
+    def test_opencode_bin_override_pins_absolute_path(self, monkeypatch):
+        monkeypatch.setenv("OPENCODE_BIN", "/Users/svc/.local/bin/opencode")
+        b = _make_opencode()
+        assert b.build_argv() == ["/Users/svc/.local/bin/opencode", "acp"]
+
+    def test_empty_opencode_bin_falls_back_to_bare_name(self, monkeypatch):
+        """An empty-string OPENCODE_BIN (unset-but-present in /etc/kai/env)
+        must not produce an empty argv head."""
+        monkeypatch.setenv("OPENCODE_BIN", "")
+        b = _make_opencode()
+        assert b.build_argv()[0] == "opencode"
 
 
 # ── build_env ───────────────────────────────────────────────────────
@@ -731,3 +823,57 @@ class TestCombineTextChunksHook:
         # Sentence boundary that OpenCode would treat as a join site;
         # the default backend leaves it verbatim.
         assert backend.combine_text_chunks("End.", "Start") == "End.Start"
+
+
+# ── Cross-user preserve list ────────────────────────────────────────
+
+
+class TestPreservedEnvVars:
+    """The sudo wrap's --preserve-env list. OpenCode delivers model
+    selection via OPENCODE_CONFIG_CONTENT (build_env), so the override
+    must carry it through env_reset or the wrapped opencode silently
+    loses its model selection; the five provider keys cover env-key
+    auth, and KAI_WEBHOOK_SECRET / TMPDIR mirror the AcpBackend
+    default. The primary auth store (~/.local/share/opencode/auth.json)
+    rides the `sudo -H` HOME rewrite and needs no preservation."""
+
+    def test_content_exact(self):
+        b = _make_opencode()
+        assert b.preserved_env_vars() == (
+            "OPENCODE_CONFIG_CONTENT",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OPENROUTER_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "KAI_WEBHOOK_SECRET",
+            "TMPDIR",
+        )
+
+    @pytest.mark.asyncio
+    async def test_wrap_argv_carries_opencode_preserve_list(self, monkeypatch):
+        """End-to-end through _ensure_started: the opencode wrap's
+        --preserve-env CSV is the hook's list, not the base default."""
+        monkeypatch.delenv("OPENCODE_BIN", raising=False)
+        b = _make_opencode(os_user="oc-user")
+        captured: dict = {}
+
+        async def _fake_spawn(*args, **kwargs):
+            captured["argv"] = args
+            return _make_mock_proc(_handshake_lines())
+
+        with (
+            patch("kai.acp.resolve_claude_user", return_value="oc-user"),
+            patch("kai.acp.asyncio.create_subprocess_exec", side_effect=_fake_spawn),
+        ):
+            await b._ensure_started()
+
+        argv = list(captured["argv"])
+        assert argv[:4] == ["sudo", "-H", "-u", "oc-user"]
+        assert argv[4] == (
+            "--preserve-env=OPENCODE_CONFIG_CONTENT,ANTHROPIC_API_KEY,"
+            "OPENAI_API_KEY,GOOGLE_API_KEY,OPENROUTER_API_KEY,DEEPSEEK_API_KEY,"
+            "KAI_WEBHOOK_SECRET,TMPDIR"
+        )
+        assert argv[5] == "--"
+        assert argv[6:] == ["opencode", "acp"]

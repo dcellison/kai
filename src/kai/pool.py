@@ -208,13 +208,14 @@ class SubprocessPool:
         home_ws = resolve_home_workspace(chat_id, self._config)
 
         # os_user for sudo -u isolation. None = run as bot user.
-        # Resolved here (rather than inside each branch) because the
-        # claude, codex, and goose backends all consume it for
-        # per-user subprocess isolation. OpenCode does not: its auth
-        # file (~/.local/share/opencode/auth.json) is per-OS-user and
-        # operator-provisioned via `opencode auth login` outside the
-        # wizard, so opencode chat stays on the service user until
-        # that provisioning story exists.
+        # Resolved here (rather than inside each branch) because all
+        # four backends consume it for per-user subprocess isolation.
+        # Each agent's auth state is per-OS-user and operator-
+        # provisioned under the target user's home (claude OAuth
+        # credentials, codex auth.json, goose keychain or env keys,
+        # opencode auth.json via `opencode auth login` run as that
+        # user); the `sudo -H` wrap each backend applies is what
+        # points the subprocess at the right home.
         os_user = user.os_user if user else None
 
         # Backend selection: "goose" uses Goose ACP, "opencode" uses
@@ -253,6 +254,7 @@ class SubprocessPool:
                 workspace_config=ws_config,
                 provider=effective_provider,
                 memory_enabled=self._config.memory_enabled,
+                os_user=os_user,
             )
 
         if backend == "codex":

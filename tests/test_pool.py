@@ -340,12 +340,13 @@ class TestPerUserBackendRouting:
         assert isinstance(instance, GooseBackend)
         assert instance.os_user == "alice-os"
 
-    def test_opencode_user_does_not_receive_os_user(self):
-        """OpenCode chat stays on the service user even when the
-        users.yaml entry carries an os_user: its auth file is
-        per-OS-user and operator-provisioned, so the pool does not
-        wire the isolation for opencode until that provisioning
-        story exists."""
+    def test_opencode_user_receives_os_user(self):
+        """An opencode user's os_user reaches OpenCodeBackend, which
+        wires the per-user sudo isolation in the shared ACP layer
+        (same contract claude_user / codex_user / goose's os_user
+        carry on their backends). Auth is operator-provisioned per
+        OS user (`opencode auth login` run as the target user); the
+        pool only threads the routing target."""
         from kai.opencode import OpenCodeBackend
 
         user = UserConfig(
@@ -359,7 +360,7 @@ class TestPerUserBackendRouting:
         pool = SubprocessPool(config=config, services_info=[])
         instance = pool.get(111)
         assert isinstance(instance, OpenCodeBackend)
-        assert instance.os_user is None
+        assert instance.os_user == "alice-os"
 
 
 # ── Per-user actions ────────────────────────────────────────────────
