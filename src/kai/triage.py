@@ -37,8 +37,12 @@ import aiohttp
 
 from kai.codex_exec import extract_codex_text
 from kai.config import ModelRole, get_model_for, resolve_claude_user
-from kai.goose import goose_provider_id
-from kai.oneshot import OneShotError, OneShotTimeout, OpenCodeOneShotReasoner
+from kai.oneshot import (
+    GooseOneShotReasoner,
+    OneShotError,
+    OneShotTimeout,
+    OpenCodeOneShotReasoner,
+)
 from kai.prompt_utils import make_boundary
 
 log = logging.getLogger(__name__)
@@ -354,16 +358,19 @@ async def run_triage(
     """
     Spawn a one-shot LLM subprocess to perform the triage analysis.
 
-    Dispatches to either Claude (`claude --print`) or Goose
-    (`goose run -i -`) based on agent_backend. Both read from stdin
-    and write plain text to stdout. Same pattern as run_review()
-    in review.py.
+    Dispatches by agent_backend: Claude (`claude --print`) and Codex
+    (`codex exec --json`) spawn inline; Goose and OpenCode dispatch
+    through their OneShotReasoner implementations in `kai.oneshot`,
+    which own binary resolution, per-user os_user routing, and the
+    allow-listed subprocess env. All paths read the prompt and
+    return a single text string. Same pattern as run_review() in
+    review.py.
 
     Args:
         prompt: The complete triage prompt (from build_triage_prompt).
         claude_user: Optional OS user to run the subprocess as (via
-            sudo -u for claude, sudo -H -u for codex / opencode).
-            Ignored when agent_backend is "goose".
+            sudo -u for claude, sudo -H -u for codex / goose /
+            opencode).
         agent_backend: Which LLM backend to use ("claude", "codex",
             "opencode", or "goose").
         provider: LLM provider name (e.g. "anthropic", "openai").
@@ -524,57 +531,36 @@ async def run_triage(
             raise ValueError(
                 "agent_backend is 'goose' but provider is empty. Set LLM_PROVIDER in .env or per-user config."
             )
-        # Goose one-shot mode: read prompt from stdin, write response
-        # to stdout. -q suppresses non-response output, --no-session
-        # avoids creating session files, --no-profile skips user
-        # config, --max-turns 1 prevents runaway tool loops. Model
-        # resolution flows through the unified (backend, provider,
-        # role) registry so a goose-on-deepseek install picks up the
-        # deepseek-shaped default; openrouter / ollama users set
-        # their per-user `models.issue_triage` in users.yaml. The
-        # --provider value runs through `goose_provider_id` because
-        # goose's wire-level provider names can differ from Kai's
-        # keys (deepseek is custom_deepseek on the goose side).
-        model = get_model_for(
+        # Dispatch to the goose one-shot reasoner, which owns the
+        # `goose run -i - ... --max-turns 1` argv, GOOSE_BIN
+        # resolution (so the spawned binary matches the absolute path
+        # the per-user sudoers rule pins), per-user os_user routing
+        # via the shared sudo -H wrap, the provider wire-name
+        # translation, and the allow-listed subprocess env. With
+        # json_schema=None the reasoner returns raw text (triage's
+        # downstream parser owns the JSON contract, matching the
+        # other backends); typed reasoner errors collapse to
+        # RuntimeError so the webhook handler's existing catch
+        # surface is unchanged.
+        triage_model = get_model_for(
             ModelRole.ISSUE_TRIAGE,
             agent_backend,
             provider,
             override=model_override,
         )
-        cmd = [
-            "goose",
-            "run",
-            "-i",
-            "-",
-            "--provider",
-            goose_provider_id(provider),
-            "--model",
-            model,
-            "-q",
-            "--no-session",
-            "--no-profile",
-            "--max-turns",
-            "1",
-        ]
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            # No start_new_session - Goose doesn't use sudo,
-            # so there is no parent/child process tree to manage.
-        )
-
+        reasoner = GooseOneShotReasoner(os_user=claude_user, provider=provider)
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=prompt.encode()),
+            result = await reasoner.run(
+                prompt=prompt,
+                model=triage_model,
                 timeout=_TRIAGE_TIMEOUT,
+                purpose="issue_triage",
             )
-        except TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from None
+        except OneShotTimeout as exc:
+            raise RuntimeError(f"Triage subprocess timed out after {_TRIAGE_TIMEOUT}s") from exc
+        except OneShotError as exc:
+            raise RuntimeError(f"Goose triage failed: {exc}") from exc
+        return result.text
     else:
         # Claude one-shot mode: --print reads from stdin, writes to stdout.
         # No cost cap is passed: subscription auth has no real per-token

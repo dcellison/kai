@@ -39,8 +39,12 @@ import aiohttp
 
 from kai.codex_exec import extract_codex_text
 from kai.config import ModelRole, get_model_for, resolve_claude_user
-from kai.goose import goose_provider_id
-from kai.oneshot import OneShotError, OneShotTimeout, OpenCodeOneShotReasoner
+from kai.oneshot import (
+    GooseOneShotReasoner,
+    OneShotError,
+    OneShotTimeout,
+    OpenCodeOneShotReasoner,
+)
 from kai.prompt_utils import make_boundary
 
 log = logging.getLogger(__name__)
@@ -624,11 +628,12 @@ async def run_review(
     """
     Spawn a one-shot LLM subprocess to perform the review.
 
-    Dispatches to Claude (`claude --print`), Codex (`codex exec
-    --json`), or Goose (`goose run -i -`) based on agent_backend.
-    All three read the prompt from stdin and return a single string
-    of review text; the prompt and output handling are identical
-    regardless of backend.
+    Dispatches by agent_backend: Claude (`claude --print`) and Codex
+    (`codex exec --json`) spawn inline; Goose and OpenCode dispatch
+    through their OneShotReasoner implementations in `kai.oneshot`.
+    All paths read the prompt and return a single string of review
+    text; the prompt and output handling are identical regardless of
+    backend.
 
     Claude path: supports sudo -u for OS-level isolation and process
     group kills for cleanup.
@@ -648,14 +653,18 @@ async def run_review(
     RuntimeError below so the caller's existing failure surface is
     unchanged.
 
-    Goose path: no sudo (Goose has no user isolation), simple
-    proc.kill() for cleanup, --max-turns 1 as the safety limit.
+    Goose path: dispatches through `GooseOneShotReasoner` in
+    `kai.oneshot` (same shape as the OpenCode path), which owns the
+    `goose run -i - ... --max-turns 1` argv, GOOSE_BIN resolution,
+    per-OS-user routing via `sudo -H -u <user>`, the provider
+    wire-name translation, and the allow-listed subprocess env.
+    Typed errors collapse to RuntimeError below.
 
     Args:
         prompt: The complete review prompt (from build_review_prompt).
         claude_user: Optional OS user to run the subprocess as (via
-            sudo -u for claude, sudo -H -u for codex / opencode).
-            Ignored when agent_backend is "goose".
+            sudo -u for claude, sudo -H -u for codex / goose /
+            opencode).
         agent_backend: Which LLM backend to use ("claude", "codex",
             "opencode", or "goose").
         provider: LLM provider name (e.g. "anthropic", "openai").
@@ -810,57 +819,35 @@ async def run_review(
             raise ValueError(
                 "agent_backend is 'goose' but provider is empty. Set LLM_PROVIDER in .env or per-user config."
             )
-        # Goose one-shot mode: read prompt from stdin, write response
-        # to stdout. -q suppresses non-response output, --no-session
-        # avoids creating session files, --no-profile skips user
-        # config, --max-turns 1 prevents runaway tool loops. Model
-        # comes from the unified (backend, provider, role) registry
-        # so a goose-on-deepseek install picks up the deepseek-shaped
-        # default; openrouter / ollama users set their per-user
-        # `models.pr_review` in users.yaml. The --provider value runs
-        # through `goose_provider_id` because goose's wire-level
-        # provider names can differ from Kai's keys (deepseek is
-        # custom_deepseek on the goose side).
-        model = get_model_for(
+        # Dispatch to the goose one-shot reasoner, which owns the
+        # `goose run -i - ... --max-turns 1` argv, GOOSE_BIN
+        # resolution (so the spawned binary matches the absolute path
+        # the per-user sudoers rule pins), per-user os_user routing
+        # via the shared sudo -H wrap, the provider wire-name
+        # translation, and the allow-listed subprocess env. With
+        # json_schema=None the reasoner returns raw review text (this
+        # function's contract); typed reasoner errors collapse to
+        # RuntimeError so the webhook handler's existing catch
+        # surface is unchanged.
+        review_model = get_model_for(
             ModelRole.PR_REVIEW,
             agent_backend,
             provider,
             override=model_override,
         )
-        cmd = [
-            "goose",
-            "run",
-            "-i",
-            "-",
-            "--provider",
-            goose_provider_id(provider),
-            "--model",
-            model,
-            "-q",
-            "--no-session",
-            "--no-profile",
-            "--max-turns",
-            "1",
-        ]
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            # No start_new_session - Goose doesn't use sudo,
-            # so there is no parent/child process tree to manage.
-        )
-
+        reasoner = GooseOneShotReasoner(os_user=claude_user, provider=provider)
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=prompt.encode()),
+            result = await reasoner.run(
+                prompt=prompt,
+                model=review_model,
                 timeout=timeout_s,
+                purpose="pr_review",
             )
-        except TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise RuntimeError(f"Review subprocess timed out after {timeout_s}s") from None
+        except OneShotTimeout as exc:
+            raise RuntimeError(f"Review subprocess timed out after {timeout_s}s") from exc
+        except OneShotError as exc:
+            raise RuntimeError(f"Goose review failed: {exc}") from exc
+        return result.text
     else:
         # Claude one-shot mode: --print reads from stdin, writes to stdout.
         # No cost cap is passed: subscription auth has no real per-token

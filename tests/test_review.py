@@ -942,162 +942,122 @@ class TestRunReviewCodex:
 # ── run_review (Goose backend) ─────────────────────────────────────
 
 
-class TestRunReviewGoose:
-    """Tests for run_review() when agent_backend="goose"."""
+class TestRunReviewGooseDispatch:
+    """
+    `run_review` with `agent_backend="goose"` dispatches to
+    `GooseOneShotReasoner` (NOT a direct `goose run` subprocess
+    spawn). The reasoner owns the argv shape, GOOSE_BIN resolution,
+    provider wire-name translation, per-user os_user routing, and
+    the allow-listed subprocess env; this class pins the dispatch
+    contract: ctor kwargs, per-provider model resolution from the
+    registry, timeout pass-through, raw-text return, and the
+    collapse of typed reasoner errors to RuntimeError.
+    """
+
+    @staticmethod
+    def _fake_reasoner(text="review output"):
+        from kai.oneshot import OneShotResult
+
+        fake = MagicMock()
+        fake.run = AsyncMock(return_value=OneShotResult(text=text, backend="goose", model="claude-sonnet-4-6"))
+        return fake
 
     @pytest.mark.asyncio
-    async def test_goose_command_structure(self):
-        """Goose backend builds the correct command with provider and model."""
-        mock_proc = _mock_process(stdout=b"review output")
+    async def test_run_review_dispatches_to_goose_reasoner(self):
+        """The goose branch builds a GooseOneShotReasoner with the
+        os_user and Kai provider key threaded through, awaits its run
+        with the registry model, and returns the raw text."""
+        fake = self._fake_reasoner(text="review body from goose")
 
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+        with (
+            patch("kai.review.GooseOneShotReasoner", return_value=fake) as ctor,
+            patch("kai.review.asyncio.create_subprocess_exec") as mock_exec,
+        ):
             result = await run_review(
-                "review prompt",
-                agent_backend="goose",
-                provider="openai",
+                "review prompt", agent_backend="goose", provider="anthropic", claude_user="someone"
             )
 
-        assert result == "review output"
-
-        # Verify the full Goose command structure
-        cmd = mock_exec.call_args[0]
-        assert cmd == (
-            "goose",
-            "run",
-            "-i",
-            "-",
-            "--provider",
-            "openai",
-            "--model",
-            "gpt-5.5",
-            "-q",
-            "--no-session",
-            "--no-profile",
-            "--max-turns",
-            "1",
-        )
+        assert result == "review body from goose"
+        ctor.assert_called_once()
+        assert ctor.call_args.kwargs == {"os_user": "someone", "provider": "anthropic"}
+        fake.run.assert_awaited_once()
+        run_kwargs = fake.run.call_args.kwargs
+        assert run_kwargs["prompt"] == "review prompt"
+        assert run_kwargs["model"] == "claude-sonnet-4-6"
+        assert run_kwargs["purpose"] == "pr_review"
+        mock_exec.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_anthropic_model_mapping(self):
-        """Anthropic provider maps to full claude-sonnet-4-6 model ID."""
-        mock_proc = _mock_process(stdout=b"output")
+    @pytest.mark.parametrize(
+        ("provider", "expected_model"),
+        [
+            ("anthropic", "claude-sonnet-4-6"),
+            ("openai", "gpt-5.5"),
+            ("deepseek", "deepseek-v4-pro"),
+            ("ollama", "llama4:70b"),
+        ],
+    )
+    async def test_model_resolved_from_registry_per_provider(self, provider, expected_model):
+        """(goose, <provider>, PR_REVIEW) registry rows reach the
+        reasoner's model kwarg. The provider key passes through in
+        Kai form (deepseek stays deepseek); the reasoner owns the
+        custom_deepseek wire-name translation at argv build."""
+        fake = self._fake_reasoner()
 
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_review("prompt", agent_backend="goose", provider="anthropic")
+        with patch("kai.review.GooseOneShotReasoner", return_value=fake) as ctor:
+            await run_review("prompt", agent_backend="goose", provider=provider)
 
-        cmd = mock_exec.call_args[0]
-        assert "--model" in cmd
-        model_idx = cmd.index("--model")
-        assert cmd[model_idx + 1] == "claude-sonnet-4-6"
-
-    @pytest.mark.asyncio
-    async def test_deepseek_provider_translated_to_wire_name(self):
-        """Kai's "deepseek" key rides the argv as goose's
-        "custom_deepseek" wire name; goose rejects the bare key with
-        "Unknown provider: deepseek". The model name stays Kai's
-        registry value untranslated."""
-        mock_proc = _mock_process(stdout=b"output")
-
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_review("prompt", agent_backend="goose", provider="deepseek")
-
-        cmd = mock_exec.call_args[0]
-        provider_idx = cmd.index("--provider")
-        assert cmd[provider_idx + 1] == "custom_deepseek"
-        model_idx = cmd.index("--model")
-        assert cmd[model_idx + 1] == "deepseek-v4-pro"
+        assert ctor.call_args.kwargs["provider"] == provider
+        assert fake.run.call_args.kwargs["model"] == expected_model
 
     @pytest.mark.asyncio
-    async def test_successful_response_stripped(self):
-        """Goose output is returned with whitespace stripped."""
-        mock_proc = _mock_process(stdout=b"  review text with whitespace  \n")
-
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc):
-            result = await run_review("prompt", agent_backend="goose", provider="anthropic")
-
-        assert result == "review text with whitespace"
-
-    @pytest.mark.asyncio
-    async def test_timeout_kills_directly(self):
-        """Goose timeout calls proc.kill(), not os.killpg()."""
-        mock_proc = AsyncMock()
-        mock_proc.pid = 99999
-        mock_proc.kill = MagicMock()
-        mock_proc.wait = AsyncMock()
-
-        with (
-            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
-            patch("kai.review.asyncio.wait_for", side_effect=TimeoutError()),
-            patch("kai.review.os.killpg") as mock_killpg,
-            pytest.raises(RuntimeError, match="timed out"),
-        ):
-            await run_review("prompt", agent_backend="goose", provider="openai")
-
-        mock_proc.kill.assert_called_once()
-        mock_killpg.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_subprocess_failure(self):
-        """Non-zero exit from Goose subprocess raises RuntimeError."""
-        mock_proc = _mock_process(stderr=b"provider error", returncode=1)
-
-        with (
-            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
-            pytest.raises(RuntimeError, match=r"Review subprocess failed.*provider error"),
-        ):
-            await run_review("prompt", agent_backend="goose", provider="openai")
-
-    @pytest.mark.asyncio
-    async def test_no_sudo_even_with_claude_user(self):
-        """Goose path never uses sudo, even when claude_user is set."""
-        mock_proc = _mock_process(stdout=b"output")
-
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_review(
-                "prompt",
-                claude_user="kai",
-                agent_backend="goose",
-                provider="anthropic",
-            )
-
-        cmd = mock_exec.call_args[0]
-        assert "sudo" not in cmd
-        assert cmd[0] == "goose"
-
-    @pytest.mark.asyncio
-    async def test_open_ended_provider_uses_registry_default(self):
-        """Goose+ollama resolves the PR_REVIEW row from the unified
-        registry. Operators override per-user via users.yaml
-        `models.pr_review`; the historic GOOSE_MODEL env path retired
-        with the `_GOOSE_AGENT_MODELS` fold-in."""
-        mock_proc = _mock_process(stdout=b"output")
-
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_review("prompt", agent_backend="goose", provider="ollama")
-
-        cmd = mock_exec.call_args[0]
-        model_idx = cmd.index("--model")
-        # Registry value for ("goose", "ollama", PR_REVIEW); see
-        # _BACKEND_PROVIDER_TIER_MODELS in config.py.
-        assert cmd[model_idx + 1] == "llama4:70b"
-
-    @pytest.mark.asyncio
-    async def test_open_ended_provider_with_model_override(self):
+    async def test_model_override_wins_over_registry(self):
         """Per-user `models.pr_review` override flows through
         `model_override` and wins over the registry default."""
-        mock_proc = _mock_process(stdout=b"output")
+        fake = self._fake_reasoner()
 
-        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await run_review(
-                "prompt",
-                agent_backend="goose",
-                provider="ollama",
-                model_override="qwen3:32b",
-            )
+        with patch("kai.review.GooseOneShotReasoner", return_value=fake):
+            await run_review("prompt", agent_backend="goose", provider="ollama", model_override="qwen3:32b")
 
-        cmd = mock_exec.call_args[0]
-        model_idx = cmd.index("--model")
-        assert cmd[model_idx + 1] == "qwen3:32b"
+        assert fake.run.call_args.kwargs["model"] == "qwen3:32b"
+
+    @pytest.mark.asyncio
+    async def test_timeout_s_passes_through_to_reasoner(self):
+        """run_review's timeout_s parameter becomes the reasoner's
+        per-call timeout (review diffs can need a larger cap than
+        the default)."""
+        fake = self._fake_reasoner()
+
+        with patch("kai.review.GooseOneShotReasoner", return_value=fake):
+            await run_review("prompt", agent_backend="goose", provider="anthropic", timeout_s=777)
+
+        assert fake.run.call_args.kwargs["timeout"] == 777
+
+    @pytest.mark.asyncio
+    async def test_run_review_collapses_oneshot_timeout_to_runtime_error(self):
+        from kai.oneshot import OneShotTimeout
+
+        fake = MagicMock()
+        fake.run = AsyncMock(side_effect=OneShotTimeout())
+
+        with (
+            patch("kai.review.GooseOneShotReasoner", return_value=fake),
+            pytest.raises(RuntimeError, match=r"Review subprocess timed out"),
+        ):
+            await run_review("prompt", agent_backend="goose", provider="anthropic")
+
+    @pytest.mark.asyncio
+    async def test_run_review_collapses_oneshot_error_to_runtime_error(self):
+        from kai.oneshot import OneShotSubprocessError
+
+        fake = MagicMock()
+        fake.run = AsyncMock(side_effect=OneShotSubprocessError(returncode=1, stderr=b"provider error"))
+
+        with (
+            patch("kai.review.GooseOneShotReasoner", return_value=fake),
+            pytest.raises(RuntimeError, match=r"Goose review failed"),
+        ):
+            await run_review("prompt", agent_backend="goose", provider="anthropic")
 
     @pytest.mark.asyncio
     async def test_default_backend_is_claude(self):
