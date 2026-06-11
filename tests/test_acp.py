@@ -46,6 +46,7 @@ import asyncio
 import json
 import logging
 import signal
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2306,3 +2307,76 @@ class TestSignalTargetUserPidFreeFunctions:
         assert not warnings
         debugs = [r for r in caplog.records if "benign race" in r.getMessage()]
         assert debugs
+
+
+class TestSessionAgeRecycling:
+    """Session-age recycling on the shared ACP layer. The age helpers
+    (_session_age_hours / _should_recycle) are inherited from
+    AgentBackend; these tests pin that AcpBackend wires the surface
+    (max_session_hours kwarg, _session_started_at stamp on handshake,
+    null on kill) and that _send_locked kills an expired subprocess
+    before _ensure_started respawns it."""
+
+    def test_should_recycle_expired_session(self):
+        b = _make_fake(max_session_hours=4)
+        proc = MagicMock()
+        proc.returncode = None
+        b._proc = proc
+        b._session_started_at = time.monotonic() - 18000  # 5 hours
+        assert b._should_recycle() is True
+
+    def test_should_recycle_disabled_by_default(self):
+        """max_session_hours defaults to 0 (no limit); an old live
+        session is never recycled unless the pool passes a limit."""
+        b = _make_fake()
+        proc = MagicMock()
+        proc.returncode = None
+        b._proc = proc
+        b._session_started_at = time.monotonic() - 999999
+        assert b._should_recycle() is False
+
+    @pytest.mark.asyncio
+    async def test_handshake_stamps_session_start_and_kill_nulls_it(self):
+        """_ensure_started records time.monotonic() so the age helpers
+        have a base; _kill nulls it so a recycled instance does not
+        inherit a stale age."""
+        b = _make_fake()
+        proc = _make_mock_proc(_handshake_lines())
+        with patch("kai.acp.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            await b._ensure_started()
+        assert b._session_started_at is not None
+        await b._kill()
+        assert b._session_started_at is None
+
+    @pytest.mark.asyncio
+    async def test_send_recycles_expired_before_ensure_started(self):
+        """_send_locked() kills the expired process before
+        _ensure_started() respawns it (the claude backend's recycle
+        contract, minus the save-prompt ACP has no equivalent of)."""
+        b = _make_fake(max_session_hours=1)
+
+        async def fake_ensure_started():
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stdin = MagicMock()
+            mock_proc.stdin.write = MagicMock()
+            mock_proc.stdin.drain = AsyncMock()
+            mock_proc.stdout = MagicMock()
+            mock_proc.stdout.readline = AsyncMock(return_value=b"")  # EOF
+            b._proc = mock_proc
+            b._session_id = "sess-recycled"
+            b._fresh_session = False
+
+        with (
+            patch.object(b, "_should_recycle", return_value=True),
+            patch.object(b, "_kill", new_callable=AsyncMock) as mock_kill,
+            patch.object(b, "_ensure_started", side_effect=fake_ensure_started),
+            patch.object(b, "_session_age_hours", return_value=2.5),
+        ):
+            events = []
+            async for event in b._send_locked("test"):
+                events.append(event)
+
+        # _kill fires at least once for the recycle (and again from
+        # the streaming loop's EOF handler, which is expected).
+        assert mock_kill.await_count >= 1

@@ -29,6 +29,7 @@ import inspect
 import json
 import os
 import signal
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2183,3 +2184,64 @@ class TestStartupFailureSurface:
         # tells the operator which backend failed, not just "spawn error".
         assert final.response.error is not None
         assert "Codex startup failed:" in final.response.error
+
+
+class TestSessionAgeRecycling:
+    """Session-age recycling on the codex backend. The age helpers
+    (_session_age_hours / _should_recycle) are inherited from
+    AgentBackend; these tests pin that CodexBackend wires the surface
+    (max_session_hours kwarg, _session_started_at stamp) and that
+    _send_locked kills an expired subprocess before _ensure_started
+    respawns it."""
+
+    def test_should_recycle_expired_session(self):
+        c = _make_codex(max_session_hours=4)
+        proc = MagicMock()
+        proc.returncode = None
+        c._proc = proc
+        c._session_started_at = time.monotonic() - 18000  # 5 hours
+        assert c._should_recycle() is True
+
+    def test_should_recycle_disabled_by_default(self):
+        """max_session_hours defaults to 0 (no limit); an old live
+        session is never recycled unless the pool passes a limit."""
+        c = _make_codex()
+        proc = MagicMock()
+        proc.returncode = None
+        c._proc = proc
+        c._session_started_at = time.monotonic() - 999999
+        assert c._should_recycle() is False
+
+    @pytest.mark.asyncio
+    async def test_send_recycles_expired_before_ensure_started(self):
+        """_send_locked() kills the expired process before
+        _ensure_started() respawns it (the claude backend's recycle
+        contract, minus the save-prompt the codex CLI has no
+        equivalent of)."""
+        c = _make_codex(max_session_hours=1)
+
+        async def fake_ensure_started():
+            mock_proc = MagicMock()
+            mock_proc.returncode = None
+            mock_proc.stdin = MagicMock()
+            mock_proc.stdin.write = MagicMock()
+            mock_proc.stdin.drain = AsyncMock()
+            mock_proc.stdout = MagicMock()
+            mock_proc.stdout.readline = AsyncMock(return_value=b"")  # EOF
+            c._proc = mock_proc
+            c._session_id = "thread-recycled"
+            c._fresh_session = False
+
+        with (
+            patch.object(c, "_should_recycle", return_value=True),
+            patch.object(c, "_kill", new_callable=AsyncMock) as mock_kill,
+            patch.object(c, "_ensure_started", side_effect=fake_ensure_started),
+            patch.object(c, "_session_age_hours", return_value=2.5),
+        ):
+            events = []
+            async for event in c._send_locked("test"):
+                events.append(event)
+
+        # _kill fires at least once for the recycle (and again from
+        # the streaming loop's EOF handler, which is expected).
+        assert mock_kill.await_count >= 1

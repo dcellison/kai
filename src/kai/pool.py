@@ -235,6 +235,7 @@ class SubprocessPool:
                 provider=effective_provider,
                 memory_enabled=self._config.memory_enabled,
                 os_user=os_user,
+                max_session_hours=self._config.agent_max_session_hours,
             )
 
         if backend == "opencode":
@@ -255,6 +256,7 @@ class SubprocessPool:
                 provider=effective_provider,
                 memory_enabled=self._config.memory_enabled,
                 os_user=os_user,
+                max_session_hours=self._config.agent_max_session_hours,
             )
 
         if backend == "codex":
@@ -276,6 +278,7 @@ class SubprocessPool:
                 provider="openai",
                 codex_user=os_user,
                 memory_enabled=self._config.memory_enabled,
+                max_session_hours=self._config.agent_max_session_hours,
             )
 
         return ClaudeCodeBackend(
@@ -287,7 +290,7 @@ class SubprocessPool:
             timeout_seconds=timeout,
             services_info=self._services_info,
             claude_user=os_user,
-            max_session_hours=self._config.claude_max_session_hours,
+            max_session_hours=self._config.agent_max_session_hours,
             workspace_config=ws_config,
             autocompact_pct=self._config.claude_autocompact_pct,
             claude_effort_level=self._config.claude_effort_level,
@@ -554,12 +557,12 @@ class SubprocessPool:
 
     def start(self) -> None:
         """Start the eviction background task (if eviction is enabled)."""
-        if self._config.claude_idle_timeout > 0:
+        if self._config.agent_idle_timeout > 0:
             self._eviction_task = asyncio.create_task(self._eviction_loop())
 
     async def _eviction_loop(self) -> None:
         """Periodically kill idle subprocesses to free memory."""
-        idle_timeout = self._config.claude_idle_timeout
+        idle_timeout = self._config.agent_idle_timeout
         while True:
             await asyncio.sleep(_EVICTION_CHECK_INTERVAL)
             now = time.monotonic()

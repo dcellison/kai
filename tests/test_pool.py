@@ -44,8 +44,8 @@ def _make_config(**overrides) -> Config:
         "allowed_user_ids": {111, 222},
         "default_model": "sonnet",
         "claude_timeout_seconds": 30,
-        "claude_max_session_hours": 0,
-        "claude_idle_timeout": 1800,
+        "agent_max_session_hours": 0,
+        "agent_idle_timeout": 1800,
         "webhook_port": 8080,
         "webhook_secret": "secret",
     }
@@ -340,6 +340,34 @@ class TestPerUserBackendRouting:
         assert isinstance(instance, GooseBackend)
         assert instance.os_user == "alice-os"
 
+    def test_all_backends_receive_max_session_hours(self):
+        """Config.agent_max_session_hours reaches every backend type:
+        session-age recycling is pool-generic, matching the AGENT_
+        env prefix, not a claude-only lever."""
+        from kai.claude import ClaudeCodeBackend
+        from kai.codex import CodexBackend
+        from kai.opencode import OpenCodeBackend
+
+        users = {
+            111: UserConfig(
+                telegram_id=111, name="a", agent_backend="claude", llm_provider="anthropic", model="sonnet"
+            ),
+            222: UserConfig(telegram_id=222, name="b", agent_backend="codex"),
+            333: UserConfig(telegram_id=333, name="c", agent_backend="goose", llm_provider="anthropic", model="sonnet"),
+            444: UserConfig(telegram_id=444, name="d", agent_backend="opencode", model="anthropic/claude-sonnet-4-6"),
+        }
+        config = _make_config(agent_max_session_hours=6.5, user_configs=users)
+        pool = SubprocessPool(config=config, services_info=[])
+        for chat_id, expected_type in [
+            (111, ClaudeCodeBackend),
+            (222, CodexBackend),
+            (333, GooseBackend),
+            (444, OpenCodeBackend),
+        ]:
+            instance = pool.get(chat_id)
+            assert isinstance(instance, expected_type)
+            assert instance.max_session_hours == 6.5
+
     def test_opencode_user_receives_os_user(self):
         """An opencode user's os_user reaches OpenCodeBackend, which
         wires the per-user sudo isolation in the shared ACP layer
@@ -476,7 +504,7 @@ class TestPropertyAccessors:
 class TestIdleEviction:
     def test_idle_instance_identified_for_eviction(self):
         """Instance idle past timeout is identified for eviction."""
-        config = _make_config(claude_idle_timeout=1)
+        config = _make_config(agent_idle_timeout=1)
         pool = SubprocessPool(config=config, services_info=[])
         pool.get(111)
 
@@ -487,13 +515,13 @@ class TestIdleEviction:
         to_evict = [
             cid
             for cid, last in pool._last_activity.items()
-            if now - last > config.claude_idle_timeout and cid in pool._pool
+            if now - last > config.agent_idle_timeout and cid in pool._pool
         ]
         assert 111 in to_evict
 
     def test_active_not_evicted(self):
         """User with recent activity is not evicted."""
-        config = _make_config(claude_idle_timeout=3600)
+        config = _make_config(agent_idle_timeout=3600)
         pool = SubprocessPool(config=config, services_info=[])
         pool.get(111)  # creates and sets last_activity to now
 
@@ -910,7 +938,7 @@ class TestGetIfExists:
 class TestEvictionTOCTOU:
     def test_toctou_guard_skips_recently_active(self):
         """TOCTOU guard skips user who became active between list build and eviction."""
-        config = _make_config(claude_idle_timeout=1)
+        config = _make_config(agent_idle_timeout=1)
         pool = SubprocessPool(config=config, services_info=[])
         pool.get(111)
 
@@ -922,7 +950,7 @@ class TestEvictionTOCTOU:
         to_evict = [
             cid
             for cid, last in pool._last_activity.items()
-            if sweep_now - last > config.claude_idle_timeout and cid in pool._pool and cid not in pool._in_flight
+            if sweep_now - last > config.agent_idle_timeout and cid in pool._pool and cid not in pool._in_flight
         ]
         assert 111 in to_evict  # user is in the evict list
 
@@ -937,7 +965,7 @@ class TestEvictionTOCTOU:
     @pytest.mark.asyncio
     async def test_toctou_guard_skips_in_flight(self):
         """TOCTOU guard skips user who entered send() between snapshot and eviction."""
-        config = _make_config(claude_idle_timeout=1)
+        config = _make_config(agent_idle_timeout=1)
         pool = SubprocessPool(config=config, services_info=[])
 
         # Two idle users: A's shutdown is the yield point, B gets the TOCTOU change.
@@ -982,7 +1010,7 @@ class TestEvictionTOCTOU:
     @pytest.mark.asyncio
     async def test_toctou_guard_skips_removed_from_pool(self):
         """TOCTOU guard skips user removed from pool between snapshot and eviction."""
-        config = _make_config(claude_idle_timeout=1)
+        config = _make_config(agent_idle_timeout=1)
         pool = SubprocessPool(config=config, services_info=[])
 
         # get() order determines to_evict order (dict insertion order); 111 must
@@ -1025,7 +1053,7 @@ class TestEvictionTOCTOU:
     @pytest.mark.asyncio
     async def test_eviction_proceeds_when_all_checks_pass(self):
         """User passing all three re-checks is evicted normally."""
-        config = _make_config(claude_idle_timeout=1)
+        config = _make_config(agent_idle_timeout=1)
         pool = SubprocessPool(config=config, services_info=[])
 
         instance = pool.get(111)
@@ -1059,7 +1087,7 @@ class TestEvictionTOCTOU:
     @pytest.mark.asyncio
     async def test_eviction_failure_triggers_sigkill_fallback(self):
         """Failed shutdown() in eviction loop triggers force_kill fallback."""
-        config = _make_config(claude_idle_timeout=1)
+        config = _make_config(agent_idle_timeout=1)
         pool = SubprocessPool(config=config, services_info=[])
 
         instance = pool.get(111)
@@ -1096,7 +1124,7 @@ class TestEvictionTOCTOU:
     @pytest.mark.asyncio
     async def test_eviction_pops_after_shutdown(self):
         """Instance stays in pool during shutdown, removed only after success."""
-        config = _make_config(claude_idle_timeout=1)
+        config = _make_config(agent_idle_timeout=1)
         pool = SubprocessPool(config=config, services_info=[])
 
         instance = pool.get(111)

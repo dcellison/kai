@@ -215,6 +215,11 @@ class CodexBackend(AgentBackend):
         # (the install wizard's guard forces MEMORY_ENABLED=false on
         # codex), so this flag is effectively always False in v1.
         memory_enabled: bool = False,
+        # Hours before the subprocess is recycled (0 = no limit).
+        # Same contract as the claude and ACP backends: prevents
+        # unbounded memory growth in a long-lived agent subprocess.
+        # The pool passes Config.agent_max_session_hours.
+        max_session_hours: float = 0,
     ):
         # ABC-required attributes (pool.py reads/writes these)
         self.model = model
@@ -225,6 +230,9 @@ class CodexBackend(AgentBackend):
         self.provider = provider  # ABC-mandated; bot.py reads this
         self.codex_user = codex_user
         self.memory_enabled = memory_enabled
+        # Session-age recycling limit (ABC surface; checked by the
+        # inherited _should_recycle at the top of _send_locked).
+        self.max_session_hours = max_session_hours
 
         # API context for session injection (passed to build_session_context)
         self._api_context = ApiContext(
@@ -251,6 +259,9 @@ class CodexBackend(AgentBackend):
         # Subprocess and session state
         self._proc: asyncio.subprocess.Process | None = None
         self._session_id: str | None = None
+        # time.monotonic() at process start; drives the inherited
+        # session-age recycling helpers. Nulled on kill/shutdown.
+        self._session_started_at: float | None = None
         self._next_id: int = 1  # Monotonically increasing JSON-RPC request ID
         self._lock = asyncio.Lock()  # Serializes all message sends
         self._fresh_session: bool = True  # True until the first message is sent
@@ -403,6 +414,7 @@ class CodexBackend(AgentBackend):
             # 16MB ceiling is itself observed in practice.
             limit=16 * 1024 * 1024,
         )
+        self._session_started_at = time.monotonic()
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
         # Save the process group ID for reliable signal delivery.
@@ -636,6 +648,22 @@ class CodexBackend(AgentBackend):
         content-block format, session/prompt dispatch, and streaming
         response accumulation from session/update notifications.
         """
+        # Recycle the session if it has exceeded the configured age
+        # limit. Prevents unbounded memory growth in a long-lived
+        # agent subprocess. Checked only before starting a new
+        # interaction, never during one, so in-flight responses
+        # complete normally. No save-prompt equivalent exists on the
+        # codex CLI; the kill is immediate, and _ensure_started()
+        # below respawns with a fresh handshake (which also re-marks
+        # the session fresh for context injection).
+        if self._should_recycle():
+            log.info(
+                "Codex session age %.1f hours exceeds limit of %.1f hours; recycling",
+                self._session_age_hours(),
+                self.max_session_hours,
+            )
+            await self._kill()
+
         try:
             await self._ensure_started()
         except (OSError, RuntimeError, TimeoutError) as exc:
@@ -1398,6 +1426,7 @@ class CodexBackend(AgentBackend):
             self._pgid = None
             self._inner_codex_pids = []
             self._effective_codex_user = None
+            self._session_started_at = None
 
     async def restart(self) -> None:
         """
@@ -1465,3 +1494,4 @@ class CodexBackend(AgentBackend):
         self._pgid = None
         self._inner_codex_pids = []
         self._effective_codex_user = None
+        self._session_started_at = None

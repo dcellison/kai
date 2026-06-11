@@ -968,8 +968,10 @@ class Config:
         allowed_user_ids: Set of Telegram user IDs permitted to interact with the bot (required)
         default_model: Default model name, provider-dependent (e.g. sonnet, gpt-5.5-pro, gemini-2.5-pro)
         claude_timeout_seconds: Seconds before a Claude response is considered timed out
-        claude_max_session_hours: Hours before the inner agent subprocess is recycled. Prevents
-            unbounded V8 memory growth that can trigger macOS Jetsam kernel panics. 0 = no limit.
+        agent_max_session_hours: Hours before an agent subprocess is recycled, on every
+            backend. Prevents unbounded memory growth in long-lived agent processes (the
+            original motivator: V8 growth in the claude CLI triggering macOS Jetsam kernel
+            panics). 0 = no limit.
         session_db_path: Path to the SQLite database for sessions, jobs, and settings
         webhook_port: Port for the local aiohttp server (webhooks + scheduling API)
         webhook_secret: HMAC secret for verifying incoming webhook payloads
@@ -1003,8 +1005,11 @@ class Config:
     # resolution chain that `resolve_user_model` implements.
     default_models: dict[str, str] = field(default_factory=dict)
     claude_timeout_seconds: int = 120
-    claude_max_session_hours: float = 0  # 0 = no limit
-    claude_idle_timeout: int = 1800  # seconds before idle subprocess eviction; 0 = no eviction
+    # Backend-generic pool lifecycle tunables, matching the AGENT_-
+    # prefixed env vars they load from: every backend's subprocess is
+    # recycled by age and evicted when idle.
+    agent_max_session_hours: float = 0  # 0 = no limit
+    agent_idle_timeout: int = 1800  # seconds before idle subprocess eviction; 0 = no eviction
 
     # Autocompact tuning helps control token usage on the claude
     # backend. 0 = use the Claude Code default (~83% threshold).
@@ -2576,14 +2581,14 @@ def load_config() -> Config:
     if not raw_session_hours:
         raw_session_hours = os.environ.get("CLAUDE_MAX_SESSION_HOURS", "").strip() or "0"
     try:
-        claude_max_session_hours = float(raw_session_hours)
+        agent_max_session_hours = float(raw_session_hours)
     except ValueError:
         raise SystemExit("AGENT_MAX_SESSION_HOURS must be a number") from None
     raw_idle_timeout = os.environ.get("AGENT_IDLE_TIMEOUT", "").strip()
     if not raw_idle_timeout:
         raw_idle_timeout = os.environ.get("CLAUDE_IDLE_TIMEOUT", "").strip() or "1800"
     try:
-        claude_idle_timeout = int(raw_idle_timeout)
+        agent_idle_timeout = int(raw_idle_timeout)
     except ValueError:
         raise SystemExit("AGENT_IDLE_TIMEOUT must be an integer") from None
     try:
@@ -3052,8 +3057,8 @@ def load_config() -> Config:
         default_model=default_model,
         default_models=default_models,
         claude_timeout_seconds=claude_timeout_seconds,
-        claude_max_session_hours=claude_max_session_hours,
-        claude_idle_timeout=claude_idle_timeout,
+        agent_max_session_hours=agent_max_session_hours,
+        agent_idle_timeout=agent_idle_timeout,
         claude_autocompact_pct=claude_autocompact_pct,
         claude_effort_level=claude_effort_level,
         codex_auth_mode=codex_auth_mode,

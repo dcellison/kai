@@ -17,6 +17,7 @@ prompt assembly that is identical across all backends.
 import logging
 import os
 import shutil
+import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -148,9 +149,9 @@ class AgentBackend(ABC):
         workspace_config, provider
 
     Backend-specific attributes (NOT on the ABC) stay on the concrete
-    class. For ClaudeCodeBackend these include: claude_user,
-    max_session_hours, autocompact_pct. The pool never touches these
-    directly; they are set at construction by _create_instance().
+    class. For ClaudeCodeBackend these include: claude_user and
+    autocompact_pct. The pool never touches these directly; they are
+    set at construction by _create_instance().
     """
 
     # These are plain instance attributes, not abstract properties,
@@ -164,6 +165,18 @@ class AgentBackend(ABC):
     timeout_seconds: int
     workspace_config: WorkspaceConfig | None
     provider: str
+
+    # Session-age recycling surface, shared by every concrete
+    # backend. __init__ sets max_session_hours (the pool passes
+    # Config.agent_max_session_hours; 0 = no limit) and the backend
+    # stamps _session_started_at with time.monotonic() at subprocess
+    # spawn, nulling it on kill/shutdown. The recycle CHECK stays
+    # backend-owned at the top of each _send_locked because the
+    # surrounding lifecycle differs (claude runs a save-prompt before
+    # the kill; the others kill immediately and respawn on the same
+    # send).
+    max_session_hours: float
+    _session_started_at: float | None
 
     # Stable identifier the shadow-mode logger (#546) and any future
     # backend-aware code path can read off the instance. Concrete
@@ -214,6 +227,18 @@ class AgentBackend(ABC):
     def session_id(self) -> str | None:
         """Current session identifier."""
         ...
+
+    # ── Session-age recycling helpers ─────────────────────────────
+
+    def _session_age_hours(self) -> float:
+        """Hours elapsed since the current subprocess started."""
+        if self._session_started_at is None:
+            return 0.0
+        return (time.monotonic() - self._session_started_at) / 3600
+
+    def _should_recycle(self) -> bool:
+        """True if the session has exceeded the configured age limit."""
+        return self.max_session_hours > 0 and self.is_alive and self._session_age_hours() >= self.max_session_hours
 
 
 # ── Context injection functions ─────────────────────────────────────

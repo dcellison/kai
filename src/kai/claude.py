@@ -114,10 +114,12 @@ class ClaudeCodeBackend(AgentBackend):
         # below for the pattern that DOES need a default shadow).
         self.claude_effort_level = claude_effort_level
         self.provider = "anthropic"  # Claude CLI always uses Anthropic
+        # Session-age recycling limit (ABC surface; checked by the
+        # inherited _should_recycle at the top of _send_locked).
+        self.max_session_hours = max_session_hours
 
         # Claude-Code-specific attributes (not on the ABC)
         self.claude_user = claude_user
-        self.max_session_hours = max_session_hours
         self.autocompact_pct = autocompact_pct
         self.memory_enabled = memory_enabled
 
@@ -162,16 +164,6 @@ class ClaudeCodeBackend(AgentBackend):
     def session_id(self) -> str | None:
         """The current Claude session ID, or None if no session is active."""
         return self._session_id
-
-    def _session_age_hours(self) -> float:
-        """Hours elapsed since the current session started."""
-        if self._session_started_at is None:
-            return 0.0
-        return (time.monotonic() - self._session_started_at) / 3600
-
-    def _should_recycle(self) -> bool:
-        """True if the session has exceeded the configured age limit."""
-        return self.max_session_hours > 0 and self.is_alive and self._session_age_hours() >= self.max_session_hours
 
     async def _ensure_started(self) -> None:
         """

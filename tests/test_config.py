@@ -186,7 +186,7 @@ class TestLoadConfigDefaults:
         config = load_config()
         assert config.default_model == "sonnet"
         assert config.claude_timeout_seconds == 120
-        assert config.claude_max_session_hours == 0
+        assert config.agent_max_session_hours == 0
         assert config.webhook_port == 8080
         # Without TELEGRAM_WEBHOOK_URL, defaults to polling mode
         assert config.telegram_webhook_url is None
@@ -266,7 +266,7 @@ class TestLoadConfigErrors:
         _set_required(monkeypatch)
         monkeypatch.setenv("AGENT_MAX_SESSION_HOURS", "4.5")
         config = load_config()
-        assert config.claude_max_session_hours == 4.5
+        assert config.agent_max_session_hours == 4.5
 
     def test_invalid_autocompact_pct(self, monkeypatch):
         _set_required(monkeypatch)
@@ -2710,8 +2710,8 @@ class TestAgentSessionLifecycleRename:
             CLAUDE_IDLE_TIMEOUT="300",
         )
         cfg = load_config()
-        assert cfg.claude_max_session_hours == 6
-        assert cfg.claude_idle_timeout == 900
+        assert cfg.agent_max_session_hours == 6
+        assert cfg.agent_idle_timeout == 900
 
     def test_legacy_only_falls_back_with_warning(self, monkeypatch, caplog):
         self._required_env(
@@ -2721,8 +2721,8 @@ class TestAgentSessionLifecycleRename:
         )
         with caplog.at_level(logging.WARNING, logger="kai.config"):
             cfg = load_config()
-        assert cfg.claude_max_session_hours == 4.5
-        assert cfg.claude_idle_timeout == 600
+        assert cfg.agent_max_session_hours == 4.5
+        assert cfg.agent_idle_timeout == 600
         messages = [r.getMessage() for r in caplog.records]
         assert any("CLAUDE_MAX_SESSION_HOURS in env is deprecated" in m for m in messages)
         assert any("CLAUDE_IDLE_TIMEOUT in env is deprecated" in m for m in messages)
@@ -2730,8 +2730,8 @@ class TestAgentSessionLifecycleRename:
     def test_neither_set_uses_defaults(self, monkeypatch):
         self._required_env(monkeypatch)
         cfg = load_config()
-        assert cfg.claude_max_session_hours == 0
-        assert cfg.claude_idle_timeout == 1800
+        assert cfg.agent_max_session_hours == 0
+        assert cfg.agent_idle_timeout == 1800
 
     def test_invalid_idle_timeout_names_canonical_key(self, monkeypatch):
         """A bad value fails fast naming the canonical key, including

@@ -660,6 +660,11 @@ class AcpBackend(AgentBackend):
         # at spawn time so a value naming the bot's own user collapses
         # to the direct-spawn path (self-sudo skip).
         os_user: str | None = None,
+        # Hours before the subprocess is recycled (0 = no limit).
+        # Same contract as the claude and codex backends: prevents
+        # unbounded memory growth in a long-lived agent subprocess.
+        # The pool passes Config.agent_max_session_hours.
+        max_session_hours: float = 0,
     ):
         # ABC-required attributes (pool.py reads/writes these)
         self.model = model
@@ -670,6 +675,9 @@ class AcpBackend(AgentBackend):
         self.provider = provider
         self.memory_enabled = memory_enabled
         self.os_user = os_user
+        # Session-age recycling limit (ABC surface; checked by the
+        # inherited _should_recycle at the top of _send_locked).
+        self.max_session_hours = max_session_hours
 
         # API context for session injection (passed to build_session_context).
         self._api_context = ApiContext(
@@ -697,6 +705,9 @@ class AcpBackend(AgentBackend):
         # Subprocess and session state.
         self._proc: asyncio.subprocess.Process | None = None
         self._session_id: str | None = None
+        # time.monotonic() at process start; drives the inherited
+        # session-age recycling helpers. Nulled on kill/shutdown.
+        self._session_started_at: float | None = None
         # Cross-user spawn state, set per incarnation in
         # _ensure_started. `_effective_os_user` is the resolved sudo
         # target (None on the direct path); `_pgid` is the wrapper's
@@ -1011,6 +1022,7 @@ class AcpBackend(AgentBackend):
         # agent is exactly the member that survives the wrapper).
         self._pgid = self._proc.pid if effective_os_user else None
         self._effective_os_user = effective_os_user
+        self._session_started_at = time.monotonic()
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
         # Step 1: initialize - establish protocol version and read the
@@ -1143,6 +1155,23 @@ class AcpBackend(AgentBackend):
         JSON-RPC session/prompt dispatch, and streaming response
         accumulation from session/update notifications.
         """
+        # Recycle the session if it has exceeded the configured age
+        # limit. Prevents unbounded memory growth in a long-lived
+        # agent subprocess. Checked only before starting a new
+        # interaction, never during one, so in-flight responses
+        # complete normally. No save-prompt equivalent exists on the
+        # ACP protocol; the kill is immediate, and _ensure_started()
+        # below respawns with a fresh handshake (which also re-marks
+        # the session fresh for context injection).
+        if self._should_recycle():
+            log.info(
+                "%s session age %.1f hours exceeds limit of %.1f hours; recycling",
+                self.backend_label,
+                self._session_age_hours(),
+                self.max_session_hours,
+            )
+            await self._kill()
+
         try:
             await self._ensure_started()
         except (OSError, RuntimeError, TimeoutError) as exc:
@@ -1540,6 +1569,7 @@ class AcpBackend(AgentBackend):
             self._session_id = None
             self._pgid = None
             self._effective_os_user = None
+            self._session_started_at = None
 
     async def restart(self) -> None:
         """
@@ -1625,3 +1655,4 @@ class AcpBackend(AgentBackend):
         self._session_id = None
         self._pgid = None
         self._effective_os_user = None
+        self._session_started_at = None
