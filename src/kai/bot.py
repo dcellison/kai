@@ -1924,6 +1924,193 @@ async def _handle_workspace_allowed(
 _NO_BASE_MSG = "No workspace base configured. Set workspace_base in users.yaml or WORKSPACE_BASE in .env."
 
 
+# Project ids are retrieval-time labels stored in memory rows, so
+# they get the same conservative shape discipline as tag slugs:
+# lowercase, digits, hyphen/underscore, no leading separator, 64-char
+# ceiling. Display names keep the user's original casing.
+_PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+async def _register_memory_project_for(
+    config: Config,
+    chat_id: int,
+    root: Path,
+    raw_name: str,
+) -> tuple[bool, str]:
+    """
+    Shared registration core for /project register and the
+    /workspace new auto-hook. Returns (ok, user_message); never
+    raises, because the auto-hook must not fail workspace creation
+    over a registration problem.
+
+    Guards, in order:
+    - project_id shape (lowercased raw_name must match _PROJECT_ID_RE).
+    - nested-root guard: if ANY registered project (merged view)
+      already owns this root, including via containment, the
+      registration is rejected naming the owner. A nested project
+      would steal scope from its parent through longest-prefix
+      detection.
+    - id collision against the merged view.
+
+    On success the row is persisted AND pushed into the detection
+    cache, so the user's next message in the workspace routes to the
+    new project with no restart.
+    """
+    from kai.memory_projects import (
+        db_registry_upsert,
+        detect_active_memory_project,
+        merged_registry,
+    )
+
+    project_id = raw_name.strip().lower()
+    if not _PROJECT_ID_RE.match(project_id):
+        return False, f"Invalid project name {raw_name!r}: use letters, digits, - or _ (max 64 chars)."
+
+    merged = merged_registry(config.memory_projects)
+    owner = detect_active_memory_project(root, merged)
+    if owner is not None:
+        return False, f"This workspace is already inside project '{owner.project_id}'."
+    if project_id in merged:
+        return False, f"Project id '{project_id}' is already registered; pick another name."
+
+    resolved_root = root.expanduser().resolve()
+    row = {
+        "project_id": project_id,
+        "display_name": raw_name.strip(),
+        "workspace_root": str(resolved_root),
+        "memory_enabled": True,
+        "default_scope_for_new_facts": "project",
+        "created_by": chat_id,
+    }
+    try:
+        await sessions.register_memory_project(
+            project_id=project_id,
+            display_name=raw_name.strip(),
+            workspace_root=str(resolved_root),
+            created_by=chat_id,
+        )
+    except Exception as e:
+        # IntegrityError covers the registration race (two users, one
+        # id or root); anything else is a DB-layer failure. Both
+        # collapse to a user-facing message because the caller may be
+        # the auto-hook, which must not raise.
+        log.warning("memory project registration failed for %r: %s", project_id, e)
+        return False, f"Could not register project '{project_id}': {e}"
+    if not db_registry_upsert(row):
+        # The handler validated every field above, so a cache
+        # rejection here means validation drift between this guard
+        # and _row_to_config; the row is persisted and will load on
+        # next restart regardless.
+        log.error("memory project cache rejected validated row %r", project_id)
+    log.info(
+        "memory.project.registry %s",
+        json.dumps(
+            {"action": "register", "project_id": project_id, "root": str(resolved_root), "by": chat_id},
+            separators=(",", ":"),
+        ),
+    )
+    return True, f"Registered memory project '{project_id}' for this workspace."
+
+
+@_require_auth
+async def handle_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /project - register, unregister, or list memory projects.
+
+    Subcommands:
+        /project                    - list registered projects
+        /project list               - same
+        /project register [name]    - register the CURRENT workspace
+                                      (name defaults to its directory name)
+        /project unregister <name>  - remove a chat-registered project
+
+    Operator-pinned projects (from the host-side registry file) are
+    visible in the listing but cannot be unregistered from chat.
+    """
+    from kai.memory_projects import (
+        db_registry_creator,
+        db_registry_remove,
+        detect_active_memory_project,
+        merged_registry,
+    )
+
+    assert update.message is not None
+    chat_id = _chat_id(update)
+    pool = _get_pool(context)
+    config: Config = context.bot_data["config"]
+
+    args = context.args or []
+    sub = args[0].lower() if args else "list"
+
+    if sub == "register":
+        current = Path(pool.get_workspace(chat_id))
+        raw_name = args[1] if len(args) > 1 else current.name
+        # The message text alone distinguishes success from rejection
+        # for the user; the boolean exists for the /workspace new
+        # auto-hook, which prefixes failures with a "Note:" wrapper.
+        _ok, message = await _register_memory_project_for(config, chat_id, current, raw_name)
+        await update.message.reply_text(message)
+        return
+
+    if sub == "unregister":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /project unregister <name>")
+            return
+        project_id = args[1].strip().lower()
+        if project_id in config.memory_projects:
+            await update.message.reply_text(
+                f"Project '{project_id}' is operator-pinned; it cannot be unregistered from chat."
+            )
+            return
+        creator = db_registry_creator(project_id)
+        if creator is None:
+            await update.message.reply_text(f"No chat-registered project named '{project_id}'.")
+            return
+        user = config.get_user_config(chat_id)
+        is_admin = user is not None and user.role == "admin"
+        if chat_id != creator and not is_admin:
+            await update.message.reply_text(
+                f"Project '{project_id}' was registered by another user; only they or an admin can unregister it."
+            )
+            return
+        removed = await sessions.unregister_memory_project(project_id)
+        db_registry_remove(project_id)
+        log.info(
+            "memory.project.registry %s",
+            json.dumps(
+                {"action": "unregister", "project_id": project_id, "by": chat_id},
+                separators=(",", ":"),
+            ),
+        )
+        if removed:
+            await update.message.reply_text(f"Unregistered memory project '{project_id}'.")
+        else:
+            await update.message.reply_text(f"Project '{project_id}' was already gone.")
+        return
+
+    if sub != "list":
+        await update.message.reply_text("Usage: /project [list | register [name] | unregister <name>]")
+        return
+
+    merged = merged_registry(config.memory_projects)
+    if not merged:
+        await update.message.reply_text(
+            "No memory projects registered.\nUse /project register [name] in a workspace to create one."
+        )
+        return
+    current = Path(pool.get_workspace(chat_id))
+    active = detect_active_memory_project(current, merged)
+    lines = ["Memory projects:"]
+    for project_id in sorted(merged):
+        cfg = merged[project_id]
+        provenance = "pinned" if project_id in config.memory_projects else "user"
+        marker = " (active)" if active is not None and active.project_id == project_id else ""
+        lines.append(f"- {project_id} [{provenance}]{marker}")
+        for project_root in cfg.workspace_roots:
+            lines.append(f"    {project_root}")
+    await update.message.reply_text("\n".join(lines))
+
+
 @_require_auth
 async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -2021,7 +2208,19 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await update.message.reply_text(
                 f"Warning: git init failed (exit code {rc}). The workspace was created but has no git repo."
             )
+        # Auto-register the new workspace as a memory project:
+        # /workspace new is an explicit "starting a project here"
+        # signal, and registering at creation time means the very
+        # first exchange routes its memories to the project instead
+        # of leaking them global. Failure warns but never blocks the
+        # creation; the workspace is fully usable unregistered, and
+        # /project register remains the manual path.
+        registered, register_note = await _register_memory_project_for(config, chat_id, resolved, name)
         await _switch_workspace(update, context, resolved)
+        if registered:
+            await update.message.reply_text(register_note)
+        else:
+            await update.message.reply_text(f"Note: memory project not registered: {register_note}")
         return
 
     # "config" keyword: view or modify workspace settings.
@@ -2728,6 +2927,9 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/workspace <name> - Switch by name\n"
         "/workspace home - Return to default\n"
         "/workspace new <name> - Create + git init + switch\n"
+        "/project - List memory projects\n"
+        "/project register [name] - Register current workspace as a memory project\n"
+        "/project unregister <name> - Remove a chat-registered project\n"
         "/workspace allow <path> - Add an allowed workspace\n"
         "/workspace deny <path> - Remove an allowed workspace\n"
         "/workspace allowed - List your workspaces\n"
@@ -3650,6 +3852,7 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
     app.add_handler(CommandHandler("job", handle_job))
     app.add_handler(CommandHandler("jobs", handle_jobs))
     app.add_handler(CommandHandler("settings", handle_settings))
+    app.add_handler(CommandHandler("project", handle_project))
     app.add_handler(CommandHandler("workspace", handle_workspace))
     app.add_handler(CommandHandler("ws", handle_workspace))
     app.add_handler(CommandHandler("workspaces", handle_workspaces))

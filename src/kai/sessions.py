@@ -150,6 +150,26 @@ async def init_db(db_path: Path) -> None:
                 PRIMARY KEY (path, chat_id)
             )
         """)
+        # User-registered memory projects (the DB layer under the
+        # operator-pinned memory-projects.yaml). One root per row:
+        # chat-registered projects are single-root by design; only
+        # YAML entries support multi-root. workspace_root is UNIQUE
+        # because the detector's longest-prefix match needs a single
+        # owner per root, mirroring the YAML loader's cross-project
+        # duplicate-root rule. created_by drives the unregister
+        # permission check (registering user or admin).
+        log.debug("Creating memory_projects table")
+        await _get_db().execute("""
+            CREATE TABLE IF NOT EXISTS memory_projects (
+                project_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                workspace_root TEXT NOT NULL UNIQUE,
+                memory_enabled INTEGER NOT NULL DEFAULT 1,
+                default_scope_for_new_facts TEXT,
+                created_by INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
         # Schema evolution: migrate old workspace_history tables (path-only
         # PK) to the new composite PK (path, chat_id). SQLite does not
@@ -739,6 +759,78 @@ async def upsert_workspace_history(path: str, chat_id: int) -> None:
         (path, chat_id),
     )
     await _get_db().commit()
+
+
+# ── Memory project registry (DB layer) ─────────────────────────────
+# User-registered memory projects. The in-memory merge with the
+# operator-pinned YAML registry lives in kai.memory_projects; these
+# accessors are the persistence layer only.
+
+
+async def register_memory_project(
+    *,
+    project_id: str,
+    display_name: str,
+    workspace_root: str,
+    created_by: int,
+    memory_enabled: bool = True,
+    default_scope_for_new_facts: str | None = "project",
+) -> None:
+    """Insert a user-registered memory project row.
+
+    Plain INSERT, not upsert: registration collisions are a user
+    error surfaced by the command handler (which checks the merged
+    registry first), and the PRIMARY KEY / UNIQUE constraints are
+    the backstop against a race between two concurrent registrations.
+    Raises sqlite's IntegrityError on collision; the caller maps it
+    to a user-facing message.
+    """
+    await _get_db().execute(
+        "INSERT INTO memory_projects (project_id, display_name, workspace_root, memory_enabled, default_scope_for_new_facts, created_by) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            project_id,
+            display_name,
+            workspace_root,
+            1 if memory_enabled else 0,
+            default_scope_for_new_facts,
+            created_by,
+        ),
+    )
+    await _get_db().commit()
+
+
+async def unregister_memory_project(project_id: str) -> bool:
+    """Delete a user-registered project row. Returns True when a row
+    was actually removed, so the handler can distinguish "gone" from
+    "never existed" without a second query."""
+    cursor = await _get_db().execute("DELETE FROM memory_projects WHERE project_id = ?", (project_id,))
+    await _get_db().commit()
+    return cursor.rowcount > 0
+
+
+async def get_memory_project_rows() -> list[dict]:
+    """All user-registered project rows as plain dicts.
+
+    Consumed by kai.memory_projects at startup (cache load) and by
+    the /project list handler. Returns dicts rather than dataclass
+    instances so validation stays in one place (the cache loader),
+    matching the YAML path where the loader validates raw dicts.
+    """
+    async with _get_db().execute(
+        "SELECT project_id, display_name, workspace_root, memory_enabled, default_scope_for_new_facts, created_by FROM memory_projects"
+    ) as cursor:
+        rows = await cursor.fetchall()
+        return [
+            {
+                "project_id": row["project_id"],
+                "display_name": row["display_name"],
+                "workspace_root": row["workspace_root"],
+                "memory_enabled": bool(row["memory_enabled"]),
+                "default_scope_for_new_facts": row["default_scope_for_new_facts"],
+                "created_by": row["created_by"],
+            }
+            for row in rows
+        ]
 
 
 async def get_all_workspace_paths(limit: int = 100) -> list[str]:

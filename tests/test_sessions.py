@@ -1,5 +1,6 @@
 """Tests for sessions.py async database CRUD."""
 
+import sqlite3
 from pathlib import Path
 
 import aiosqlite
@@ -50,6 +51,75 @@ class TestSessions:
 
     async def test_get_stats_unknown(self, db):
         assert await sessions.get_stats(999) is None
+
+
+class TestMemoryProjectRows:
+    """Persistence layer for chat-registered memory projects. The
+    merge/validation logic lives in kai.memory_projects; these tests
+    pin the CRUD contract and the DB-level uniqueness backstops."""
+
+    async def test_register_and_list_roundtrip(self, db):
+        await sessions.register_memory_project(
+            project_id="phi",
+            display_name="Phi",
+            workspace_root="/work/phi",
+            created_by=123,
+        )
+        rows = await sessions.get_memory_project_rows()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["project_id"] == "phi"
+        assert row["display_name"] == "Phi"
+        assert row["workspace_root"] == "/work/phi"
+        assert row["memory_enabled"] is True
+        assert row["default_scope_for_new_facts"] == "project"
+        assert row["created_by"] == 123
+
+    async def test_unregister_returns_whether_row_existed(self, db):
+        await sessions.register_memory_project(
+            project_id="phi",
+            display_name="Phi",
+            workspace_root="/work/phi",
+            created_by=123,
+        )
+        assert await sessions.unregister_memory_project("phi") is True
+        assert await sessions.unregister_memory_project("phi") is False
+        assert await sessions.get_memory_project_rows() == []
+
+    async def test_duplicate_project_id_raises(self, db):
+        """PRIMARY KEY backstop for the registration race; the
+        handler checks the merged registry first, but two concurrent
+        registrations must not both land."""
+        await sessions.register_memory_project(
+            project_id="phi",
+            display_name="Phi",
+            workspace_root="/work/phi",
+            created_by=123,
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            await sessions.register_memory_project(
+                project_id="phi",
+                display_name="Phi Again",
+                workspace_root="/work/elsewhere",
+                created_by=456,
+            )
+
+    async def test_duplicate_root_raises(self, db):
+        """UNIQUE(workspace_root) backstop: the detector needs a
+        single owner per root."""
+        await sessions.register_memory_project(
+            project_id="phi",
+            display_name="Phi",
+            workspace_root="/work/phi",
+            created_by=123,
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            await sessions.register_memory_project(
+                project_id="phi2",
+                display_name="Phi Two",
+                workspace_root="/work/phi",
+                created_by=456,
+            )
 
 
 # ── Jobs ─────────────────────────────────────────────────────────────

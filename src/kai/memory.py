@@ -1829,11 +1829,13 @@ async def retrieve_scoped_memories(
     # #543's lazy import of the scope constants. A None workspace
     # skips detection: no path means no project authority, which
     # collapses to the same global-only allowed scopes as an
-    # unregistered path (detection rule 4).
-    from kai.memory_projects import detect_active_memory_project
+    # unregistered path (detection rule 4). Detection consults the
+    # MERGED registry (operator-pinned YAML over user-registered DB
+    # rows) so chat registrations take effect without a restart.
+    from kai.memory_projects import detect_active_memory_project, merged_registry
 
     if context.workspace is not None:
-        active_project = detect_active_memory_project(context.workspace, _config.memory_projects)
+        active_project = detect_active_memory_project(context.workspace, merged_registry(_config.memory_projects))
 
     # Step 3: build allowed scopes. Project scope is admitted only
     # when an active project is detected AND that project has

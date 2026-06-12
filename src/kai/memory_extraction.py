@@ -31,7 +31,7 @@ from pathlib import Path
 from kai import memory
 from kai.config import Config, ModelRole, resolve_user_model
 from kai.memory import MemoryResult
-from kai.memory_projects import ActiveMemoryProject, detect_active_memory_project
+from kai.memory_projects import ActiveMemoryProject, detect_active_memory_project, merged_registry
 from kai.oneshot import _EXTRACTOR_CWD as _EXTRACTOR_CWD
 from kai.oneshot import _SUBPROCESS_ENV_ALLOWLIST as _SUBPROCESS_ENV_ALLOWLIST
 from kai.oneshot import (
@@ -3119,10 +3119,12 @@ async def extract_and_store(
     # which project they belong to. The detector is pure and cheap
     # (longest-prefix match over the registry), but running it per
     # fact would still invite drift if a future edit moved the two
-    # write paths apart.
+    # write paths apart. Detection consults the MERGED registry
+    # (operator-pinned YAML over user-registered DB rows) so chat
+    # registrations route writes without a restart.
     active_project: ActiveMemoryProject | None = None
     if workspace:
-        active_project = detect_active_memory_project(Path(workspace), config.memory_projects)
+        active_project = detect_active_memory_project(Path(workspace), merged_registry(config.memory_projects))
 
     sem = _get_semaphore(user_id)
     # Pre-initialize the storage counters so the post-try summary log

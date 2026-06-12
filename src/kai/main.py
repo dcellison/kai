@@ -244,6 +244,17 @@ def _start() -> None:
         use_webhook = config.telegram_webhook_url is not None
 
         await sessions.init_db(config.session_db_path)
+
+        # Load user-registered memory projects into the detection
+        # cache. Must follow init_db (the rows live in the session
+        # DB) and precede message handling, because both detection
+        # call sites read the merged registry on the very first
+        # turn. After startup the /project handlers keep the cache
+        # in lockstep with the DB; this is the only bulk load.
+        from kai.memory_projects import load_db_registry
+
+        load_db_registry(await sessions.get_memory_project_rows())
+
         app = create_bot(config, use_webhook=use_webhook)
 
         # Determine the default user (admin or first user) for per-user
