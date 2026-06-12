@@ -14,13 +14,21 @@ reports the Pareto frontier of (precision, latency).
 Design rationale (the part that is not obvious from the code):
 
 - The harness scores against `format_context`, not `search` directly.
-  `format_context` is what production runs; scoring a reduced pipeline
-  (search without floor filtering or budget walking) would measure a
-  code path the agent never uses. `format_context` is already
-  instrumented with a structured `memory.recall` log line, so the
-  harness reads the log rather than wrapping retrieval. This doubles
-  as a regression test: if the log emit ever stops being parseable,
-  the harness fails loudly.
+  `format_context` is the LEGACY recall pipeline; scoring a reduced
+  pipeline (search without floor filtering or budget walking) would
+  measure a code path the agent never uses. `format_context` is
+  already instrumented with a structured `memory.recall` log line, so
+  the harness reads the log rather than wrapping retrieval. This
+  doubles as a regression test: if the log emit ever stops being
+  parseable, the harness fails loudly.
+
+- LEGACY-RECALL EVALUATOR ONLY: when `MEMORY_SCOPED_RECALL_ENABLED`
+  is on, production turns are served by scoped retrieval through
+  `assemble_turn_context`, which this harness does NOT exercise. The
+  harness warns at init when that knob is enabled, and its results
+  then describe a pipeline production no longer runs. A scoped-aware
+  evaluator (workspace-parameterized probes against the scoped live
+  helper) is future work tracked in the scoped-memory epic.
 
 - Probes whose expected fact has been deleted from the store between
   authoring and evaluation are bucketed as "probe-set drift" rather
@@ -1108,6 +1116,18 @@ def _initialize_memory() -> bool:
                 file=sys.stderr,
             )
             return False
+        # Loud divergence warning, not a hard stop: the legacy
+        # numbers are still meaningful for comparing against older
+        # baselines, but they no longer describe the live read path
+        # once the cutover knob is on. Anyone using this harness as
+        # post-cutover evidence needs to see this in the run output.
+        if config.memory_scoped_recall_enabled:
+            print(
+                "eval: WARNING: MEMORY_SCOPED_RECALL_ENABLED is on; production serves "
+                "scoped recall, but this harness measures the LEGACY pipeline only. "
+                "Do not use these results as evidence about the live read path.",
+                file=sys.stderr,
+            )
         return True
     except Exception as e:
         print(f"eval: init failed: {e}", file=sys.stderr)

@@ -729,3 +729,27 @@ class TestApplyOverride:
         assert pre_speaker_weights == mem_mod._SPEAKER_WEIGHTS
         assert pre_overfetch == mem_mod._SEARCH_OVERFETCH
         assert mem_mod._config is pre_config
+
+
+class TestLegacyOnlyWarning:
+    """This harness measures the legacy recall pipeline; when the
+    scoped-recall cutover knob is on, production serves a different
+    read path and the init step must say so loudly."""
+
+    def _init_with(self, monkeypatch, *, scoped_enabled: bool) -> bool:
+        cfg = MagicMock()
+        cfg.memory_scoped_recall_enabled = scoped_enabled
+        monkeypatch.setattr("kai.config.load_config", lambda: cfg)
+        monkeypatch.setattr("kai.memory.init_memory", lambda config: None)
+        monkeypatch.setattr("kai.memory.is_enabled", lambda: True)
+        return retrieval._initialize_memory()
+
+    def test_warns_when_scoped_recall_enabled(self, monkeypatch, capsys):
+        assert self._init_with(monkeypatch, scoped_enabled=True) is True
+        err = capsys.readouterr().err
+        assert "LEGACY pipeline only" in err
+
+    def test_silent_when_scoped_recall_disabled(self, monkeypatch, capsys):
+        assert self._init_with(monkeypatch, scoped_enabled=False) is True
+        err = capsys.readouterr().err
+        assert "LEGACY pipeline only" not in err
