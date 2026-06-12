@@ -4414,6 +4414,7 @@ class TestStoreFactsScopeMetadata:
         scope_lines = [r.message for r in caplog.records if r.message.startswith("memory.extract.scope ")]
         assert len(scope_lines) == 1
         payload = json.loads(scope_lines[0].split(" ", 1)[1])
+        assert payload["source"] == "facts"
         assert payload["active_project_id"] == "kai"
         assert payload["matched_root"] == "/work/kai"
         assert payload["project_memory_enabled"] is True
@@ -4511,6 +4512,92 @@ class TestEpisodeScopeMetadata:
         assert captured_metadata["scope"] == "global"
         assert captured_metadata["scope_source"] == "extraction_default"
 
+    @pytest.mark.asyncio
+    async def test_episode_only_store_emits_scope_log(self, monkeypatch, caplog):
+        """An episode can store with zero facts (the two outputs are
+        orthogonal), and `_store_facts` never runs on that path; the
+        episode-side emission is what keeps episode-only scoped writes
+        visible in the memory.extract.scope stream."""
+        episode_payload = {
+            "goal": "Lock per-user home workspace as the canonical layout",
+            "context": "ctx",
+            "approach": "ap",
+            "outcome": "out",
+            "outcome_quality": "success",
+            "tags": ["t1"],
+            "actors": ["user"],
+            "scope_hint": "project",
+        }
+
+        async def _fake_runner(payload, config, **kwargs):
+            return episode_payload, None
+
+        monkeypatch.setattr(memory_extraction, "_run_episode_extractor", _fake_runner)
+        monkeypatch.setattr(memory_extraction, "_emit_episode_log", lambda **kw: None)
+        from kai import memory as memory_module
+
+        monkeypatch.setattr(memory_module, "add_structured", lambda *a, **kw: "stored-mem-id")
+
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            await memory_extraction._generate_episode(
+                user_text="propose home layout",
+                assistant_text="locked: per-user home workspace",
+                user_id="u-int",
+                session_id="s-1",
+                config=_cfg(),
+                effective_backend="claude",
+                effective_provider="anthropic",
+                active_project=_active_project(),
+            )
+
+        scope_lines = [r.message for r in caplog.records if r.message.startswith("memory.extract.scope ")]
+        assert len(scope_lines) == 1
+        payload = json.loads(scope_lines[0].split(" ", 1)[1])
+        assert payload["source"] == "episode"
+        assert payload["active_project_id"] == "kai"
+        assert payload["hinted"] == 1
+        assert payload["stored_project"] == 1
+        assert payload["stored_global"] == 0
+
+    @pytest.mark.asyncio
+    async def test_failed_episode_store_emits_no_scope_log(self, monkeypatch, caplog):
+        """The scope log reports rows that LANDED; an add_structured
+        failure must not emit one (mirroring the fact side's
+        stored-rows-only tally)."""
+        episode_payload = {
+            "goal": "Lock per-user home workspace as the canonical layout",
+            "context": "ctx",
+            "approach": "ap",
+            "outcome": "out",
+            "outcome_quality": "success",
+            "tags": ["t1"],
+            "actors": ["user"],
+        }
+
+        async def _fake_runner(payload, config, **kwargs):
+            return episode_payload, None
+
+        monkeypatch.setattr(memory_extraction, "_run_episode_extractor", _fake_runner)
+        monkeypatch.setattr(memory_extraction, "_emit_episode_log", lambda **kw: None)
+        from kai import memory as memory_module
+
+        monkeypatch.setattr(memory_module, "add_structured", lambda *a, **kw: None)
+
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            await memory_extraction._generate_episode(
+                user_text="propose home layout",
+                assistant_text="locked: per-user home workspace",
+                user_id="u-int",
+                session_id="s-1",
+                config=_cfg(),
+                effective_backend="claude",
+                effective_provider="anthropic",
+                active_project=_active_project(),
+            )
+
+        scope_lines = [r.message for r in caplog.records if r.message.startswith("memory.extract.scope ")]
+        assert scope_lines == []
+
 
 class TestWorkspaceThreading:
     """`extract_and_store` detects the active project from the
@@ -4606,3 +4693,202 @@ class TestScopeHintSchema:
         props = memory_extraction._EPISODE_SCHEMA["properties"]["episode"]["properties"]
         assert props["scope_hint"]["enum"] == ["global", "project"]
         assert "scope_hint" not in memory_extraction._EPISODE_SCHEMA["properties"]["episode"]["required"]
+
+
+def _mem_result(mem_id: str, metadata: dict, score: float = 0.9) -> MemoryResult:
+    """Build a MemoryResult with real (dict) metadata for scope tests."""
+    return MemoryResult(
+        id=mem_id,
+        text="t",
+        score=score,
+        memory_type="fact",
+        metadata=metadata,
+        created_at="2026-06-12T00:00:00",
+    )
+
+
+# Scope-carrying metadata shapes used by the write-time-read tests.
+# `scope_source` must be a write-path value or the resolver flags the
+# row invalid_defaulted; classifier is the realistic shape for rows
+# written by the routing path.
+_OTHER_PROJECT_META = {"scope": "project", "project_id": "other", "scope_source": "classifier"}
+_KAI_PROJECT_META = {"scope": "project", "project_id": "kai", "scope_source": "classifier"}
+
+
+class TestScopeAdmittedWriteReads:
+    """Unit tests for `_scope_admitted`, the write-time-read admission
+    rule shared by the consolidation-candidate filter and the dedup
+    gate. Composes the read side's resolver and admission helper, so
+    these tests pin the composition (which rows a write-time read may
+    act on), not the helpers' internals."""
+
+    def test_legacy_row_admitted_everywhere(self):
+        assert memory_extraction._scope_admitted({}, None) is True
+        assert memory_extraction._scope_admitted({}, "kai") is True
+
+    def test_matching_project_row_admitted(self):
+        assert memory_extraction._scope_admitted(_KAI_PROJECT_META, "kai") is True
+
+    def test_wrong_project_row_rejected(self):
+        assert memory_extraction._scope_admitted(_OTHER_PROJECT_META, "kai") is False
+
+    def test_project_row_rejected_without_project_authority(self):
+        """allowed_project_id None covers both no-detected-project and
+        memory-disabled-project; in either state a project row has no
+        write-time-read authority."""
+        assert memory_extraction._scope_admitted(_KAI_PROJECT_META, None) is False
+
+    def test_task_row_rejected(self):
+        meta = {"scope": "task", "scope_source": "classifier"}
+        assert memory_extraction._scope_admitted(meta, "kai") is False
+
+    def test_allowed_write_project_id_requires_memory_enabled(self):
+        assert memory_extraction._allowed_write_project_id(None) is None
+        assert memory_extraction._allowed_write_project_id(_active_project(memory_enabled=False)) is None
+        assert memory_extraction._allowed_write_project_id(_active_project()) == "kai"
+
+
+class TestConsolidationCandidateScope:
+    """Wrong-project rows must never enter the consolidation candidate
+    set: an `update_of` against such a row deletes and rewrites another
+    project's memory under the current project, and a `skip_redundant`
+    suppresses a valid current-project write. The filter removes them
+    BEFORE the candidate block is rendered and before
+    `candidate_id_set` is built, so the extractor can neither see nor
+    legally cite them."""
+
+    @pytest.mark.asyncio
+    async def test_wrong_project_candidate_filtered_from_extractor_input(self, monkeypatch, tmp_path, caplog):
+        root = (tmp_path / "kai").resolve()
+        root.mkdir()
+        cfg = _cfg(
+            memory_consolidation_candidates_n=8,
+            memory_projects={
+                "kai": MemoryProjectConfig(
+                    project_id="kai",
+                    display_name="Kai",
+                    workspace_roots=(root,),
+                    memory_enabled=True,
+                    default_scope_for_new_facts=None,
+                )
+            },
+        )
+        candidates = [
+            _mem_result("legacy-row", {}),
+            _mem_result("kai-row", dict(_KAI_PROJECT_META)),
+            _mem_result("other-row", dict(_OTHER_PROJECT_META)),
+        ]
+        monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: list(candidates))
+
+        seen: dict = {}
+
+        async def _fake_extractor(payload, config, **kwargs):
+            seen["candidate_ids"] = kwargs.get("candidate_ids")
+            seen["payload"] = payload
+            result = MagicMock()
+            result.facts = []
+            result.has_episode = False
+            return result
+
+        monkeypatch.setattr(memory_extraction, "_run_extractor", _fake_extractor)
+
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            await extract_and_store(
+                user_text="u",
+                assistant_text="a",
+                user_id="1",
+                config=cfg,
+                workspace=str(root),
+            )
+
+        # The wrong-project row is gone from both the citable id set
+        # and the rendered payload; admissible rows survive.
+        assert seen["candidate_ids"] == {"legacy-row", "kai-row"}
+        assert "other-row" not in seen["payload"]
+        # The candidate log line reports the exclusion so an operator
+        # can see scope filtering acting on write-time reads.
+        cand_lines = [r.message for r in caplog.records if r.message.startswith("memory.consolidate.candidates ")]
+        assert len(cand_lines) == 1
+        payload = json.loads(cand_lines[0].split(" ", 1)[1])
+        assert payload["excluded_by_scope"] == 1
+        assert payload["n_candidates"] == 2
+
+    @pytest.mark.asyncio
+    async def test_no_project_excludes_all_project_candidates(self, monkeypatch):
+        """Outside any registered project, project-scoped rows from
+        EVERY project lose candidate authority; only global/legacy
+        rows remain citable."""
+        cfg = _cfg(memory_consolidation_candidates_n=8)
+        candidates = [
+            _mem_result("legacy-row", {}),
+            _mem_result("kai-row", dict(_KAI_PROJECT_META)),
+        ]
+        monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: list(candidates))
+
+        seen: dict = {}
+
+        async def _fake_extractor(payload, config, **kwargs):
+            seen["candidate_ids"] = kwargs.get("candidate_ids")
+            result = MagicMock()
+            result.facts = []
+            result.has_episode = False
+            return result
+
+        monkeypatch.setattr(memory_extraction, "_run_extractor", _fake_extractor)
+
+        await extract_and_store(user_text="u", assistant_text="a", user_id="1", config=cfg)
+
+        assert seen["candidate_ids"] == {"legacy-row"}
+
+
+class TestDedupGateScope:
+    """`_paraphrase_neighbor` must not let a wrong-project row
+    suppress a current-project write, and must not let a wrong-project
+    row at rank 1 mask an admissible duplicate below it."""
+
+    def _searches(self, monkeypatch, results: list[MemoryResult]) -> None:
+        monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
+        monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: list(results))
+
+    def test_wrong_project_neighbor_does_not_suppress(self, monkeypatch):
+        self._searches(monkeypatch, [_mem_result("other-row", dict(_OTHER_PROJECT_META), score=0.99)])
+        neighbor = _paraphrase_neighbor("x", "u1", threshold=0.9, active_project=_active_project())
+        assert neighbor is None
+
+    def test_admissible_duplicate_below_wrong_project_row_still_fires(self, monkeypatch):
+        """Rank 1 is wrong-project; rank 2 is an admissible duplicate
+        above threshold. The gate must skip rank 1 and fire on rank 2;
+        the pre-fix top-1 fetch would have returned the wrong-project
+        row and (post-admission) missed the real duplicate."""
+        self._searches(
+            monkeypatch,
+            [
+                _mem_result("other-row", dict(_OTHER_PROJECT_META), score=0.99),
+                _mem_result("kai-row", dict(_KAI_PROJECT_META), score=0.95),
+            ],
+        )
+        neighbor = _paraphrase_neighbor("x", "u1", threshold=0.9, active_project=_active_project())
+        assert neighbor is not None
+        assert neighbor.id == "kai-row"
+
+    def test_nearest_admissible_below_threshold_does_not_fire(self, monkeypatch):
+        """The first admitted hit is the nearest admissible neighbor;
+        if it is below threshold the gate must not fire, and later
+        (lower-scored) hits must not be consulted."""
+        self._searches(
+            monkeypatch,
+            [
+                _mem_result("other-row", dict(_OTHER_PROJECT_META), score=0.99),
+                _mem_result("kai-row", dict(_KAI_PROJECT_META), score=0.7),
+            ],
+        )
+        neighbor = _paraphrase_neighbor("x", "u1", threshold=0.9, active_project=_active_project())
+        assert neighbor is None
+
+    def test_legacy_neighbor_still_fires_without_project(self, monkeypatch):
+        """The pre-scoping behavior is preserved for the global-only
+        state: a legacy row above threshold suppresses the duplicate."""
+        self._searches(monkeypatch, [_mem_result("legacy-row", {}, score=0.95)])
+        neighbor = _paraphrase_neighbor("x", "u1", threshold=0.9)
+        assert neighbor is not None
+        assert neighbor.id == "legacy-row"

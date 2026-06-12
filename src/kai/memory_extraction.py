@@ -1792,14 +1792,72 @@ def _validate_facts(
     return validated
 
 
-def _paraphrase_neighbor(content: str, user_id: str, threshold: float) -> MemoryResult | None:
-    """
-    Top-1 semantic-search dedup gate.
+# Fetch width for the dedup gate's neighbor search. The gate's
+# decision needs only the nearest ADMISSIBLE neighbor, but a wrong-
+# scope row can occupy rank 1 and mask an admissible duplicate right
+# below it, so the gate scans a small descending-score window instead
+# of trusting top-1. Five covers the realistic case (a handful of
+# near-identical rows split across projects) without turning the gate
+# into a full retrieval.
+_DEDUP_NEIGHBOR_FETCH_N: int = 5
 
-    Returns the nearest existing user-scoped memory when its cosine
-    score meets or exceeds `threshold` against `content`. Returns None
-    when no neighbor reaches the threshold, when the store is empty,
-    when memory is disabled, or when the search call raises.
+
+def _allowed_write_project_id(active_project: ActiveMemoryProject | None) -> str | None:
+    """
+    The project id whose project-scoped rows have authority over this
+    extraction run's write-time reads, or None for global-only.
+
+    None covers both "no detected project" and "detected project with
+    memory disabled", matching the read side's admission contract
+    (`memory._scoped_memory_admission_reason` treats a None
+    allowed_project_id as project-scope-not-allowed). Centralized so
+    the consolidation-candidate filter and the dedup gate cannot
+    drift on the memory-disabled rule.
+    """
+    if active_project is None or not active_project.memory_enabled:
+        return None
+    return active_project.project_id
+
+
+def _scope_admitted(metadata: dict | None, allowed_project_id: str | None) -> bool:
+    """
+    True when a stored row has authority in this extraction run.
+
+    Thin composition of the read side's resolver and admission helper
+    so write-time reads (consolidation candidates, the dedup gate)
+    apply EXACTLY the rule retrieval uses: global always admitted
+    (including legacy rows), project rows only under a matching
+    allowed_project_id, task rows never. Write-time reads control
+    deletion (`update_of`) and suppression (`skip_redundant`, dedup),
+    so their candidate authority must be at least as scoped as the
+    write authority they gate.
+    """
+    resolved = memory.resolve_memory_scope(metadata)
+    return memory._scoped_memory_admission_reason(resolved, allowed_project_id=allowed_project_id) is None
+
+
+def _paraphrase_neighbor(
+    content: str,
+    user_id: str,
+    threshold: float,
+    active_project: ActiveMemoryProject | None = None,
+) -> MemoryResult | None:
+    """
+    Nearest-admissible-neighbor semantic-search dedup gate.
+
+    Returns the nearest existing user-scoped memory that is ADMITTED
+    under the active scope policy when its cosine score meets or
+    exceeds `threshold` against `content`. Returns None when no
+    admissible neighbor reaches the threshold, when the store is
+    empty, when memory is disabled, or when the search call raises.
+
+    Scope admission (`_scope_admitted`) is applied before the
+    threshold test: a near-verbatim row belonging to ANOTHER project
+    must not suppress this project's write, because the row has no
+    authority here even at cosine 1.0. Results arrive in descending
+    score order, so the first admitted hit IS the nearest admissible
+    neighbor; if its score is below threshold, every later admissible
+    hit's score is too, and the gate does not fire.
 
     Returning the matched `MemoryResult` (vs the prior `bool`) lets the
     caller log the neighbor's id and cosine score on a fire without
@@ -1828,14 +1886,17 @@ def _paraphrase_neighbor(content: str, user_id: str, threshold: float) -> Memory
         # at the public-API layer; this helper is called from inside
         # the semaphore block of `extract_and_store` which already
         # runs off the hot path, so a direct sync call is fine here.
-        results = memory.search(content, user_id=user_id, limit=1)
+        results = memory.search(content, user_id=user_id, limit=_DEDUP_NEIGHBOR_FETCH_N)
     except Exception:
         log.debug("_paraphrase_neighbor: search failed; treating as non-duplicate", exc_info=True)
         return None
-    if not results:
+    allowed_project_id = _allowed_write_project_id(active_project)
+    for result in results or []:
+        if not _scope_admitted(result.metadata, allowed_project_id):
+            continue
+        if result.score >= threshold:
+            return result
         return None
-    if results[0].score >= threshold:
-        return results[0]
     return None
 
 
@@ -2485,8 +2546,11 @@ async def _generate_episode(
                     # Write-scope routing, same consumption shape as
                     # the fact path in _store_facts: the generator's
                     # scope_hint is routed (never stored raw) and the
-                    # resulting scope fields land in metadata.
-                    extra.update(_route_write_scope(episode.get("scope_hint"), active_project))
+                    # resulting scope fields land in metadata. Kept in
+                    # a named variable because the post-store scope
+                    # log below reports the routed outcome.
+                    scope_meta = _route_write_scope(episode.get("scope_hint"), active_project)
+                    extra.update(scope_meta)
                     # add_structured is sync (Mem0 is sync). Run off
                     # the event loop so the embedding step does not
                     # block other stage-2 tasks queued behind this
@@ -2512,6 +2576,21 @@ async def _generate_episode(
                         outcome = "stored"
                         memory_id = mem_id
                         reason = None
+                        # Episode-side scope log, emitted only for a
+                        # row that actually landed (mirrors the fact
+                        # side's stored-rows-only tally). Episodes are
+                        # orthogonal to facts, so without this line an
+                        # episode-only run would write scoped metadata
+                        # with no memory.extract.scope record at all.
+                        _emit_scope_log(
+                            user_id=user_id,
+                            source="episode",
+                            active_project=active_project,
+                            hinted=1 if scope_meta["scope_source"] == memory.SCOPE_SOURCE_CLASSIFIER else 0,
+                            defaulted=0 if scope_meta["scope_source"] == memory.SCOPE_SOURCE_CLASSIFIER else 1,
+                            stored_global=1 if scope_meta["scope"] == memory.SCOPE_GLOBAL else 0,
+                            stored_project=1 if scope_meta["scope"] == memory.SCOPE_PROJECT else 0,
+                        )
                     else:
                         outcome = "store_failed"
                         reason = "add_structured returned None"
@@ -2550,6 +2629,50 @@ _SCOPE_CONFIDENCE_DEFAULTED: float = 0.6
 # schema regression that lets a stray string through) is treated as
 # "no hint" rather than rejected or guessed.
 _VALID_SCOPE_HINTS: frozenset[str] = frozenset({memory.SCOPE_GLOBAL, memory.SCOPE_PROJECT})
+
+
+def _emit_scope_log(
+    *,
+    user_id: str,
+    source: str,
+    active_project: ActiveMemoryProject | None,
+    hinted: int,
+    defaulted: int,
+    stored_global: int,
+    stored_project: int,
+) -> None:
+    """
+    Emit one memory.extract.scope JSON line for a set of scoped writes.
+
+    Shared by the fact path (`_store_facts`, source="facts", once per
+    run with that run's tallies) and the episode path
+    (`_generate_episode`, source="episode", once per stored episode).
+    Episodes are orthogonal to facts (a run can store an episode with
+    zero facts), so a single fact-side emission would leave
+    episode-only scoped writes invisible; the `source` discriminator
+    is what lets a log reader attribute a scoped row to the path that
+    wrote it. `active_project_id` reports the DETECTED project even
+    when memory_enabled is false (routing then forces global); the
+    `project_memory_enabled` field is what distinguishes the two
+    states, mirroring the detector's diagnostics contract.
+    """
+    log.info(
+        "memory.extract.scope %s",
+        json.dumps(
+            {
+                "user_id": user_id,
+                "source": source,
+                "active_project_id": active_project.project_id if active_project else None,
+                "matched_root": str(active_project.matched_root) if active_project else None,
+                "project_memory_enabled": active_project.memory_enabled if active_project else None,
+                "hinted": hinted,
+                "defaulted": defaulted,
+                "stored_global": stored_global,
+                "stored_project": stored_project,
+            },
+            separators=(",", ":"),
+        ),
+    )
 
 
 def _route_write_scope(
@@ -2827,6 +2950,7 @@ def _store_facts(
             content,
             user_id,
             threshold=config.memory_duplicate_threshold,
+            active_project=active_project,
         )
         if neighbor is not None:
             log.debug("_store_facts: skipping duplicate %r", content[:80])
@@ -2888,29 +3012,20 @@ def _store_facts(
                 replaced_id=None,
                 outcome="dropped_backend",
             )
-    # One scope-routing line per extraction run (this function is
-    # called at most once per run, and only when the validated fact
-    # list is non-empty). The fixed-shape JSON record lets shadow-log
-    # analysis trace a scoped row back to the write-time decision that
-    # produced it. `active_project_id` reports the DETECTED project
-    # even when memory_enabled is false (routing then forces global);
-    # the `project_memory_enabled` field is what distinguishes the two
-    # states, mirroring the detector's diagnostics contract.
-    log.info(
-        "memory.extract.scope %s",
-        json.dumps(
-            {
-                "user_id": user_id,
-                "active_project_id": active_project.project_id if active_project else None,
-                "matched_root": str(active_project.matched_root) if active_project else None,
-                "project_memory_enabled": active_project.memory_enabled if active_project else None,
-                "hinted": scope_hinted,
-                "defaulted": scope_defaulted,
-                "stored_global": stored_by_scope.get(memory.SCOPE_GLOBAL, 0),
-                "stored_project": stored_by_scope.get(memory.SCOPE_PROJECT, 0),
-            },
-            separators=(",", ":"),
-        ),
+    # One fact-side scope-routing line per extraction run (this
+    # function is called at most once per run, and only when the
+    # validated fact list is non-empty). The fixed-shape JSON record
+    # lets shadow-log analysis trace a scoped row back to the
+    # write-time decision that produced it; episode-side writes emit
+    # their own line from `_generate_episode`.
+    _emit_scope_log(
+        user_id=user_id,
+        source="facts",
+        active_project=active_project,
+        hinted=scope_hinted,
+        defaulted=scope_defaulted,
+        stored_global=stored_by_scope.get(memory.SCOPE_GLOBAL, 0),
+        stored_project=stored_by_scope.get(memory.SCOPE_PROJECT, 0),
     )
     return stored, replaced, skipped
 
@@ -3068,6 +3183,24 @@ async def extract_and_store(
                 # `or []` collapses both None and a falsy empty result
                 # to the documented contract (a list).
                 candidates = candidates or []
+            # Scope admission for consolidation candidates. The fetch
+            # above is user-wide; without this filter, a project row
+            # from ANOTHER project can enter the EXISTING FACTS block,
+            # where an `update_of` would delete-and-rewrite it under
+            # the current project's scope and a `skip_redundant` would
+            # suppress a valid current-project write. Consolidation is
+            # a write-time read that controls deletion and storage, so
+            # its candidate authority must match the write authority:
+            # the same admission rule retrieval uses, keyed on the
+            # detected project. Excluded candidates also never reach
+            # `candidate_id_set`, so an extractor that hallucinates a
+            # filtered id falls into the existing hallucinated-id drop.
+            excluded_by_scope = 0
+            if candidates:
+                write_project_id = _allowed_write_project_id(active_project)
+                admitted = [c for c in candidates if _scope_admitted(c.metadata, write_project_id)]
+                excluded_by_scope = len(candidates) - len(admitted)
+                candidates = admitted
             candidate_id_set: set[str] = {c.id for c in candidates}
             # Per-id metadata lookup for `_validate_facts` Rule 4b
             # (issue #414): the rule needs the existing row's stored
@@ -3089,6 +3222,7 @@ async def extract_and_store(
                         "user_id": user_id,
                         "n_candidates": len(candidates),
                         "candidate_ids": [c.id for c in candidates],
+                        "excluded_by_scope": excluded_by_scope,
                     },
                     separators=(",", ":"),
                 ),
@@ -3233,6 +3367,7 @@ __all__ = [
     "_ALLOWED_TYPES",
     "_CONFIRMATION_QUOTE_MIN_CHARS",
     "_CONSOLIDATION_INTENTS",
+    "_DEDUP_NEIGHBOR_FETCH_N",
     "_EXTRACTION_PROMPT_VERSION",
     "_EXTRACTION_SYSTEM_PROMPT",
     "_EXTRACTOR_CWD",
@@ -3242,9 +3377,11 @@ __all__ = [
     "_SCOPE_CONFIDENCE_DEFAULTED",
     "_SCOPE_CONFIDENCE_HINTED",
     "_SEMAPHORE_CAP",
+    "_allowed_write_project_id",
     "_build_extraction_payload",
     "_capped_assistant",
     "_emit_intent_log",
+    "_emit_scope_log",
     "_get_semaphore",
     "_paraphrase_neighbor",
     "_per_user_semaphores",
@@ -3252,6 +3389,7 @@ __all__ = [
     "_render_candidate_source",
     "_route_write_scope",
     "_run_extractor",
+    "_scope_admitted",
     "_store_facts",
     "_strip_role_labels",
     "_validate_episode",
