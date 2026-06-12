@@ -9,6 +9,13 @@ dropping into an ad-hoc Python shell.
 Scope (spec §16 + Phase 4 of spec 320):
 - `purge <user_id> --source <source>`: scoped deletion. Leaves rows
   whose metadata.source does not match untouched.
+- `reclassify-scope <user_id> [...]`: guarded scope reclassification
+  of unreviewed global rows. Dry-run by default (report + proposals
+  file, no store writes); `--apply` writes a reviewed proposals file
+  with pre-images dumped first; `--rollback` restores a pre-image
+  file. The pass logic lives in `src/kai/memory_reclassify.py`; this
+  module owns only argument parsing, the authorization gates, and
+  dispatch.
 
 Commands that modify the store require an explicit `--yes` flag. When
 `--yes` is absent, the command prints the action it WOULD take and
@@ -26,8 +33,10 @@ future incident requires the nuclear option, add it as a separate
 `nuke` subcommand with its own review.
 
 This module should NOT import `kai.bot`, `kai.pool`, or other
-bot-runtime code, so the CLI stays cheap to invoke. Only the memory
-and config modules are needed.
+bot-runtime code, so the CLI stays cheap to invoke. The reclassify
+handler imports `kai.memory_reclassify` (which pulls the one-shot
+reasoner stack) inside the function for the same reason: a plain
+`purge` invocation never pays that import.
 """
 
 from __future__ import annotations
@@ -36,6 +45,10 @@ import argparse
 import asyncio
 import logging
 import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from kai.config import Config
 
 log = logging.getLogger(__name__)
 
@@ -88,16 +101,105 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Confirm deletion. Without this flag the command prints the planned action and exits with status 2.",
     )
+
+    # Lazy import: the choices list is the only config dependency at
+    # parser-build time. Importing it here (not at module top) keeps
+    # `import kai.memory_admin` itself free of kai.config, preserving
+    # the module's zero-kai-imports surface for test collection.
+    from kai.config import ONESHOT_REASONER_BACKENDS
+
+    rec = sub.add_parser(
+        "reclassify-scope",
+        help="Reclassify unreviewed global memory rows (dry-run by default)",
+        description=(
+            "Classify rows whose resolved scope is global with legacy or "
+            "extraction-default provenance. Dry-run (the default) writes a "
+            "report plus a proposals file and never touches the store. "
+            "--apply writes a reviewed proposals file after re-checks, "
+            "dumping pre-images first. --rollback restores rows from a "
+            "pre-image file. The daemon must be stopped; the embedded "
+            "store is single-process."
+        ),
+    )
+    rec.add_argument(
+        "user_id",
+        help="Telegram chat id (as a string) whose rows to reclassify.",
+    )
+    # Classification flags default to None (not their documented
+    # defaults) so the mutating-mode rejection below can tell "flag
+    # explicitly passed" from "default in effect"; the dry-run driver
+    # applies the real defaults.
+    rec.add_argument(
+        "--backend",
+        choices=sorted(ONESHOT_REASONER_BACKENDS),
+        default=None,
+        help="Reasoner backend. Default: the target user's effective backend.",
+    )
+    rec.add_argument(
+        "--os-user",
+        dest="os_user",
+        default=None,
+        help="OS user whose provider auth runs the reasoner. Default: the target user's os_user mapping.",
+    )
+    rec.add_argument(
+        "--provider",
+        default=None,
+        help="Provider wire name (goose only). Default: the target user's effective provider.",
+    )
+    rec.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Confidence gate for both verdict directions. Default: 0.8.",
+    )
+    rec.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help="Eyeball-sample size in the dry-run report. Default: 10.",
+    )
+    rec.add_argument(
+        "--out-dir",
+        dest="out_dir",
+        default=None,
+        help="Artifact directory. Default: <DATA_DIR>/home/<user_id>/docs/reclassify/.",
+    )
+    mode = rec.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--apply",
+        metavar="PROPOSALS",
+        default=None,
+        help="Apply a reviewed proposals file (requires --yes).",
+    )
+    mode.add_argument(
+        "--rollback",
+        metavar="PREIMAGES",
+        default=None,
+        help="Restore rows from a pre-image file (requires --yes).",
+    )
+    rec.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm a mutating mode. Without it, --apply/--rollback print the planned change count and exit with status 2.",
+    )
     return parser
 
 
-def _initialize_memory() -> bool:
-    """Load config and call `init_memory()`; return True on success.
+def _initialize_memory() -> Config | None:
+    """Load config and call `init_memory()`; return the Config on success.
 
     The admin CLI reuses the same init path as the bot so the same
     embedding model, Qdrant directory, and history DB settings are in
     effect. A failure here (missing optional deps, unreadable Qdrant
     dir) is reported to stderr; the caller exits with status 1.
+
+    Returns the loaded Config (truthy) rather than a bare True so
+    subcommands that need config values (reclassify-scope reads the
+    session DB path, project registry, and model settings) do not
+    load the environment twice; `purge`'s `if not _initialize_memory()`
+    check is unaffected. None signals failure. The embedded store is
+    single-process, so a failure here while the daemon is running is
+    expected; stop the service first.
     """
     try:
         from kai.config import load_config
@@ -111,14 +213,15 @@ def _initialize_memory() -> bool:
             # etc.). Both cases print a warning during init_memory; we
             # just stop the command from proceeding.
             print(
-                "memory admin: memory is not enabled. Set MEMORY_ENABLED=true and verify the store is readable.",
+                "memory admin: memory is not enabled. Set MEMORY_ENABLED=true, verify the store is "
+                "readable, and make sure the daemon is stopped (the embedded store is single-process).",
                 file=sys.stderr,
             )
-            return False
-        return True
+            return None
+        return config
     except Exception as e:
         print(f"memory admin: init failed: {e}", file=sys.stderr)
-        return False
+        return None
 
 
 def _cmd_purge(args: argparse.Namespace) -> int:
@@ -176,6 +279,100 @@ def _cmd_purge(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_reclassify(args: argparse.Namespace) -> int:
+    """Execute the `reclassify-scope` subcommand. Returns an exit code.
+
+    Gate order, deliberately:
+    1. Classification flags are rejected in mutating modes before
+       anything else; a typo must not silently change apply
+       semantics.
+    2. Memory init runs before the --yes gate (same rationale as
+       purge: the no-yes plan doubles as a smoke test).
+    3. Mutating modes parse and header-validate their artifact
+       BEFORE the --yes gate, so the plan shows the real change
+       count and a wrong-user file fails loudly up front.
+    The pass logic lives in kai.memory_reclassify; this function owns
+    only the gates and dispatch, per the module-docstring split.
+    """
+    mutating = args.apply is not None or args.rollback is not None
+    if mutating:
+        # The None defaults exist precisely for this check: any
+        # non-None value was explicitly passed.
+        offenders = [
+            name
+            for name, value in (
+                ("--backend", args.backend),
+                ("--os-user", args.os_user),
+                ("--provider", args.provider),
+                ("--threshold", args.threshold),
+                ("--sample", args.sample),
+            )
+            if value is not None
+        ]
+        if offenders:
+            print(
+                f"memory admin: {', '.join(offenders)} only apply to dry-run classification; "
+                "remove them when using --apply/--rollback.",
+                file=sys.stderr,
+            )
+            return 2
+
+    threshold = args.threshold if args.threshold is not None else 0.8
+    if not (0.0 <= threshold <= 1.0):
+        print(f"memory admin: --threshold must be in [0.0, 1.0], got {threshold}", file=sys.stderr)
+        return 2
+
+    config = _initialize_memory()
+    if config is None:
+        return 1
+
+    from pathlib import Path
+
+    from kai import memory_reclassify
+    from kai.config import DATA_DIR
+
+    out_dir = Path(args.out_dir) if args.out_dir else DATA_DIR / "home" / args.user_id / "docs" / "reclassify"
+
+    if not mutating:
+        sample = args.sample if args.sample is not None else 10
+        return asyncio.run(
+            memory_reclassify.run_dry_run(
+                config,
+                args.user_id,
+                backend=args.backend,
+                os_user=args.os_user,
+                provider=args.provider,
+                threshold=threshold,
+                sample=sample,
+                out_dir=out_dir,
+            )
+        )
+
+    artifact_path = Path(args.apply if args.apply is not None else args.rollback)
+    row_type = "proposal" if args.apply is not None else "preimage"
+    try:
+        header, rows = memory_reclassify.parse_artifact(artifact_path.read_text(encoding="utf-8"), row_type=row_type)
+    except (OSError, ValueError) as e:
+        print(f"memory admin: cannot read {row_type} file: {e}", file=sys.stderr)
+        return 1
+    error = memory_reclassify.validate_header(header, user_id=args.user_id)
+    if error is not None:
+        print(f"memory admin: {error}", file=sys.stderr)
+        return 1
+
+    if not args.yes:
+        verb = "apply" if args.apply is not None else "roll back"
+        print(f"memory admin: would {verb} {len(rows)} row(s) from run {header['run_id']} for user {args.user_id}.")
+        print("memory admin: re-run with --yes to execute.")
+        return 2
+
+    if args.apply is not None:
+        return asyncio.run(
+            memory_reclassify.run_apply(config, args.user_id, proposals_path=artifact_path, out_dir=out_dir)
+        )
+    return asyncio.run(memory_reclassify.run_rollback(config, args.user_id, preimages_path=artifact_path))
+
+
 def cli(argv: list[str]) -> None:
     """Dispatch entry point. Called from `__main__.py` with argv[2:].
 
@@ -187,6 +384,8 @@ def cli(argv: list[str]) -> None:
 
     if args.command == "purge":
         sys.exit(_cmd_purge(args))
+    if args.command == "reclassify-scope":
+        sys.exit(_cmd_reclassify(args))
     # argparse's required=True on the subparsers guarantees a known
     # command reaches this point, so the else branch is unreachable
     # under normal invocation. Guarded anyway in case a future

@@ -381,6 +381,19 @@ _BUILDER_SCOPE_SOURCES: frozenset[str] = frozenset(
     }
 )
 
+# Structured-log event name for scope reassignments. Shared by the
+# /memory scope tools (operator moves) and the reclassification CLI
+# (classifier runs and rollbacks) so log readers key on one event
+# regardless of which writer changed the row.
+SCOPE_CHANGE_EVENT = "memory.scope_change"
+
+# Metadata key stamped by classifier writes, carrying the run id that
+# ties a row's scope assignment back to its dry-run report, proposals
+# file, and pre-image dump. Not part of the canonical five scope keys
+# (`build_scope_metadata` does not emit it); the reclassification
+# apply step adds it alongside them.
+SCOPE_RUN_ID_KEY = "scope_run_id"
+
 
 @dataclass(frozen=True)
 class ResolvedMemoryScope:

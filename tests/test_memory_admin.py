@@ -203,7 +203,7 @@ class TestInitializeMemory:
     """Isolated tests for the init helper. The CLI tests above patch
     this helper out; these ensure its own branches are exercised."""
 
-    def test_returns_false_when_is_enabled_false(self, capsys):
+    def test_returns_none_when_is_enabled_false(self, capsys):
         """init_memory ran but memory stays disabled (e.g. MEMORY_ENABLED=
         false or dimension mismatch). The CLI must not proceed."""
         with (
@@ -212,25 +212,28 @@ class TestInitializeMemory:
             patch("kai.memory.is_enabled", return_value=False),
         ):
             ok = memory_admin._initialize_memory()
-        assert ok is False
+        assert ok is None
         err = capsys.readouterr().err
         assert "not enabled" in err
 
-    def test_returns_true_on_success(self):
+    def test_returns_config_on_success(self):
+        """Success hands back the loaded Config (truthy) so subcommands
+        that need config values do not load the environment twice."""
+        cfg = MagicMock()
         with (
-            patch("kai.config.load_config", return_value=MagicMock()),
+            patch("kai.config.load_config", return_value=cfg),
             patch("kai.memory.init_memory"),
             patch("kai.memory.is_enabled", return_value=True),
         ):
             ok = memory_admin._initialize_memory()
-        assert ok is True
+        assert ok is cfg
 
-    def test_returns_false_on_exception(self, capsys):
+    def test_returns_none_on_exception(self, capsys):
         """load_config raising (bad env, missing file) surfaces as a
-        stderr message and False, not a crash."""
+        stderr message and None, not a crash."""
         with patch("kai.config.load_config", side_effect=RuntimeError("bad env")):
             ok = memory_admin._initialize_memory()
-        assert ok is False
+        assert ok is None
         err = capsys.readouterr().err
         assert "init failed" in err
 
@@ -259,3 +262,161 @@ class TestCliDispatch:
         with patch.object(memory_admin, "_cmd_purge", return_value=2), pytest.raises(SystemExit) as exc_info:
             memory_admin.cli(["purge", "12345", "--source", "extracted"])
         assert exc_info.value.code == 2
+
+    def test_dispatch_calls_reclassify(self):
+        with (
+            patch.object(memory_admin, "_cmd_reclassify", return_value=0) as cmd_mock,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            memory_admin.cli(["reclassify-scope", "100"])
+        assert exc_info.value.code == 0
+        assert cmd_mock.call_args[0][0].user_id == "100"
+
+
+# ── reclassify-scope: parser ─────────────────────────────────────────
+
+
+class TestReclassifyParser:
+    def test_modes_are_mutually_exclusive(self):
+        parser = memory_admin._build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["reclassify-scope", "100", "--apply", "a.jsonl", "--rollback", "b.jsonl"])
+
+    def test_classification_flags_default_to_none(self):
+        """None defaults are load-bearing: the mutating-mode rejection
+        distinguishes explicitly-passed flags from defaults by None."""
+        parser = memory_admin._build_parser()
+        args = parser.parse_args(["reclassify-scope", "100"])
+        assert args.backend is None
+        assert args.os_user is None
+        assert args.provider is None
+        assert args.threshold is None
+        assert args.sample is None
+        assert args.out_dir is None
+        assert args.apply is None
+        assert args.rollback is None
+        assert args.yes is False
+
+    def test_backend_choices_reject_unknown(self):
+        parser = memory_admin._build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["reclassify-scope", "100", "--backend", "acp"])
+
+
+# ── reclassify-scope: gates ──────────────────────────────────────────
+
+
+def _write_proposals(tmp_path, *, user_id="100", run_id="rs-1", n=2):
+    """A minimal valid proposals file for gate tests."""
+    from kai import memory_reclassify
+
+    proposals = [
+        memory_reclassify.Proposal(
+            memory_id=f"m{i}",
+            verdict="global",
+            project_id=None,
+            confidence=0.9,
+            reason="r",
+            prior_scope_source="legacy_default",
+            text_sha256="ab",
+        )
+        for i in range(n)
+    ]
+    path = tmp_path / "proposals.jsonl"
+    path.write_text(memory_reclassify.render_proposals({"run_id": run_id, "user_id": user_id}, proposals))
+    return path
+
+
+class TestReclassifyGates:
+    def _args(self, argv):
+        return memory_admin._build_parser().parse_args(["reclassify-scope", *argv])
+
+    def test_classification_flags_rejected_in_mutating_mode(self, tmp_path, capsys):
+        """A typo'd dry-run flag must not silently change apply
+        semantics; it is rejected before memory init runs."""
+        args = self._args(["100", "--apply", str(tmp_path / "p.jsonl"), "--threshold", "0.9"])
+        with patch.object(memory_admin, "_initialize_memory") as init_mock:
+            code = memory_admin._cmd_reclassify(args)
+        assert code == 2
+        init_mock.assert_not_called()
+        assert "--threshold" in capsys.readouterr().err
+
+    def test_threshold_out_of_range_rejected(self, capsys):
+        args = self._args(["100", "--threshold", "1.5"])
+        with patch.object(memory_admin, "_initialize_memory") as init_mock:
+            code = memory_admin._cmd_reclassify(args)
+        assert code == 2
+        init_mock.assert_not_called()
+        assert "[0.0, 1.0]" in capsys.readouterr().err
+
+    def test_init_failure_returns_1(self):
+        args = self._args(["100"])
+        with patch.object(memory_admin, "_initialize_memory", return_value=None):
+            code = memory_admin._cmd_reclassify(args)
+        assert code == 1
+
+    def test_apply_without_yes_prints_count_and_exits_2(self, tmp_path, capsys):
+        path = _write_proposals(tmp_path, n=3)
+        args = self._args(["100", "--apply", str(path)])
+        with patch.object(memory_admin, "_initialize_memory", return_value=MagicMock()):
+            code = memory_admin._cmd_reclassify(args)
+        assert code == 2
+        out = capsys.readouterr().out
+        assert "3 row(s)" in out
+        assert "rs-1" in out
+        assert "--yes" in out
+
+    def test_apply_wrong_user_header_aborts(self, tmp_path, capsys):
+        path = _write_proposals(tmp_path, user_id="200")
+        args = self._args(["100", "--apply", str(path), "--yes"])
+        with patch.object(memory_admin, "_initialize_memory", return_value=MagicMock()):
+            code = memory_admin._cmd_reclassify(args)
+        assert code == 1
+        assert "200" in capsys.readouterr().err
+
+    def test_apply_with_yes_dispatches_run_apply(self, tmp_path):
+        path = _write_proposals(tmp_path)
+        args = self._args(["100", "--apply", str(path), "--yes"])
+        run_apply = AsyncMock(return_value=0)
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=MagicMock()),
+            patch("kai.memory_reclassify.run_apply", run_apply),
+        ):
+            code = memory_admin._cmd_reclassify(args)
+        assert code == 0
+        run_apply.assert_awaited_once()
+        assert run_apply.call_args.kwargs["proposals_path"] == path
+
+    def test_rollback_with_yes_dispatches_run_rollback(self, tmp_path):
+        from kai import memory_reclassify
+
+        path = tmp_path / "pre.jsonl"
+        path.write_text(
+            memory_reclassify.render_preimages(
+                {"run_id": "rs-1", "user_id": "100"},
+                [memory_reclassify.PreImage(memory_id="a", text="t", metadata={})],
+            )
+        )
+        args = self._args(["100", "--rollback", str(path), "--yes"])
+        run_rollback = AsyncMock(return_value=0)
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=MagicMock()),
+            patch("kai.memory_reclassify.run_rollback", run_rollback),
+        ):
+            code = memory_admin._cmd_reclassify(args)
+        assert code == 0
+        run_rollback.assert_awaited_once()
+
+    def test_dry_run_dispatches_with_documented_defaults(self):
+        args = self._args(["100"])
+        run_dry_run = AsyncMock(return_value=0)
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=MagicMock()),
+            patch("kai.memory_reclassify.run_dry_run", run_dry_run),
+        ):
+            code = memory_admin._cmd_reclassify(args)
+        assert code == 0
+        kwargs = run_dry_run.call_args.kwargs
+        assert kwargs["threshold"] == 0.8
+        assert kwargs["sample"] == 10
+        assert kwargs["backend"] is None

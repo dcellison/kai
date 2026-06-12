@@ -2072,7 +2072,8 @@ async def _apply_scope_change(
         # scope_source after an operator move is always "operator",
         # so only the before value is recorded.
         log.info(
-            "memory.scope_change %s",
+            "%s %s",
+            memory.SCOPE_CHANGE_EVENT,
             json.dumps(
                 {
                     "memory_id": memory_id,
