@@ -2987,20 +2987,20 @@ class TestBuildScopeView:
     """Rendering of the resolver arms into operator-facing labels."""
 
     def test_explicit_global(self):
-        view = memory_command._build_scope_view(_scoped_fact("global"), {}, None)
+        view = memory_command._build_scope_view(_scoped_fact("global"), {}, None, scoped_recall_enabled=True)
         assert view.scope_label == "global"
         assert view.source_label == "extraction_default (confidence 1.00)"
         assert view.retrievable_label == "yes"
 
     def test_legacy_row_defaults_global_with_legacy_source(self):
-        view = memory_command._build_scope_view(_scoped_fact(None), {}, None)
+        view = memory_command._build_scope_view(_scoped_fact(None), {}, None, scoped_recall_enabled=True)
         assert view.scope_label == "global"
         assert view.resolved.legacy_defaulted is True
         assert "legacy_default" in view.source_label
         assert view.retrievable_label == "yes"
 
     def test_invalid_scope_value_renders_invalid_source(self):
-        view = memory_command._build_scope_view(_scoped_fact("bogus"), {}, None)
+        view = memory_command._build_scope_view(_scoped_fact("bogus"), {}, None, scoped_recall_enabled=True)
         assert view.scope_label == "global"
         assert view.resolved.invalid_defaulted is True
         assert "invalid_default" in view.source_label
@@ -3008,19 +3008,19 @@ class TestBuildScopeView:
     def test_project_row_registered_same_display(self):
         registry = {"kai": _project_cfg("kai")}
         fact = _scoped_fact("project", project_id="kai", scope_source="classifier", scope_confidence=0.8)
-        view = memory_command._build_scope_view(fact, registry, None)
+        view = memory_command._build_scope_view(fact, registry, None, scoped_recall_enabled=True)
         assert view.scope_label == "project 'kai'"
         assert view.source_label == "classifier (confidence 0.80)"
 
     def test_project_row_registered_distinct_display(self):
         registry = {"kai": _project_cfg("kai", display="Kai Assistant")}
         fact = _scoped_fact("project", project_id="kai", scope_source="operator")
-        view = memory_command._build_scope_view(fact, registry, None)
+        view = memory_command._build_scope_view(fact, registry, None, scoped_recall_enabled=True)
         assert view.scope_label == "project 'kai' (Kai Assistant)"
 
     def test_project_row_unregistered_is_flagged(self):
         fact = _scoped_fact("project", project_id="ghost", scope_source="operator")
-        view = memory_command._build_scope_view(fact, {}, None)
+        view = memory_command._build_scope_view(fact, {}, None, scoped_recall_enabled=True)
         assert view.scope_label == "project 'ghost' (not registered)"
 
     def test_project_row_missing_id(self):
@@ -3028,20 +3028,22 @@ class TestBuildScopeView:
         # verdict reaches the missing-id arm instead of stopping at
         # project_scope_not_allowed.
         fact = _scoped_fact("project", project_id=None, scope_source="operator")
-        view = memory_command._build_scope_view(fact, {}, _active_project("kai"))
+        view = memory_command._build_scope_view(fact, {}, _active_project("kai"), scoped_recall_enabled=True)
         assert view.scope_label == "project (no project id)"
         assert "project_scope_missing_project_id" in view.retrievable_label
 
     def test_task_row(self):
         fact = _scoped_fact("task", scope_source="extraction_default")
-        view = memory_command._build_scope_view(fact, {}, None)
+        view = memory_command._build_scope_view(fact, {}, None, scoped_recall_enabled=True)
         assert view.scope_label == "task"
         assert "task_scope_not_supported" in view.retrievable_label
 
 
 class TestScopeViewAdmissionParity:
-    """The retrievability verdict must match scoped retrieval's own
-    admission rule under the same allowed-project derivation."""
+    """With scoped recall enabled, the retrievability verdict must
+    match scoped retrieval's own admission rule under the same
+    allowed-project derivation. (Knob-off behavior is pinned in
+    TestScopeViewCutoverKnob.)"""
 
     @pytest.mark.parametrize(
         "fact,active",
@@ -3060,7 +3062,7 @@ class TestScopeViewAdmissionParity:
         ],
     )
     def test_verdict_matches_admission_reason(self, fact, active):
-        view = memory_command._build_scope_view(fact, {}, active)
+        view = memory_command._build_scope_view(fact, {}, active, scoped_recall_enabled=True)
         allowed = active.project_id if active is not None and active.memory_enabled else None
         reason = memory._scoped_memory_admission_reason(
             memory.resolve_memory_scope(fact.metadata),
@@ -3074,14 +3076,16 @@ class TestScopeViewAdmissionParity:
 
     def test_mismatch_names_both_projects(self):
         fact = _scoped_fact("project", project_id="anvil", scope_source="operator")
-        view = memory_command._build_scope_view(fact, {}, _active_project("kai"))
+        view = memory_command._build_scope_view(fact, {}, _active_project("kai"), scoped_recall_enabled=True)
         assert "row 'anvil'" in view.retrievable_label
         assert "here 'kai'" in view.retrievable_label
 
     def test_disabled_project_distinguished_from_no_project(self):
         fact = _scoped_fact("project", project_id="kai", scope_source="operator")
-        disabled = memory_command._build_scope_view(fact, {}, _active_project("kai", enabled=False))
-        nowhere = memory_command._build_scope_view(fact, {}, None)
+        disabled = memory_command._build_scope_view(
+            fact, {}, _active_project("kai", enabled=False), scoped_recall_enabled=True
+        )
+        nowhere = memory_command._build_scope_view(fact, {}, None, scoped_recall_enabled=True)
         assert "project memory disabled here" in disabled.retrievable_label
         assert "no active project here" in nowhere.retrievable_label
 
@@ -3122,7 +3126,7 @@ class TestBuildScopeScreen:
     def test_renders_scope_block_and_targets(self):
         registry = {"kai": _project_cfg("kai")}
         fact = _scoped_fact(None)
-        view = memory_command._build_scope_view(fact, registry, None)
+        view = memory_command._build_scope_view(fact, registry, None, scoped_recall_enabled=True)
         targets = memory_command._scope_change_targets(view.resolved, registry)
         text, kb = memory_command._build_scope_screen(fact, view, targets)
         assert '"Scoped fact text."' in text
@@ -3138,7 +3142,7 @@ class TestBuildScopeScreen:
 
     def test_no_targets_renders_empty_message(self):
         fact = _scoped_fact("global")
-        view = memory_command._build_scope_view(fact, {}, None)
+        view = memory_command._build_scope_view(fact, {}, None, scoped_recall_enabled=True)
         text, kb = memory_command._build_scope_screen(fact, view, [])
         assert "No scope changes available" in text
         assert [row[0].text for row in kb.inline_keyboard] == ["back"]
@@ -3171,7 +3175,9 @@ class TestBuildScopeConfirm:
 class TestFactViewScopeBlock:
     def test_extracted_arm_renders_aligned_scope_rows(self):
         fact = _scoped_fact("project", project_id="kai", scope_source="classifier", scope_confidence=0.7)
-        view = memory_command._build_scope_view(fact, {"kai": _project_cfg("kai")}, _active_project("kai"))
+        view = memory_command._build_scope_view(
+            fact, {"kai": _project_cfg("kai")}, _active_project("kai"), scoped_recall_enabled=True
+        )
         text, _ = memory_command._build_fact_view(fact, return_to=None, scope_view=view)
         assert "Scope:            project 'kai'" in text
         assert "Scope source:     classifier (confidence 0.70)" in text
@@ -3179,7 +3185,7 @@ class TestFactViewScopeBlock:
 
     def test_episode_arm_renders_scope_rows(self):
         fact = _episode_fact()
-        view = memory_command._build_scope_view(fact, {}, None)
+        view = memory_command._build_scope_view(fact, {}, None, scoped_recall_enabled=True)
         text, _ = memory_command._build_fact_view(fact, return_to=None, scope_view=view)
         assert "Scope:  global" in text
         assert "Scope source:  legacy_default (confidence 1.00)" in text
@@ -3489,3 +3495,64 @@ class TestScopeCallbackCodec:
         # the project id itself never enters callback data.
         encoded = memory_command._encode_callback("sct", "999")
         assert len(encoded.encode("utf-8")) <= 64
+
+
+class TestScopeViewCutoverKnob:
+    """While scoped recall is disabled, the live prompt path is legacy
+    recall, which applies no scope admission, so the verdict must say
+    scope is not enforced instead of predicting a scoped yes/no that
+    the serving branch would not honor."""
+
+    _NOT_ENFORCED = "yes (scope not enforced: scoped recall disabled)"
+
+    def test_knob_off_renders_not_enforced_for_wrong_project_row(self):
+        # The exact transition-state hazard: a wrong-project row that
+        # scoped admission would exclude is still injectable by legacy
+        # recall, so the verdict must not claim "no".
+        fact = _scoped_fact("project", project_id="anvil", scope_source="operator")
+        view = memory_command._build_scope_view(fact, {}, _active_project("kai"), scoped_recall_enabled=False)
+        assert view.retrievable_label == self._NOT_ENFORCED
+        assert "project_id_mismatch" not in view.retrievable_label
+
+    def test_knob_off_renders_not_enforced_for_task_row(self):
+        fact = _scoped_fact("task")
+        view = memory_command._build_scope_view(fact, {}, None, scoped_recall_enabled=False)
+        assert view.retrievable_label == self._NOT_ENFORCED
+
+    def test_knob_off_keeps_scope_and_source_labels(self):
+        # The inspection half stays fully informative with the knob
+        # off: the assignment and provenance still render, only the
+        # verdict switches to the not-enforced form.
+        fact = _scoped_fact("project", project_id="anvil", scope_source="classifier", scope_confidence=0.8)
+        view = memory_command._build_scope_view(
+            fact, {"anvil": _project_cfg("anvil")}, None, scoped_recall_enabled=False
+        )
+        assert view.scope_label == "project 'anvil'"
+        assert view.source_label == "classifier (confidence 0.80)"
+
+    @pytest.mark.asyncio
+    async def test_fact_view_send_helper_passes_live_knob(self, monkeypatch, update_factory, context_factory):
+        """Live-injection parity at the send-helper level: the detail
+        render consults `memory.is_scoped_recall_enabled()` so the
+        verdict follows the branch actually serving prompts."""
+        import kai.memory_projects as mp_mod
+
+        monkeypatch.setattr(mp_mod, "_db_registry", {})
+        fact = _scoped_fact("project", project_id="anvil", scope_source="operator")
+        monkeypatch.setattr(memory_command.memory, "get_by_id", lambda *, user_id, memory_id: fact)
+        sent = {}
+
+        async def fake_send(update, text, kb, edit):
+            sent["text"] = text
+
+        monkeypatch.setattr(memory_command, "_send_or_edit", fake_send)
+        ctx = context_factory()
+        ctx.bot_data["config"].memory_projects = {}
+
+        monkeypatch.setattr(memory_command.memory, "is_scoped_recall_enabled", lambda: False)
+        await memory_command._send_fact_view(update_factory(callback_data="mem:fview"), ctx, 100, "scoped1")
+        assert self._NOT_ENFORCED in sent["text"]
+
+        monkeypatch.setattr(memory_command.memory, "is_scoped_recall_enabled", lambda: True)
+        await memory_command._send_fact_view(update_factory(callback_data="mem:fview"), ctx, 100, "scoped1")
+        assert "no (project_scope_not_allowed" in sent["text"]

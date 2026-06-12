@@ -367,7 +367,13 @@ def _browse_score(fact: MemoryResult) -> float:
 # rather than echoing raw metadata. The retrievability verdict reuses
 # `memory._scoped_memory_admission_reason` - the exact admission rule
 # scoped retrieval applies - so the detail view can never disagree
-# with what retrieval would actually do. Writes go through
+# with what scoped retrieval would do. The verdict is also honest
+# about the cutover state: while the scoped-recall knob is off, the
+# live prompt path is legacy recall, which applies NO scope admission
+# before rendering rows into the injected memory block, so a scoped
+# yes/no would be false for the system actually serving prompts. In
+# that state the verdict renders a "scope not enforced" label instead
+# of a prediction only scoped mode would honor. Writes go through
 # `memory.build_scope_metadata` (validated shape, operator
 # provenance) merged over the row's existing metadata, because
 # `memory.update_metadata` replaces the metadata dict wholesale and
@@ -395,6 +401,10 @@ class _ScopeView:
             greps against the same vocabulary the logs use.
         retrievable_label: "yes", or "no (<admission reason>)" with
             the stable exclusion-reason key retrieval logs carry.
+            While scoped recall is disabled, a constant
+            "yes (scope not enforced: scoped recall disabled)"
+            because legacy recall serves prompts without scope
+            admission and every user-visible row stays eligible.
     """
 
     resolved: ResolvedMemoryScope
@@ -407,6 +417,8 @@ def _build_scope_view(
     fact: MemoryResult,
     registry: dict[str, MemoryProjectConfig],
     active: ActiveMemoryProject | None,
+    *,
+    scoped_recall_enabled: bool,
 ) -> _ScopeView:
     """Resolve a row's scope into operator-facing display strings.
 
@@ -414,6 +426,15 @@ def _build_scope_view(
     over chat-registered rows) and `active` is the project detected
     for the caller's current workspace, or None. Both come from
     `_scope_inputs`; tests can pass fixtures directly.
+
+    `scoped_recall_enabled` is the live cutover-knob state; production
+    callers pass `memory.is_scoped_recall_enabled()`. It is required
+    (no default) because the retrievability verdict is only truthful
+    relative to the branch actually serving prompts: scoped admission
+    when the knob is on, no scope filtering at all when it is off. A
+    defaulted value here would let a future caller silently render
+    scoped predictions while legacy recall still injects wrong-scope
+    rows.
 
     The allowed-project derivation mirrors scoped retrieval exactly:
     project authority exists only when a project is detected AND has
@@ -441,22 +462,31 @@ def _build_scope_view(
 
     source_label = f"{resolved.scope_source} (confidence {resolved.scope_confidence:.2f})"
 
-    # Retrievability verdict: same allowed-project derivation and
-    # same admission rule as scoped retrieval. The two enriched
-    # arms add the context an operator cannot reconstruct from the
-    # bare reason key (which two projects mismatched; whether "not
-    # allowed" means no project here or a disabled one).
-    allowed = active.project_id if active is not None and active.memory_enabled else None
-    reason = memory._scoped_memory_admission_reason(resolved, allowed_project_id=allowed)
-    if reason is None:
-        retrievable_label = "yes"
-    elif reason == memory._ADMISSION_PROJECT_ID_MISMATCH:
-        retrievable_label = f"no ({reason}: row '{resolved.project_id}', here '{allowed}')"
-    elif reason == memory._ADMISSION_PROJECT_SCOPE_NOT_ALLOWED:
-        detail = "project memory disabled here" if active is not None else "no active project here"
-        retrievable_label = f"no ({reason}: {detail})"
+    # Retrievability verdict. With the knob off, the live prompt path
+    # is legacy recall, which never consults scope, so every
+    # user-visible row stays eligible regardless of its assignment;
+    # rendering the scoped yes/no in that state would tell the
+    # operator a wrong-scope row cannot reach the prompt while legacy
+    # recall can still inject it. With the knob on: same
+    # allowed-project derivation and same admission rule as scoped
+    # retrieval. The two enriched arms add the context an operator
+    # cannot reconstruct from the bare reason key (which two projects
+    # mismatched; whether "not allowed" means no project here or a
+    # disabled one).
+    if not scoped_recall_enabled:
+        retrievable_label = "yes (scope not enforced: scoped recall disabled)"
     else:
-        retrievable_label = f"no ({reason})"
+        allowed = active.project_id if active is not None and active.memory_enabled else None
+        reason = memory._scoped_memory_admission_reason(resolved, allowed_project_id=allowed)
+        if reason is None:
+            retrievable_label = "yes"
+        elif reason == memory._ADMISSION_PROJECT_ID_MISMATCH:
+            retrievable_label = f"no ({reason}: row '{resolved.project_id}', here '{allowed}')"
+        elif reason == memory._ADMISSION_PROJECT_SCOPE_NOT_ALLOWED:
+            detail = "project memory disabled here" if active is not None else "no active project here"
+            retrievable_label = f"no ({reason}: {detail})"
+        else:
+            retrievable_label = f"no ({reason})"
 
     return _ScopeView(
         resolved=resolved,
@@ -1873,7 +1903,7 @@ async def _send_fact_view(
         await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
     registry, active = _scope_inputs(context, chat_id)
-    scope_view = _build_scope_view(fact, registry, active)
+    scope_view = _build_scope_view(fact, registry, active, scoped_recall_enabled=memory.is_scoped_recall_enabled())
     text, kb = _build_fact_view(fact, return_to, scope_view)
     # Cache holds only this fact's id so the forget flow knows what to
     # delete without re-encoding the id into callback data.
@@ -1937,7 +1967,7 @@ async def _send_scope_screen(
         await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
     registry, active = _scope_inputs(context, chat_id)
-    scope_view = _build_scope_view(fact, registry, active)
+    scope_view = _build_scope_view(fact, registry, active, scoped_recall_enabled=memory.is_scoped_recall_enabled())
     targets = _scope_change_targets(scope_view.resolved, registry)
     text, kb = _build_scope_screen(fact, scope_view, targets)
     # Preserve return_to so the eventual back-nav from the fact view
