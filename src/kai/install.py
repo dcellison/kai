@@ -354,35 +354,43 @@ def _validate_chat_id(value: str) -> bool:
 
 
 def _validate_claude_bin(value: str) -> bool:
-    """Return True when the path exists and is executable.
+    """Return True when the path is absolute, exists, and is executable.
 
     Required by the claude wizard prompt; the path is baked into both
     the runtime CLAUDE_BIN env var and the sudoers rule that allows
     cross-os_user claude spawns, so a non-existent path here would
     surface as a confusing 'a password is required' at first message.
+    The path must also be absolute: a relative path resolves against
+    the wizard's working directory at validation time but against the
+    daemon's working directory at spawn time, and sudoers command
+    matching expects absolute paths, so a relative value that passes
+    here would still break both consumers.
     """
     if not value:
         return False
     p = Path(value)
-    return p.is_file() and os.access(p, os.X_OK)
+    return p.is_absolute() and p.is_file() and os.access(p, os.X_OK)
 
 
 def _validate_codex_bin(value: str) -> bool:
-    """Return True when the path exists and is executable.
+    """Return True when the path is absolute, exists, and is executable.
 
     Required by the codex wizard prompt; the path is baked into both
     the runtime CODEX_BIN env var and the sudoers rule that allows
     cross-os_user codex spawns, so a non-existent path here would
     surface as a confusing 'a password is required' at first message.
+    The absoluteness requirement mirrors `_validate_claude_bin` above:
+    relative paths resolve differently for the wizard and the daemon,
+    and sudoers command matching expects absolute paths.
     """
     if not value:
         return False
     p = Path(value)
-    return p.is_file() and os.access(p, os.X_OK)
+    return p.is_absolute() and p.is_file() and os.access(p, os.X_OK)
 
 
 def _validate_opencode_bin(value: str) -> bool:
-    """Return True when the path exists and is executable.
+    """Return True when the path is absolute, exists, and is executable.
 
     Required by the opencode wizard prompt; the path is baked into
     both the runtime OPENCODE_BIN env var and the sudoers rule that
@@ -390,28 +398,29 @@ def _validate_opencode_bin(value: str) -> bool:
     here would surface as a confusing 'a password is required' or
     'command not found' at the first one-shot call. Paired with
     `_validate_codex_bin` above so the two binary validators stay
-    together; the body shape matches codex byte-for-byte (is-file
-    plus executable) because the underlying requirement is the
-    same.
+    together; the body shape matches codex byte-for-byte (absolute
+    plus is-file plus executable) because the underlying requirement
+    is the same.
     """
     if not value:
         return False
     p = Path(value)
-    return p.is_file() and os.access(p, os.X_OK)
+    return p.is_absolute() and p.is_file() and os.access(p, os.X_OK)
 
 
 def _validate_goose_bin(value: str) -> bool:
-    """Return True when the path exists and is executable.
+    """Return True when the path is absolute, exists, and is executable.
 
     Required by the goose wizard prompt; same dual consumer as the
     codex and opencode validators above (runtime GOOSE_BIN env var
-    plus the per-user sudoers rule), and the same is-file plus
-    executable body because the underlying requirement is the same.
+    plus the per-user sudoers rule), and the same absolute plus
+    is-file plus executable body because the underlying requirement
+    is the same.
     """
     if not value:
         return False
     p = Path(value)
-    return p.is_file() and os.access(p, os.X_OK)
+    return p.is_absolute() and p.is_file() and os.access(p, os.X_OK)
 
 
 def _install_staging_path(filename: str) -> Path:
@@ -983,7 +992,7 @@ def _cmd_config() -> None:
             )
             if _validate_claude_bin(claude_bin):
                 break
-            print(f"  Path '{claude_bin}' does not exist or is not executable.")
+            print(f"  Path '{claude_bin}' is not an absolute path to an existing executable.")
     if agent_backend == "codex":
         codex_auth_mode = _prompt_choice(
             "Codex auth mode",
@@ -1010,7 +1019,7 @@ def _cmd_config() -> None:
             )
             if _validate_codex_bin(codex_bin):
                 break
-            print(f"  Path '{codex_bin}' does not exist or is not executable.")
+            print(f"  Path '{codex_bin}' is not an absolute path to an existing executable.")
         if codex_auth_mode == "subscription":
             print("  After install, log in to codex as the target os_user:")
             print("    <os_user> ~$ codex login")
@@ -1056,7 +1065,7 @@ def _cmd_config() -> None:
             )
             if _validate_opencode_bin(opencode_bin):
                 break
-            print(f"  Path '{opencode_bin}' does not exist or is not executable.")
+            print(f"  Path '{opencode_bin}' is not an absolute path to an existing executable.")
         print("  After install, authenticate OpenCode for at least one provider:")
         print("    <service_user> ~$ opencode auth login")
         print("  Kai writes the active model into OPENCODE_CONFIG_CONTENT at process spawn;")
@@ -1084,7 +1093,7 @@ def _cmd_config() -> None:
             )
             if _validate_goose_bin(goose_bin):
                 break
-            print(f"  Path '{goose_bin}' does not exist or is not executable.")
+            print(f"  Path '{goose_bin}' is not an absolute path to an existing executable.")
 
     # Multi-provider backends (opencode, goose): operator picks the
     # provider that drives the (backend, provider, role) registry
@@ -1180,7 +1189,7 @@ def _cmd_config() -> None:
             )
             if _validate_claude_bin(claude_bin):
                 break
-            print(f"  Path '{claude_bin}' does not exist or is not executable.")
+            print(f"  Path '{claude_bin}' is not an absolute path to an existing executable.")
     if "codex" in peruser_backends and not codex_bin:
         print("  users.yaml has a codex entry; the daemon needs a resolvable codex binary.")
         while True:
@@ -1192,7 +1201,7 @@ def _cmd_config() -> None:
             )
             if _validate_codex_bin(codex_bin):
                 break
-            print(f"  Path '{codex_bin}' does not exist or is not executable.")
+            print(f"  Path '{codex_bin}' is not an absolute path to an existing executable.")
     if "opencode" in peruser_backends and not opencode_bin:
         print("  users.yaml has an opencode entry; the daemon needs a resolvable opencode binary.")
         while True:
@@ -1204,7 +1213,7 @@ def _cmd_config() -> None:
             )
             if _validate_opencode_bin(opencode_bin):
                 break
-            print(f"  Path '{opencode_bin}' does not exist or is not executable.")
+            print(f"  Path '{opencode_bin}' is not an absolute path to an existing executable.")
     if "goose" in peruser_backends and not goose_bin:
         print("  users.yaml has a goose entry; the daemon needs a resolvable goose binary.")
         while True:
@@ -1216,7 +1225,7 @@ def _cmd_config() -> None:
             )
             if _validate_goose_bin(goose_bin):
                 break
-            print(f"  Path '{goose_bin}' does not exist or is not executable.")
+            print(f"  Path '{goose_bin}' is not an absolute path to an existing executable.")
 
     # -- Agent --
     # DEFAULT_MODEL and AGENT_TIMEOUT_SECONDS are
@@ -1647,7 +1656,7 @@ def _cmd_config() -> None:
                         )
                         if _validate_codex_bin(codex_bin):
                             break
-                        print(f"  Path '{codex_bin}' does not exist or is not executable.")
+                        print(f"  Path '{codex_bin}' is not an absolute path to an existing executable.")
                 # Symmetric defense-in-depth for the opencode global
                 # backend. The global-opencode block above already
                 # collected opencode_bin on the normal flow; the gate
@@ -1671,7 +1680,7 @@ def _cmd_config() -> None:
                         )
                         if _validate_opencode_bin(opencode_bin):
                             break
-                        print(f"  Path '{opencode_bin}' does not exist or is not executable.")
+                        print(f"  Path '{opencode_bin}' is not an absolute path to an existing executable.")
                 # Same defense-in-depth shape for the goose global
                 # backend: the global-goose block above collects
                 # goose_bin on the normal flow; this gate covers a
@@ -1689,7 +1698,7 @@ def _cmd_config() -> None:
                         )
                         if _validate_goose_bin(goose_bin):
                             break
-                        print(f"  Path '{goose_bin}' does not exist or is not executable.")
+                        print(f"  Path '{goose_bin}' is not an absolute path to an existing executable.")
                 # Same defense-in-depth shape for the claude global
                 # backend, completing the four-backend set: the
                 # global-claude block above collects claude_bin on
@@ -1708,7 +1717,7 @@ def _cmd_config() -> None:
                         )
                         if _validate_claude_bin(claude_bin):
                             break
-                        print(f"  Path '{claude_bin}' does not exist or is not executable.")
+                        print(f"  Path '{claude_bin}' is not an absolute path to an existing executable.")
                 # Extraction timeout is the LLM-call hard cap inside
                 # memory_extraction.py:541. Default 10s is too aggressive
                 # for production - real extractions routinely take 20-30s

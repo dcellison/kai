@@ -8033,8 +8033,9 @@ class TestApplyMigratePerOsUserTmpdir:
 
 class TestValidateClaudeBin:
     """claude binary path existence validator. Mirrors
-    `TestValidateCodexBin` exactly: same five edge cases (empty,
-    nonexistent, directory, non-executable file, executable file)."""
+    `TestValidateCodexBin` exactly: same six edge cases (empty,
+    nonexistent, directory, non-executable file, relative path,
+    executable file)."""
 
     def test_empty_value_rejected(self):
         from kai.install import _validate_claude_bin
@@ -8057,6 +8058,18 @@ class TestValidateClaudeBin:
         f = tmp_path / "fake_claude"
         f.write_text("#!/bin/sh\necho hi\n")
         assert _validate_claude_bin(str(f)) is False
+
+    def test_relative_path_rejected(self, tmp_path, monkeypatch):
+        """A relative path is rejected even when it points at a real
+        executable from the current working directory; the value feeds
+        /etc/kai/env and sudoers, where only absolute paths work."""
+        from kai.install import _validate_claude_bin
+
+        f = tmp_path / "fake_claude"
+        f.write_text("#!/bin/sh\necho hi\n")
+        f.chmod(0o755)
+        monkeypatch.chdir(tmp_path)
+        assert _validate_claude_bin("fake_claude") is False
 
     def test_executable_file_accepted(self, tmp_path):
         from kai.install import _validate_claude_bin
@@ -8092,6 +8105,18 @@ class TestValidateCodexBin:
         f.write_text("#!/bin/sh\necho hi\n")
         assert _validate_codex_bin(str(f)) is False
 
+    def test_relative_path_rejected(self, tmp_path, monkeypatch):
+        """A relative path is rejected even when it points at a real
+        executable from the current working directory; the value feeds
+        /etc/kai/env and sudoers, where only absolute paths work."""
+        from kai.install import _validate_codex_bin
+
+        f = tmp_path / "fake_codex"
+        f.write_text("#!/bin/sh\necho hi\n")
+        f.chmod(0o755)
+        monkeypatch.chdir(tmp_path)
+        assert _validate_codex_bin("fake_codex") is False
+
     def test_executable_file_accepted(self, tmp_path):
         from kai.install import _validate_codex_bin
 
@@ -8103,12 +8128,13 @@ class TestValidateCodexBin:
 
 class TestValidateOpenCodeBin:
     """opencode binary path existence validator. Mirrors
-    `TestValidateCodexBin` exactly: same five edge cases (empty,
-    nonexistent, directory, non-executable file, executable file).
-    The shared validator shape (`is_file()` AND `os.access(_, X_OK)`)
-    is the same one codex uses; pinning both halves protects against
-    a future refactor that drops one and silently weakens the
-    binary-path check for one backend but not the other."""
+    `TestValidateCodexBin` exactly: same six edge cases (empty,
+    nonexistent, directory, non-executable file, relative path,
+    executable file). The shared validator shape (`is_absolute()` AND
+    `is_file()` AND `os.access(_, X_OK)`) is the same one codex uses;
+    pinning all three legs protects against a future refactor that
+    drops one and silently weakens the binary-path check for one
+    backend but not the other."""
 
     def test_empty_value_rejected(self):
         from kai.install import _validate_opencode_bin
@@ -8132,6 +8158,18 @@ class TestValidateOpenCodeBin:
         f.write_text("#!/bin/sh\necho hi\n")
         assert _validate_opencode_bin(str(f)) is False
 
+    def test_relative_path_rejected(self, tmp_path, monkeypatch):
+        """A relative path is rejected even when it points at a real
+        executable from the current working directory; the value feeds
+        /etc/kai/env and sudoers, where only absolute paths work."""
+        from kai.install import _validate_opencode_bin
+
+        f = tmp_path / "fake_opencode"
+        f.write_text("#!/bin/sh\necho hi\n")
+        f.chmod(0o755)
+        monkeypatch.chdir(tmp_path)
+        assert _validate_opencode_bin("fake_opencode") is False
+
     def test_executable_file_accepted(self, tmp_path):
         from kai.install import _validate_opencode_bin
 
@@ -8144,9 +8182,10 @@ class TestValidateOpenCodeBin:
 class TestValidateGooseBin:
     """goose binary path existence validator. Mirrors
     `TestValidateCodexBin` and `TestValidateOpenCodeBin` exactly: same
-    five edge cases (empty, nonexistent, directory, non-executable
-    file, executable file), pinning the shared validator shape for
-    the third backend the same way it is pinned for the other two."""
+    six edge cases (empty, nonexistent, directory, non-executable
+    file, relative path, executable file), pinning the shared
+    validator shape for the third backend the same way it is pinned
+    for the other two."""
 
     def test_empty_value_rejected(self):
         from kai.install import _validate_goose_bin
@@ -8169,6 +8208,18 @@ class TestValidateGooseBin:
         f = tmp_path / "fake_goose"
         f.write_text("#!/bin/sh\necho hi\n")
         assert _validate_goose_bin(str(f)) is False
+
+    def test_relative_path_rejected(self, tmp_path, monkeypatch):
+        """A relative path is rejected even when it points at a real
+        executable from the current working directory; the value feeds
+        /etc/kai/env and sudoers, where only absolute paths work."""
+        from kai.install import _validate_goose_bin
+
+        f = tmp_path / "fake_goose"
+        f.write_text("#!/bin/sh\necho hi\n")
+        f.chmod(0o755)
+        monkeypatch.chdir(tmp_path)
+        assert _validate_goose_bin("fake_goose") is False
 
     def test_executable_file_accepted(self, tmp_path):
         from kai.install import _validate_goose_bin
