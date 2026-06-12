@@ -565,6 +565,17 @@ def get_effective_provider(backend: str, llm_provider: str) -> str:
 EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 _VALID_EFFORT_LEVELS: frozenset[str] = frozenset(EFFORT_LEVELS)
 
+# Valid values for the codex `model_reasoning_effort` config override,
+# taken verbatim from the upstream codex configuration reference
+# (xhigh is model-dependent; the override applies to Responses-API
+# models). Same two-shape pattern as EFFORT_LEVELS above: ordered
+# tuple for operator-facing listings in intensity order, derived
+# frozenset for O(1) membership checks. The vocabularies are
+# CLI-specific and deliberately not shared: codex has "minimal" and
+# no "max"; claude has "max" and no "minimal".
+CODEX_EFFORT_LEVELS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh")
+_VALID_CODEX_EFFORT_LEVELS: frozenset[str] = frozenset(CODEX_EFFORT_LEVELS)
+
 
 def validate_model_for_provider(model: str, provider: str) -> bool:
     """Check if a model is valid for a provider.
@@ -1042,6 +1053,19 @@ class Config:
     # same way goose+openai does. Only consulted when AGENT_BACKEND=codex;
     # ignored on every other backend.
     codex_auth_mode: str = "subscription"
+
+    # Reasoning effort passed to the inner codex as a
+    # `-c model_reasoning_effort=<value>` config override on the
+    # app-server argv. Empty string (default) passes nothing: codex
+    # then falls back to each OS user's own ~/.codex/config.toml or
+    # the model default. That asymmetry with claude_effort_level
+    # (which always passes a value) is deliberate: codex config is
+    # per-OS-user and operator-owned, and xhigh availability is
+    # model-dependent, so a global override is opt-in rather than
+    # silently replacing a user's own setting. Validated at config
+    # load against _VALID_CODEX_EFFORT_LEVELS so a typo fails fast.
+    # Only consulted when the user's effective backend is codex.
+    codex_effort_level: str = ""
 
     # Database - uses DATA_DIR so the db lands in the writable data directory
     session_db_path: Path = field(default_factory=lambda: DATA_DIR / "kai.db")
@@ -2639,6 +2663,17 @@ def load_config() -> Config:
         # expects to see in an error string.
         raise SystemExit(f"CLAUDE_EFFORT_LEVEL must be one of {list(EFFORT_LEVELS)}, got {claude_effort_level!r}")
 
+    # CODEX_EFFORT_LEVEL: same strip/lower + membership shape as the
+    # claude block above, with one contract difference: empty / unset
+    # stays empty (set-or-absent). Empty means CodexBackend passes no
+    # `-c model_reasoning_effort` override and codex falls back to the
+    # per-OS-user ~/.codex/config.toml or the model default.
+    codex_effort_level = os.environ.get("CODEX_EFFORT_LEVEL", "").strip().lower()
+    if codex_effort_level and codex_effort_level not in _VALID_CODEX_EFFORT_LEVELS:
+        raise SystemExit(
+            f"CODEX_EFFORT_LEVEL must be one of {list(CODEX_EFFORT_LEVELS)} or empty, got {codex_effort_level!r}"
+        )
+
     # PR review agent config. The global `pr_review` toggle now lives
     # per-user in users.yaml; PR_REVIEW_COOLDOWN / PR_REVIEW_TIMEOUT_S
     # remain as global resource controls.
@@ -3071,6 +3106,7 @@ def load_config() -> Config:
         claude_autocompact_pct=claude_autocompact_pct,
         claude_effort_level=claude_effort_level,
         codex_auth_mode=codex_auth_mode,
+        codex_effort_level=codex_effort_level,
         webhook_port=webhook_port,
         webhook_secret=os.environ.get("WEBHOOK_SECRET", ""),
         voice_enabled=os.environ.get("VOICE_ENABLED", "").lower() in ("1", "true", "yes"),

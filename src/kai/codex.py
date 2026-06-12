@@ -220,6 +220,14 @@ class CodexBackend(AgentBackend):
         # unbounded memory growth in a long-lived agent subprocess.
         # The pool passes Config.agent_max_session_hours.
         max_session_hours: float = 0,
+        # Reasoning effort forwarded as a `-c model_reasoning_effort=
+        # <value>` config override on the spawn argv. Empty (default)
+        # passes no override: codex falls back to the per-OS-user
+        # ~/.codex/config.toml or the model default. Set-or-absent by
+        # design (see Config.codex_effort_level); validated at config
+        # load, so any non-empty value reaching this point is one of
+        # the CLI's accepted tiers.
+        codex_effort_level: str = "",
     ):
         # ABC-required attributes (pool.py reads/writes these)
         self.model = model
@@ -230,6 +238,7 @@ class CodexBackend(AgentBackend):
         self.provider = provider  # ABC-mandated; bot.py reads this
         self.codex_user = codex_user
         self.memory_enabled = memory_enabled
+        self.codex_effort_level = codex_effort_level
         # Session-age recycling limit (ABC surface; checked by the
         # inherited _should_recycle at the top of _send_locked).
         self.max_session_hours = max_session_hours
@@ -372,7 +381,17 @@ class CodexBackend(AgentBackend):
         # rule also names exactly. Falls back to bare "codex" so
         # single-user installs with codex on PATH still work.
         codex_bin = os.environ.get("CODEX_BIN") or "codex"
-        codex_argv = [codex_bin, "app-server"]
+        codex_argv = [codex_bin]
+        # The reasoning-effort override rides BEFORE the subcommand
+        # token: `-c key=value` is defined at the codex CLI root
+        # (flattened into the multitool parser and propagated to every
+        # subcommand), so root position is the form the CLI's own
+        # structure guarantees. Set-or-absent: no flag at all when the
+        # knob is empty, leaving the per-OS-user config.toml or the
+        # model default in charge of reasoning effort.
+        if self.codex_effort_level:
+            codex_argv += ["-c", f"model_reasoning_effort={self.codex_effort_level}"]
+        codex_argv.append("app-server")
         if effective_codex_user:
             # -H sets HOME to <codex_user>'s pw entry so codex reads
             # auth from ~<codex_user>/.codex/auth.json, not the bot's

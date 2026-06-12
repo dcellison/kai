@@ -2532,7 +2532,8 @@ class TestCmdConfig:
                 "120",  # agent timeout
                 "0",  # max session age hours (0 = no limit)
                 "1800",  # idle eviction timeout seconds
-                # autocompact + effort skipped on non-claude backend
+                # autocompact + claude effort skipped on non-claude backend
+                "",  # codex reasoning effort (empty = codex default)
                 "8080",  # webhook port
                 "test-secret",  # webhook secret
                 "",  # workspace base
@@ -2940,7 +2941,8 @@ class TestCmdConfigDefaultModelDispatch:
             "120",  # agent timeout (global default)
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
-            # No autocompact_pct / effort_level prompts (claude-only)
+            # No autocompact_pct / claude effort prompts (claude-only)
+            "",  # codex reasoning effort (empty = codex default)
             "8080",  # webhook port
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base (global default)
@@ -2973,7 +2975,9 @@ class TestCmdConfigDefaultModelDispatch:
             "120",  # agent timeout (global default)
             "0",  # max session age hours (0 = no limit)
             "1800",  # idle eviction timeout seconds
-            # autocompact_pct / effort_level prompts are claude-only (gated)
+            # autocompact_pct / effort prompts are backend-gated
+            # (claude tunables and the codex effort prompt all skip
+            # on goose)
             "8080",  # webhook port
             "test-secret",  # webhook secret
             "~/Projects",  # workspace base (global default)
@@ -3009,6 +3013,34 @@ class TestCmdConfigDefaultModelDispatch:
         _cmd_config()
         conf = json.loads((tmp_path / "install.conf").read_text())
         return helper_mock, conf["env"]
+
+    def test_codex_effort_default_omits_env_key(self, tmp_path, monkeypatch):
+        """Accepting the empty default leaves CODEX_EFFORT_LEVEL out
+        of install.conf entirely: the set-or-absent contract means
+        absence IS the 'use codex's own config' signal. Pairs with
+        the non-default test below to pin both emission branches."""
+        self._setup(monkeypatch, tmp_path)
+        _, env = self._run(
+            monkeypatch,
+            tmp_path,
+            self._inputs_for_codex_subscription(),
+            helper_return="gpt-5.5",
+        )
+        assert "CODEX_EFFORT_LEVEL" not in env
+
+    def test_codex_effort_non_default_writes_env_key(self, tmp_path, monkeypatch):
+        """A chosen effort tier round-trips from the wizard prompt
+        into install.conf, lowercased by the prompt's normalization
+        (mixed case pins the .strip().lower() behavior)."""
+        self._setup(monkeypatch, tmp_path)
+        base = list(self._inputs_for_codex_subscription())
+        idx = base.index("8080")
+        # The slot immediately before the webhook port is the codex
+        # effort answer in this chain.
+        assert base[idx - 1] == ""
+        base[idx - 1] = "HIGH"
+        _, env = self._run(monkeypatch, tmp_path, base, helper_return="gpt-5.5")
+        assert env.get("CODEX_EFFORT_LEVEL") == "high"
 
     def test_reprompts_on_provider_flip_with_users_yaml(self, tmp_path, monkeypatch):
         """

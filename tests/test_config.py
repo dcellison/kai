@@ -58,6 +58,7 @@ _CONFIG_ENV_VARS = [
     "CLAUDE_MAX_CONTEXT_WINDOW",
     "CLAUDE_AUTOCOMPACT_PCT",
     "CLAUDE_EFFORT_LEVEL",
+    "CODEX_EFFORT_LEVEL",
     "TOTP_SESSION_MINUTES",
     "TOTP_CHALLENGE_SECONDS",
     "TOTP_LOCKOUT_ATTEMPTS",
@@ -1227,6 +1228,62 @@ class TestClaudeEffortLevel:
         monkeypatch.setenv("CLAUDE_EFFORT_LEVEL", "   ")
         config = load_config()
         assert config.claude_effort_level == "high"
+
+
+# ── CODEX_EFFORT_LEVEL config ────────────────────────────────────────
+
+
+class TestCodexEffortLevel:
+    """Coverage for the CODEX_EFFORT_LEVEL env var: same strip/lower +
+    allow-list shape as CLAUDE_EFFORT_LEVEL with one contract
+    difference, the set-or-absent default. Empty / unset stays empty,
+    meaning CodexBackend passes no `-c model_reasoning_effort`
+    override and codex falls back to the per-OS-user config.toml or
+    the model default."""
+
+    def test_default_empty_when_unset(self, monkeypatch):
+        # Unset must stay empty, NOT fall back to a tier. An invented
+        # default would silently override every codex user's own
+        # config.toml effort setting from a knob the operator never
+        # touched.
+        _set_required(monkeypatch)
+        config = load_config()
+        assert config.codex_effort_level == ""
+
+    def test_valid_value_parses(self, monkeypatch):
+        # All five upstream values must round-trip. If codex adds a
+        # tier, CODEX_EFFORT_LEVELS in config.py and this list must
+        # move together.
+        _set_required(monkeypatch)
+        for value in ["minimal", "low", "medium", "high", "xhigh"]:
+            monkeypatch.setenv("CODEX_EFFORT_LEVEL", value)
+            config = load_config()
+            assert config.codex_effort_level == value, f"value {value!r} did not round-trip"
+
+    def test_invalid_value_raises(self, monkeypatch):
+        # Outside the allow-list must SystemExit at config load; a
+        # bad value reaching the spawn argv would fail at the codex
+        # subprocess instead, burning a chat session to discover.
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CODEX_EFFORT_LEVEL", "max")
+        with pytest.raises(SystemExit, match="CODEX_EFFORT_LEVEL"):
+            load_config()
+
+    def test_uppercase_and_whitespace_normalized(self, monkeypatch):
+        # Same copy-paste absorption as the claude parser: case and
+        # surrounding whitespace must not cause an opaque rejection.
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CODEX_EFFORT_LEVEL", "  HIGH ")
+        config = load_config()
+        assert config.codex_effort_level == "high"
+
+    def test_whitespace_only_stays_empty(self, monkeypatch):
+        # Whitespace-only is effectively unset: it must collapse to
+        # empty (no override) rather than hit the allow-list check.
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CODEX_EFFORT_LEVEL", "   ")
+        config = load_config()
+        assert config.codex_effort_level == ""
 
 
 # ── Memory extraction config (spec §6.4, §13.1) ─────────────────────

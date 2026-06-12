@@ -1567,6 +1567,37 @@ class TestSubprocessConstruction:
 # ── Per-user OAuth isolation (codex_user / sudo wrap) ─────────────
 
 
+class TestCodexEffortArgv:
+    """codex_effort_level rides the spawn argv as a root-position
+    `-c model_reasoning_effort=<value>` config override (the -c
+    argument is defined at the codex CLI root and propagated to every
+    subcommand), and is set-or-absent: no flag at all when the knob
+    is empty, leaving the per-OS-user config.toml or model default in
+    charge."""
+
+    @pytest.mark.asyncio
+    async def test_effort_override_rides_before_subcommand(self):
+        c = _make_codex(codex_effort_level="high")
+        proc = _make_mock_proc(_handshake_lines())
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await c._ensure_started()
+        argv = list(mock_exec.call_args[0])
+        i = argv.index("-c")
+        assert argv[i + 1] == "model_reasoning_effort=high"
+        # Root position: the override precedes the subcommand token.
+        assert i < argv.index("app-server")
+
+    @pytest.mark.asyncio
+    async def test_no_override_when_unset(self):
+        c = _make_codex()
+        proc = _make_mock_proc(_handshake_lines())
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await c._ensure_started()
+        argv = list(mock_exec.call_args[0])
+        assert "-c" not in argv
+        assert "app-server" in argv
+
+
 class TestCodexUserSudoWrap:
     """
     Verify the per-user OAuth isolation lever.

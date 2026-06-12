@@ -43,6 +43,7 @@ from kai.config import (
     BACKEND_PROVIDERS,
     BACKENDS_NEEDING_PROVIDER_PROMPT,
     CODEX_DEFAULT_MODEL,
+    CODEX_EFFORT_LEVELS,
     CODEX_MODELS,
     EFFORT_LEVELS,
     MODEL_REGISTRY,
@@ -1437,6 +1438,34 @@ def _cmd_config() -> None:
         )
         print()
 
+    # CODEX_EFFORT_LEVEL mirrors the claude effort prompt for the
+    # codex backend with one contract difference: the default is empty
+    # (set-or-absent). Empty means CodexBackend passes no
+    # `-c model_reasoning_effort` override and codex falls back to the
+    # per-OS-user ~/.codex/config.toml or the model default, which is
+    # the right posture because codex config is per-OS-user and
+    # operator-owned, and xhigh availability is model-dependent.
+    # _prompt_choice cannot express "empty means skip", so this is a
+    # validated free-text prompt: empty accepted, anything else must
+    # be in CODEX_EFFORT_LEVELS (the same allow-list config.py
+    # enforces at load, so install.conf cannot carry a value that
+    # fails at service startup).
+    codex_effort_level = ""
+    if agent_backend == "codex":
+        while True:
+            codex_effort_level = (
+                _prompt(
+                    "Codex reasoning effort (empty = codex default)",
+                    existing_env.get("CODEX_EFFORT_LEVEL", ""),
+                )
+                .strip()
+                .lower()
+            )
+            if not codex_effort_level or codex_effort_level in CODEX_EFFORT_LEVELS:
+                break
+            print(f"  Must be one of {', '.join(CODEX_EFFORT_LEVELS)}, or empty for the codex default.")
+        print()
+
     # -- Webhook server --
     print("-- Webhook server --")
     while True:
@@ -1994,6 +2023,13 @@ def _cmd_config() -> None:
     # allow-list config.py uses, so no re-validation here.
     if claude_effort_level != "high":
         env["CLAUDE_EFFORT_LEVEL"] = claude_effort_level
+
+    # CODEX_EFFORT_LEVEL: same delta-from-defaults posture. The
+    # default is empty (codex's own config rules), so any non-empty
+    # value is operator intent worth persisting; empty stays out of
+    # install.conf entirely.
+    if codex_effort_level:
+        env["CODEX_EFFORT_LEVEL"] = codex_effort_level
 
     # Conditionally add optional values
     if transport == "webhook":
