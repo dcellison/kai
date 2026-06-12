@@ -1960,48 +1960,56 @@ async def _register_memory_project_for(
         db_registry_upsert,
         detect_active_memory_project,
         merged_registry,
+        registry_mutation_lock,
     )
 
     project_id = raw_name.strip().lower()
     if not _PROJECT_ID_RE.match(project_id):
         return False, f"Invalid project name {raw_name!r}: use letters, digits, - or _ (max 64 chars)."
 
-    merged = merged_registry(config.memory_projects)
-    owner = detect_active_memory_project(root, merged)
-    if owner is not None:
-        return False, f"This workspace is already inside project '{owner.project_id}'."
-    if project_id in merged:
-        return False, f"Project id '{project_id}' is already registered; pick another name."
+    # Guard + persist + cache update under the registry mutation
+    # lock: the guards read the merged view, and without the lock a
+    # second registration can pass its own guards against the same
+    # stale view while this one is awaiting the DB insert, committing
+    # a parent/child pair the nested-root guard exists to prevent.
+    async with registry_mutation_lock:
+        merged = merged_registry(config.memory_projects)
+        owner = detect_active_memory_project(root, merged)
+        if owner is not None:
+            return False, f"This workspace is already inside project '{owner.project_id}'."
+        if project_id in merged:
+            return False, f"Project id '{project_id}' is already registered; pick another name."
 
-    resolved_root = root.expanduser().resolve()
-    row = {
-        "project_id": project_id,
-        "display_name": raw_name.strip(),
-        "workspace_root": str(resolved_root),
-        "memory_enabled": True,
-        "default_scope_for_new_facts": "project",
-        "created_by": chat_id,
-    }
-    try:
-        await sessions.register_memory_project(
-            project_id=project_id,
-            display_name=raw_name.strip(),
-            workspace_root=str(resolved_root),
-            created_by=chat_id,
-        )
-    except Exception as e:
-        # IntegrityError covers the registration race (two users, one
-        # id or root); anything else is a DB-layer failure. Both
-        # collapse to a user-facing message because the caller may be
-        # the auto-hook, which must not raise.
-        log.warning("memory project registration failed for %r: %s", project_id, e)
-        return False, f"Could not register project '{project_id}': {e}"
-    if not db_registry_upsert(row):
-        # The handler validated every field above, so a cache
-        # rejection here means validation drift between this guard
-        # and _row_to_config; the row is persisted and will load on
-        # next restart regardless.
-        log.error("memory project cache rejected validated row %r", project_id)
+        resolved_root = root.expanduser().resolve()
+        row = {
+            "project_id": project_id,
+            "display_name": raw_name.strip(),
+            "workspace_root": str(resolved_root),
+            "memory_enabled": True,
+            "default_scope_for_new_facts": "project",
+            "created_by": chat_id,
+        }
+        try:
+            await sessions.register_memory_project(
+                project_id=project_id,
+                display_name=raw_name.strip(),
+                workspace_root=str(resolved_root),
+                created_by=chat_id,
+            )
+        except Exception as e:
+            # IntegrityError covers id/root collisions that raced a
+            # restart-era row the cache never saw; anything else is a
+            # DB-layer failure. Both collapse to a user-facing message
+            # because the caller may be the auto-hook, which must not
+            # raise.
+            log.warning("memory project registration failed for %r: %s", project_id, e)
+            return False, f"Could not register project '{project_id}': {e}"
+        if not db_registry_upsert(row):
+            # The handler validated every field above, so a cache
+            # rejection here means validation drift between this guard
+            # and _row_to_config; the row is persisted and will load on
+            # next restart regardless.
+            log.error("memory project cache rejected validated row %r", project_id)
     log.info(
         "memory.project.registry %s",
         json.dumps(
@@ -2073,8 +2081,13 @@ async def handle_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"Project '{project_id}' was registered by another user; only they or an admin can unregister it."
             )
             return
-        removed = await sessions.unregister_memory_project(project_id)
-        db_registry_remove(project_id)
+        # Same mutation lock as registration: a register guard must
+        # never read the merged view mid-unregister.
+        from kai.memory_projects import registry_mutation_lock
+
+        async with registry_mutation_lock:
+            removed = await sessions.unregister_memory_project(project_id)
+            db_registry_remove(project_id)
         log.info(
             "memory.project.registry %s",
             json.dumps(

@@ -5099,6 +5099,49 @@ class TestHandleProject:
         reply = update.message.reply_text.call_args.args[0]
         assert "Unregistered" in reply
 
+    async def test_concurrent_parent_child_registration_serialized(self, tmp_path):
+        """The nested-root guard reads the merged view BEFORE an
+        awaited DB insert; without the registry mutation lock, two
+        concurrent registrations both pass their guards against the
+        same stale view and commit a parent/child pair (the child
+        then steals the parent's subtree via longest-prefix
+        detection). With the lock, the second registration observes
+        the first and is rejected. The persist stub yields to the
+        event loop to force the interleaving the lock must close."""
+        from kai.bot import _register_memory_project_for
+        from kai.memory_projects import detect_active_memory_project, merged_registry
+
+        parent = tmp_path / "parent"
+        child = parent / "child"
+        child.mkdir(parents=True)
+        config = _make_config()
+
+        async def _yielding_persist(**kwargs):
+            await asyncio.sleep(0)
+
+        with patch(
+            "kai.bot.sessions.register_memory_project",
+            new=AsyncMock(side_effect=_yielding_persist),
+        ):
+            results = await asyncio.gather(
+                _register_memory_project_for(config, 12345, parent, "parent"),
+                _register_memory_project_for(config, 12345, child, "child"),
+            )
+
+        successes = [message for ok, message in results if ok]
+        rejections = [message for ok, message in results if not ok]
+        assert len(successes) == 1
+        assert len(rejections) == 1
+        assert "already inside project" in rejections[0]
+        # The merged registry must never contain nested DB-owned
+        # roots: detection from inside the child resolves to the
+        # single registered project.
+        merged = merged_registry({})
+        assert len(merged) == 1
+        active = detect_active_memory_project(child, merged)
+        assert active is not None
+        assert active.project_id == "parent"
+
     async def test_list_shows_provenance_and_active_marker(self, tmp_path):
         from kai.bot import handle_project
         from kai.memory_projects import load_db_registry

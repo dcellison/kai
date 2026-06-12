@@ -38,6 +38,7 @@ later issues in the scoped-memory epic.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -170,6 +171,18 @@ _VALID_DEFAULT_SCOPES: frozenset[str] = frozenset({"global", "project"})
 
 _db_registry: dict[str, MemoryProjectConfig] = {}
 _db_creators: dict[str, int] = {}
+
+# Serializes registry mutations (guard + DB write + cache update).
+# The nested-root and collision guards are reads of the merged view
+# taken BEFORE an awaited DB insert; under concurrent command
+# handling, two registrations can both pass their guards against the
+# same stale view and commit a parent/child pair that the guards
+# exist to prevent (the child then steals its parent's subtree via
+# longest-prefix detection). The DB's uniqueness constraints only
+# cover exact id/root equality, not containment, so the stable-view
+# property must come from serialization. Mutations are rare,
+# operator-driven events; a single registry-wide lock costs nothing.
+registry_mutation_lock = asyncio.Lock()
 
 
 def _row_to_config(row: dict) -> MemoryProjectConfig | None:
