@@ -338,6 +338,82 @@ class TestArtifactFormats:
         assert memory_reclassify.validate_header({"run_id": "rs-1", "user_id": "100"}, user_id="100") is None
 
 
+class TestParseProposals:
+    """Strict row validation: a hand-edited proposals file must fail
+    parsing as a whole, never crash apply midway through writes."""
+
+    def _line(self, **overrides) -> str:
+        row = {
+            "type": "proposal",
+            "memory_id": "m1",
+            "verdict": "project",
+            "project_id": "kai",
+            "confidence": 0.9,
+            "reason": "r",
+            "prior_scope_source": "legacy_default",
+            "text_sha256": "ab",
+        }
+        row.update(overrides)
+        header = json.dumps({"type": "header", "run_id": "rs-1", "user_id": "100"})
+        return header + "\n" + json.dumps(row)
+
+    def test_valid_round_trip(self):
+        header, proposals = memory_reclassify.parse_proposals(self._line())
+        assert header["run_id"] == "rs-1"
+        assert proposals[0].verdict == "project"
+        assert proposals[0].confidence == 0.9
+
+    def test_global_verdict_normalizes_stray_target(self):
+        _, proposals = memory_reclassify.parse_proposals(self._line(verdict="global", project_id="kai"))
+        assert proposals[0].project_id is None
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"memory_id": ""},
+            {"memory_id": 7},
+            {"verdict": "task"},
+            {"verdict": "oops"},
+            {"project_id": None},
+            {"confidence": "high"},
+            {"confidence": 1.7},
+            {"text_sha256": None},
+        ],
+    )
+    def test_invalid_rows_raise_with_line_number(self, overrides):
+        with pytest.raises(ValueError, match="line 2"):
+            memory_reclassify.parse_proposals(self._line(**overrides))
+
+
+class TestParsePreimages:
+    """Same strictness for the restore artifact: a malformed pre-image
+    row could otherwise silently restore an empty row."""
+
+    def _line(self, **overrides) -> str:
+        row = {"type": "preimage", "memory_id": "m1", "text": "t", "metadata": {"source": "extracted"}}
+        row.update(overrides)
+        header = json.dumps({"type": "header", "run_id": "rs-1", "user_id": "100"})
+        return header + "\n" + json.dumps(row)
+
+    def test_valid_round_trip(self):
+        _, preimages = memory_reclassify.parse_preimages(self._line())
+        assert preimages[0].metadata == {"source": "extracted"}
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"memory_id": ""},
+            {"text": ""},
+            {"text": None},
+            {"metadata": "not a dict"},
+            {"metadata": None},
+        ],
+    )
+    def test_invalid_rows_raise_with_line_number(self, overrides):
+        with pytest.raises(ValueError, match="line 2"):
+            memory_reclassify.parse_preimages(self._line(**overrides))
+
+
 # ── Report rendering ────────────────────────────────────────────────
 
 
@@ -693,6 +769,59 @@ class TestApply:
         code = await memory_reclassify.run_apply(env["config"], "100", proposals_path=path, out_dir=env["out_dir"])
         assert code == 1
 
+    @pytest.mark.asyncio
+    async def test_existing_preimage_file_is_never_truncated(self, apply_env, tmp_path):
+        """A re-run of the same apply must not overwrite the first
+        run's rollback material; the path derives from the run id, so
+        only exclusive creation protects it."""
+        env = apply_env
+        row = _legacy("a")
+        env["store"] = {"a": row}
+        path = _proposals_file(tmp_path, [row])
+        env["out_dir"].mkdir(parents=True)
+        existing = env["out_dir"] / "reclassify-rs-apply-preimages.jsonl"
+        existing.write_text("rollback material from the first apply\n")
+        code = await memory_reclassify.run_apply(env["config"], "100", proposals_path=path, out_dir=env["out_dir"])
+        assert code == 1
+        assert env["updates"] == []
+        assert existing.read_text() == "rollback material from the first apply\n"
+
+    @pytest.mark.asyncio
+    async def test_no_survivors_writes_no_preimage_file(self, apply_env, tmp_path):
+        """The accidental-re-apply shape: every row was reclassified
+        by the first run, so the re-check deselects all of them. The
+        second run must not leave a header-only pre-image file where
+        the first run's rollback material lives."""
+        env = apply_env
+        reclassified = _row("a", scope_md={"scope": "project", "project_id": "kai", "scope_source": "classifier"})
+        env["store"] = {"a": reclassified}
+        path = _proposals_file(tmp_path, [_legacy("a")])
+        code = await memory_reclassify.run_apply(env["config"], "100", proposals_path=path, out_dir=env["out_dir"])
+        assert code == 0
+        assert env["updates"] == []
+        assert not (env["out_dir"] / "reclassify-rs-apply-preimages.jsonl").exists()
+
+    @pytest.mark.asyncio
+    async def test_malformed_proposal_row_aborts_before_store(self, apply_env, tmp_path, monkeypatch):
+        """A hand-edited row with an invalid verdict must abort the
+        whole apply during parsing, before any fetch or write."""
+        env = apply_env
+        row = _legacy("a")
+        good = _proposals_file(tmp_path, [row]).read_text()
+        corrupted = good.replace('"verdict":"project"', '"verdict":"task"')
+        bad_path = tmp_path / "edited.jsonl"
+        bad_path.write_text(corrupted)
+        fetches: list[str] = []
+        monkeypatch.setattr(
+            memory_reclassify.memory,
+            "get_by_id",
+            lambda *, user_id, memory_id: fetches.append(memory_id),
+        )
+        code = await memory_reclassify.run_apply(env["config"], "100", proposals_path=bad_path, out_dir=env["out_dir"])
+        assert code == 1
+        assert fetches == []
+        assert env["updates"] == []
+
 
 # ── Rollback ────────────────────────────────────────────────────────
 
@@ -756,4 +885,24 @@ class TestRollback:
         path = _preimage_file(tmp_path, [memory_reclassify.PreImage(memory_id="ghost", text="t", metadata={})])
         code = await memory_reclassify.run_rollback(env["config"], "100", preimages_path=path)
         assert code == 0
+        assert env["updates"] == []
+
+    @pytest.mark.asyncio
+    async def test_malformed_preimage_row_aborts_before_store(self, apply_env, tmp_path, monkeypatch):
+        """A pre-image row without text must abort the whole rollback
+        during parsing; writing it back would wipe the row's content."""
+        env = apply_env
+        good = _preimage_file(tmp_path, [memory_reclassify.PreImage(memory_id="a", text="t", metadata={})]).read_text()
+        corrupted = good.replace('"text":"t"', '"text":""')
+        bad_path = tmp_path / "edited.jsonl"
+        bad_path.write_text(corrupted)
+        fetches: list[str] = []
+        monkeypatch.setattr(
+            memory_reclassify.memory,
+            "get_by_id",
+            lambda *, user_id, memory_id: fetches.append(memory_id),
+        )
+        code = await memory_reclassify.run_rollback(env["config"], "100", preimages_path=bad_path)
+        assert code == 1
+        assert fetches == []
         assert env["updates"] == []

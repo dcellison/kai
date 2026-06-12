@@ -434,6 +434,79 @@ def validate_header(header: dict[str, Any], *, user_id: str) -> str | None:
     return None
 
 
+def parse_proposals(text: str) -> tuple[dict[str, Any], list[Proposal]]:
+    """Parse a proposals file into fully validated Proposal objects.
+
+    Strict by design: a proposals file is a hand-editable
+    authorization artifact, and apply mutates the store row by row.
+    A row that only fails AT WRITE TIME would crash the run after
+    earlier rows were already updated, so every field is validated
+    here, before any store access. Raises ValueError naming the
+    offending line; the caller aborts the whole apply.
+    """
+    header, raws = parse_artifact(text, row_type="proposal")
+    proposals: list[Proposal] = []
+    for i, raw in enumerate(raws, start=2):
+        mid = raw.get("memory_id")
+        if not isinstance(mid, str) or not mid:
+            raise ValueError(f"proposal line {i}: memory_id must be a non-empty string")
+        verdict = raw.get("verdict")
+        if verdict not in (memory.SCOPE_GLOBAL, memory.SCOPE_PROJECT):
+            raise ValueError(f"proposal line {i}: verdict must be 'global' or 'project', got {verdict!r}")
+        project_id = raw.get("project_id")
+        if verdict == memory.SCOPE_PROJECT:
+            if not isinstance(project_id, str) or not project_id:
+                raise ValueError(f"proposal line {i}: project verdict requires a non-empty project_id")
+        else:
+            # Normalize, matching the gate: a global re-stamp never
+            # carries a target, whatever a hand edit left behind.
+            project_id = None
+        confidence = raw.get("confidence")
+        if not isinstance(confidence, int | float) or not (0.0 <= float(confidence) <= 1.0):
+            raise ValueError(f"proposal line {i}: confidence must be a number in [0.0, 1.0], got {confidence!r}")
+        sha = raw.get("text_sha256")
+        if not isinstance(sha, str) or not sha:
+            raise ValueError(f"proposal line {i}: text_sha256 must be a non-empty string")
+        reason = raw.get("reason")
+        proposals.append(
+            Proposal(
+                memory_id=mid,
+                verdict=verdict,
+                project_id=project_id,
+                confidence=float(confidence),
+                reason=reason if isinstance(reason, str) else "",
+                prior_scope_source=str(raw.get("prior_scope_source", "")),
+                text_sha256=sha,
+            )
+        )
+    return header, proposals
+
+
+def parse_preimages(text: str) -> tuple[dict[str, Any], list[PreImage]]:
+    """Parse a pre-image file into fully validated PreImage objects.
+
+    Same strictness rationale as `parse_proposals`: rollback writes
+    the dumped text and metadata back verbatim, so a malformed row
+    (text missing, metadata not a dict) would either crash mid-run
+    or silently restore an empty row. Raises ValueError naming the
+    offending line; the caller aborts the whole rollback.
+    """
+    header, raws = parse_artifact(text, row_type="preimage")
+    preimages: list[PreImage] = []
+    for i, raw in enumerate(raws, start=2):
+        mid = raw.get("memory_id")
+        if not isinstance(mid, str) or not mid:
+            raise ValueError(f"preimage line {i}: memory_id must be a non-empty string")
+        pre_text = raw.get("text")
+        if not isinstance(pre_text, str) or not pre_text:
+            raise ValueError(f"preimage line {i}: text must be a non-empty string")
+        metadata = raw.get("metadata")
+        if not isinstance(metadata, dict):
+            raise ValueError(f"preimage line {i}: metadata must be an object")
+        preimages.append(PreImage(memory_id=mid, text=pre_text, metadata=metadata))
+    return header, preimages
+
+
 # ── Pure helpers: report rendering ──────────────────────────────────
 
 
@@ -726,11 +799,15 @@ async def run_apply(config: Config, user_id: str, *, proposals_path: Path, out_d
     """Apply a reviewed proposals file with per-row re-checks.
 
     Never re-runs classification: the reviewed file IS the change
-    set. Pre-images are dumped (and fsynced) before the first store
-    write; a dump failure aborts with zero changes.
+    set. Every proposal row is schema-validated up front (a
+    hand-edited row must abort the run BEFORE any write, not crash
+    it midway). Pre-images are dumped (and fsynced) before the first
+    store write; a dump failure aborts with zero changes, and an
+    existing pre-image file is never truncated because it may be the
+    only rollback material from an earlier apply of the same run.
     """
     try:
-        header, raw_rows = parse_artifact(proposals_path.read_text(encoding="utf-8"), row_type="proposal")
+        header, proposals = parse_proposals(proposals_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         print(f"memory admin: cannot read proposals: {e}")
         return 1
@@ -746,13 +823,12 @@ async def run_apply(config: Config, user_id: str, *, proposals_path: Path, out_d
     # and registry as they are NOW. The pairs that survive carry
     # their fresh row so the pre-image dump and the write use the
     # same fetched state.
-    survivors: list[tuple[dict[str, Any], MemoryResult, ResolvedMemoryScope]] = []
+    survivors: list[tuple[Proposal, MemoryResult, ResolvedMemoryScope]] = []
     skips: dict[str, list[str]] = {}
-    for raw in raw_rows:
-        mid = raw.get("memory_id", "")
-        row = memory.get_by_id(user_id=user_id, memory_id=mid)
+    for proposal in proposals:
+        row = memory.get_by_id(user_id=user_id, memory_id=proposal.memory_id)
         if row is None:
-            skips.setdefault(SKIP_ROW_GONE, []).append(mid)
+            skips.setdefault(SKIP_ROW_GONE, []).append(proposal.memory_id)
             continue
         resolved = memory.resolve_memory_scope(row.metadata)
         still_selected = (
@@ -764,24 +840,37 @@ async def run_apply(config: Config, user_id: str, *, proposals_path: Path, out_d
             # Covers the operator-moved-it-since-dry-run case: an
             # operator (or earlier classifier) write changes the
             # provenance, which deselects the row here.
-            skips.setdefault(SKIP_DESELECTED, []).append(mid)
+            skips.setdefault(SKIP_DESELECTED, []).append(proposal.memory_id)
             continue
-        if _text_sha256(row.text) != raw.get("text_sha256"):
-            skips.setdefault(SKIP_TEXT_DRIFT, []).append(mid)
+        if _text_sha256(row.text) != proposal.text_sha256:
+            skips.setdefault(SKIP_TEXT_DRIFT, []).append(proposal.memory_id)
             continue
-        if raw.get("verdict") == memory.SCOPE_PROJECT:
-            pid = raw.get("project_id")
-            if not isinstance(pid, str) or pid not in registry:
-                skips.setdefault(SKIP_UNREGISTERED_TARGET, []).append(mid)
+        if proposal.verdict == memory.SCOPE_PROJECT:
+            pid = proposal.project_id
+            if pid is None or pid not in registry:
+                skips.setdefault(SKIP_UNREGISTERED_TARGET, []).append(proposal.memory_id)
                 continue
             if not registry[pid].memory_enabled:
-                skips.setdefault(SKIP_DISABLED_TARGET, []).append(mid)
+                skips.setdefault(SKIP_DISABLED_TARGET, []).append(proposal.memory_id)
                 continue
-        survivors.append((raw, row, resolved))
+        survivors.append((proposal, row, resolved))
 
-    # Pre-image dump before any write; abort on failure. fsync so a
-    # crash mid-apply cannot leave changed rows with rollback
-    # material trapped in the page cache.
+    # Nothing to write means nothing to roll back: stop before the
+    # pre-image step entirely. Writing a header-only file here would
+    # at best be noise and at worst (same run id re-applied after a
+    # successful first pass) truncate the previous run's rollback
+    # material into an empty shell.
+    if not survivors:
+        skip_summary = ", ".join(f"{len(ids)} {reason}" for reason, ids in sorted(skips.items())) or "none"
+        print(f"memory admin: apply {run_id}: nothing to apply; skipped: {skip_summary}.")
+        return 0
+
+    # Pre-image dump before any write; abort on failure. Exclusive
+    # creation ("x"): the path derives from the run id, so a re-run
+    # of the same apply would otherwise silently overwrite the only
+    # copy of the original rows. fsync so a crash mid-apply cannot
+    # leave changed rows with rollback material trapped in the page
+    # cache.
     preimage_path = out_dir / f"reclassify-{run_id}-preimages.jsonl"
     preimage_header = {
         "run_id": run_id,
@@ -794,25 +883,30 @@ async def run_apply(config: Config, user_id: str, *, proposals_path: Path, out_d
     ]
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
-        with open(preimage_path, "w", encoding="utf-8") as f:
+        with open(preimage_path, "x", encoding="utf-8") as f:
             f.write(render_preimages(preimage_header, preimages))
             f.flush()
             os.fsync(f.fileno())
+    except FileExistsError:
+        print(
+            f"memory admin: pre-image file already exists for run {run_id}: {preimage_path}\n"
+            "memory admin: refusing to overwrite rollback material; move it aside first "
+            "(or use it with --rollback)."
+        )
+        return 1
     except OSError as e:
         print(f"memory admin: pre-image dump failed, aborting with no changes: {e}")
         return 1
 
     applied = 0
     failed = 0
-    for raw, row, resolved in survivors:
-        verdict = raw["verdict"]
-        pid = raw.get("project_id") if verdict == memory.SCOPE_PROJECT else None
+    for proposal, row, resolved in survivors:
         merged = dict(row.metadata or {})
         merged.update(
             memory.build_scope_metadata(
-                scope=verdict,
-                project_id=pid,
-                scope_confidence=float(raw.get("confidence", 1.0)),
+                scope=proposal.verdict,
+                project_id=proposal.project_id,
+                scope_confidence=proposal.confidence,
                 scope_source=memory.SCOPE_SOURCE_CLASSIFIER,
             )
         )
@@ -824,8 +918,8 @@ async def run_apply(config: Config, user_id: str, *, proposals_path: Path, out_d
                 memory_id=row.id,
                 user_id=user_id,
                 from_resolved=resolved,
-                to_scope=verdict,
-                to_project_id=pid,
+                to_scope=proposal.verdict,
+                to_project_id=proposal.project_id,
                 run_id=run_id,
             )
         else:
@@ -847,13 +941,16 @@ async def run_rollback(config: Config, user_id: str, *, preimages_path: Path) ->
 
     Restores text and metadata exactly as dumped; Mem0 recomputes
     the embedding from the restored text, so the row returns to its
-    prior retrieval behavior. Rows whose CURRENT provenance is
-    operator are skipped: the pre-image file is rollback material
-    for classifier writes, not a time machine over later operator
-    intent.
+    prior retrieval behavior. Every pre-image row is schema-validated
+    up front (same rationale as apply: a malformed row in a
+    hand-editable restore artifact must abort the run before any
+    write, not crash it midway or silently restore an empty row).
+    Rows whose CURRENT provenance is operator are skipped: the
+    pre-image file is rollback material for classifier writes, not a
+    time machine over later operator intent.
     """
     try:
-        header, raw_rows = parse_artifact(preimages_path.read_text(encoding="utf-8"), row_type="preimage")
+        header, preimages = parse_preimages(preimages_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         print(f"memory admin: cannot read pre-images: {e}")
         return 1
@@ -866,27 +963,21 @@ async def run_rollback(config: Config, user_id: str, *, preimages_path: Path) ->
     restored = 0
     failed = 0
     skips: dict[str, list[str]] = {}
-    for raw in raw_rows:
-        mid = raw.get("memory_id", "")
-        pre_text = raw.get("text", "")
-        pre_metadata = raw.get("metadata")
-        if not isinstance(pre_metadata, dict):
-            skips.setdefault(SKIP_MALFORMED_OUTPUT, []).append(mid)
-            continue
-        current = memory.get_by_id(user_id=user_id, memory_id=mid)
+    for pre in preimages:
+        current = memory.get_by_id(user_id=user_id, memory_id=pre.memory_id)
         if current is None:
-            skips.setdefault(SKIP_ROW_GONE, []).append(mid)
+            skips.setdefault(SKIP_ROW_GONE, []).append(pre.memory_id)
             continue
         current_resolved = memory.resolve_memory_scope(current.metadata)
         if current_resolved.scope_source == memory.SCOPE_SOURCE_OPERATOR:
-            skips.setdefault(SKIP_OPERATOR_CORRECTION, []).append(mid)
+            skips.setdefault(SKIP_OPERATOR_CORRECTION, []).append(pre.memory_id)
             continue
-        ok = memory.update_metadata(user_id=user_id, memory_id=mid, data=pre_text, metadata=pre_metadata)
+        ok = memory.update_metadata(user_id=user_id, memory_id=pre.memory_id, data=pre.text, metadata=pre.metadata)
         if ok:
             restored += 1
-            pre_resolved = memory.resolve_memory_scope(pre_metadata)
+            pre_resolved = memory.resolve_memory_scope(pre.metadata)
             _emit_scope_change(
-                memory_id=mid,
+                memory_id=pre.memory_id,
                 user_id=user_id,
                 from_resolved=current_resolved,
                 to_scope=pre_resolved.scope,

@@ -349,6 +349,39 @@ class TestReclassifyGates:
         init_mock.assert_not_called()
         assert "[0.0, 1.0]" in capsys.readouterr().err
 
+    def test_negative_sample_rejected_before_init(self, capsys):
+        """A negative sample would only blow up at report rendering,
+        after every reasoner call has been paid for; the typo must
+        die before memory init."""
+        args = self._args(["100", "--sample", "-1"])
+        with patch.object(memory_admin, "_initialize_memory") as init_mock:
+            code = memory_admin._cmd_reclassify(args)
+        assert code == 2
+        init_mock.assert_not_called()
+        assert ">= 0" in capsys.readouterr().err
+
+    def test_zero_sample_accepted(self):
+        args = self._args(["100", "--sample", "0"])
+        run_dry_run = AsyncMock(return_value=0)
+        with (
+            patch.object(memory_admin, "_initialize_memory", return_value=MagicMock()),
+            patch("kai.memory_reclassify.run_dry_run", run_dry_run),
+        ):
+            code = memory_admin._cmd_reclassify(args)
+        assert code == 0
+        assert run_dry_run.call_args.kwargs["sample"] == 0
+
+    def test_apply_plan_path_rejects_malformed_rows(self, tmp_path, capsys):
+        """The no-yes plan path uses the same strict row validation as
+        the driver, so a hand-edited file fails before authorization."""
+        path = _write_proposals(tmp_path)
+        path.write_text(path.read_text().replace('"verdict":"global"', '"verdict":"oops"'))
+        args = self._args(["100", "--apply", str(path)])
+        with patch.object(memory_admin, "_initialize_memory", return_value=MagicMock()):
+            code = memory_admin._cmd_reclassify(args)
+        assert code == 1
+        assert "verdict" in capsys.readouterr().err
+
     def test_init_failure_returns_1(self):
         args = self._args(["100"])
         with patch.object(memory_admin, "_initialize_memory", return_value=None):

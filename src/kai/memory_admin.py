@@ -321,6 +321,13 @@ def _cmd_reclassify(args: argparse.Namespace) -> int:
     if not (0.0 <= threshold <= 1.0):
         print(f"memory admin: --threshold must be in [0.0, 1.0], got {threshold}", file=sys.stderr)
         return 2
+    sample = args.sample if args.sample is not None else 10
+    # A negative sample would survive until report rendering and kill
+    # the run AFTER every reasoner call has been paid for; reject the
+    # typo up front. Zero is valid (no sample section).
+    if sample < 0:
+        print(f"memory admin: --sample must be >= 0, got {sample}", file=sys.stderr)
+        return 2
 
     config = _initialize_memory()
     if config is None:
@@ -334,7 +341,6 @@ def _cmd_reclassify(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir) if args.out_dir else DATA_DIR / "home" / args.user_id / "docs" / "reclassify"
 
     if not mutating:
-        sample = args.sample if args.sample is not None else 10
         return asyncio.run(
             memory_reclassify.run_dry_run(
                 config,
@@ -348,10 +354,18 @@ def _cmd_reclassify(args: argparse.Namespace) -> int:
             )
         )
 
+    # Typed parsers, not the generic artifact reader: a hand-edited
+    # row with a bad verdict or confidence fails HERE, in the plan
+    # path, before --yes and before any store access. The driver
+    # re-validates the same way, so both entries share one contract.
     artifact_path = Path(args.apply if args.apply is not None else args.rollback)
     row_type = "proposal" if args.apply is not None else "preimage"
     try:
-        header, rows = memory_reclassify.parse_artifact(artifact_path.read_text(encoding="utf-8"), row_type=row_type)
+        text = artifact_path.read_text(encoding="utf-8")
+        if args.apply is not None:
+            header, rows = memory_reclassify.parse_proposals(text)
+        else:
+            header, rows = memory_reclassify.parse_preimages(text)
     except (OSError, ValueError) as e:
         print(f"memory admin: cannot read {row_type} file: {e}", file=sys.stderr)
         return 1
