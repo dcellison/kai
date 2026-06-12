@@ -17,12 +17,13 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from kai import memory_extraction
-from kai.config import Config
+from kai.config import Config, MemoryProjectConfig
 from kai.memory import MemoryResult
 from kai.memory_extraction import (
     _CONFIRMATION_QUOTE_MIN_CHARS,
@@ -32,6 +33,8 @@ from kai.memory_extraction import (
     _FACT_SCHEMA,
     _GENERIC_CONFIRMATION_RE,
     _RULE_6_REJECTIONS,
+    _SCOPE_CONFIDENCE_DEFAULTED,
+    _SCOPE_CONFIDENCE_HINTED,
     _WORKFLOW_EVENT_RE,
     _WORKFLOW_SELF_ANNOUNCEMENT_QUOTE_RE,
     _build_extraction_payload,
@@ -41,6 +44,7 @@ from kai.memory_extraction import (
     _paraphrase_neighbor,
     _render_candidate_line,
     _render_candidate_source,
+    _route_write_scope,
     _store_facts,
     _strip_role_labels,
     _validate_episode,
@@ -48,6 +52,7 @@ from kai.memory_extraction import (
     extract_and_store,
     get_extractor_stats,
 )
+from kai.memory_projects import ActiveMemoryProject
 
 # ── Fixtures ─────────────────────────────────────────────────────────
 
@@ -2602,7 +2607,7 @@ class TestExtractionPromptSoftVocab:
     def test_extraction_prompt_version_bumped(self):
         """The version stamp on every fact's metadata; bumped
         whenever the schema or prompt changes meaningfully."""
-        assert _EXTRACTION_PROMPT_VERSION == "11"
+        assert _EXTRACTION_PROMPT_VERSION == "12"
 
     def test_extraction_prompt_version_history_extended(self):
         """The prompt-version history comment block (the sequence
@@ -2646,6 +2651,11 @@ class TestExtractionPromptSoftVocab:
         # at the current head of the version sequence.
         assert "v11 (2026-05-24)" in src
         assert "user-announced completed workflow actions" in src
+        # v12 entry: scope_hint write-scope judgment field. Pinning
+        # the literal date plus the distinguishing phrase keeps the
+        # rule honest at the current head of the version sequence.
+        assert "v12 (2026-06-12)" in src
+        assert "scope_hint FORMAT field" in src
 
 
 class TestRule6WorkflowEventRegex:
@@ -4157,3 +4167,442 @@ class TestExtractAndStorePerUserDispatch:
         # Stage 2 inherits the codex backend stage 1 resolved.
         assert captured_episode_kwargs.get("effective_backend") == "codex"
         assert captured_episode_kwargs.get("os_user") == "alice_os"
+
+
+# ── Write-scope routing (scoped-memory epic) ─────────────────────────
+
+
+def _active_project(**overrides) -> ActiveMemoryProject:
+    """Build an ActiveMemoryProject with test defaults.
+
+    Mirrors what detect_active_memory_project returns for a registered
+    root; tests override individual fields to exercise each routing
+    rule without re-running detection.
+    """
+    defaults: dict = {
+        "project_id": "kai",
+        "display_name": "Kai",
+        "matched_root": Path("/work/kai"),
+        "memory_enabled": True,
+        "default_scope_for_new_facts": None,
+    }
+    defaults.update(overrides)
+    return ActiveMemoryProject(**defaults)
+
+
+class TestRouteWriteScope:
+    """Unit tests for `_route_write_scope`, one per routing rule.
+
+    The helper is pure (hint + detection result in, scope-metadata
+    dict out), so every rule is pinned directly without mocks. The
+    dict shape itself is produced by `memory.build_scope_metadata`,
+    whose validation is covered in test_memory.py; these tests assert
+    the ROUTING decisions (scope, source, confidence, id propagation),
+    not the builder's field mechanics.
+    """
+
+    def test_no_project_routes_global_default(self):
+        meta = _route_write_scope("project", None)
+        assert meta["scope"] == "global"
+        assert meta["scope_source"] == "extraction_default"
+        assert meta["scope_confidence"] == _SCOPE_CONFIDENCE_DEFAULTED
+        assert meta["project_id"] is None
+
+    def test_memory_disabled_project_routes_global_and_ignores_hint(self):
+        """A detectable project with memory_enabled=false must behave
+        exactly like no project: global scope, default source, hint
+        ignored. This mirrors the read side's "known project, memory
+        disabled" rule so write and read authority cannot disagree."""
+        project = _active_project(memory_enabled=False)
+        meta = _route_write_scope("project", project)
+        assert meta["scope"] == "global"
+        assert meta["scope_source"] == "extraction_default"
+        assert meta["project_id"] is None
+
+    def test_project_hint_wins_with_detection_identity(self):
+        """A valid "project" hint takes project scope, but the
+        project_id and workspace_root come from DETECTION, never from
+        anything the model produced. The identity fields are the
+        authority boundary; the model only judges which side of it
+        the content falls on."""
+        project = _active_project()
+        meta = _route_write_scope("project", project)
+        assert meta["scope"] == "project"
+        assert meta["scope_source"] == "classifier"
+        assert meta["scope_confidence"] == _SCOPE_CONFIDENCE_HINTED
+        assert meta["project_id"] == "kai"
+        assert meta["workspace_root"] == "/work/kai"
+
+    def test_global_hint_wins_inside_project(self):
+        """An operator-identity fact extracted inside a project
+        workspace stays global when the model says global; the
+        active project must not leak into its identity fields."""
+        project = _active_project()
+        meta = _route_write_scope("global", project)
+        assert meta["scope"] == "global"
+        assert meta["scope_source"] == "classifier"
+        assert meta["scope_confidence"] == _SCOPE_CONFIDENCE_HINTED
+        assert meta["project_id"] is None
+
+    def test_missing_hint_falls_back_to_registry_project_default(self):
+        project = _active_project(default_scope_for_new_facts="project")
+        meta = _route_write_scope(None, project)
+        assert meta["scope"] == "project"
+        assert meta["scope_source"] == "extraction_default"
+        assert meta["scope_confidence"] == _SCOPE_CONFIDENCE_DEFAULTED
+        assert meta["project_id"] == "kai"
+
+    def test_missing_hint_falls_back_to_registry_global_default(self):
+        project = _active_project(default_scope_for_new_facts="global")
+        meta = _route_write_scope(None, project)
+        assert meta["scope"] == "global"
+        assert meta["scope_source"] == "extraction_default"
+
+    def test_missing_hint_with_no_registry_default_routes_global(self):
+        project = _active_project(default_scope_for_new_facts=None)
+        meta = _route_write_scope(None, project)
+        assert meta["scope"] == "global"
+        assert meta["scope_source"] == "extraction_default"
+
+    @pytest.mark.parametrize("bad_hint", ["task", "Project", "GLOBAL", "", 42, ["project"], {"scope": "project"}])
+    def test_invalid_hint_treated_as_missing(self, bad_hint):
+        """Every malformed hint shape takes the missing-hint path: the
+        registry default applies and the source stays
+        extraction_default. The schema enum should prevent these from
+        ever arriving, but a schema regression must degrade to policy
+        defaulting, never to guessing or to dropping the fact."""
+        project = _active_project(default_scope_for_new_facts="project")
+        meta = _route_write_scope(bad_hint, project)
+        assert meta["scope"] == "project"
+        assert meta["scope_source"] == "extraction_default"
+        assert meta["scope_confidence"] == _SCOPE_CONFIDENCE_DEFAULTED
+
+
+class TestStoreFactsScopeMetadata:
+    """Integration of `_route_write_scope` into `_store_facts`: the
+    routed fields land in add_structured metadata, the raw hint does
+    not, and the per-run memory.extract.scope log line carries the
+    routing tallies."""
+
+    def _captured_store(self, monkeypatch) -> list[dict]:
+        """Stub the storage boundary; return the captured metadata
+        list (one entry per add_structured call, in call order)."""
+        captured: list[dict] = []
+        monkeypatch.setattr(
+            "kai.memory_extraction._paraphrase_neighbor",
+            lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.add_structured",
+            lambda content, **kw: captured.append(kw.get("metadata") or {}) or f"id-{len(captured)}",
+        )
+        return captured
+
+    def test_project_hint_lands_in_metadata(self, monkeypatch):
+        captured = self._captured_store(monkeypatch)
+        facts = [
+            {
+                "content": "The retry queue drains via the cron worker",
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "new",
+                "speaker": "assistant",
+                "scope_hint": "project",
+            }
+        ]
+        stored, _, _ = _store_facts(
+            facts,
+            user_id="u1",
+            session_id="s1",
+            config=_cfg(),
+            active_project=_active_project(),
+        )
+        assert stored == 1
+        meta = captured[0]
+        assert meta["scope"] == "project"
+        assert meta["project_id"] == "kai"
+        assert meta["workspace_root"] == "/work/kai"
+        assert meta["scope_source"] == "classifier"
+        # The raw hint is consumed by routing, never persisted: the
+        # routed fields plus scope_source already encode everything
+        # the hint said.
+        assert "scope_hint" not in meta
+
+    def test_default_active_project_none_routes_global(self, monkeypatch):
+        """Callers that do not pass active_project (the replay
+        harness, any pre-scoped-memory call site) get explicit global
+        scope metadata on every row, which is the same authority the
+        legacy-default read path already assigned them implicitly."""
+        captured = self._captured_store(monkeypatch)
+        facts = [
+            {
+                "content": "User prefers Celsius",
+                "tags": ["preference"],
+                "confidence": 0.9,
+                "intent": "new",
+                "speaker": "user",
+            }
+        ]
+        stored, _, _ = _store_facts(facts, user_id="u1", session_id="s1", config=_cfg())
+        assert stored == 1
+        meta = captured[0]
+        assert meta["scope"] == "global"
+        assert meta["scope_source"] == "extraction_default"
+        assert meta["project_id"] is None
+
+    def test_update_of_branch_routes_scope_too(self, monkeypatch):
+        """The update_of branch shares the metadata bundle with the
+        new branch; pin it separately so a refactor that splits the
+        bundle cannot silently drop scope from replacements."""
+        captured = self._captured_store(monkeypatch)
+        monkeypatch.setattr(
+            "kai.memory_extraction.memory.delete_by_id",
+            lambda *, user_id, memory_id: True,
+        )
+        facts = [
+            {
+                "content": "The retry queue drains via the async worker",
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "update_of",
+                "existing_id": "old-id",
+                "speaker": "assistant",
+                "scope_hint": "project",
+            }
+        ]
+        stored, replaced, _ = _store_facts(
+            facts,
+            user_id="u1",
+            session_id="s1",
+            config=_cfg(),
+            active_project=_active_project(),
+        )
+        assert (stored, replaced) == (1, 1)
+        assert captured[0]["scope"] == "project"
+        assert captured[0]["project_id"] == "kai"
+
+    def test_scope_log_line_carries_tallies(self, monkeypatch, caplog):
+        """One memory.extract.scope line per run: hinted vs defaulted
+        counts and per-scope stored tallies must reflect rows that
+        actually landed."""
+        self._captured_store(monkeypatch)
+        facts = [
+            {
+                "content": "The retry queue drains via the cron worker",
+                "tags": ["fact"],
+                "confidence": 0.9,
+                "intent": "new",
+                "speaker": "assistant",
+                "scope_hint": "project",
+            },
+            {
+                "content": "User prefers Celsius",
+                "tags": ["preference"],
+                "confidence": 0.9,
+                "intent": "new",
+                "speaker": "user",
+            },
+        ]
+        with caplog.at_level("INFO", logger="kai.memory_extraction"):
+            _store_facts(
+                facts,
+                user_id="u1",
+                session_id="s1",
+                config=_cfg(),
+                active_project=_active_project(),
+            )
+        scope_lines = [r.message for r in caplog.records if r.message.startswith("memory.extract.scope ")]
+        assert len(scope_lines) == 1
+        payload = json.loads(scope_lines[0].split(" ", 1)[1])
+        assert payload["active_project_id"] == "kai"
+        assert payload["matched_root"] == "/work/kai"
+        assert payload["project_memory_enabled"] is True
+        assert payload["hinted"] == 1
+        assert payload["defaulted"] == 1
+        assert payload["stored_project"] == 1
+        assert payload["stored_global"] == 1
+
+
+class TestEpisodeScopeMetadata:
+    """Episode writes route scope under the same rules as facts."""
+
+    @pytest.mark.asyncio
+    async def test_episode_scope_hint_lands_in_metadata(self, monkeypatch):
+        episode_payload = {
+            "goal": "Lock per-user home workspace as the canonical layout",
+            "context": "ctx",
+            "approach": "ap",
+            "outcome": "out",
+            "outcome_quality": "success",
+            "tags": ["t1"],
+            "actors": ["user"],
+            "scope_hint": "project",
+        }
+
+        async def _fake_runner(payload, config, **kwargs):
+            return episode_payload, None
+
+        captured_metadata: dict = {}
+
+        def _fake_add_structured(*args, **kwargs):
+            captured_metadata.update(kwargs.get("metadata") or {})
+            return "stored-mem-id"
+
+        monkeypatch.setattr(memory_extraction, "_run_episode_extractor", _fake_runner)
+        monkeypatch.setattr(memory_extraction, "_emit_episode_log", lambda **kw: None)
+        from kai import memory as memory_module
+
+        monkeypatch.setattr(memory_module, "add_structured", _fake_add_structured)
+
+        await memory_extraction._generate_episode(
+            user_text="propose home layout",
+            assistant_text="locked: per-user home workspace",
+            user_id="u-int",
+            session_id="s-1",
+            config=_cfg(),
+            effective_backend="claude",
+            effective_provider="anthropic",
+            active_project=_active_project(),
+        )
+
+        assert captured_metadata["scope"] == "project"
+        assert captured_metadata["project_id"] == "kai"
+        assert captured_metadata["scope_source"] == "classifier"
+        assert "scope_hint" not in captured_metadata
+
+    @pytest.mark.asyncio
+    async def test_episode_without_active_project_routes_global(self, monkeypatch):
+        episode_payload = {
+            "goal": "Lock per-user home workspace as the canonical layout",
+            "context": "ctx",
+            "approach": "ap",
+            "outcome": "out",
+            "outcome_quality": "success",
+            "tags": ["t1"],
+            "actors": ["user"],
+            "scope_hint": "project",
+        }
+
+        async def _fake_runner(payload, config, **kwargs):
+            return episode_payload, None
+
+        captured_metadata: dict = {}
+
+        def _fake_add_structured(*args, **kwargs):
+            captured_metadata.update(kwargs.get("metadata") or {})
+            return "stored-mem-id"
+
+        monkeypatch.setattr(memory_extraction, "_run_episode_extractor", _fake_runner)
+        monkeypatch.setattr(memory_extraction, "_emit_episode_log", lambda **kw: None)
+        from kai import memory as memory_module
+
+        monkeypatch.setattr(memory_module, "add_structured", _fake_add_structured)
+
+        await memory_extraction._generate_episode(
+            user_text="propose home layout",
+            assistant_text="locked: per-user home workspace",
+            user_id="u-int",
+            session_id="s-1",
+            config=_cfg(),
+            effective_backend="claude",
+            effective_provider="anthropic",
+        )
+
+        assert captured_metadata["scope"] == "global"
+        assert captured_metadata["scope_source"] == "extraction_default"
+
+
+class TestWorkspaceThreading:
+    """`extract_and_store` detects the active project from the
+    `workspace` parameter once per run and threads the result into
+    `_store_facts`."""
+
+    def _fact(self) -> dict:
+        return {
+            "content": "User prefers Celsius",
+            "tags": ["preference"],
+            "confidence": 0.9,
+            "intent": "new",
+            "speaker": "user",
+        }
+
+    def _result(self) -> MagicMock:
+        result = MagicMock()
+        result.facts = [self._fact()]
+        result.has_episode = False
+        return result
+
+    @pytest.mark.asyncio
+    async def test_workspace_inside_registered_root_detects_project(self, monkeypatch, tmp_path):
+        root = (tmp_path / "kai").resolve()
+        root.mkdir()
+        cfg = _cfg(
+            memory_projects={
+                "kai": MemoryProjectConfig(
+                    project_id="kai",
+                    display_name="Kai",
+                    workspace_roots=(root,),
+                    memory_enabled=True,
+                    default_scope_for_new_facts=None,
+                )
+            }
+        )
+        monkeypatch.setattr(memory_extraction, "_run_extractor", AsyncMock(return_value=self._result()))
+        seen: dict = {}
+
+        def _fake_store(facts, *, user_id, session_id, config, active_project=None):
+            seen["active_project"] = active_project
+            return (1, 0, 0)
+
+        monkeypatch.setattr(memory_extraction, "_store_facts", _fake_store)
+
+        await extract_and_store(
+            user_text="u",
+            assistant_text="a",
+            user_id="1",
+            config=cfg,
+            workspace=str(root / "src"),
+        )
+
+        assert seen["active_project"] is not None
+        assert seen["active_project"].project_id == "kai"
+        assert seen["active_project"].matched_root == root
+
+    @pytest.mark.asyncio
+    async def test_no_workspace_skips_detection(self, monkeypatch):
+        """The default-None path (replay harness, legacy callers) must
+        not even consult the registry; routing sees active_project
+        None and writes global."""
+        monkeypatch.setattr(memory_extraction, "_run_extractor", AsyncMock(return_value=self._result()))
+        monkeypatch.setattr(
+            memory_extraction,
+            "detect_active_memory_project",
+            lambda *a, **kw: pytest.fail("detection must not run without a workspace"),
+        )
+        seen: dict = {}
+
+        def _fake_store(facts, *, user_id, session_id, config, active_project=None):
+            seen["active_project"] = active_project
+            return (1, 0, 0)
+
+        monkeypatch.setattr(memory_extraction, "_store_facts", _fake_store)
+
+        await extract_and_store(user_text="u", assistant_text="a", user_id="1", config=_cfg())
+
+        assert seen["active_project"] is None
+
+
+class TestScopeHintSchema:
+    """Pin the scope_hint contract in both extractor schemas."""
+
+    def test_fact_schema_scope_hint_optional_enum(self):
+        props = _FACT_SCHEMA["properties"]["facts"]["items"]["properties"]
+        assert props["scope_hint"]["enum"] == ["global", "project"]
+        # NOT required: omission is the model's "neither clearly
+        # applies" signal and must stay schema-legal.
+        assert "scope_hint" not in _FACT_SCHEMA["properties"]["facts"]["items"]["required"]
+
+    def test_episode_schema_scope_hint_optional_enum(self):
+        props = memory_extraction._EPISODE_SCHEMA["properties"]["episode"]["properties"]
+        assert props["scope_hint"]["enum"] == ["global", "project"]
+        assert "scope_hint" not in memory_extraction._EPISODE_SCHEMA["properties"]["episode"]["required"]

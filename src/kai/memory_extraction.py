@@ -26,10 +26,12 @@ import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 
 from kai import memory
 from kai.config import Config, ModelRole, resolve_user_model
 from kai.memory import MemoryResult
+from kai.memory_projects import ActiveMemoryProject, detect_active_memory_project
 from kai.oneshot import _EXTRACTOR_CWD as _EXTRACTOR_CWD
 from kai.oneshot import _SUBPROCESS_ENV_ALLOWLIST as _SUBPROCESS_ENV_ALLOWLIST
 from kai.oneshot import (
@@ -142,14 +144,20 @@ log = logging.getLogger(__name__)
 # extractor classified the same probe correctly. Schema unchanged;
 # the bump lets post-rollout log analysis partition facts produced
 # after the merge-PR negative landed from those produced before it.
-_EXTRACTION_PROMPT_VERSION: str = "11"
+# v12 (2026-06-12): added the scope_hint FORMAT field (global vs
+# project write-scope judgment for the scoped-memory routing path),
+# with worked examples. The fact schema gains the matching optional
+# scope_hint enum.
+_EXTRACTION_PROMPT_VERSION: str = "12"
 
 # Sibling of _EXTRACTION_PROMPT_VERSION for stage-2 episode generation.
 # Stored in each episode's metadata so future cleanups can target a
 # specific episode-prompt revision the same way fact prompt versions
 # are tracked. Bump on any substantive edit to _EPISODE_SYSTEM_PROMPT
 # or _EPISODE_SCHEMA.
-_EPISODE_PROMPT_VERSION: str = "1"
+# v2 (2026-06-12): added the optional scope_hint field (global vs
+# project write-scope judgment for the scoped-memory routing path).
+_EPISODE_PROMPT_VERSION: str = "2"
 
 # Memory `type` values this module writes. Track 1 writes "exchange"
 # from memory.py; Track 2 writes "fact" from here. Any other type value
@@ -362,6 +370,17 @@ _FACT_SCHEMA: dict = {
                         "type": "string",
                         "enum": ["user", "assistant"],
                     },
+                    # Optional write-scope judgment. NOT in `required`:
+                    # the prompt tells the model to omit the field when
+                    # neither value clearly applies, and the routing
+                    # helper treats absence as "use policy default".
+                    # A required field would push the model toward
+                    # guessing a scope, which is exactly the failure
+                    # mode scoped memory exists to prevent.
+                    "scope_hint": {
+                        "type": "string",
+                        "enum": ["global", "project"],
+                    },
                 },
                 "required": ["content", "tags", "confidence", "intent", "speaker"],
                 "additionalProperties": False,
@@ -535,6 +554,29 @@ FORMAT each fact as:
   confirms the action, minimum 20 characters, and must reference
   the action specifically (not a generic "thanks"). If no such
   quote exists, do not emit the fact.
+- scope_hint: OPTIONAL. Either "global" or "project". Emit "global"
+  when the fact would hold for this user in ANY project context:
+  identity, location, timezone, stable preferences, working style,
+  hardware, cross-project constraints. Emit "project" when the fact
+  is specific to the project being worked on in this conversation:
+  implementation details, repo or module specifics, project-local
+  conventions, decisions whose authority ends at the project
+  boundary. OMIT the field when neither clearly applies; an omitted
+  scope_hint falls back to a safe policy default, and omitting is
+  always better than guessing.
+
+  Worked examples:
+
+  - "User prefers Celsius" -> scope_hint: "global". True in every
+    project.
+  - "The webhook secret is read from the WEBHOOK_SECRET env var"
+    -> scope_hint: "project". An implementation detail of the
+    project under discussion; in a different project the same
+    sentence could be false.
+  - "User decided the parser rewrite ships behind a feature flag"
+    -> scope_hint: "project". A durable decision, but its
+    authority ends at this project's boundary.
+  - "User works in Eastern Time" -> scope_hint: "global".
 
 EPISODE CLASSIFICATION (windowed):
 Decide whether the CURRENT exchange (marked with >>>) is the closing
@@ -711,6 +753,14 @@ _EPISODE_SCHEMA: dict = {
                     "minItems": 1,
                     "maxItems": 10,
                 },
+                # Optional write-scope judgment, mirroring the fact
+                # schema's scope_hint. Absence means "use policy
+                # default"; see the fact-schema comment for why the
+                # field must not be required.
+                "scope_hint": {
+                    "type": "string",
+                    "enum": ["global", "project"],
+                },
             },
             "required": [
                 "goal",
@@ -792,6 +842,14 @@ FIELDS (required unless noted):
   GitHub login or service name for an external actor, or a PR or
   issue number (e.g. "PR #360", "#306") for an artifact that was
   central to the situation.
+
+- scope_hint: OPTIONAL. Either "global" or "project". Emit
+  "project" when the situation is specific to the project being
+  worked on (an implementation arc, a debugging session in one
+  codebase, a repo-local decision). Emit "global" when the
+  situation's lesson would apply to this user's work in any
+  project. OMIT the field when neither clearly applies; omitting
+  is always better than guessing.
 
 GUIDELINES:
 - Prefer specificity over generality. An episode that could fit
@@ -2284,6 +2342,7 @@ async def _generate_episode(
     effective_backend: str,
     effective_provider: str,
     os_user: str | None = None,
+    active_project: ActiveMemoryProject | None = None,
 ) -> None:
     """
     Stage-2 task body: generate one episode record and store it.
@@ -2299,6 +2358,11 @@ async def _generate_episode(
     extraction semaphore) so concurrent stage-2 calls for the same user
     serialize. Stage 1 calls for the same user proceed in parallel
     because stage 2 is by design out-of-band.
+
+    `active_project` is the run-level detection result threaded from
+    `extract_and_store` (same single-resolution contract as `os_user`
+    and the backend triple); `_route_write_scope` consumes it with the
+    generated episode's `scope_hint` at the metadata-build site below.
     """
     sem = _get_episode_semaphore(user_id)
     # Pre-acquire fallback so the post-try _emit_episode_log call
@@ -2418,6 +2482,11 @@ async def _generate_episode(
                     }
                     if "lessons" in episode:
                         extra["lessons"] = episode["lessons"]
+                    # Write-scope routing, same consumption shape as
+                    # the fact path in _store_facts: the generator's
+                    # scope_hint is routed (never stored raw) and the
+                    # resulting scope fields land in metadata.
+                    extra.update(_route_write_scope(episode.get("scope_hint"), active_project))
                     # add_structured is sync (Mem0 is sync). Run off
                     # the event loop so the embedding step does not
                     # block other stage-2 tasks queued behind this
@@ -2465,12 +2534,103 @@ async def _generate_episode(
     )
 
 
+# Write-time scope-assignment confidence. Hinted assignments carry the
+# extractor's content judgment; defaulted assignments are mechanical
+# policy fallbacks with no judgment behind them. The gap between the
+# two values is what lets a later audit (or a reclassification pass)
+# find the defaulted rows without parsing scope_source strings. No
+# retrieval ranking weights scope_confidence yet (the read-time
+# resolver only carries it through); these values are write-side
+# provenance only.
+_SCOPE_CONFIDENCE_HINTED: float = 0.9
+_SCOPE_CONFIDENCE_DEFAULTED: float = 0.6
+
+# Hint values the routing helper accepts. Mirrors the scope_hint enum
+# in _FACT_SCHEMA and _EPISODE_SCHEMA; anything else (including a
+# schema regression that lets a stray string through) is treated as
+# "no hint" rather than rejected or guessed.
+_VALID_SCOPE_HINTS: frozenset[str] = frozenset({memory.SCOPE_GLOBAL, memory.SCOPE_PROJECT})
+
+
+def _route_write_scope(
+    hint: object,
+    active_project: ActiveMemoryProject | None,
+) -> dict[str, object]:
+    """
+    Apply the write-scope routing rules and return scope metadata.
+
+    The returned dict comes from `memory.build_scope_metadata()` and
+    merges into a row's metadata before `add_structured()`. Routing is
+    fail-safe: every path that cannot justify project scope lands on
+    global, and an unusable hint is discarded (the FACT is kept; only
+    the hint is ignored). Never raises on bad input; an exception here
+    would bubble through `_store_facts` into the run-level catch and
+    lose the whole validated batch over its least important field.
+
+    Rules, in precedence order:
+
+    1. No detected project, or the detected project has
+       `memory_enabled: false`: global, `scope_source=extraction_default`.
+       Hints are ignored in this state; there is no project to attach
+       project scope to, and honoring a "global" hint here would
+       record classifier provenance for a decision the classifier did
+       not actually make.
+    2. Detected project and a valid hint: the hint wins,
+       `scope_source=classifier`. Project-scoped rows take their
+       `project_id` and `workspace_root` from detection, never from
+       the model.
+    3. Detected project, missing or invalid hint: the registry's
+       `default_scope_for_new_facts` when set, else global;
+       `scope_source=extraction_default`.
+
+    Defaulted assignments (rules 1 and 3) carry
+    `_SCOPE_CONFIDENCE_DEFAULTED`; hinted assignments (rule 2) carry
+    `_SCOPE_CONFIDENCE_HINTED`.
+    """
+    if active_project is None or not active_project.memory_enabled:
+        return memory.build_scope_metadata(
+            scope=memory.SCOPE_GLOBAL,
+            scope_source=memory.SCOPE_SOURCE_EXTRACTION_DEFAULT,
+            scope_confidence=_SCOPE_CONFIDENCE_DEFAULTED,
+        )
+
+    if isinstance(hint, str) and hint in _VALID_SCOPE_HINTS:
+        if hint == memory.SCOPE_PROJECT:
+            return memory.build_scope_metadata(
+                scope=memory.SCOPE_PROJECT,
+                project_id=active_project.project_id,
+                workspace_root=str(active_project.matched_root),
+                scope_source=memory.SCOPE_SOURCE_CLASSIFIER,
+                scope_confidence=_SCOPE_CONFIDENCE_HINTED,
+            )
+        return memory.build_scope_metadata(
+            scope=memory.SCOPE_GLOBAL,
+            scope_source=memory.SCOPE_SOURCE_CLASSIFIER,
+            scope_confidence=_SCOPE_CONFIDENCE_HINTED,
+        )
+
+    if active_project.default_scope_for_new_facts == memory.SCOPE_PROJECT:
+        return memory.build_scope_metadata(
+            scope=memory.SCOPE_PROJECT,
+            project_id=active_project.project_id,
+            workspace_root=str(active_project.matched_root),
+            scope_source=memory.SCOPE_SOURCE_EXTRACTION_DEFAULT,
+            scope_confidence=_SCOPE_CONFIDENCE_DEFAULTED,
+        )
+    return memory.build_scope_metadata(
+        scope=memory.SCOPE_GLOBAL,
+        scope_source=memory.SCOPE_SOURCE_EXTRACTION_DEFAULT,
+        scope_confidence=_SCOPE_CONFIDENCE_DEFAULTED,
+    )
+
+
 def _store_facts(
     facts: list[dict],
     *,
     user_id: str,
     session_id: str | None,
     config: Config,
+    active_project: ActiveMemoryProject | None = None,
 ) -> tuple[int, int, int]:
     """
     Persist validated facts via memory.add_structured, branching on intent.
@@ -2492,6 +2652,14 @@ def _store_facts(
     rather than re-loaded here so a test or a per-call override can
     flow through the same code path; also avoids an in-loop
     `load_config()` cost.
+
+    `active_project` is the workspace-detection result threaded from
+    `extract_and_store`; `_route_write_scope` consumes it (with each
+    fact's `scope_hint`) to merge scope metadata into every stored
+    row. None routes all facts global, which is both the no-workspace
+    state and the not-in-a-registered-project state. The function
+    emits one `memory.extract.scope` JSON line per call recording the
+    detection result and the routing tallies for rows that landed.
 
     Each intent branch emits exactly one `memory.consolidate.intent`
     line via `_emit_intent_log`. The `intent="new"` branch keeps the
@@ -2515,6 +2683,22 @@ def _store_facts(
     stored = 0
     replaced = 0
     skipped = 0
+    # Per-run scope routing tallies for the memory.extract.scope log
+    # line. `hinted`/`defaulted` count rows that LANDED (not proposed
+    # facts), keyed off the routed scope_source, so the log reflects
+    # what actually entered the store.
+    scope_hinted = 0
+    scope_defaulted = 0
+    stored_by_scope: dict[str, int] = {memory.SCOPE_GLOBAL: 0, memory.SCOPE_PROJECT: 0}
+
+    def _tally_scope(scope_meta: dict[str, object]) -> None:
+        nonlocal scope_hinted, scope_defaulted
+        if scope_meta["scope_source"] == memory.SCOPE_SOURCE_CLASSIFIER:
+            scope_hinted += 1
+        else:
+            scope_defaulted += 1
+        scope = str(scope_meta["scope"])
+        stored_by_scope[scope] = stored_by_scope.get(scope, 0) + 1
 
     for fact in facts:
         content = fact.get("content")
@@ -2553,6 +2737,13 @@ def _store_facts(
         # by the time _validate_facts has run.
         if "confirmation_quote" in fact:
             extra["confirmation_quote"] = fact["confirmation_quote"]
+        # Write-scope routing. The model's scope_hint is consumed here
+        # and deliberately NOT copied into metadata: the routed result
+        # (scope, project_id, workspace_root, scope_confidence,
+        # scope_source) is the durable record; the raw hint adds no
+        # information beyond what scope_source already encodes.
+        scope_meta = _route_write_scope(fact.get("scope_hint"), active_project)
+        extra.update(scope_meta)
 
         if intent == "skip_redundant":
             # No storage call. The intent log is the only side effect
@@ -2622,6 +2813,7 @@ def _store_facts(
             )
             stored += 1
             replaced += 1
+            _tally_scope(scope_meta)
             continue
 
         # intent == "new" (rule-1 already rejected anything else, but
@@ -2680,6 +2872,7 @@ def _store_facts(
                 outcome="stored",
             )
             stored += 1
+            _tally_scope(scope_meta)
         else:
             # `dropped_backend`: storage disabled OR backend swallowed
             # the call (Mem0 add() has an internal try/except that turns
@@ -2695,6 +2888,30 @@ def _store_facts(
                 replaced_id=None,
                 outcome="dropped_backend",
             )
+    # One scope-routing line per extraction run (this function is
+    # called at most once per run, and only when the validated fact
+    # list is non-empty). The fixed-shape JSON record lets shadow-log
+    # analysis trace a scoped row back to the write-time decision that
+    # produced it. `active_project_id` reports the DETECTED project
+    # even when memory_enabled is false (routing then forces global);
+    # the `project_memory_enabled` field is what distinguishes the two
+    # states, mirroring the detector's diagnostics contract.
+    log.info(
+        "memory.extract.scope %s",
+        json.dumps(
+            {
+                "user_id": user_id,
+                "active_project_id": active_project.project_id if active_project else None,
+                "matched_root": str(active_project.matched_root) if active_project else None,
+                "project_memory_enabled": active_project.memory_enabled if active_project else None,
+                "hinted": scope_hinted,
+                "defaulted": scope_defaulted,
+                "stored_global": stored_by_scope.get(memory.SCOPE_GLOBAL, 0),
+                "stored_project": stored_by_scope.get(memory.SCOPE_PROJECT, 0),
+            },
+            separators=(",", ":"),
+        ),
+    )
     return stored, replaced, skipped
 
 
@@ -2710,6 +2927,7 @@ async def extract_and_store(
     config: Config | None = None,
     prior_pairs: list[tuple[str, str]] | None = None,
     os_user_override: str | None = None,
+    workspace: str | None = None,
 ) -> int:
     """
     Run Haiku extraction on an exchange and store the resulting facts.
@@ -2736,6 +2954,17 @@ async def extract_and_store(
     fetches it from `history.get_recent_pairs` and threads it through;
     None preserves the pre-#392 single-turn behavior for any caller
     (notably the existing test suite) that does not yet pass it.
+
+    The optional `workspace` parameter is the user's active workspace
+    path, threaded by bot.py from the same per-user state the recall
+    path uses. It drives write-scope routing: the path is matched
+    against the memory project registry once per run and the result
+    flows into both stages' storage writes. None (the default) skips
+    detection and routes every row global, which keeps callers that
+    predate scoped memory (notably the eval replay harness, whose
+    extractor input must stay byte-equivalent across replays) on
+    exactly the pre-routing write shape apart from the now-explicit
+    scope metadata.
     """
     if config is None:
         from kai.config import load_config
@@ -2768,6 +2997,17 @@ async def extract_and_store(
     # mirrors `_resolve_effective_backend`.
     effective_backend = _resolve_effective_backend(user_id, config)
     effective_provider = _resolve_effective_provider(user_id, config)
+
+    # Active-project detection, ONCE per run, threaded into both
+    # stages like os_user and the backend triple above so a single
+    # exchange's fact rows and episode row can never disagree on
+    # which project they belong to. The detector is pure and cheap
+    # (longest-prefix match over the registry), but running it per
+    # fact would still invite drift if a future edit moved the two
+    # write paths apart.
+    active_project: ActiveMemoryProject | None = None
+    if workspace:
+        active_project = detect_active_memory_project(Path(workspace), config.memory_projects)
 
     sem = _get_semaphore(user_id)
     # Pre-initialize the storage counters so the post-try summary log
@@ -2902,6 +3142,7 @@ async def extract_and_store(
                         user_id=user_id,
                         session_id=session_id,
                         config=config,
+                        active_project=active_project,
                     ),
                 )
             else:
@@ -2939,6 +3180,7 @@ async def extract_and_store(
                         effective_backend=effective_backend,
                         effective_provider=effective_provider,
                         os_user=os_user,
+                        active_project=active_project,
                     ),
                     name=f"episode-{user_id}",
                 )
@@ -2997,6 +3239,8 @@ __all__ = [
     "_FACT_SCHEMA",
     "_GENERIC_CONFIRMATION_RE",
     "_ROLE_LABEL_RE",
+    "_SCOPE_CONFIDENCE_DEFAULTED",
+    "_SCOPE_CONFIDENCE_HINTED",
     "_SEMAPHORE_CAP",
     "_build_extraction_payload",
     "_capped_assistant",
@@ -3006,6 +3250,7 @@ __all__ = [
     "_per_user_semaphores",
     "_render_candidate_line",
     "_render_candidate_source",
+    "_route_write_scope",
     "_run_extractor",
     "_store_facts",
     "_strip_role_labels",

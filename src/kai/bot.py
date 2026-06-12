@@ -3548,10 +3548,19 @@ async def _handle_response(
                         session_id=final_response.session_id,
                         config=config,
                         prior_pairs=prior_pairs,
+                        workspace=ingest_workspace,
                     )
             except Exception:
                 log.warning("Memory ingestion failed", exc_info=True)
 
+        # Workspace for write-scope routing, captured BEFORE the
+        # fire-and-forget task is scheduled. The exchange being
+        # extracted happened in THIS workspace; reading
+        # pool.get_workspace inside the task instead would let a
+        # /workspace switch that lands during the ingestion delay
+        # re-route the exchange's facts to a project the conversation
+        # never touched.
+        ingest_workspace = str(pool.get_workspace(chat_id))
         task = asyncio.create_task(_ingest_memory())
         _pending_memory_tasks.add(task)
         task.add_done_callback(_pending_memory_tasks.discard)

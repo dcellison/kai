@@ -113,7 +113,7 @@ def test_store_block_does_not_reference_durability_test():
 
 def test_prompt_version_bumped():
     """Version stamp matches the prompt revision."""
-    assert _EXTRACTION_PROMPT_VERSION == "11"
+    assert _EXTRACTION_PROMPT_VERSION == "12"
 
 
 def test_no_em_or_en_dashes_in_quality_test_block():

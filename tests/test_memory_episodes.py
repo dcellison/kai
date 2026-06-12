@@ -425,7 +425,7 @@ class TestStage2Trigger:
         causal correlation in logs."""
         order: list[str] = []
 
-        def _store_recorder(facts, *, user_id, session_id, config):
+        def _store_recorder(facts, *, user_id, session_id, config, active_project=None):
             order.append("store_facts")
             return (len(facts), 0, 0)
 
