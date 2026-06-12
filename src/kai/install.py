@@ -2839,6 +2839,7 @@ def _generate_sudoers(
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/services.yaml
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/users.yaml
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/workspaces.yaml
+        {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/memory-projects.yaml
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/totp.secret
         {service_user} ALL=(root) NOPASSWD: {cat_path} /etc/kai/totp.attempts
         {service_user} ALL=(root) NOPASSWD: {tee_path} /etc/kai/totp.attempts

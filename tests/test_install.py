@@ -326,6 +326,7 @@ class TestGenerateSudoers:
         assert f"{cat_path} /etc/kai/services.yaml" in result
         assert f"{cat_path} /etc/kai/users.yaml" in result
         assert f"{cat_path} /etc/kai/workspaces.yaml" in result
+        assert f"{cat_path} /etc/kai/memory-projects.yaml" in result
         assert f"{cat_path} /etc/kai/totp.secret" in result
         assert f"{cat_path} /etc/kai/totp.attempts" in result
 

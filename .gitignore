@@ -8,6 +8,7 @@
 # User and workspace config (contains user IDs and local paths)
 /users.yaml
 /workspaces.yaml
+/memory-projects.yaml
 
 # Python
 __pycache__/
