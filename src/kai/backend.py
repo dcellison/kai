@@ -1030,43 +1030,72 @@ async def assemble_turn_context(
     # / `run_scoped_recall_shadow` symbols) without import-order
     # surprises.
     if chat_id is not None and search_query.strip():
-        # Legacy recall is the live prompt content. The split
-        # introduced in #546 (format_context_with_recall_payload +
-        # _emit_recall_log) lets shadow-mode logging reuse the
-        # same legacy search and payload without re-running search;
-        # the wrapper format_context still exists for callers that
-        # do not need the payload, but assemble_turn_context owns
-        # the shadow-mode call site and so reads the payload
-        # directly. memory.recall stays "exactly one line per
-        # eligible turn" - emitted here, never twice.
         from kai.memory import (
             _emit_recall_log,
             format_context_with_recall_payload,
+            format_scoped_context_with_recall_payload,
+            is_scoped_recall_enabled,
             run_scoped_recall_shadow,
         )
 
-        legacy_recall = await format_context_with_recall_payload(search_query, user_id=str(chat_id))
-        _emit_recall_log(legacy_recall.recall_payload)
-        if legacy_recall.rendered_context:
-            prompt = prepend_to_prompt(prompt, legacy_recall.rendered_context)
+        if is_scoped_recall_enabled():
+            # Scoped recall IS the live prompt content. The helper is
+            # fail-closed internally: any scoped retrieval or
+            # rendering error collapses to an empty rendered block
+            # with reason="scoped_error" in the payload, so a read-
+            # path bug degrades to "no memory this turn" and never to
+            # unscoped fallback content. memory.recall stays "exactly
+            # one line per eligible turn" in both knob states -
+            # emitted here, never twice.
+            scoped_recall = await format_scoped_context_with_recall_payload(
+                search_query,
+                user_id=str(chat_id),
+                workspace=workspace,
+                backend_name=backend_name,
+                job_type=job_type,
+                session_id=session_id,
+            )
+            _emit_recall_log(scoped_recall.recall_payload)
+            if scoped_recall.rendered_context:
+                prompt = prepend_to_prompt(prompt, scoped_recall.rendered_context)
+            # No shadow while scoped recall is live: the comparison
+            # exists to validate scoped retrieval against legacy
+            # before cutover, and running legacy as a second query
+            # per turn buys nothing once scoped serves the prompt.
+            # The scoped_debug fields on the memory.recall line above
+            # carry the audit trail the shadow line used to provide.
+        else:
+            # Legacy recall is the live prompt content. The split
+            # introduced in #546 (format_context_with_recall_payload +
+            # _emit_recall_log) lets shadow-mode logging reuse the
+            # same legacy search and payload without re-running search;
+            # the wrapper format_context still exists for callers that
+            # do not need the payload, but assemble_turn_context owns
+            # the shadow-mode call site and so reads the payload
+            # directly. memory.recall stays "exactly one line per
+            # eligible turn" - emitted here, never twice.
+            legacy_recall = await format_context_with_recall_payload(search_query, user_id=str(chat_id))
+            _emit_recall_log(legacy_recall.recall_payload)
+            if legacy_recall.rendered_context:
+                prompt = prepend_to_prompt(prompt, legacy_recall.rendered_context)
 
-        # Shadow-mode comparison log (#546). Best-effort; the helper
-        # is failure-isolated internally and short-circuits when
-        # disabled, so the live prompt path above is unaffected by
-        # any scoped retrieval or rendering bug. Backends pass
-        # workspace/backend_name/job_type so the shadow log can
-        # detect the active project and identify the caller; tests
-        # that omit those kwargs land on the missing-workspace
-        # branch which still emits a uniform shadow line.
-        await run_scoped_recall_shadow(
-            query=search_query,
-            user_id=str(chat_id),
-            legacy_result=legacy_recall,
-            workspace=workspace,
-            backend_name=backend_name,
-            job_type=job_type,
-            session_id=session_id,
-        )
+            # Shadow-mode comparison log (#546). Best-effort; the helper
+            # is failure-isolated internally and short-circuits when
+            # disabled, so the live prompt path above is unaffected by
+            # any scoped retrieval or rendering bug. Backends pass
+            # workspace/backend_name/job_type so the shadow log can
+            # detect the active project and identify the caller; tests
+            # that omit those kwargs land on the missing-workspace
+            # branch which still emits a uniform shadow line.
+            await run_scoped_recall_shadow(
+                query=search_query,
+                user_id=str(chat_id),
+                legacy_result=legacy_recall,
+                workspace=workspace,
+                backend_name=backend_name,
+                job_type=job_type,
+                session_id=session_id,
+            )
 
     # Foreign-workspace reminder is built fresh by the caller on
     # every turn (it depends on the workspace state at call time).

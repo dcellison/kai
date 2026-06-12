@@ -1896,3 +1896,126 @@ class TestAssembleTurnContext:
         )
         assert legacy_mock.call_count == 1, "legacy recall must run exactly once"
         assert shadow_mock.call_count == 1, "shadow must run exactly once when enabled"
+
+
+class TestScopedRecallCutover:
+    """Knob-on behavior of `assemble_turn_context`: scoped retrieval
+    serves the live prompt content; legacy recall and the shadow
+    comparison are both skipped. The knob itself is read through
+    `is_scoped_recall_enabled`, patched here because backend tests
+    run without an initialized memory config."""
+
+    def _enable(self, monkeypatch):
+        monkeypatch.setattr("kai.memory.is_scoped_recall_enabled", lambda: True)
+
+    def _patch_scoped_recall(self, monkeypatch, *, rendered_context: str = "", recall_payload: dict | None = None):
+        """Scoped twin of `_patch_legacy_recall`."""
+        from kai.memory import ScopedRecallResult
+
+        payload = recall_payload if recall_payload is not None else {"reason": "ok"}
+        fake = AsyncMock(return_value=ScopedRecallResult(rendered_context=rendered_context, recall_payload=payload))
+        monkeypatch.setattr("kai.memory.format_scoped_context_with_recall_payload", fake)
+        return fake
+
+    async def test_scoped_serves_live_content_and_skips_legacy_and_shadow(self, monkeypatch):
+        """The cutover's core contract in one test: scoped output is
+        prepended, the legacy pipeline never runs (no second Mem0
+        search), the shadow comparison never runs, and memory.recall
+        is emitted exactly once with the scoped payload."""
+        from kai.backend import assemble_turn_context
+
+        self._enable(monkeypatch)
+        legacy_mock = _patch_legacy_recall(monkeypatch, rendered_context="[LEGACY BLOCK]")
+        shadow_mock = AsyncMock()
+        monkeypatch.setattr("kai.memory.run_scoped_recall_shadow", shadow_mock)
+        scoped_payload = {"reason": "ok", "scoped_debug": {"active_project_id": "kai"}}
+        scoped_mock = self._patch_scoped_recall(
+            monkeypatch,
+            rendered_context="[SCOPED BLOCK]",
+            recall_payload=scoped_payload,
+        )
+        emit_mock = MagicMock()
+        monkeypatch.setattr("kai.memory._emit_recall_log", emit_mock)
+
+        ws = Path("/tmp/test_workspace_scoped")
+        result = await assemble_turn_context(
+            "user message",
+            chat_id=42,
+            session_context="",
+            workspace_reminder="",
+            workspace=ws,
+            backend_name="claude_code",
+            job_type="interactive",
+            session_id="sess-1",
+        )
+
+        assert isinstance(result, str)
+        assert "[SCOPED BLOCK]" in result
+        assert "[LEGACY BLOCK]" not in result
+        legacy_mock.assert_not_called()
+        shadow_mock.assert_not_called()
+        assert scoped_mock.call_count == 1
+        assert scoped_mock.call_args.args[0] == "user message"
+        kwargs = scoped_mock.call_args.kwargs
+        assert kwargs["user_id"] == "42"
+        assert kwargs["workspace"] == ws
+        assert kwargs["backend_name"] == "claude_code"
+        assert kwargs["job_type"] == "interactive"
+        assert kwargs["session_id"] == "sess-1"
+        assert emit_mock.call_count == 1
+        assert emit_mock.call_args.args[0] is scoped_payload
+
+    async def test_scoped_empty_render_prepends_nothing_but_still_logs(self, monkeypatch):
+        """The fail-closed surface as the backend sees it: the helper
+        collapses every scoped failure (and every legitimate
+        no-content path) to rendered_context="". The backend must
+        prepend nothing and still emit the one memory.recall line so
+        the turn stays visible in the log stream."""
+        from kai.backend import assemble_turn_context
+
+        self._enable(monkeypatch)
+        _patch_legacy_recall(monkeypatch, rendered_context="[LEGACY BLOCK]")
+        monkeypatch.setattr("kai.memory.run_scoped_recall_shadow", AsyncMock())
+        self._patch_scoped_recall(monkeypatch, rendered_context="", recall_payload={"reason": "scoped_error"})
+        emit_mock = MagicMock()
+        monkeypatch.setattr("kai.memory._emit_recall_log", emit_mock)
+
+        result = await assemble_turn_context(
+            "user message",
+            chat_id=42,
+            session_context="",
+            workspace_reminder="",
+            workspace=Path("/tmp/ws"),
+        )
+
+        assert "[LEGACY BLOCK]" not in result
+        assert emit_mock.call_count == 1
+        assert emit_mock.call_args.args[0]["reason"] == "scoped_error"
+
+    async def test_knob_off_keeps_legacy_path_and_never_calls_scoped(self, monkeypatch):
+        """Disabled-state pin: with the knob explicitly off, the
+        scoped live helper is never invoked and the legacy + shadow
+        pair runs unchanged. Existing TestAssembleTurnContext tests
+        cover the legacy path's details; this test pins the
+        knob-off/scoped-helper boundary specifically."""
+        from kai.backend import assemble_turn_context
+
+        monkeypatch.setattr("kai.memory.is_scoped_recall_enabled", lambda: False)
+        legacy_mock = _patch_legacy_recall(monkeypatch, rendered_context="[LEGACY BLOCK]")
+        shadow_mock = AsyncMock()
+        monkeypatch.setattr("kai.memory.run_scoped_recall_shadow", shadow_mock)
+        scoped_mock = self._patch_scoped_recall(monkeypatch, rendered_context="[SCOPED BLOCK]")
+
+        result = await assemble_turn_context(
+            "user message",
+            chat_id=42,
+            session_context="",
+            workspace_reminder="",
+            workspace=Path("/tmp/ws"),
+        )
+
+        assert "[LEGACY BLOCK]" in result
+        assert "[SCOPED BLOCK]" not in result
+        scoped_mock.assert_not_called()
+        assert legacy_mock.call_count == 1
+        assert shadow_mock.call_count == 1

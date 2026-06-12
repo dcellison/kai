@@ -538,7 +538,11 @@ class ScopedRetrievalContext:
         message: The raw user query to search against.
         workspace: Active workspace path. The helper resolves it
             through `detect_active_memory_project` to find the
-            active memory project.
+            active memory project. None skips detection entirely
+            and produces global-only retrieval, the same outcome
+            detection rule 4 gives an unregistered path; callers
+            without a workspace concept get safe behavior instead
+            of an error.
         job_type: Optional job-type tag (e.g. "interactive",
             "scheduled"). Recorded in debug metadata.
         backend_name: Optional backend identifier (e.g. "claude",
@@ -549,7 +553,7 @@ class ScopedRetrievalContext:
 
     chat_id: int | str
     message: str
-    workspace: Path
+    workspace: Path | None
     job_type: str | None = None
     backend_name: str | None = None
     session_id: str | None = None
@@ -1375,6 +1379,19 @@ def is_recall_shadow_enabled() -> bool:
     return _config is not None and _config.memory_recall_shadow_enabled
 
 
+def is_scoped_recall_enabled() -> bool:
+    """
+    True when the live prompt context should be served by scoped
+    retrieval instead of legacy recall.
+
+    Backed by `Config.memory_scoped_recall_enabled`, which defaults
+    off and is enabled via `MEMORY_SCOPED_RECALL_ENABLED=1`. The
+    composition with `memory_enabled` happens in `load_config`, the
+    same contract as `is_recall_shadow_enabled` above.
+    """
+    return _config is not None and _config.memory_scoped_recall_enabled
+
+
 def search(query: str, *, user_id: str, limit: int | None = None) -> list[MemoryResult]:
     """
     Search for memories semantically similar to the query.
@@ -1809,10 +1826,14 @@ async def retrieve_scoped_memories(
 
     # Step 2: detect active project. Function-local import keeps
     # config.py's import surface lean and matches the pattern from
-    # #543's lazy import of the scope constants.
+    # #543's lazy import of the scope constants. A None workspace
+    # skips detection: no path means no project authority, which
+    # collapses to the same global-only allowed scopes as an
+    # unregistered path (detection rule 4).
     from kai.memory_projects import detect_active_memory_project
 
-    active_project = detect_active_memory_project(context.workspace, _config.memory_projects)
+    if context.workspace is not None:
+        active_project = detect_active_memory_project(context.workspace, _config.memory_projects)
 
     # Step 3: build allowed scopes. Project scope is admitted only
     # when an active project is detected AND that project has
@@ -2371,6 +2392,117 @@ async def run_scoped_recall_shadow(
     base["scoped_rendered_chars"] = len(rendered)
 
     _emit_recall_shadow_log(base)
+
+
+@dataclass(frozen=True)
+class ScopedRecallResult:
+    """
+    Internal-only result type for `format_scoped_context_with_recall_payload`.
+
+    The scoped twin of `LegacyRecallResult`: the rendered two-section
+    memory block plus the `memory.recall` payload the caller emits
+    exactly once via `_emit_recall_log`. Separate type (not a reuse of
+    the legacy one) so call sites and tests state which pipeline
+    produced the value.
+
+    Attributes:
+        rendered_context: The scoped memory block ready to prepend to
+            the prompt, or `""` for every short-circuit and failure
+            path.
+        recall_payload: The fully populated `memory.recall` dict
+            (uniform base schema from `_base_recall_payload`, plus
+            the scoped debug fields under `scoped_debug`).
+    """
+
+    rendered_context: str
+    recall_payload: dict[str, object]
+
+
+# `memory.recall` reason for a scoped live-path failure. Lives beside
+# the scoped pipeline (not with the legacy reason constants) because
+# only the scoped live path can produce it; the legacy pipeline's
+# failure surface is inside Mem0 and collapses to no_results.
+_RECALL_REASON_SCOPED_ERROR = "scoped_error"
+
+
+async def format_scoped_context_with_recall_payload(
+    query: str,
+    *,
+    user_id: str,
+    workspace: Path | None,
+    backend_name: str | None = None,
+    job_type: str | None = None,
+    session_id: str | None = None,
+    token_budget: int | None = None,
+) -> ScopedRecallResult:
+    """
+    Run the scoped recall pipeline for LIVE prompt injection.
+
+    Composes `retrieve_scoped_memories` (filter-before-rank) and
+    `format_scoped_context` (two-section rendering) into the same
+    rendered-text-plus-payload shape the legacy
+    `format_context_with_recall_payload` returns, so the caller in
+    `assemble_turn_context` can switch pipelines without changing its
+    emit-once `memory.recall` contract.
+
+    FAIL CLOSED: every exception from scoped retrieval or rendering is
+    caught here and collapses to `rendered_context=""` with
+    `reason="scoped_error"` plus the error class and truncated message
+    in the payload. The epic's invariant is that a scoped read-path
+    bug must degrade to "less memory", never to unscoped fallback
+    content; returning empty (instead of raising or delegating to
+    legacy recall) is the enforcement point. The caller still emits
+    the payload, so the failing turn stays visible in the log stream.
+
+    A None `workspace` flows through to global-only retrieval (see
+    `ScopedRetrievalContext.workspace`); unlike the shadow path there
+    is no skip branch, because this IS the live content path and a
+    workspace-less caller still deserves its global memories.
+    """
+    payload = _base_recall_payload(user_id, query)
+
+    try:
+        context = ScopedRetrievalContext(
+            chat_id=user_id,
+            message=query,
+            workspace=workspace,
+            job_type=job_type,
+            backend_name=backend_name,
+            session_id=session_id,
+        )
+        budget = token_budget
+        if budget is None and _config is not None:
+            budget = _config.memory_token_budget
+        payload["budget_tokens"] = budget if budget is not None else 0
+        # latency_ms scopes the retrieval call only, mirroring the
+        # legacy payload's contract (embedding/query time, not
+        # rendering time).
+        t0 = time.perf_counter()
+        scoped_result = await retrieve_scoped_memories(context, token_budget=budget)
+        payload["latency_ms"] = int((time.perf_counter() - t0) * 1000)
+        rendered = format_scoped_context(scoped_result, token_budget=budget)
+    except Exception as exc:
+        payload["reason"] = _RECALL_REASON_SCOPED_ERROR
+        payload["scoped_error_type"] = type(exc).__name__
+        payload["scoped_error_message"] = _truncate(str(exc), _SHADOW_ERROR_MESSAGE_TRUNC)
+        payload["returned_empty"] = True
+        return ScopedRecallResult(rendered_context="", recall_payload=payload)
+
+    debug = scoped_result.debug
+    payload["reason"] = debug.reason
+    payload["fetch_limit"] = debug.fetch_limit
+    payload["floor"] = debug.floor
+    payload["hits_raw"] = debug.hits_raw
+    payload["hits_after_floor"] = debug.hits_after_floor
+    payload["returned_empty"] = rendered == ""
+    payload["rendered_chars"] = len(rendered)
+    # The scoped decision trail (active project, allowed scopes,
+    # per-reason exclusion counts) rides the live recall line under
+    # one key, so the auditability the shadow line provided survives
+    # the cutover without a second log stream.
+    payload["scoped_debug"] = _scoped_debug_to_payload(debug)
+    payload["hits"] = [_scoped_hit_to_shadow_payload(h) for h in scoped_result.hits]
+    return ScopedRecallResult(rendered_context=rendered, recall_payload=payload)
 
 
 def count_by_source(user_id: str, source: str) -> int:

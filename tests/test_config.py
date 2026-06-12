@@ -67,6 +67,7 @@ _CONFIG_ENV_VARS = [
     "LLM_PROVIDER",
     "MEMORY_ENABLED",
     "MEMORY_SEARCH_LIMIT",
+    "MEMORY_SCOPED_RECALL_ENABLED",
     "MEMORY_TOKEN_BUDGET",
     "MEMORY_EMBEDDING_MODEL",
     "MEMORY_REASONER_BACKEND",
@@ -3327,6 +3328,74 @@ class TestMemoryRecallShadowConfig:
         cfg = load_config()
         assert cfg.memory_enabled is False
         assert cfg.memory_recall_shadow_enabled is False
+
+
+class TestMemoryScopedRecallConfig:
+    """Tests for `Config.memory_scoped_recall_enabled` and its
+    `MEMORY_SCOPED_RECALL_ENABLED` env-var parse.
+
+    Default-off, the OPPOSITE polarity of the shadow toggle above:
+    shadow only observes, so it defaults on to collect evidence; the
+    cutover changes live prompt content, so it stays off until the
+    operator flips it deliberately."""
+
+    def _base_env(self, monkeypatch):
+        """Minimal env so load_config builds cleanly. Caller adds
+        MEMORY_SCOPED_RECALL_ENABLED on top to drive the test."""
+        for v in _CONFIG_ENV_VARS:
+            monkeypatch.delenv(v, raising=False)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+        monkeypatch.setenv("ALLOWED_USER_IDS", "12345")
+        monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
+        monkeypatch.setenv("MEMORY_ENABLED", "true")  # gate for the sub-toggle
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n",
+        )
+
+    def test_scoped_recall_defaults_off(self, monkeypatch):
+        """Unset env var keeps the cutover off even with memory on;
+        the default-off posture is what makes shipping the switch
+        behavior-neutral."""
+        self._base_env(monkeypatch)
+        monkeypatch.delenv("MEMORY_SCOPED_RECALL_ENABLED", raising=False)
+        cfg = load_config()
+        assert cfg.memory_scoped_recall_enabled is False
+
+    def test_scoped_recall_enable_values(self, monkeypatch):
+        """Each explicit enable string turns the cutover on,
+        case-insensitively."""
+        for enable_value in ("1", "true", "yes", "TRUE", "Yes"):
+            self._base_env(monkeypatch)
+            monkeypatch.setenv("MEMORY_SCOPED_RECALL_ENABLED", enable_value)
+            cfg = load_config()
+            assert cfg.memory_scoped_recall_enabled is True, f"failed to enable with {enable_value!r}"
+
+    def test_scoped_recall_non_enable_values_stay_off(self, monkeypatch):
+        """Anything outside the enable set stays off; a typo must
+        not flip live prompt content."""
+        for off_value in ("0", "false", "no", "on", "enabled", "y"):
+            self._base_env(monkeypatch)
+            monkeypatch.setenv("MEMORY_SCOPED_RECALL_ENABLED", off_value)
+            cfg = load_config()
+            assert cfg.memory_scoped_recall_enabled is False, f"unexpectedly enabled with {off_value!r}"
+
+    def test_scoped_recall_disabled_when_memory_off(self, monkeypatch):
+        """Sub-toggle composition: scoped recall is gated on
+        memory_enabled even when its own env var is set."""
+        for v in _CONFIG_ENV_VARS:
+            monkeypatch.delenv(v, raising=False)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+        monkeypatch.setenv("ALLOWED_USER_IDS", "12345")
+        monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
+        _patch_protected_users_yaml(
+            monkeypatch,
+            "users:\n  - telegram_id: 12345\n    name: test\n    role: admin\n",
+        )
+        monkeypatch.setenv("MEMORY_SCOPED_RECALL_ENABLED", "true")
+        cfg = load_config()
+        assert cfg.memory_enabled is False
+        assert cfg.memory_scoped_recall_enabled is False
 
 
 class TestOneShotReasonerBackendsConstant:

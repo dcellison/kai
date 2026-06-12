@@ -1612,6 +1612,11 @@ def _cmd_config() -> None:
     # default at runtime via load_config, so the env entry stays
     # suppressed by the delta-from-default check below.
     memory_duplicate_threshold = "0.9"
+    # Scoped-recall cutover pre-init. False matches the dataclass
+    # default so the true-only emission below suppresses the env
+    # entry when memory is disabled (prompt never reached) or the
+    # operator declines.
+    memory_scoped_recall_enabled = False
     if memory_enabled:
         # Memory extraction is supported on agent backends that ship a
         # OneShotReasoner. Every shipped backend is in
@@ -1856,6 +1861,16 @@ def _cmd_config() -> None:
             if _validate_positive_int(memory_search_limit):
                 break
             print("  Must be a positive integer.")
+        # Scoped-recall cutover (read path). Serves the per-turn
+        # memory context from project-aware scoped retrieval instead
+        # of legacy unscoped recall; wrong-project rows are excluded
+        # from the prompt regardless of semantic score. Default-off:
+        # the operator flips it after the shadow comparison log has
+        # shown clean wrong-scope exclusions on real traffic.
+        memory_scoped_recall_enabled = _prompt_bool(
+            "Serve memory recall from scoped retrieval (project-aware)",
+            existing_env.get("MEMORY_SCOPED_RECALL_ENABLED", "false").lower() in ("1", "true", "yes"),
+        )
     print()
 
     # -- External services --
@@ -2131,6 +2146,12 @@ def _cmd_config() -> None:
         # naturally drops this key via the surrounding if.
         if int(memory_search_limit) != 10:
             env["MEMORY_SEARCH_LIMIT"] = memory_search_limit
+        # Scoped-recall cutover. True-only emission: false is the
+        # dataclass default, and the env dict is rebuilt fresh each
+        # wizard run, so declining (or disabling memory) drops the
+        # key on the next /etc/kai/env regeneration.
+        if memory_scoped_recall_enabled:
+            env["MEMORY_SCOPED_RECALL_ENABLED"] = "true"
 
     # Drop the three deprecated memory env vars on every wizard run
     # (issue #515). Reasoner and model both derive per-user from each

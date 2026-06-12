@@ -1277,6 +1277,18 @@ class Config:
     # is enabled (legacy recall provides the baseline to compare).
     memory_recall_shadow_enabled: bool = True
 
+    # Scoped-recall cutover. When True, the per-turn prompt context is
+    # served by scoped retrieval (filter-before-rank against the
+    # project registry, rendered as separate global/project sections)
+    # instead of legacy unscoped recall, and the shadow comparison is
+    # skipped (running legacy as a second query per turn buys nothing
+    # once scoped is live). Default-off is deliberate: shipping the
+    # switch disabled keeps the deploy behavior-neutral, and the
+    # operator flips it via `make config` once the shadow log has
+    # shown clean wrong-scope exclusions on real traffic. Like the
+    # shadow toggle, this is a sub-toggle of memory_enabled.
+    memory_scoped_recall_enabled: bool = False
+
     def get_workspace_config(self, workspace: Path) -> WorkspaceConfig | None:
         """
         Get per-workspace config for a path, or None for global defaults.
@@ -2779,6 +2791,15 @@ def load_config() -> Config:
     memory_recall_shadow_enabled = _shadow_raw.strip().lower() not in ("0", "false", "no")
     memory_recall_shadow_enabled = memory_recall_shadow_enabled and memory_enabled
 
+    # Scoped-recall cutover toggle. Default-off, normal parse (only the
+    # explicit enable strings turn it on), the OPPOSITE polarity of the
+    # shadow toggle above: shadow defaults on because it only observes,
+    # the cutover defaults off because it changes live prompt content.
+    # Composed with memory_enabled like every other memory sub-toggle.
+    _scoped_recall_raw = os.environ.get("MEMORY_SCOPED_RECALL_ENABLED", "")
+    memory_scoped_recall_enabled = _scoped_recall_raw.strip().lower() in ("1", "true", "yes")
+    memory_scoped_recall_enabled = memory_scoped_recall_enabled and memory_enabled
+
     # Deprecation warnings for the three retired memory env vars. The
     # reasoner and model used for memory extraction now derive entirely
     # from each user's effective `agent_backend` (per-user dispatch via
@@ -3133,6 +3154,7 @@ def load_config() -> Config:
         memory_embedding_model=memory_embedding_model,
         memory_extraction_enabled=memory_extraction_enabled,
         memory_recall_shadow_enabled=memory_recall_shadow_enabled,
+        memory_scoped_recall_enabled=memory_scoped_recall_enabled,
         memory_extraction_timeout_s=memory_extraction_timeout_s,
         episode_classifier_context_turns=episode_classifier_context_turns,
         memory_consolidation_candidates_n=memory_consolidation_candidates_n,

@@ -18,7 +18,7 @@ import os
 import re
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -6017,3 +6017,141 @@ class TestRuntimeBackendsPassShadowContext:
         assert ClaudeCodeBackend.backend_name == "claude_code"
         assert CodexBackend.backend_name == "codex"
         assert GooseBackend.backend_name == "goose"
+
+
+class TestIsScopedRecallEnabled:
+    """The knob gate mirrors `is_recall_shadow_enabled`'s contract:
+    config-backed, False when memory was never initialized."""
+
+    def test_false_without_config(self):
+        import kai.memory as mem_mod
+        from kai.memory import is_scoped_recall_enabled
+
+        mem_mod._config = None
+        assert is_scoped_recall_enabled() is False
+
+    def test_reflects_config_flag(self):
+        import kai.memory as mem_mod
+        from kai.memory import is_scoped_recall_enabled
+
+        mem_mod._config = _make_config(memory_scoped_recall_enabled=True)
+        assert is_scoped_recall_enabled() is True
+        mem_mod._config = _make_config(memory_scoped_recall_enabled=False)
+        assert is_scoped_recall_enabled() is False
+
+
+class TestFormatScopedContextWithRecallPayload:
+    """The live scoped recall helper: composes scoped retrieval and
+    rendering into rendered-text-plus-payload, fail-closed."""
+
+    async def test_project_workspace_renders_sections_and_populates_payload(self, tmp_path):
+        import kai.memory as mem_mod
+        from kai.memory import format_scoped_context_with_recall_payload
+
+        project_root = tmp_path / "kai"
+        project_root.mkdir()
+        mock_mem = MagicMock()
+        mock_mem.search.return_value = {
+            "results": [
+                _search_row("g1", "global fact", 0.8, scope="global"),
+                _search_row("p1", "kai project fact", 0.9, scope="project", project_id="kai"),
+            ]
+        }
+        mem_mod._memory = mock_mem
+        mem_mod._config = _mp_config(memory_projects={"kai": _mp("kai", project_root)})
+
+        result = await format_scoped_context_with_recall_payload(
+            "what is kai?",
+            user_id="123",
+            workspace=project_root,
+            backend_name="claude_code",
+            job_type="interactive",
+            session_id="sess-1",
+        )
+
+        assert "global fact" in result.rendered_context
+        assert "kai project fact" in result.rendered_context
+        # Two-section shape: global header and the project header.
+        assert "[Relevant global memories" in result.rendered_context
+        assert "Kai project memories" in result.rendered_context
+        payload = result.recall_payload
+        assert payload["reason"] == "ok"
+        assert payload["returned_empty"] is False
+        assert payload["scoped_debug"]["active_project_id"] == "kai"
+        assert list(payload["scoped_debug"]["allowed_scopes"]) == ["global", "project"]
+
+    async def test_none_workspace_is_global_only(self, tmp_path):
+        """A workspace-less caller still gets its global memories;
+        detection is skipped and project rows are excluded. This is
+        the live-path behavior that distinguishes the cutover from
+        the shadow's missing_workspace skip."""
+        import kai.memory as mem_mod
+        from kai.memory import format_scoped_context_with_recall_payload
+
+        project_root = tmp_path / "kai"
+        project_root.mkdir()
+        mock_mem = MagicMock()
+        mock_mem.search.return_value = {
+            "results": [
+                _search_row("g1", "global fact", 0.8, scope="global"),
+                _search_row("p1", "kai project fact", 0.9, scope="project", project_id="kai"),
+            ]
+        }
+        mem_mod._memory = mock_mem
+        mem_mod._config = _mp_config(memory_projects={"kai": _mp("kai", project_root)})
+
+        result = await format_scoped_context_with_recall_payload(
+            "what is kai?",
+            user_id="123",
+            workspace=None,
+        )
+
+        assert "global fact" in result.rendered_context
+        assert "kai project fact" not in result.rendered_context
+        assert result.recall_payload["scoped_debug"]["active_project_id"] is None
+        assert list(result.recall_payload["scoped_debug"]["allowed_scopes"]) == ["global"]
+
+    async def test_retrieval_failure_fails_closed(self, monkeypatch, tmp_path):
+        """The epic's invariant at its enforcement point: a scoped
+        retrieval error returns empty rendered content (never raises,
+        never falls back to unscoped content) with the error recorded
+        in the payload."""
+        import kai.memory as mem_mod
+        from kai.memory import format_scoped_context_with_recall_payload
+
+        mem_mod._config = _mp_config()
+        monkeypatch.setattr(
+            "kai.memory.retrieve_scoped_memories",
+            AsyncMock(side_effect=RuntimeError("qdrant exploded")),
+        )
+
+        result = await format_scoped_context_with_recall_payload(
+            "what is kai?",
+            user_id="123",
+            workspace=tmp_path,
+        )
+
+        assert result.rendered_context == ""
+        payload = result.recall_payload
+        assert payload["reason"] == "scoped_error"
+        assert payload["scoped_error_type"] == "RuntimeError"
+        assert "qdrant exploded" in str(payload["scoped_error_message"])
+        assert payload["returned_empty"] is True
+
+    async def test_disabled_memory_short_circuits(self, tmp_path):
+        """Memory disabled flows through retrieve_scoped_memories'
+        disabled reason; rendered content stays empty."""
+        import kai.memory as mem_mod
+        from kai.memory import format_scoped_context_with_recall_payload
+
+        mem_mod._memory = None
+        mem_mod._config = None
+
+        result = await format_scoped_context_with_recall_payload(
+            "what is kai?",
+            user_id="123",
+            workspace=tmp_path,
+        )
+
+        assert result.rendered_context == ""
+        assert result.recall_payload["reason"] == "disabled"
