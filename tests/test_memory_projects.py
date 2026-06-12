@@ -275,6 +275,39 @@ class TestDbRegistryCache:
         assert "kai-imposter" not in merged
         assert set(merged) == {"kai"}
 
+    def test_yaml_parent_evicts_persisted_db_child_root(self, tmp_path):
+        """Containment, not just equality: a persisted DB root INSIDE
+        a later-pinned YAML root would win that subtree via
+        longest-prefix detection, so the merge must evict it. The
+        register-time nested guard cannot catch this ordering (the
+        DB row predates the YAML pin); the merge is the only gate."""
+        parent = tmp_path / "parent"
+        child = parent / "child"
+        deep = child / "src"
+        deep.mkdir(parents=True)
+        load_db_registry([_row("child", child)])
+        merged = merged_registry({"parent": _project("parent", parent)})
+        assert "child" not in merged
+        active = detect_active_memory_project(deep, merged)
+        assert active is not None
+        assert active.project_id == "parent"
+
+    def test_yaml_child_inside_db_parent_coexists(self, tmp_path):
+        """The inverse direction is ordinary nested-project
+        coexistence: a deeper YAML root owns its subtree through
+        longest-prefix while the DB parent keeps the surrounding
+        area, exactly like nested YAML entries."""
+        parent = tmp_path / "parent"
+        child = parent / "child"
+        child.mkdir(parents=True)
+        load_db_registry([_row("parent", parent)])
+        merged = merged_registry({"child": _project("child", child)})
+        assert set(merged) == {"parent", "child"}
+        inside_child = detect_active_memory_project(child, merged)
+        assert inside_child is not None and inside_child.project_id == "child"
+        inside_parent = detect_active_memory_project(parent, merged)
+        assert inside_parent is not None and inside_parent.project_id == "parent"
+
     def test_upsert_and_remove_visible_immediately(self, tmp_path):
         """Restart-free contract: cache mutations show up in the very
         next merged_registry call."""

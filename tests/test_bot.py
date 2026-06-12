@@ -5155,6 +5155,31 @@ class TestWorkspaceNewAutoRegister:
         replies = [c.args[0] for c in update.message.reply_text.call_args_list]
         assert any("Registered memory project 'myproj'" in r for r in replies)
 
+    async def test_workspace_new_subpath_registers_basename(self, tmp_path):
+        """/workspace new accepts relative subpaths; the auto-hook
+        must register the created directory's BASENAME, since the
+        raw argument's separator would fail slug validation and
+        silently skip registration on a perfectly valid creation."""
+        from kai.bot import handle_workspace
+        from kai.memory_projects import merged_registry
+
+        update = _make_update("/workspace new sub/project")
+        ctx = _make_context(args=["new", "sub/project"])
+
+        proc = MagicMock()
+        proc.wait = AsyncMock(return_value=0)
+        with (
+            _mock_resolve(base=tmp_path),
+            patch("kai.bot.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=proc),
+            patch("kai.bot._switch_workspace", new_callable=AsyncMock),
+            patch("kai.bot.sessions.register_memory_project", new_callable=AsyncMock) as persist,
+        ):
+            await handle_workspace(update, ctx)
+
+        persist.assert_awaited_once()
+        assert persist.call_args.kwargs["project_id"] == "project"
+        assert "project" in merged_registry({})
+
     async def test_workspace_new_registration_failure_does_not_block(self, tmp_path):
         """A registration failure warns but the workspace creation
         and switch still happen."""

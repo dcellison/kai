@@ -282,12 +282,24 @@ def merged_registry(yaml_projects: dict[str, MemoryProjectConfig]) -> dict[str, 
     if not _db_registry:
         return yaml_projects
     yaml_roots = {root for project in yaml_projects.values() for root in project.workspace_roots}
+
+    def _yaml_owned(root: Path) -> bool:
+        # Equality OR containment, matching the detector's own
+        # containment model: a DB root INSIDE a YAML root would win
+        # that subtree via longest-prefix matching, so a later
+        # operator pin of the parent must evict the persisted child,
+        # not coexist with it. The inverse (a YAML root inside a DB
+        # root) is ordinary nested-project coexistence: the deeper
+        # YAML root already owns its subtree through longest-prefix,
+        # exactly like nested YAML entries.
+        return any(root == yaml_root or root.is_relative_to(yaml_root) for yaml_root in yaml_roots)
+
     merged: dict[str, MemoryProjectConfig] = {}
     for project_id, cfg in _db_registry.items():
         if project_id in yaml_projects:
             log.debug("memory_projects: db project %r shadowed by yaml id", project_id)
             continue
-        if any(root in yaml_roots for root in cfg.workspace_roots):
+        if any(_yaml_owned(root) for root in cfg.workspace_roots):
             log.debug("memory_projects: db project %r root owned by yaml layer", project_id)
             continue
         merged[project_id] = cfg

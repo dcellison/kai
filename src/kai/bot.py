@@ -2214,8 +2214,12 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # first exchange routes its memories to the project instead
         # of leaking them global. Failure warns but never blocks the
         # creation; the workspace is fully usable unregistered, and
-        # /project register remains the manual path.
-        registered, register_note = await _register_memory_project_for(config, chat_id, resolved, name)
+        # /project register remains the manual path. The BASENAME,
+        # not the raw argument: /workspace new accepts relative
+        # subpaths ("sub/project"), whose separator would fail the
+        # project-id slug validation; the final path component
+        # matches /project register's default for the same directory.
+        registered, register_note = await _register_memory_project_for(config, chat_id, resolved, resolved.name)
         await _switch_workspace(update, context, resolved)
         if registered:
             await update.message.reply_text(register_note)
