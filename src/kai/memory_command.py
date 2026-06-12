@@ -52,6 +52,7 @@ enumeration.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -62,13 +63,14 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from kai import memory
-from kai.config import ONESHOT_REASONER_BACKENDS, Config
-from kai.memory import MemoryResult, MemoryStats
+from kai.config import ONESHOT_REASONER_BACKENDS, Config, MemoryProjectConfig
+from kai.memory import MemoryResult, MemoryStats, ResolvedMemoryScope
+from kai.memory_projects import ActiveMemoryProject, detect_active_memory_project, merged_registry
 
 if TYPE_CHECKING:
     # Only used for type hints; importing at runtime would create a
     # cycle since bot.py imports this module.
-    pass
+    from kai.pool import SubprocessPool
 
 log = logging.getLogger(__name__)
 
@@ -121,6 +123,19 @@ class _ScreenCache:
     on dispatch. Storing the structured form (rather than a callback
     string) means the back-target representation can change without
     needing to reparse stale entries.
+
+    `scope_targets` backs the scope screen the same way `memory_ids`
+    backs the list views: each entry is a (kind, project_id) tuple
+    where kind is "global" (project_id None) or "project". The target
+    buttons carry only the integer index, so a long project id can
+    never push callback data over the Telegram 64-byte ceiling. A
+    project id stored here may also collide with no reserved word:
+    the tuple's kind discriminator is what distinguishes "move to
+    the project named 'global'" from "make global".
+
+    `scope_target` is the entry the user tapped, carried from the
+    scope screen to its confirm step so the apply verb needs no
+    callback arguments at all.
     """
 
     screen: str
@@ -128,6 +143,8 @@ class _ScreenCache:
     page: int = 0
     query: str | None = None
     return_to: tuple[str, list[str]] | None = None
+    scope_targets: list[tuple[str, str | None]] = field(default_factory=list)
+    scope_target: tuple[str, str | None] | None = None
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -340,6 +357,167 @@ def _browse_score(fact: MemoryResult) -> float:
     arithmetic does not require a parallel edit in the browse path.
     """
     return memory._speaker_weight(fact)
+
+
+# ── Scope helpers ───────────────────────────────────────────────────
+#
+# Row-level scope inspection and correction. Reads go through
+# `memory.resolve_memory_scope` so legacy and corrupted rows render
+# their read-time interpretation (the same one retrieval acts on)
+# rather than echoing raw metadata. The retrievability verdict reuses
+# `memory._scoped_memory_admission_reason` - the exact admission rule
+# scoped retrieval applies - so the detail view can never disagree
+# with what retrieval would actually do. Writes go through
+# `memory.build_scope_metadata` (validated shape, operator
+# provenance) merged over the row's existing metadata, because
+# `memory.update_metadata` replaces the metadata dict wholesale and
+# a partial dict would silently destroy every unlisted field.
+
+
+@dataclass(frozen=True)
+class _ScopeView:
+    """Pre-rendered scope strings for the detail and scope screens.
+
+    Built once per render by `_build_scope_view` and passed into the
+    pure builders, so the builders stay free of registry and
+    detection I/O.
+
+    Attributes:
+        resolved: The row's read-time scope interpretation; kept so
+            the scope screen can derive transition targets without
+            re-resolving.
+        scope_label: Operator-facing scope value, e.g. "global" or
+            "project 'kai'", with an unregistered-project or
+            missing-id marker when applicable.
+        source_label: Scope provenance with confidence, e.g.
+            "operator (confidence 1.00)". Values render raw
+            (legacy_default, extraction_default, ...) so the screen
+            greps against the same vocabulary the logs use.
+        retrievable_label: "yes", or "no (<admission reason>)" with
+            the stable exclusion-reason key retrieval logs carry.
+    """
+
+    resolved: ResolvedMemoryScope
+    scope_label: str
+    source_label: str
+    retrievable_label: str
+
+
+def _build_scope_view(
+    fact: MemoryResult,
+    registry: dict[str, MemoryProjectConfig],
+    active: ActiveMemoryProject | None,
+) -> _ScopeView:
+    """Resolve a row's scope into operator-facing display strings.
+
+    `registry` is the merged project registry (operator-pinned YAML
+    over chat-registered rows) and `active` is the project detected
+    for the caller's current workspace, or None. Both come from
+    `_scope_inputs`; tests can pass fixtures directly.
+
+    The allowed-project derivation mirrors scoped retrieval exactly:
+    project authority exists only when a project is detected AND has
+    memory enabled. Keeping the two predicates identical is what the
+    admission-parity guarantee rests on.
+    """
+    resolved = memory.resolve_memory_scope(fact.metadata)
+
+    # Scope label. Project rows render their id plus the registered
+    # display name when it differs; a project id that is no longer
+    # in the registry is flagged rather than hidden, because the row
+    # is still movable and the operator needs to see why it stopped
+    # being retrievable anywhere.
+    if resolved.scope == memory.SCOPE_PROJECT:
+        pid = resolved.project_id
+        if pid is None:
+            scope_label = "project (no project id)"
+        elif pid in registry:
+            display = registry[pid].display_name
+            scope_label = f"project '{pid}'" if display == pid else f"project '{pid}' ({display})"
+        else:
+            scope_label = f"project '{pid}' (not registered)"
+    else:
+        scope_label = resolved.scope
+
+    source_label = f"{resolved.scope_source} (confidence {resolved.scope_confidence:.2f})"
+
+    # Retrievability verdict: same allowed-project derivation and
+    # same admission rule as scoped retrieval. The two enriched
+    # arms add the context an operator cannot reconstruct from the
+    # bare reason key (which two projects mismatched; whether "not
+    # allowed" means no project here or a disabled one).
+    allowed = active.project_id if active is not None and active.memory_enabled else None
+    reason = memory._scoped_memory_admission_reason(resolved, allowed_project_id=allowed)
+    if reason is None:
+        retrievable_label = "yes"
+    elif reason == memory._ADMISSION_PROJECT_ID_MISMATCH:
+        retrievable_label = f"no ({reason}: row '{resolved.project_id}', here '{allowed}')"
+    elif reason == memory._ADMISSION_PROJECT_SCOPE_NOT_ALLOWED:
+        detail = "project memory disabled here" if active is not None else "no active project here"
+        retrievable_label = f"no ({reason}: {detail})"
+    else:
+        retrievable_label = f"no ({reason})"
+
+    return _ScopeView(
+        resolved=resolved,
+        scope_label=scope_label,
+        source_label=source_label,
+        retrievable_label=retrievable_label,
+    )
+
+
+def _scope_change_targets(
+    resolved: ResolvedMemoryScope,
+    registry: dict[str, MemoryProjectConfig],
+) -> list[tuple[str, str | None]]:
+    """Derive the scope transitions offered for a row.
+
+    Returns (kind, project_id) tuples in render order: the global
+    target first when offered, then project targets sorted by id for
+    deterministic keyboards.
+
+    Rules:
+    - "Make global" is offered unless the row is already explicitly
+      global with valid provenance. Legacy-default and invalid rows
+      DO get the global target even though they already resolve to
+      global: applying it stamps explicit operator provenance, which
+      converts an auditable-debt row into a deliberate assignment.
+    - Every registered project is a move target except the row's own
+      project - unless the row is invalid-flagged, where re-assigning
+      the same project is meaningful because it repairs the broken
+      provenance while keeping the assignment.
+    """
+    targets: list[tuple[str, str | None]] = []
+    already_explicit_global = (
+        resolved.scope == memory.SCOPE_GLOBAL and not resolved.legacy_defaulted and not resolved.invalid_defaulted
+    )
+    if not already_explicit_global:
+        targets.append(("global", None))
+    for pid in sorted(registry):
+        if pid == resolved.project_id and not resolved.invalid_defaulted:
+            continue
+        targets.append(("project", pid))
+    return targets
+
+
+def _scope_inputs(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> tuple[dict[str, MemoryProjectConfig], ActiveMemoryProject | None]:
+    """Fetch the merged registry and the caller's active project.
+
+    The workspace comes from the subprocess pool (the same per-user
+    workspace scoped retrieval sees on the next turn). A missing
+    pool collapses to no-workspace semantics: no path means no
+    project authority, the same global-only posture scoped retrieval
+    takes for a None workspace.
+    """
+    config: Config = context.bot_data["config"]
+    registry = merged_registry(config.memory_projects)
+    pool: SubprocessPool | None = context.bot_data.get("pool")
+    if pool is None:
+        return registry, None
+    return registry, detect_active_memory_project(pool.get_workspace(chat_id), registry)
 
 
 # ── Builder: dashboard ──────────────────────────────────────────────
@@ -666,6 +844,7 @@ def _build_facts_list_view(
 def _build_fact_view(
     fact: MemoryResult,
     return_to: tuple[str, list[str]] | None,
+    scope_view: _ScopeView | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Render the fact detail screen (spec §6.3).
 
@@ -693,7 +872,15 @@ def _build_fact_view(
     `return_to` encodes where the back button should land. It can be
     None for callers (e.g., tests) that don't care; in that case the
     back button defaults to the dashboard. The keyboard is the same
-    (back / forget) across all three sources.
+    (back / scope / forget) across all three sources.
+
+    `scope_view` carries the pre-rendered scope block (scope value,
+    provenance, retrievability verdict). Every production caller
+    passes it; None omits the block so direct builder callers that
+    are not exercising scope rendering need no registry fixture.
+    All three source arms render the same three scope rows because
+    scope is a cross-source axis - an episode is just as capable of
+    being mis-scoped as a fact.
     """
     md = fact.metadata or {}
     tags = md.get("tags") or []
@@ -787,6 +974,14 @@ def _build_fact_view(
         if confidence_line is not None:
             footer_lines.append(confidence_line)
         footer_lines.append(f"Date:  {_format_date(fact.created_at, with_time=True)}")
+        # Scope block trails the Date row so the existing tail
+        # convention (date last among the legacy fields) stays
+        # recognizable while the three scope rows read as one
+        # appended unit.
+        if scope_view is not None:
+            footer_lines.append(f"Scope:  {scope_view.scope_label}")
+            footer_lines.append(f"Scope source:  {scope_view.source_label}")
+            footer_lines.append(f"Retrievable here:  {scope_view.retrievable_label}")
         lines = [
             header,
             "",
@@ -822,6 +1017,16 @@ def _build_fact_view(
         # without re-validating.
         confirmation_line = confirmation if confirmation else "n/a"
 
+        # Scope block sits with the other classification rows (after
+        # the extractor provenance, before the Confirmation block)
+        # using the same 18-column label alignment as the rows above.
+        scope_rows: list[str] = []
+        if scope_view is not None:
+            scope_rows = [
+                f"Scope:            {scope_view.scope_label}",
+                f"Scope source:     {scope_view.source_label}",
+                f"Retrievable here: {scope_view.retrievable_label}",
+            ]
         lines = [
             "Fact",
             "",
@@ -833,6 +1038,7 @@ def _build_fact_view(
             f"Date:             {_format_date(fact.created_at, with_time=True)}",
             f"Session:          {session_id or '(none)'}",
             f"Prompt version:   {prompt_version or '(none)'}",
+            *scope_rows,
             "",
             f"Confirmation:     {confirmation_line}",
         ]
@@ -843,6 +1049,7 @@ def _build_fact_view(
         [
             [
                 InlineKeyboardButton("back", callback_data=back_callback),
+                InlineKeyboardButton("scope", callback_data=_encode_callback("scp")),
                 InlineKeyboardButton("forget", callback_data=_encode_callback("ffc")),
             ]
         ]
@@ -870,14 +1077,108 @@ def _build_forget_fact_confirm(fact: MemoryResult) -> tuple[str, InlineKeyboardM
     deploy transition could in principle slip a different source
     through).
     """
-    source = (fact.metadata or {}).get("source", "")
-    label = {"extracted": "fact", "episode": "episode", "migration": "fact"}.get(source, "memory")
+    label = _source_noun(fact)
     text = f'Forget this {label}?\n\n"{fact.text}"\n\nThis cannot be undone.'
     kb = InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton("confirm forget", callback_data=_encode_callback("ffd")),
                 InlineKeyboardButton("cancel", callback_data=_encode_callback("fview")),
+            ]
+        ]
+    )
+    return text, kb
+
+
+def _source_noun(fact: MemoryResult) -> str:
+    """Operator-facing noun for a row, keyed on `metadata.source`.
+
+    Extracted and migration share "fact" because the UI does not
+    surface that distinction; the generic "memory" fallback covers
+    an unknown source slipping through a stale cache during a deploy
+    transition (same defensive posture as the forget flow).
+    """
+    source = (fact.metadata or {}).get("source", "")
+    return {"extracted": "fact", "episode": "episode", "migration": "fact"}.get(source, "memory")
+
+
+# ── Builder: scope screen and confirm ───────────────────────────────
+
+
+def _build_scope_screen(
+    fact: MemoryResult,
+    scope_view: _ScopeView,
+    targets: list[tuple[str, str | None]],
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Render the scope screen: current assignment plus transitions.
+
+    The body repeats the detail view's scope block (in the two-space
+    label style) above the transition prompt so the operator decides
+    with the current assignment in front of them, not from memory of
+    the previous screen.
+
+    Keyboard shape: one target button per row. Project ids are
+    operator-chosen and can be long; packing several per row would
+    truncate labels on a phone, and the target count is bounded by
+    the registry size, which is small by construction. The nav row
+    holds a single back button to the fact view.
+
+    Targets render by cache index (`sct:<idx>`), never by id, for
+    the same 64-byte-ceiling reason the list views use indexed
+    `fact` callbacks.
+    """
+    lines = [
+        "Scope",
+        "",
+        f'"{fact.text}"',
+        "",
+        f"Scope:  {scope_view.scope_label}",
+        f"Scope source:  {scope_view.source_label}",
+        f"Retrievable here:  {scope_view.retrievable_label}",
+        "",
+    ]
+    if targets:
+        lines.append("Choose a new scope:")
+    else:
+        # Reachable when the row is explicitly global and no projects
+        # are registered: nothing to move to, nothing to re-stamp.
+        lines.append("No scope changes available (no registered projects).")
+    text = "\n".join(lines)
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for idx, (kind, pid) in enumerate(targets):
+        label = "Make global" if kind == "global" else f"Move to '{pid}'"
+        rows.append([InlineKeyboardButton(label, callback_data=_encode_callback("sct", str(idx)))])
+    rows.append([InlineKeyboardButton("back", callback_data=_encode_callback("fview"))])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _build_scope_confirm(
+    fact: MemoryResult,
+    target: tuple[str, str | None],
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Render the scope-change confirmation.
+
+    Mirrors the forget confirmation's shape (question, quoted row
+    text, confirm/cancel row) but drops the irreversibility warning:
+    a scope change can be reversed by moving the row back. The
+    confirm step exists anyway because the prior assignment is not
+    visible after the change lands - a fat-fingered tap would leave
+    the operator unsure what the row's scope used to be.
+
+    Cancel returns to the scope screen (the screen the tap came
+    from), matching the forget flow's own convention of cancelling
+    back one step rather than to a fixed screen.
+    """
+    kind, pid = target
+    noun = _source_noun(fact)
+    question = f"Make this {noun} global?" if kind == "global" else f"Move this {noun} to project '{pid}'?"
+    text = f'{question}\n\n"{fact.text}"'
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("confirm", callback_data=_encode_callback("scd")),
+                InlineKeyboardButton("cancel", callback_data=_encode_callback("scp")),
             ]
         ]
     )
@@ -929,6 +1230,53 @@ def _build_search_results(
 # ── Builder: stats (spec §6.6) ──────────────────────────────────────
 
 
+# Display labels and render order for the fixed (non-project) scope
+# buckets emitted by `memory.get_stats`. Projects render between
+# global_legacy and task, sorted by count descending with id as the
+# tiebreaker, matching the prompt-version table's determinism rule.
+_SCOPE_BUCKET_ORDER: list[tuple[str, str]] = [
+    ("global", "global"),
+    ("global_legacy", "global (legacy)"),
+    ("task", "task"),
+    ("project_missing_id", "project (no project id)"),
+    ("invalid", "invalid"),
+]
+
+
+def _scope_distribution_lines(by_scope: dict[str, int]) -> list[str]:
+    """Format the scope-distribution rows for the stats screen.
+
+    Fixed buckets keep a stable position so repeated /memory stats
+    reads scan the same way; project buckets (keys prefixed
+    `project:`) slot in after the two global rows. Only non-zero
+    buckets appear because `get_stats` never emits zero counts.
+    """
+    project_items = sorted(
+        ((key.removeprefix("project:"), count) for key, count in by_scope.items() if key.startswith("project:")),
+        key=lambda item: (-item[1], item[0]),
+    )
+    rows: list[tuple[str, int]] = []
+    for key, label in _SCOPE_BUCKET_ORDER[:2]:
+        if key in by_scope:
+            rows.append((label, by_scope[key]))
+    rows.extend((f"project '{pid}'", count) for pid, count in project_items)
+    for key, label in _SCOPE_BUCKET_ORDER[2:]:
+        if key in by_scope:
+            rows.append((label, by_scope[key]))
+
+    # Any bucket key this renderer does not recognize renders raw at
+    # the end rather than silently vanishing: a distribution that
+    # hides rows misrepresents the corpus, and the raw key is enough
+    # signal that the renderer and the aggregator have drifted.
+    known = {key for key, _ in _SCOPE_BUCKET_ORDER}
+    rows.extend(
+        (key, count) for key, count in sorted(by_scope.items()) if key not in known and not key.startswith("project:")
+    )
+
+    width = max(len(label) for label, _ in rows)
+    return [f"  {label.ljust(width)}  {count:>3}" for label, count in rows]
+
+
 def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
     """Render the read-only stats dashboard.
 
@@ -963,6 +1311,17 @@ def _build_stats(stats: MemoryStats) -> tuple[str, InlineKeyboardMarkup]:
         lines.append(f"Total facts:      {total_facts}")
     if stats.episode_count:
         lines.append(f"Total episodes:   {stats.episode_count}")
+
+    # Scope distribution over all user-visible rows. Sits right after
+    # the headline because (unlike the extracted-only sections below)
+    # it spans every user-visible source. The global_legacy row is
+    # the operator's running measure of reclassification debt - rows
+    # that retrieval treats as global only because nothing has
+    # classified them yet.
+    if stats.by_scope:
+        lines.append("")
+        lines.append("Scope:")
+        lines.extend(_scope_distribution_lines(stats.by_scope))
 
     # The three extracted-shaped sections below all read extractor-only
     # metadata (confidence, confirmation_quote, prompt_version). For
@@ -1109,7 +1468,14 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
       stats             - re-render stats
       ffc               - forget single fact confirm
       ffd               - forget single fact: do delete
-      fview             - cancel forget; return to fact view (same id)
+      fview             - return to fact view (same id); cancel target
+                          of the forget confirm, back target of the
+                          scope screen
+      scp               - scope screen for the cached fact; cancel
+                          target of the scope confirm
+      sct <idx>         - scope target tapped (resolved against
+                          cache.scope_targets); renders confirm
+      scd               - scope change confirmed: apply
     """
     # PTB CallbackQueryHandler guarantees both callback_query and
     # query.data are present, but `python -O` strips asserts; use
@@ -1274,6 +1640,53 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             else:
                 await _send_dashboard(update, context, chat_id, edit=True)
             await query.answer("Forgotten." if ok else "Not found.")
+            return
+        if verb == "scp":
+            # Scope screen for the fact in cache. Reached from the
+            # fact view's scope button and from the confirm screen's
+            # cancel button; both leave the fact id at memory_ids[0].
+            cache = _get_cache(chat_id)
+            if cache is None or not cache.memory_ids:
+                await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
+                return
+            await _send_scope_screen(update, context, chat_id, cache.memory_ids[0])
+            await query.answer()
+            return
+        if verb == "sct":
+            # Scope target tapped. The integer arg indexes
+            # cache.scope_targets (set by _send_scope_screen); any
+            # decode or range failure routes through the standard
+            # session-expired fallback like the fact verb does.
+            cache = _get_cache(chat_id)
+            if cache is None or not cache.memory_ids or not args:
+                await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
+                return
+            try:
+                idx = int(args[0])
+            except ValueError:
+                await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
+                return
+            if idx < 0 or idx >= len(cache.scope_targets):
+                await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
+                return
+            await _send_scope_confirm(update, context, chat_id, cache.memory_ids[0], cache.scope_targets[idx])
+            await query.answer()
+            return
+        if verb == "scd":
+            # Scope change confirmed. The selected target rode the
+            # cache from the confirm screen, so the callback carries
+            # no arguments to validate.
+            cache = _get_cache(chat_id)
+            if cache is None or not cache.memory_ids or cache.scope_target is None:
+                await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
+                return
+            answer = await _apply_scope_change(update, context, chat_id, cache.memory_ids[0], cache.scope_target)
+            await query.answer(answer)
             return
     except Exception as exc:
         # Spec §8: never let a Mem0 exception surface as a stack trace.
@@ -1459,7 +1872,9 @@ async def _send_fact_view(
         # non-extracted source, Mem0 fetch error).
         await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
-    text, kb = _build_fact_view(fact, return_to)
+    registry, active = _scope_inputs(context, chat_id)
+    scope_view = _build_scope_view(fact, registry, active)
+    text, kb = _build_fact_view(fact, return_to, scope_view)
     # Cache holds only this fact's id so the forget flow knows what to
     # delete without re-encoding the id into callback data.
     _set_cache(
@@ -1502,6 +1917,151 @@ async def _send_forget_fact_confirm(
         ),
     )
     await _send_or_edit(update, text, kb, edit=True)
+
+
+async def _send_scope_screen(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    memory_id: str,
+) -> None:
+    """Render the scope screen for a fact.
+
+    Re-fetches the row and re-derives the targets on every render
+    (including the cancel path back from the confirm screen), so the
+    screen always reflects the registry and the row as they are now,
+    not as they were when the fact view was first opened.
+    """
+    fact = memory.get_by_id(user_id=str(chat_id), memory_id=memory_id)
+    if fact is None:
+        await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
+        return
+    registry, active = _scope_inputs(context, chat_id)
+    scope_view = _build_scope_view(fact, registry, active)
+    targets = _scope_change_targets(scope_view.resolved, registry)
+    text, kb = _build_scope_screen(fact, scope_view, targets)
+    # Preserve return_to so the eventual back-nav from the fact view
+    # still lands on the originating list screen after a round trip
+    # through the scope flow.
+    cache = _get_cache(chat_id)
+    return_to = cache.return_to if cache is not None else None
+    _set_cache(
+        chat_id,
+        _ScreenCache(
+            screen="scope",
+            memory_ids=[memory_id],
+            return_to=return_to,
+            scope_targets=targets,
+        ),
+    )
+    await _send_or_edit(update, text, kb, edit=True)
+
+
+async def _send_scope_confirm(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    memory_id: str,
+    target: tuple[str, str | None],
+) -> None:
+    """Render the scope-change confirmation for a tapped target.
+
+    The selected target moves into `cache.scope_target` so the apply
+    verb (`scd`) needs no callback arguments. `scope_targets` is NOT
+    carried forward: the confirm screen has no target buttons, so an
+    empty list is the honest cache state, and a stale `sct` tap from
+    an older message in chat history falls into the standard
+    session-expired path instead of resolving against a list the
+    user is no longer looking at.
+    """
+    fact = memory.get_by_id(user_id=str(chat_id), memory_id=memory_id)
+    if fact is None:
+        await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
+        return
+    text, kb = _build_scope_confirm(fact, target)
+    cache = _get_cache(chat_id)
+    return_to = cache.return_to if cache is not None else None
+    _set_cache(
+        chat_id,
+        _ScreenCache(
+            screen="scope_confirm",
+            memory_ids=[memory_id],
+            return_to=return_to,
+            scope_target=target,
+        ),
+    )
+    await _send_or_edit(update, text, kb, edit=True)
+
+
+async def _apply_scope_change(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    memory_id: str,
+    target: tuple[str, str | None],
+) -> str:
+    """Apply a confirmed scope change and re-render the fact view.
+
+    Returns the toast string for the callback answer (the caller
+    answers after this helper's sends complete, preserving the
+    answer-after-send pattern).
+
+    Write shape: the row's existing metadata is copied and the five
+    scope keys are overlaid from `build_scope_metadata`, because
+    `memory.update_metadata` REPLACES the metadata dict wholesale -
+    passing only the scope keys would destroy tags, confidence,
+    episode fields, and every other stored field. Operator moves
+    carry `scope_source="operator"`, full confidence, and no
+    `workspace_root`: that field records write-time workspace
+    provenance, which a retarget from chat does not have.
+    """
+    fact = memory.get_by_id(user_id=str(chat_id), memory_id=memory_id)
+    if fact is None:
+        await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
+        return "Not found."
+    old = memory.resolve_memory_scope(fact.metadata)
+    kind, pid = target
+    scope_md = memory.build_scope_metadata(
+        scope=memory.SCOPE_GLOBAL if kind == "global" else memory.SCOPE_PROJECT,
+        project_id=pid,
+        scope_confidence=1.0,
+        scope_source=memory.SCOPE_SOURCE_OPERATOR,
+    )
+    merged = dict(fact.metadata or {})
+    merged.update(scope_md)
+    ok = memory.update_metadata(
+        user_id=str(chat_id),
+        memory_id=memory_id,
+        data=fact.text,
+        metadata=merged,
+    )
+    if ok:
+        # Structured audit line, one per applied change. The before
+        # values come from the resolver (not raw metadata) so legacy
+        # rows log the same global-interpretation retrieval acted on;
+        # scope_source after an operator move is always "operator",
+        # so only the before value is recorded.
+        log.info(
+            "memory.scope_change %s",
+            json.dumps(
+                {
+                    "memory_id": memory_id,
+                    "chat_id": chat_id,
+                    "from_scope": old.scope,
+                    "from_project_id": old.project_id,
+                    "from_scope_source": old.scope_source,
+                    "to_scope": scope_md["scope"],
+                    "to_project_id": scope_md["project_id"],
+                },
+                separators=(",", ":"),
+            ),
+        )
+    # Re-render the fact view either way: on success it shows the new
+    # scope block; on failure it re-fetches and shows whatever state
+    # the row is actually in (including "no longer exists" if the row
+    # vanished mid-flow).
+    await _send_fact_view(update, context, chat_id, memory_id)
+    return "Scope updated." if ok else "Update failed."
 
 
 async def _send_search(

@@ -500,6 +500,22 @@ class MemoryStats:
     confidence_below_0_6: int = 0
     confirmation_quote_count: int = 0
     by_prompt_version: dict[str, int] = field(default_factory=dict)
+    # Scope distribution over USER-VISIBLE rows (extracted, episode,
+    # migration), unlike the extracted-only aggregates above: scope
+    # applies to every user-visible source, so restricting the
+    # distribution to extracted rows would hide mis-scoped episodes
+    # and understate the legacy-default backlog that reclassification
+    # needs to measure. Keys are stable bucket identifiers consumed
+    # by the /memory stats renderer:
+    #   "global"             - explicit valid global rows
+    #   "global_legacy"      - rows resolved global via legacy_default
+    #   "invalid"            - rows flagged invalid_defaulted by the
+    #                          resolver (corrupted scope or provenance)
+    #   "project:<id>"       - valid project rows, one bucket per id
+    #   "project_missing_id" - valid project rows with no project_id
+    #   "task"               - valid task rows
+    # Buckets are present only when non-zero.
+    by_scope: dict[str, int] = field(default_factory=dict)
 
 
 # ── Scoped retrieval helper data shapes ──────────────────────────────
@@ -3243,6 +3259,7 @@ def get_stats(*, user_id: str) -> MemoryStats:
     extracted: list[MemoryResult] = []
     episode_count = 0
     migration_count = 0
+    by_scope: dict[str, int] = {}
     for m in memories:
         src = m.metadata.get("source")
         if src == "extracted":
@@ -3251,6 +3268,28 @@ def get_stats(*, user_id: str) -> MemoryStats:
             episode_count += 1
         elif src == "migration":
             migration_count += 1
+        # Scope distribution covers every user-visible source, not
+        # just extracted: scope is a cross-source axis and the
+        # legacy-default bucket is the operator's running measure of
+        # reclassification debt. Legacy ""-source rows are excluded
+        # for the same reason they are invisible in the browse UI.
+        if src in USER_VISIBLE_SOURCES:
+            resolved = resolve_memory_scope(m.metadata)
+            if resolved.invalid_defaulted:
+                bucket = "invalid"
+            elif resolved.legacy_defaulted:
+                bucket = "global_legacy"
+            elif resolved.scope == SCOPE_PROJECT:
+                # Valid project rows missing an id get their own
+                # bucket rather than folding into "invalid": the
+                # resolver deliberately preserves them as project
+                # rows (it does not guess), and retrieval excludes
+                # them with a distinct admission reason, so the
+                # stats view keeps the same boundary visible.
+                bucket = f"project:{resolved.project_id}" if resolved.project_id else "project_missing_id"
+            else:
+                bucket = resolved.scope
+            by_scope[bucket] = by_scope.get(bucket, 0) + 1
 
     by_tag: dict[str, int] = {}
     by_prompt_version: dict[str, int] = {}
@@ -3331,4 +3370,5 @@ def get_stats(*, user_id: str) -> MemoryStats:
         confidence_below_0_6=confidence_below_0_6,
         confirmation_quote_count=confirmation_count,
         by_prompt_version=by_prompt_version,
+        by_scope=by_scope,
     )

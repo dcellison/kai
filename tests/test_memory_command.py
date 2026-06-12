@@ -19,14 +19,18 @@ No real Mem0 instance is involved. The handler tests that drive
 
 from __future__ import annotations
 
+import logging
 import time
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kai import memory_command
+from kai import memory, memory_command
+from kai.config import MemoryProjectConfig
 from kai.memory import MemoryResult, MemoryStats
+from kai.memory_projects import ActiveMemoryProject
 
 # ── Fixture builders ────────────────────────────────────────────────
 
@@ -305,9 +309,9 @@ class TestBuildFactView:
         assert "v3" in text
         # No confirmation quote on a non-confirmed_action fact.
         assert "n/a" in text
-        # Two buttons in one row: back + forget.
+        # Three buttons in one row: back + scope + forget.
         row = kb.inline_keyboard[0]
-        assert [btn.text for btn in row] == ["back", "forget"]
+        assert [btn.text for btn in row] == ["back", "scope", "forget"]
 
     def test_back_button_routes_to_return_to(self):
         f = _fact("id1", "x", ["preference"])
@@ -2923,3 +2927,565 @@ class TestTagBrowseAxisRetired:
         assert "Tags:" in text
         assert "migration" in text
         assert "/backend" in text
+
+
+# ── Scope tools ─────────────────────────────────────────────────────
+#
+# Fixture builders for the scope-tool tests. Scope metadata rides the
+# existing extracted-fact shape; the helpers below overlay the five
+# scope keys (or deliberately corrupt them) on top of `_fact`.
+
+
+def _scoped_fact(
+    scope: str | None,
+    *,
+    project_id: str | None = None,
+    scope_source: str | None = "extraction_default",
+    scope_confidence: float = 1.0,
+    workspace_root: str | None = None,
+) -> MemoryResult:
+    """An extracted fact carrying explicit scope metadata.
+
+    `scope=None` omits the scope keys entirely (legacy shape);
+    `scope_source=None` writes scope without provenance (the
+    resolver's invalid arm for malformed writes).
+    """
+    f = _fact("scoped1", "Scoped fact text.", ["preference"])
+    if scope is not None:
+        f.metadata["scope"] = scope
+        f.metadata["project_id"] = project_id
+        f.metadata["workspace_root"] = workspace_root
+        f.metadata["scope_confidence"] = scope_confidence
+        if scope_source is not None:
+            f.metadata["scope_source"] = scope_source
+    return f
+
+
+def _project_cfg(pid: str, *, display: str | None = None, enabled: bool = True) -> MemoryProjectConfig:
+    """A registry entry with a synthetic root under /work."""
+    return MemoryProjectConfig(
+        project_id=pid,
+        display_name=display if display is not None else pid,
+        workspace_roots=(Path("/work") / pid,),
+        memory_enabled=enabled,
+        default_scope_for_new_facts="project",
+    )
+
+
+def _active_project(pid: str, *, enabled: bool = True) -> ActiveMemoryProject:
+    """An active-project detection result for `pid`."""
+    return ActiveMemoryProject(
+        project_id=pid,
+        display_name=pid,
+        matched_root=Path("/work") / pid,
+        memory_enabled=enabled,
+        default_scope_for_new_facts="project",
+    )
+
+
+class TestBuildScopeView:
+    """Rendering of the resolver arms into operator-facing labels."""
+
+    def test_explicit_global(self):
+        view = memory_command._build_scope_view(_scoped_fact("global"), {}, None)
+        assert view.scope_label == "global"
+        assert view.source_label == "extraction_default (confidence 1.00)"
+        assert view.retrievable_label == "yes"
+
+    def test_legacy_row_defaults_global_with_legacy_source(self):
+        view = memory_command._build_scope_view(_scoped_fact(None), {}, None)
+        assert view.scope_label == "global"
+        assert view.resolved.legacy_defaulted is True
+        assert "legacy_default" in view.source_label
+        assert view.retrievable_label == "yes"
+
+    def test_invalid_scope_value_renders_invalid_source(self):
+        view = memory_command._build_scope_view(_scoped_fact("bogus"), {}, None)
+        assert view.scope_label == "global"
+        assert view.resolved.invalid_defaulted is True
+        assert "invalid_default" in view.source_label
+
+    def test_project_row_registered_same_display(self):
+        registry = {"kai": _project_cfg("kai")}
+        fact = _scoped_fact("project", project_id="kai", scope_source="classifier", scope_confidence=0.8)
+        view = memory_command._build_scope_view(fact, registry, None)
+        assert view.scope_label == "project 'kai'"
+        assert view.source_label == "classifier (confidence 0.80)"
+
+    def test_project_row_registered_distinct_display(self):
+        registry = {"kai": _project_cfg("kai", display="Kai Assistant")}
+        fact = _scoped_fact("project", project_id="kai", scope_source="operator")
+        view = memory_command._build_scope_view(fact, registry, None)
+        assert view.scope_label == "project 'kai' (Kai Assistant)"
+
+    def test_project_row_unregistered_is_flagged(self):
+        fact = _scoped_fact("project", project_id="ghost", scope_source="operator")
+        view = memory_command._build_scope_view(fact, {}, None)
+        assert view.scope_label == "project 'ghost' (not registered)"
+
+    def test_project_row_missing_id(self):
+        # The active project makes project scope allowed, so the
+        # verdict reaches the missing-id arm instead of stopping at
+        # project_scope_not_allowed.
+        fact = _scoped_fact("project", project_id=None, scope_source="operator")
+        view = memory_command._build_scope_view(fact, {}, _active_project("kai"))
+        assert view.scope_label == "project (no project id)"
+        assert "project_scope_missing_project_id" in view.retrievable_label
+
+    def test_task_row(self):
+        fact = _scoped_fact("task", scope_source="extraction_default")
+        view = memory_command._build_scope_view(fact, {}, None)
+        assert view.scope_label == "task"
+        assert "task_scope_not_supported" in view.retrievable_label
+
+
+class TestScopeViewAdmissionParity:
+    """The retrievability verdict must match scoped retrieval's own
+    admission rule under the same allowed-project derivation."""
+
+    @pytest.mark.parametrize(
+        "fact,active",
+        [
+            (_scoped_fact("global"), None),
+            (_scoped_fact(None), _active_project("kai")),
+            (_scoped_fact("project", project_id="kai", scope_source="operator"), _active_project("kai")),
+            (_scoped_fact("project", project_id="anvil", scope_source="operator"), _active_project("kai")),
+            (_scoped_fact("project", project_id="kai", scope_source="operator"), None),
+            (
+                _scoped_fact("project", project_id="kai", scope_source="operator"),
+                _active_project("kai", enabled=False),
+            ),
+            (_scoped_fact("project", project_id=None, scope_source="operator"), _active_project("kai")),
+            (_scoped_fact("task"), _active_project("kai")),
+        ],
+    )
+    def test_verdict_matches_admission_reason(self, fact, active):
+        view = memory_command._build_scope_view(fact, {}, active)
+        allowed = active.project_id if active is not None and active.memory_enabled else None
+        reason = memory._scoped_memory_admission_reason(
+            memory.resolve_memory_scope(fact.metadata),
+            allowed_project_id=allowed,
+        )
+        if reason is None:
+            assert view.retrievable_label == "yes"
+        else:
+            assert view.retrievable_label.startswith("no (")
+            assert reason in view.retrievable_label
+
+    def test_mismatch_names_both_projects(self):
+        fact = _scoped_fact("project", project_id="anvil", scope_source="operator")
+        view = memory_command._build_scope_view(fact, {}, _active_project("kai"))
+        assert "row 'anvil'" in view.retrievable_label
+        assert "here 'kai'" in view.retrievable_label
+
+    def test_disabled_project_distinguished_from_no_project(self):
+        fact = _scoped_fact("project", project_id="kai", scope_source="operator")
+        disabled = memory_command._build_scope_view(fact, {}, _active_project("kai", enabled=False))
+        nowhere = memory_command._build_scope_view(fact, {}, None)
+        assert "project memory disabled here" in disabled.retrievable_label
+        assert "no active project here" in nowhere.retrievable_label
+
+
+class TestScopeChangeTargets:
+    """Transition derivation per current scope and registry."""
+
+    _REGISTRY = {"anvil": _project_cfg("anvil"), "kai": _project_cfg("kai")}
+
+    def _resolved(self, fact):
+        return memory.resolve_memory_scope(fact.metadata)
+
+    def test_explicit_global_offers_projects_only(self):
+        targets = memory_command._scope_change_targets(self._resolved(_scoped_fact("global")), self._REGISTRY)
+        assert targets == [("project", "anvil"), ("project", "kai")]
+
+    def test_legacy_global_offers_global_stamp_and_projects(self):
+        targets = memory_command._scope_change_targets(self._resolved(_scoped_fact(None)), self._REGISTRY)
+        assert targets == [("global", None), ("project", "anvil"), ("project", "kai")]
+
+    def test_project_row_excludes_own_project(self):
+        fact = _scoped_fact("project", project_id="kai", scope_source="operator")
+        targets = memory_command._scope_change_targets(self._resolved(fact), self._REGISTRY)
+        assert targets == [("global", None), ("project", "anvil")]
+
+    def test_invalid_project_row_includes_own_project_for_repair(self):
+        # scope present and valid, but no scope_source: invalid arm.
+        fact = _scoped_fact("project", project_id="kai", scope_source=None)
+        targets = memory_command._scope_change_targets(self._resolved(fact), self._REGISTRY)
+        assert targets == [("global", None), ("project", "anvil"), ("project", "kai")]
+
+    def test_explicit_global_empty_registry_offers_nothing(self):
+        targets = memory_command._scope_change_targets(self._resolved(_scoped_fact("global")), {})
+        assert targets == []
+
+
+class TestBuildScopeScreen:
+    def test_renders_scope_block_and_targets(self):
+        registry = {"kai": _project_cfg("kai")}
+        fact = _scoped_fact(None)
+        view = memory_command._build_scope_view(fact, registry, None)
+        targets = memory_command._scope_change_targets(view.resolved, registry)
+        text, kb = memory_command._build_scope_screen(fact, view, targets)
+        assert '"Scoped fact text."' in text
+        assert "Scope:  global" in text
+        assert "legacy_default" in text
+        assert "Choose a new scope:" in text
+        # One button per target row, then the nav row.
+        labels = [row[0].text for row in kb.inline_keyboard]
+        assert labels == ["Make global", "Move to 'kai'", "back"]
+        assert kb.inline_keyboard[0][0].callback_data == "mem:sct:0"
+        assert kb.inline_keyboard[1][0].callback_data == "mem:sct:1"
+        assert kb.inline_keyboard[-1][0].callback_data == "mem:fview"
+
+    def test_no_targets_renders_empty_message(self):
+        fact = _scoped_fact("global")
+        view = memory_command._build_scope_view(fact, {}, None)
+        text, kb = memory_command._build_scope_screen(fact, view, [])
+        assert "No scope changes available" in text
+        assert [row[0].text for row in kb.inline_keyboard] == ["back"]
+
+
+class TestBuildScopeConfirm:
+    def test_global_target_question(self):
+        fact = _scoped_fact("project", project_id="kai", scope_source="operator")
+        text, kb = memory_command._build_scope_confirm(fact, ("global", None))
+        assert text.startswith("Make this fact global?")
+        assert '"Scoped fact text."' in text
+        # Reversible action: no irreversibility warning.
+        assert "cannot be undone" not in text
+        row = kb.inline_keyboard[0]
+        assert [btn.text for btn in row] == ["confirm", "cancel"]
+        assert row[0].callback_data == "mem:scd"
+        assert row[1].callback_data == "mem:scp"
+
+    def test_project_target_question(self):
+        fact = _scoped_fact("global")
+        text, _ = memory_command._build_scope_confirm(fact, ("project", "anvil"))
+        assert text.startswith("Move this fact to project 'anvil'?")
+
+    def test_episode_noun(self):
+        fact = _episode_fact()
+        text, _ = memory_command._build_scope_confirm(fact, ("project", "kai"))
+        assert text.startswith("Move this episode to project 'kai'?")
+
+
+class TestFactViewScopeBlock:
+    def test_extracted_arm_renders_aligned_scope_rows(self):
+        fact = _scoped_fact("project", project_id="kai", scope_source="classifier", scope_confidence=0.7)
+        view = memory_command._build_scope_view(fact, {"kai": _project_cfg("kai")}, _active_project("kai"))
+        text, _ = memory_command._build_fact_view(fact, return_to=None, scope_view=view)
+        assert "Scope:            project 'kai'" in text
+        assert "Scope source:     classifier (confidence 0.70)" in text
+        assert "Retrievable here: yes" in text
+
+    def test_episode_arm_renders_scope_rows(self):
+        fact = _episode_fact()
+        view = memory_command._build_scope_view(fact, {}, None)
+        text, _ = memory_command._build_fact_view(fact, return_to=None, scope_view=view)
+        assert "Scope:  global" in text
+        assert "Scope source:  legacy_default (confidence 1.00)" in text
+        assert "Retrievable here:  yes" in text
+
+    def test_no_scope_view_omits_block(self):
+        text, _ = memory_command._build_fact_view(_fact("a", "x", ["t"]), return_to=None)
+        assert "Scope:" not in text
+        assert "Retrievable here" not in text
+
+
+class TestScopeCallbackDispatch:
+    """scp / sct / scd verb routing and session-expired guards."""
+
+    @pytest.mark.asyncio
+    async def test_scp_without_cache_expires(self, monkeypatch, update_factory, context_factory):
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        sent = {}
+
+        async def fake_dash(update, context, chat_id, edit=False):
+            sent["dash"] = True
+
+        monkeypatch.setattr(memory_command, "_send_dashboard", fake_dash)
+        upd = update_factory(callback_data="mem:scp")
+        await memory_command.handle_memory_callback(upd, context_factory())
+        assert sent.get("dash") is True
+        upd.callback_query.answer.assert_awaited_once_with(memory_command._MSG_SESSION_EXPIRED)
+
+    @pytest.mark.asyncio
+    async def test_scp_with_cached_fact_opens_scope_screen(self, monkeypatch, update_factory, context_factory):
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        sent = {}
+
+        async def fake_scope_screen(update, context, chat_id, memory_id):
+            sent["memory_id"] = memory_id
+
+        monkeypatch.setattr(memory_command, "_send_scope_screen", fake_scope_screen)
+        memory_command._set_cache(100, memory_command._ScreenCache(screen="fact", memory_ids=["m1"]))
+        upd = update_factory(callback_data="mem:scp")
+        await memory_command.handle_memory_callback(upd, context_factory())
+        assert sent["memory_id"] == "m1"
+
+    @pytest.mark.asyncio
+    async def test_sct_out_of_range_expires(self, monkeypatch, update_factory, context_factory):
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        sent = {}
+
+        async def fake_dash(update, context, chat_id, edit=False):
+            sent["dash"] = True
+
+        monkeypatch.setattr(memory_command, "_send_dashboard", fake_dash)
+        memory_command._set_cache(
+            100,
+            memory_command._ScreenCache(screen="scope", memory_ids=["m1"], scope_targets=[("global", None)]),
+        )
+        upd = update_factory(callback_data="mem:sct:5")
+        await memory_command.handle_memory_callback(upd, context_factory())
+        assert sent.get("dash") is True
+
+    @pytest.mark.asyncio
+    async def test_sct_valid_index_opens_confirm(self, monkeypatch, update_factory, context_factory):
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        sent = {}
+
+        async def fake_confirm(update, context, chat_id, memory_id, target):
+            sent["target"] = target
+
+        monkeypatch.setattr(memory_command, "_send_scope_confirm", fake_confirm)
+        memory_command._set_cache(
+            100,
+            memory_command._ScreenCache(
+                screen="scope",
+                memory_ids=["m1"],
+                scope_targets=[("global", None), ("project", "kai")],
+            ),
+        )
+        upd = update_factory(callback_data="mem:sct:1")
+        await memory_command.handle_memory_callback(upd, context_factory())
+        assert sent["target"] == ("project", "kai")
+
+    @pytest.mark.asyncio
+    async def test_scd_without_selected_target_expires(self, monkeypatch, update_factory, context_factory):
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        sent = {}
+
+        async def fake_dash(update, context, chat_id, edit=False):
+            sent["dash"] = True
+
+        monkeypatch.setattr(memory_command, "_send_dashboard", fake_dash)
+        memory_command._set_cache(100, memory_command._ScreenCache(screen="scope_confirm", memory_ids=["m1"]))
+        upd = update_factory(callback_data="mem:scd")
+        await memory_command.handle_memory_callback(upd, context_factory())
+        assert sent.get("dash") is True
+
+    @pytest.mark.asyncio
+    async def test_scd_applies_selected_target(self, monkeypatch, update_factory, context_factory):
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        applied = {}
+
+        async def fake_apply(update, context, chat_id, memory_id, target):
+            applied["memory_id"] = memory_id
+            applied["target"] = target
+            return "Scope updated."
+
+        monkeypatch.setattr(memory_command, "_apply_scope_change", fake_apply)
+        memory_command._set_cache(
+            100,
+            memory_command._ScreenCache(
+                screen="scope_confirm",
+                memory_ids=["m1"],
+                scope_target=("project", "kai"),
+            ),
+        )
+        upd = update_factory(callback_data="mem:scd")
+        await memory_command.handle_memory_callback(upd, context_factory())
+        assert applied == {"memory_id": "m1", "target": ("project", "kai")}
+        upd.callback_query.answer.assert_awaited_once_with("Scope updated.")
+
+
+class TestApplyScopeChange:
+    """Read-merge-write apply path: field preservation, provenance,
+    ownership pass-through, failure modes, audit log line."""
+
+    def _run_apply(self, monkeypatch, fact, *, update_ok=True):
+        captured: dict[str, Any] = {}
+        monkeypatch.setattr(memory_command.memory, "get_by_id", lambda *, user_id, memory_id: fact)
+
+        def fake_update(*, user_id, memory_id, data, metadata):
+            captured.update(user_id=user_id, memory_id=memory_id, data=data, metadata=metadata)
+            return update_ok
+
+        monkeypatch.setattr(memory_command.memory, "update_metadata", fake_update)
+
+        async def fake_fact_view(update, context, chat_id, memory_id):
+            captured["rerendered"] = memory_id
+
+        monkeypatch.setattr(memory_command, "_send_fact_view", fake_fact_view)
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_preserves_every_non_scope_field(self, monkeypatch, update_factory, context_factory):
+        fact = _scoped_fact("project", project_id="anvil", scope_source="classifier", scope_confidence=0.6)
+        original = dict(fact.metadata)
+        captured = self._run_apply(monkeypatch, fact)
+        answer = await memory_command._apply_scope_change(
+            update_factory(callback_data="mem:scd"), context_factory(), 100, "scoped1", ("project", "kai")
+        )
+        assert answer == "Scope updated."
+        md = captured["metadata"]
+        # Every non-scope key survives byte-identically.
+        scope_keys = {"scope", "project_id", "workspace_root", "scope_confidence", "scope_source"}
+        for key, value in original.items():
+            if key not in scope_keys:
+                assert md[key] == value
+        # The five scope keys carry the operator write shape.
+        assert md["scope"] == "project"
+        assert md["project_id"] == "kai"
+        assert md["workspace_root"] is None
+        assert md["scope_confidence"] == 1.0
+        assert md["scope_source"] == "operator"
+        # Mem0 update requires the row text; ownership rides user_id.
+        assert captured["data"] == fact.text
+        assert captured["user_id"] == "100"
+        assert captured["rerendered"] == "scoped1"
+
+    @pytest.mark.asyncio
+    async def test_make_global_discards_project_fields(self, monkeypatch, update_factory, context_factory):
+        fact = _scoped_fact("project", project_id="anvil", scope_source="operator", workspace_root="/work/anvil")
+        captured = self._run_apply(monkeypatch, fact)
+        answer = await memory_command._apply_scope_change(
+            update_factory(callback_data="mem:scd"), context_factory(), 100, "scoped1", ("global", None)
+        )
+        assert answer == "Scope updated."
+        md = captured["metadata"]
+        assert md["scope"] == "global"
+        assert md["project_id"] is None
+        assert md["workspace_root"] is None
+
+    @pytest.mark.asyncio
+    async def test_missing_row_returns_not_found(self, monkeypatch, update_factory, context_factory):
+        monkeypatch.setattr(memory_command.memory, "get_by_id", lambda *, user_id, memory_id: None)
+        sent = {}
+
+        async def fake_send(update, text, kb, edit):
+            sent["text"] = text
+
+        monkeypatch.setattr(memory_command, "_send_or_edit", fake_send)
+        answer = await memory_command._apply_scope_change(
+            update_factory(callback_data="mem:scd"), context_factory(), 100, "gone", ("global", None)
+        )
+        assert answer == "Not found."
+        assert sent["text"] == "This memory no longer exists."
+
+    @pytest.mark.asyncio
+    async def test_update_failure_reports_and_rerenders(self, monkeypatch, update_factory, context_factory):
+        fact = _scoped_fact("global")
+        captured = self._run_apply(monkeypatch, fact, update_ok=False)
+        answer = await memory_command._apply_scope_change(
+            update_factory(callback_data="mem:scd"), context_factory(), 100, "scoped1", ("project", "kai")
+        )
+        assert answer == "Update failed."
+        assert captured["rerendered"] == "scoped1"
+
+    @pytest.mark.asyncio
+    async def test_emits_scope_change_log_line(self, monkeypatch, update_factory, context_factory, caplog):
+        fact = _scoped_fact("project", project_id="anvil", scope_source="classifier")
+        self._run_apply(monkeypatch, fact)
+        with caplog.at_level(logging.INFO, logger="kai.memory_command"):
+            await memory_command._apply_scope_change(
+                update_factory(callback_data="mem:scd"), context_factory(), 100, "scoped1", ("global", None)
+            )
+        line = next(r.message for r in caplog.records if r.message.startswith("memory.scope_change"))
+        assert '"from_scope":"project"' in line
+        assert '"from_project_id":"anvil"' in line
+        assert '"to_scope":"global"' in line
+        assert '"to_project_id":null' in line
+
+    @pytest.mark.asyncio
+    async def test_failed_update_emits_no_log_line(self, monkeypatch, update_factory, context_factory, caplog):
+        fact = _scoped_fact("global")
+        self._run_apply(monkeypatch, fact, update_ok=False)
+        with caplog.at_level(logging.INFO, logger="kai.memory_command"):
+            await memory_command._apply_scope_change(
+                update_factory(callback_data="mem:scd"), context_factory(), 100, "scoped1", ("project", "kai")
+            )
+        assert not any(r.message.startswith("memory.scope_change") for r in caplog.records)
+
+
+class TestScopeInputs:
+    def test_missing_pool_collapses_to_no_active_project(self, context_factory, monkeypatch):
+        import kai.memory_projects as mp_mod
+
+        monkeypatch.setattr(mp_mod, "_db_registry", {})
+        ctx = context_factory()
+        ctx.bot_data["config"].memory_projects = {"kai": _project_cfg("kai")}
+        registry, active = memory_command._scope_inputs(ctx, 100)
+        assert "kai" in registry
+        assert active is None
+
+    def test_pool_workspace_drives_detection(self, context_factory, monkeypatch, tmp_path):
+        import kai.memory_projects as mp_mod
+
+        monkeypatch.setattr(mp_mod, "_db_registry", {})
+        root = tmp_path / "kai"
+        root.mkdir()
+        cfg = MemoryProjectConfig(
+            project_id="kai",
+            display_name="kai",
+            workspace_roots=(root.resolve(),),
+            memory_enabled=True,
+            default_scope_for_new_facts="project",
+        )
+        ctx = context_factory()
+        ctx.bot_data["config"].memory_projects = {"kai": cfg}
+        pool = MagicMock()
+        pool.get_workspace.return_value = root
+        ctx.bot_data["pool"] = pool
+        _registry, active = memory_command._scope_inputs(ctx, 100)
+        assert active is not None and active.project_id == "kai"
+        pool.get_workspace.assert_called_once_with(100)
+
+
+class TestStatsScopeSection:
+    def test_distribution_renders_in_fixed_order(self):
+        base = _stats(extracted_count=5)
+        stats = MemoryStats(
+            **{**base.__dict__, "by_scope": {"project:kai": 2, "global": 1, "global_legacy": 9, "invalid": 1}}
+        )
+        text, _ = memory_command._build_stats(stats)
+        assert "Scope:" in text
+        idx_global = text.index("global ")
+        idx_legacy = text.index("global (legacy)")
+        idx_project = text.index("project 'kai'")
+        idx_invalid = text.index("invalid")
+        assert idx_global < idx_legacy < idx_project < idx_invalid
+
+    def test_projects_sort_by_count_then_id(self):
+        lines = memory_command._scope_distribution_lines({"project:kai": 1, "project:anvil": 1, "project:phi": 4})
+        rendered = "\n".join(lines)
+        assert rendered.index("'phi'") < rendered.index("'anvil'") < rendered.index("'kai'")
+
+    def test_unknown_bucket_renders_raw(self):
+        lines = memory_command._scope_distribution_lines({"global": 1, "mystery_bucket": 2})
+        assert any("mystery_bucket" in line for line in lines)
+
+    def test_no_by_scope_omits_section(self):
+        text, _ = memory_command._build_stats(_stats(extracted_count=3))
+        assert "Scope:" not in text
+
+
+class TestScopeCallbackCodec:
+    def test_scope_verbs_round_trip(self):
+        for encoded, verb, args in [
+            ("mem:scp", "scp", []),
+            ("mem:sct:7", "sct", ["7"]),
+            ("mem:scd", "scd", []),
+        ]:
+            assert memory_command._encode_callback(verb, *args) == encoded
+            action = memory_command._decode_callback(encoded)
+            assert action is not None
+            assert action.verb == verb
+            assert action.args == args
+
+    def test_sct_index_stays_under_ceiling(self):
+        # Target indices are bounded by registry size; even an absurd
+        # three-digit index stays far below the 64-byte limit because
+        # the project id itself never enters callback data.
+        encoded = memory_command._encode_callback("sct", "999")
+        assert len(encoded.encode("utf-8")) <= 64

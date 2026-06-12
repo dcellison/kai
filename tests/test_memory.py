@@ -6238,3 +6238,75 @@ class TestFormatScopedContextWithRecallPayload:
 
         assert result.rendered_context == ""
         assert result.recall_payload["reason"] == "disabled"
+
+
+class TestGetStatsScopeDistribution:
+    """`MemoryStats.by_scope` buckets resolved scope over user-visible
+    rows. Resolution goes through `resolve_memory_scope`, so legacy and
+    corrupted rows land in their audit buckets instead of echoing raw
+    metadata."""
+
+    def _stats_with(self, rows):
+        """Helper: install a mock returning `rows` and call get_stats."""
+        import kai.memory as mem_mod
+        from kai.memory import get_stats
+
+        mock_mem = MagicMock()
+        mock_mem.get_all.return_value = {"results": rows}
+        mem_mod._memory = mock_mem
+        return get_stats(user_id="123")
+
+    @staticmethod
+    def _row(rid: str, source: str, scope_md: dict | None = None) -> dict:
+        metadata: dict = {"type": "fact", "source": source}
+        if scope_md is not None:
+            metadata.update(scope_md)
+        return {"id": rid, "memory": f"row {rid}", "score": 0.0, "metadata": metadata, "created_at": ""}
+
+    def test_buckets_cover_all_resolver_arms(self):
+        stats = self._stats_with(
+            [
+                # Legacy: no scope key at all.
+                self._row("1", "extracted"),
+                # Explicit valid global.
+                self._row("2", "extracted", {"scope": "global", "scope_source": "extraction_default"}),
+                # Valid project rows, two for kai and one for anvil.
+                self._row("3", "extracted", {"scope": "project", "project_id": "kai", "scope_source": "classifier"}),
+                self._row("4", "episode", {"scope": "project", "project_id": "kai", "scope_source": "operator"}),
+                self._row("5", "extracted", {"scope": "project", "project_id": "anvil", "scope_source": "operator"}),
+                # Corrupted scope value.
+                self._row("6", "migration", {"scope": "bogus"}),
+                # Valid project scope but provenance missing: invalid arm.
+                self._row("7", "extracted", {"scope": "project", "project_id": "kai"}),
+                # Valid project scope, valid provenance, no id.
+                self._row("8", "extracted", {"scope": "project", "scope_source": "operator"}),
+                # Valid task row.
+                self._row("9", "extracted", {"scope": "task", "scope_source": "extraction_default"}),
+            ]
+        )
+        assert stats.by_scope == {
+            "global_legacy": 1,
+            "global": 1,
+            "project:kai": 2,
+            "project:anvil": 1,
+            "invalid": 2,
+            "project_missing_id": 1,
+            "task": 1,
+        }
+
+    def test_non_user_visible_rows_are_excluded(self):
+        stats = self._stats_with(
+            [
+                # Track 1 / legacy "" sources never reach the
+                # distribution, matching their invisibility in the
+                # browse UI.
+                self._row("1", "user_raw", {"scope": "global", "scope_source": "extraction_default"}),
+                {"id": "2", "memory": "no source", "score": 0.0, "metadata": {"type": "exchange"}, "created_at": ""},
+                self._row("3", "extracted"),
+            ]
+        )
+        assert stats.by_scope == {"global_legacy": 1}
+
+    def test_empty_corpus_yields_empty_distribution(self):
+        stats = self._stats_with([])
+        assert stats.by_scope == {}
