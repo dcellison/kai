@@ -1972,7 +1972,7 @@ async def _register_memory_project_for(
     # second registration can pass its own guards against the same
     # stale view while this one is awaiting the DB insert, committing
     # a parent/child pair the nested-root guard exists to prevent.
-    async with registry_mutation_lock:
+    async with registry_mutation_lock():
         merged = merged_registry(config.memory_projects)
         owner = detect_active_memory_project(root, merged)
         if owner is not None:
@@ -2065,29 +2065,41 @@ async def handle_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("Usage: /project unregister <name>")
             return
         project_id = args[1].strip().lower()
-        if project_id in config.memory_projects:
-            await update.message.reply_text(
-                f"Project '{project_id}' is operator-pinned; it cannot be unregistered from chat."
-            )
-            return
-        creator = db_registry_creator(project_id)
-        if creator is None:
-            await update.message.reply_text(f"No chat-registered project named '{project_id}'.")
-            return
-        user = config.get_user_config(chat_id)
-        is_admin = user is not None and user.role == "admin"
-        if chat_id != creator and not is_admin:
-            await update.message.reply_text(
-                f"Project '{project_id}' was registered by another user; only they or an admin can unregister it."
-            )
-            return
-        # Same mutation lock as registration: a register guard must
-        # never read the merged view mid-unregister.
         from kai.memory_projects import registry_mutation_lock
 
-        async with registry_mutation_lock:
-            removed = await sessions.unregister_memory_project(project_id)
-            db_registry_remove(project_id)
+        # The role comes from static config and cannot go stale;
+        # everything keyed on the registry row must be read under the
+        # mutation lock below.
+        user = config.get_user_config(chat_id)
+        is_admin = user is not None and user.role == "admin"
+
+        # Pinned check, creator lookup, authorization, AND the delete
+        # all under the registry mutation lock: a creator read before
+        # the lock can authorize against a row that an earlier queued
+        # mutation deletes and a different user re-registers under
+        # the same id, letting stale authorization delete the new
+        # owner's project. The denial is computed inside the lock and
+        # replied outside it, so Telegram I/O never holds the lock.
+        denial: str | None = None
+        removed = False
+        async with registry_mutation_lock():
+            if project_id in config.memory_projects:
+                denial = f"Project '{project_id}' is operator-pinned; it cannot be unregistered from chat."
+            else:
+                creator = db_registry_creator(project_id)
+                if creator is None:
+                    denial = f"No chat-registered project named '{project_id}'."
+                elif chat_id != creator and not is_admin:
+                    denial = (
+                        f"Project '{project_id}' was registered by another user; "
+                        "only they or an admin can unregister it."
+                    )
+                else:
+                    removed = await sessions.unregister_memory_project(project_id)
+                    db_registry_remove(project_id)
+        if denial is not None:
+            await update.message.reply_text(denial)
+            return
         log.info(
             "memory.project.registry %s",
             json.dumps(

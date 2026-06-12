@@ -42,6 +42,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from weakref import WeakKeyDictionary
 
 from kai.config import MemoryProjectConfig
 
@@ -182,7 +183,24 @@ _db_creators: dict[str, int] = {}
 # cover exact id/root equality, not containment, so the stable-view
 # property must come from serialization. Mutations are rare,
 # operator-driven events; a single registry-wide lock costs nothing.
-registry_mutation_lock = asyncio.Lock()
+#
+# Per-loop factory rather than a module-level Lock: asyncio locks
+# bind to the event loop that first acquires them and raise when
+# acquired from another loop. The daemon runs one loop forever, so
+# production sees a single lock; the factory exists so any context
+# with a different loop lifecycle (tests, future tooling) gets a
+# lock bound to ITS loop instead of a cross-loop RuntimeError.
+_registry_mutation_locks: WeakKeyDictionary = WeakKeyDictionary()
+
+
+def registry_mutation_lock() -> asyncio.Lock:
+    """The registry mutation lock for the running event loop."""
+    loop = asyncio.get_running_loop()
+    lock = _registry_mutation_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _registry_mutation_locks[loop] = lock
+    return lock
 
 
 def _row_to_config(row: dict) -> MemoryProjectConfig | None:

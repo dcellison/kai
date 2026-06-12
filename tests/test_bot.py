@@ -5099,6 +5099,72 @@ class TestHandleProject:
         reply = update.message.reply_text.call_args.args[0]
         assert "Unregistered" in reply
 
+    async def test_stale_unregister_authorization_rechecked_under_lock(self, tmp_path):
+        """Unregister authorization must be read under the mutation
+        lock: a creator read before the lock can authorize against a
+        row that earlier queued mutations delete and a different
+        user re-registers under the same id. The test holds the lock,
+        starts the stale unregister so it queues, swaps the row's
+        owner while it waits, and asserts the recheck denies the
+        deletion and the new owner's project survives."""
+        from kai.bot import handle_project
+        from kai.memory_projects import (
+            db_registry_remove,
+            db_registry_upsert,
+            load_db_registry,
+            merged_registry,
+            registry_mutation_lock,
+        )
+
+        root_old = tmp_path / "phi-old"
+        root_old.mkdir()
+        root_new = tmp_path / "phi-new"
+        root_new.mkdir()
+        # phi originally registered by chat 999 (the stale caller).
+        load_db_registry(
+            [
+                {
+                    "project_id": "phi",
+                    "display_name": "Phi",
+                    "workspace_root": str(root_old),
+                    "memory_enabled": True,
+                    "default_scope_for_new_facts": "project",
+                    "created_by": 999,
+                }
+            ]
+        )
+        update = _make_update("/project unregister phi", chat_id=999)
+        ctx = _make_context(args=["unregister", "phi"])
+
+        with patch("kai.bot.sessions.unregister_memory_project", new_callable=AsyncMock) as remove:
+            async with registry_mutation_lock():
+                # The stale unregister starts and queues behind the
+                # held lock BEFORE the ownership swap below.
+                task = asyncio.create_task(handle_project(update, ctx))
+                await asyncio.sleep(0)
+                # Earlier queued mutations, simulated under the held
+                # lock: the old phi goes away and a different user
+                # re-registers the id.
+                db_registry_remove("phi")
+                db_registry_upsert(
+                    {
+                        "project_id": "phi",
+                        "display_name": "Phi",
+                        "workspace_root": str(root_new),
+                        "memory_enabled": True,
+                        "default_scope_for_new_facts": "project",
+                        "created_by": 12345,
+                    }
+                )
+            await task
+
+        remove.assert_not_awaited()
+        reply = update.message.reply_text.call_args.args[0]
+        assert "registered by another user" in reply
+        # The new owner's project survives with its new root.
+        merged = merged_registry({})
+        assert merged["phi"].workspace_roots == (root_new.resolve(),)
+
     async def test_concurrent_parent_child_registration_serialized(self, tmp_path):
         """The nested-root guard reads the merged view BEFORE an
         awaited DB insert; without the registry mutation lock, two
