@@ -969,6 +969,100 @@ class TestHistoryUnreadable:
         _records, any_unreadable = _candidates_for_row(chat_id, created_at_dt, window_seconds=86400)
         assert any_unreadable is True
 
+    def test_malformed_user_ts_collapses_file_to_unreadable(self, history_dir):
+        # Same partial-history hazard, one layer deeper: a user record
+        # whose ts field is missing or unparseable would otherwise be
+        # silently dropped, leaving an unrelated valid candidate free
+        # to win the overlap. _candidates_for_row must set
+        # any_unreadable=True so the row buckets HISTORY_UNREADABLE.
+        chat_id = 1
+        user_dir = history_dir / str(chat_id)
+        user_dir.mkdir(parents=True, exist_ok=True)
+        path = user_dir / "2026-06-13.jsonl"
+        path.write_text(
+            # Valid user record we don't want to silently lean on.
+            json.dumps({"ts": "2026-06-13T01:00:00+00:00", "dir": "user", "chat_id": 1, "text": "alpha"})
+            + "\n"
+            # User record with missing ts.
+            + json.dumps({"dir": "user", "chat_id": 1, "text": "beta"})
+            + "\n",
+            encoding="utf-8",
+        )
+        created_at_dt = datetime(2026, 6, 13, 2, 0, 0, tzinfo=UTC)
+        _records, any_unreadable = _candidates_for_row(chat_id, created_at_dt, window_seconds=86400)
+        assert any_unreadable is True
+
+    def test_unparseable_user_ts_collapses_file_to_unreadable(self, history_dir):
+        chat_id = 1
+        user_dir = history_dir / str(chat_id)
+        user_dir.mkdir(parents=True, exist_ok=True)
+        path = user_dir / "2026-06-13.jsonl"
+        path.write_text(
+            # User record with a non-ISO ts string.
+            json.dumps({"ts": "this is not a timestamp", "dir": "user", "chat_id": 1, "text": "alpha"}) + "\n",
+            encoding="utf-8",
+        )
+        created_at_dt = datetime(2026, 6, 13, 2, 0, 0, tzinfo=UTC)
+        _records, any_unreadable = _candidates_for_row(chat_id, created_at_dt, window_seconds=86400)
+        assert any_unreadable is True
+
+    def test_dry_run_buckets_history_unreadable_when_true_source_has_bad_ts(self, tmp_path, history_dir):
+        # End-to-end: the true source user record has a malformed ts,
+        # and a tempting valid candidate sits next to it with text that
+        # would otherwise share strong overlap with the row. Dry-run
+        # must bucket the row HISTORY_UNREADABLE, NOT STRONG_MATCH
+        # against the tempting candidate.
+        from kai.memory_provenance_backfill import run_dry_run
+
+        chat_id = 1
+        user_dir = history_dir / str(chat_id)
+        user_dir.mkdir(parents=True, exist_ok=True)
+        path = user_dir / "2026-06-13.jsonl"
+        # Bad-ts record carries text that mirrors the row content.
+        # Tempting valid candidate shares strong overlap with the row.
+        path.write_text(
+            json.dumps({"ts": "not a real timestamp", "dir": "user", "chat_id": 1, "text": "true source content"})
+            + "\n"
+            + json.dumps(
+                {
+                    "ts": "2026-06-13T01:30:00+00:00",
+                    "dir": "user",
+                    "chat_id": 1,
+                    "text": "deploy the new build on monday at noon and watch the staging logs",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        row = _alive_row(
+            row_id="m1",
+            text="deploy the new build on monday at noon",
+            created_at="2026-06-13T02:00:00+00:00",
+        )
+        out_dir = tmp_path / "out"
+        with patch("kai.memory.get_all", return_value=[row]):
+            code = asyncio.run(
+                run_dry_run(
+                    _BASE_CONFIG,
+                    str(chat_id),
+                    window_seconds=86400,
+                    min_overlap=0.3,
+                    strong_overlap_ratio=2.0,
+                    shingle_n=4,
+                    sample=10,
+                    out_dir=out_dir,
+                )
+            )
+        assert code == 0
+        # The proposals file must be empty (header only). The tempting
+        # candidate's strong overlap with the row is NOT what we want
+        # to act on; the corrupt file makes scoring untrustworthy.
+        proposals_path = next(out_dir.glob("backfill-*-proposals.jsonl"))
+        lines = [ln for ln in proposals_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        # Header only, no proposal lines.
+        assert len(lines) == 1
+        assert json.loads(lines[0])["type"] == "header"
+
     def test_date_files_iterate_every_day_in_window(self, tmp_path):
         chat_id = 1
         start = datetime(2026, 6, 10, 0, 0, 0, tzinfo=UTC)

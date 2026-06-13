@@ -564,12 +564,22 @@ def _candidates_for_row(
         for rec in records:
             if rec.get("dir") != "user":
                 continue
+            # User-record corruption is the same partial-history hazard
+            # as a malformed JSON line: a true-source user record whose
+            # `ts` is missing, the wrong type, or unparseable would be
+            # silently dropped from the candidate set, leaving an
+            # unrelated valid user record free to win the overlap. Mark
+            # the file as unreadable for THIS row so the caller buckets
+            # the whole row HISTORY_UNREADABLE rather than scoring
+            # against incomplete evidence.
             ts = rec.get("ts")
             if not isinstance(ts, str):
+                any_unreadable = True
                 continue
             try:
                 rec_dt = datetime.fromisoformat(ts)
             except ValueError:
+                any_unreadable = True
                 continue
             if rec_dt.tzinfo is None:
                 rec_dt = rec_dt.replace(tzinfo=UTC)
