@@ -1379,6 +1379,48 @@ def _render_sweep_table(
     return "\n".join([header, sep, *rows])
 
 
+def _print_sweep_top_config_distributions(
+    sweep_results: list[tuple[ConfigOverride, list[ScopedProbeResult], ScopedMetrics]],
+) -> None:
+    """Emit the stdout distribution lines for the TOP-RANKED sweep
+    config, with the config inline.
+
+    A sweep produces one ScopedMetrics per grid point and each carries
+    its own `by_active_project` and `by_scoped_reason`. `by_active_
+    project` is invariant across the grid because workspace detection
+    runs before any swept knob touches retrieval, but `by_scoped_
+    reason` is NOT invariant: a probe whose rows fall below the floor
+    reports `all_below_floor` at one floor and `ok` at another, so the
+    distribution shifts with `--floor` sweeps.
+
+    Picking the last grid point as a "representative" row would silently
+    misreport: with `--floor 0.15 0.40` the sorted table shows the
+    best row at the top, then the last grid point at floor=0.40 is the
+    one whose probes fell below the floor, and the printed summary
+    would say `all_below_floor=N` for a config the operator is not
+    looking at. Instead, this helper sorts by the same key the sweep
+    table uses (precision@5 desc, latency_p50 asc), takes the top row,
+    and prints both distributions tagged with that row's config so the
+    binding is explicit. Per-row distributions remain available in the
+    JSON output for operators chasing a specific grid point.
+    """
+    if not sweep_results:
+        return
+    sorted_results = sorted(
+        sweep_results,
+        key=lambda t: (-t[2].precision_at_k.get(5, 0.0), t[2].latency_p50_ms),
+    )
+    top_cfg, _, top_metrics = sorted_results[0]
+    print(
+        "eval: top config: "
+        f"floor={top_cfg.floor:.2f}, usr_w={top_cfg.user_weight:.2f}, "
+        f"ast_w={top_cfg.assistant_weight:.2f}, ep_w={top_cfg.episode_summary_weight:.2f}, "
+        f"over={top_cfg.overfetch}"
+    )
+    print(_format_distribution("by_active_project", top_metrics.by_active_project))
+    print(_format_distribution("by_scoped_reason", top_metrics.by_scoped_reason))
+
+
 def _format_distribution(label: str, distribution: dict[str, int]) -> str:
     """Render a sorted `key=count, ...` distribution line for stdout.
 
@@ -1658,15 +1700,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
         sweep_results = await run_sweep(probes, args.user_id, grid)
         print("Full sweep table (sorted by precision@5, then latency):")
         print(_render_sweep_table(sweep_results))
-        # Stdout summary lines use the LAST grid point's metrics for
-        # the distribution; the distributions are independent of the
-        # swept knobs (active project detection runs at request time
-        # and does not vary with floor/weight/overfetch), so the
-        # last-row values are representative.
-        if sweep_results:
-            _, _, last_metrics = sweep_results[-1]
-            print(_format_distribution("by_active_project", last_metrics.by_active_project))
-            print(_format_distribution("by_scoped_reason", last_metrics.by_scoped_reason))
+        _print_sweep_top_config_distributions(sweep_results)
         if args.output:
             payload = _build_sweep_json(probes, sweep_results, args.include_details)
             args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")

@@ -1002,6 +1002,74 @@ class TestStdoutSummary:
         line = _format_distribution("by_scoped_reason", {})
         assert line == "eval: by_scoped_reason: (empty)"
 
+    def test_sweep_summary_uses_top_ranked_config_not_last_grid_point(self, capsys):
+        """`by_scoped_reason` shifts with `--floor` because rows that
+        fall below the floor flip from `ok` to `all_below_floor`. The
+        sweep stdout summary must therefore be tagged to a specific
+        config; emitting the last grid point's distribution after a
+        precision-sorted table would silently misreport. The fix
+        prints the top-ranked config (same sort key the table uses)
+        with the config inline; this test pins that behavior.
+        """
+        from kai.eval.retrieval_scoped import (
+            ScopedMetrics,
+            _print_sweep_top_config_distributions,
+        )
+
+        # Two configs. The "winner" (precision@5 = 0.9) is NOT the last
+        # grid point. The "loser" (precision@5 = 0.1) is last and
+        # carries a different by_scoped_reason distribution; with the
+        # buggy "last row wins" logic, the test would observe the
+        # loser's distribution.
+        winner_cfg = ConfigOverride(
+            floor=0.15,
+            user_weight=0.85,
+            assistant_weight=0.8,
+            episode_summary_weight=0.85,
+            overfetch=20,
+        )
+        loser_cfg = ConfigOverride(
+            floor=0.40,
+            user_weight=0.85,
+            assistant_weight=0.8,
+            episode_summary_weight=0.85,
+            overfetch=20,
+        )
+
+        def _metrics(p5: float, scoped_reason: dict[str, int]) -> ScopedMetrics:
+            return ScopedMetrics(
+                n_probes=10,
+                n_scored_positive=10,
+                n_drift_positive=0,
+                precision_at_k={1: p5, 3: p5, 5: p5},
+                recall_at_k={1: p5, 3: p5, 5: p5},
+                mrr=p5,
+                fraction_in_prompt=p5,
+                n_scored_negative=0,
+                n_drift_negative=0,
+                exclusion_pass_in_prompt=1.0,
+                exclusion_pass_in_candidates=1.0,
+                latency_p50_ms=10.0,
+                latency_p95_ms=20.0,
+                by_scoped_reason=scoped_reason,
+                by_active_project={"kai": 10},
+            )
+
+        sweep_results = [
+            (winner_cfg, [], _metrics(0.9, {"ok": 10})),
+            (loser_cfg, [], _metrics(0.1, {"all_below_floor": 10})),
+        ]
+        _print_sweep_top_config_distributions(sweep_results)
+        out = capsys.readouterr().out
+        # The winner's floor must appear (0.15), not the loser's (0.40).
+        assert "floor=0.15" in out
+        assert "floor=0.40" not in out
+        # The winner's scoped_reason distribution must be printed, not
+        # the loser's. The buggy "last row wins" code would have
+        # printed `all_below_floor=10` instead.
+        assert "ok=10" in out
+        assert "all_below_floor" not in out
+
 
 # ── Test 13: Fail-closed observation ────────────────────────────────
 
