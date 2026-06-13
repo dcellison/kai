@@ -134,7 +134,6 @@ def log_message(
     # Separates users on disk so grep/jq searches are naturally scoped
     # and one user's history can be managed independently.
     user_dir = _LOG_DIR / str(chat_id)
-    user_dir.mkdir(parents=True, exist_ok=True)
     # Single `now` call so the ts written into the record and the date
     # baked into the filename can never drift across a midnight boundary
     # within one log_message invocation. The returned LogEntry carries
@@ -151,7 +150,14 @@ def log_message(
         "media": media,
     }
     filepath = user_dir / f"{date}.jsonl"
+    # mkdir lives inside the try so a filesystem permission or
+    # availability failure BEFORE the append still produces the same
+    # None signal as an append failure. Without this, a directory
+    # creation error would escape `log_message` and crash the
+    # caller, defeating the safety property the LogEntry | None
+    # contract is meant to provide.
     try:
+        user_dir.mkdir(parents=True, exist_ok=True)
         with open(filepath, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
@@ -476,6 +482,7 @@ LookupReason = Literal[
     "unreadable",
     "ts_not_found",
     "hash_mismatch",
+    "chat_mismatch",
 ]
 
 _TRANSCRIPT_WINDOW_TURN_CAP = 50
@@ -600,6 +607,7 @@ def fetch_transcript_context(
     before: int = 3,
     after: int = 1,
     memory_id: str | None = None,
+    expected_chat_id: int | None = None,
 ) -> TranscriptLookup:
     """
     Resolve a row's transcript provenance into surrounding turns.
@@ -618,6 +626,17 @@ def fetch_transcript_context(
             assistant turn. Walks at most one file forward.
         memory_id: Optional row id, carried into the drift log so log
             queries can correlate failures back to the affected row.
+        expected_chat_id: Ownership gate for the consumer. When
+            provided AND it differs from `provenance.chat_id`, the
+            helper returns `chat_mismatch` BEFORE touching disk: row
+            ownership (verified by Mem0's user_id partition at
+            `get_by_id` time) does not extend to the `source_chat_id`
+            field, which is just metadata the row carries. A
+            malformed, restored, or forged row whose `source_chat_id`
+            points at another chat would otherwise let the consumer
+            dereference an unrelated chat's JSONL. Callers that
+            already trust the provenance (admin tooling that scans
+            cross-chat by design) can omit the kwarg.
 
     Returns:
         TranscriptLookup with `reason="ok"` and a populated
@@ -634,6 +653,10 @@ def fetch_transcript_context(
                          user-side miss from assistant-side miss).
         - hash_mismatch: the user line was found but its text no
                          longer matches the stored fingerprint.
+        - chat_mismatch: `expected_chat_id` was supplied and disagrees
+                         with `provenance.chat_id`. No disk access
+                         occurs; the drift log fires so a forged or
+                         corrupted pointer surfaces in observability.
 
     The helper never returns a "maybe matched" turn. A wrong-turn
     render would be worse than no render at all.
@@ -642,6 +665,15 @@ def fetch_transcript_context(
         return TranscriptLookup(reason="legacy", context=None)
 
     chat_id: int = provenance.chat_id
+    if expected_chat_id is not None and chat_id != expected_chat_id:
+        # Fail closed BEFORE the filesystem read so a cross-chat
+        # pointer cannot leak even one byte of another chat's
+        # transcript. The drift log surfaces the attempt so an
+        # operator scanning observability for provenance issues can
+        # find a forged or restored-from-bad-backup row.
+        _emit_drift_log(memory_id=memory_id, chat_id=chat_id, reason="chat_mismatch")
+        return TranscriptLookup(reason="chat_mismatch", context=None)
+
     date: str = provenance.date
     user_ts: str = provenance.user_ts
     user_text_sha256: str = provenance.user_text_sha256
@@ -790,16 +822,28 @@ def _collect_after(
     right after whichever target is the rightmost one in the primary
     file). When today's file does not provide enough, walk one file
     forward.
+
+    Midnight-cross edge case: an episode whose user lands on day D
+    and whose assistant lands on day D+1 reaches here with
+    `anchor_index=None` (the assistant is not in `primary_records`)
+    but `target_assistant` populated. The early return for
+    `anchor_index is None` is therefore gated on having no
+    target_assistant at all; when the target lives in the next file,
+    we skip the primary-file scan and walk straight into the
+    next-file path below.
     """
-    if after <= 0 or anchor_index is None:
+    if after <= 0:
+        return []
+    if anchor_index is None and target_assistant is None:
         return []
     collected: list[TranscriptTurn] = []
-    for rec in primary_records[anchor_index + 1 :]:
-        if _turn_is_synthetic(rec.get("text", "")):
-            continue
-        collected.append(_to_turn(rec))
-        if len(collected) >= after:
-            break
+    if anchor_index is not None:
+        for rec in primary_records[anchor_index + 1 :]:
+            if _turn_is_synthetic(rec.get("text", "")):
+                continue
+            collected.append(_to_turn(rec))
+            if len(collected) >= after:
+                break
     if len(collected) < after:
         # The episode midnight-cross path may have already populated
         # the assistant from the next file. We still want to include

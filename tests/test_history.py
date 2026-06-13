@@ -841,3 +841,118 @@ class TestFetchTranscriptContext:
         # `before` walks one file back and pulls the yesterday user
         # turn rather than returning a short window.
         assert [t.text for t in result.context.before] == ["yesterday"]
+
+
+class TestFetchTranscriptContextChatOwnership:
+    """Cross-chat pointer protection: when expected_chat_id disagrees
+    with provenance.chat_id, the helper refuses to dereference."""
+
+    def test_mismatch_returns_chat_mismatch_before_disk(self, _log_dir, caplog):
+        import hashlib
+
+        # Write a file for chat 2 that DOES contain the target line.
+        # The helper must not read it on behalf of expected_chat_id=1.
+        path = _log_dir / "2" / "2026-06-13.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"ts": "2026-06-13T09:00:00+00:00", "dir": "user", "chat_id": 2, "text": "secret"}) + "\n"
+        )
+        provenance = _Provenance(
+            chat_id=2,  # the row's source pointer (bad data on a chat-1 row)
+            date="2026-06-13",
+            user_ts="2026-06-13T09:00:00+00:00",
+            user_text_sha256=hashlib.sha256(b"secret").hexdigest(),
+        )
+        with caplog.at_level("INFO", logger="kai.history"):
+            result = history.fetch_transcript_context(provenance, expected_chat_id=1, memory_id="m")
+        assert result.reason == "chat_mismatch"
+        assert result.context is None
+        # The drift log fired with the new reason.
+        assert any('"reason":"chat_mismatch"' in r.message for r in caplog.records)
+
+    def test_match_proceeds(self, _log_dir):
+        import hashlib
+
+        path = _log_dir / "1" / "2026-06-13.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"ts": "2026-06-13T09:00:00+00:00", "dir": "user", "chat_id": 1, "text": "ok"}) + "\n"
+        )
+        provenance = _Provenance(
+            chat_id=1,
+            date="2026-06-13",
+            user_ts="2026-06-13T09:00:00+00:00",
+            user_text_sha256=hashlib.sha256(b"ok").hexdigest(),
+        )
+        result = history.fetch_transcript_context(provenance, expected_chat_id=1)
+        assert result.reason == "ok"
+
+    def test_no_expected_chat_id_skips_check(self, _log_dir):
+        """Admin callers (cross-chat scans) get the old behaviour when
+        they omit the gate."""
+        import hashlib
+
+        path = _log_dir / "5" / "2026-06-13.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"ts": "2026-06-13T09:00:00+00:00", "dir": "user", "chat_id": 5, "text": "x"}) + "\n"
+        )
+        provenance = _Provenance(
+            chat_id=5,
+            date="2026-06-13",
+            user_ts="2026-06-13T09:00:00+00:00",
+            user_text_sha256=hashlib.sha256(b"x").hexdigest(),
+        )
+        result = history.fetch_transcript_context(provenance)
+        assert result.reason == "ok"
+
+
+class TestFetchTranscriptContextMidnightCrossAfterWindow:
+    """The after-window walks into the next-day file when the assistant
+    target itself lives there: a follow-up turn on day D+1 must appear
+    in `lookup.context.after`."""
+
+    def test_after_window_includes_next_day_turn(self, _log_dir):
+        import hashlib
+
+        prev = _log_dir / "1" / "2026-06-12.jsonl"
+        nextp = _log_dir / "1" / "2026-06-13.jsonl"
+        prev.parent.mkdir(parents=True, exist_ok=True)
+        prev.write_text(
+            json.dumps({"ts": "2026-06-12T23:59:00+00:00", "dir": "user", "chat_id": 1, "text": "u"}) + "\n"
+        )
+        nextp.write_text(
+            json.dumps({"ts": "2026-06-13T00:00:30+00:00", "dir": "assistant", "chat_id": 1, "text": "a"})
+            + "\n"
+            + json.dumps({"ts": "2026-06-13T00:05:00+00:00", "dir": "user", "chat_id": 1, "text": "follow-up"})
+            + "\n"
+        )
+        provenance = _Provenance(
+            chat_id=1,
+            date="2026-06-12",
+            user_ts="2026-06-12T23:59:00+00:00",
+            user_text_sha256=hashlib.sha256(b"u").hexdigest(),
+            assistant_ts="2026-06-13T00:00:30+00:00",
+            date_end="2026-06-13",
+        )
+        result = history.fetch_transcript_context(provenance, before=0, after=1)
+        assert result.reason == "ok"
+        assert [t.text for t in result.context.after] == ["follow-up"]
+
+
+class TestLogMessageMkdirFailure:
+    def test_mkdir_oserror_returns_none(self, monkeypatch, _log_dir):
+        """Directory creation failures now share the LogEntry | None
+        contract with append failures (P3 boundary fix)."""
+        from pathlib import Path
+
+        original_mkdir = Path.mkdir
+
+        def boom(self, *args, **kwargs):
+            if str(self).startswith(str(_log_dir)):
+                raise OSError("read-only filesystem")
+            return original_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", boom)
+        entry = log_message(direction="user", chat_id=99, text="x")
+        assert entry is None

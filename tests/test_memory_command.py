@@ -3720,3 +3720,38 @@ class TestSourceViewBuilder:
         text, _ = memory_command._build_source_view(f, lookup)
         assert len(text) <= 4096
         assert "(output truncated)" in text
+
+
+class TestSourceViewOwnership:
+    """`/memory source` must refuse to dereference a row whose
+    `source_chat_id` does not match the current chat, even when the
+    JSONL would otherwise resolve."""
+
+    @pytest.mark.asyncio
+    async def test_cross_chat_pointer_renders_failure_body(
+        self, tmp_path, monkeypatch, update_factory, context_factory
+    ):
+        from kai import history
+
+        # JSONL for chat 2 with a matching ts and hash; the helper
+        # must not consult it for a chat-1 caller.
+        path = tmp_path / "2" / "2026-06-13.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text('{"ts": "2026-06-13T09:00:00+00:00", "dir": "user", "chat_id": 2, "text": "secret"}\n')
+        monkeypatch.setattr(history, "_LOG_DIR", tmp_path)
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+
+        fact = _provenanced_fact(
+            chat_id=2,
+            user_text_sha256=__import__("hashlib").sha256(b"secret").hexdigest(),
+        )
+        monkeypatch.setattr(memory_command.memory, "get_by_id", lambda *, user_id, memory_id: fact)
+        sent = {}
+
+        async def fake_send(update, text, kb, edit):
+            sent["text"] = text
+
+        monkeypatch.setattr(memory_command, "_send_or_edit", fake_send)
+        await memory_command._send_source_view(update_factory(callback_data="mem:src"), context_factory(), 1, fact.id)
+        assert "does not match this chat" in sent["text"]
+        assert "secret" not in sent["text"]

@@ -514,6 +514,8 @@ def parse_preimages(text: str) -> tuple[dict[str, Any], list[PreImage]]:
 def _collect_provenance_quotes(
     selected: list[tuple[MemoryResult, ResolvedMemoryScope]],
     proposals: list[Proposal],
+    *,
+    user_id: str,
 ) -> dict[str, str]:
     """Build the memory_id → originating-user-text map for the report.
 
@@ -526,7 +528,21 @@ def _collect_provenance_quotes(
     The proposal set drives the iteration: we only look up provenance
     for rows that actually appear in the report's eyeball sample
     space, not for the larger selected pool.
+
+    `user_id` is the CLI's `<user_id>` argument; when it parses as an
+    int, it becomes `expected_chat_id` on the lookup so the helper
+    refuses to dereference any row whose `source_chat_id` does not
+    match. Mem0's user-id partition already scopes the row read, but
+    the row's provenance pointer is independent metadata and must be
+    validated separately. When the CLI was invoked against a non-
+    numeric sandbox id, the gate is skipped (the helper falls back
+    to its no-expected-chat-id behaviour); admin contexts that scan
+    cross-chat by design can also pass `expected_chat_id=None`.
     """
+    try:
+        expected_chat_id: int | None = int(user_id)
+    except ValueError:
+        expected_chat_id = None
     quotes: dict[str, str] = {}
     proposal_ids = {p.memory_id for p in proposals}
     metadata_by_id = {row.id: row.metadata for row, _ in selected if row.id in proposal_ids}
@@ -534,7 +550,13 @@ def _collect_provenance_quotes(
         provenance = read_transcript_provenance(metadata)
         if not provenance.present:
             continue
-        lookup = fetch_transcript_context(provenance, before=0, after=0, memory_id=memory_id)
+        lookup = fetch_transcript_context(
+            provenance,
+            before=0,
+            after=0,
+            memory_id=memory_id,
+            expected_chat_id=expected_chat_id,
+        )
         if lookup.reason != "ok" or lookup.context is None:
             continue
         quotes[memory_id] = _truncate(lookup.context.target_user.text, 80)
@@ -822,7 +844,7 @@ async def run_dry_run(
     # and the proposal renders without the `said:` line. The lookup
     # itself happens here in the driver (not in the pure renderer) so
     # the renderer stays free of I/O for unit testing.
-    provenance_user_texts = _collect_provenance_quotes(selected, proposals)
+    provenance_user_texts = _collect_provenance_quotes(selected, proposals, user_id=user_id)
     report = render_report(
         run_id=run_id,
         user_id=user_id,

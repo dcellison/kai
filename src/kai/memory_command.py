@@ -2120,6 +2120,7 @@ _SOURCE_FAILURE_MESSAGES: dict[str, str] = {
     "unreadable": "The history file could not be read.",
     "ts_not_found": "The original message was not found in the history file.",
     "hash_mismatch": "Content drift detected: the original message no longer matches its fingerprint.",
+    "chat_mismatch": "This memory's source pointer does not match this chat; refusing to dereference.",
     "legacy": "This memory predates source tracking.",
 }
 
@@ -2193,7 +2194,14 @@ async def _send_source_view(
         await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
     provenance = read_transcript_provenance(fact.metadata)
-    lookup = fetch_transcript_context(provenance, memory_id=memory_id)
+    # `expected_chat_id` enforces the ownership gate: Mem0's
+    # `get_by_id` partition verifies the row belongs to this chat,
+    # but the `source_chat_id` field on that row is just metadata
+    # the row carries; a malformed/forged value pointing at another
+    # chat would otherwise let this UI dereference an unrelated
+    # chat's JSONL. The helper returns chat_mismatch before any
+    # filesystem read on disagreement.
+    lookup = fetch_transcript_context(provenance, memory_id=memory_id, expected_chat_id=chat_id)
     text, kb = _build_source_view(fact, lookup)
     cache = _get_cache(chat_id)
     return_to = cache.return_to if cache is not None else None
