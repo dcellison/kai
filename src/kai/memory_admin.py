@@ -16,6 +16,12 @@ Scope (spec §16 + Phase 4 of spec 320):
   file. The pass logic lives in `src/kai/memory_reclassify.py`; this
   module owns only argument parsing, the authorization gates, and
   dispatch.
+- `backfill-provenance <user_id> [...]`: stamp transcript provenance
+  on legacy rows via content-overlap matching against the JSONL
+  history. Dry-run by default; `--apply` writes the four required
+  `source_*` keys onto surviving rows with pre-images dumped first;
+  `--rollback` restores rows whose source block has not drifted.
+  The pass logic lives in `src/kai/memory_provenance_backfill.py`.
 
 Commands that modify the store require an explicit `--yes` flag. When
 `--yes` is absent, the command prints the action it WOULD take and
@@ -178,6 +184,85 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Restore rows from a pre-image file (requires --yes).",
     )
     rec.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm a mutating mode. Without it, --apply/--rollback print the planned change count and exit with status 2.",
+    )
+
+    bp = sub.add_parser(
+        "backfill-provenance",
+        help="Stamp transcript provenance on legacy rows via content-overlap matching",
+        description=(
+            "Backfill the four required source_* keys onto rows extracted "
+            "before transcript provenance landed. Dry-run (the default) "
+            "scores each row's text against user turns in a JSONL search "
+            "window; auto-matches require dominant content overlap. Apply "
+            "writes the four keys onto surviving proposals after re-checks. "
+            "Rollback restores rows whose source_* block has not drifted "
+            "since apply. The daemon must be stopped."
+        ),
+    )
+    bp.add_argument(
+        "user_id",
+        help="Telegram chat id (as a string) whose rows to backfill.",
+    )
+    # Scoring flags default to None so the mutating-mode rejection
+    # below can tell "flag explicitly passed" from "default in effect";
+    # the dry-run driver applies the real defaults.
+    bp.add_argument(
+        "--window-seconds",
+        dest="window_seconds",
+        type=int,
+        default=None,
+        help="Time window before created_at to search the JSONL. Default: 86400 (24h).",
+    )
+    bp.add_argument(
+        "--min-overlap",
+        dest="min_overlap",
+        type=float,
+        default=None,
+        help="Minimum overlap score for a candidate to be considered. Default: 0.30.",
+    )
+    bp.add_argument(
+        "--strong-overlap-ratio",
+        dest="strong_overlap_ratio",
+        type=float,
+        default=None,
+        help="Dominance ratio the winner must clear over the runner-up. Default: 2.0.",
+    )
+    bp.add_argument(
+        "--overlap-shingle-n",
+        dest="overlap_shingle_n",
+        type=int,
+        default=None,
+        help="Token-shingle width for the overlap score. Default: 4.",
+    )
+    bp.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help="Sample size for the report's STRONG_MATCH and curation sections. Default: 10.",
+    )
+    bp.add_argument(
+        "--out-dir",
+        dest="out_dir",
+        default=None,
+        help="Artifact directory. Default: <DATA_DIR>/home/<user_id>/docs/backfill-provenance/.",
+    )
+    bp_mode = bp.add_mutually_exclusive_group()
+    bp_mode.add_argument(
+        "--apply",
+        metavar="PROPOSALS",
+        default=None,
+        help="Apply a reviewed proposals file (requires --yes).",
+    )
+    bp_mode.add_argument(
+        "--rollback",
+        metavar="PREIMAGES",
+        default=None,
+        help="Restore rows from a pre-image file (requires --yes).",
+    )
+    bp.add_argument(
         "--yes",
         action="store_true",
         help="Confirm a mutating mode. Without it, --apply/--rollback print the planned change count and exit with status 2.",
@@ -387,6 +472,145 @@ def _cmd_reclassify(args: argparse.Namespace) -> int:
     return asyncio.run(memory_reclassify.run_rollback(config, args.user_id, preimages_path=artifact_path))
 
 
+def _cmd_backfill_provenance(args: argparse.Namespace) -> int:
+    """Execute the `backfill-provenance` subcommand. Returns an exit code.
+
+    Mirrors `_cmd_reclassify`'s gate order: scoring-style flags are
+    rejected in mutating modes BEFORE anything else (a typo on
+    `--min-overlap` must not silently change apply semantics, because
+    apply consumes the proposals file verbatim); memory init runs
+    before the `--yes` gate so the dry-run plan doubles as a smoke
+    test; mutating modes parse and header-validate their artifact
+    BEFORE `--yes` so the plan shows the real change count and a
+    wrong-user file fails loudly up front.
+    """
+    mutating = args.apply is not None or args.rollback is not None
+    if mutating:
+        offenders = [
+            name
+            for name, value in (
+                ("--window-seconds", args.window_seconds),
+                ("--min-overlap", args.min_overlap),
+                ("--strong-overlap-ratio", args.strong_overlap_ratio),
+                ("--overlap-shingle-n", args.overlap_shingle_n),
+                ("--sample", args.sample),
+            )
+            if value is not None
+        ]
+        if offenders:
+            print(
+                f"memory admin: {', '.join(offenders)} only apply to dry-run scoring; "
+                "remove them when using --apply/--rollback.",
+                file=sys.stderr,
+            )
+            return 2
+
+    # Apply defaults from the module's constants only after the
+    # mutating-mode rejection runs, so the rejection's "explicitly
+    # passed" check stays meaningful.
+    from kai import memory_provenance_backfill
+
+    window_seconds = (
+        args.window_seconds if args.window_seconds is not None else memory_provenance_backfill._DEFAULT_WINDOW_SECONDS
+    )
+    min_overlap = args.min_overlap if args.min_overlap is not None else memory_provenance_backfill._DEFAULT_MIN_OVERLAP
+    strong_overlap_ratio = (
+        args.strong_overlap_ratio
+        if args.strong_overlap_ratio is not None
+        else memory_provenance_backfill._DEFAULT_STRONG_OVERLAP_RATIO
+    )
+    shingle_n = (
+        args.overlap_shingle_n if args.overlap_shingle_n is not None else memory_provenance_backfill._DEFAULT_SHINGLE_N
+    )
+    sample = args.sample if args.sample is not None else 10
+
+    if window_seconds < 1:
+        print(f"memory admin: --window-seconds must be a positive int, got {window_seconds}", file=sys.stderr)
+        return 2
+    if not (0.0 <= min_overlap <= 1.0):
+        print(f"memory admin: --min-overlap must be in [0.0, 1.0], got {min_overlap}", file=sys.stderr)
+        return 2
+    if strong_overlap_ratio < 1.0:
+        print(
+            f"memory admin: --strong-overlap-ratio must be >= 1.0, got {strong_overlap_ratio}",
+            file=sys.stderr,
+        )
+        return 2
+    if shingle_n < 1:
+        print(f"memory admin: --overlap-shingle-n must be a positive int, got {shingle_n}", file=sys.stderr)
+        return 2
+    if sample < 0:
+        print(f"memory admin: --sample must be >= 0, got {sample}", file=sys.stderr)
+        return 2
+
+    config = _initialize_memory()
+    if config is None:
+        return 1
+
+    from pathlib import Path
+
+    from kai.config import DATA_DIR
+
+    out_dir = Path(args.out_dir) if args.out_dir else DATA_DIR / "home" / args.user_id / "docs" / "backfill-provenance"
+
+    if not mutating:
+        return asyncio.run(
+            memory_provenance_backfill.run_dry_run(
+                config,
+                args.user_id,
+                window_seconds=window_seconds,
+                min_overlap=min_overlap,
+                strong_overlap_ratio=strong_overlap_ratio,
+                shingle_n=shingle_n,
+                sample=sample,
+                out_dir=out_dir,
+            )
+        )
+
+    # Typed parsers, not the generic artifact reader: a hand-edited
+    # row with a bad field fails HERE, in the plan path, before --yes
+    # and before any store access. The driver re-validates the same
+    # way, so both entries share one contract.
+    artifact_path = Path(args.apply if args.apply is not None else args.rollback)
+    row_type = "proposal" if args.apply is not None else "preimage"
+    try:
+        text = artifact_path.read_text(encoding="utf-8")
+        if args.apply is not None:
+            header, rows = memory_provenance_backfill.parse_proposals(text)
+        else:
+            header, rows = memory_provenance_backfill.parse_preimages(text)
+    except (OSError, ValueError) as e:
+        print(f"memory admin: cannot read {row_type} file: {e}", file=sys.stderr)
+        return 1
+    error = memory_provenance_backfill.validate_header(header, user_id=args.user_id)
+    if error is not None:
+        print(f"memory admin: {error}", file=sys.stderr)
+        return 1
+
+    if not args.yes:
+        verb = "apply" if args.apply is not None else "roll back"
+        print(f"memory admin: would {verb} {len(rows)} row(s) from run {header['run_id']} for user {args.user_id}.")
+        print("memory admin: re-run with --yes to execute.")
+        return 2
+
+    if args.apply is not None:
+        return asyncio.run(
+            memory_provenance_backfill.run_apply(
+                config,
+                args.user_id,
+                proposals_path=artifact_path,
+                out_dir=out_dir,
+            )
+        )
+    return asyncio.run(
+        memory_provenance_backfill.run_rollback(
+            config,
+            args.user_id,
+            preimages_path=artifact_path,
+        )
+    )
+
+
 def cli(argv: list[str]) -> None:
     """Dispatch entry point. Called from `__main__.py` with argv[2:].
 
@@ -400,6 +624,8 @@ def cli(argv: list[str]) -> None:
         sys.exit(_cmd_purge(args))
     if args.command == "reclassify-scope":
         sys.exit(_cmd_reclassify(args))
+    if args.command == "backfill-provenance":
+        sys.exit(_cmd_backfill_provenance(args))
     # argparse's required=True on the subparsers guarantees a known
     # command reaches this point, so the else branch is unreachable
     # under normal invocation. Guarded anyway in case a future
