@@ -44,7 +44,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from weakref import WeakKeyDictionary
 
-from kai.config import MemoryProjectConfig
+from kai import sessions
+from kai.config import Config, MemoryProjectConfig
 
 log = logging.getLogger(__name__)
 
@@ -336,3 +337,28 @@ def merged_registry(yaml_projects: dict[str, MemoryProjectConfig]) -> dict[str, 
         merged[project_id] = cfg
     merged.update(yaml_projects)
     return merged
+
+
+# ── Out-of-process registry bootstrap ───────────────────────────────
+
+
+async def load_project_registry(config: Config) -> dict[str, MemoryProjectConfig]:
+    """Bootstrap the merged project registry in a fresh CLI process.
+
+    Mirrors daemon startup exactly: session-DB init, bulk-load the
+    chat-registered rows into the detection cache, then merge under
+    the operator-pinned YAML layer. Runs in BOTH dry-run and apply
+    (apply re-checks target registration, so an apply without this
+    load would skip every chat-registered target as unregistered,
+    which is the exact failure the re-check exists to prevent).
+    Rollback restores dumped state wholesale and does not need it.
+
+    Lives on `kai.memory_projects` (the registry module) rather than
+    on a CLI module so every out-of-process consumer that needs the
+    merged registry (`memory_reclassify`, the scoped retrieval
+    evaluator, future tooling) imports it from the natural home and
+    no CLI has to depend on another CLI just for the bootstrap.
+    """
+    await sessions.init_db(config.session_db_path)
+    load_db_registry(await sessions.get_memory_project_rows())
+    return merged_registry(config.memory_projects)

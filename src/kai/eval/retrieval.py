@@ -26,9 +26,10 @@ Design rationale (the part that is not obvious from the code):
   is on, production turns are served by scoped retrieval through
   `assemble_turn_context`, which this harness does NOT exercise. The
   harness warns at init when that knob is enabled, and its results
-  then describe a pipeline production no longer runs. A scoped-aware
-  evaluator (workspace-parameterized probes against the scoped live
-  helper) is future work tracked in the scoped-memory epic.
+  then describe a pipeline production no longer runs. The
+  workspace-parameterized scoped sibling lives at
+  `kai.eval.retrieval_scoped`; both harnesses ship in parallel until
+  side-by-side comparisons settle which (if either) to retire.
 
 - Probes whose expected fact has been deleted from the store between
   authoring and evaluation are bucketed as "probe-set drift" rather

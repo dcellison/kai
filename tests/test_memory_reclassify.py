@@ -736,8 +736,8 @@ class TestApply:
                 }
             ]
         )
-        monkeypatch.setattr(memory_reclassify.sessions, "init_db", init_db)
-        monkeypatch.setattr(memory_reclassify.sessions, "get_memory_project_rows", rows)
+        monkeypatch.setattr(mp_mod.sessions, "init_db", init_db)
+        monkeypatch.setattr(mp_mod.sessions, "get_memory_project_rows", rows)
         monkeypatch.setattr(mp_mod, "_db_registry", {})
         monkeypatch.setattr(mp_mod, "_db_creators", {})
         cfg = _config(tmp_path)

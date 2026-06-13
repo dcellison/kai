@@ -54,7 +54,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from kai import memory, sessions
+from kai import memory
 from kai.config import Config, MemoryProjectConfig, ModelRole, resolve_user_model
 from kai.history import fetch_transcript_context
 from kai.memory import MemoryResult, ResolvedMemoryScope, read_transcript_provenance
@@ -65,7 +65,7 @@ from kai.memory_extraction import (
     _resolve_os_user,
     _resolve_user_config,
 )
-from kai.memory_projects import load_db_registry, merged_registry
+from kai.memory_projects import load_project_registry
 from kai.oneshot import OneShotError
 
 log = logging.getLogger(__name__)
@@ -690,22 +690,6 @@ def _emit_scope_change(
 
 
 # ── Drivers ─────────────────────────────────────────────────────────
-
-
-async def load_project_registry(config: Config) -> dict[str, MemoryProjectConfig]:
-    """Bootstrap the merged project registry in a fresh CLI process.
-
-    Mirrors daemon startup exactly: session-DB init, bulk-load the
-    chat-registered rows into the detection cache, then merge under
-    the operator-pinned YAML layer. Runs in BOTH dry-run and apply
-    (apply re-checks target registration, so an apply without this
-    load would skip every chat-registered target as unregistered,
-    which is the exact failure the re-check exists to prevent).
-    Rollback restores dumped state wholesale and does not need it.
-    """
-    await sessions.init_db(config.session_db_path)
-    load_db_registry(await sessions.get_memory_project_rows())
-    return merged_registry(config.memory_projects)
 
 
 def resolve_classification_settings(
