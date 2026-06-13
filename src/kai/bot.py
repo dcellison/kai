@@ -68,7 +68,7 @@ from kai.config import (
     models_for_backend,
     validate_model_for_backend,
 )
-from kai.history import log_message
+from kai.history import LogEntry, log_message
 from kai.locks import get_lock, get_stop_event
 from kai.pool import SubprocessPool
 from kai.telegram_utils import chunk_text
@@ -3082,7 +3082,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     caption = update.message.caption or "What's in this image?"
     caption += f"\n[File saved to: {saved}]"
-    log_message(direction="user", chat_id=chat_id, text=caption, media={"type": "photo"})
+    # Capture the user LogEntry for transcript provenance threading.
+    user_log = log_message(direction="user", chat_id=chat_id, text=caption, media={"type": "photo"})
     content = [
         {"type": "text", "text": caption},
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
@@ -3102,6 +3103,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 _prepend_queue_marker(content) if was_queued else content,
                 pool,
                 model,
+                user_log=user_log,
             )
         finally:
             _clear_responding(chat_id)
@@ -3211,7 +3213,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         img_caption = caption or f"What's in this image ({file_name})?"
         img_caption += f"\n[File saved to: {saved}]"
 
-        log_message(
+        user_log = log_message(
             direction="user",
             chat_id=chat_id,
             text=caption or file_name,
@@ -3236,7 +3238,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         saved = _save_upload(raw, file_name, user_id=chat_id)
         header = f"File: {file_name}\n```\n{text_content}\n```\n[File saved to: {saved}]"
 
-        log_message(
+        user_log = log_message(
             direction="user",
             chat_id=chat_id,
             text=caption or f"[file: {file_name}]",
@@ -3253,7 +3255,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         data = await file.download_as_bytearray()
         saved = _save_upload(bytes(data), file_name, user_id=chat_id)
 
-        log_message(
+        user_log = log_message(
             direction="user",
             chat_id=chat_id,
             text=caption or f"[file: {file_name}]",
@@ -3275,6 +3277,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 _prepend_queue_marker(content) if was_queued else content,
                 pool,
                 model,
+                user_log=user_log,
             )
         finally:
             _clear_responding(chat_id)
@@ -3327,25 +3330,36 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     file = await context.bot.get_file(voice.file_id)
     audio_data = bytes(await file.download_as_bytearray())
 
-    log_message(
-        direction="user",
-        chat_id=chat_id,
-        text=f"[voice message, {voice.duration}s]",
-        media={"type": "voice", "duration": voice.duration},
-    )
+    voice_media = {"type": "voice", "duration": voice.duration}
+    voice_placeholder = f"[voice message, {voice.duration}s]"
 
+    # Transcription failure paths preserve the historical placeholder
+    # entry so an operator grepping history sees that a voice message
+    # came in even when whisper failed. Extraction never runs on those
+    # paths, so the placeholder's lack of recoverable content is not a
+    # provenance gap; the only paths that ever stamp provenance are
+    # below, after a real transcript exists.
     try:
         transcript = await transcribe_voice(audio_data, config.whisper_model_path)
     except TranscriptionError as e:
+        log_message(direction="user", chat_id=chat_id, text=voice_placeholder, media=voice_media)
         await update.message.reply_text(f"Transcription failed: {e}")
         return
 
     if not transcript:
+        log_message(direction="user", chat_id=chat_id, text=voice_placeholder, media=voice_media)
         await update.message.reply_text("Couldn't make out any speech in that voice message.")
         return
 
     # Echo the transcription so the user sees what Kai heard
     await _reply_safe(update.message, f"_Heard:_ {transcript}")
+
+    # Log the transcript itself as the user's message so the JSONL line
+    # carries what the extractor actually saw. This is the only history-
+    # output behaviour change in the provenance work: previous behaviour
+    # wrote only the duration placeholder, which silently lost the user's
+    # actual words and made source view useless for voice-derived rows.
+    user_log = log_message(direction="user", chat_id=chat_id, text=transcript, media=voice_media)
 
     prompt = f"[Voice message transcription]: {transcript}"
     model = pool.get_model(chat_id)
@@ -3364,6 +3378,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 _prepend_queue_marker(prompt) if was_queued else prompt,
                 pool,
                 model,
+                user_log=user_log,
             )
         finally:
             _clear_responding(chat_id)
@@ -3513,7 +3528,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     chat_id = _chat_id(update)
     prompt = update.message.text
-    log_message(direction="user", chat_id=chat_id, text=prompt)
+    # Capture the user LogEntry so _handle_response can thread it to
+    # the provenance writer. None on JSONL write failure; the extraction
+    # path then skips provenance stamping for this exchange.
+    user_log = log_message(direction="user", chat_id=chat_id, text=prompt)
     pool = _get_pool(context)
     model = pool.get_model(chat_id)
 
@@ -3531,6 +3549,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 _prepend_queue_marker(prompt) if was_queued else prompt,
                 pool,
                 model,
+                user_log=user_log,
             )
         finally:
             _clear_responding(chat_id)
@@ -3548,6 +3567,7 @@ async def _handle_response(
     prompt: str | list,
     pool: SubprocessPool,
     model: str,
+    user_log: LogEntry | None = None,
 ) -> None:
     """
     Stream Claude's response and deliver it to the user.
@@ -3700,7 +3720,11 @@ async def _handle_response(
         await sessions.save_session(chat_id, final_response.session_id, model)
 
     final_text = final_response.text
-    log_message(direction="assistant", chat_id=chat_id, text=final_text)
+    # Capture the assistant LogEntry so the provenance writer can stamp
+    # the exact JSONL ts/date/sha256 the line landed with. None means
+    # the append failed (logged by log_message itself); the extraction
+    # path then skips provenance stamping for this exchange.
+    assistant_log = log_message(direction="assistant", chat_id=chat_id, text=final_text)
 
     # Fire-and-forget: embed this exchange in semantic memory.
     # Runs in a background task so it does not delay response delivery.
@@ -3780,6 +3804,8 @@ async def _handle_response(
                         config=config,
                         prior_pairs=prior_pairs,
                         workspace=ingest_workspace,
+                        user_log=user_log,
+                        assistant_log=assistant_log,
                     )
             except Exception:
                 log.warning("Memory ingestion failed", exc_info=True)

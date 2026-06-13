@@ -3556,3 +3556,167 @@ class TestScopeViewCutoverKnob:
         monkeypatch.setattr(memory_command.memory, "is_scoped_recall_enabled", lambda: True)
         await memory_command._send_fact_view(update_factory(callback_data="mem:fview"), ctx, 100, "scoped1")
         assert "no (project_scope_not_allowed" in sent["text"]
+
+
+# ── Source view (transcript provenance) ────────────────────────────
+
+
+def _provenanced_fact(
+    fact_id: str = "fact-1",
+    *,
+    text: str = "Sample fact",
+    source: str = "extracted",
+    chat_id: int = 100,
+    date: str = "2026-06-13",
+    user_ts: str = "2026-06-13T09:00:00+00:00",
+    user_text_sha256: str = "a" * 64,
+    assistant_ts: str | None = "2026-06-13T09:00:30+00:00",
+    date_end: str | None = None,
+) -> MemoryResult:
+    md: dict[str, Any] = {
+        "source": source,
+        "tags": [],
+        "confidence": 0.9,
+        "speaker": "user",
+        "source_chat_id": chat_id,
+        "source_date": date,
+        "source_user_ts": user_ts,
+        "source_user_text_sha256": user_text_sha256,
+    }
+    if assistant_ts is not None:
+        md["source_assistant_ts"] = assistant_ts
+    if date_end is not None:
+        md["source_date_end"] = date_end
+    return MemoryResult(
+        id=fact_id, text=text, score=0.0, memory_type="fact", metadata=md, created_at="2026-06-13T09:00:00"
+    )
+
+
+class TestSourceLabel:
+    def test_legacy_label(self):
+        f = _fact("a", "x", ["t"])
+        from kai.memory import read_transcript_provenance
+
+        provenance = read_transcript_provenance(f.metadata)
+        assert memory_command._build_source_label(f, provenance) == "not recorded (legacy)"
+
+    def test_fact_label_renders_user_ts(self):
+        from kai.memory import read_transcript_provenance
+
+        f = _provenanced_fact()
+        provenance = read_transcript_provenance(f.metadata)
+        label = memory_command._build_source_label(f, provenance)
+        assert label == "2026-06-13 09:00:00 UTC"
+
+    def test_episode_same_day_label_collapses_date(self):
+        from kai.memory import read_transcript_provenance
+
+        f = _provenanced_fact(source="episode")
+        provenance = read_transcript_provenance(f.metadata)
+        label = memory_command._build_source_label(f, provenance)
+        # Same-day: one date, two times.
+        assert label == "2026-06-13 09:00:00 to 09:00:30 UTC"
+
+    def test_episode_midnight_cross_keeps_both_dates(self):
+        from kai.memory import read_transcript_provenance
+
+        f = _provenanced_fact(
+            source="episode",
+            assistant_ts="2026-06-14T00:01:00+00:00",
+            date_end="2026-06-14",
+        )
+        provenance = read_transcript_provenance(f.metadata)
+        label = memory_command._build_source_label(f, provenance)
+        assert label == "2026-06-13 09:00:00 UTC to 2026-06-14 00:01:00 UTC"
+
+
+class TestFactViewSourceBlock:
+    def test_legacy_row_renders_fallback_and_no_source_button(self):
+        from kai.memory import read_transcript_provenance
+
+        f = _fact("a", "x", ["tag"])
+        provenance = read_transcript_provenance(f.metadata)
+        text, kb = memory_command._build_fact_view(f, return_to=None, provenance=provenance)
+        assert "not recorded (legacy)" in text
+        row = kb.inline_keyboard[0]
+        labels = [btn.text for btn in row]
+        assert "source" not in labels
+        assert labels == ["back", "scope", "forget"]
+
+    def test_provenanced_row_renders_label_and_source_button(self):
+        from kai.memory import read_transcript_provenance
+
+        f = _provenanced_fact()
+        provenance = read_transcript_provenance(f.metadata)
+        text, kb = memory_command._build_fact_view(f, return_to=None, provenance=provenance)
+        assert "Source:" in text
+        assert "2026-06-13 09:00:00 UTC" in text
+        labels = [btn.text for btn in kb.inline_keyboard[0]]
+        assert labels == ["back", "source", "scope", "forget"]
+
+
+class TestSourceViewBuilder:
+    def _ctx(self, *, before=None, after=None):
+        from kai.history import TranscriptContext, TranscriptLookup, TranscriptTurn
+
+        return TranscriptLookup(
+            reason="ok",
+            context=TranscriptContext(
+                chat_id=100,
+                target_user=TranscriptTurn(ts="2026-06-13T09:00:00+00:00", direction="user", text="user msg"),
+                target_assistant=TranscriptTurn(
+                    ts="2026-06-13T09:00:30+00:00", direction="assistant", text="assistant reply"
+                ),
+                before=before or [],
+                after=after or [],
+                truncated=False,
+            ),
+        )
+
+    def test_ok_renders_user_and_assistant_turns(self):
+        f = _provenanced_fact()
+        text, kb = memory_command._build_source_view(f, self._ctx())
+        assert "user msg" in text
+        assert "assistant reply" in text
+        # Back button goes via fview, reusing the fact-view re-render
+        # flow that reads memory_ids from cache.
+        assert kb.inline_keyboard[0][0].callback_data == "mem:fview"
+
+    def test_failure_reasons_have_distinct_bodies(self):
+        from kai.history import TranscriptLookup
+
+        f = _provenanced_fact()
+        bodies: dict[str, str] = {}
+        for reason in ("file_missing", "unreadable", "ts_not_found", "hash_mismatch"):
+            text, _ = memory_command._build_source_view(f, TranscriptLookup(reason=reason, context=None))
+            bodies[reason] = text
+        # All four bodies are distinct so the operator can tell drift
+        # from missing file from missing ts.
+        assert len(set(bodies.values())) == 4
+        assert "drift" in bodies["hash_mismatch"]
+        assert "no longer available" in bodies["file_missing"]
+
+    def test_oversized_body_truncated_under_limit(self):
+        """Pathological exchange with very long turns: the body
+        ceiling clamps the output and the marker is visible."""
+        from kai.history import TranscriptContext, TranscriptLookup, TranscriptTurn
+
+        long_text = "x" * 2000
+        turns = [
+            TranscriptTurn(ts=f"2026-06-13T08:00:{i:02d}+00:00", direction="user", text=long_text) for i in range(20)
+        ]
+        lookup = TranscriptLookup(
+            reason="ok",
+            context=TranscriptContext(
+                chat_id=100,
+                target_user=TranscriptTurn(ts="2026-06-13T09:00:00+00:00", direction="user", text=long_text),
+                target_assistant=TranscriptTurn(ts="2026-06-13T09:00:30+00:00", direction="assistant", text=long_text),
+                before=turns,
+                after=turns,
+                truncated=True,
+            ),
+        )
+        f = _provenanced_fact()
+        text, _ = memory_command._build_source_view(f, lookup)
+        assert len(text) <= 4096
+        assert "(output truncated)" in text

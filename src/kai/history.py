@@ -20,10 +20,13 @@ when asked about past conversations. get_recent_history() provides a formatted
 summary of the last few messages for ambient recall at session start.
 """
 
+import hashlib
 import json
 import logging
 import re
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from kai.config import DATA_DIR
 
@@ -63,19 +66,63 @@ _SYNTHETIC_ASSISTANT_MARKERS: re.Pattern[str] = re.compile(
 )
 
 
+@dataclass(frozen=True)
+class LogEntry:
+    """
+    Receipt for a successfully appended JSONL line.
+
+    Returned by `log_message` so the transcript provenance writer
+    (`memory_extraction.extract_and_store`) can stamp the exact
+    timestamp, date filename, and content hash that landed on disk,
+    without re-deriving any of them and risking near-midnight skew
+    or post-strip variants of the persisted text.
+
+    Attributes:
+        ts: The exact `ts` value persisted to the JSONL record.
+        date: The UTC date used as the `YYYY-MM-DD.jsonl` filename.
+            Carried separately from `ts` so callers do not slice the
+            ISO string; both are derived from the same
+            `datetime.now(UTC)` call so a wraparound between them is
+            structurally impossible.
+        chat_id: Telegram chat id, matching the JSONL `chat_id` field.
+        direction: "user" or "assistant", matching the JSONL `dir`.
+        text: The exact `text` field persisted to the JSONL line.
+        sha256: SHA-256 hex digest of `text.encode("utf-8")`. Cached
+            here so the provenance writer does not have to re-hash;
+            the transcript helper compares against this fingerprint
+            at lookup time.
+    """
+
+    ts: str
+    date: str
+    chat_id: int
+    direction: str
+    text: str
+    sha256: str
+
+
 def log_message(
     *,
     direction: str,
     chat_id: int,
     text: str,
     media: dict | None = None,
-) -> None:
+) -> LogEntry | None:
     """
     Append a single message record to today's JSONL chat log.
 
     Called from bot.py for every inbound user message and outbound assistant
     response. Each message is written immediately (not batched) so the log
     stays current even if the process crashes mid-conversation.
+
+    Returns:
+        A `LogEntry` describing the persisted line on success, or `None`
+        when the JSONL append failed (an `OSError` from the filesystem
+        layer is logged via the existing warning path; the return value
+        is the only signal a caller has that the line did NOT make it
+        to disk). Callers that stamp transcript provenance must skip
+        the stamp when the return is `None`, so a write failure never
+        produces a row pointing at a JSONL line that does not exist.
 
     Args:
         direction: "user" for inbound messages, "assistant" for Kai's responses.
@@ -88,20 +135,42 @@ def log_message(
     # and one user's history can be managed independently.
     user_dir = _LOG_DIR / str(chat_id)
     user_dir.mkdir(parents=True, exist_ok=True)
+    # Single `now` call so the ts written into the record and the date
+    # baked into the filename can never drift across a midnight boundary
+    # within one log_message invocation. The returned LogEntry carries
+    # both, derived from the same instant, so the provenance writer
+    # stamps the file path the line actually landed in.
     now = datetime.now(UTC)
+    ts = now.isoformat()
+    date = now.strftime("%Y-%m-%d")
     record = {
-        "ts": now.isoformat(),
+        "ts": ts,
         "dir": direction,
         "chat_id": chat_id,
         "text": text,
         "media": media,
     }
-    filepath = user_dir / f"{now.strftime('%Y-%m-%d')}.jsonl"
+    filepath = user_dir / f"{date}.jsonl"
     try:
         with open(filepath, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
         log.exception("Failed to write chat log")
+        # Returning None (not a populated LogEntry) is the contract
+        # that lets the transcript-provenance writer skip stamping for
+        # this exchange. A populated entry here would produce a row
+        # pointing at a JSONL line that does not exist, which would
+        # later surface as a `memory.provenance.drift` file-missing or
+        # ts-not-found event.
+        return None
+    return LogEntry(
+        ts=ts,
+        date=date,
+        chat_id=chat_id,
+        direction=direction,
+        text=text,
+        sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    )
 
 
 def get_recent_history(chat_id: int | None = None) -> str:
@@ -387,3 +456,373 @@ def _pair_records_chronologically(records: list[dict]) -> list[tuple[str, str]]:
             pairs.append((pending_user, text))
             pending_user = None
     return pairs
+
+
+# ── Transcript provenance reader ────────────────────────────────────
+#
+# Memory rows written from real bot paths carry source_* metadata
+# pointing back at the JSONL line(s) that produced them. The reader
+# below resolves a TranscriptProvenance value (built from a row's
+# metadata by `kai.memory.read_transcript_provenance`) into the
+# originating turns plus a small surrounding window, with fail-closed
+# semantics: a missing file, missing timestamp, or content-hash drift
+# returns the failure reason rather than guessing at a similar turn.
+
+
+LookupReason = Literal[
+    "ok",
+    "legacy",
+    "file_missing",
+    "unreadable",
+    "ts_not_found",
+    "hash_mismatch",
+]
+
+_TRANSCRIPT_WINDOW_TURN_CAP = 50
+
+_PROVENANCE_DRIFT_EVENT = "memory.provenance.drift"
+
+
+@dataclass(frozen=True)
+class TranscriptTurn:
+    """One JSONL record reduced to the fields the source-view consumers need."""
+
+    ts: str
+    direction: str
+    text: str
+
+
+@dataclass(frozen=True)
+class TranscriptContext:
+    """
+    The originating turns plus a chronological surrounding window.
+
+    `target_assistant` is None when the row's stored provenance has
+    no `source_assistant_ts` (a corner case the spec admits but does
+    not produce from real bot paths today); an assistant ts that IS
+    set but no longer resolves in the JSONL is reported as a drift
+    via TranscriptLookup.reason, not by setting this to None.
+
+    `truncated` flags the episode-window cap and is always False on
+    fact lookups (whose context is fixed by the `before` / `after`
+    parameters).
+    """
+
+    chat_id: int
+    target_user: TranscriptTurn
+    target_assistant: TranscriptTurn | None
+    before: list[TranscriptTurn]
+    after: list[TranscriptTurn]
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class TranscriptLookup:
+    """
+    Typed result for `fetch_transcript_context`.
+
+    `reason` always carries one of the LookupReason values; `context`
+    is populated iff `reason == "ok"`. The two are bundled so callers
+    (the /memory source view, the reclassification dry-run report)
+    can branch on the reason without scraping logs.
+    """
+
+    reason: LookupReason
+    context: TranscriptContext | None
+
+
+def _read_jsonl_file(path) -> list[dict] | None:
+    """
+    Best-effort JSONL reader.
+
+    Returns the parsed records on success, None on any I/O failure.
+    Malformed lines are skipped individually (mirroring
+    `get_recent_history`'s own posture); only a file-level error
+    collapses the return to None so the caller can distinguish
+    "file present but garbled rows" from "file unreadable."
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    out: list[dict] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            log.debug("Skipping malformed JSON line in %s: %s", path.name, line[:100])
+    return out
+
+
+def _shift_date(date: str, days: int) -> str:
+    """
+    Add `days` to a `YYYY-MM-DD` string, returning the same shape.
+
+    Used to walk one file forward or back when the target window
+    crosses midnight. Goes through `datetime` rather than string
+    math so leap years and month rollovers behave correctly without
+    a calendar table.
+    """
+    parsed = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=UTC)
+    return (parsed + timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def _emit_drift_log(
+    *,
+    memory_id: str | None,
+    chat_id: int | None,
+    reason: LookupReason,
+    side: str | None = None,
+) -> None:
+    """
+    Structured log line for a non-ok, non-legacy lookup.
+
+    Every drift event names the row (when known), the chat, the
+    stable reason key, and the `side` discriminator that distinguishes
+    user-line and assistant-line misses for `ts_not_found`. Keeping
+    one event name across every failure mode means downstream log
+    queries do not have to enumerate sub-events as the helper grows.
+    """
+    payload: dict = {
+        "memory_id": memory_id,
+        "chat_id": chat_id,
+        "reason": reason,
+        "side": side,
+    }
+    log.info("%s %s", _PROVENANCE_DRIFT_EVENT, json.dumps(payload, separators=(",", ":")))
+
+
+def fetch_transcript_context(
+    provenance,
+    *,
+    before: int = 3,
+    after: int = 1,
+    memory_id: str | None = None,
+) -> TranscriptLookup:
+    """
+    Resolve a row's transcript provenance into surrounding turns.
+
+    Args:
+        provenance: A `kai.memory.TranscriptProvenance` value. Typed
+            as Any here to avoid an import cycle (memory.py imports
+            history.py for log writes, and the resolver lives in
+            memory.py); duck-typed access to `present`, `chat_id`,
+            `date`, `user_ts`, `user_text_sha256`, `assistant_ts`,
+            and `date_end` is the contract.
+        before: Maximum non-synthetic turns to include in the
+            preceding context window. Walks at most one file backward
+            when today's file does not contain `before` predecessors.
+        after: Maximum non-synthetic turns to include after the
+            assistant turn. Walks at most one file forward.
+        memory_id: Optional row id, carried into the drift log so log
+            queries can correlate failures back to the affected row.
+
+    Returns:
+        TranscriptLookup with `reason="ok"` and a populated
+        `TranscriptContext` on success. Every other path returns a
+        non-ok reason with `context=None`; non-ok, non-legacy reasons
+        emit a single structured log line.
+
+    Failure mode contract:
+        - legacy:        `provenance.present is False`. No log emitted.
+        - file_missing:  the per-day JSONL file is absent from disk.
+        - unreadable:    the file exists but cannot be read.
+        - ts_not_found:  the named timestamp is absent from the file
+                         (the `side` field of the log distinguishes
+                         user-side miss from assistant-side miss).
+        - hash_mismatch: the user line was found but its text no
+                         longer matches the stored fingerprint.
+
+    The helper never returns a "maybe matched" turn. A wrong-turn
+    render would be worse than no render at all.
+    """
+    if not provenance.present:
+        return TranscriptLookup(reason="legacy", context=None)
+
+    chat_id: int = provenance.chat_id
+    date: str = provenance.date
+    user_ts: str = provenance.user_ts
+    user_text_sha256: str = provenance.user_text_sha256
+    assistant_ts: str | None = provenance.assistant_ts
+
+    primary_path = _LOG_DIR / str(chat_id) / f"{date}.jsonl"
+    if not primary_path.exists():
+        _emit_drift_log(memory_id=memory_id, chat_id=chat_id, reason="file_missing")
+        return TranscriptLookup(reason="file_missing", context=None)
+    primary_records = _read_jsonl_file(primary_path)
+    if primary_records is None:
+        _emit_drift_log(memory_id=memory_id, chat_id=chat_id, reason="unreadable")
+        return TranscriptLookup(reason="unreadable", context=None)
+
+    # Locate the user line by exact ts + direction. The lookup is by
+    # ts (not by index) so any future history-management tool that
+    # reorders or deduplicates lines without changing them does not
+    # break provenance.
+    user_index = _find_record_index(primary_records, ts=user_ts, direction="user")
+    if user_index is None:
+        _emit_drift_log(memory_id=memory_id, chat_id=chat_id, reason="ts_not_found", side="user")
+        return TranscriptLookup(reason="ts_not_found", context=None)
+    user_record = primary_records[user_index]
+    user_text = user_record.get("text", "")
+    if hashlib.sha256(user_text.encode("utf-8")).hexdigest() != user_text_sha256:
+        _emit_drift_log(memory_id=memory_id, chat_id=chat_id, reason="hash_mismatch")
+        return TranscriptLookup(reason="hash_mismatch", context=None)
+    target_user = TranscriptTurn(ts=user_record["ts"], direction="user", text=user_text)
+
+    target_assistant: TranscriptTurn | None = None
+    if assistant_ts is not None:
+        # Same-day search first; the assistant turn usually lives in
+        # the same file. When it does not, walk one file forward
+        # (episode midnight cross) before giving up.
+        assistant_index = _find_record_index(primary_records, ts=assistant_ts, direction="assistant")
+        if assistant_index is None:
+            forward_path = _LOG_DIR / str(chat_id) / f"{_shift_date(date, 1)}.jsonl"
+            forward_records = _read_jsonl_file(forward_path) if forward_path.exists() else None
+            if forward_records is not None:
+                forward_assistant_index = _find_record_index(forward_records, ts=assistant_ts, direction="assistant")
+                if forward_assistant_index is not None:
+                    rec = forward_records[forward_assistant_index]
+                    target_assistant = TranscriptTurn(ts=rec["ts"], direction="assistant", text=rec.get("text", ""))
+            if target_assistant is None:
+                _emit_drift_log(memory_id=memory_id, chat_id=chat_id, reason="ts_not_found", side="assistant")
+                return TranscriptLookup(reason="ts_not_found", context=None)
+        else:
+            rec = primary_records[assistant_index]
+            target_assistant = TranscriptTurn(ts=rec["ts"], direction="assistant", text=rec.get("text", ""))
+
+    before_turns = _collect_before(
+        chat_id=chat_id, date=date, primary_records=primary_records, user_index=user_index, before=before
+    )
+    after_turns = _collect_after(
+        chat_id=chat_id,
+        date=date,
+        primary_records=primary_records,
+        anchor_index=user_index
+        if target_assistant is None
+        else _find_record_index(primary_records, ts=target_assistant.ts, direction="assistant"),
+        target_assistant=target_assistant,
+        after=after,
+    )
+
+    return TranscriptLookup(
+        reason="ok",
+        context=TranscriptContext(
+            chat_id=chat_id,
+            target_user=target_user,
+            target_assistant=target_assistant,
+            before=before_turns,
+            after=after_turns,
+            truncated=False,
+        ),
+    )
+
+
+def _find_record_index(records: list[dict], *, ts: str, direction: str) -> int | None:
+    """
+    Return the index of the first record matching exact ts + direction.
+
+    Linear scan; per-day JSONL files are small enough that an index
+    would add complexity without measurable benefit. Returns None
+    when no record matches.
+    """
+    for i, rec in enumerate(records):
+        if rec.get("ts") == ts and rec.get("dir") == direction:
+            return i
+    return None
+
+
+def _turn_is_synthetic(text: str) -> bool:
+    """Skip synthetic assistant placeholders in context windows."""
+    return bool(_SYNTHETIC_ASSISTANT_MARKERS.fullmatch(text or ""))
+
+
+def _to_turn(rec: dict) -> TranscriptTurn:
+    return TranscriptTurn(ts=rec.get("ts", ""), direction=rec.get("dir", ""), text=rec.get("text", ""))
+
+
+def _collect_before(
+    *, chat_id: int, date: str, primary_records: list[dict], user_index: int, before: int
+) -> list[TranscriptTurn]:
+    """
+    Walk backwards from the target user line, including up to `before`
+    non-synthetic turns. When today's file does not provide enough,
+    walk one file back. Returns chronological order (oldest first).
+    """
+    if before <= 0:
+        return []
+    collected: list[TranscriptTurn] = []
+    for rec in reversed(primary_records[:user_index]):
+        if _turn_is_synthetic(rec.get("text", "")):
+            continue
+        collected.append(_to_turn(rec))
+        if len(collected) >= before:
+            break
+    if len(collected) < before:
+        prev_path = _LOG_DIR / str(chat_id) / f"{_shift_date(date, -1)}.jsonl"
+        if prev_path.exists():
+            prev_records = _read_jsonl_file(prev_path)
+            if prev_records is not None:
+                for rec in reversed(prev_records):
+                    if _turn_is_synthetic(rec.get("text", "")):
+                        continue
+                    collected.append(_to_turn(rec))
+                    if len(collected) >= before:
+                        break
+    collected.reverse()
+    return collected
+
+
+def _collect_after(
+    *,
+    chat_id: int,
+    date: str,
+    primary_records: list[dict],
+    anchor_index: int | None,
+    target_assistant: TranscriptTurn | None,
+    after: int,
+) -> list[TranscriptTurn]:
+    """
+    Walk forward from the anchor index, including up to `after`
+    non-synthetic turns. The anchor is the assistant turn when
+    present, otherwise the user turn (so the "after" window starts
+    right after whichever target is the rightmost one in the primary
+    file). When today's file does not provide enough, walk one file
+    forward.
+    """
+    if after <= 0 or anchor_index is None:
+        return []
+    collected: list[TranscriptTurn] = []
+    for rec in primary_records[anchor_index + 1 :]:
+        if _turn_is_synthetic(rec.get("text", "")):
+            continue
+        collected.append(_to_turn(rec))
+        if len(collected) >= after:
+            break
+    if len(collected) < after:
+        # The episode midnight-cross path may have already populated
+        # the assistant from the next file. We still want to include
+        # any "after" turns following that assistant in the next file
+        # itself, which is the same path the same-day branch would have
+        # taken if the assistant lived locally.
+        next_path = _LOG_DIR / str(chat_id) / f"{_shift_date(date, 1)}.jsonl"
+        if next_path.exists():
+            next_records = _read_jsonl_file(next_path)
+            if next_records is not None:
+                # When the target_assistant lives in next_records, start
+                # after it; otherwise start at the beginning of the file.
+                start = 0
+                if target_assistant is not None:
+                    forward_assistant_index = _find_record_index(
+                        next_records, ts=target_assistant.ts, direction="assistant"
+                    )
+                    if forward_assistant_index is not None:
+                        start = forward_assistant_index + 1
+                for rec in next_records[start:]:
+                    if _turn_is_synthetic(rec.get("text", "")):
+                        continue
+                    collected.append(_to_turn(rec))
+                    if len(collected) >= after:
+                        break
+    return collected

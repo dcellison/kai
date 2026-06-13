@@ -6310,3 +6310,67 @@ class TestGetStatsScopeDistribution:
     def test_empty_corpus_yields_empty_distribution(self):
         stats = self._stats_with([])
         assert stats.by_scope == {}
+
+
+class TestReadTranscriptProvenance:
+    """Resolver mirrors resolve_memory_scope's legacy-safe shape."""
+
+    def _md(self, **overrides):
+        base = {
+            "source_chat_id": 100,
+            "source_date": "2026-06-13",
+            "source_user_ts": "2026-06-13T09:00:00+00:00",
+            "source_user_text_sha256": "a" * 64,
+        }
+        base.update(overrides)
+        return base
+
+    def test_all_required_fields_present(self):
+        from kai.memory import read_transcript_provenance
+
+        p = read_transcript_provenance(self._md(source_assistant_ts="2026-06-13T09:00:30+00:00"))
+        assert p.present is True
+        assert p.chat_id == 100
+        assert p.assistant_ts == "2026-06-13T09:00:30+00:00"
+
+    def test_missing_required_field_not_present(self):
+        from kai.memory import read_transcript_provenance
+
+        md = self._md()
+        del md["source_user_ts"]
+        p = read_transcript_provenance(md)
+        assert p.present is False
+
+    def test_legacy_metadata_not_present(self):
+        from kai.memory import read_transcript_provenance
+
+        p = read_transcript_provenance({"source": "extracted"})
+        assert p.present is False
+        assert p.chat_id is None
+
+    def test_empty_string_required_field_not_present(self):
+        """An empty string fingerprint is malformed and must not flip
+        present True; a half-locator is worse than no locator."""
+        from kai.memory import read_transcript_provenance
+
+        p = read_transcript_provenance(self._md(source_user_text_sha256=""))
+        assert p.present is False
+
+    def test_assistant_ts_absence_does_not_flip_present(self):
+        """The four required fields are the only present-gate; absent
+        assistant_ts is the legitimate single-turn provenance case."""
+        from kai.memory import read_transcript_provenance
+
+        p = read_transcript_provenance(self._md())
+        assert p.present is True
+        assert p.assistant_ts is None
+
+    def test_date_end_populated_only_on_midnight_cross(self):
+        from kai.memory import read_transcript_provenance
+
+        same_day = read_transcript_provenance(self._md(source_assistant_ts="2026-06-13T09:30:00+00:00"))
+        cross = read_transcript_provenance(
+            self._md(source_assistant_ts="2026-06-14T00:30:00+00:00", source_date_end="2026-06-14")
+        )
+        assert same_day.date_end is None
+        assert cross.date_end == "2026-06-14"

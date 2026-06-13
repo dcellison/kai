@@ -544,3 +544,300 @@ class TestGetRecentPairs:
         pairs = get_recent_pairs(chat_id=1, n=0)
 
         assert pairs == []
+
+
+# ── Transcript provenance: LogEntry contract ────────────────────────
+
+
+class _Provenance:
+    """Lightweight stand-in for kai.memory.TranscriptProvenance.
+
+    Lets the helper tests construct lookup inputs without dragging
+    Mem0 into the test surface; the real resolver is exercised in
+    test_memory.py. Field names mirror the dataclass exactly.
+    """
+
+    def __init__(
+        self,
+        *,
+        present=True,
+        chat_id=1,
+        date=None,
+        user_ts=None,
+        user_text_sha256=None,
+        assistant_ts=None,
+        date_end=None,
+    ):
+        self.present = present
+        self.chat_id = chat_id
+        self.date = date
+        self.user_ts = user_ts
+        self.user_text_sha256 = user_text_sha256
+        self.assistant_ts = assistant_ts
+        self.date_end = date_end
+
+
+class TestLogEntryContract:
+    def test_returns_log_entry_with_matching_fields(self, _log_dir):
+        entry = log_message(direction="user", chat_id=42, text="hello")
+        assert entry is not None
+        assert entry.chat_id == 42
+        assert entry.direction == "user"
+        assert entry.text == "hello"
+        # ts and date derive from the same now() call; the date must
+        # match the filename the line landed in.
+        assert (_log_dir / "42" / f"{entry.date}.jsonl").exists()
+        # sha256 fingerprints the exact text byte sequence.
+        import hashlib
+
+        assert entry.sha256 == hashlib.sha256(b"hello").hexdigest()
+
+    def test_failure_paths_still_return_entries(self, _log_dir):
+        # Synthetic placeholder writes (the assistant failure markers)
+        # also receive populated LogEntry returns; extraction does not
+        # run on those paths, so the returns are simply unused.
+        entry = log_message(direction="assistant", chat_id=1, text="[stopped by user]")
+        assert entry is not None
+        assert entry.text == "[stopped by user]"
+
+    def test_oserror_returns_none(self, monkeypatch, _log_dir):
+        """An OSError during the JSONL append yields None, not a
+        populated entry that would point at a never-written line."""
+        import builtins
+
+        original = builtins.open
+
+        def boom(path, mode="r", *args, **kwargs):
+            if "a" in mode:
+                raise OSError("disk full")
+            return original(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", boom)
+        entry = log_message(direction="user", chat_id=1, text="lost")
+        assert entry is None
+
+
+class TestFetchTranscriptContext:
+    """Black-box tests over fetch_transcript_context using the local
+    `_Provenance` stub so the helper's behaviour is exercised without
+    dragging the kai.memory resolver into the test inputs."""
+
+    def _write_jsonl(self, _log_dir, chat_id, date, records):
+        path = _log_dir / str(chat_id) / f"{date}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+        return path
+
+    def test_legacy_returns_legacy_reason(self):
+        result = history.fetch_transcript_context(_Provenance(present=False))
+        assert result.reason == "legacy"
+        assert result.context is None
+
+    def test_happy_path_returns_target_and_window(self, _log_dir):
+        import hashlib
+
+        self._write_jsonl(
+            _log_dir,
+            1,
+            "2026-06-13",
+            [
+                {"ts": "2026-06-13T08:00:00+00:00", "dir": "user", "chat_id": 1, "text": "prev user"},
+                {"ts": "2026-06-13T08:00:10+00:00", "dir": "assistant", "chat_id": 1, "text": "prev assistant"},
+                {"ts": "2026-06-13T09:00:00+00:00", "dir": "user", "chat_id": 1, "text": "target user"},
+                {"ts": "2026-06-13T09:00:30+00:00", "dir": "assistant", "chat_id": 1, "text": "target assistant"},
+                {"ts": "2026-06-13T09:30:00+00:00", "dir": "user", "chat_id": 1, "text": "next user"},
+            ],
+        )
+        provenance = _Provenance(
+            chat_id=1,
+            date="2026-06-13",
+            user_ts="2026-06-13T09:00:00+00:00",
+            user_text_sha256=hashlib.sha256(b"target user").hexdigest(),
+            assistant_ts="2026-06-13T09:00:30+00:00",
+        )
+        result = history.fetch_transcript_context(provenance, before=2, after=1)
+        assert result.reason == "ok"
+        assert result.context.target_user.text == "target user"
+        assert result.context.target_assistant.text == "target assistant"
+        assert [t.text for t in result.context.before] == ["prev user", "prev assistant"]
+        assert [t.text for t in result.context.after] == ["next user"]
+
+    def test_file_missing_logs_drift(self, _log_dir, caplog):
+        provenance = _Provenance(
+            chat_id=99,
+            date="2026-01-01",
+            user_ts="2026-01-01T00:00:00+00:00",
+            user_text_sha256="abc",
+        )
+        with caplog.at_level("INFO", logger="kai.history"):
+            result = history.fetch_transcript_context(provenance, memory_id="mem-1")
+        assert result.reason == "file_missing"
+        # Drift log fired with the row id and reason.
+        drift = next(r for r in caplog.records if "memory.provenance.drift" in r.message)
+        assert '"memory_id":"mem-1"' in drift.message
+        assert '"reason":"file_missing"' in drift.message
+
+    def test_ts_not_found_user_side(self, _log_dir, caplog):
+        self._write_jsonl(
+            _log_dir,
+            1,
+            "2026-06-13",
+            [{"ts": "2026-06-13T01:00:00+00:00", "dir": "user", "chat_id": 1, "text": "x"}],
+        )
+        provenance = _Provenance(
+            chat_id=1,
+            date="2026-06-13",
+            user_ts="2026-06-13T09:00:00+00:00",
+            user_text_sha256="any",
+        )
+        with caplog.at_level("INFO", logger="kai.history"):
+            result = history.fetch_transcript_context(provenance, memory_id="m")
+        assert result.reason == "ts_not_found"
+        drift = next(r for r in caplog.records if "memory.provenance.drift" in r.message)
+        assert '"side":"user"' in drift.message
+
+    def test_hash_mismatch_returns_reason_and_logs(self, _log_dir, caplog):
+        self._write_jsonl(
+            _log_dir,
+            1,
+            "2026-06-13",
+            [{"ts": "2026-06-13T09:00:00+00:00", "dir": "user", "chat_id": 1, "text": "actual"}],
+        )
+        provenance = _Provenance(
+            chat_id=1,
+            date="2026-06-13",
+            user_ts="2026-06-13T09:00:00+00:00",
+            user_text_sha256="wrong" * 12,
+        )
+        with caplog.at_level("INFO", logger="kai.history"):
+            result = history.fetch_transcript_context(provenance, memory_id="m")
+        assert result.reason == "hash_mismatch"
+        assert result.context is None
+        assert any("hash_mismatch" in r.message for r in caplog.records)
+
+    def test_assistant_missing_returns_ts_not_found(self, _log_dir, caplog):
+        """The drift case where user matches but the named assistant
+        ts is absent from JSONL: drift-not-ok, side=assistant."""
+        import hashlib
+
+        self._write_jsonl(
+            _log_dir,
+            1,
+            "2026-06-13",
+            [{"ts": "2026-06-13T09:00:00+00:00", "dir": "user", "chat_id": 1, "text": "user msg"}],
+        )
+        provenance = _Provenance(
+            chat_id=1,
+            date="2026-06-13",
+            user_ts="2026-06-13T09:00:00+00:00",
+            user_text_sha256=hashlib.sha256(b"user msg").hexdigest(),
+            assistant_ts="2026-06-13T09:00:30+00:00",
+        )
+        with caplog.at_level("INFO", logger="kai.history"):
+            result = history.fetch_transcript_context(provenance, memory_id="m")
+        assert result.reason == "ts_not_found"
+        drift = next(r for r in caplog.records if "memory.provenance.drift" in r.message)
+        assert '"side":"assistant"' in drift.message
+
+    def test_legitimately_no_assistant_returns_ok_with_none(self, _log_dir):
+        """A row whose stored provenance has no assistant_ts at all
+        (None) returns ok with target_assistant=None."""
+        import hashlib
+
+        self._write_jsonl(
+            _log_dir,
+            1,
+            "2026-06-13",
+            [{"ts": "2026-06-13T09:00:00+00:00", "dir": "user", "chat_id": 1, "text": "u"}],
+        )
+        provenance = _Provenance(
+            chat_id=1,
+            date="2026-06-13",
+            user_ts="2026-06-13T09:00:00+00:00",
+            user_text_sha256=hashlib.sha256(b"u").hexdigest(),
+            assistant_ts=None,
+        )
+        result = history.fetch_transcript_context(provenance)
+        assert result.reason == "ok"
+        assert result.context.target_assistant is None
+
+    def test_synthetic_markers_excluded_from_context(self, _log_dir):
+        import hashlib
+
+        self._write_jsonl(
+            _log_dir,
+            1,
+            "2026-06-13",
+            [
+                {"ts": "2026-06-13T07:00:00+00:00", "dir": "user", "chat_id": 1, "text": "real user"},
+                {"ts": "2026-06-13T07:00:10+00:00", "dir": "assistant", "chat_id": 1, "text": "[stopped by user]"},
+                {"ts": "2026-06-13T09:00:00+00:00", "dir": "user", "chat_id": 1, "text": "target"},
+                {"ts": "2026-06-13T09:00:30+00:00", "dir": "assistant", "chat_id": 1, "text": "answer"},
+            ],
+        )
+        provenance = _Provenance(
+            chat_id=1,
+            date="2026-06-13",
+            user_ts="2026-06-13T09:00:00+00:00",
+            user_text_sha256=hashlib.sha256(b"target").hexdigest(),
+            assistant_ts="2026-06-13T09:00:30+00:00",
+        )
+        result = history.fetch_transcript_context(provenance, before=5, after=0)
+        # Synthetic assistant placeholder is skipped; only the real
+        # prior user turn appears in `before`.
+        assert [t.text for t in result.context.before] == ["real user"]
+
+    def test_assistant_in_next_day_file(self, _log_dir):
+        """Episode midnight cross: user on day D, assistant on day D+1."""
+        import hashlib
+
+        self._write_jsonl(
+            _log_dir,
+            1,
+            "2026-06-12",
+            [{"ts": "2026-06-12T23:59:00+00:00", "dir": "user", "chat_id": 1, "text": "u"}],
+        )
+        self._write_jsonl(
+            _log_dir,
+            1,
+            "2026-06-13",
+            [{"ts": "2026-06-13T00:00:30+00:00", "dir": "assistant", "chat_id": 1, "text": "a"}],
+        )
+        provenance = _Provenance(
+            chat_id=1,
+            date="2026-06-12",
+            user_ts="2026-06-12T23:59:00+00:00",
+            user_text_sha256=hashlib.sha256(b"u").hexdigest(),
+            assistant_ts="2026-06-13T00:00:30+00:00",
+            date_end="2026-06-13",
+        )
+        result = history.fetch_transcript_context(provenance, after=0)
+        assert result.reason == "ok"
+        assert result.context.target_assistant.text == "a"
+
+    def test_before_window_walks_to_previous_file(self, _log_dir):
+        import hashlib
+
+        self._write_jsonl(
+            _log_dir,
+            1,
+            "2026-06-12",
+            [{"ts": "2026-06-12T23:00:00+00:00", "dir": "user", "chat_id": 1, "text": "yesterday"}],
+        )
+        self._write_jsonl(
+            _log_dir,
+            1,
+            "2026-06-13",
+            [{"ts": "2026-06-13T00:30:00+00:00", "dir": "user", "chat_id": 1, "text": "today target"}],
+        )
+        provenance = _Provenance(
+            chat_id=1,
+            date="2026-06-13",
+            user_ts="2026-06-13T00:30:00+00:00",
+            user_text_sha256=hashlib.sha256(b"today target").hexdigest(),
+            assistant_ts=None,
+        )
+        result = history.fetch_transcript_context(provenance, before=2, after=0)
+        # `before` walks one file back and pulls the yesterday user
+        # turn rather than returning a short window.
+        assert [t.text for t in result.context.before] == ["yesterday"]

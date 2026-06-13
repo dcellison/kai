@@ -395,6 +395,114 @@ SCOPE_CHANGE_EVENT = "memory.scope_change"
 SCOPE_RUN_ID_KEY = "scope_run_id"
 
 
+# ── Transcript provenance: row-side pointer to the originating turns ─
+#
+# Rows extracted from real bot paths carry a `source_*` block that
+# fingerprints the JSONL line(s) the extraction consumed. The keys
+# live in the existing Mem0 metadata dict (no schema change to the
+# store) and are read by `read_transcript_provenance()` below. The
+# transcript-reading helper that turns a TranscriptProvenance into
+# surrounding turns lives in `kai.history`; the resolver here is
+# import-cycle-safe because it touches only metadata fields and the
+# `TranscriptProvenance` dataclass.
+
+SOURCE_CHAT_ID_KEY = "source_chat_id"
+SOURCE_DATE_KEY = "source_date"
+SOURCE_USER_TS_KEY = "source_user_ts"
+SOURCE_USER_TEXT_SHA256_KEY = "source_user_text_sha256"
+SOURCE_ASSISTANT_TS_KEY = "source_assistant_ts"
+SOURCE_DATE_END_KEY = "source_date_end"
+
+
+@dataclass(frozen=True)
+class TranscriptProvenance:
+    """
+    Read-time interpretation of a row's `source_*` metadata.
+
+    `present` is the contract every consumer keys on: when False, the
+    row predates provenance (or extraction skipped stamping due to a
+    `log_message` write failure), and the originating turns cannot be
+    recovered. When True, every required field is populated and the
+    transcript helper has a definite lookup target.
+
+    Attributes:
+        present: True iff `chat_id`, `date`, `user_ts`, and
+            `user_text_sha256` are all populated. A row with three of
+            four required fields is malformed; the resolver flags it
+            not-present rather than guessing.
+        chat_id: Telegram chat id whose JSONL holds the source turns.
+            Redundant with Mem0's row-level `user_id` so the locator
+            survives a future move off Mem0 without round-tripping
+            through the store.
+        date: UTC date (`YYYY-MM-DD`) used as the JSONL filename for
+            the user turn.
+        user_ts: ISO 8601 timestamp of the originating user turn,
+            matching the JSONL `ts` field exactly.
+        user_text_sha256: SHA-256 hex digest of the user turn's exact
+            JSONL `text` value (UTF-8 bytes). The drift gate fingerprints
+            the persisted record, not any sanitized variant.
+        assistant_ts: ISO 8601 timestamp of the paired assistant turn,
+            or None when the row was deliberately written without one
+            (a corner case the schema admits but the bot does not
+            produce today).
+        date_end: UTC date of the assistant turn when the exchange or
+            episode window crosses midnight, else None. Episode rows
+            populate this whenever the user and assistant turns fall
+            on different UTC dates; fact rows carry the assistant date
+            implicitly via `assistant_ts`.
+    """
+
+    present: bool
+    chat_id: int | None
+    date: str | None
+    user_ts: str | None
+    user_text_sha256: str | None
+    assistant_ts: str | None
+    date_end: str | None
+
+
+def read_transcript_provenance(metadata: dict[str, Any] | None) -> TranscriptProvenance:
+    """
+    Interpret a row's `source_*` metadata into a TranscriptProvenance.
+
+    Required fields are `source_chat_id`, `source_date`, `source_user_ts`,
+    and `source_user_text_sha256`. A row missing ANY of those is treated
+    as not-present; the resolver does not guess at a half-populated
+    locator. `source_assistant_ts` and `source_date_end` are optional;
+    their absence on a present row is meaningful (no assistant turn /
+    same-day window) and does not flip the present flag.
+
+    The resolver does not validate timestamp formats beyond presence;
+    the transcript helper performs that check at lookup time and fails
+    closed on any non-resolving locator.
+    """
+    md = metadata or {}
+    chat_id = md.get(SOURCE_CHAT_ID_KEY)
+    date = md.get(SOURCE_DATE_KEY)
+    user_ts = md.get(SOURCE_USER_TS_KEY)
+    user_text_sha256 = md.get(SOURCE_USER_TEXT_SHA256_KEY)
+    required_present = (
+        isinstance(chat_id, int)
+        and isinstance(date, str)
+        and isinstance(user_ts, str)
+        and isinstance(user_text_sha256, str)
+        and bool(date)
+        and bool(user_ts)
+        and bool(user_text_sha256)
+    )
+    assistant_ts = md.get(SOURCE_ASSISTANT_TS_KEY)
+    date_end = md.get(SOURCE_DATE_END_KEY)
+    return TranscriptProvenance(
+        present=required_present,
+        chat_id=chat_id if isinstance(chat_id, int) else None,
+        date=date if isinstance(date, str) and date else None,
+        user_ts=user_ts if isinstance(user_ts, str) and user_ts else None,
+        user_text_sha256=user_text_sha256 if isinstance(user_text_sha256, str) and user_text_sha256 else None,
+        assistant_ts=assistant_ts if isinstance(assistant_ts, str) and assistant_ts else None,
+        date_end=date_end if isinstance(date_end, str) and date_end else None,
+    )
+
+
 @dataclass(frozen=True)
 class ResolvedMemoryScope:
     """

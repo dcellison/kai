@@ -64,7 +64,19 @@ from telegram.ext import ContextTypes
 
 from kai import memory
 from kai.config import ONESHOT_REASONER_BACKENDS, Config, MemoryProjectConfig
-from kai.memory import MemoryResult, MemoryStats, ResolvedMemoryScope
+from kai.history import (
+    TranscriptContext,
+    TranscriptLookup,
+    TranscriptTurn,
+    fetch_transcript_context,
+)
+from kai.memory import (
+    MemoryResult,
+    MemoryStats,
+    ResolvedMemoryScope,
+    TranscriptProvenance,
+    read_transcript_provenance,
+)
 from kai.memory_projects import ActiveMemoryProject, detect_active_memory_project, merged_registry
 
 if TYPE_CHECKING:
@@ -550,6 +562,122 @@ def _scope_inputs(
     return registry, detect_active_memory_project(pool.get_workspace(chat_id), registry)
 
 
+# ── Transcript provenance helpers ───────────────────────────────────
+#
+# Row-side pointer to the originating turns. Reads go through
+# `read_transcript_provenance`; the transcript lookup happens at
+# `source` button tap time via `fetch_transcript_context`. The
+# detail view always renders a Source line (legacy fallback for
+# rows without provenance), and the keyboard gains a `source`
+# button only when provenance is present.
+
+
+# Safe ceiling on the source-view body; Telegram's hard limit is
+# 4096 characters and `_send_or_edit` does not truncate, so the
+# renderer enforces a ceiling under that with a visible marker.
+# 3900 leaves headroom for any future footer (currently none).
+_SOURCE_VIEW_BODY_CEILING = 3900
+
+# Per-turn cap inside the source view. Most ordinary fact lookups
+# (target user + assistant + a few context turns at this length)
+# stay well under the body ceiling; the marker below catches any
+# pathological exchange that does not.
+_SOURCE_VIEW_TURN_CAP = 400
+
+_SOURCE_VIEW_TRUNCATION_MARKER = "\n... (output truncated)"
+
+
+def _format_source_ts(ts: str) -> str:
+    """Render an ISO 8601 ts as `YYYY-MM-DD HH:MM:SS UTC`.
+
+    The stored ts is always UTC (it comes from `datetime.now(UTC)`),
+    so the suffix is hardcoded rather than parsed; future display-
+    timezone conversion is a separate concern. A malformed ts falls
+    through unchanged so a corrupted row still renders something
+    legible.
+    """
+    if "T" in ts and len(ts) >= 19:
+        date, rest = ts.split("T", 1)
+        return f"{date} {rest[:8]} UTC"
+    return ts
+
+
+def _build_source_label(fact: MemoryResult, provenance: TranscriptProvenance) -> str:
+    """Render the Source row's right-hand value.
+
+    Three cases keyed on the row's source field (extracted vs
+    episode/migration) and on whether the user and assistant turns
+    fall on the same UTC date:
+    - Legacy / not-present: `not recorded (legacy)`.
+    - Fact: `YYYY-MM-DD HH:MM:SS UTC` (single user ts; the assistant
+      date is implicit in `source_assistant_ts`).
+    - Episode: `YYYY-MM-DD HH:MM:SS to HH:MM:SS UTC` (same-day) or
+      `YYYY-MM-DD HH:MM:SS to YYYY-MM-DD HH:MM:SS UTC` (midnight
+      cross). The full two-date form lets the operator see the
+      exchange straddled a day boundary without opening the source
+      view.
+    """
+    if not provenance.present:
+        return "not recorded (legacy)"
+    source = (fact.metadata or {}).get("source", "")
+    if source != "episode" or provenance.assistant_ts is None:
+        # Fact and migration arms render the single user ts. Migration
+        # rows do not carry provenance today (the writer does not
+        # stamp `source_*`), so the not-present branch above usually
+        # catches them; the defensive single-ts render here is for any
+        # future caller that does stamp a migration row.
+        return _format_source_ts(provenance.user_ts or "")
+    user_part = _format_source_ts(provenance.user_ts or "")
+    assistant_part = _format_source_ts(provenance.assistant_ts)
+    # Same-day episodes drop the second date so the line reads as
+    # "DATE HH:MM:SS to HH:MM:SS UTC" rather than repeating the date.
+    # Midnight cross keeps both dates so the boundary is visible at a
+    # glance.
+    if provenance.date_end is None or provenance.date_end == provenance.date:
+        # _format_source_ts produces "DATE HH:MM:SS UTC"; trim the
+        # trailing "UTC" from the user part and the leading "DATE "
+        # from the assistant part so the joined form reads correctly.
+        # The replacement happens by string surgery rather than
+        # restructuring the formatter to keep _format_source_ts the
+        # single source of truth for the ts shape.
+        if user_part.endswith(" UTC"):
+            user_part = user_part[: -len(" UTC")]
+        if " " in assistant_part:
+            _, assistant_tail = assistant_part.split(" ", 1)
+            assistant_part = assistant_tail
+        return f"{user_part} to {assistant_part}"
+    return f"{user_part} to {assistant_part}"
+
+
+def _truncate_to_message_limit(body: str) -> str:
+    """Trim a source-view body to fit under Telegram's 4096-char limit.
+
+    `_send_or_edit` sends the supplied text as-is and does not
+    truncate; without this clamp, an oversized body would surface
+    as a Telegram `BadRequest` and the callback would collapse to
+    the generic memory-query failure path. The marker is appended
+    visibly so the operator knows the body was cut rather than
+    rendered fully.
+    """
+    if len(body) <= _SOURCE_VIEW_BODY_CEILING:
+        return body
+    keep = _SOURCE_VIEW_BODY_CEILING - len(_SOURCE_VIEW_TRUNCATION_MARKER)
+    return body[: max(keep, 0)] + _SOURCE_VIEW_TRUNCATION_MARKER
+
+
+def _truncate_source_turn(text: str) -> str:
+    """Cap a single turn's text inside the source view.
+
+    Primary defence against an oversized body; the body-level clamp
+    catches the residual pathological case where even the capped
+    turns add up to more than the body ceiling.
+    """
+    flat = text.replace("\r", "")
+    if len(flat) <= _SOURCE_VIEW_TURN_CAP:
+        return flat
+    return flat[: _SOURCE_VIEW_TURN_CAP - 1] + "…"
+
+
 # ── Builder: dashboard ──────────────────────────────────────────────
 
 
@@ -875,6 +1003,7 @@ def _build_fact_view(
     fact: MemoryResult,
     return_to: tuple[str, list[str]] | None,
     scope_view: _ScopeView | None = None,
+    provenance: TranscriptProvenance | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Render the fact detail screen (spec §6.3).
 
@@ -1012,6 +1141,12 @@ def _build_fact_view(
             footer_lines.append(f"Scope:  {scope_view.scope_label}")
             footer_lines.append(f"Scope source:  {scope_view.source_label}")
             footer_lines.append(f"Retrievable here:  {scope_view.retrievable_label}")
+        # Source row appended last so the existing tail (date + scope)
+        # stays recognizable. Always rendered when a provenance value
+        # is supplied (legacy rows produce the documented fallback);
+        # production callers always pass one.
+        if provenance is not None:
+            footer_lines.append(f"Source:  {_build_source_label(fact, provenance)}")
         lines = [
             header,
             "",
@@ -1057,6 +1192,12 @@ def _build_fact_view(
                 f"Scope source:     {scope_view.source_label}",
                 f"Retrievable here: {scope_view.retrievable_label}",
             ]
+        # Source row uses the same 18-column alignment so the new line
+        # reads as part of the existing extractor block, not as an
+        # appendix. Always rendered when a provenance value is supplied.
+        source_rows: list[str] = []
+        if provenance is not None:
+            source_rows = [f"Source:           {_build_source_label(fact, provenance)}"]
         lines = [
             "Fact",
             "",
@@ -1069,21 +1210,24 @@ def _build_fact_view(
             f"Session:          {session_id or '(none)'}",
             f"Prompt version:   {prompt_version or '(none)'}",
             *scope_rows,
+            *source_rows,
             "",
             f"Confirmation:     {confirmation_line}",
         ]
     text = "\n".join(lines)
 
     back_callback = _encode_callback(return_to[0], *return_to[1]) if return_to is not None else _encode_callback("dash")
-    kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("back", callback_data=back_callback),
-                InlineKeyboardButton("scope", callback_data=_encode_callback("scp")),
-                InlineKeyboardButton("forget", callback_data=_encode_callback("ffc")),
-            ]
-        ]
-    )
+    # Source button is conditional: provenance-absent rows have no
+    # exchange to reveal, so the button would route to a "legacy"
+    # body that adds no operator value. Position is between back
+    # and scope so the navigation buttons cluster on the left and
+    # the action buttons (scope, forget) cluster on the right.
+    row: list[InlineKeyboardButton] = [InlineKeyboardButton("back", callback_data=back_callback)]
+    if provenance is not None and provenance.present:
+        row.append(InlineKeyboardButton("source", callback_data=_encode_callback("src")))
+    row.append(InlineKeyboardButton("scope", callback_data=_encode_callback("scp")))
+    row.append(InlineKeyboardButton("forget", callback_data=_encode_callback("ffc")))
+    kb = InlineKeyboardMarkup([row])
     return text, kb
 
 
@@ -1500,12 +1644,16 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
       ffd               - forget single fact: do delete
       fview             - return to fact view (same id); cancel target
                           of the forget confirm, back target of the
-                          scope screen
+                          scope screen, back target of the source view
       scp               - scope screen for the cached fact; cancel
                           target of the scope confirm
       sct <idx>         - scope target tapped (resolved against
                           cache.scope_targets); renders confirm
       scd               - scope change confirmed: apply
+      src               - source view for the cached fact; calls
+                          fetch_transcript_context and renders the
+                          originating exchange or a per-reason
+                          failure body
     """
     # PTB CallbackQueryHandler guarantees both callback_query and
     # query.data are present, but `python -O` strips asserts; use
@@ -1670,6 +1818,19 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             else:
                 await _send_dashboard(update, context, chat_id, edit=True)
             await query.answer("Forgotten." if ok else "Not found.")
+            return
+        if verb == "src":
+            # Source view for the fact in cache. The fact id was
+            # cached when the user opened the detail view; the back
+            # button on the source view uses the existing fview verb
+            # to re-render the same fact view from that cache.
+            cache = _get_cache(chat_id)
+            if cache is None or not cache.memory_ids:
+                await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
+                return
+            await _send_source_view(update, context, chat_id, cache.memory_ids[0])
+            await query.answer()
             return
         if verb == "scp":
             # Scope screen for the fact in cache. Reached from the
@@ -1904,7 +2065,8 @@ async def _send_fact_view(
         return
     registry, active = _scope_inputs(context, chat_id)
     scope_view = _build_scope_view(fact, registry, active, scoped_recall_enabled=memory.is_scoped_recall_enabled())
-    text, kb = _build_fact_view(fact, return_to, scope_view)
+    provenance = read_transcript_provenance(fact.metadata)
+    text, kb = _build_fact_view(fact, return_to, scope_view, provenance)
     # Cache holds only this fact's id so the forget flow knows what to
     # delete without re-encoding the id into callback data.
     _set_cache(
@@ -1942,6 +2104,103 @@ async def _send_forget_fact_confirm(
         chat_id,
         _ScreenCache(
             screen="forget_fact_confirm",
+            memory_ids=[memory_id],
+            return_to=return_to,
+        ),
+    )
+    await _send_or_edit(update, text, kb, edit=True)
+
+
+# Per-reason source-view failure messages. Strings live as module
+# constants so test assertions key on them and so the lookup helper's
+# stable reason vocabulary stays one-to-one with the operator-facing
+# wording.
+_SOURCE_FAILURE_MESSAGES: dict[str, str] = {
+    "file_missing": "The history file for that date is no longer available.",
+    "unreadable": "The history file could not be read.",
+    "ts_not_found": "The original message was not found in the history file.",
+    "hash_mismatch": "Content drift detected: the original message no longer matches its fingerprint.",
+    "legacy": "This memory predates source tracking.",
+}
+
+
+def _build_source_view(
+    fact: MemoryResult,
+    lookup: TranscriptLookup,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Render the source view body and its back-to-fact keyboard.
+
+    On `reason="ok"` the body shows the surrounding turns in
+    chronological order with per-turn headers; on any other reason
+    the body renders the message from `_SOURCE_FAILURE_MESSAGES`.
+    The body-level truncation marker is appended once after assembly
+    so even a pathological exchange stays under the Telegram limit.
+
+    The keyboard is a single back button; the verb `fview` reuses
+    the existing fact-view re-render flow, which reads the cached
+    memory_id and presents the detail view unchanged.
+    """
+    if lookup.reason == "ok" and lookup.context is not None:
+        body = _render_source_view_body(fact, lookup.context)
+    else:
+        message = _SOURCE_FAILURE_MESSAGES.get(lookup.reason, "Source unavailable.")
+        body = f"Source\n\n{message}"
+    body = _truncate_to_message_limit(body)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("back", callback_data=_encode_callback("fview"))]])
+    return body, kb
+
+
+def _render_source_view_body(fact: MemoryResult, context: TranscriptContext) -> str:
+    """Compose the chronological exchange body for `reason="ok"`."""
+    lines: list[str] = ["Source", "", f'For memory "{_truncate(fact.text, 60)}":', ""]
+    if context.truncated:
+        lines.append("(Episode window truncated.)")
+        lines.append("")
+    for turn in context.before:
+        lines.extend(_render_source_view_turn(turn))
+    lines.extend(_render_source_view_turn(context.target_user))
+    if context.target_assistant is not None:
+        lines.extend(_render_source_view_turn(context.target_assistant))
+    for turn in context.after:
+        lines.extend(_render_source_view_turn(turn))
+    return "\n".join(lines).rstrip()
+
+
+def _render_source_view_turn(turn: TranscriptTurn) -> list[str]:
+    """One turn's lines: a `[ts UTC] direction:` header then capped text."""
+    header_label = "user" if turn.direction == "user" else "assistant"
+    return [
+        f"[{_format_source_ts(turn.ts)}] {header_label}:",
+        _truncate_source_turn(turn.text),
+        "",
+    ]
+
+
+async def _send_source_view(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    memory_id: str,
+) -> None:
+    """Render the source view for a fact, edit-in-place.
+
+    Re-fetches the row before resolving provenance so a row deleted
+    between the fact view and the tap surfaces as the standard
+    "no longer exists" body rather than a stale rendering.
+    """
+    fact = memory.get_by_id(user_id=str(chat_id), memory_id=memory_id)
+    if fact is None:
+        await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
+        return
+    provenance = read_transcript_provenance(fact.metadata)
+    lookup = fetch_transcript_context(provenance, memory_id=memory_id)
+    text, kb = _build_source_view(fact, lookup)
+    cache = _get_cache(chat_id)
+    return_to = cache.return_to if cache is not None else None
+    _set_cache(
+        chat_id,
+        _ScreenCache(
+            screen="source",
             memory_ids=[memory_id],
             return_to=return_to,
         ),

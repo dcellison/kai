@@ -4637,7 +4637,7 @@ class TestWorkspaceThreading:
         monkeypatch.setattr(memory_extraction, "_run_extractor", AsyncMock(return_value=self._result()))
         seen: dict = {}
 
-        def _fake_store(facts, *, user_id, session_id, config, active_project=None):
+        def _fake_store(facts, *, user_id, session_id, config, active_project=None, **_extra):
             seen["active_project"] = active_project
             return (1, 0, 0)
 
@@ -4668,7 +4668,7 @@ class TestWorkspaceThreading:
         )
         seen: dict = {}
 
-        def _fake_store(facts, *, user_id, session_id, config, active_project=None):
+        def _fake_store(facts, *, user_id, session_id, config, active_project=None, **_extra):
             seen["active_project"] = active_project
             return (1, 0, 0)
 
@@ -4892,3 +4892,100 @@ class TestDedupGateScope:
         neighbor = _paraphrase_neighbor("x", "u1", threshold=0.9)
         assert neighbor is not None
         assert neighbor.id == "legacy-row"
+
+
+# ── Transcript provenance stamping ──────────────────────────────────
+
+
+class TestProvenanceStamping:
+    """`_store_facts` stamps `source_*` keys when both LogEntry kwargs
+    are present; omits them when either is None."""
+
+    def _capture_metadata(self, monkeypatch):
+        captured: dict = {}
+        from kai import memory as memory_module
+        from kai.history import LogEntry
+
+        # Force the dedup gate path to skip so the existing-fact lookup
+        # never runs (these tests are about the stamping shape).
+        monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: True)
+        monkeypatch.setattr("kai.memory_extraction.memory.search", lambda *a, **kw: [])
+
+        def fake_add_structured(*args, **kwargs):
+            captured["metadata"] = kwargs.get("metadata") or {}
+            return "stored-id"
+
+        monkeypatch.setattr(memory_module, "add_structured", fake_add_structured)
+        return captured, LogEntry
+
+    def test_both_logs_present_stamps_source_keys(self, monkeypatch):
+        captured, LogEntry = self._capture_metadata(monkeypatch)
+        user_log = LogEntry(
+            ts="2026-06-13T09:00:00+00:00",
+            date="2026-06-13",
+            chat_id=100,
+            direction="user",
+            text="hello",
+            sha256="u" * 64,
+        )
+        assistant_log = LogEntry(
+            ts="2026-06-13T09:00:30+00:00",
+            date="2026-06-13",
+            chat_id=100,
+            direction="assistant",
+            text="hi",
+            sha256="a" * 64,
+        )
+        facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "new"}]
+        _store_facts(
+            facts, user_id="100", session_id="s", config=_cfg(), user_log=user_log, assistant_log=assistant_log
+        )
+        md = captured["metadata"]
+        assert md["source_chat_id"] == 100
+        assert md["source_date"] == "2026-06-13"
+        assert md["source_user_ts"] == "2026-06-13T09:00:00+00:00"
+        assert md["source_user_text_sha256"] == "u" * 64
+        assert md["source_assistant_ts"] == "2026-06-13T09:00:30+00:00"
+
+    def test_missing_user_log_skips_stamp(self, monkeypatch):
+        """When `log_message` returned None for the user write, no
+        `source_*` keys are stamped and the row matches today's
+        legacy metadata shape."""
+        captured, LogEntry = self._capture_metadata(monkeypatch)
+        assistant_log = LogEntry(
+            ts="2026-06-13T09:00:30+00:00",
+            date="2026-06-13",
+            chat_id=100,
+            direction="assistant",
+            text="hi",
+            sha256="a" * 64,
+        )
+        facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "new"}]
+        _store_facts(facts, user_id="100", session_id="s", config=_cfg(), user_log=None, assistant_log=assistant_log)
+        md = captured["metadata"]
+        assert "source_chat_id" not in md
+        assert "source_user_ts" not in md
+
+    def test_missing_assistant_log_skips_stamp(self, monkeypatch):
+        captured, LogEntry = self._capture_metadata(monkeypatch)
+        user_log = LogEntry(
+            ts="2026-06-13T09:00:00+00:00",
+            date="2026-06-13",
+            chat_id=100,
+            direction="user",
+            text="hello",
+            sha256="u" * 64,
+        )
+        facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "new"}]
+        _store_facts(facts, user_id="100", session_id="s", config=_cfg(), user_log=user_log, assistant_log=None)
+        md = captured["metadata"]
+        assert "source_chat_id" not in md
+
+    def test_both_omitted_matches_legacy_shape(self, monkeypatch):
+        """No LogEntry kwargs at all (the sandbox / eval call shape)
+        produces no `source_*` keys."""
+        captured, _ = self._capture_metadata(monkeypatch)
+        facts = [{"content": "x", "tags": ["fact"], "confidence": 0.9, "intent": "new"}]
+        _store_facts(facts, user_id="100", session_id="s", config=_cfg())
+        md = captured["metadata"]
+        assert not any(k.startswith("source_") for k in md if k != "source")

@@ -30,6 +30,7 @@ from pathlib import Path
 
 from kai import memory
 from kai.config import Config, ModelRole, resolve_user_model
+from kai.history import LogEntry
 from kai.memory import MemoryResult
 from kai.memory_projects import ActiveMemoryProject, detect_active_memory_project, merged_registry
 from kai.oneshot import _EXTRACTOR_CWD as _EXTRACTOR_CWD
@@ -2404,6 +2405,8 @@ async def _generate_episode(
     effective_provider: str,
     os_user: str | None = None,
     active_project: ActiveMemoryProject | None = None,
+    user_log: LogEntry | None = None,
+    assistant_log: LogEntry | None = None,
 ) -> None:
     """
     Stage-2 task body: generate one episode record and store it.
@@ -2551,6 +2554,24 @@ async def _generate_episode(
                     # log below reports the routed outcome.
                     scope_meta = _route_write_scope(episode.get("scope_hint"), active_project)
                     extra.update(scope_meta)
+                    # Transcript provenance. Same shape
+                    # as the fact path; `source_date_end` is the only
+                    # episode-specific key, populated only when the
+                    # exchange straddled midnight so a single-day
+                    # episode's metadata stays small. Episodes here
+                    # describe the current exchange (the v3 spec drops
+                    # the prior-pair window framing because
+                    # _generate_episode does not consume prior_pairs);
+                    # the start and end keys are the user and
+                    # assistant turns of this exchange.
+                    if user_log is not None and assistant_log is not None:
+                        extra[memory.SOURCE_CHAT_ID_KEY] = user_log.chat_id
+                        extra[memory.SOURCE_DATE_KEY] = user_log.date
+                        extra[memory.SOURCE_USER_TS_KEY] = user_log.ts
+                        extra[memory.SOURCE_USER_TEXT_SHA256_KEY] = user_log.sha256
+                        extra[memory.SOURCE_ASSISTANT_TS_KEY] = assistant_log.ts
+                        if assistant_log.date != user_log.date:
+                            extra[memory.SOURCE_DATE_END_KEY] = assistant_log.date
                     # add_structured is sync (Mem0 is sync). Run off
                     # the event loop so the embedding step does not
                     # block other stage-2 tasks queued behind this
@@ -2754,6 +2775,8 @@ def _store_facts(
     session_id: str | None,
     config: Config,
     active_project: ActiveMemoryProject | None = None,
+    user_log: LogEntry | None = None,
+    assistant_log: LogEntry | None = None,
 ) -> tuple[int, int, int]:
     """
     Persist validated facts via memory.add_structured, branching on intent.
@@ -2867,6 +2890,22 @@ def _store_facts(
         # information beyond what scope_source already encodes.
         scope_meta = _route_write_scope(fact.get("scope_hint"), active_project)
         extra.update(scope_meta)
+
+        # Transcript provenance. Stamped only when both
+        # log entries are present: a single-side stamp would be a
+        # half-locator and would force the reader to invent the
+        # missing half. The Optional defaults let sandbox / replay /
+        # eval callers omit the kwargs entirely, and they cover the
+        # real-bot path where `log_message` returned None due to a
+        # JSONL write failure (the row then lands with no `source_*`
+        # keys, matching the legacy shape and the resolver's
+        # not-present path).
+        if user_log is not None and assistant_log is not None:
+            extra[memory.SOURCE_CHAT_ID_KEY] = user_log.chat_id
+            extra[memory.SOURCE_DATE_KEY] = user_log.date
+            extra[memory.SOURCE_USER_TS_KEY] = user_log.ts
+            extra[memory.SOURCE_USER_TEXT_SHA256_KEY] = user_log.sha256
+            extra[memory.SOURCE_ASSISTANT_TS_KEY] = assistant_log.ts
 
         if intent == "skip_redundant":
             # No storage call. The intent log is the only side effect
@@ -3043,6 +3082,8 @@ async def extract_and_store(
     prior_pairs: list[tuple[str, str]] | None = None,
     os_user_override: str | None = None,
     workspace: str | None = None,
+    user_log: LogEntry | None = None,
+    assistant_log: LogEntry | None = None,
 ) -> int:
     """
     Run Haiku extraction on an exchange and store the resulting facts.
@@ -3080,6 +3121,17 @@ async def extract_and_store(
     extractor input must stay byte-equivalent across replays) on
     exactly the pre-routing write shape apart from the now-explicit
     scope metadata.
+
+    The optional `user_log` and `assistant_log` parameters carry the
+    `LogEntry` receipts returned by the two `log_message` calls for
+    this exchange. When both are present, the metadata-write blocks
+    stamp `source_*` provenance keys pointing back at the JSONL turns
+    extraction consumed; when either is None (sandbox / replay / eval
+    callers that synthesize exchanges, or a real path where the JSONL
+    append failed and `log_message` returned None), no provenance is
+    stamped and the row matches today's metadata shape byte for byte.
+    The legacy-row UI fallback handles the absent case across every
+    consumer surface.
     """
     if config is None:
         from kai.config import load_config
@@ -3279,6 +3331,8 @@ async def extract_and_store(
                         session_id=session_id,
                         config=config,
                         active_project=active_project,
+                        user_log=user_log,
+                        assistant_log=assistant_log,
                     ),
                 )
             else:
@@ -3317,6 +3371,8 @@ async def extract_and_store(
                         effective_provider=effective_provider,
                         os_user=os_user,
                         active_project=active_project,
+                        user_log=user_log,
+                        assistant_log=assistant_log,
                     ),
                     name=f"episode-{user_id}",
                 )

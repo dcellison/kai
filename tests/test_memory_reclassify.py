@@ -906,3 +906,62 @@ class TestRollback:
         assert code == 1
         assert fetches == []
         assert env["updates"] == []
+
+
+# ── Transcript provenance in the report ─────────────────────────────
+
+
+class TestReportProvenanceQuote:
+    def _proposals(self):
+        return [
+            memory_reclassify.Proposal(
+                memory_id=f"m{i}",
+                verdict="project" if i % 2 else "global",
+                project_id="kai" if i % 2 else None,
+                confidence=0.9,
+                reason=f"reason {i}",
+                prior_scope_source="legacy_default",
+                text_sha256="ab",
+            )
+            for i in range(3)
+        ]
+
+    def test_present_entries_render_said_line(self):
+        proposals = self._proposals()
+        report = memory_reclassify.render_report(
+            run_id="rs-test",
+            user_id="100",
+            backend="claude",
+            threshold=0.8,
+            scanned=3,
+            selected=3,
+            proposals=proposals,
+            skips={},
+            sample_size=3,
+            texts={p.memory_id: f"text {p.memory_id}" for p in proposals},
+            provenance_user_texts={"m0": "what did the user actually say"},
+        )
+        assert 'said:   "what did the user actually say"' in report
+        # The other two proposals (no entry) render unchanged.
+        assert report.count("said:") == 1
+
+    def test_no_provenance_argument_renders_identically(self):
+        """The optional kwarg defaults to None; older callers see the
+        original report shape."""
+        proposals = self._proposals()
+        kwargs = dict(
+            run_id="rs-test",
+            user_id="100",
+            backend="claude",
+            threshold=0.8,
+            scanned=3,
+            selected=3,
+            proposals=proposals,
+            skips={},
+            sample_size=3,
+            texts={p.memory_id: f"text {p.memory_id}" for p in proposals},
+        )
+        without = memory_reclassify.render_report(**kwargs)
+        with_empty = memory_reclassify.render_report(**kwargs, provenance_user_texts={})
+        assert without == with_empty
+        assert "said:" not in without

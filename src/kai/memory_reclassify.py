@@ -56,7 +56,8 @@ from typing import Any
 
 from kai import memory, sessions
 from kai.config import Config, MemoryProjectConfig, ModelRole, resolve_user_model
-from kai.memory import MemoryResult, ResolvedMemoryScope
+from kai.history import fetch_transcript_context
+from kai.memory import MemoryResult, ResolvedMemoryScope, read_transcript_provenance
 from kai.memory_extraction import (
     _build_memory_reasoner,
     _resolve_effective_backend,
@@ -510,6 +511,36 @@ def parse_preimages(text: str) -> tuple[dict[str, Any], list[PreImage]]:
 # ── Pure helpers: report rendering ──────────────────────────────────
 
 
+def _collect_provenance_quotes(
+    selected: list[tuple[MemoryResult, ResolvedMemoryScope]],
+    proposals: list[Proposal],
+) -> dict[str, str]:
+    """Build the memory_id → originating-user-text map for the report.
+
+    Best-effort: a row without provenance, with a failed JSONL
+    lookup, or whose helper returns any non-ok reason contributes
+    nothing. The text is truncated here (80 chars) so the renderer
+    stays formatter-only and the entry it pulls is already
+    report-sized.
+
+    The proposal set drives the iteration: we only look up provenance
+    for rows that actually appear in the report's eyeball sample
+    space, not for the larger selected pool.
+    """
+    quotes: dict[str, str] = {}
+    proposal_ids = {p.memory_id for p in proposals}
+    metadata_by_id = {row.id: row.metadata for row, _ in selected if row.id in proposal_ids}
+    for memory_id, metadata in metadata_by_id.items():
+        provenance = read_transcript_provenance(metadata)
+        if not provenance.present:
+            continue
+        lookup = fetch_transcript_context(provenance, before=0, after=0, memory_id=memory_id)
+        if lookup.reason != "ok" or lookup.context is None:
+            continue
+        quotes[memory_id] = _truncate(lookup.context.target_user.text, 80)
+    return quotes
+
+
 def render_report(
     *,
     run_id: str,
@@ -522,6 +553,7 @@ def render_report(
     skips: dict[str, list[str]],
     sample_size: int,
     texts: dict[str, str],
+    provenance_user_texts: dict[str, str] | None = None,
 ) -> str:
     """Render the dry-run report markdown.
 
@@ -529,6 +561,14 @@ def render_report(
     only in the report (the proposals file carries the sha) so the
     machine-readable artifact stays small while the human-readable
     one shows what was actually classified.
+
+    `provenance_user_texts` optionally maps memory_id to the row's
+    originating user-turn text (already truncated by the caller).
+    When an entry is present, the eyeball-sample line gains a `said:`
+    line that quotes the originating message so the operator can
+    eyeball "is this really a project fact" against the message that
+    produced it. Entries are missing for legacy rows or for rows
+    whose transcript lookup failed; those proposals render as before.
 
     The eyeball sample is drawn with `random.Random(run_id)` so
     re-rendering the same run reproduces the same sample; the
@@ -556,6 +596,13 @@ def render_report(
             text = _truncate(texts.get(p.memory_id, ""), 80)
             lines.append(f'{i}. [{target} {p.confidence:.2f}] "{text}" (was {p.prior_scope_source})')
             lines.append(f"   reason: {p.reason}")
+            # Optional originating-turn quote when transcript provenance
+            # is present on the source row. Legacy rows and lookup
+            # failures contribute nothing, so the line is appended
+            # only when the entry actually exists. The caller has
+            # already truncated the text to keep the report compact.
+            if provenance_user_texts and p.memory_id in provenance_user_texts:
+                lines.append(f'   said:   "{provenance_user_texts[p.memory_id]}"')
         lines.append("")
         lines.append("## All proposals")
         lines.append("| id | verdict | conf | was | text |")
@@ -770,6 +817,12 @@ async def run_dry_run(
     }
     proposals_path = out_dir / f"reclassify-{run_id}-proposals.jsonl"
     proposals_path.write_text(render_proposals(header, proposals), encoding="utf-8")
+    # Transcript-provenance lookup is best-effort: any non-ok reason
+    # (legacy, file missing, ts not found, drift) contributes nothing
+    # and the proposal renders without the `said:` line. The lookup
+    # itself happens here in the driver (not in the pure renderer) so
+    # the renderer stays free of I/O for unit testing.
+    provenance_user_texts = _collect_provenance_quotes(selected, proposals)
     report = render_report(
         run_id=run_id,
         user_id=user_id,
@@ -781,6 +834,7 @@ async def run_dry_run(
         skips=skips,
         sample_size=sample,
         texts={row.id: row.text for row, _ in selected},
+        provenance_user_texts=provenance_user_texts,
     )
     report_path = out_dir / f"reclassify-{run_id}-report.md"
     report_path.write_text(report, encoding="utf-8")
