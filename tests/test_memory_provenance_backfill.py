@@ -369,6 +369,30 @@ class TestApplyDriftGates:
             candidate_text_snippet="cand",
         )
 
+    def test_apply_rejects_proposal_with_mismatched_chat_id(self, tmp_path, history_dir):
+        # Proposal carries chat_id=2 while the CLI runs for user_id="1".
+        # The artifact-level user_id check passes (header user_id="1"),
+        # but the per-proposal chat-id guard catches the mismatch and
+        # refuses to apply BEFORE any store access.
+        proposals_path = self._make_proposals_file(tmp_path, [self._proposal(chat_id=2)])
+        get_calls: list = []
+        update_calls: list = []
+        with (
+            patch(
+                "kai.memory.get_by_id",
+                side_effect=lambda **kwargs: get_calls.append(kwargs) or None,
+            ),
+            patch(
+                "kai.memory.update_metadata",
+                side_effect=lambda **kwargs: update_calls.append(kwargs) or True,
+            ),
+        ):
+            code = asyncio.run(run_apply(_BASE_CONFIG, "1", proposals_path=proposals_path, out_dir=tmp_path / "out"))
+        assert code == 1
+        # Neither read nor write reached Mem0.
+        assert get_calls == []
+        assert update_calls == []
+
     def test_skip_row_gone(self, tmp_path, history_dir):
         proposals_path = self._make_proposals_file(tmp_path, [self._proposal()])
         # get_by_id returns None -> SKIP_ROW_GONE; no writes.
@@ -721,6 +745,94 @@ class TestRollback:
         assert captured[0]["data"] == "row body"
         assert captured[0]["metadata"] == metadata_before
 
+    def test_rollback_exit_one_when_only_attempted_write_failed(self, tmp_path):
+        # Two preimages: one drifts (skipped as operator_correction),
+        # one matches and is attempted but update_metadata returns
+        # False. With the old "exit 1 only when no skips" rule, the
+        # run would have exited 0; the corrected rule (attempted =
+        # restored + failed; exit 1 when attempted and restored == 0)
+        # exits 1.
+        applied_block = {
+            SOURCE_CHAT_ID_KEY: 1,
+            SOURCE_DATE_KEY: "2026-06-12",
+            SOURCE_USER_TS_KEY: "2026-06-12T10:00:00+00:00",
+            SOURCE_USER_TEXT_SHA256_KEY: "abc",
+        }
+        metadata_before = {"source": "extracted"}
+        preimages = [
+            PreImage(
+                memory_id="drifted",
+                text="row body",
+                metadata_before=metadata_before,
+                applied_source_block=applied_block,
+            ),
+            PreImage(
+                memory_id="failed",
+                text="row body",
+                metadata_before=metadata_before,
+                applied_source_block=applied_block,
+            ),
+        ]
+        path = self._make_preimage_file(tmp_path, preimages)
+
+        def fake_get(*, user_id: str, memory_id: str):
+            if memory_id == "drifted":
+                # current source block differs -> SKIP_OPERATOR_CORRECTION
+                drifted_block = dict(applied_block)
+                drifted_block[SOURCE_USER_TS_KEY] = "2026-06-12T11:00:00+00:00"
+                return MemoryResult(
+                    id="drifted",
+                    text="row body",
+                    score=0.0,
+                    memory_type="fact",
+                    metadata={**metadata_before, **drifted_block},
+                    created_at="2026-06-13T00:00:00+00:00",
+                )
+            return MemoryResult(
+                id="failed",
+                text="row body",
+                score=0.0,
+                memory_type="fact",
+                metadata={**metadata_before, **applied_block},
+                created_at="2026-06-13T00:00:00+00:00",
+            )
+
+        with (
+            patch("kai.memory.get_by_id", side_effect=fake_get),
+            patch("kai.memory.update_metadata", return_value=False),
+        ):
+            code = asyncio.run(run_rollback(_BASE_CONFIG, "1", preimages_path=path))
+        assert code == 1
+
+    def test_rollback_rejects_preimage_with_mismatched_chat_id(self, tmp_path):
+        # PreImage's applied_source_block carries chat_id=2 while the
+        # CLI runs for user_id="1". The pre-image guard rejects the
+        # whole rollback before any store access.
+        applied_block = {
+            SOURCE_CHAT_ID_KEY: 2,  # mismatched
+            SOURCE_DATE_KEY: "2026-06-12",
+            SOURCE_USER_TS_KEY: "2026-06-12T10:00:00+00:00",
+            SOURCE_USER_TEXT_SHA256_KEY: "abc",
+        }
+        preimage = PreImage(
+            memory_id="m1",
+            text="row body",
+            metadata_before={"source": "extracted"},
+            applied_source_block=applied_block,
+        )
+        path = self._make_preimage_file(tmp_path, [preimage])
+        update_calls: list = []
+        with (
+            patch("kai.memory.get_by_id", return_value=None),
+            patch(
+                "kai.memory.update_metadata",
+                side_effect=lambda **kwargs: update_calls.append(kwargs) or True,
+            ),
+        ):
+            code = asyncio.run(run_rollback(_BASE_CONFIG, "1", preimages_path=path))
+        assert code == 1
+        assert update_calls == []
+
 
 # ── Test 9: Header validation ──────────────────────────────────────
 
@@ -833,6 +945,29 @@ class TestHistoryUnreadable:
         # (a multi-day window over partially-readable history), but
         # the any_unreadable flag is the one that triggers the whole-
         # row HISTORY_UNREADABLE bucket in the driver.
+
+    def test_malformed_jsonl_line_collapses_file_to_unreadable(self, history_dir):
+        # An intersecting file exists but contains a malformed JSON
+        # line. Silently skipping the bad line would let scoring run
+        # against partial history; the contract is fail-closed at the
+        # file level. The row buckets as HISTORY_UNREADABLE.
+        chat_id = 1
+        user_dir = history_dir / str(chat_id)
+        user_dir.mkdir(parents=True, exist_ok=True)
+        path = user_dir / "2026-06-13.jsonl"
+        # One valid line, one malformed line. The valid line alone
+        # would NOT be a STRONG_MATCH (no overlap), but the point is
+        # that the file is treated as unreadable regardless of which
+        # candidates remain after skipping the bad line.
+        path.write_text(
+            json.dumps({"ts": "2026-06-13T01:00:00+00:00", "dir": "user", "chat_id": 1, "text": "x"})
+            + "\n"
+            + "this line is not valid json\n",
+            encoding="utf-8",
+        )
+        created_at_dt = datetime(2026, 6, 13, 2, 0, 0, tzinfo=UTC)
+        _records, any_unreadable = _candidates_for_row(chat_id, created_at_dt, window_seconds=86400)
+        assert any_unreadable is True
 
     def test_date_files_iterate_every_day_in_window(self, tmp_path):
         chat_id = 1

@@ -501,6 +501,15 @@ def _read_jsonl_records(path: Path) -> list[dict] | None:
     returns an EMPTY LIST, distinct from the None signal: the caller
     treats absence as "no candidates from this day" and unreadability
     as "we cannot trust the window's coverage for this row".
+
+    Malformed-line policy is fail-closed: a single JSONDecodeError
+    inside an otherwise-readable file collapses the whole file to
+    None. The safety contract is "do not score against partial
+    history": if the true source turn is the malformed line, or a
+    runner-up above `--min-overlap` is, the row could be proposed
+    on incomplete evidence. Silently skipping bad lines would turn
+    file-level corruption into a SCORING signal, exactly what the
+    HISTORY_UNREADABLE bucket exists to prevent at the file level.
     """
     if not path.exists():
         return []
@@ -515,7 +524,7 @@ def _read_jsonl_records(path: Path) -> list[dict] | None:
         try:
             rec = json.loads(line)
         except json.JSONDecodeError:
-            continue
+            return None
         if isinstance(rec, dict):
             records.append(rec)
     return records
@@ -1102,6 +1111,29 @@ async def run_apply(
         return 1
     run_id: str = header["run_id"]
 
+    # Per-proposal chat-id guard. The artifact-level user_id check is
+    # not sufficient: a hand-edited or forged proposal row whose
+    # chat_id points at a different user would otherwise pass parsing,
+    # update the CLI user's memory row via get_by_id(user_id=user_id,
+    # ...), verify the JSONL under the other chat, and then stamp the
+    # CLI user's row with a source_chat_id that does not match. The
+    # row would be durably marked present, but its source button would
+    # always fail closed for the actual user via the expected_chat_id
+    # ownership gate. Reject the whole apply if any proposal carries a
+    # chat_id that does not match the CLI user.
+    try:
+        user_id_int = int(user_id)
+    except ValueError:
+        print(f"memory admin: user_id {user_id!r} is not an integer chat id; cannot apply.")
+        return 1
+    mismatched = [p.memory_id for p in proposals if p.chat_id != user_id_int]
+    if mismatched:
+        print(
+            f"memory admin: {len(mismatched)} proposal(s) carry chat_id != user_id {user_id_int}; "
+            "refusing to apply. First few: " + ", ".join(mismatched[:5]) + "."
+        )
+        return 1
+
     # Re-check phase: every proposal is verified against the live
     # store AND the live JSONL as they are NOW. The survivors carry
     # their fresh row so the pre-image dump and the write use the
@@ -1264,6 +1296,24 @@ async def run_rollback(
         return 1
     run_id: str = header["run_id"]
 
+    # Per-preimage chat-id guard, symmetric with apply's. A pre-image
+    # file whose applied_source_block carries a chat_id that does not
+    # match the CLI user could only have come from a hand edit or a
+    # forged artifact; refusing to restore in that case keeps the
+    # authorization model honest at both ends of the round trip.
+    try:
+        user_id_int = int(user_id)
+    except ValueError:
+        print(f"memory admin: user_id {user_id!r} is not an integer chat id; cannot rollback.")
+        return 1
+    mismatched = [p.memory_id for p in preimages if p.applied_source_block.get(SOURCE_CHAT_ID_KEY) != user_id_int]
+    if mismatched:
+        print(
+            f"memory admin: {len(mismatched)} preimage(s) carry applied chat_id != user_id "
+            f"{user_id_int}; refusing to rollback. First few: " + ", ".join(mismatched[:5]) + "."
+        )
+        return 1
+
     restored = 0
     failed = 0
     skips: dict[str, list[str]] = {}
@@ -1308,6 +1358,13 @@ async def run_rollback(
 
     skip_summary = ", ".join(f"{len(ids)} {reason}" for reason, ids in sorted(skips.items())) or "none"
     print(f"memory admin: rollback {run_id}: restored {restored}, failed {failed}, skipped: {skip_summary}.")
-    if preimages and restored == 0 and not skips:
+    # Exit-code policy mirrors reclassify: exit 1 ONLY when rollback
+    # attempted writes and none landed. Attempted = restored + failed
+    # (skips are not attempts). An all-skip run is a valid outcome
+    # (every preimage's source block drifted); an attempt-with-all-
+    # failures run is not, regardless of whether other preimages were
+    # skipped on the same invocation.
+    attempted = restored + failed
+    if attempted and restored == 0:
         return 1
     return 0
