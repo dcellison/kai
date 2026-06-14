@@ -29,8 +29,12 @@ What this is NOT:
   `scope_source` from the live store. The check covers STRUCTURAL
   minimums (collision count, positive-only count, non-project count,
   unregistered-workspace gate); legacy-default coverage is verified
-  separately by running the scoped evaluator and inspecting the
-  per-probe `scoped_reason` distribution.
+  out of band, by inspecting each candidate expected_fact_id row's
+  `scope_source` directly (via `/memory` or a get_by_id call), then
+  running the scoped evaluator to confirm the chosen probes surface
+  end to end. The evaluator's `scoped_reason` distribution describes
+  the retrieval outcome (ok / no_results_after_scope / etc.), NOT
+  the row's scope_source; the two signals are independent.
 
 Exit codes mirror the admin-CLI convention:
 - 0: corpus meets every documented minimum
