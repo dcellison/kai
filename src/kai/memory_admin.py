@@ -237,6 +237,27 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Token-shingle width for the overlap score. Default: 4.",
     )
+    # Pass 2 controls. `--no-assistant-pass` uses store_const + default=None
+    # so the mutating-mode rejection below can distinguish "explicitly
+    # passed" from "default in effect"; without it, the rejection's
+    # `if value is not None` filter would always read False on a
+    # boolean store_true flag and the flag would be silently
+    # tolerated under --apply/--rollback.
+    bp.add_argument(
+        "--no-assistant-pass",
+        dest="no_assistant_pass",
+        action="store_const",
+        const=True,
+        default=None,
+        help=("Disable Pass 2 (assistant-turn matching). Dry-run only; apply consumes the proposals file verbatim."),
+    )
+    bp.add_argument(
+        "--assistant-max-user-gap-seconds",
+        dest="assistant_max_user_gap_seconds",
+        type=int,
+        default=None,
+        help=("Pass 2: maximum seconds between the paired user turn and the winning assistant turn. Default: 600."),
+    )
     bp.add_argument(
         "--sample",
         type=int,
@@ -493,6 +514,8 @@ def _cmd_backfill_provenance(args: argparse.Namespace) -> int:
                 ("--min-overlap", args.min_overlap),
                 ("--strong-overlap-ratio", args.strong_overlap_ratio),
                 ("--overlap-shingle-n", args.overlap_shingle_n),
+                ("--no-assistant-pass", args.no_assistant_pass),
+                ("--assistant-max-user-gap-seconds", args.assistant_max_user_gap_seconds),
                 ("--sample", args.sample),
             )
             if value is not None
@@ -523,6 +546,16 @@ def _cmd_backfill_provenance(args: argparse.Namespace) -> int:
         args.overlap_shingle_n if args.overlap_shingle_n is not None else memory_provenance_backfill._DEFAULT_SHINGLE_N
     )
     sample = args.sample if args.sample is not None else 10
+    # Pass 2 settings. `assistant_pass_enabled` defaults to True; the
+    # `--no-assistant-pass` flag uses store_const + default=None so an
+    # explicit pass flips this to False, and the absent flag leaves
+    # Pass 2 on.
+    assistant_pass_enabled = args.no_assistant_pass is None
+    assistant_max_user_gap_seconds = (
+        args.assistant_max_user_gap_seconds
+        if args.assistant_max_user_gap_seconds is not None
+        else memory_provenance_backfill._DEFAULT_ASSISTANT_MAX_USER_GAP_SECONDS
+    )
 
     if window_seconds < 1:
         print(f"memory admin: --window-seconds must be a positive int, got {window_seconds}", file=sys.stderr)
@@ -538,6 +571,13 @@ def _cmd_backfill_provenance(args: argparse.Namespace) -> int:
         return 2
     if shingle_n < 1:
         print(f"memory admin: --overlap-shingle-n must be a positive int, got {shingle_n}", file=sys.stderr)
+        return 2
+    if assistant_max_user_gap_seconds < 1:
+        print(
+            f"memory admin: --assistant-max-user-gap-seconds must be a positive int, "
+            f"got {assistant_max_user_gap_seconds}",
+            file=sys.stderr,
+        )
         return 2
     if sample < 0:
         print(f"memory admin: --sample must be >= 0, got {sample}", file=sys.stderr)
@@ -564,6 +604,8 @@ def _cmd_backfill_provenance(args: argparse.Namespace) -> int:
                 shingle_n=shingle_n,
                 sample=sample,
                 out_dir=out_dir,
+                assistant_pass_enabled=assistant_pass_enabled,
+                assistant_max_user_gap_seconds=assistant_max_user_gap_seconds,
             )
         )
 

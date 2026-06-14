@@ -139,14 +139,44 @@ _CURATION_REPORT_TOP_N = 3
 SKIP_AMBIGUOUS_OVERLAP = "ambiguous_overlap"
 SKIP_NO_CANDIDATE = "no_candidate"
 SKIP_HISTORY_UNREADABLE = "history_unreadable"
+# Pass 2 (assistant-turn matching) skip buckets. The harness runs
+# Pass 2 only on rows where Pass 1 returned NO_CANDIDATE; these
+# buckets surface assistant-side failure modes distinctly so the
+# operator's tuning advice (widen the window vs tighten dominance
+# vs accept the curation gap) does not collapse into "no_candidate".
+SKIP_ASSISTANT_AMBIGUOUS_OVERLAP = "assistant_ambiguous_overlap"
+SKIP_NO_PRECEDING_USER = "no_preceding_user"
+SKIP_AMBIGUOUS_USER_PAIRING = "ambiguous_user_pairing"
 # Apply-time re-check skips.
 SKIP_ROW_GONE = "row_gone"
 SKIP_DESELECTED = "deselected"
 SKIP_METADATA_DRIFT = "metadata_drift"
 SKIP_TRANSCRIPT_DRIFT = "transcript_drift"
+SKIP_ASSISTANT_DRIFT = "assistant_drift"
 # Rollback-only skip: the row's source_* block was changed by another
 # writer after backfill; rollback must not silently undo that change.
 SKIP_OPERATOR_CORRECTION = "operator_correction"
+
+
+# Default for the Pass 2 max-gap guard. Once Pass 2's assistant
+# overlap winner is fixed, the harness walks back to find a single
+# preceding user turn within `--assistant-max-user-gap-seconds` of
+# the assistant turn. Beyond that distance, the user-to-assistant
+# pairing is untrustworthy (the gap typically implies a delayed
+# reply boundary or a different conversational neighborhood) and the
+# row buckets as `no_preceding_user`. 600s matches the typical bot
+# response latency tail; operators with unusually long reasoning
+# turns can widen via the CLI flag.
+_DEFAULT_ASSISTANT_MAX_USER_GAP_SECONDS = 600
+
+
+# Match-pass discriminator on a proposal. Pass 1 (user-turn match)
+# emits `"user"`; Pass 2 (assistant-turn match) emits `"assistant"`.
+# Legacy proposal files carry no match_pass field; the parser
+# defaults missing values to `"user"` so those files still apply.
+_MATCH_PASS_USER = "user"
+_MATCH_PASS_ASSISTANT = "assistant"
+_VALID_MATCH_PASSES = frozenset({_MATCH_PASS_USER, _MATCH_PASS_ASSISTANT})
 
 
 # Metadata keys the apply-time fingerprint covers. Selected so a drift
@@ -210,6 +240,23 @@ class Proposal:
     Row text and candidate text snippets ride along so a hand audit
     of the proposals file does not require cross-referencing back
     to the store and the JSONL.
+
+    `match_pass` records which pass produced this proposal: `"user"`
+    means the row text overlapped a user turn directly (Pass 1);
+    `"assistant"` means the row text overlapped an assistant turn
+    and the harness selected the unique preceding user turn within
+    the boundary window as the source (Pass 2). For Pass 2 proposals,
+    `assistant_ts`, `assistant_text_sha256`, and `assistant_text_
+    snippet` carry the assistant evidence that authorized the match;
+    apply re-verifies the assistant line at write time. For Pass 1
+    proposals, all three fields are empty strings (the schema is
+    uniform across passes).
+
+    The four `source_*` keys actually written to Mem0 metadata are
+    user-side only on both passes. The assistant fields are
+    verification-only: they let apply detect assistant-line drift
+    between dry-run and apply, but they are not persisted as durable
+    row metadata.
     """
 
     memory_id: str
@@ -224,6 +271,10 @@ class Proposal:
     prior_metadata_sha256: str
     row_text_snippet: str
     candidate_text_snippet: str
+    match_pass: str = _MATCH_PASS_USER
+    assistant_ts: str = ""
+    assistant_text_sha256: str = ""
+    assistant_text_snippet: str = ""
 
 
 @dataclass(frozen=True)
@@ -413,6 +464,93 @@ def _gate_match(
     return None, SKIP_AMBIGUOUS_OVERLAP, runner_up_score
 
 
+# ── Pure helpers: Pass 2 (assistant-turn matching) ─────────────────
+
+
+def _pair_winning_assistant_with_user(
+    records: list[dict],
+    winning_assistant_ts: str,
+    *,
+    max_user_gap_seconds: int,
+) -> tuple[dict | None, str | None]:
+    """Bind a Pass 2 winning assistant turn to its source user turn.
+
+    The pairing rule is conservative: walk backwards from the winning
+    assistant turn to the previous assistant boundary, then look at
+    the user turns sitting between that boundary and the winner.
+    "Exactly one" produces a confident source; "zero" or "two or
+    more" both bucket the row out of Pass 2 so the harness never
+    stamps a wrong-source pointer from an ambiguous neighborhood.
+
+    Returns `(user_record, skip_reason)` where exactly one of the
+    two is non-None:
+
+    - `(user_record, None)`: pairing succeeded; `user_record` is the
+      unique preceding user turn within the boundary window AND
+      within `max_user_gap_seconds` of the winning assistant turn.
+    - `(None, SKIP_NO_PRECEDING_USER)`: no user turn sits between the
+      boundary and the winner, or the unique user turn exceeds the
+      max-gap guard. Same bucket because the operator's tuning
+      advice is the same (widen the gap if appropriate).
+    - `(None, SKIP_AMBIGUOUS_USER_PAIRING)`: two or more user turns
+      between the boundary and the winner. No tuning unlocks this;
+      the pairing is genuinely ambiguous and the row stays in the
+      curation backlog.
+
+    `records` is the full window cache (both directions) in file-
+    then-line order. The function trusts the cache's validation
+    contract (every record has a parseable `ts`); a winner whose ts
+    does not appear in `records` returns `(None, SKIP_NO_PRECEDING_
+    USER)` rather than crashing.
+    """
+    winner_index = -1
+    for i, rec in enumerate(records):
+        if rec.get("dir") == "assistant" and rec.get("ts") == winning_assistant_ts:
+            winner_index = i
+            break
+    if winner_index < 0:
+        return None, SKIP_NO_PRECEDING_USER
+
+    # Walk back from the winner to the previous assistant record (the
+    # boundary). The user turns we will consider are those between
+    # boundary and winner exclusive. If no prior assistant exists in
+    # the window, the boundary is the start of the cache.
+    boundary_index = -1
+    for j in range(winner_index - 1, -1, -1):
+        if records[j].get("dir") == "assistant":
+            boundary_index = j
+            break
+
+    user_candidates = [rec for rec in records[boundary_index + 1 : winner_index] if rec.get("dir") == "user"]
+    if not user_candidates:
+        return None, SKIP_NO_PRECEDING_USER
+    if len(user_candidates) >= 2:
+        return None, SKIP_AMBIGUOUS_USER_PAIRING
+
+    source_user = user_candidates[0]
+    # Max-gap guard. The cache's validation contract guarantees
+    # parseable ts on every record, so the fromisoformat call here
+    # is total; the bare try/except is defensive insurance against a
+    # future change to the cache contract.
+    try:
+        user_dt = datetime.fromisoformat(source_user["ts"])
+        winner_dt = datetime.fromisoformat(winning_assistant_ts)
+    except (ValueError, KeyError):
+        return None, SKIP_NO_PRECEDING_USER
+    if user_dt.tzinfo is None:
+        user_dt = user_dt.replace(tzinfo=UTC)
+    if winner_dt.tzinfo is None:
+        winner_dt = winner_dt.replace(tzinfo=UTC)
+    gap = (winner_dt - user_dt).total_seconds()
+    if gap > max_user_gap_seconds:
+        # A user turn exists but the boundary-to-winner window opens
+        # too wide. The conservative call is to skip; widening the
+        # CLI flag is the operator's call.
+        return None, SKIP_NO_PRECEDING_USER
+
+    return source_user, None
+
+
 # ── Pure helpers: selection and fingerprinting ──────────────────────
 
 
@@ -530,26 +668,57 @@ def _read_jsonl_records(path: Path) -> list[dict] | None:
     return records
 
 
-def _candidates_for_row(
+def _records_for_row_window(
     chat_id: int,
     created_at_dt: datetime,
     *,
     window_seconds: int,
 ) -> tuple[list[dict], bool]:
-    """Return user-direction records in the row's window plus an
-    `any_unreadable` flag.
+    """Return EVERY in-window JSONL record (both directions) in file-
+    then-line order, plus an `any_unreadable` flag.
 
-    Walks every JSONL file intersecting the window
-    `[created_at - window_seconds, created_at]`. When ANY intersecting
-    file exists but cannot be read, returns `(records_so_far, True)`:
-    the caller buckets the row as HISTORY_UNREADABLE rather than
-    scoring against partial history (a winner picked from partial
-    data could be wrong because the true source sits inside the
-    unreadable file). Absent files (no chat that day) are normal and
-    do not raise the flag.
+    Both passes read the same window. Pass 1 filters the cache to
+    user-direction records at its scoring site; Pass 2 filters the
+    same cache to assistant-direction records and walks back across
+    record order to bind a winning assistant turn to the preceding
+    user turn. Returning the full window from one reader is what
+    lets the two passes share one disk read per file.
 
-    Returns user-direction records whose `ts` falls inside the
-    window, in file-then-line order. The caller scores them.
+    Validation contract (fail-closed on partial history):
+
+    - File-level: an existing-but-unreadable file (`OSError` from the
+      read, or a `JSONDecodeError` on any line) flips `any_unreadable`
+      to True. The caller treats absence (no file for that day) as
+      "no chat that day", which is normal; absence does NOT raise the
+      flag. Unreadability does.
+    - Per-record: every record in a readable file must validate. The
+      checks fire on records of BOTH directions because Pass 2 binds
+      a user turn to an assistant turn, and a malformed assistant
+      record between them can hide the boundary the pairing walk
+      depends on. Failed checks: `dir` not a non-empty string;
+      `chat_id` missing or not equal to the CLI chat id; `text` not
+      a string; `ts` missing, non-string, or unparseable as ISO. Any
+      failure on ANY record flips `any_unreadable` to True.
+
+    The `chat_id` check defends against a polluted file (a copy of
+    another user's JSONL accidentally placed under this user's
+    directory). The original Mem0/Telegram pipeline already partitions
+    by user; the per-record gate stops a manual restore mishap from
+    becoming a scoring signal.
+
+    Records whose `dir` is neither `"user"` nor `"assistant"` are
+    silently dropped (some future direction sentinel arriving in the
+    log would not be a corruption signal, just an unknown record we
+    do not score against). Validation still runs on those records so
+    a malformed-`ts` user record disguised as an unknown direction
+    cannot escape the gate.
+
+    Returns:
+        (records, any_unreadable). `records` is in file-then-line
+        order across every JSONL file intersecting the window; each
+        entry's `ts` parses, each is for `chat_id`, each has a string
+        `dir`/`text`. `records` is non-empty only when the cache is
+        clean enough to score against.
     """
     window_start = created_at_dt - timedelta(seconds=window_seconds)
     window_end = created_at_dt
@@ -562,18 +731,25 @@ def _candidates_for_row(
             any_unreadable = True
             continue
         for rec in records:
-            if rec.get("dir") != "user":
+            # Per-record validation runs on every record regardless of
+            # direction. A malformed assistant record between two user
+            # records can hide the assistant boundary Pass 2 walks
+            # against; treating its corruption as silent would let
+            # partial history become a scoring signal.
+            direction = rec.get("dir")
+            if not isinstance(direction, str) or not direction:
+                any_unreadable = True
                 continue
-            # User-record corruption is the same partial-history hazard
-            # as a malformed JSON line: a true-source user record whose
-            # `ts` is missing, the wrong type, or unparseable would be
-            # silently dropped from the candidate set, leaving an
-            # unrelated valid user record free to win the overlap. Mark
-            # the file as unreadable for THIS row so the caller buckets
-            # the whole row HISTORY_UNREADABLE rather than scoring
-            # against incomplete evidence.
+            rec_chat_id = rec.get("chat_id")
+            if rec_chat_id != chat_id:
+                any_unreadable = True
+                continue
+            text = rec.get("text")
+            if not isinstance(text, str):
+                any_unreadable = True
+                continue
             ts = rec.get("ts")
-            if not isinstance(ts, str):
+            if not isinstance(ts, str) or not ts:
                 any_unreadable = True
                 continue
             try:
@@ -583,6 +759,12 @@ def _candidates_for_row(
                 continue
             if rec_dt.tzinfo is None:
                 rec_dt = rec_dt.replace(tzinfo=UTC)
+            # Only the two known directions enter the cache. Other
+            # values pass validation (they are not corruption per se),
+            # but the caller has no use for them; dropping them at
+            # the reader keeps both pass filters cheap.
+            if direction not in {"user", "assistant"}:
+                continue
             if window_start <= rec_dt <= window_end:
                 out.append(rec)
     return out, any_unreadable
@@ -592,7 +774,17 @@ def _candidates_for_row(
 
 
 def render_proposals(header: dict[str, Any], proposals: list[Proposal]) -> str:
-    """Serialize a proposals file: header line, then proposal lines."""
+    """Serialize a proposals file: header line, then proposal lines.
+
+    Schema is uniform across passes: every proposal carries
+    `match_pass`, `assistant_ts`, `assistant_text_sha256`, and
+    `assistant_text_snippet`. Pass 1 proposals set `match_pass` to
+    `"user"` and the three assistant fields to empty strings; Pass 2
+    proposals set `match_pass` to `"assistant"` and populate the
+    other three. Keeping the shape uniform across passes means a
+    downstream tool reading the JSONL never needs a per-row branch
+    on the discriminator.
+    """
     lines = [json.dumps({"type": "header", **header}, separators=(",", ":"))]
     for p in proposals:
         lines.append(
@@ -611,6 +803,10 @@ def render_proposals(header: dict[str, Any], proposals: list[Proposal]) -> str:
                     "prior_metadata_sha256": p.prior_metadata_sha256,
                     "row_text_snippet": p.row_text_snippet,
                     "candidate_text_snippet": p.candidate_text_snippet,
+                    "match_pass": p.match_pass,
+                    "assistant_ts": p.assistant_ts,
+                    "assistant_text_sha256": p.assistant_text_sha256,
+                    "assistant_text_snippet": p.assistant_text_snippet,
                 },
                 separators=(",", ":"),
             )
@@ -736,6 +932,49 @@ def parse_proposals(text: str) -> tuple[dict[str, Any], list[Proposal]]:
         prior_fp = raw.get("prior_metadata_sha256")
         if not isinstance(prior_fp, str) or not prior_fp:
             raise ValueError(f"proposal line {i}: prior_metadata_sha256 must be a non-empty string")
+
+        # match_pass discriminator. Missing defaults to "user" for
+        # backward compatibility with legacy proposal files written
+        # before Pass 2 existed; those files have no match_pass field
+        # at all and must parse cleanly as Pass 1 proposals.
+        match_pass_raw = raw.get("match_pass", _MATCH_PASS_USER)
+        if not isinstance(match_pass_raw, str) or match_pass_raw not in _VALID_MATCH_PASSES:
+            raise ValueError(
+                f"proposal line {i}: match_pass must be one of {sorted(_VALID_MATCH_PASSES)}, got {match_pass_raw!r}"
+            )
+
+        # Assistant evidence fields. Default to empty strings on Pass
+        # 1 proposals so the schema stays uniform; Pass 2 requires
+        # non-empty values for both the timestamp and the hash. The
+        # timestamp must also parse via fromisoformat so the apply
+        # helper can derive the assistant JSONL date without catching
+        # a runtime parse error.
+        assistant_ts_raw = raw.get("assistant_ts", "")
+        if not isinstance(assistant_ts_raw, str):
+            raise ValueError(f"proposal line {i}: assistant_ts must be a string")
+        assistant_sha_raw = raw.get("assistant_text_sha256", "")
+        if not isinstance(assistant_sha_raw, str):
+            raise ValueError(f"proposal line {i}: assistant_text_sha256 must be a string")
+        assistant_snippet_raw = raw.get("assistant_text_snippet", "")
+        if not isinstance(assistant_snippet_raw, str):
+            raise ValueError(f"proposal line {i}: assistant_text_snippet must be a string")
+
+        if match_pass_raw == _MATCH_PASS_ASSISTANT:
+            if not assistant_ts_raw:
+                raise ValueError(f"proposal line {i}: match_pass='assistant' requires non-empty assistant_ts")
+            try:
+                datetime.fromisoformat(assistant_ts_raw)
+            except ValueError as e:
+                # Authorization-artifact gate: a hand-edited proposal
+                # whose assistant_ts is non-empty but unparseable
+                # would otherwise crash the apply-time assistant
+                # helper trying to derive the JSONL date. Failing
+                # closed at parse time means apply never has to
+                # handle a parse error on this field.
+                raise ValueError(f"proposal line {i}: assistant_ts must be a parseable ISO timestamp ({e})") from e
+            if not assistant_sha_raw:
+                raise ValueError(f"proposal line {i}: match_pass='assistant' requires non-empty assistant_text_sha256")
+
         proposals.append(
             Proposal(
                 memory_id=mid,
@@ -750,6 +989,10 @@ def parse_proposals(text: str) -> tuple[dict[str, Any], list[Proposal]]:
                 prior_metadata_sha256=prior_fp,
                 row_text_snippet=str(raw.get("row_text_snippet", "")),
                 candidate_text_snippet=str(raw.get("candidate_text_snippet", "")),
+                match_pass=match_pass_raw,
+                assistant_ts=assistant_ts_raw,
+                assistant_text_sha256=assistant_sha_raw,
+                assistant_text_snippet=assistant_snippet_raw,
             )
         )
     return header, proposals
@@ -824,6 +1067,8 @@ def render_report(
     min_overlap: float,
     strong_overlap_ratio: float,
     shingle_n: int,
+    assistant_pass_enabled: bool,
+    assistant_max_user_gap_seconds: int,
     scanned: int,
     selected: int,
     matches: list[RowMatch],
@@ -833,16 +1078,22 @@ def render_report(
     """Build the human-readable dry-run report.
 
     Pure function (no IO). The report has four sections: parameters,
-    counts, a sample of STRONG_MATCH proposals (so the operator can
-    eyeball auto-matches), and a curation backlog (AMBIGUOUS_OVERLAP
-    plus NO_CANDIDATE rows with their top candidates). Order is
-    deterministic so two runs over the same data render byte-
-    identically.
+    counts (including the user-vs-assistant pass distribution and
+    every Pass 2 skip bucket), a sample of STRONG_MATCH proposals,
+    and a curation backlog. Order is deterministic so two runs over
+    the same data render byte-identically.
     """
     proposals = [m for m in matches if m.bucket == "STRONG_MATCH"]
+    user_pass = sum(1 for m in proposals if m.proposal is not None and m.proposal.match_pass == _MATCH_PASS_USER)
+    assistant_pass = sum(
+        1 for m in proposals if m.proposal is not None and m.proposal.match_pass == _MATCH_PASS_ASSISTANT
+    )
     ambiguous = [m for m in matches if m.bucket == SKIP_AMBIGUOUS_OVERLAP]
     no_candidate = [m for m in matches if m.bucket == SKIP_NO_CANDIDATE]
     history_unreadable = [m for m in matches if m.bucket == SKIP_HISTORY_UNREADABLE]
+    assistant_ambiguous = [m for m in matches if m.bucket == SKIP_ASSISTANT_AMBIGUOUS_OVERLAP]
+    no_preceding_user = [m for m in matches if m.bucket == SKIP_NO_PRECEDING_USER]
+    ambiguous_user_pairing = [m for m in matches if m.bucket == SKIP_AMBIGUOUS_USER_PAIRING]
 
     lines = [
         f"# Backfill provenance dry-run report: {run_id}",
@@ -852,18 +1103,35 @@ def render_report(
         f"Min overlap: {min_overlap}",
         f"Strong overlap ratio: {strong_overlap_ratio}",
         f"Shingle n: {shingle_n}",
+        f"Assistant pass: {'enabled' if assistant_pass_enabled else 'disabled'} "
+        f"(max user gap: {assistant_max_user_gap_seconds}s)",
         "",
         "## Counts",
         "",
         f"- scanned: {scanned}",
         f"- selected: {selected}",
-        f"- proposals (STRONG_MATCH): {len(proposals)}",
+        f"- proposals (STRONG_MATCH): {len(proposals)}  (user: {user_pass}, assistant: {assistant_pass})",
         f"- skipped ambiguous_overlap: {len(ambiguous)}",
         f"- skipped no_candidate: {len(no_candidate)}",
         f"- skipped history_unreadable: {len(history_unreadable)}",
+        f"- skipped assistant_ambiguous_overlap: {len(assistant_ambiguous)}",
+        f"- skipped no_preceding_user: {len(no_preceding_user)}",
+        f"- skipped ambiguous_user_pairing: {len(ambiguous_user_pairing)}",
     ]
+    # Reserved skip buckets that the report renders explicitly above;
+    # any other bucket coming through the `skips` dict is rendered in
+    # alphabetical order at the tail so report counts stay deterministic
+    # across runs.
+    _RESERVED_BUCKETS = {
+        SKIP_AMBIGUOUS_OVERLAP,
+        SKIP_NO_CANDIDATE,
+        SKIP_HISTORY_UNREADABLE,
+        SKIP_ASSISTANT_AMBIGUOUS_OVERLAP,
+        SKIP_NO_PRECEDING_USER,
+        SKIP_AMBIGUOUS_USER_PAIRING,
+    }
     for reason, ids in sorted(skips.items()):
-        if reason in {SKIP_AMBIGUOUS_OVERLAP, SKIP_NO_CANDIDATE, SKIP_HISTORY_UNREADABLE}:
+        if reason in _RESERVED_BUCKETS:
             continue
         lines.append(f"- skipped {reason}: {len(ids)}")
 
@@ -873,22 +1141,43 @@ def render_report(
             assert m.proposal is not None
             lines.extend(_render_row_sample(m))
 
-    if (ambiguous or no_candidate) and sample_size > 0:
+    # Curation backlog covers every bucket that an operator might
+    # address either via tooling tuning or via the future curation
+    # tool. Pass 2 skip buckets join Pass 1's here so a single review
+    # pass sees the whole NEEDS_CURATION space.
+    backlog = ambiguous + no_candidate + assistant_ambiguous + no_preceding_user + ambiguous_user_pairing
+    if backlog and sample_size > 0:
         lines.extend(["", "## Curation backlog (operator review)"])
-        for m in (ambiguous + no_candidate)[:sample_size]:
+        for m in backlog[:sample_size]:
             lines.extend(_render_row_sample(m))
 
     return "\n".join(lines) + "\n"
 
 
 def _render_row_sample(match: RowMatch) -> list[str]:
-    """Render one RowMatch as a markdown sub-section."""
+    """Render one RowMatch as a markdown sub-section.
+
+    Pass 2 STRONG_MATCH samples carry both the assistant text
+    snippet (the discriminator that authorized the match) and the
+    user text snippet (the source the harness will stamp). The
+    operator can audit either side without opening the proposals
+    JSONL.
+    """
+    heading_tag = match.bucket
+    if match.proposal is not None and match.proposal.match_pass == _MATCH_PASS_ASSISTANT:
+        heading_tag = f"{match.bucket} via assistant pass"
     out = [
         "",
-        f"### {match.row.id} ({match.bucket})",
+        f"### {match.row.id} ({heading_tag})",
         "",
         f"Row: {_snippet(match.row.text)}",
     ]
+    if match.proposal is not None and match.proposal.match_pass == _MATCH_PASS_ASSISTANT:
+        out.append(
+            f"Assistant discriminator (ts={match.proposal.assistant_ts}): {match.proposal.assistant_text_snippet}"
+        )
+        out.append(f"Paired source user (ts={match.proposal.user_ts}): {match.proposal.candidate_text_snippet}")
+        return out
     if not match.top_candidates:
         out.append("Top candidates: (none in window)")
         return out
@@ -911,6 +1200,8 @@ async def run_dry_run(
     shingle_n: int,
     sample: int,
     out_dir: Path,
+    assistant_pass_enabled: bool = True,
+    assistant_max_user_gap_seconds: int = _DEFAULT_ASSISTANT_MAX_USER_GAP_SECONDS,
 ) -> int:
     """Score every backfill candidate and write report + proposals.
 
@@ -946,7 +1237,14 @@ async def run_dry_run(
         if created_at_dt.tzinfo is None:
             created_at_dt = created_at_dt.replace(tzinfo=UTC)
 
-        records, any_unreadable = _candidates_for_row(
+        # Single window read serves both passes. Pass 1 filters the
+        # cache to user records at the scoring site; Pass 2 filters
+        # the same cache to assistant records when Pass 1 returns no
+        # candidate. The reader's per-record validation contract
+        # covers both directions, so a malformed assistant record
+        # collapses the row even if Pass 2 never gets to use the
+        # assistant cache.
+        records, any_unreadable = _records_for_row_window(
             chat_id_int,
             created_at_dt,
             window_seconds=window_seconds,
@@ -956,9 +1254,11 @@ async def run_dry_run(
             matches.append(RowMatch(row=row, bucket=SKIP_HISTORY_UNREADABLE, top_candidates=[], proposal=None))
             continue
 
+        # Pass 1: score row text against user turns in the window.
+        user_records = [r for r in records if r["dir"] == "user"]
         scored = _score_candidates(
             row.text,
-            records,
+            user_records,
             shingle_n=shingle_n,
             created_at_dt=created_at_dt,
         )
@@ -968,38 +1268,122 @@ async def run_dry_run(
             min_overlap=min_overlap,
             strong_overlap_ratio=strong_overlap_ratio,
         )
-        if winner is None:
+
+        if winner is not None:
+            # Pass 1 STRONG_MATCH. Build a Pass 1 proposal with empty
+            # assistant fields (the schema is uniform across passes).
+            try:
+                user_ts_dt = datetime.fromisoformat(winner.ts)
+            except ValueError:
+                # Defensive: the cache contract guarantees parseable
+                # ts on every record, so this is unreachable in
+                # practice. Drop to NO_CANDIDATE rather than emitting
+                # a proposal whose date we cannot derive.
+                skips.setdefault(SKIP_NO_CANDIDATE, []).append(row.id)
+                matches.append(RowMatch(row=row, bucket=SKIP_NO_CANDIDATE, top_candidates=top, proposal=None))
+                continue
+            if user_ts_dt.tzinfo is None:
+                user_ts_dt = user_ts_dt.replace(tzinfo=UTC)
+            date = user_ts_dt.strftime("%Y-%m-%d")
+            proposal = Proposal(
+                memory_id=row.id,
+                chat_id=chat_id_int,
+                date=date,
+                user_ts=winner.ts,
+                user_text_sha256=winner.sha256,
+                overlap_score=winner.overlap_score,
+                runner_up_overlap_score=runner_up_score,
+                candidate_count=len(scored),
+                gap_seconds=winner.gap_seconds,
+                prior_metadata_sha256=_metadata_fingerprint(row.metadata),
+                row_text_snippet=_snippet(row.text),
+                candidate_text_snippet=_snippet(winner.text),
+                match_pass=_MATCH_PASS_USER,
+            )
+            matches.append(RowMatch(row=row, bucket="STRONG_MATCH", top_candidates=top, proposal=proposal))
+            continue
+
+        # Pass 1 returned None. Two skip-bucket paths from here:
+        # AMBIGUOUS_OVERLAP rows keep the Pass 1 verdict (Pass 1
+        # already had a signal); NO_CANDIDATE rows enter Pass 2 when
+        # the assistant pass is enabled.
+        if bucket != SKIP_NO_CANDIDATE or not assistant_pass_enabled:
             skips.setdefault(bucket, []).append(row.id)
             matches.append(RowMatch(row=row, bucket=bucket, top_candidates=top, proposal=None))
             continue
 
-        # STRONG_MATCH. Build the proposal with its full audit context.
+        # Pass 2: score row text against assistant turns in the same
+        # cached window.
+        assistant_records = [r for r in records if r["dir"] == "assistant"]
+        assistant_scored = _score_candidates(
+            row.text,
+            assistant_records,
+            shingle_n=shingle_n,
+            created_at_dt=created_at_dt,
+        )
+        assistant_winner, assistant_bucket, assistant_runner_up = _gate_match(
+            assistant_scored,
+            min_overlap=min_overlap,
+            strong_overlap_ratio=strong_overlap_ratio,
+        )
+        if assistant_winner is None:
+            # Pass 2 buckets are distinct from Pass 1's so the
+            # operator's tuning advice does not collapse: assistant-
+            # side ambiguity is a different signal than no candidate.
+            final_bucket = (
+                SKIP_ASSISTANT_AMBIGUOUS_OVERLAP if assistant_bucket == SKIP_AMBIGUOUS_OVERLAP else SKIP_NO_CANDIDATE
+            )
+            skips.setdefault(final_bucket, []).append(row.id)
+            matches.append(RowMatch(row=row, bucket=final_bucket, top_candidates=top, proposal=None))
+            continue
+
+        # Pass 2 found a dominant assistant turn. Bind it to the
+        # unique preceding user turn in the boundary window; the
+        # conservative pairing rule refuses anything ambiguous.
+        source_user_rec, pair_skip = _pair_winning_assistant_with_user(
+            records,
+            assistant_winner.ts,
+            max_user_gap_seconds=assistant_max_user_gap_seconds,
+        )
+        if source_user_rec is None:
+            assert pair_skip is not None
+            skips.setdefault(pair_skip, []).append(row.id)
+            matches.append(RowMatch(row=row, bucket=pair_skip, top_candidates=top, proposal=None))
+            continue
+
+        source_user_text = source_user_rec.get("text", "")
+        source_user_ts = source_user_rec.get("ts", "")
         try:
-            user_ts_dt = datetime.fromisoformat(winner.ts)
+            user_ts_dt = datetime.fromisoformat(source_user_ts)
         except ValueError:
-            # Defensive: _score_candidates already filtered malformed
-            # timestamps, so this is unreachable in practice. Drop the
-            # row to NO_CANDIDATE if it somehow happens; do not write
-            # a proposal whose date we cannot derive.
-            skips.setdefault(SKIP_NO_CANDIDATE, []).append(row.id)
-            matches.append(RowMatch(row=row, bucket=SKIP_NO_CANDIDATE, top_candidates=top, proposal=None))
+            # Unreachable under the cache contract; if it does fire,
+            # the row stays in the curation backlog rather than
+            # producing a proposal with an underivable date.
+            skips.setdefault(SKIP_NO_PRECEDING_USER, []).append(row.id)
+            matches.append(RowMatch(row=row, bucket=SKIP_NO_PRECEDING_USER, top_candidates=top, proposal=None))
             continue
         if user_ts_dt.tzinfo is None:
             user_ts_dt = user_ts_dt.replace(tzinfo=UTC)
         date = user_ts_dt.strftime("%Y-%m-%d")
+        user_sha = hashlib.sha256(source_user_text.encode("utf-8")).hexdigest()
+
         proposal = Proposal(
             memory_id=row.id,
             chat_id=chat_id_int,
             date=date,
-            user_ts=winner.ts,
-            user_text_sha256=winner.sha256,
-            overlap_score=winner.overlap_score,
-            runner_up_overlap_score=runner_up_score,
-            candidate_count=len(scored),
-            gap_seconds=winner.gap_seconds,
+            user_ts=source_user_ts,
+            user_text_sha256=user_sha,
+            overlap_score=assistant_winner.overlap_score,
+            runner_up_overlap_score=assistant_runner_up,
+            candidate_count=len(assistant_scored),
+            gap_seconds=assistant_winner.gap_seconds,
             prior_metadata_sha256=_metadata_fingerprint(row.metadata),
             row_text_snippet=_snippet(row.text),
-            candidate_text_snippet=_snippet(winner.text),
+            candidate_text_snippet=_snippet(source_user_text),
+            match_pass=_MATCH_PASS_ASSISTANT,
+            assistant_ts=assistant_winner.ts,
+            assistant_text_sha256=assistant_winner.sha256,
+            assistant_text_snippet=_snippet(assistant_winner.text),
         )
         matches.append(RowMatch(row=row, bucket="STRONG_MATCH", top_candidates=top, proposal=proposal))
 
@@ -1017,6 +1401,8 @@ async def run_dry_run(
         "min_overlap": min_overlap,
         "strong_overlap_ratio": strong_overlap_ratio,
         "shingle_n": shingle_n,
+        "assistant_pass_enabled": assistant_pass_enabled,
+        "assistant_max_user_gap_seconds": assistant_max_user_gap_seconds,
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
     }
     proposals_path = out_dir / f"backfill-{run_id}-proposals.jsonl"
@@ -1030,6 +1416,8 @@ async def run_dry_run(
             min_overlap=min_overlap,
             strong_overlap_ratio=strong_overlap_ratio,
             shingle_n=shingle_n,
+            assistant_pass_enabled=assistant_pass_enabled,
+            assistant_max_user_gap_seconds=assistant_max_user_gap_seconds,
             scanned=len(rows),
             selected=len(selected_rows),
             matches=matches,
@@ -1071,12 +1459,14 @@ def _verify_jsonl_user_text(
 ) -> bool:
     """Re-fetch the user line from JSONL at apply time, recompute sha.
 
-    Returns True when the line exists AND its sha256 matches the
-    expected fingerprint. False when the file is gone, the line is
-    gone, or the text has drifted. The apply-time transcript-drift
-    gate is the only safety check the harness has against a JSONL
-    edit between dry-run and apply; without it, a proposal stamped
-    against a since-modified turn would write an invalid pointer.
+    Returns True when the line exists, its `chat_id` matches the
+    expected chat, AND its sha256 matches the expected fingerprint.
+    False when the file is gone, the line is gone, the chat_id has
+    drifted, or the text has drifted. The chat_id check defends
+    against a polluted file with a same-ts/same-text record under
+    the wrong owner: hash verification alone would let that slip
+    past, leaving the row stamped with a source pointer that does
+    not actually belong to the user.
     """
     path = _LOG_DIR / str(chat_id) / f"{date}.jsonl"
     records = _read_jsonl_records(path)
@@ -1087,6 +1477,55 @@ def _verify_jsonl_user_text(
             continue
         if rec.get("ts") != user_ts:
             continue
+        if rec.get("chat_id") != chat_id:
+            # Per-record ownership gate. A restored or misplaced file
+            # with a matching ts but the wrong owner is a forged
+            # pointer; refuse to authorize the apply.
+            return False
+        text = rec.get("text", "")
+        if not isinstance(text, str):
+            return False
+        return hashlib.sha256(text.encode("utf-8")).hexdigest() == expected_sha256
+    return False
+
+
+def _verify_jsonl_assistant_text(
+    chat_id: int,
+    assistant_ts: str,
+    expected_sha256: str,
+) -> bool:
+    """Re-fetch the assistant line from JSONL at apply time.
+
+    Pass 2's assistant evidence authorized the proposal at dry-run;
+    apply re-verifies it before writing so a wrong-source pointer
+    cannot pass through if the assistant line was edited, deleted,
+    or replaced between the two runs.
+
+    Derives the JSONL file from `assistant_ts`'s UTC date, which can
+    differ from `proposal.date` (the user-side date) when the user
+    and assistant turns straddle midnight. `parse_proposals` already
+    rejected proposals whose `assistant_ts` is non-parseable, so the
+    fromisoformat call here is total.
+
+    Returns True only when the line exists, has `dir == "assistant"`,
+    matches `chat_id`, and hashes to `expected_sha256`. False
+    otherwise.
+    """
+    assistant_dt = datetime.fromisoformat(assistant_ts)
+    if assistant_dt.tzinfo is None:
+        assistant_dt = assistant_dt.replace(tzinfo=UTC)
+    assistant_date = assistant_dt.strftime("%Y-%m-%d")
+    path = _LOG_DIR / str(chat_id) / f"{assistant_date}.jsonl"
+    records = _read_jsonl_records(path)
+    if not records:
+        return False
+    for rec in records:
+        if rec.get("dir") != "assistant":
+            continue
+        if rec.get("ts") != assistant_ts:
+            continue
+        if rec.get("chat_id") != chat_id:
+            return False
         text = rec.get("text", "")
         if not isinstance(text, str):
             return False
@@ -1173,6 +1612,19 @@ async def run_apply(
         ):
             skips.setdefault(SKIP_TRANSCRIPT_DRIFT, []).append(proposal.memory_id)
             continue
+        # Pass 2 proposals carry assistant-side evidence that
+        # authorized the dry-run match. Apply re-verifies the
+        # assistant line (hash + chat_id) so a drift between dry-run
+        # and apply collapses the proposal to SKIP_ASSISTANT_DRIFT
+        # rather than writing a row whose user-side stamp is intact
+        # but whose discriminator is gone.
+        if proposal.match_pass == _MATCH_PASS_ASSISTANT and not _verify_jsonl_assistant_text(
+            chat_id=proposal.chat_id,
+            assistant_ts=proposal.assistant_ts,
+            expected_sha256=proposal.assistant_text_sha256,
+        ):
+            skips.setdefault(SKIP_ASSISTANT_DRIFT, []).append(proposal.memory_id)
+            continue
         survivors.append((proposal, row))
 
     if not survivors:
@@ -1240,9 +1692,11 @@ async def run_apply(
                         "memory_id": row.id,
                         "user_id": user_id,
                         "run_id": run_id,
+                        "match_pass": proposal.match_pass,
                         "overlap_score": proposal.overlap_score,
                         "gap_seconds": proposal.gap_seconds,
                         "source_user_ts": proposal.user_ts,
+                        "assistant_ts": proposal.assistant_ts,
                     },
                     separators=(",", ":"),
                 ),
