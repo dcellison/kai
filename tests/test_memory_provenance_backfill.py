@@ -1569,6 +1569,29 @@ class TestPass2Algorithm:
         # the same in both cases.
         assert "skipped no_preceding_user: 1" in report
 
+    def test_pass2_skips_when_user_timestamp_is_after_assistant(self, history_dir, tmp_path):
+        chat_id = 1
+        # The user line sits BEFORE the assistant in JSONL order but
+        # AFTER it by timestamp. An assistant turn cannot be sourced
+        # by a later user turn; the file's apparent "preceding"
+        # relationship is corrupt. The pairing rule must refuse
+        # rather than stamp a wrong-direction pointer.
+        _write_jsonl(
+            history_dir,
+            chat_id,
+            "2026-06-12",
+            [
+                _user_rec("2026-06-12T10:02:00+00:00", _PASS2_USER_TEXT),
+                _assistant_rec("2026-06-12T10:01:00+00:00", _PASS2_ASSISTANT_TEXT),
+            ],
+        )
+        row = _alive_row(row_id="m1", text=_PASS2_ROW_TEXT, created_at="2026-06-12T10:05:00+00:00")
+        out_dir = self._dry_run(history_dir, tmp_path, row)
+        proposals = self._proposals_in(out_dir)
+        assert proposals == []
+        report = self._report_in(out_dir)
+        assert "skipped no_preceding_user: 1" in report
+
     # Test 6.
     def test_pass2_skips_ambiguous_user_pairing(self, history_dir, tmp_path):
         chat_id = 1

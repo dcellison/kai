@@ -489,9 +489,12 @@ def _pair_winning_assistant_with_user(
       unique preceding user turn within the boundary window AND
       within `max_user_gap_seconds` of the winning assistant turn.
     - `(None, SKIP_NO_PRECEDING_USER)`: no user turn sits between the
-      boundary and the winner, or the unique user turn exceeds the
-      max-gap guard. Same bucket because the operator's tuning
-      advice is the same (widen the gap if appropriate).
+      boundary and the winner; OR the unique user turn exceeds the
+      max-gap guard; OR the unique user turn's timestamp is AFTER
+      the assistant's (JSONL order disagrees with timestamps, so
+      the file's apparent "preceding" relationship is corrupt).
+      Same bucket because the operator-visible outcome is the same:
+      no usable preceding user turn for the winner.
     - `(None, SKIP_AMBIGUOUS_USER_PAIRING)`: two or more user turns
       between the boundary and the winner. No tuning unlocks this;
       the pairing is genuinely ambiguous and the row stays in the
@@ -542,6 +545,17 @@ def _pair_winning_assistant_with_user(
     if winner_dt.tzinfo is None:
         winner_dt = winner_dt.replace(tzinfo=UTC)
     gap = (winner_dt - user_dt).total_seconds()
+    if gap < 0:
+        # The candidate user record appears before the winning
+        # assistant in JSONL order but its timestamp is AFTER the
+        # assistant's. An assistant turn cannot be sourced by a
+        # later user turn, so the file's JSONL order disagrees with
+        # the timestamps; treat that as a partial-history hazard
+        # and refuse to stamp a wrong-direction pointer. The bucket
+        # matches the max-gap case because the operator-visible
+        # outcome is the same: no usable preceding user turn for
+        # this winner.
+        return None, SKIP_NO_PRECEDING_USER
     if gap > max_user_gap_seconds:
         # A user turn exists but the boundary-to-winner window opens
         # too wide. The conservative call is to skip; widening the
