@@ -145,13 +145,96 @@ class TestCoverageReport:
         # Neither contributed to kai's counts.
         assert report.per_project["kai"].total_probes == 0
 
-    def test_empty_registry_renders_no_per_project_entries(self):
+    def test_empty_registry_is_a_shortfall_by_default(self):
+        # The tool's primary job is per-project safety coverage; an
+        # empty memory-enabled registry plus no per-project shortfalls
+        # would have been a meaningless "all met" before. Now it
+        # surfaces an explicit shortfall so the operator either fixes
+        # the registry or opts in to --non-project-only.
         report = check_corpus_coverage([], {}, _MINIMUMS)
         assert report.per_project == {}
-        # Non-project minimum still fires when the corpus is empty.
-        assert report.shortfalls == [
-            "non-project (workspace=null): 0 probes (need 1)",
+        assert any("registry has no memory-enabled projects" in s for s in report.shortfalls)
+        # The non-project minimum still fires too because the corpus
+        # is empty.
+        assert any("non-project (workspace=null)" in s for s in report.shortfalls)
+
+    def test_empty_registry_passes_under_non_project_only(self, tmp_path):
+        # Corpus deliberately exercises only the global section; the
+        # non-project minimum is the only check that applies.
+        probes = [_probe(line=1, expected_fact_id="x", workspace=None)]
+        report = check_corpus_coverage([*probes], {}, _MINIMUMS, non_project_only=True)
+        assert report.shortfalls == []
+
+    def test_disabled_project_not_required_for_coverage(self, tmp_path):
+        # A YAML-pinned project with memory_enabled=False: production
+        # scope filter returns global-only at admission, so per-project
+        # collision probes against it would assert a property retrieval
+        # does not enforce. The coverage check filters disabled
+        # projects out of per-project minimums.
+        registry = _registry(tmp_path, "kai")
+        disabled_root = tmp_path / "disabled"
+        disabled_root.mkdir(parents=True, exist_ok=True)
+        registry["disabled"] = MemoryProjectConfig(
+            project_id="disabled",
+            display_name="disabled",
+            workspace_roots=(disabled_root.resolve(),),
+            memory_enabled=False,
+            default_scope_for_new_facts="project",
+        )
+        # Corpus exercises kai correctly but has nothing for the
+        # disabled project; this should pass without complaint about
+        # the disabled project.
+        kai_root = str(registry["kai"].workspace_roots[0])
+        probes = [
+            _probe(line=1, expected_fact_id=None, expected_excluded_fact_ids=("y",), workspace=kai_root),
+            _probe(line=2, expected_fact_id=None, expected_excluded_fact_ids=("z",), workspace=kai_root),
+            _probe(line=3, expected_fact_id="p", workspace=kai_root),
+            _probe(line=4, expected_fact_id="q", workspace=None),
         ]
+        report = check_corpus_coverage(probes, registry, _MINIMUMS)
+        # `disabled` does not appear in per_project (filtered out).
+        assert "disabled" not in report.per_project
+        # No shortfall mentions the disabled project.
+        assert all("disabled" not in s for s in report.shortfalls)
+        # And the run is otherwise clean.
+        assert report.shortfalls == []
+
+    def test_probe_pinned_to_disabled_project_does_not_count_as_unregistered(self, tmp_path):
+        # A probe whose workspace matches a disabled project's root
+        # should NOT be bucketed as unregistered (the path IS
+        # registered); it just does not contribute to coverage.
+        registry = _registry(tmp_path, "kai")
+        disabled_root = tmp_path / "disabled"
+        disabled_root.mkdir(parents=True, exist_ok=True)
+        registry["disabled"] = MemoryProjectConfig(
+            project_id="disabled",
+            display_name="disabled",
+            workspace_roots=(disabled_root.resolve(),),
+            memory_enabled=False,
+            default_scope_for_new_facts="project",
+        )
+        probes = [_probe(line=1, expected_fact_id="x", workspace=str(disabled_root))]
+        report = check_corpus_coverage(probes, registry, _MINIMUMS, non_project_only=False)
+        assert report.unregistered_workspace_count == 0
+
+    def test_unregistered_workspace_is_a_shortfall(self, tmp_path):
+        # Probe with a workspace path that no registered project
+        # matches: the operator forgot to pin a chat-registered project
+        # or the path is stale. The check must surface this.
+        registry = _registry(tmp_path, "kai")
+        kai_root = str(registry["kai"].workspace_roots[0])
+        probes = [
+            # Coverage for kai is fine.
+            _probe(line=1, expected_fact_id=None, expected_excluded_fact_ids=("y",), workspace=kai_root),
+            _probe(line=2, expected_fact_id=None, expected_excluded_fact_ids=("z",), workspace=kai_root),
+            _probe(line=3, expected_fact_id="p", workspace=kai_root),
+            _probe(line=4, expected_fact_id="q", workspace=None),
+            # One probe targeting an unregistered path.
+            _probe(line=5, expected_fact_id="r", workspace=str(tmp_path / "stale")),
+        ]
+        report = check_corpus_coverage(probes, registry, _MINIMUMS)
+        assert report.unregistered_workspace_count == 1
+        assert any("unregistered workspace" in s for s in report.shortfalls)
 
     def test_shortfalls_name_every_gap(self, tmp_path):
         registry = _registry(tmp_path, "kai")
@@ -305,6 +388,47 @@ class TestCLIExitCodes:
         assert code == 1
         err = capsys.readouterr().err
         assert "failed to load probes" in err
+
+    def test_exit_two_when_registry_empty_without_non_project_only(self, tmp_path, capsys):
+        # Empty YAML registry plus a corpus that satisfies the non-
+        # project minimum: under the old behavior this exited 0 (false
+        # green); under the new behavior the empty registry is itself
+        # a shortfall and exit is 2.
+        probes_path = tmp_path / "probes.jsonl"
+        _write_probes(probes_path, [{"question": "q", "expected_fact_id": "x"}])
+        fake_config = type("FakeConfig", (), {"memory_projects": {}})()
+        with patch("kai.config.load_config", return_value=fake_config):
+            code = main(
+                [
+                    str(probes_path),
+                    "--min-collision-per-project",
+                    "2",
+                    "--min-positive-per-project",
+                    "1",
+                    "--min-non-project",
+                    "1",
+                ]
+            )
+        assert code == 2
+        out = capsys.readouterr().out
+        assert "registry has no memory-enabled projects" in out
+
+    def test_exit_zero_under_non_project_only_with_empty_registry(self, tmp_path, capsys):
+        # Same setup as above but the operator opts in to non-project-
+        # only: empty registry is no longer a shortfall.
+        probes_path = tmp_path / "probes.jsonl"
+        _write_probes(probes_path, [{"question": "q", "expected_fact_id": "x"}])
+        fake_config = type("FakeConfig", (), {"memory_projects": {}})()
+        with patch("kai.config.load_config", return_value=fake_config):
+            code = main(
+                [
+                    str(probes_path),
+                    "--non-project-only",
+                    "--min-non-project",
+                    "1",
+                ]
+            )
+        assert code == 0
 
     def test_exit_one_when_probes_file_empty(self, tmp_path, capsys):
         # Probe file with only comment lines; loader returns [].

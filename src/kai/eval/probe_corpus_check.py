@@ -22,6 +22,15 @@ What this is NOT:
 - A check on the live legacy backlog. Coverage is measured against
   the operator's authoring intent, not against the actual /memory
   state for any user.
+- A complete corpus authoring gate. The "at least N legacy-default
+  probes" minimum from the original issue body cannot be enforced
+  here: distinguishing a legacy-default-targeting probe from any
+  other positive probe requires reading the expected_fact_id row's
+  `scope_source` from the live store. The check covers STRUCTURAL
+  minimums (collision count, positive-only count, non-project count,
+  unregistered-workspace gate); legacy-default coverage is verified
+  separately by running the scoped evaluator and inspecting the
+  per-probe `scoped_reason` distribution.
 
 Exit codes mirror the admin-CLI convention:
 - 0: corpus meets every documented minimum
@@ -151,6 +160,8 @@ def check_corpus_coverage(
     probes: list[ScopedProbe],
     registry: dict[str, MemoryProjectConfig],
     minimums: CoverageMinimums,
+    *,
+    non_project_only: bool = False,
 ) -> CoverageReport:
     """Compute the coverage report for a probe corpus.
 
@@ -159,29 +170,46 @@ def check_corpus_coverage(
     codes; unit tests exercise this function directly with hand-
     constructed registries and probe lists.
 
-    Algorithm:
-        1. Initialize an empty ProjectCoverage for every registered
-           project so the report names zero-coverage projects
-           explicitly.
-        2. For each probe, detect its active project via the same
-           rule the scoped evaluator uses, bucket it, and classify.
-        3. After bucketing, walk every project and compute the
-           shortfall list against the minimums.
+    Registry filtering: only projects with `memory_enabled=True`
+    contribute to per-project minimums. The scoped retrieval helper
+    treats a detected disabled project as global-only at admission
+    (it carries the active-project debug metadata but produces
+    `allowed_scopes=("global",)`), so requiring collision probes
+    against a disabled project would assert a property the scope
+    filter does not enforce. Disabled projects do appear in the
+    report's diagnostics so the operator sees they exist; they just
+    do not block coverage.
 
-    Workspace=null probes contribute to `non_project_count` only.
-    Workspaces that match no registered project contribute to
-    `unregistered_workspace_count` and are NOT counted against any
-    per-project minimum (because they cannot be: an unregistered
-    workspace can never have collision probes for a project that
-    does not exist).
+    Non-project-only mode: when set, per-project minimums are
+    suppressed and an empty memory-enabled registry stops being a
+    shortfall. The mode exists for corpora that deliberately exercise
+    only the global section (e.g. a smoke test corpus for the
+    global-only retrieval posture). Without the mode, an empty
+    memory-enabled registry is a shortfall (the tool's primary job
+    is per-project safety coverage; "nothing to check" is not a
+    meaningful pass).
+
+    Unregistered workspace probes (workspace set but matching no
+    registered project) are always a shortfall. Either the operator
+    forgot to pin a chat-registered project in YAML, or the
+    workspace path is stale. Silent counting would let the corpus
+    exercise zero active projects while automation read exit 0.
     """
-    per_project_total: dict[str, int] = {pid: 0 for pid in registry}
-    per_project_collision: dict[str, int] = {pid: 0 for pid in registry}
-    per_project_positive: dict[str, int] = {pid: 0 for pid in registry}
+    enabled_registry = {pid: cfg for pid, cfg in registry.items() if cfg.memory_enabled}
+
+    per_project_total: dict[str, int] = {pid: 0 for pid in enabled_registry}
+    per_project_collision: dict[str, int] = {pid: 0 for pid in enabled_registry}
+    per_project_positive: dict[str, int] = {pid: 0 for pid in enabled_registry}
     non_project_count = 0
     unregistered_workspace_count = 0
 
     for probe in probes:
+        # Detection runs against the FULL registry (including disabled
+        # projects) so a probe pinned to a disabled project's workspace
+        # is bucketed correctly as "matched a registered project",
+        # then dropped from the enabled-registry per-project counts.
+        # Without this, a disabled-project probe would falsely land in
+        # the unregistered bucket and trip the unregistered shortfall.
         bucket = _detect_probe_active_project(probe, registry)
         is_collision, is_positive_only = _classify_probe(probe)
 
@@ -190,6 +218,13 @@ def check_corpus_coverage(
                 non_project_count += 1
             else:
                 unregistered_workspace_count += 1
+            continue
+
+        if bucket not in enabled_registry:
+            # Disabled project: counted as matched-but-not-required.
+            # The probe is not a corpus authoring mistake (the path is
+            # registered), but it cannot contribute to the safety
+            # signal because the scope filter would admit global only.
             continue
 
         per_project_total[bucket] = per_project_total.get(bucket, 0) + 1
@@ -205,23 +240,40 @@ def check_corpus_coverage(
             collision_probes=per_project_collision[pid],
             positive_only_probes=per_project_positive[pid],
         )
-        for pid in sorted(registry)
+        for pid in sorted(enabled_registry)
     }
 
     shortfalls: list[str] = []
-    for pid in sorted(registry):
-        cov = per_project[pid]
-        if cov.collision_probes < minimums.min_collision_per_project:
+    if not non_project_only:
+        if not enabled_registry:
             shortfalls.append(
-                f"project {pid!r}: {cov.collision_probes} collision probes (need {minimums.min_collision_per_project})"
+                "registry has no memory-enabled projects to check per-project coverage "
+                "against (pass --non-project-only if the corpus is deliberately global-only)"
             )
-        if cov.positive_only_probes < minimums.min_positive_per_project:
-            shortfalls.append(
-                f"project {pid!r}: {cov.positive_only_probes} positive-only probes "
-                f"(need {minimums.min_positive_per_project})"
-            )
+        for pid in sorted(enabled_registry):
+            cov = per_project[pid]
+            if cov.collision_probes < minimums.min_collision_per_project:
+                shortfalls.append(
+                    f"project {pid!r}: {cov.collision_probes} collision probes "
+                    f"(need {minimums.min_collision_per_project})"
+                )
+            if cov.positive_only_probes < minimums.min_positive_per_project:
+                shortfalls.append(
+                    f"project {pid!r}: {cov.positive_only_probes} positive-only probes "
+                    f"(need {minimums.min_positive_per_project})"
+                )
     if non_project_count < minimums.min_non_project:
         shortfalls.append(f"non-project (workspace=null): {non_project_count} probes (need {minimums.min_non_project})")
+    if unregistered_workspace_count > 0:
+        # Unregistered workspaces are always a shortfall: either the
+        # operator forgot to pin chat-registered projects into YAML
+        # (the registry layer this tool reads), or the workspace path
+        # is stale. Silent counting would let the corpus exercise zero
+        # active projects while the tool reported green.
+        shortfalls.append(
+            f"unregistered workspace: {unregistered_workspace_count} probes with workspace "
+            "paths that match no registered project (pin in YAML or fix the paths)"
+        )
 
     return CoverageReport(
         per_project=per_project,
@@ -320,6 +372,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_DEFAULT_MIN_NON_PROJECT,
         help=(f"Minimum probes whose workspace is null (non-project assertions). Default: {_DEFAULT_MIN_NON_PROJECT}."),
     )
+    parser.add_argument(
+        "--non-project-only",
+        action="store_true",
+        help=(
+            "Skip the per-project minimums entirely; only the --min-non-project "
+            "threshold gates the result. Use for corpora that deliberately exercise "
+            "only the global section. Without this flag, an empty memory-enabled "
+            "registry is a shortfall (the tool's primary job is per-project safety "
+            "coverage, and 'nothing to check' would be a meaningless pass)."
+        ),
+    )
     return parser
 
 
@@ -374,7 +437,12 @@ def _run_cli(args: argparse.Namespace) -> int:
         min_positive_per_project=args.min_positive_per_project,
         min_non_project=args.min_non_project,
     )
-    report = check_corpus_coverage(probes, registry, minimums)
+    report = check_corpus_coverage(
+        probes,
+        registry,
+        minimums,
+        non_project_only=args.non_project_only,
+    )
     print(render_report(report))
     return 2 if report.shortfalls else 0
 
