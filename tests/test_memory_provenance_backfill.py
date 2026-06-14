@@ -1727,6 +1727,63 @@ class TestPerRecordValidation:
             [{"ts": 123456, "dir": "assistant", "chat_id": 1, "text": "x"}],
         )
 
+    def test_out_of_window_corruption_does_not_collapse_clean_in_window_pair(self, history_dir, tmp_path):
+        # A row at 10:05 with a 24h window scores only against
+        # records up to 10:05 on the same day. A later record at
+        # 15:00 with a mismatched chat_id or non-string text cannot
+        # affect Pass 1 scoring, Pass 2 assistant matching, or
+        # boundary pairing for this row; the reader must skip it
+        # silently rather than flag the whole window unreadable.
+        # Same-day files routinely carry post-created_at records
+        # (the assistant's reply to a later user turn), so an over-
+        # eager gate would over-reject otherwise-clean rows.
+        chat_id = 1
+        user_dir = history_dir / str(chat_id)
+        user_dir.mkdir(parents=True, exist_ok=True)
+        path = user_dir / "2026-06-12.jsonl"
+        path.write_text(
+            json.dumps({"ts": "2026-06-12T10:00:00+00:00", "dir": "user", "chat_id": 1, "text": "live user line"})
+            + "\n"
+            + json.dumps(
+                {"ts": "2026-06-12T10:01:00+00:00", "dir": "assistant", "chat_id": 1, "text": "live assistant line"}
+            )
+            + "\n"
+            + json.dumps(
+                {"ts": "2026-06-12T15:00:00+00:00", "dir": "user", "chat_id": 999, "text": "later mismatched record"}
+            )
+            + "\n"
+            + json.dumps({"ts": "2026-06-12T15:30:00+00:00", "dir": "user", "chat_id": 1, "text": 42})
+            + "\n",
+            encoding="utf-8",
+        )
+        created_at_dt = datetime(2026, 6, 12, 10, 5, 0, tzinfo=UTC)
+        records, any_unreadable = _records_for_row_window(chat_id, created_at_dt, window_seconds=86400)
+        assert any_unreadable is False
+        # Only the two in-window records made it into the cache;
+        # the corrupt later records were silently skipped.
+        assert [r["text"] for r in records] == ["live user line", "live assistant line"]
+
+    def test_out_of_window_malformed_ts_still_collapses(self, history_dir):
+        # The asymmetry that makes the in-window scoping safe: a
+        # malformed `ts` ANYWHERE in the file collapses the row,
+        # because without a parseable timestamp the reader cannot
+        # prove the record falls outside the window. Fail-closed is
+        # the only safe call.
+        chat_id = 1
+        user_dir = history_dir / str(chat_id)
+        user_dir.mkdir(parents=True, exist_ok=True)
+        path = user_dir / "2026-06-12.jsonl"
+        path.write_text(
+            json.dumps({"ts": "2026-06-12T10:00:00+00:00", "dir": "user", "chat_id": 1, "text": "live user"})
+            + "\n"
+            + json.dumps({"ts": "this is not a timestamp", "dir": "user", "chat_id": 1, "text": "x"})
+            + "\n",
+            encoding="utf-8",
+        )
+        created_at_dt = datetime(2026, 6, 12, 10, 5, 0, tzinfo=UTC)
+        _records, any_unreadable = _records_for_row_window(chat_id, created_at_dt, window_seconds=86400)
+        assert any_unreadable is True
+
 
 # ── Tests 11-15: Apply-time gates on Pass 2 proposals ─────────────
 

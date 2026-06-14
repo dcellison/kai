@@ -691,14 +691,23 @@ def _records_for_row_window(
       to True. The caller treats absence (no file for that day) as
       "no chat that day", which is normal; absence does NOT raise the
       flag. Unreadability does.
-    - Per-record: every record in a readable file must validate. The
-      checks fire on records of BOTH directions because Pass 2 binds
-      a user turn to an assistant turn, and a malformed assistant
-      record between them can hide the boundary the pairing walk
-      depends on. Failed checks: `dir` not a non-empty string;
-      `chat_id` missing or not equal to the CLI chat id; `text` not
-      a string; `ts` missing, non-string, or unparseable as ISO. Any
-      failure on ANY record flips `any_unreadable` to True.
+    - Per-record `ts`: a missing, non-string, or unparseable `ts` on
+      ANY record (in-window or not) flips `any_unreadable` to True.
+      Without a parseable `ts` the reader cannot prove the record
+      falls outside the row's window, so fail-closed is the only
+      safe call: a malformed-ts record sitting where the true source
+      would have been is the exact partial-history hazard the gate
+      exists to catch.
+    - Per-record `dir`/`chat_id`/`text`: validated only on records
+      whose parsed `ts` falls inside the row's window. Records past
+      `created_at` (same-day files naturally carry the assistant's
+      reply to a later user turn) cannot affect Pass 1 scoring,
+      Pass 2 assistant matching, or boundary pairing for this row;
+      collapsing the row on those records would over-reject every
+      row whose neighborhood happens to contain corruption later in
+      the day. In-window failures still fail closed: `dir` not a
+      non-empty string; `chat_id` missing or not equal to the CLI
+      chat id; `text` not a string.
 
     The `chat_id` check defends against a polluted file (a copy of
     another user's JSONL accidentally placed under this user's
@@ -709,9 +718,9 @@ def _records_for_row_window(
     Records whose `dir` is neither `"user"` nor `"assistant"` are
     silently dropped (some future direction sentinel arriving in the
     log would not be a corruption signal, just an unknown record we
-    do not score against). Validation still runs on those records so
-    a malformed-`ts` user record disguised as an unknown direction
-    cannot escape the gate.
+    do not score against). The `ts` gate still runs on those records
+    so a malformed-`ts` user record disguised as an unknown direction
+    cannot escape the partial-history check.
 
     Returns:
         (records, any_unreadable). `records` is in file-then-line
@@ -731,11 +740,36 @@ def _records_for_row_window(
             any_unreadable = True
             continue
         for rec in records:
-            # Per-record validation runs on every record regardless of
-            # direction. A malformed assistant record between two user
-            # records can hide the assistant boundary Pass 2 walks
-            # against; treating its corruption as silent would let
-            # partial history become a scoring signal.
+            # Parse `ts` first. Without a parseable timestamp we
+            # cannot know whether the record falls inside the row's
+            # window, so a malformed `ts` is always a corruption
+            # signal: fail-closed regardless of the record's other
+            # fields or its hypothetical position in time.
+            ts = rec.get("ts")
+            if not isinstance(ts, str) or not ts:
+                any_unreadable = True
+                continue
+            try:
+                rec_dt = datetime.fromisoformat(ts)
+            except ValueError:
+                any_unreadable = True
+                continue
+            if rec_dt.tzinfo is None:
+                rec_dt = rec_dt.replace(tzinfo=UTC)
+            # Records outside the row's window cannot affect Pass 1
+            # scoring, Pass 2 assistant matching, or boundary pairing
+            # for this row. Same-day files routinely carry records
+            # past `created_at` (the assistant's reply to a later
+            # user turn, the conversation continuing into the
+            # afternoon); collapsing the row on those records would
+            # over-reject every row whose neighborhood happens to
+            # contain corruption later in the day.
+            if not (window_start <= rec_dt <= window_end):
+                continue
+            # In-window validation: a malformed `dir`, `chat_id`, or
+            # `text` on a record the row could actually score
+            # against still has the partial-history hazard the gate
+            # exists to prevent.
             direction = rec.get("dir")
             if not isinstance(direction, str) or not direction:
                 any_unreadable = True
@@ -748,25 +782,13 @@ def _records_for_row_window(
             if not isinstance(text, str):
                 any_unreadable = True
                 continue
-            ts = rec.get("ts")
-            if not isinstance(ts, str) or not ts:
-                any_unreadable = True
-                continue
-            try:
-                rec_dt = datetime.fromisoformat(ts)
-            except ValueError:
-                any_unreadable = True
-                continue
-            if rec_dt.tzinfo is None:
-                rec_dt = rec_dt.replace(tzinfo=UTC)
             # Only the two known directions enter the cache. Other
             # values pass validation (they are not corruption per se),
             # but the caller has no use for them; dropping them at
             # the reader keeps both pass filters cheap.
             if direction not in {"user", "assistant"}:
                 continue
-            if window_start <= rec_dt <= window_end:
-                out.append(rec)
+            out.append(rec)
     return out, any_unreadable
 
 
