@@ -1460,7 +1460,7 @@ async def _handle_send_file(request: web.Request) -> web.Response:
     pool = request.app.get("pool")
     if pool is None:
         return web.json_response({"error": "No workspace configured"}, status=403)
-    workspace = str(pool.get_workspace(chat_id))
+    workspace = str(await pool.get_effective_workspace(chat_id))
     # Allow files from either the workspace or DATA_DIR/files/.
     # DATA_DIR/files/ is where uploaded files now live (PR #145).
     # Confinement to DATA_DIR/"files" (not all of DATA_DIR) is deliberate;

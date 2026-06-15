@@ -542,24 +542,29 @@ def _scope_change_targets(
     return targets
 
 
-def _scope_inputs(
+async def _scope_inputs(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
 ) -> tuple[dict[str, MemoryProjectConfig], ActiveMemoryProject | None]:
     """Fetch the merged registry and the caller's active project.
 
-    The workspace comes from the subprocess pool (the same per-user
-    workspace scoped retrieval sees on the next turn). A missing
-    pool collapses to no-workspace semantics: no path means no
-    project authority, the same global-only posture scoped retrieval
-    takes for a None workspace.
+    The workspace comes from the subprocess pool's effective resolver
+    (the same per-user workspace scoped retrieval sees on the next
+    turn). Calling the resolver here rather than the sync getter
+    means the saved workspace gets restored eagerly when needed, so
+    /memory's scope detection lines up with the user's settings
+    instead of the home default the lazy pool would otherwise show.
+    A missing pool collapses to no-workspace semantics: no path
+    means no project authority, the same global-only posture scoped
+    retrieval takes for a None workspace.
     """
     config: Config = context.bot_data["config"]
     registry = merged_registry(config.memory_projects)
     pool: SubprocessPool | None = context.bot_data.get("pool")
     if pool is None:
         return registry, None
-    return registry, detect_active_memory_project(pool.get_workspace(chat_id), registry)
+    workspace = await pool.get_effective_workspace(chat_id)
+    return registry, detect_active_memory_project(workspace, registry)
 
 
 # ── Transcript provenance helpers ───────────────────────────────────
@@ -2063,7 +2068,7 @@ async def _send_fact_view(
         # non-extracted source, Mem0 fetch error).
         await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
-    registry, active = _scope_inputs(context, chat_id)
+    registry, active = await _scope_inputs(context, chat_id)
     scope_view = _build_scope_view(fact, registry, active, scoped_recall_enabled=memory.is_scoped_recall_enabled())
     provenance = read_transcript_provenance(fact.metadata)
     text, kb = _build_fact_view(fact, return_to, scope_view, provenance)
@@ -2233,7 +2238,7 @@ async def _send_scope_screen(
     if fact is None:
         await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
-    registry, active = _scope_inputs(context, chat_id)
+    registry, active = await _scope_inputs(context, chat_id)
     scope_view = _build_scope_view(fact, registry, active, scoped_recall_enabled=memory.is_scoped_recall_enabled())
     targets = _scope_change_targets(scope_view.resolved, registry)
     text, kb = _build_scope_screen(fact, scope_view, targets)

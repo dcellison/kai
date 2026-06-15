@@ -509,6 +509,13 @@ async def _switch_model(context: ContextTypes.DEFAULT_TYPE, chat_id: int, model:
     it survives restarts (behavior change from session-only).
     """
     pool = _get_pool(context)
+    # Resolve the effective workspace BEFORE setting the model. The
+    # resolver may switch the live instance into the saved workspace
+    # which resets `instance.model` to the default and reapplies any
+    # workspace-level override; doing that after set_model would undo
+    # the just-set model. With this ordering, set_model operates on
+    # the already-restored instance and the model assignment sticks.
+    workspace = str(await pool.get_effective_workspace(chat_id))
     pool.set_model(chat_id, model)
     # Persist to settings table so the choice survives restarts
     await sessions.set_user_setting(chat_id, "model", model)
@@ -516,7 +523,6 @@ async def _switch_model(context: ContextTypes.DEFAULT_TYPE, chat_id: int, model:
     # takes effect. Without this, a prior /workspace config model entry
     # shadows the user setting (workspace config has higher precedence)
     # and the model would revert on the next service restart.
-    workspace = str(pool.get_workspace(chat_id))
     await sessions.delete_workspace_config_setting(chat_id, workspace, "model")
     await pool.restart(chat_id)
     await _end_session(chat_id)
@@ -1192,7 +1198,8 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     ws_config = await sessions.build_workspace_config(yaml_config, path, chat_id)
     await pool.change_workspace(chat_id, path, workspace_config=ws_config)
     # Per-user file confinement is handled at request time in webhook.py
-    # via pool.get_workspace(chat_id), so no global update needed here.
+    # via pool.get_effective_workspace(chat_id), so no global update needed
+    # here.
     await _end_session(chat_id)
 
     if path == home:
@@ -1218,7 +1225,7 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     # for THIS user, not a shared default.
     home = resolve_home_workspace(_chat_id(update), config)
 
-    if path == pool.get_workspace(_chat_id(update)):
+    if path == await pool.get_effective_workspace(_chat_id(update)):
         await update.message.reply_text("Already in that workspace.")
         return
 
@@ -1326,7 +1333,7 @@ async def _handle_workspace_config(
     chat_id = _chat_id(update)
     pool = _get_pool(context)
     config: Config = context.bot_data["config"]
-    workspace = pool.get_workspace(chat_id)
+    workspace = await pool.get_effective_workspace(chat_id)
     workspace_str = str(workspace)
 
     # Parse: "config [field] [value...]"
@@ -1634,7 +1641,7 @@ async def handle_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     base, allowed = await sessions.resolve_workspace_access(chat_id, config)
     history = await sessions.get_workspace_history(chat_id)
     pool = _get_pool(context)
-    current = str(pool.get_workspace(chat_id))
+    current = str(await pool.get_effective_workspace(chat_id))
     # Per-user home for the listing's "Home" pin and the empty-state
     # short-circuit below.
     home = str(resolve_home_workspace(chat_id, config))
@@ -1716,7 +1723,9 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             await sessions.delete_workspace_history(str(path), chat_id)
             await query.answer("That workspace is no longer allowed.")
             history = await sessions.get_workspace_history(chat_id)
-            keyboard = _workspaces_keyboard(history, str(pool.get_workspace(chat_id)), str(home), base, allowed)
+            keyboard = _workspaces_keyboard(
+                history, str(await pool.get_effective_workspace(chat_id)), str(home), base, allowed
+            )
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return
         # Remove stale entries where the directory no longer exists
@@ -1724,13 +1733,15 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
             await sessions.delete_workspace_history(str(path), chat_id)
             await query.answer("That workspace no longer exists.")
             history = await sessions.get_workspace_history(chat_id)
-            keyboard = _workspaces_keyboard(history, str(pool.get_workspace(chat_id)), str(home), base, allowed)
+            keyboard = _workspaces_keyboard(
+                history, str(await pool.get_effective_workspace(chat_id)), str(home), base, allowed
+            )
             await query.edit_message_reply_markup(reply_markup=keyboard)
             return
         label = _short_workspace_name(str(path), base)
 
     # Already there — dismiss the keyboard
-    if path == pool.get_workspace(chat_id):
+    if path == await pool.get_effective_workspace(chat_id):
         await query.answer()
         await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
         return
@@ -2051,7 +2062,7 @@ async def handle_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     sub = args[0].lower() if args else "list"
 
     if sub == "register":
-        current = Path(pool.get_workspace(chat_id))
+        current = Path(await pool.get_effective_workspace(chat_id))
         raw_name = args[1] if len(args) > 1 else current.name
         # The message text alone distinguishes success from rejection
         # for the user; the boolean exists for the /workspace new
@@ -2123,7 +2134,7 @@ async def handle_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "No memory projects registered.\nUse /project register [name] in a workspace to create one."
         )
         return
-    current = Path(pool.get_workspace(chat_id))
+    current = Path(await pool.get_effective_workspace(chat_id))
     active = detect_active_memory_project(current, merged)
     lines = ["Memory projects:"]
     for project_id in sorted(merged):
@@ -2166,7 +2177,7 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # No args: show current workspace
     if not context.args:
-        current = pool.get_workspace(chat_id)
+        current = await pool.get_effective_workspace(chat_id)
         short = _short_workspace_name(str(current), base)
         if current == home:
             short = "Home"
@@ -3813,11 +3824,11 @@ async def _handle_response(
         # Workspace for write-scope routing, captured BEFORE the
         # fire-and-forget task is scheduled. The exchange being
         # extracted happened in THIS workspace; reading
-        # pool.get_workspace inside the task instead would let a
-        # /workspace switch that lands during the ingestion delay
-        # re-route the exchange's facts to a project the conversation
-        # never touched.
-        ingest_workspace = str(pool.get_workspace(chat_id))
+        # pool.get_effective_workspace inside the task instead would
+        # let a /workspace switch that lands during the ingestion
+        # delay re-route the exchange's facts to a project the
+        # conversation never touched.
+        ingest_workspace = str(await pool.get_effective_workspace(chat_id))
         task = asyncio.create_task(_ingest_memory())
         _pending_memory_tasks.add(task)
         task.add_done_callback(_pending_memory_tasks.discard)

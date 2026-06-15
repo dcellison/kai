@@ -557,7 +557,7 @@ def _make_mock_claude(model="sonnet", workspace=None, is_alive=True, provider="a
     pool.get_model = MagicMock(return_value=model)
     pool.get_effective_model = AsyncMock(return_value=model)
     pool.set_model = MagicMock()
-    pool.get_workspace = MagicMock(return_value=ws)
+    pool.get_effective_workspace = AsyncMock(return_value=ws)
     pool.is_alive = MagicMock(return_value=is_alive)
     pool.get_session_id = MagicMock(return_value=None)
     pool.restart = AsyncMock()
@@ -1296,6 +1296,54 @@ class TestHandleModelCallback:
         # Model switch must clear workspace config override to prevent
         # the stale entry from shadowing the user setting on restart.
         mock_delete.assert_called_once_with(ANY, ANY, "model")
+
+    @pytest.mark.asyncio
+    async def test_switch_model_resolver_runs_before_set_model(self, tmp_path):
+        """
+        /model x against a saved non-home workspace must leave the live
+        instance carrying "x", not a workspace-level override.
+
+        The resolver runs change_workspace under the hood, which resets
+        the live model to the default and re-applies any workspace-
+        level model override from the cached WorkspaceConfig. If the
+        resolver fires AFTER set_model, that reset clobbers the user's
+        chosen model with the stale override. Pin the ordering by
+        emulating the change_workspace side effect on the mock pool.
+        """
+        from kai.bot import _switch_model
+
+        pool = _make_mock_claude(model="default")
+        instance = pool.get_if_exists.return_value
+        saved_ws = tmp_path / "foo"
+
+        async def resolver_side_effect(_chat_id):
+            # change_workspace inside the resolver resets the live
+            # model to the default and re-applies the workspace's
+            # stale override.
+            instance.model = "old-override"
+            return saved_ws
+
+        def set_model_side_effect(_chat_id, model):
+            instance.model = model
+
+        pool.get_effective_workspace.side_effect = resolver_side_effect
+        pool.set_model.side_effect = set_model_side_effect
+
+        ctx = _make_context(claude=pool)
+        with (
+            patch("kai.bot.sessions.clear_session", new_callable=AsyncMock),
+            patch("kai.bot.sessions.set_user_setting", new_callable=AsyncMock),
+            patch("kai.bot.sessions.delete_workspace_config_setting", new_callable=AsyncMock) as mock_delete,
+        ):
+            await _switch_model(ctx, 12345, "x")
+
+        # Live instance carries the user's choice, not the workspace's
+        # stale override. Catches a regression where set_model runs
+        # before the resolver.
+        assert instance.model == "x"
+        # Delete targets the saved workspace, not home, because the
+        # resolver returned the saved path before delete was called.
+        mock_delete.assert_called_once_with(12345, str(saved_ws), "model")
 
 
 # ── handle_voice_command ─────────────────────────────────────────────
@@ -3759,7 +3807,7 @@ class TestHandleWorkspaceConfig:
 
         # Should persist the model setting
         mock_sessions.set_workspace_config_setting.assert_called_once_with(
-            12345, str(pool.get_workspace(12345)), "model", "opus"
+            12345, str(pool.get_effective_workspace.return_value), "model", "opus"
         )
         # Should apply config change (rebuild + change_workspace)
         mock_sessions.build_workspace_config.assert_called_once()
@@ -3783,7 +3831,7 @@ class TestHandleWorkspaceConfig:
             await _handle_workspace_config(update, ctx, "config timeout 300")
 
         mock_sessions.set_workspace_config_setting.assert_called_once_with(
-            12345, str(pool.get_workspace(12345)), "timeout", "300"
+            12345, str(pool.get_effective_workspace.return_value), "timeout", "300"
         )
         reply = update.message.reply_text.call_args[0][0]
         assert "300" in reply
@@ -3827,7 +3875,7 @@ class TestHandleWorkspaceConfig:
 
         # Should delete the env key entirely (empty dict -> delete)
         mock_sessions.delete_workspace_config_setting.assert_called_once_with(
-            12345, str(pool.get_workspace(12345)), "env"
+            12345, str(pool.get_effective_workspace.return_value), "env"
         )
         reply = update.message.reply_text.call_args[0][0]
         assert "Removed" in reply
@@ -3867,7 +3915,7 @@ class TestHandleWorkspaceConfig:
             await _handle_workspace_config(update, ctx, "config prompt Hello world")
 
         mock_sessions.set_workspace_config_setting.assert_called_once_with(
-            12345, str(pool.get_workspace(12345)), "prompt", "Hello world"
+            12345, str(pool.get_effective_workspace.return_value), "prompt", "Hello world"
         )
         pool.change_workspace.assert_called_once()
 
@@ -3886,7 +3934,7 @@ class TestHandleWorkspaceConfig:
             await _handle_workspace_config(update, ctx, "config prompt clear")
 
         mock_sessions.delete_workspace_config_setting.assert_called_once_with(
-            12345, str(pool.get_workspace(12345)), "prompt"
+            12345, str(pool.get_effective_workspace.return_value), "prompt"
         )
         pool.change_workspace.assert_called_once()
 
@@ -3904,7 +3952,9 @@ class TestHandleWorkspaceConfig:
         with self._patches(mock_sessions):
             await _handle_workspace_config(update, ctx, "config reset")
 
-        mock_sessions.delete_all_workspace_config.assert_called_once_with(12345, str(pool.get_workspace(12345)))
+        mock_sessions.delete_all_workspace_config.assert_called_once_with(
+            12345, str(pool.get_effective_workspace.return_value)
+        )
         pool.change_workspace.assert_called_once()
         reply = update.message.reply_text.call_args[0][0]
         assert "global defaults" in reply.lower()
@@ -3924,7 +3974,7 @@ class TestHandleWorkspaceConfig:
             await _handle_workspace_config(update, ctx, "config reset model")
 
         mock_sessions.delete_workspace_config_setting.assert_called_once_with(
-            12345, str(pool.get_workspace(12345)), "model"
+            12345, str(pool.get_effective_workspace.return_value), "model"
         )
         pool.change_workspace.assert_called_once()
         reply = update.message.reply_text.call_args[0][0]

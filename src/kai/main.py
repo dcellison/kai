@@ -359,8 +359,8 @@ def _start() -> None:
             # In webhook mode, this also registers the Telegram webhook with the API.
             await webhook.start(app, config)
             # Phase 3: per-user file confinement is handled at request
-            # time via pool.get_workspace(chat_id) in webhook.py. No
-            # global workspace sync needed at startup.
+            # time via pool.get_effective_workspace(chat_id) in
+            # webhook.py. No global workspace sync needed at startup.
 
             # Start the subprocess pool's idle eviction task.
             app.bot_data["pool"].start()

@@ -229,7 +229,7 @@ class TestPerUserBackendRouting:
             patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value=db_settings),
             patch.object(instance, "restart", new_callable=AsyncMock),
         ):
-            await pool._restore_workspace(111, instance)
+            await pool._apply_user_db_settings(111, instance)
             # "opus" is invalid for openai - should be ignored, model stays at gpt-5.4
             assert instance.model == "gpt-5.4"
 
@@ -480,17 +480,23 @@ class TestPropertyAccessors:
         ):
             assert await pool.get_effective_model(999) == "opus"
 
-    def test_get_workspace_no_instance(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_get_effective_workspace_no_instance_no_saved(self, tmp_path, monkeypatch):
         """
-        get_workspace returns the per-user default when no instance exists.
+        get_effective_workspace falls back to the per-user home when no
+        instance exists and no saved workspace setting is recorded.
 
-        Post-#353 the fallback resolves through resolve_home_workspace
-        instead of the removed global Config field, landing the user in
-        DATA_DIR/home/<chat_id>/.
+        The fallback resolves through resolve_home_workspace, landing the
+        user in DATA_DIR/home/<chat_id>/.
         """
         monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+
+        async def _no_setting(key: str) -> str | None:
+            return None
+
+        monkeypatch.setattr("kai.pool.sessions.get_setting", _no_setting)
         pool = SubprocessPool(config=_make_config(), services_info=[])
-        assert pool.get_workspace(999) == tmp_path / "home" / "999"
+        assert await pool.get_effective_workspace(999) == tmp_path / "home" / "999"
 
     def test_is_alive_no_instance(self):
         """is_alive returns False when no instance exists."""
@@ -587,8 +593,12 @@ class TestWorkspaceRestoration:
                 yield  # make it a generator
 
             mock_send.side_effect = empty_send
-            async for _ in pool.send("test", chat_id=111):
-                pass
+            # send() calls _apply_user_db_settings after the workspace half;
+            # patch get_user_settings so the second helper finds no overrides
+            # and the send path completes without restarting the subprocess.
+            with patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}):
+                async for _ in pool.send("test", chat_id=111):
+                    pass
             mock_change.assert_called_once()
 
     @pytest.mark.asyncio
@@ -607,11 +617,10 @@ class TestWorkspaceRestoration:
         # Simulate DB overrides: user set model=opus
         db_settings = {"model": "opus"}
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
             patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value=db_settings),
             patch.object(instance, "restart", new_callable=AsyncMock) as mock_restart,
         ):
-            await pool._restore_workspace(111, instance)
+            await pool._apply_user_db_settings(111, instance)
             # Model is a CLI flag, so changing it triggers restart
             assert instance.model == "opus"
             mock_restart.assert_called_once()
@@ -623,11 +632,10 @@ class TestWorkspaceRestoration:
         instance = pool.get(111)
 
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
             patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
             patch.object(instance, "restart", new_callable=AsyncMock) as mock_restart,
         ):
-            await pool._restore_workspace(111, instance)
+            await pool._apply_user_db_settings(111, instance)
             mock_restart.assert_not_called()
 
     @pytest.mark.asyncio
@@ -645,7 +653,7 @@ class TestWorkspaceRestoration:
             patch("kai.pool.sessions.delete_setting", new_callable=AsyncMock) as mock_delete,
         ):
             # The restore should detect the path doesn't exist and delete
-            await pool._restore_workspace(111, pool.get(111))
+            await pool._attempt_workspace_restore(111, pool.get(111))
             mock_delete.assert_called_once_with("workspace:111")
 
     @pytest.mark.asyncio
@@ -665,10 +673,9 @@ class TestWorkspaceRestoration:
                 return_value=(None, [ws]),
             ),
             patch("kai.pool.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
-            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
             patch.object(instance, "change_workspace", new_callable=AsyncMock) as mock_change,
         ):
-            await pool._restore_workspace(111, instance)
+            await pool._attempt_workspace_restore(111, instance)
             mock_change.assert_called_once()
 
     @pytest.mark.asyncio
@@ -690,9 +697,8 @@ class TestWorkspaceRestoration:
                 return_value=(other_base, []),
             ),
             patch("kai.pool.sessions.delete_setting", new_callable=AsyncMock) as mock_delete,
-            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
         ):
-            await pool._restore_workspace(111, pool.get(111))
+            await pool._attempt_workspace_restore(111, pool.get(111))
             mock_delete.assert_called_once_with("workspace:111")
 
     @pytest.mark.asyncio
@@ -703,7 +709,7 @@ class TestWorkspaceRestoration:
         rejects) is dropped by apply_workspace_model() but the original
         WorkspaceConfig object is still stored on instance.workspace_config
         with the invalid model field. The precedence guard in
-        _restore_workspace must NOT treat that stored field as
+        _apply_user_db_settings must NOT treat that stored field as
         "workspace model applied"; otherwise a perfectly valid per-user
         DB model (gpt-5.4-mini) gets silently suppressed by a never-
         applied workspace override. Re-validate ws_model against the
@@ -746,11 +752,10 @@ class TestWorkspaceRestoration:
         # DB has a valid per-user model override: gpt-5.4-mini.
         db_settings = {"model": "gpt-5.4-mini"}
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
             patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value=db_settings),
             patch.object(instance, "restart", new_callable=AsyncMock) as mock_restart,
         ):
-            await pool._restore_workspace(111, instance)
+            await pool._apply_user_db_settings(111, instance)
             # The DB model wins because the workspace model was never
             # actually applied (rejected by apply_workspace_model).
             assert instance.model == "gpt-5.4-mini"
@@ -774,10 +779,9 @@ class TestWorkspaceRestoration:
                 return_value=(base, []),
             ),
             patch("kai.pool.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
-            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={}),
             patch.object(instance, "change_workspace", new_callable=AsyncMock) as mock_change,
         ):
-            await pool._restore_workspace(111, instance)
+            await pool._attempt_workspace_restore(111, instance)
             mock_change.assert_called_once()
 
 
@@ -786,10 +790,11 @@ class TestWorkspaceRestoration:
 
 class TestRestoreBackendNameDispatch:
     """
-    _restore_workspace reads the backend identifier off `instance.backend_name`
-    instead of inspecting the concrete class name. Pin each real backend's
-    value plus the falsy fallback so an OpenCode (or any future) backend
-    cannot regress the dispatch by setting backend_name incorrectly.
+    _apply_user_db_settings reads the backend identifier off
+    `instance.backend_name` instead of inspecting the concrete class
+    name. Pin each real backend's value plus the falsy fallback so an
+    OpenCode (or any future) backend cannot regress the dispatch by
+    setting backend_name incorrectly.
     """
 
     @pytest.mark.asyncio
@@ -808,12 +813,11 @@ class TestRestoreBackendNameDispatch:
 
         db_settings = {"model": "gpt-5.4-mini"}
         with (
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
             patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value=db_settings),
             patch("kai.pool.validate_model_for_backend", return_value=True) as mock_validate,
             patch.object(instance, "restart", new_callable=AsyncMock),
         ):
-            await pool._restore_workspace(111, instance)
+            await pool._apply_user_db_settings(111, instance)
             # Validator received the instance's backend_name, not "claude".
             # validate_model_for_backend may also be called for ws_model_raw,
             # but ws_model_raw is None here so the only invocation is for
@@ -836,12 +840,11 @@ class TestRestoreBackendNameDispatch:
         db_settings = {"model": "opus"}
         with (
             caplog.at_level(logging.WARNING, logger="kai.pool"),
-            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None),
             patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value=db_settings),
             patch("kai.pool.validate_model_for_backend", return_value=True) as mock_validate,
             patch.object(instance, "restart", new_callable=AsyncMock),
         ):
-            await pool._restore_workspace(111, instance)
+            await pool._apply_user_db_settings(111, instance)
             # Fallback string is "claude".
             mock_validate.assert_called_once_with("opus", "claude", "anthropic")
         # Warning was logged about the empty backend_name.
@@ -1160,3 +1163,332 @@ class TestEvictionTOCTOU:
         assert in_pool_during_shutdown == [True]
         # Removed after shutdown completed
         assert 111 not in pool._pool
+
+
+# ── Effective workspace resolver ────────────────────────────────────
+
+
+class TestGetEffectiveWorkspace:
+    """
+    The resolver replaces the sync home-biased pool.get_workspace.
+    Command and API surfaces consult it to find the user's effective
+    workspace; the resolver eagerly restores the saved workspace into
+    a live instance so callers cannot observe the home default while
+    a valid saved row exists.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_instance_no_saved_returns_home(self, tmp_path, monkeypatch):
+        """Cold state, no saved row -> home; no instance materialized."""
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        with patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None):
+            result = await pool.get_effective_workspace(999)
+        assert result == tmp_path / "home" / "999"
+        assert 999 not in pool._pool
+
+    @pytest.mark.asyncio
+    async def test_no_instance_saved_valid_returns_saved_and_restores(self, tmp_path, monkeypatch):
+        """Cold state, saved row valid -> saved path; instance created and switched."""
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+        ws = tmp_path / "foo"
+        ws.mkdir()
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch(
+                "kai.pool.sessions.resolve_workspace_access",
+                new_callable=AsyncMock,
+                return_value=(None, [ws]),
+            ),
+            patch("kai.pool.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
+            patch.object(SubprocessPool, "_create_instance") as mock_create,
+        ):
+            stub = MagicMock()
+            stub.change_workspace = AsyncMock()
+            mock_create.return_value = stub
+            result = await pool.get_effective_workspace(999)
+        assert result == ws
+        assert 999 in pool._pool
+        stub.change_workspace.assert_awaited_once()
+        # Workspace half done; settings half stays pending for the
+        # first send().
+        assert 999 not in pool._pending_workspace_restore
+        assert 999 in pool._pending_settings_restore
+
+    @pytest.mark.asyncio
+    async def test_no_instance_saved_missing_clears_and_returns_home(self, tmp_path, monkeypatch):
+        """Cold state, saved row pointing to a deleted dir -> home; setting deleted; no instance."""
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(tmp_path / "gone")),
+            patch(
+                "kai.pool.sessions.resolve_workspace_access",
+                new_callable=AsyncMock,
+                return_value=(None, []),
+            ),
+            patch("kai.pool.sessions.delete_setting", new_callable=AsyncMock) as mock_delete,
+        ):
+            result = await pool.get_effective_workspace(999)
+        assert result == tmp_path / "home" / "999"
+        mock_delete.assert_awaited_once_with("workspace:999")
+        assert 999 not in pool._pool
+
+    @pytest.mark.asyncio
+    async def test_no_instance_saved_disallowed_clears_and_returns_home(self, tmp_path, monkeypatch):
+        """Cold state, saved row valid path but disallowed -> home; setting deleted; no instance."""
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+        ws = tmp_path / "evicted"
+        ws.mkdir()
+        other_base = tmp_path / "base"
+        other_base.mkdir()
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch(
+                "kai.pool.sessions.resolve_workspace_access",
+                new_callable=AsyncMock,
+                return_value=(other_base, []),
+            ),
+            patch("kai.pool.sessions.delete_setting", new_callable=AsyncMock) as mock_delete,
+        ):
+            result = await pool.get_effective_workspace(999)
+        assert result == tmp_path / "home" / "999"
+        mock_delete.assert_awaited_once_with("workspace:999")
+        assert 999 not in pool._pool
+
+    @pytest.mark.asyncio
+    async def test_instance_not_pending_returns_instance_workspace(self, tmp_path, monkeypatch):
+        """Warm instance with no pending flag -> short-circuit to instance.workspace, no DB read."""
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        instance = pool.get(111)
+        # Simulate a previous resolver/send having finalized the
+        # workspace half.
+        pool._pending_workspace_restore.discard(111)
+        with patch("kai.pool.sessions.get_setting", new_callable=AsyncMock) as mock_setting:
+            result = await pool.get_effective_workspace(111)
+        assert result == instance.workspace
+        mock_setting.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pending_instance_saved_valid_switches_and_clears(self, tmp_path, monkeypatch):
+        """Pending instance with saved valid row gets switched and the workspace-pending flag clears."""
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+        ws = tmp_path / "foo"
+        ws.mkdir()
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        instance = pool.get(111)
+        assert 111 in pool._pending_workspace_restore
+        assert 111 in pool._pending_settings_restore
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch(
+                "kai.pool.sessions.resolve_workspace_access",
+                new_callable=AsyncMock,
+                return_value=(None, [ws]),
+            ),
+            patch("kai.pool.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
+            patch.object(instance, "change_workspace", new_callable=AsyncMock) as mock_change,
+        ):
+            result = await pool.get_effective_workspace(111)
+        assert result == ws
+        mock_change.assert_awaited_once()
+        assert 111 not in pool._pending_workspace_restore
+        # Settings half MUST stay pending so the next send() applies
+        # DB-stored model/timeout. Splitting the marker is the entire
+        # point of the resolver vs send-path separation.
+        assert 111 in pool._pending_settings_restore
+
+    @pytest.mark.asyncio
+    async def test_pending_instance_saved_missing_clears_and_returns_home(self, tmp_path, monkeypatch):
+        """Pending instance with saved row pointing nowhere -> home, setting deleted, pending cleared."""
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        pool.get(111)
+        with (
+            patch(
+                "kai.pool.sessions.get_setting",
+                new_callable=AsyncMock,
+                return_value=str(tmp_path / "gone"),
+            ),
+            patch(
+                "kai.pool.sessions.resolve_workspace_access",
+                new_callable=AsyncMock,
+                return_value=(None, []),
+            ),
+            patch("kai.pool.sessions.delete_setting", new_callable=AsyncMock) as mock_delete,
+        ):
+            result = await pool.get_effective_workspace(111)
+        assert result == tmp_path / "home" / "111"
+        mock_delete.assert_awaited_once_with("workspace:111")
+        assert 111 not in pool._pending_workspace_restore
+        assert 111 in pool._pending_settings_restore
+
+    @pytest.mark.asyncio
+    async def test_pending_instance_saved_disallowed_clears_and_returns_home(self, tmp_path, monkeypatch):
+        """Pending instance with saved path no longer allowed -> home, setting deleted, pending cleared."""
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+        ws = tmp_path / "evicted"
+        ws.mkdir()
+        other_base = tmp_path / "base"
+        other_base.mkdir()
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        pool.get(111)
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch(
+                "kai.pool.sessions.resolve_workspace_access",
+                new_callable=AsyncMock,
+                return_value=(other_base, []),
+            ),
+            patch("kai.pool.sessions.delete_setting", new_callable=AsyncMock) as mock_delete,
+        ):
+            result = await pool.get_effective_workspace(111)
+        assert result == tmp_path / "home" / "111"
+        mock_delete.assert_awaited_once_with("workspace:111")
+        assert 111 not in pool._pending_workspace_restore
+        assert 111 in pool._pending_settings_restore
+
+    @pytest.mark.asyncio
+    async def test_pending_instance_no_saved_clears_and_returns_home(self, tmp_path, monkeypatch):
+        """Pending instance with no saved row -> home, no setting writes, pending cleared."""
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        pool.get(111)
+        with patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=None):
+            result = await pool.get_effective_workspace(111)
+        assert result == tmp_path / "home" / "111"
+        assert 111 not in pool._pending_workspace_restore
+        assert 111 in pool._pending_settings_restore
+
+
+# ── send() after resolver: P1 guard for DB-settings restore ─────────
+
+
+class TestSendAppliesSettingsAfterResolverCall:
+    """
+    Calling get_effective_workspace before send() must NOT suppress the
+    DB-settings restore that send() owns. The pending marker is split
+    so the resolver only clears the workspace half; the first send()
+    still picks up and applies the user's stored model/timeout.
+
+    If a future refactor accidentally re-conflates the markers, these
+    tests catch the regression.
+    """
+
+    @pytest.mark.asyncio
+    async def test_resolver_then_send_applies_db_model(self, tmp_path, monkeypatch):
+        """Resolver call before send still leaves DB model application for send."""
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+        ws = tmp_path / "foo"
+        ws.mkdir()
+        user = UserConfig(telegram_id=111, name="alice")
+        config = _make_config(user_configs={111: user})
+        pool = SubprocessPool(config=config, services_info=[])
+
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch(
+                "kai.pool.sessions.resolve_workspace_access",
+                new_callable=AsyncMock,
+                return_value=(None, [ws]),
+            ),
+            patch("kai.pool.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
+        ):
+            # Step 1: command-path resolver call finishes the workspace
+            # half early.
+            await pool.get_effective_workspace(111)
+
+        instance = pool.get(111)
+        # The resolver applied change_workspace via the real instance
+        # method which resets self.model; bring it back to the global
+        # default so the DB model differs.
+        instance.model = "sonnet"
+        assert 111 not in pool._pending_workspace_restore
+        assert 111 in pool._pending_settings_restore
+
+        with (
+            patch("kai.pool.sessions.get_user_settings", new_callable=AsyncMock, return_value={"model": "opus"}),
+            patch.object(instance, "restart", new_callable=AsyncMock) as mock_restart,
+            patch.object(instance, "send", new_callable=MagicMock) as mock_send,
+        ):
+
+            async def empty_send(*args, **kwargs):
+                return
+                yield
+
+            mock_send.side_effect = empty_send
+            async for _ in pool.send("hello", chat_id=111):
+                pass
+
+        # Step 2: send() picked up the still-pending settings flag and
+        # applied the DB model. If the resolver had wrongly cleared
+        # _pending_settings_restore, this assertion would fail.
+        assert instance.model == "opus"
+        mock_restart.assert_awaited_once()
+        assert 111 not in pool._pending_settings_restore
+
+    @pytest.mark.asyncio
+    async def test_resolver_then_send_applies_db_timeout(self, tmp_path, monkeypatch):
+        """Resolver call before send still leaves DB timeout application for send."""
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+        ws = tmp_path / "foo"
+        ws.mkdir()
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+
+        with (
+            patch("kai.pool.sessions.get_setting", new_callable=AsyncMock, return_value=str(ws)),
+            patch(
+                "kai.pool.sessions.resolve_workspace_access",
+                new_callable=AsyncMock,
+                return_value=(None, [ws]),
+            ),
+            patch("kai.pool.sessions.build_workspace_config", new_callable=AsyncMock, return_value=None),
+        ):
+            await pool.get_effective_workspace(111)
+
+        instance = pool.get(111)
+        assert 111 not in pool._pending_workspace_restore
+        assert 111 in pool._pending_settings_restore
+
+        with (
+            patch(
+                "kai.pool.sessions.get_user_settings",
+                new_callable=AsyncMock,
+                return_value={"timeout": "120"},
+            ),
+            patch.object(instance, "restart", new_callable=AsyncMock),
+            patch.object(instance, "send", new_callable=MagicMock) as mock_send,
+        ):
+
+            async def empty_send(*args, **kwargs):
+                return
+                yield
+
+            mock_send.side_effect = empty_send
+            async for _ in pool.send("hello", chat_id=111):
+                pass
+
+        assert instance.timeout_seconds == 120
+        assert 111 not in pool._pending_settings_restore
+
+    @pytest.mark.asyncio
+    async def test_change_workspace_keeps_settings_pending(self, tmp_path, monkeypatch):
+        """An explicit /workspace switch must NOT suppress the DB-settings restore."""
+        monkeypatch.setattr("kai.backend.DATA_DIR", tmp_path)
+        ws = tmp_path / "foo"
+        ws.mkdir()
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        with patch("kai.pool.SubprocessPool._create_instance") as mock_create:
+            stub = MagicMock()
+            stub.change_workspace = AsyncMock()
+            mock_create.return_value = stub
+            await pool.change_workspace(111, ws)
+        # Workspace flag cleared by the explicit switch...
+        assert 111 not in pool._pending_workspace_restore
+        # ...but settings flag is preserved so the next send applies
+        # DB-stored model/timeout. Pre-split behavior accidentally
+        # cleared both here.
+        assert 111 in pool._pending_settings_restore

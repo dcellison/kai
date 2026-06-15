@@ -3415,17 +3415,19 @@ class TestApplyScopeChange:
 
 
 class TestScopeInputs:
-    def test_missing_pool_collapses_to_no_active_project(self, context_factory, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_missing_pool_collapses_to_no_active_project(self, context_factory, monkeypatch):
         import kai.memory_projects as mp_mod
 
         monkeypatch.setattr(mp_mod, "_db_registry", {})
         ctx = context_factory()
         ctx.bot_data["config"].memory_projects = {"kai": _project_cfg("kai")}
-        registry, active = memory_command._scope_inputs(ctx, 100)
+        registry, active = await memory_command._scope_inputs(ctx, 100)
         assert "kai" in registry
         assert active is None
 
-    def test_pool_workspace_drives_detection(self, context_factory, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_pool_workspace_drives_detection(self, context_factory, monkeypatch, tmp_path):
         import kai.memory_projects as mp_mod
 
         monkeypatch.setattr(mp_mod, "_db_registry", {})
@@ -3441,11 +3443,11 @@ class TestScopeInputs:
         ctx = context_factory()
         ctx.bot_data["config"].memory_projects = {"kai": cfg}
         pool = MagicMock()
-        pool.get_workspace.return_value = root
+        pool.get_effective_workspace = AsyncMock(return_value=root)
         ctx.bot_data["pool"] = pool
-        _registry, active = memory_command._scope_inputs(ctx, 100)
+        _registry, active = await memory_command._scope_inputs(ctx, 100)
         assert active is not None and active.project_id == "kai"
-        pool.get_workspace.assert_called_once_with(100)
+        pool.get_effective_workspace.assert_awaited_once_with(100)
 
 
 class TestStatsScopeSection:

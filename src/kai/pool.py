@@ -71,7 +71,15 @@ class SubprocessPool:
         self._services_info = services_info
         self._pool: dict[int, AgentBackend] = {}
         self._last_activity: dict[int, float] = {}
-        self._needs_workspace_restore: set[int] = set()
+        # Pending one-time setup for a freshly-created backend instance.
+        # Split into two flags so a command-path workspace resolver call
+        # can finish the workspace half without suppressing the DB-
+        # settings half that only the first send() applies. A conflated
+        # marker would let a /memory or /workspace read clear the
+        # pending state before send() ever had a chance to push the
+        # user's stored model/timeout into the new subprocess.
+        self._pending_workspace_restore: set[int] = set()
+        self._pending_settings_restore: set[int] = set()
         self._in_flight: set[int] = set()  # chat_ids with active send()
         self._eviction_task: asyncio.Task | None = None
 
@@ -88,7 +96,12 @@ class SubprocessPool:
         if chat_id not in self._pool:
             instance = self._create_instance(chat_id)
             self._pool[chat_id] = instance
-            self._needs_workspace_restore.add(chat_id)
+            # Mark both one-time setup steps as pending. The split
+            # matters at command-path callers that finish the workspace
+            # half via get_effective_workspace; settings still need to
+            # land on the first ordinary send().
+            self._pending_workspace_restore.add(chat_id)
+            self._pending_settings_restore.add(chat_id)
         self._last_activity[chat_id] = time.monotonic()
         return self._pool[chat_id]
 
@@ -106,7 +119,7 @@ class SubprocessPool:
         2. Global config defaults (from .env)
 
         Per-user DB overrides (set via /settings or /model) are applied
-        in _restore_workspace() since they require async DB access.
+        in _apply_user_db_settings() since they require async DB access.
         """
         user = self._config.get_user_config(chat_id)
 
@@ -305,13 +318,21 @@ class SubprocessPool:
         Route a prompt to the user's subprocess.
 
         On the first call for a newly created instance, restores the
-        user's saved workspace from the database before sending.
+        user's saved workspace and applies DB-stored model/timeout
+        before sending. Each piece runs only if the corresponding
+        pending flag is set, so a command-path resolver call that
+        already handled the workspace half does not duplicate work
+        here and a workspace-handled-but-settings-pending instance
+        still gets its DB settings on first send.
+
         Marks the user as in-flight to prevent eviction mid-stream.
         """
         instance = self.get(chat_id)
-        if chat_id in self._needs_workspace_restore:
-            await self._restore_workspace(chat_id, instance)
-            self._needs_workspace_restore.discard(chat_id)
+        if chat_id in self._pending_workspace_restore:
+            await self._attempt_workspace_restore(chat_id, instance)
+        if chat_id in self._pending_settings_restore:
+            await self._apply_user_db_settings(chat_id, instance)
+            self._pending_settings_restore.discard(chat_id)
         self._last_activity[chat_id] = time.monotonic()
         self._in_flight.add(chat_id)
         try:
@@ -321,16 +342,27 @@ class SubprocessPool:
             self._in_flight.discard(chat_id)
             self._last_activity[chat_id] = time.monotonic()
 
-    async def _restore_workspace(self, chat_id: int, instance: AgentBackend) -> None:
-        """Restore a user's saved workspace from the database.
+    async def _attempt_workspace_restore(self, chat_id: int, instance: AgentBackend) -> Path:
+        """Restore the saved workspace into a live instance.
 
-        Validates that the saved workspace is still an allowed path
-        using per-user workspace access (workspace_base from users.yaml,
-        allowed list from DB + global ALLOWED_WORKSPACES). An admin who
-        removes a path should not have users silently bypass the
-        restriction on their next message.
+        Reads `settings.workspace:<chat_id>`, validates path existence
+        and per-user workspace access (workspace_base from users.yaml,
+        allowed list from DB + global ALLOWED_WORKSPACES), and switches
+        the instance into the saved path when valid. Stale rows (path
+        gone or no longer allowed) are deleted so an admin removing a
+        path does not have users silently bypass the restriction.
+
+        Always clears the workspace-restore flag for `chat_id` before
+        returning, regardless of whether the saved row was valid,
+        stale, or absent. This is the invariant the command-path
+        resolver relies on: a single decision finalizes the effective
+        workspace for the live instance.
+
+        Returns the effective workspace path (saved when valid,
+        otherwise the user's home workspace).
         """
         saved = await sessions.get_setting(f"workspace:{chat_id}")
+        effective: Path | None = None
         if saved:
             ws_path = Path(saved)
             if not ws_path.is_dir():
@@ -341,7 +373,6 @@ class SubprocessPool:
                 )
                 await sessions.delete_setting(f"workspace:{chat_id}")
             else:
-                # Resolve per-user workspace access for the allowed check
                 base, allowed = await sessions.resolve_workspace_access(chat_id, self._config)
                 if not is_workspace_allowed(ws_path, base, allowed):
                     log.warning(
@@ -351,89 +382,109 @@ class SubprocessPool:
                     )
                     await sessions.delete_setting(f"workspace:{chat_id}")
                 else:
-                    # Layer DB overrides on top of YAML baseline so user's
-                    # per-workspace config (set via /workspace config) is
-                    # applied on startup, not just after explicit switches.
+                    # Layer DB overrides on top of YAML baseline so the
+                    # user's per-workspace config (set via /workspace
+                    # config) is applied on startup, not just after
+                    # explicit switches.
                     yaml_config = self._config.get_workspace_config(ws_path)
                     ws_config = await sessions.build_workspace_config(yaml_config, ws_path, chat_id)
                     await instance.change_workspace(ws_path, workspace_config=ws_config)
                     log.info("Restored workspace for user %d: %s", chat_id, ws_path)
+                    effective = ws_path
 
-        # Apply per-user DB overrides (set via /settings or /model).
-        # _create_instance() already applied users.yaml baselines, so we
-        # only need the DB layer here. Workspace config takes precedence
-        # over user settings (more specific wins).
+        self._pending_workspace_restore.discard(chat_id)
+        if effective is not None:
+            return effective
+        return resolve_home_workspace(chat_id, self._config)
+
+    async def _apply_user_db_settings(self, chat_id: int, instance: AgentBackend) -> None:
+        """Apply per-user DB-stored settings to a live instance.
+
+        Covers the model and timeout overrides set via /settings or
+        /model. _create_instance() already applied the users.yaml
+        baselines, so this layer only handles the DB tier. Workspace
+        config takes precedence over user settings (more specific
+        wins).
+
+        Called from send() on the first ordinary text turn after
+        instance creation. The command-path resolver never invokes
+        this helper: settings need a subprocess restart to take
+        effect when the model changes, which would interrupt any UI
+        operation that just wanted to read the effective workspace.
+        """
         db_settings = await sessions.get_user_settings(chat_id)
-        if db_settings:
-            # Track whether any flag-level setting changed (requires restart
-            # because the value is baked into the CLI command at startup)
-            needs_restart = False
+        if not db_settings:
+            return
 
-            # Read the backend identifier off the instance. Every
-            # concrete backend sets `backend_name` as a class attribute
-            # (claude_code / goose / codex / opencode). The ABC default
-            # is the empty string, so a test double or legacy stub that
-            # never overrides falls through to "claude" with a warning;
-            # this preserves the historical default for unknown shapes
-            # while keeping real backends out of the class-name if-chain
-            # that previously had to be extended for every new backend.
-            # Hoisted out of the DB-model branch because the ws_model
-            # guard below also needs it.
-            instance_backend = instance.backend_name
-            if not instance_backend:
-                log.warning(
-                    "Instance %s has empty backend_name; falling back to 'claude'. "
-                    "Concrete backends must set the backend_name class attribute.",
-                    type(instance).__name__,
-                )
-                instance_backend = "claude"
+        # Track whether any flag-level setting changed (requires restart
+        # because the value is baked into the CLI command at startup)
+        needs_restart = False
 
-            # Model: only apply if workspace config has a VALID model
-            # for this backend. A workspaces.yaml entry like
-            # `model: gpt-5.4-nano` applied to a codex instance is
-            # rejected by apply_workspace_model() at backend __init__
-            # time (the helper returns the current model and logs a
-            # warning), but the original WorkspaceConfig - still
-            # carrying the invalid model field - remains stored on
-            # instance.workspace_config. Treating any non-empty
-            # workspace_config.model as precedence-bearing therefore
-            # blocks a valid per-user DB model (e.g. gpt-5.4-mini)
-            # even though the workspace override was never applied.
-            # Re-run the same validation here so the precedence guard
-            # matches what was actually applied to instance.model.
-            ws_model_raw = instance.workspace_config.model if instance.workspace_config else None
-            ws_model_applied = bool(
-                ws_model_raw and validate_model_for_backend(ws_model_raw, instance_backend, instance.provider)
+        # Read the backend identifier off the instance. Every concrete
+        # backend sets `backend_name` as a class attribute (claude_code
+        # / goose / codex / opencode). The ABC default is the empty
+        # string, so a test double or legacy stub that never overrides
+        # falls through to "claude" with a warning; this preserves the
+        # historical default for unknown shapes while keeping real
+        # backends out of the class-name if-chain that previously had
+        # to be extended for every new backend. Hoisted out of the
+        # DB-model branch because the ws_model guard below also needs
+        # it.
+        instance_backend = instance.backend_name
+        if not instance_backend:
+            log.warning(
+                "Instance %s has empty backend_name; falling back to 'claude'. "
+                "Concrete backends must set the backend_name class attribute.",
+                type(instance).__name__,
             )
-            if not ws_model_applied and "model" in db_settings and db_settings["model"] != instance.model:
-                stored_model = db_settings["model"]
-                if validate_model_for_backend(stored_model, instance_backend, instance.provider):
-                    instance.model = stored_model
-                    needs_restart = True
-                else:
-                    log.warning(
-                        "Ignoring stored model '%s' for user %d (invalid for backend '%s'/provider '%s')",
-                        stored_model,
-                        chat_id,
-                        instance_backend,
-                        instance.provider,
-                    )
+            instance_backend = "claude"
 
-            # Timeout: workspace config timeout overrides user default
-            ws_timeout = instance.workspace_config.timeout if instance.workspace_config else None
-            if ws_timeout is None and "timeout" in db_settings:
-                try:
-                    instance.timeout_seconds = int(db_settings["timeout"])
-                except (ValueError, TypeError):
-                    log.warning("Corrupt timeout in DB for user %d", chat_id)
+        # Model: only apply if workspace config has a VALID model for
+        # this backend. A workspaces.yaml entry like
+        # `model: gpt-5.4-nano` applied to a codex instance is rejected
+        # by apply_workspace_model() at backend __init__ time (the
+        # helper returns the current model and logs a warning), but
+        # the original WorkspaceConfig still carrying the invalid
+        # model field remains stored on instance.workspace_config.
+        # Treating any non-empty workspace_config.model as
+        # precedence-bearing therefore blocks a valid per-user DB
+        # model (e.g. gpt-5.4-mini) even though the workspace override
+        # was never applied. Re-run the same validation here so the
+        # precedence guard matches what was actually applied to
+        # instance.model.
+        ws_model_raw = instance.workspace_config.model if instance.workspace_config else None
+        ws_model_applied = bool(
+            ws_model_raw and validate_model_for_backend(ws_model_raw, instance_backend, instance.provider)
+        )
+        if not ws_model_applied and "model" in db_settings and db_settings["model"] != instance.model:
+            stored_model = db_settings["model"]
+            if validate_model_for_backend(stored_model, instance_backend, instance.provider):
+                instance.model = stored_model
+                needs_restart = True
+            else:
+                log.warning(
+                    "Ignoring stored model '%s' for user %d (invalid for backend '%s'/provider '%s')",
+                    stored_model,
+                    chat_id,
+                    instance_backend,
+                    instance.provider,
+                )
 
-            # restart() kills the subprocess and spawns a new one, but
-            # the backend *object* is preserved. Mutations made
-            # above (timeout, model) survive the
-            # restart because the new subprocess reads from self.* attrs.
-            if needs_restart:
-                log.info("Restarting process for user %d: per-user DB overrides differ", chat_id)
-                await instance.restart()
+        # Timeout: workspace config timeout overrides user default
+        ws_timeout = instance.workspace_config.timeout if instance.workspace_config else None
+        if ws_timeout is None and "timeout" in db_settings:
+            try:
+                instance.timeout_seconds = int(db_settings["timeout"])
+            except (ValueError, TypeError):
+                log.warning("Corrupt timeout in DB for user %d", chat_id)
+
+        # restart() kills the subprocess and spawns a new one, but the
+        # backend *object* is preserved. Mutations made above (timeout,
+        # model) survive the restart because the new subprocess reads
+        # from self.* attrs.
+        if needs_restart:
+            log.info("Restarting process for user %d: per-user DB overrides differ", chat_id)
+            await instance.restart()
 
     # ── Per-user actions ────────────────────────────────────────────
 
@@ -492,8 +543,11 @@ class SubprocessPool:
         instance = self.get(chat_id)
         # Explicit workspace change supersedes any pending restore.
         # Without this, the next send() would restore the old saved
-        # workspace over the one just set.
-        self._needs_workspace_restore.discard(chat_id)
+        # workspace over the one just set. Settings-restore stays
+        # pending: an explicit /workspace switch carries no signal
+        # about user-level model or timeout preferences, and pre-split
+        # behavior accidentally suppressed the DB-settings job here.
+        self._pending_workspace_restore.discard(chat_id)
         await instance.change_workspace(new_workspace, workspace_config=workspace_config)
 
     async def restart(self, chat_id: int) -> None:
@@ -532,17 +586,73 @@ class SubprocessPool:
         instance = self.get(chat_id)
         instance.model = model
 
-    def get_workspace(self, chat_id: int) -> Path:
+    async def get_effective_workspace(self, chat_id: int) -> Path:
         """
-        Get the active workspace for a user.
+        Get the effective workspace for a user, eagerly restoring the
+        saved workspace into the live instance when one exists.
 
-        When no backend instance exists yet (user has not sent their
-        first message in this process lifetime) we resolve the per-user
-        home directory rather than the removed global default. This
-        matches what _build_backend would do on first send().
+        All user-visible workspace decisions (command displays,
+        equality checks, scope detection, file confinement) flow
+        through this method so command-path callers cannot observe
+        the home default while `settings.workspace:<chat_id>` points
+        at a valid saved path. The matching send-path restore stays
+        as a backstop.
+
+        Resolution order:
+
+        1. If a live instance exists AND has no pending workspace
+           restore: return its current workspace.
+        2. Else read `settings.workspace:<chat_id>`. If unset: return
+           the user's home workspace. If an instance exists, discard
+           the workspace-restore flag (the effective path IS home).
+        3. If set, validate path existence and per-user workspace
+           access. If invalid: delete the stale row, return home,
+           and discard the workspace-restore flag on any pre-existing
+           instance.
+        4. If valid: create or reuse the instance, then delegate to
+           `_attempt_workspace_restore` which performs the switch,
+           clears the flag, and returns the saved path.
+
+        The resolver only touches the workspace-restore flag.
+        `_pending_settings_restore` is the send path's responsibility,
+        so user-level model/timeout overrides still land on the first
+        ordinary text turn even if a command-path resolver call
+        already finalized the workspace half.
         """
-        instance = self.get_if_exists(chat_id)
-        return instance.workspace if instance else resolve_home_workspace(chat_id, self._config)
+        instance = self._pool.get(chat_id)
+        if instance is not None and chat_id not in self._pending_workspace_restore:
+            return instance.workspace
+
+        saved = await sessions.get_setting(f"workspace:{chat_id}")
+        if not saved:
+            if instance is not None:
+                self._pending_workspace_restore.discard(chat_id)
+            return resolve_home_workspace(chat_id, self._config)
+
+        ws_path = Path(saved)
+        base, allowed = await sessions.resolve_workspace_access(chat_id, self._config)
+        if not ws_path.is_dir() or not is_workspace_allowed(ws_path, base, allowed):
+            log.warning(
+                "Saved workspace for user %d invalid; clearing: %s",
+                chat_id,
+                saved,
+            )
+            await sessions.delete_setting(f"workspace:{chat_id}")
+            if instance is not None:
+                self._pending_workspace_restore.discard(chat_id)
+            return resolve_home_workspace(chat_id, self._config)
+
+        # Only now do we materialize an instance. Avoiding instance
+        # creation in the no-saved-row and stale-row branches keeps
+        # the resolver cheap for cold reads that just want to confirm
+        # "home is the right answer."
+        instance = self.get(chat_id)
+        # Re-validate inside _attempt_workspace_restore via its own
+        # DB read so a concurrent writer that cleared the setting
+        # between this check and the helper call is still handled
+        # correctly (it returns home instead of trying to switch to a
+        # since-deleted target).
+        return await self._attempt_workspace_restore(chat_id, instance)
 
     def is_alive(self, chat_id: int) -> bool:
         """True if this user's subprocess is running."""

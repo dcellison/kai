@@ -325,11 +325,12 @@ class TestUpdateJob:
 @pytest.fixture
 def send_file_request(tmp_path):
     """Create a mock request for the send-file endpoint with workspace confinement."""
-    # Post-#353 send-file resolves the workspace via pool.get_workspace(chat_id)
+    # Send-file resolves the workspace via pool.get_effective_workspace(chat_id)
     # rather than a global app["workspace"] slot. The fixture supplies a mock
-    # pool whose get_workspace() returns tmp_path so path confinement passes.
+    # pool whose get_effective_workspace() returns tmp_path so path confinement
+    # passes.
     mock_pool = MagicMock()
-    mock_pool.get_workspace = MagicMock(return_value=tmp_path)
+    mock_pool.get_effective_workspace = AsyncMock(return_value=tmp_path)
     request = MagicMock(spec=web.Request)
     request.app = {
         "webhook_secret": "test-secret",
