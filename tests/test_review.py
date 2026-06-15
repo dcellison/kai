@@ -11,6 +11,7 @@ from kai.review import (
     _MAX_PATCH_CHARS,
     _MAX_PRIOR_COMMENTS_CHARS,
     _MAX_RELATED_CONTEXT_CHARS,
+    _MAX_REVIEW_CONTEXT_CHARS,
     _REVIEW_HEADER,
     BudgetNote,
     ChangedFile,
@@ -23,6 +24,7 @@ from kai.review import (
     PRReviewContext,
     PRReviewResult,
     RelatedExcerpt,
+    _estimate_total_chars,
     _normalize_repo_from_remote,
     _resolve_workspace_remote_repo,
     budget_review_context,
@@ -2038,6 +2040,7 @@ class TestBudgetReviewContext:
                 path=f"src/{i}.py",
                 line=i,
                 symbol=f"sym{i}",
+                kind="function",
                 reason="r",
                 excerpt="x" * 4000,
             )
@@ -2128,7 +2131,16 @@ class TestBuildReviewPromptFromContext:
                 ),
             ),
             changed_files=(ChangedFile(path="src/a.py", status="modified", content="print('x')", note=None),),
-            related_context=(RelatedExcerpt(path="src/b.py", line=1, symbol="foo", reason="r", excerpt="hit"),),
+            related_context=(
+                RelatedExcerpt(
+                    path="src/b.py",
+                    line=1,
+                    symbol="foo",
+                    kind="function",
+                    reason="r",
+                    excerpt="hit",
+                ),
+            ),
             spec="must do X",
             conventions="snake_case",
             prior_comments="prior thread",
@@ -2159,7 +2171,16 @@ class TestBuildReviewPromptFromContext:
         ctx = _ctx(
             patch="-- patch --",
             commits=(Commit(oid="abc1234567", headline="h", body=""),),
-            related_context=(RelatedExcerpt(path="src/b.py", line=1, symbol="foo", reason="r", excerpt="hit"),),
+            related_context=(
+                RelatedExcerpt(
+                    path="src/b.py",
+                    line=1,
+                    symbol="foo",
+                    kind="function",
+                    reason="r",
+                    excerpt="hit",
+                ),
+            ),
         )
         prompt = build_review_prompt_from_context(ctx)
         # Pull every hex token after `BEGIN <label> ` and verify uniqueness.
@@ -2229,3 +2250,279 @@ class TestGeneratePRReview:
         assert result.repo == "owner/repo"
         assert result.pr_number == 42
         assert isinstance(result, PRReviewResult)
+
+
+# ── Review-round fixes ─────────────────────────────────────────────
+
+
+class TestRelatedContextDropsByPriority:
+    """
+    The related-context cap drops broad/lower-signal hits before
+    production callers. The earlier implementation pop()ed from the
+    tail and ignored kind, which could discard a function caller
+    found late in favour of a dotted-event hit found early.
+    """
+
+    def test_low_priority_dropped_first(self):
+        # A function caller (high priority) appears LATER than a
+        # dotted_event hit (low priority); the cap must still keep
+        # the function caller and drop the dotted_event one.
+        body = "x" * 30_000
+        excerpts = (
+            RelatedExcerpt(
+                path="src/event.py",
+                line=1,
+                symbol="memory.recall",
+                kind="dotted_event",
+                reason="r",
+                excerpt=body,
+            ),
+            RelatedExcerpt(
+                path="src/caller.py",
+                line=1,
+                symbol="my_helper",
+                kind="function",
+                reason="r",
+                excerpt=body,
+            ),
+        )
+        ctx = _ctx(related_context=excerpts)
+        out = budget_review_context(ctx)
+        kept_kinds = [e.kind for e in out.related_context]
+        assert "function" in kept_kinds
+        assert "dotted_event" not in kept_kinds
+
+    def test_within_same_priority_latest_dropped_first(self):
+        # Two function-caller hits over the cap; the later one drops
+        # so the earliest discovery survives.
+        body = "x" * 30_000
+        excerpts = (
+            RelatedExcerpt(
+                path="src/a.py",
+                line=1,
+                symbol="fn",
+                kind="function",
+                reason="r",
+                excerpt=body,
+            ),
+            RelatedExcerpt(
+                path="src/b.py",
+                line=2,
+                symbol="fn",
+                kind="function",
+                reason="r",
+                excerpt=body,
+            ),
+        )
+        ctx = _ctx(related_context=excerpts)
+        out = budget_review_context(ctx)
+        paths = [e.path for e in out.related_context]
+        assert "src/a.py" in paths
+        assert "src/b.py" not in paths
+
+
+class TestBudgetEnforcesGlobalCeiling:
+    """
+    After per-section caps, the final bundle must respect
+    _MAX_REVIEW_CONTEXT_CHARS. Long spec + conventions + linked
+    issue bodies + prior comments + commits used to leak past the
+    ceiling because the cross-section ladder only touched related
+    excerpts and the patch.
+    """
+
+    def test_long_spec_and_conventions_trim_under_global_cap(self):
+        # Each section sits within its own cap but the sum overshoots.
+        long_spec = "spec line\n" * 8_000  # ~80K chars
+        long_conv = "convention line\n" * 8_000  # ~120K chars
+        long_issues = tuple(
+            LinkedIssue(
+                number=n,
+                title=f"Issue {n}",
+                body="x" * 5_000,
+                state="OPEN",
+                url="",
+                labels=(),
+                comments=(),
+            )
+            for n in range(8)
+        )
+        ctx = _ctx(
+            spec=long_spec,
+            conventions=long_conv,
+            linked_issues=long_issues,
+            patch="diff " * 20_000,
+        )
+        out = budget_review_context(ctx)
+        assert _estimate_total_chars(out) <= _MAX_REVIEW_CONTEXT_CHARS, (
+            f"global cap violated: {_estimate_total_chars(out)} > {_MAX_REVIEW_CONTEXT_CHARS}"
+        )
+        # The reviewer should see what was trimmed.
+        sections = {n.section for n in out.budget_notes}
+        # At least one of SPEC, CONVENTIONS, PATCH appears in notes.
+        assert sections & {"SPEC", "CONVENTIONS", "PATCH"}
+
+    def test_pathological_bundle_emits_last_resort_note(self):
+        # Forcing every section to overflow even after the ladder
+        # runs - issue bodies are never dropped and many small notes
+        # plus a giant patch keep us above the cap. The function
+        # should record a BUDGET_NOTES entry rather than silently
+        # returning over-budget.
+        long_issues = tuple(
+            LinkedIssue(
+                number=n,
+                title=f"Issue {n}",
+                body="x" * 20_000,
+                state="OPEN",
+                url="",
+                labels=(),
+                comments=(),
+            )
+            for n in range(20)
+        )
+        ctx = _ctx(linked_issues=long_issues)
+        out = budget_review_context(ctx)
+        sections = {n.section for n in out.budget_notes}
+        # Either we managed to fit (good) or we emitted the
+        # last-resort BUDGET_NOTES entry (also acceptable).
+        if _estimate_total_chars(out) > _MAX_REVIEW_CONTEXT_CHARS:
+            assert "BUDGET_NOTES" in sections
+
+
+class TestChangedFileURLEncoding:
+    """
+    File paths with URL-reserved characters (`?`, `#`, space) must
+    reach the GitHub Contents API endpoint intact.
+    """
+
+    @pytest.mark.asyncio
+    async def test_question_mark_in_path_is_encoded(self):
+        meta = ExtendedPRMetadata(
+            repo="owner/repo",
+            number=42,
+            title="",
+            description="",
+            author="",
+            state="",
+            url="",
+            base_ref="",
+            head_ref="",
+            head_oid="sha",
+            commit_oids=(),
+            changed_paths=(("docs/a?b.md", "modified"),),
+            closing_issue_numbers=(),
+            review_decision="",
+        )
+        proc = _mock_process(
+            stdout=json.dumps(
+                {
+                    "type": "file",
+                    "encoding": "base64",
+                    "size": 3,
+                    "content": "aGk=",
+                }
+            ).encode()
+        )
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_sub:
+            await fetch_changed_files_at_head(meta)
+        invoked_endpoint = mock_sub.call_args.args[2]
+        assert invoked_endpoint == "repos/owner/repo/contents/docs/a%3Fb.md?ref=sha"
+
+    @pytest.mark.asyncio
+    async def test_hash_in_path_is_encoded(self):
+        meta = ExtendedPRMetadata(
+            repo="owner/repo",
+            number=42,
+            title="",
+            description="",
+            author="",
+            state="",
+            url="",
+            base_ref="",
+            head_ref="",
+            head_oid="sha",
+            commit_oids=(),
+            changed_paths=(("docs/a#b.md", "modified"),),
+            closing_issue_numbers=(),
+            review_decision="",
+        )
+        proc = _mock_process(
+            stdout=json.dumps(
+                {
+                    "type": "file",
+                    "encoding": "base64",
+                    "size": 3,
+                    "content": "aGk=",
+                }
+            ).encode()
+        )
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_sub:
+            await fetch_changed_files_at_head(meta)
+        invoked_endpoint = mock_sub.call_args.args[2]
+        assert "%23" in invoked_endpoint
+
+    @pytest.mark.asyncio
+    async def test_space_in_path_is_encoded(self):
+        meta = ExtendedPRMetadata(
+            repo="owner/repo",
+            number=42,
+            title="",
+            description="",
+            author="",
+            state="",
+            url="",
+            base_ref="",
+            head_ref="",
+            head_oid="sha",
+            commit_oids=(),
+            changed_paths=(("docs/my file.md", "modified"),),
+            closing_issue_numbers=(),
+            review_decision="",
+        )
+        proc = _mock_process(
+            stdout=json.dumps(
+                {
+                    "type": "file",
+                    "encoding": "base64",
+                    "size": 3,
+                    "content": "aGk=",
+                }
+            ).encode()
+        )
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_sub:
+            await fetch_changed_files_at_head(meta)
+        invoked_endpoint = mock_sub.call_args.args[2]
+        assert "%20" in invoked_endpoint
+
+    @pytest.mark.asyncio
+    async def test_directory_separators_preserved(self):
+        meta = ExtendedPRMetadata(
+            repo="owner/repo",
+            number=42,
+            title="",
+            description="",
+            author="",
+            state="",
+            url="",
+            base_ref="",
+            head_ref="",
+            head_oid="sha",
+            commit_oids=(),
+            changed_paths=(("src/kai/review.py", "modified"),),
+            closing_issue_numbers=(),
+            review_decision="",
+        )
+        proc = _mock_process(
+            stdout=json.dumps(
+                {
+                    "type": "file",
+                    "encoding": "base64",
+                    "size": 3,
+                    "content": "aGk=",
+                }
+            ).encode()
+        )
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_sub:
+            await fetch_changed_files_at_head(meta)
+        invoked_endpoint = mock_sub.call_args.args[2]
+        # `/` stays unescaped so the endpoint remains a real path.
+        assert invoked_endpoint == "repos/owner/repo/contents/src/kai/review.py?ref=sha"

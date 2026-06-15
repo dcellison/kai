@@ -34,6 +34,7 @@ import glob as glob_mod
 import json
 import logging
 import re
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -280,6 +281,12 @@ class RelatedExcerpt:
         path: Repo-relative path of the file containing the hit.
         line: 1-based line number of the matching line.
         symbol: The patch-extracted symbol that produced this hit.
+        kind: The symbol's classification (one of the
+            `_SymbolCandidate.kind` values: "function", "class",
+            "env_var", "config_field", "dotted_event",
+            "slash_command", "test"). The budgeter uses kind to drop
+            broad/lower-signal hits before production-caller hits
+            when the related section runs over its cap.
         reason: Human-readable explanation for why the excerpt was
             included (e.g. "`format_x` is called here outside the
             changed files").
@@ -289,6 +296,7 @@ class RelatedExcerpt:
     path: str
     line: int
     symbol: str
+    kind: str
     reason: str
     excerpt: str
 
@@ -1233,10 +1241,17 @@ async def _fetch_file_at_head(
     if suffix in _BINARY_FILE_SUFFIXES:
         return (None, f"binary ({suffix}); contents omitted")
 
+    # URL-encode the path segment so files with reserved URL
+    # characters (`?`, `#`, ` `, etc.) reach the contents endpoint
+    # intact. `safe="/"` keeps directory separators readable while
+    # escaping everything else; without this, `docs/a?b.md` would
+    # split into a query string and the API would either 404 or
+    # return the wrong file.
+    encoded_path = urllib.parse.quote(path, safe="/")
     proc = await asyncio.create_subprocess_exec(
         "gh",
         "api",
-        f"repos/{repo}/contents/{path}?ref={head_oid}",
+        f"repos/{repo}/contents/{encoded_path}?ref={head_oid}",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -1691,6 +1706,7 @@ async def _rg_search_outside_changed(
                     path=rel_path,
                     line=int(current["line"] or 0),
                     symbol=symbol.name,
+                    kind=symbol.kind,
                     reason=_reason_for_symbol(symbol),
                     excerpt="\n".join(current["lines"]),
                 )
@@ -1865,7 +1881,16 @@ def _truncate_with_marker(text: str, limit: int, marker: str) -> str:
 def _cap_related(
     related: tuple[RelatedExcerpt, ...],
 ) -> tuple[tuple[RelatedExcerpt, ...], list[BudgetNote]]:
-    """Apply the per-section cap to related-context excerpts."""
+    """Apply the per-section cap to related-context excerpts.
+
+    Drops by symbol kind in priority order: dotted-event and test
+    excerpts (broad signal) drop first, then slash-command / env-var
+    / config-field, then function/class (production callers) last.
+    Within the same priority bucket we drop the excerpt that
+    appeared latest in the input order so the earlier, higher-signal
+    discovery survives. This implements the spec's "drop broad /
+    repetitive hits before production callers" rung.
+    """
     notes: list[BudgetNote] = []
     if not related:
         return ((), notes)
@@ -1874,47 +1899,49 @@ def _cap_related(
     if total <= _MAX_RELATED_CONTEXT_CHARS:
         return (related, notes)
 
-    # Drop ladder rung 1: drop broad/duplicate-reason hits first.
-    # Excerpts are already deduped by (path, line) in the searcher;
-    # within the remaining set, dotted_event hits are the broadest
-    # signal and drop first, then test excerpts, then everything
-    # else from the tail. This preserves earlier-discovered hits
-    # (higher-priority symbols extracted first by extract_symbols).
-    priority = {
-        "function": 0,
-        "class": 0,
-        "config_field": 1,
-        "env_var": 1,
-        "slash_command": 1,
-        "test": 2,
-        "dotted_event": 3,
+    # Higher number = drop sooner. Anything unknown (future kinds,
+    # mis-tagged) lands in the most-likely-to-drop bucket so the
+    # fallback is conservative rather than dropping a real production
+    # caller.
+    drop_priority = {
+        "dotted_event": 4,
+        "test": 3,
+        "slash_command": 2,
+        "env_var": 2,
+        "config_field": 2,
+        "function": 1,
+        "class": 1,
     }
-    ordered = sorted(
-        enumerate(related),
-        key=lambda item: (priority.get(item[1].symbol[:0] or "", 0), item[0]),
+    # `drop_order` lists excerpt indices in the order we will drop
+    # them from `related`. We sort by (drop_priority desc, original
+    # index desc) so the highest-drop-priority and latest-seen
+    # excerpts go first; sorting is stable so equal-priority hits
+    # follow their original insertion order in reverse.
+    drop_order = sorted(
+        range(len(related)),
+        key=lambda i: (-drop_priority.get(related[i].kind, 4), -i),
     )
-    # `priority` keyed on symbol kind requires the RelatedExcerpt to
-    # carry kind; we resolve it from the reason wording, but the
-    # safer approach is to drop tail-first when reason-based
-    # classification is unavailable. Fall back to tail-first ordering
-    # so the budgeter remains deterministic regardless of symbol kind
-    # availability.
-    kept: list[RelatedExcerpt] = list(related)
+    keep_mask = [True] * len(related)
     dropped = 0
-    while kept and sum(_measure_related(e) for e in kept) > _MAX_RELATED_CONTEXT_CHARS:
-        kept.pop()
+    running_total = total
+    for idx in drop_order:
+        if running_total <= _MAX_RELATED_CONTEXT_CHARS:
+            break
+        running_total -= _measure_related(related[idx])
+        keep_mask[idx] = False
         dropped += 1
+    kept = tuple(e for e, keep in zip(related, keep_mask, strict=True) if keep)
     if dropped:
         notes.append(
             BudgetNote(
                 section="RELATED_CONTEXT",
-                message=f"Dropped {dropped} related excerpt(s) to stay within section cap.",
+                message=(
+                    f"Dropped {dropped} related excerpt(s) to stay within section cap "
+                    "(broader/lower-priority hits removed first)."
+                ),
             )
         )
-    # Silence the unused-variable warning for the priority-aware
-    # ordering attempt; v1 keeps the simpler tail-drop policy above.
-    _ = ordered
-    return (tuple(kept), notes)
+    return (kept, notes)
 
 
 def _cap_commits(
@@ -2182,64 +2209,184 @@ def budget_review_context(ctx: PRReviewContext) -> PRReviewContext:
 
 
 def _apply_cross_section_ladder(ctx: PRReviewContext) -> PRReviewContext:
-    """Reduce sections further when the per-section caps still overshoot."""
+    """
+    Reduce sections in documented priority order until under the global cap.
+
+    Per-section caps in `budget_review_context()` keep each section
+    individually bounded, but their sum can still exceed
+    `_MAX_REVIEW_CONTEXT_CHARS` when many sections are simultaneously
+    near their own ceiling (a long spec, long conventions, many
+    linked-issue bodies, a near-max patch). This function enforces
+    the global ceiling by walking the spec's drop ladder rung by
+    rung and re-checking the estimate after each step.
+
+    The final invariant: on return, either
+    ``_estimate_total_chars(out) <= _MAX_REVIEW_CONTEXT_CHARS`` or
+    every reducible section has been minimised and a last-resort
+    note records the residual overshoot. Anything less would let the
+    backend become the de facto budgeter via silent truncation,
+    which is exactly the failure mode this PR is meant to prevent.
+    """
     notes = list(ctx.budget_notes)
     related = ctx.related_context
-    while (
-        related
-        and _estimate_total_chars(
-            PRReviewContext(
-                repo=ctx.repo,
-                pr_number=ctx.pr_number,
-                metadata=ctx.metadata,
-                linked_issues=ctx.linked_issues,
-                commits=ctx.commits,
-                patch=ctx.patch,
-                changed_files=ctx.changed_files,
-                related_context=related,
-                spec=ctx.spec,
-                conventions=ctx.conventions,
-                prior_comments=ctx.prior_comments,
-            )
+    commits = ctx.commits
+    linked_issues = ctx.linked_issues
+    patch = ctx.patch
+    prior_comments = ctx.prior_comments
+    spec = ctx.spec
+    conventions = ctx.conventions
+    changed_files = ctx.changed_files
+
+    def _current() -> PRReviewContext:
+        return PRReviewContext(
+            repo=ctx.repo,
+            pr_number=ctx.pr_number,
+            metadata=ctx.metadata,
+            linked_issues=linked_issues,
+            commits=commits,
+            patch=patch,
+            changed_files=changed_files,
+            related_context=related,
+            spec=spec,
+            conventions=conventions,
+            prior_comments=prior_comments,
         )
-        > _MAX_REVIEW_CONTEXT_CHARS
-    ):
-        related = related[:-1]
-    if len(related) != len(ctx.related_context):
+
+    def _over() -> bool:
+        return _estimate_total_chars(_current()) > _MAX_REVIEW_CONTEXT_CHARS
+
+    # Rung 1: drop related-context excerpts in priority order
+    # (lowest signal first). The per-section cap already used the
+    # same ordering, but the section may sit just under its own cap
+    # while the global ceiling still demands further cuts.
+    if related and _over():
+        original_count = len(related)
+        drop_priority = {
+            "dotted_event": 4,
+            "test": 3,
+            "slash_command": 2,
+            "env_var": 2,
+            "config_field": 2,
+            "function": 1,
+            "class": 1,
+        }
+        drop_order = sorted(
+            range(len(related)),
+            key=lambda i: (-drop_priority.get(related[i].kind, 4), -i),
+        )
+        keep_mask = [True] * len(related)
+        for idx in drop_order:
+            if not _over():
+                break
+            keep_mask[idx] = False
+            related = tuple(e for e, keep in zip(ctx.related_context, keep_mask, strict=True) if keep)
+        dropped = original_count - len(related)
+        if dropped:
+            notes.append(
+                BudgetNote(
+                    section="RELATED_CONTEXT",
+                    message=(
+                        f"Cross-section ladder dropped {dropped} additional related "
+                        "excerpt(s) under the global ceiling."
+                    ),
+                )
+            )
+
+    # Rung 2: collapse any commit bodies the per-section cap left
+    # behind. Headlines remain so the reviewer keeps the SHA timeline.
+    if _over() and any(c.body for c in commits):
+        commits = tuple(Commit(oid=c.oid, headline=c.headline, body="") for c in commits)
         notes.append(
             BudgetNote(
-                section="RELATED_CONTEXT",
+                section="COMMITS",
                 message=(
-                    f"Cross-section ladder dropped {len(ctx.related_context) - len(related)} "
-                    "related excerpt(s) after per-section caps left the bundle "
-                    "above the global ceiling."
+                    "Cross-section ladder dropped remaining commit bodies under "
+                    "the global ceiling; headlines preserved."
                 ),
             )
         )
 
-    # Patch and changed-files truncation as a last resort. The spec's
-    # ladder keeps full changed files last, so we shave the patch
-    # ahead of changed-file content.
-    patch = ctx.patch
-    if (
-        _estimate_total_chars(
-            PRReviewContext(
-                repo=ctx.repo,
-                pr_number=ctx.pr_number,
-                metadata=ctx.metadata,
-                linked_issues=ctx.linked_issues,
-                commits=ctx.commits,
-                patch=patch,
-                changed_files=ctx.changed_files,
-                related_context=related,
-                spec=ctx.spec,
-                conventions=ctx.conventions,
-                prior_comments=ctx.prior_comments,
+    # Rung 3: drop ordinary linked-issue comments (keep
+    # scope-defining ones plus bodies/titles).
+    if _over() and linked_issues:
+        trimmed = tuple(
+            LinkedIssue(
+                number=issue.number,
+                title=issue.title,
+                body=issue.body,
+                state=issue.state,
+                url=issue.url,
+                labels=issue.labels,
+                comments=tuple(c for c in issue.comments if _comment_is_scope_defining(c.body)),
+            )
+            for issue in linked_issues
+        )
+        if any(trimmed[i].comments != linked_issues[i].comments for i in range(len(trimmed))):
+            linked_issues = trimmed
+            notes.append(
+                BudgetNote(
+                    section="LINKED_ISSUES",
+                    message=(
+                        "Cross-section ladder dropped ordinary linked-issue comments "
+                        "under the global ceiling; bodies and scope-defining comments "
+                        "preserved."
+                    ),
+                )
+            )
+
+    # Rung 4: prior-review thread. Per-section cap is 50K; under the
+    # global ceiling we tighten to 5K so the latest finding survives.
+    if _over() and prior_comments and len(prior_comments) > 5_000:
+        before = len(prior_comments)
+        prior_comments = _truncate_with_marker(
+            prior_comments,
+            5_000,
+            "\n[... prior review thread further truncated under global cap ...]\n",
+        )
+        notes.append(
+            BudgetNote(
+                section="PRIOR_REVIEW_THREAD",
+                message=(
+                    f"Cross-section ladder reduced prior review thread ({before} -> {len(prior_comments)} chars)."
+                ),
             )
         )
-        > _MAX_REVIEW_CONTEXT_CHARS
-    ):
+
+    # Rung 5: spec and conventions. These are local author-supplied
+    # content; useful but can dominate the bundle when long. Spec
+    # trims first because conventions tend to be denser per char.
+    if _over() and spec and len(spec) > 10_000:
+        before = len(spec)
+        spec = _truncate_with_marker(
+            spec,
+            10_000,
+            "\n\n[... spec truncated under global cap ...]\n",
+        )
+        notes.append(
+            BudgetNote(
+                section="SPEC",
+                message=f"Spec truncated under global ceiling ({before} -> {len(spec)} chars).",
+            )
+        )
+    if _over() and conventions and len(conventions) > 8_000:
+        before = len(conventions)
+        conventions = _truncate_with_marker(
+            conventions,
+            8_000,
+            "\n\n[... conventions truncated under global cap ...]\n",
+        )
+        notes.append(
+            BudgetNote(
+                section="CONVENTIONS",
+                message=(f"Conventions truncated under global ceiling ({before} -> {len(conventions)} chars)."),
+            )
+        )
+
+    # Rung 6: patch. Spec ladder keeps full changed files truncated
+    # last, so the patch shaves before changed-file content.
+    if _over() and patch:
         new_patch_cap = max(20_000, _MAX_PATCH_CHARS // 2)
+        before = len(patch)
         patch = _truncate_with_marker(
             patch,
             new_patch_cap,
@@ -2248,7 +2395,50 @@ def _apply_cross_section_ladder(ctx: PRReviewContext) -> PRReviewContext:
         notes.append(
             BudgetNote(
                 section="PATCH",
-                message=f"Patch further reduced to {len(patch)} chars under global ceiling.",
+                message=(f"Patch further reduced under global ceiling ({before} -> {len(patch)} chars)."),
+            )
+        )
+
+    # Rung 7 (last resort): full changed-file contents. The spec
+    # protects these the longest; we only drop them when every other
+    # section has been minimised. Bodies turn into notes so existence
+    # and status remain visible to the reviewer.
+    if _over() and any(f.content is not None for f in changed_files):
+        changed_files = tuple(
+            ChangedFile(
+                path=f.path,
+                status=f.status,
+                content=None,
+                note=f.note or "content omitted under global cap",
+            )
+            if f.content is not None
+            else f
+            for f in changed_files
+        )
+        notes.append(
+            BudgetNote(
+                section="CHANGED_FILES_AT_HEAD",
+                message=(
+                    "Cross-section ladder dropped remaining full changed-file contents "
+                    "under the global ceiling; file existence + status preserved."
+                ),
+            )
+        )
+
+    # Even after the ladder runs, an adversarial bundle (huge linked
+    # issue bodies plus many file notes) can remain above the cap.
+    # Record an explicit warning instead of pretending the budget
+    # invariant held; the reviewer should know the bundle came in
+    # over budget.
+    if _over():
+        notes.append(
+            BudgetNote(
+                section="BUDGET_NOTES",
+                message=(
+                    f"Bundle remains above global ceiling after the full drop ladder; "
+                    f"estimated {_estimate_total_chars(_current())} chars vs cap "
+                    f"{_MAX_REVIEW_CONTEXT_CHARS}."
+                ),
             )
         )
 
@@ -2256,14 +2446,14 @@ def _apply_cross_section_ladder(ctx: PRReviewContext) -> PRReviewContext:
         repo=ctx.repo,
         pr_number=ctx.pr_number,
         metadata=ctx.metadata,
-        linked_issues=ctx.linked_issues,
-        commits=ctx.commits,
+        linked_issues=linked_issues,
+        commits=commits,
         patch=patch,
-        changed_files=ctx.changed_files,
+        changed_files=changed_files,
         related_context=related,
-        spec=ctx.spec,
-        conventions=ctx.conventions,
-        prior_comments=ctx.prior_comments,
+        spec=spec,
+        conventions=conventions,
+        prior_comments=prior_comments,
         budget_notes=tuple(notes),
         collection_warnings=ctx.collection_warnings,
     )
