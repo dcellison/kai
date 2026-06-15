@@ -8,13 +8,35 @@ import pytest
 
 from kai.review import (
     _MAX_DIFF_CHARS,
+    _MAX_PATCH_CHARS,
     _MAX_PRIOR_COMMENTS_CHARS,
+    _MAX_RELATED_CONTEXT_CHARS,
     _REVIEW_HEADER,
+    BudgetNote,
+    ChangedFile,
+    CollectionWarning,
+    Commit,
+    ExtendedPRMetadata,
+    IssueComment,
+    LinkedIssue,
     PRMetadata,
+    PRReviewContext,
+    PRReviewResult,
+    RelatedExcerpt,
+    _normalize_repo_from_remote,
+    _resolve_workspace_remote_repo,
+    budget_review_context,
     build_review_prompt,
+    build_review_prompt_from_context,
     extract_pr_metadata,
+    extract_symbols,
+    fetch_changed_files_at_head,
+    fetch_extended_pr_metadata,
+    fetch_linked_issue,
+    fetch_linked_issues,
     fetch_pr_diff,
     fetch_prior_comments,
+    generate_pr_review,
     load_conventions,
     load_spec,
     post_review_comment,
@@ -1084,28 +1106,48 @@ class TestSendReviewSummary:
 # ── review_pr (orchestrator) ────────────────────────────────────────
 
 
+def _result(text: str = "review output") -> PRReviewResult:
+    """Build a PRReviewResult fixture for review_pr orchestrator tests."""
+    return PRReviewResult(
+        repo="owner/repo",
+        pr_number=42,
+        pr_title="Add feature X",
+        pr_url="https://github.com/owner/repo/pull/42",
+        review_text=text,
+        collection_warnings=(),
+    )
+
+
 class TestReviewPR:
+    """
+    Webhook orchestrator tests. The heavy lifting now lives in
+    generate_pr_review(); these tests cover the orchestration layer
+    that calls generate_pr_review, post_review_comment, and
+    send_review_summary in the right order with the right arguments.
+    """
+
     @pytest.mark.asyncio
     async def test_full_pipeline(self):
-        """All steps are called in order with correct arguments."""
+        """Patch-fetch checks the early-empty guard and full happy path."""
         payload = _webhook_payload()
 
         with (
             patch("kai.review.fetch_pr_diff", return_value="diff content") as mock_diff,
-            patch("kai.review.fetch_prior_comments", return_value=None),
-            patch("kai.review.run_review", return_value="review output") as mock_run,
+            patch(
+                "kai.review.generate_pr_review",
+                return_value=_result(),
+            ) as mock_generate,
             patch("kai.review.post_review_comment", return_value=True) as mock_post,
             patch("kai.review.send_review_summary") as mock_summary,
         ):
             await review_pr(payload, 8080, "secret", claude_user="kai")
 
         mock_diff.assert_called_once_with("owner/repo", 42)
-        mock_run.assert_called_once()
+        mock_generate.assert_called_once()
+        assert mock_generate.call_args.args == ("owner/repo", 42)
+        assert mock_generate.call_args.kwargs["claude_user"] == "kai"
         mock_post.assert_called_once_with("owner/repo", 42, "review output")
 
-        # Construct the expected metadata independently to verify
-        # extract_pr_metadata produced the right values - not just
-        # asserting the mock's captured args against themselves.
         expected_meta = PRMetadata(
             repo="owner/repo",
             number=42,
@@ -1118,22 +1160,22 @@ class TestReviewPR:
 
     @pytest.mark.asyncio
     async def test_empty_diff_skips_review(self):
-        """Empty diffs skip the review entirely without sending notifications."""
+        """Empty diffs skip the bundle build entirely; no summary fires."""
         payload = _webhook_payload()
 
         with (
             patch("kai.review.fetch_pr_diff", return_value="  \n"),
-            patch("kai.review.run_review") as mock_run,
+            patch("kai.review.generate_pr_review") as mock_generate,
             patch("kai.review.send_review_summary") as mock_summary,
         ):
             await review_pr(payload, 8080, "secret")
 
-        mock_run.assert_not_called()
+        mock_generate.assert_not_called()
         mock_summary.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_diff_failure_sends_notification(self):
-        """When diff fetching fails, a failure notification is sent."""
+        """When the early-empty fetch raises, a failure summary is sent."""
         payload = _webhook_payload()
 
         with (
@@ -1142,19 +1184,20 @@ class TestReviewPR:
         ):
             await review_pr(payload, 8080, "secret")
 
-        # Failure notification should have been sent
         mock_summary.assert_called_once()
-        assert mock_summary.call_args[0][1] is False  # success=False
+        assert mock_summary.call_args[0][1] is False
 
     @pytest.mark.asyncio
-    async def test_claude_failure_sends_notification(self):
-        """When Claude subprocess fails, a failure notification is sent."""
+    async def test_backend_failure_sends_notification(self):
+        """When the review backend fails, a failure summary is sent."""
         payload = _webhook_payload()
 
         with (
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
-            patch("kai.review.fetch_prior_comments", return_value=None),
-            patch("kai.review.run_review", side_effect=RuntimeError("Claude crashed")),
+            patch(
+                "kai.review.generate_pr_review",
+                side_effect=RuntimeError("backend crashed"),
+            ),
             patch("kai.review.send_review_summary") as mock_summary,
         ):
             await review_pr(payload, 8080, "secret")
@@ -1164,144 +1207,76 @@ class TestReviewPR:
 
     @pytest.mark.asyncio
     async def test_empty_review_sends_failure(self):
-        """Empty Claude output sends a failure notification."""
+        """Empty review backend output sends a failure summary."""
         payload = _webhook_payload()
 
         with (
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
-            patch("kai.review.fetch_prior_comments", return_value=None),
-            patch("kai.review.run_review", return_value="  "),
+            patch("kai.review.generate_pr_review", return_value=_result("  ")),
             patch("kai.review.post_review_comment") as mock_post,
             patch("kai.review.send_review_summary") as mock_summary,
         ):
             await review_pr(payload, 8080, "secret")
 
-        # Should not attempt to post an empty review
         mock_post.assert_not_called()
         mock_summary.assert_called_once()
         assert mock_summary.call_args[0][1] is False
 
     @pytest.mark.asyncio
-    async def test_spec_injected_into_prompt(self):
-        """When load_spec returns content, it is passed to build_review_prompt."""
+    async def test_forwards_spec_dir(self):
+        """spec_dir is forwarded from review_pr to generate_pr_review."""
         payload = _webhook_payload()
 
         with (
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
-            patch("kai.review.load_spec", return_value="Must implement feature Y.") as mock_load,
-            patch("kai.review.load_conventions", return_value=None),
-            patch("kai.review.fetch_prior_comments", return_value=None),
-            patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
-            patch("kai.review.run_review", return_value="review output"),
+            patch(
+                "kai.review.generate_pr_review",
+                return_value=_result(),
+            ) as mock_generate,
             patch("kai.review.post_review_comment", return_value=True),
             patch("kai.review.send_review_summary"),
         ):
-            await review_pr(payload, 8080, "secret", local_repo_path="/repo")
+            await review_pr(
+                payload,
+                8080,
+                "secret",
+                local_repo_path="/repo",
+                spec_dir="my/specs",
+            )
 
-        mock_load.assert_called_once()
-        # Verify spec content was passed through to the prompt builder
-        assert mock_build.call_args[1].get("spec") == "Must implement feature Y."
+        assert mock_generate.call_args.kwargs["spec_dir"] == "my/specs"
+        assert mock_generate.call_args.kwargs["local_repo_path"] == "/repo"
+        assert mock_generate.call_args.kwargs["include_prior_comments"] is True
 
     @pytest.mark.asyncio
-    async def test_passes_spec_dir_to_load_spec(self):
-        """spec_dir is forwarded from review_pr to load_spec."""
+    async def test_forwards_backend_provider_timeout_model(self):
+        """Backend-routing kwargs flow through to generate_pr_review."""
         payload = _webhook_payload()
 
         with (
             patch("kai.review.fetch_pr_diff", return_value="diff content"),
-            patch("kai.review.load_spec", return_value=None) as mock_load,
-            patch("kai.review.load_conventions", return_value=None),
-            patch("kai.review.fetch_prior_comments", return_value=None),
-            patch("kai.review.build_review_prompt", return_value="prompt"),
-            patch("kai.review.run_review", return_value="review output"),
+            patch(
+                "kai.review.generate_pr_review",
+                return_value=_result(),
+            ) as mock_generate,
             patch("kai.review.post_review_comment", return_value=True),
             patch("kai.review.send_review_summary"),
         ):
-            await review_pr(payload, 8080, "secret", local_repo_path="/repo", spec_dir="my/specs")
+            await review_pr(
+                payload,
+                8080,
+                "secret",
+                agent_backend="codex",
+                provider="openai",
+                timeout_s=42,
+                model_override="gpt-foo",
+            )
 
-        # Verify spec_dir was passed through to load_spec
-        assert mock_load.call_args[0][2] == "my/specs"
-
-    @pytest.mark.asyncio
-    async def test_conventions_injected_into_prompt(self):
-        """When load_conventions returns content, it is passed to build_review_prompt."""
-        payload = _webhook_payload()
-
-        with (
-            patch("kai.review.fetch_pr_diff", return_value="diff content"),
-            patch("kai.review.load_spec", return_value=None),
-            patch("kai.review.load_conventions", return_value="Use snake_case.") as mock_conv,
-            patch("kai.review.fetch_prior_comments", return_value=None),
-            patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
-            patch("kai.review.run_review", return_value="review output"),
-            patch("kai.review.post_review_comment", return_value=True),
-            patch("kai.review.send_review_summary"),
-        ):
-            await review_pr(payload, 8080, "secret", local_repo_path="/repo")
-
-        mock_conv.assert_called_once()
-        assert mock_build.call_args[1].get("conventions") == "Use snake_case."
-
-    @pytest.mark.asyncio
-    async def test_no_conventions_passes_none(self):
-        """When load_conventions returns None, conventions=None is passed to the prompt."""
-        payload = _webhook_payload()
-
-        with (
-            patch("kai.review.fetch_pr_diff", return_value="diff content"),
-            patch("kai.review.load_spec", return_value=None),
-            patch("kai.review.load_conventions", return_value=None) as mock_conv,
-            patch("kai.review.fetch_prior_comments", return_value=None),
-            patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
-            patch("kai.review.run_review", return_value="review output"),
-            patch("kai.review.post_review_comment", return_value=True),
-            patch("kai.review.send_review_summary"),
-        ):
-            await review_pr(payload, 8080, "secret", local_repo_path="/repo")
-
-        mock_conv.assert_called_once()
-        assert mock_build.call_args[1].get("conventions") is None
-
-    @pytest.mark.asyncio
-    async def test_prior_comments_injected_into_prompt(self):
-        """When fetch_prior_comments returns a thread, it is passed to build_review_prompt."""
-        payload = _webhook_payload()
-        prior_thread = "[2026-03-12T14:00:00Z] kai-bot:\n## Review by Kai\n\nFound a bug."
-
-        with (
-            patch("kai.review.fetch_pr_diff", return_value="diff content"),
-            patch("kai.review.load_spec", return_value=None),
-            patch("kai.review.load_conventions", return_value=None),
-            patch("kai.review.fetch_prior_comments", return_value=prior_thread) as mock_prior,
-            patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
-            patch("kai.review.run_review", return_value="review output"),
-            patch("kai.review.post_review_comment", return_value=True),
-            patch("kai.review.send_review_summary"),
-        ):
-            await review_pr(payload, 8080, "secret", local_repo_path="/repo")
-
-        mock_prior.assert_called_once_with("owner/repo", 42)
-        assert mock_build.call_args[1].get("prior_comments") == prior_thread
-
-    @pytest.mark.asyncio
-    async def test_prior_comments_failure_does_not_block(self):
-        """When fetch_prior_comments returns None, review proceeds without context."""
-        payload = _webhook_payload()
-
-        with (
-            patch("kai.review.fetch_pr_diff", return_value="diff content"),
-            patch("kai.review.load_spec", return_value=None),
-            patch("kai.review.load_conventions", return_value=None),
-            patch("kai.review.fetch_prior_comments", return_value=None),
-            patch("kai.review.build_review_prompt", return_value="full prompt") as mock_build,
-            patch("kai.review.run_review", return_value="review output"),
-            patch("kai.review.post_review_comment", return_value=True),
-            patch("kai.review.send_review_summary"),
-        ):
-            await review_pr(payload, 8080, "secret", local_repo_path="/repo")
-
-        # prior_comments should be None, review should still proceed
-        assert mock_build.call_args[1].get("prior_comments") is None
+        kwargs = mock_generate.call_args.kwargs
+        assert kwargs["agent_backend"] == "codex"
+        assert kwargs["provider"] == "openai"
+        assert kwargs["timeout_s"] == 42
+        assert kwargs["model_override"] == "gpt-foo"
 
 
 # ── resolve_spec_from_body ─────────────────────────────────────────
@@ -1623,3 +1598,634 @@ class TestLoadConventions:
         meta = _metadata()
         result = await load_conventions(meta, local_repo_path=str(tmp_path))
         assert result is None
+
+
+# ── extract_symbols ────────────────────────────────────────────────
+
+
+class TestExtractSymbols:
+    """
+    Patch-only extraction. Tests pin the kinds we promise to extract
+    plus the noise filter and cap; specifics around regex shape are
+    covered by the kind labels rather than by anchoring on internal
+    pattern names.
+    """
+
+    def test_extracts_function_def_from_added_line(self):
+        patch_text = "diff --git a/x.py b/x.py\n+++ b/x.py\n+def my_helper(x):\n+    return x\n"
+        symbols = extract_symbols(patch_text)
+        names = {s.name for s in symbols}
+        assert "my_helper" in names
+        kinds = {s.name: s.kind for s in symbols}
+        assert kinds["my_helper"] == "function"
+
+    def test_extracts_async_def(self):
+        patch_text = "+async def my_async_helper():\n+    pass\n"
+        symbols = {s.name for s in extract_symbols(patch_text)}
+        assert "my_async_helper" in symbols
+
+    def test_extracts_class_name(self):
+        patch_text = "+class MyClass:\n+    pass\n"
+        kinds = {s.name: s.kind for s in extract_symbols(patch_text)}
+        assert kinds["MyClass"] == "class"
+
+    def test_extracts_env_var(self):
+        patch_text = "+MEMORY_SCOPED_RECALL_ENABLED = True\n"
+        kinds = {s.name: s.kind for s in extract_symbols(patch_text)}
+        assert kinds["MEMORY_SCOPED_RECALL_ENABLED"] == "env_var"
+
+    def test_extracts_config_field_annotation(self):
+        patch_text = "+    memory_scoped_recall_enabled: bool = False\n"
+        kinds = {s.name: s.kind for s in extract_symbols(patch_text)}
+        assert kinds["memory_scoped_recall_enabled"] == "config_field"
+
+    def test_extracts_dotted_event_name(self):
+        patch_text = '+log.info("memory.recall hits=%d", n)\n'
+        symbols = extract_symbols(patch_text)
+        names = {s.name for s in symbols}
+        assert "memory.recall" in names
+        kinds = {s.name: s.kind for s in symbols}
+        assert kinds["memory.recall"] == "dotted_event"
+
+    def test_extracts_test_name(self):
+        patch_text = "+def test_something_specific(): pass\n"
+        kinds = {s.name: s.kind for s in extract_symbols(patch_text)}
+        assert kinds["test_something_specific"] == "test"
+
+    def test_extracts_command_handler(self):
+        patch_text = '+app.add_handler(CommandHandler("review", handle_review))\n'
+        kinds = {s.name: s.kind for s in extract_symbols(patch_text)}
+        assert kinds["review"] == "slash_command"
+
+    def test_ignores_removed_lines(self):
+        # Symbol appears only on a deletion line; the extractor should
+        # not pull it (we're searching consumers of the NEW shape).
+        patch_text = "-def removed_helper(): pass\n"
+        names = {s.name for s in extract_symbols(patch_text)}
+        assert "removed_helper" not in names
+
+    def test_filters_noise(self):
+        patch_text = "+self = None\n+data = []\n"
+        names = {s.name for s in extract_symbols(patch_text)}
+        assert "self" not in names
+        assert "data" not in names
+
+    def test_dedupes_by_name(self):
+        patch_text = "+def repeated(): pass\n+def repeated(): pass\n"
+        symbols = extract_symbols(patch_text)
+        assert sum(1 for s in symbols if s.name == "repeated") == 1
+
+    def test_caps_total_candidates(self):
+        # 100 distinct function definitions should not produce 100
+        # candidates; the cap holds.
+        from kai.review import _MAX_SYMBOL_CANDIDATES
+
+        lines = "".join(f"+def fn_{i}(): pass\n" for i in range(_MAX_SYMBOL_CANDIDATES + 50))
+        symbols = extract_symbols(lines)
+        assert len(symbols) == _MAX_SYMBOL_CANDIDATES
+
+    def test_empty_patch_returns_empty(self):
+        assert extract_symbols("") == ()
+
+    def test_ignores_file_header_lines(self):
+        # `+++ b/path` is a unified-diff header, not a code addition.
+        patch_text = "+++ b/src/foo.py\n+def bar(): pass\n"
+        names = {s.name for s in extract_symbols(patch_text)}
+        assert "bar" in names
+        # The `+++` header itself shouldn't produce spurious symbols.
+        assert "+" not in names
+
+
+# ── _normalize_repo_from_remote / _resolve_workspace_remote_repo ────
+
+
+class TestNormalizeRepoFromRemote:
+    def test_ssh_form(self):
+        assert _normalize_repo_from_remote("git@github.com:dcellison/kai.git") == "dcellison/kai"
+
+    def test_ssh_form_without_dotgit(self):
+        assert _normalize_repo_from_remote("git@github.com:dcellison/kai") == "dcellison/kai"
+
+    def test_https_form(self):
+        assert _normalize_repo_from_remote("https://github.com/dcellison/kai.git") == "dcellison/kai"
+
+    def test_https_with_subpath(self):
+        # Extra path segments after owner/name shouldn't affect normalization.
+        assert _normalize_repo_from_remote("https://github.com/dcellison/kai/tree/main") == "dcellison/kai"
+
+    def test_empty_returns_empty(self):
+        assert _normalize_repo_from_remote("") == ""
+
+    def test_unrecognized_form_returns_empty(self):
+        assert _normalize_repo_from_remote("some-random-string") == ""
+
+
+class TestResolveWorkspaceRemoteRepo:
+    @pytest.mark.asyncio
+    async def test_none_path_returns_empty(self):
+        assert await _resolve_workspace_remote_repo(None) == ""
+
+    @pytest.mark.asyncio
+    async def test_missing_git_dir_returns_empty(self, tmp_path):
+        assert await _resolve_workspace_remote_repo(str(tmp_path)) == ""
+
+    @pytest.mark.asyncio
+    async def test_resolves_origin_remote(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        proc = _mock_process(stdout=b"git@github.com:dcellison/kai.git\n")
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            assert await _resolve_workspace_remote_repo(str(tmp_path)) == "dcellison/kai"
+
+
+# ── fetch_extended_pr_metadata ──────────────────────────────────────
+
+
+class TestFetchExtendedPRMetadata:
+    @pytest.mark.asyncio
+    async def test_parses_full_payload(self):
+        payload = {
+            "number": 42,
+            "title": "Add feature X",
+            "body": "Body text",
+            "state": "OPEN",
+            "url": "https://github.com/owner/repo/pull/42",
+            "author": {"login": "alice"},
+            "baseRefName": "main",
+            "headRefName": "feature/x",
+            "headRefOid": "abc123",
+            "commits": [{"oid": "sha1"}, {"oid": "sha2"}],
+            "files": [
+                {"path": "src/a.py", "status": "modified"},
+                {"path": "src/b.py", "status": "added"},
+            ],
+            "closingIssuesReferences": [{"number": 100}, {"number": 101}],
+            "reviewDecision": "APPROVED",
+        }
+        proc = _mock_process(stdout=json.dumps(payload).encode())
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            meta = await fetch_extended_pr_metadata("owner/repo", 42)
+        assert meta.head_oid == "abc123"
+        assert meta.commit_oids == ("sha1", "sha2")
+        assert meta.changed_paths == (
+            ("src/a.py", "modified"),
+            ("src/b.py", "added"),
+        )
+        assert meta.closing_issue_numbers == (100, 101)
+        assert meta.review_decision == "APPROVED"
+        assert meta.author == "alice"
+
+    @pytest.mark.asyncio
+    async def test_empty_optional_fields(self):
+        payload = {"number": 42}
+        proc = _mock_process(stdout=json.dumps(payload).encode())
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            meta = await fetch_extended_pr_metadata("owner/repo", 42)
+        assert meta.commit_oids == ()
+        assert meta.changed_paths == ()
+        assert meta.closing_issue_numbers == ()
+        assert meta.review_decision == ""
+
+    @pytest.mark.asyncio
+    async def test_subprocess_failure_raises(self):
+        proc = _mock_process(stderr=b"gh: not found", returncode=1)
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match="gh pr view failed"),
+        ):
+            await fetch_extended_pr_metadata("owner/repo", 42)
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_raises(self):
+        proc = _mock_process(stdout=b"not json")
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match="invalid JSON"),
+        ):
+            await fetch_extended_pr_metadata("owner/repo", 42)
+
+
+# ── fetch_linked_issue / fetch_linked_issues ───────────────────────
+
+
+class TestFetchLinkedIssue:
+    @pytest.mark.asyncio
+    async def test_parses_body_labels_comments(self):
+        payload = {
+            "number": 100,
+            "title": "Issue title",
+            "body": "Acceptance: do X.",
+            "state": "OPEN",
+            "url": "https://github.com/owner/repo/issues/100",
+            "labels": [{"name": "enhancement"}, {"name": "v1"}],
+            "comments": [
+                {
+                    "author": {"login": "bob"},
+                    "body": "I think we should also do Y.",
+                    "createdAt": "2026-03-01T00:00:00Z",
+                }
+            ],
+        }
+        proc = _mock_process(stdout=json.dumps(payload).encode())
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            issue = await fetch_linked_issue("owner/repo", 100)
+        assert issue.title == "Issue title"
+        assert issue.labels == ("enhancement", "v1")
+        assert len(issue.comments) == 1
+        assert issue.comments[0].author == "bob"
+
+    @pytest.mark.asyncio
+    async def test_failure_raises(self):
+        proc = _mock_process(stderr=b"gh: not found", returncode=1)
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match="gh issue view failed"),
+        ):
+            await fetch_linked_issue("owner/repo", 100)
+
+
+class TestFetchLinkedIssues:
+    @pytest.mark.asyncio
+    async def test_empty_input_returns_empty(self):
+        issues, warnings = await fetch_linked_issues("owner/repo", ())
+        assert issues == ()
+        assert warnings == ()
+
+    @pytest.mark.asyncio
+    async def test_one_failure_becomes_warning(self):
+        good_payload = json.dumps(
+            {"number": 100, "title": "Good", "body": "", "state": "OPEN", "url": "", "labels": [], "comments": []}
+        ).encode()
+
+        call_count = [0]
+
+        def _factory(*args, **_kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return _mock_process(stdout=good_payload)
+            return _mock_process(stderr=b"gh: not found", returncode=1)
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_factory):
+            issues, warnings = await fetch_linked_issues("owner/repo", (100, 200))
+
+        assert len(issues) == 1
+        assert issues[0].number == 100
+        assert len(warnings) == 1
+        assert warnings[0].source == "linked_issue:200"
+
+
+# ── fetch_changed_files_at_head ─────────────────────────────────────
+
+
+class TestFetchChangedFilesAtHead:
+    def _meta(self, changed_paths, head_oid="sha"):
+        return ExtendedPRMetadata(
+            repo="owner/repo",
+            number=42,
+            title="",
+            description="",
+            author="",
+            state="",
+            url="",
+            base_ref="",
+            head_ref="",
+            head_oid=head_oid,
+            commit_oids=(),
+            changed_paths=tuple(changed_paths),
+            closing_issue_numbers=(),
+            review_decision="",
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_returns_empty(self):
+        files, warnings = await fetch_changed_files_at_head(self._meta(()))
+        assert files == ()
+        assert warnings == ()
+
+    @pytest.mark.asyncio
+    async def test_missing_head_oid_yields_warning(self):
+        meta = self._meta((("src/a.py", "modified"),), head_oid="")
+        files, warnings = await fetch_changed_files_at_head(meta)
+        assert len(files) == 1
+        assert files[0].content is None
+        assert files[0].note == "head SHA unavailable; contents omitted"
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_deleted_file_gets_note(self):
+        meta = self._meta((("src/gone.py", "removed"),))
+        # No subprocess should be invoked for a removed file.
+        with patch("asyncio.create_subprocess_exec") as mock_sub:
+            files, _ = await fetch_changed_files_at_head(meta)
+        mock_sub.assert_not_called()
+        assert files[0].content is None
+        assert "deleted" in (files[0].note or "")
+
+    @pytest.mark.asyncio
+    async def test_text_file_decoded(self):
+        import base64
+
+        payload = json.dumps(
+            {
+                "type": "file",
+                "encoding": "base64",
+                "size": 12,
+                "content": base64.b64encode(b"hello world\n").decode(),
+            }
+        ).encode()
+        meta = self._meta((("src/hello.py", "modified"),))
+        proc = _mock_process(stdout=payload)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            files, _ = await fetch_changed_files_at_head(meta)
+        assert files[0].content == "hello world\n"
+        assert files[0].note is None
+
+    @pytest.mark.asyncio
+    async def test_binary_suffix_gets_note_without_subprocess(self):
+        meta = self._meta((("src/logo.png", "added"),))
+        with patch("asyncio.create_subprocess_exec") as mock_sub:
+            files, _ = await fetch_changed_files_at_head(meta)
+        mock_sub.assert_not_called()
+        assert files[0].content is None
+        assert "binary" in (files[0].note or "")
+
+    @pytest.mark.asyncio
+    async def test_too_large_file_gets_note(self):
+        # API returns size above the cap; the content is requested but
+        # we record the omission note without inlining.
+        import base64
+
+        big_body = b"x" * 50
+        payload = json.dumps(
+            {
+                "type": "file",
+                "encoding": "base64",
+                "size": 500_000,
+                "content": base64.b64encode(big_body).decode(),
+            }
+        ).encode()
+        meta = self._meta((("src/huge.py", "modified"),))
+        proc = _mock_process(stdout=payload)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            files, _ = await fetch_changed_files_at_head(meta)
+        assert files[0].content is None
+        assert "too large" in (files[0].note or "")
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_gets_note(self):
+        meta = self._meta((("src/x.py", "modified"),))
+        proc = _mock_process(stderr=b"404 not found", returncode=1)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            files, _ = await fetch_changed_files_at_head(meta)
+        assert files[0].content is None
+        assert "fetch failed" in (files[0].note or "")
+
+
+# ── budget_review_context ──────────────────────────────────────────
+
+
+def _ctx(**overrides) -> PRReviewContext:
+    """Build a PRReviewContext with sensible defaults for budgeter tests."""
+    defaults = {
+        "repo": "owner/repo",
+        "pr_number": 42,
+        "metadata": ExtendedPRMetadata(
+            repo="owner/repo",
+            number=42,
+            title="t",
+            description="d",
+            author="a",
+            state="OPEN",
+            url="u",
+            base_ref="main",
+            head_ref="x",
+            head_oid="sha",
+            commit_oids=(),
+            changed_paths=(),
+            closing_issue_numbers=(),
+            review_decision="",
+        ),
+        "linked_issues": (),
+        "commits": (),
+        "patch": "",
+        "changed_files": (),
+        "related_context": (),
+        "spec": None,
+        "conventions": None,
+        "prior_comments": None,
+    }
+    defaults.update(overrides)
+    return PRReviewContext(**defaults)
+
+
+class TestBudgetReviewContext:
+    def test_passthrough_when_under_caps(self):
+        ctx = _ctx(patch="small patch")
+        out = budget_review_context(ctx)
+        assert out.patch == "small patch"
+        assert out.budget_notes == ()
+
+    def test_patch_truncation_emits_note(self):
+        big = "x" * (_MAX_PATCH_CHARS + 1000)
+        ctx = _ctx(patch=big)
+        out = budget_review_context(ctx)
+        assert len(out.patch) <= _MAX_PATCH_CHARS
+        sections = {n.section for n in out.budget_notes}
+        assert "PATCH" in sections
+
+    def test_related_excerpts_dropped_when_over_cap(self):
+        many = tuple(
+            RelatedExcerpt(
+                path=f"src/{i}.py",
+                line=i,
+                symbol=f"sym{i}",
+                reason="r",
+                excerpt="x" * 4000,
+            )
+            for i in range(40)
+        )
+        ctx = _ctx(related_context=many)
+        out = budget_review_context(ctx)
+        assert sum(len(e.excerpt) for e in out.related_context) <= _MAX_RELATED_CONTEXT_CHARS + 200
+        sections = {n.section for n in out.budget_notes}
+        assert "RELATED_CONTEXT" in sections
+
+    def test_commit_bodies_drop_before_headlines(self):
+        commits = tuple(Commit(oid=f"{i:040x}", headline=f"headline {i}", body="x" * 5000) for i in range(20))
+        ctx = _ctx(commits=commits)
+        out = budget_review_context(ctx)
+        # All headlines retained, bodies trimmed.
+        assert len(out.commits) == len(commits)
+        assert any(c.body == "" for c in out.commits)
+
+    def test_linked_issue_bodies_never_dropped(self):
+        issues = tuple(
+            LinkedIssue(
+                number=n,
+                title=f"Issue {n}",
+                body="x" * 5000,
+                state="OPEN",
+                url="",
+                labels=(),
+                comments=tuple(
+                    IssueComment(author="b", body="ordinary " + ("y" * 1000), created_at="") for _ in range(5)
+                ),
+            )
+            for n in range(20)
+        )
+        ctx = _ctx(linked_issues=issues)
+        out = budget_review_context(ctx)
+        for issue in out.linked_issues:
+            assert issue.body == "x" * 5000
+
+    def test_scope_defining_comment_retained_over_ordinary(self):
+        scope_comment = IssueComment(
+            author="o",
+            body="acceptance criteria: feature must do Y",
+            created_at="",
+        )
+        ordinary = IssueComment(author="b", body="x" * 10_000, created_at="")
+        issue = LinkedIssue(
+            number=1,
+            title="t",
+            body="x" * 5000,
+            state="OPEN",
+            url="",
+            labels=(),
+            comments=(scope_comment,) + tuple(ordinary for _ in range(10)),
+        )
+        ctx = _ctx(linked_issues=(issue,))
+        out = budget_review_context(ctx)
+        kept_bodies = [c.body for c in out.linked_issues[0].comments]
+        # Scope-defining comment is retained; some ordinary comments
+        # may have dropped.
+        assert any("acceptance criteria" in b for b in kept_bodies)
+
+    def test_deterministic(self):
+        big = "x" * (_MAX_PATCH_CHARS + 5000)
+        ctx = _ctx(patch=big)
+        out1 = budget_review_context(ctx)
+        out2 = budget_review_context(ctx)
+        assert out1 == out2
+
+
+# ── build_review_prompt_from_context ───────────────────────────────
+
+
+class TestBuildReviewPromptFromContext:
+    def test_renders_required_sections_when_present(self):
+        ctx = _ctx(
+            patch="-- patch --",
+            commits=(Commit(oid="abc1234567", headline="h", body=""),),
+            linked_issues=(
+                LinkedIssue(
+                    number=1,
+                    title="Issue",
+                    body="body text",
+                    state="OPEN",
+                    url="u",
+                    labels=(),
+                    comments=(),
+                ),
+            ),
+            changed_files=(ChangedFile(path="src/a.py", status="modified", content="print('x')", note=None),),
+            related_context=(RelatedExcerpt(path="src/b.py", line=1, symbol="foo", reason="r", excerpt="hit"),),
+            spec="must do X",
+            conventions="snake_case",
+            prior_comments="prior thread",
+        )
+        prompt = build_review_prompt_from_context(ctx)
+        for label in (
+            "PR_METADATA",
+            "LINKED_ISSUES",
+            "COMMITS",
+            "SPEC",
+            "CONVENTIONS",
+            "PRIOR_REVIEW_THREAD",
+            "PATCH",
+            "CHANGED_FILES_AT_HEAD",
+            "RELATED_CONTEXT",
+        ):
+            assert f"BEGIN {label}" in prompt, f"missing {label}"
+
+    def test_skips_empty_sections(self):
+        ctx = _ctx(patch="-- patch --")
+        prompt = build_review_prompt_from_context(ctx)
+        # Empty sections don't render boundaries.
+        assert "BEGIN LINKED_ISSUES" not in prompt
+        assert "BEGIN RELATED_CONTEXT" not in prompt
+        assert "BEGIN COMMITS" not in prompt
+
+    def test_each_section_has_distinct_boundary_token(self):
+        ctx = _ctx(
+            patch="-- patch --",
+            commits=(Commit(oid="abc1234567", headline="h", body=""),),
+            related_context=(RelatedExcerpt(path="src/b.py", line=1, symbol="foo", reason="r", excerpt="hit"),),
+        )
+        prompt = build_review_prompt_from_context(ctx)
+        # Pull every hex token after `BEGIN <label> ` and verify uniqueness.
+        tokens = re.findall(r"BEGIN \S+ ([0-9a-f]+) ---", prompt)
+        assert len(tokens) == len(set(tokens))
+
+    def test_includes_first_pass_completeness_instruction(self):
+        prompt = build_review_prompt_from_context(_ctx())
+        assert "Prioritize first-pass review completeness" in prompt
+
+    def test_includes_findings_first_instruction(self):
+        prompt = build_review_prompt_from_context(_ctx())
+        assert "Do not summarize the PR before listing findings" in prompt
+
+    def test_budget_notes_render_inside_their_own_boundary(self):
+        ctx = _ctx(budget_notes=(BudgetNote(section="RELATED_CONTEXT", message="dropped 14 hits"),))
+        prompt = build_review_prompt_from_context(ctx)
+        assert "BEGIN BUDGET_NOTES" in prompt
+        assert "dropped 14 hits" in prompt
+
+    def test_collection_warnings_render_inside_their_own_boundary(self):
+        ctx = _ctx(collection_warnings=(CollectionWarning(source="related_search", message="search unavailable"),))
+        prompt = build_review_prompt_from_context(ctx)
+        assert "BEGIN COLLECTION_WARNINGS" in prompt
+        assert "search unavailable" in prompt
+
+
+# ── generate_pr_review ─────────────────────────────────────────────
+
+
+class TestGeneratePRReview:
+    @pytest.mark.asyncio
+    async def test_drives_builder_renderer_and_run_review(self):
+        ctx = _ctx(patch="x")
+        with (
+            patch("kai.review.build_pr_review_context", return_value=ctx) as mock_build,
+            patch(
+                "kai.review.build_review_prompt_from_context",
+                return_value="rendered",
+            ) as mock_render,
+            patch("kai.review.run_review", return_value="output") as mock_run,
+        ):
+            result = await generate_pr_review(
+                "owner/repo",
+                42,
+                local_repo_path="/repo",
+                spec_dir="my/specs",
+                include_prior_comments=False,
+                claude_user="kai",
+                agent_backend="codex",
+                provider="openai",
+                timeout_s=42,
+                model_override="gpt-foo",
+            )
+        mock_build.assert_called_once()
+        assert mock_build.call_args.kwargs["local_repo_path"] == "/repo"
+        assert mock_build.call_args.kwargs["spec_dir"] == "my/specs"
+        assert mock_build.call_args.kwargs["include_prior_comments"] is False
+        mock_render.assert_called_once_with(ctx)
+        run_kwargs = mock_run.call_args.kwargs
+        assert run_kwargs["agent_backend"] == "codex"
+        assert run_kwargs["provider"] == "openai"
+        assert run_kwargs["timeout_s"] == 42
+        assert run_kwargs["model_override"] == "gpt-foo"
+        assert run_kwargs["claude_user"] == "kai"
+        assert result.review_text == "output"
+        assert result.repo == "owner/repo"
+        assert result.pr_number == 42
+        assert isinstance(result, PRReviewResult)
